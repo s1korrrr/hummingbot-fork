@@ -693,8 +693,11 @@ class PositionExecutor(ExecutorBase):
             self.logger().error(f"Take profit order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
 
     def get_custom_info(self) -> Dict:
+        level_id = self.config.level_id
+        role = level_id if level_id in {"scout", "runner"} else None
         return {
-            "level_id": self.config.level_id,
+            "level_id": level_id,
+            "role": role,
             "current_position_average_price": self.entry_price,
             "side": self.config.side,
             "current_retries": self._current_retries,

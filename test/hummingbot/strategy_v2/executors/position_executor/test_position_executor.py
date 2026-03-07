@@ -599,10 +599,21 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         custom_info = executor.get_custom_info()
 
         self.assertEqual(custom_info["level_id"], position_config.level_id)
+        self.assertIsNone(custom_info["role"])
         self.assertEqual(custom_info["current_position_average_price"], executor.entry_price)
         self.assertEqual(custom_info["side"], position_config.side)
         self.assertEqual(custom_info["current_retries"], executor._current_retries)
         self.assertEqual(custom_info["max_retries"], executor._max_retries)
+
+    def test_get_custom_info_sets_role_for_named_split_legs(self):
+        position_config = self.get_position_config_market_long()
+        position_config.level_id = "scout"
+        executor = PositionExecutor(self.strategy, position_config)
+
+        custom_info = executor.get_custom_info()
+
+        self.assertEqual(custom_info["level_id"], "scout")
+        self.assertEqual(custom_info["role"], "scout")
 
     def test_cancel_close_order_and_process_cancel_event(self):
         position_config = self.get_position_config_market_long()

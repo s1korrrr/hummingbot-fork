@@ -144,6 +144,8 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertIn(tracked_order, executor._failed_orders)
         self.assertIsNone(executor._order)
         self.assertEqual(executor._current_retries, 1)
+        self.assertTrue(self.is_partially_logged("ERROR", "Order failed order_id=OID-FAIL"))
+        self.assertTrue(self.is_partially_logged("ERROR", "pair=ETH-USDT"))
 
     @patch.object(OrderExecutor, "get_in_flight_order")
     def test_process_order_completed_event(self, in_flight_order_mock):
@@ -266,7 +268,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
 
         status_lines = executor.to_format_status()
         self.assertEqual(len(status_lines), 1)
-        self.assertIn("Trading Pair: ETH-USDT", status_lines[0])
+        self.assertIn("🎯 Trading Pair: ETH-USDT", status_lines[0])
         self.assertIn("Exchange: binance", status_lines[0])
         self.assertIn("Amount: 1", status_lines[0])
         self.assertIn("Price: 100", status_lines[0])
@@ -332,6 +334,8 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         await executor.validate_sufficient_balance()
         self.assertEqual(executor.close_type, CloseType.INSUFFICIENT_BALANCE)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertTrue(self.is_partially_logged("ERROR", "Not enough budget to open position"))
+        self.assertTrue(self.is_partially_logged("ERROR", "pair=ETH-USDT"))
 
     @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
     @patch.object(OrderExecutor, 'get_trading_rules')

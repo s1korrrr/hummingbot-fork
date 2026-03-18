@@ -441,20 +441,20 @@ class StatArb(ControllerBase):
         """
         status_lines = []
         status_lines.append(f"""
-Dominant Pair: {self.config.connector_pair_dominant} | Hedge Pair: {self.config.connector_pair_hedge} |
-Timeframe: {self.config.interval} | Lookback Period: {self.config.lookback_period} | Entry Threshold: {self.config.entry_threshold}
+⚖️ Dominant Pair: {self.config.connector_pair_dominant} | 🛡️ Hedge Pair: {self.config.connector_pair_hedge} |
+⏱️ Timeframe: {self.config.interval} | Lookback Period: {self.config.lookback_period} | 🎯 Entry Threshold: {self.config.entry_threshold}
 
-Positions targets:
+📍 Positions targets:
 Theoretical Dominant         : {self.theoretical_dominant_quote} | Theoretical Hedge: {self.theoretical_hedge_quote} | Position Hedge Ratio: {self.config.pos_hedge_ratio}
 Position Dominant            : {self.processed_data['position_dominant_quote']:.2f} | Position Hedge: {self.processed_data['position_hedge_quote']:.2f} | Imbalance: {self.processed_data['imbalance']:.2f} | Imbalance Scaled: {self.processed_data['imbalance_scaled_pct']:.2f} %
 
-Current Executors:
+🚦 Current Executors:
 Active Orders Dominant       : {len(self.processed_data['executors_dominant_placed'])} | Active Orders Hedge       : {len(self.processed_data['executors_hedge_placed'])} |
 Active Orders Dominant Filled: {len(self.processed_data['executors_dominant_filled'])} | Active Orders Hedge Filled: {len(self.processed_data['executors_hedge_filled'])}
 
-Signal: {self.processed_data['signal']:.2f} | Z-Score: {self.processed_data['z_score']:.2f} | Spread: {self.processed_data['spread']:.2f}
-Alpha : {self.processed_data['alpha']:.2f} | Beta: {self.processed_data['beta']:.2f}
-Pair PnL PCT: {self.processed_data['pair_pnl_pct'] * 100:.2f} %
+🎯 Signal: {self.processed_data['signal']:.2f} | Z-Score: {self.processed_data['z_score']:.2f} | Spread: {self.processed_data['spread']:.2f}
+🧠 Alpha : {self.processed_data['alpha']:.2f} | Beta: {self.processed_data['beta']:.2f}
+💰 Pair PnL PCT: {self.processed_data['pair_pnl_pct'] * 100:.2f} %
 """)
         return status_lines
 

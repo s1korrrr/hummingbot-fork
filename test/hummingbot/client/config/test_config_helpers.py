@@ -16,6 +16,7 @@ from hummingbot.client.config.config_helpers import (
     ReadOnlyClientConfigAdapter,
     get_connector_config_yml_path,
     get_strategy_config_map,
+    load_client_config_map_from_file,
     load_connector_config_map_from_file,
     save_to_yml,
 )
@@ -30,9 +31,11 @@ class ConfigHelpersTest(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.ev_loop = asyncio.get_event_loop()
+        self._original_client_config_path = config_helpers.CLIENT_CONFIG_PATH
         self._original_connectors_conf_dir_path = config_helpers.CONNECTORS_CONF_DIR_PATH
 
     def tearDown(self) -> None:
+        config_helpers.CLIENT_CONFIG_PATH = self._original_client_config_path
         config_helpers.CONNECTORS_CONF_DIR_PATH = self._original_connectors_conf_dir_path
         super().tearDown()
 
@@ -93,6 +96,41 @@ strategy: pure_market_making
             cm_loaded = load_connector_config_map_from_file(temp_file_name)
 
         self.assertEqual(cm, cm_loaded)
+
+    def test_load_client_config_map_from_file_ignores_legacy_top_level_keys(self):
+        legacy_config = """\
+fetch_pairs_from_all_exchanges: true
+previous_strategy: null
+certs_path: /tmp/certs
+command_shortcuts:
+  - command: spreads
+    help: Set bid and ask spread
+    arguments:
+      - Bid Spread
+      - Ask Spread
+    output:
+      - config bid_spread $1
+      - config ask_spread $2
+"""
+        with TemporaryDirectory() as d:
+            d = Path(d)
+            temp_file_name = d / "conf_client.yml"
+            temp_file_name.write_text(legacy_config, encoding="utf-8")
+            config_helpers.CLIENT_CONFIG_PATH = temp_file_name
+
+            with self.assertLogs(level="WARNING") as log_records:
+                cm_loaded = load_client_config_map_from_file()
+
+            saved_config = temp_file_name.read_text(encoding="utf-8")
+
+        self.assertTrue(cm_loaded.fetch_pairs_from_all_exchanges)
+        self.assertNotIn("previous_strategy", saved_config)
+        self.assertNotIn("certs_path", saved_config)
+        self.assertNotIn("command_shortcuts", saved_config)
+        self.assertIn(
+            "Ignoring deprecated/unknown client config keys",
+            "\n".join(log_records.output),
+        )
 
     def test_decrypt_config_map_secret_values(self):
         class DummySubModel(BaseClientModel):

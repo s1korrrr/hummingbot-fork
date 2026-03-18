@@ -151,7 +151,7 @@ class OrderExecutor(ExecutorBase):
             position_action=self.config.position_action,
         )
         self._order = TrackedOrder(order_id=order_id)
-        self.logger().debug(f"Executor ID: {self.config.id} - Placing order {order_id}")
+        self.logger().debug(self._log_message(f"Placing order order_id={order_id}"))
 
     def get_order_type(self) -> OrderType:
         """
@@ -206,7 +206,7 @@ class OrderExecutor(ExecutorBase):
         """
         self.cancel_order()
         self.place_open_order()
-        self.logger().debug("Renewing order")
+        self.logger().debug(self._log_message("Renewing order"))
 
     def cancel_order(self):
         """
@@ -218,7 +218,7 @@ class OrderExecutor(ExecutorBase):
                 trading_pair=self.config.trading_pair,
                 order_id=self._order.order_id
             )
-            self.logger().debug("Cancelling order")
+            self.logger().debug(self._log_message(f"Cancelling order order_id={self._order.order_id}"))
 
     def update_tracked_order_with_order_id(self, order_id: str):
         """
@@ -270,7 +270,12 @@ class OrderExecutor(ExecutorBase):
         if self._order and event.order_id == self._order.order_id:
             self._failed_orders.append(self._order)
             self._order = None
-            self.logger().error(f"Order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
+            self.logger().error(
+                self._log_message(
+                    f"Order failed order_id={event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
+            )
             self._current_retries += 1
 
     def get_custom_info(self) -> Dict:
@@ -296,9 +301,9 @@ class OrderExecutor(ExecutorBase):
         :return: A list of formatted status lines.
         """
         lines = [f"""
-| Trading Pair: {self.config.trading_pair} | Exchange: {self.config.connector_name} | Action: {self.config.position_action}
-| Amount: {self.config.amount} | Price: {self._order.order.price if self._order and self._order.order else 'N/A'}
-| Execution Strategy: {self.config.execution_strategy} | Retries: {self._current_retries}/{self._max_retries}
+| 🎯 Trading Pair: {self.config.trading_pair} | 🏦 Exchange: {self.config.connector_name} | ⚙️ Action: {self.config.position_action}
+| 📦 Amount: {self.config.amount} | 💲 Price: {self._order.order.price if self._order and self._order.order else 'N/A'}
+| 🧭 Execution Strategy: {self.config.execution_strategy} | 🔁 Retries: {self._current_retries}/{self._max_retries}
 """]
         return lines
 
@@ -326,7 +331,7 @@ class OrderExecutor(ExecutorBase):
         adjusted_order_candidates = self.adjust_order_candidates(self.config.connector_name, [order_candidate])
         if adjusted_order_candidates[0].amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
+            self.logger().error(self._log_message("Not enough budget to open position"))
             self.stop()
 
     async def _sleep(self, delay: float):

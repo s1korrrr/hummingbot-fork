@@ -528,6 +528,7 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("2"), positions[0].amount)
         self.assertEqual(Decimal("1100"), positions[0].breakeven_price)
         self.assertEqual(Decimal("100"), positions[0].unrealized_pnl_quote)
+        self.assertEqual(Decimal("50"), positions[0].realized_pnl_quote)
         self.assertEqual(Decimal("5"), positions[0].cum_fees_quote)
         self.assertEqual(Decimal("30"), positions[0].volume_traded_quote)
         self.assertEqual(456, positions[0].timestamp)

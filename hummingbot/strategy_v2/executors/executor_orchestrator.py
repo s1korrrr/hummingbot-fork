@@ -164,6 +164,7 @@ class ExecutorOrchestrator:
         self.executors_update_interval = executors_update_interval
         self.executors_max_retries = executors_max_retries
         self.active_executors = {}
+        self.stored_executors = {}
         self.positions_held = {}
         self.executors_ids_position_held = deque(maxlen=50)
         self.cached_performance = {}
@@ -179,6 +180,7 @@ class ExecutorOrchestrator:
             if controller_id not in self.cached_performance:
                 self.cached_performance[controller_id] = PerformanceReport()
                 self.active_executors[controller_id] = []
+                self.stored_executors[controller_id] = []
                 self.positions_held[controller_id] = []
         db_executors = MarketsRecorder.get_instance().get_all_executors()
         for executor in db_executors:
@@ -186,6 +188,7 @@ class ExecutorOrchestrator:
             if controller_id not in self.strategy.controllers:
                 continue
             self._update_cached_performance(controller_id, executor)
+            self._record_stored_executor(controller_id, executor)
 
         # Create initial positions from config overrides first
         self._create_initial_positions()
@@ -220,6 +223,33 @@ class ExecutorOrchestrator:
             report.close_type_counts[executor_info.close_type] = report.close_type_counts.get(executor_info.close_type,
                                                                                               0) + 1
 
+    @staticmethod
+    def _should_store_executor_for_history(executor_info: ExecutorInfo) -> bool:
+        return executor_info.is_done or not executor_info.is_active
+
+    def _record_stored_executor(self, controller_id: str, executor_info: ExecutorInfo):
+        if not self._should_store_executor_for_history(executor_info):
+            return
+        if controller_id not in self.stored_executors:
+            self.stored_executors[controller_id] = []
+        persisted_custom_info = dict(executor_info.custom_info or {})
+        persisted_custom_info.setdefault("persistence_source", "db")
+        stored_executor = executor_info.model_copy(
+            deep=True,
+            update={"custom_info": persisted_custom_info},
+        )
+        deduped_executors = [
+            stored
+            for stored in self.stored_executors[controller_id]
+            if stored.id != stored_executor.id
+        ]
+        deduped_executors.append(stored_executor)
+        deduped_executors.sort(
+            key=lambda info: info.close_timestamp if info.close_timestamp is not None else info.timestamp,
+            reverse=True,
+        )
+        self.stored_executors[controller_id] = deduped_executors[:20]
+
     def _load_position_from_db(self, controller_id: str, db_position: Position):
         """
         Load a position from the database and recreate it as a PositionHold object.
@@ -251,6 +281,10 @@ class ExecutorOrchestrator:
 
         # Add to positions held
         self.positions_held[controller_id].append(position_hold)
+        self.logger().info(
+            f"Restored held position | controller={controller_id} pair={db_position.trading_pair} "
+            f"side={db_position.side} amount={db_position.amount} breakeven={db_position.breakeven_price}"
+        )
 
     def _create_initial_positions(self):
         """
@@ -261,6 +295,7 @@ class ExecutorOrchestrator:
             if controller_id not in self.cached_performance:
                 self.cached_performance[controller_id] = PerformanceReport()
                 self.active_executors[controller_id] = []
+                self.stored_executors[controller_id] = []
                 self.positions_held[controller_id] = []
 
             for position_config in initial_positions:
@@ -293,20 +328,33 @@ class ExecutorOrchestrator:
                 self.logger().info(f"Created initial position for controller {controller_id}: {position_config.amount} "
                                    f"{position_config.side.name} {position_config.trading_pair} on {position_config.connector_name}")
 
-    async def stop(self, max_executors_close_attempts: int = 3):
+    async def stop(self,
+                   max_executors_close_attempts: int = 3,
+                   keep_position_by_controller: Optional[Dict[str, bool]] = None):
         """
         Stop the orchestrator task and all active executors.
         """
+        keep_position_by_controller = keep_position_by_controller or {}
         # first we stop all active executors
         for controller_id, executors_list in self.active_executors.items():
+            keep_position = keep_position_by_controller.get(controller_id, False)
             for executor in executors_list:
                 if not executor.is_closed:
-                    executor.early_stop()
-        for i in range(max_executors_close_attempts):
+                    executor.early_stop(keep_position=keep_position)
+        for _ in range(max_executors_close_attempts):
             if all([executor.executor_info.is_done for executors_list in self.active_executors.values()
                     for executor in executors_list]):
-                continue
+                break
             await asyncio.sleep(2.0)
+        else:
+            pending_executors = [
+                executor.config.id for executors_list in self.active_executors.values()
+                for executor in executors_list if not executor.executor_info.is_done
+            ]
+            if pending_executors:
+                self.logger().warning(
+                    f"Shutdown timed out while waiting for executors to stop: {pending_executors}"
+                )
         # Store all positions and executors
         self.store_all_positions()
         self.store_all_executors()
@@ -317,6 +365,7 @@ class ExecutorOrchestrator:
         """
         Store or update all positions in the database.
         """
+        self._update_positions_from_done_executors()
         markets_recorder = MarketsRecorder.get_instance()
         for controller_id, positions_list in self.positions_held.items():
             if controller_id is None:
@@ -350,6 +399,11 @@ class ExecutorOrchestrator:
                 )
                 # Store or update the position in the database
                 markets_recorder.update_or_store_position(position_record)
+                self.logger().info(
+                    f"Stored held position | controller={controller_id} pair={position_summary.trading_pair} "
+                    f"side={position_summary.side.name} amount={position_summary.amount} "
+                    f"breakeven={position_summary.breakeven_price}"
+                )
 
         # Clear all positions after storing (avoid modifying list while iterating)
         self.positions_held.clear()
@@ -360,6 +414,7 @@ class ExecutorOrchestrator:
                 # Store the executor in the database
                 MarketsRecorder.get_instance().store_or_update_executor(executor)
                 self._update_cached_performance(controller_id, executor.executor_info)
+                self._record_stored_executor(controller_id, executor.executor_info)
         # Remove the executors from the list
         self.active_executors = {}
 
@@ -374,6 +429,7 @@ class ExecutorOrchestrator:
             return
         if controller_id not in self.cached_performance:
             self.active_executors[controller_id] = []
+            self.stored_executors[controller_id] = []
             self.positions_held[controller_id] = []
             self.cached_performance[controller_id] = PerformanceReport()
 
@@ -533,6 +589,7 @@ class ExecutorOrchestrator:
         try:
             MarketsRecorder.get_instance().store_or_update_executor(executor)
             self._update_cached_performance(controller_id, executor.executor_info)
+            self._record_stored_executor(controller_id, executor.executor_info)
         except Exception as e:
             self.logger().error(f"Error storing executor id {executor_id}: {str(e)}.")
             self.logger().error(f"Executor info: {executor.executor_info} | Config: {executor.config}")
@@ -546,8 +603,16 @@ class ExecutorOrchestrator:
         Generate a report of all executors.
         """
         report = {}
-        for controller_id, executors_list in self.active_executors.items():
-            report[controller_id] = [executor.executor_info for executor in executors_list if executor]
+        controller_ids = set(list(self.active_executors.keys()) + list(self.stored_executors.keys()))
+        for controller_id in controller_ids:
+            active_executors = [executor.executor_info for executor in self.active_executors.get(controller_id, []) if executor]
+            active_executor_ids = {executor.id for executor in active_executors}
+            stored_executors = [
+                executor
+                for executor in self.stored_executors.get(controller_id, [])
+                if executor.id not in active_executor_ids
+            ]
+            report[controller_id] = active_executors + stored_executors
         return report
 
     def get_positions_report(self) -> Dict[str, List[PositionSummary]]:

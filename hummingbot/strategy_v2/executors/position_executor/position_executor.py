@@ -18,7 +18,7 @@ from hummingbot.core.event.events import (
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TrailingStop
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
@@ -32,6 +32,25 @@ class PositionExecutor(ExecutorBase):
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
+    @staticmethod
+    def _fmt_decimal(value: Optional[Decimal], precision: int = 5) -> str:
+        if value is None:
+            return "n/a"
+        try:
+            return f"{Decimal(str(value)):.{precision}f}"
+        except Exception:
+            return "n/a"
+
+    @staticmethod
+    def _to_decimal(value) -> Optional[Decimal]:
+        if value is None:
+            return None
+        try:
+            decimal_value = Decimal(str(value))
+            return decimal_value if decimal_value.is_finite() else None
+        except Exception:
+            return None
+
     def __init__(self, strategy: StrategyV2Base, config: PositionExecutorConfig,
                  update_interval: float = 1.0, max_retries: int = 10):
         """
@@ -44,7 +63,11 @@ class PositionExecutor(ExecutorBase):
         """
         if config.triple_barrier_config.time_limit_order_type != OrderType.MARKET or \
                 config.triple_barrier_config.stop_loss_order_type != OrderType.MARKET:
-            error = "Only market orders are supported for time_limit and stop_loss"
+            error = (
+                "Only market orders are supported for time_limit and stop_loss "
+                f"| executor={config.id} connector={config.connector_name} "
+                f"pair={config.trading_pair} side={config.side.name}"
+            )
             self.logger().error(error)
             raise ValueError(error)
         super().__init__(strategy=strategy, config=config, connectors=[config.connector_name],
@@ -62,6 +85,9 @@ class PositionExecutor(ExecutorBase):
         self._take_profit_limit_order: Optional[TrackedOrder] = None
         self._failed_orders: List[TrackedOrder] = []
         self._trailing_stop_trigger_pct: Optional[Decimal] = None
+        self._trailing_stop_move_count: int = 0
+        self._trailing_stop_armed_timestamp: Optional[float] = None
+        self._trailing_stop_last_update_timestamp: Optional[float] = None
 
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._current_retries = 0
@@ -209,6 +235,101 @@ class PositionExecutor(ExecutorBase):
     @property
     def close_order_side(self):
         return TradeType.BUY if self.config.side == TradeType.SELL else TradeType.SELL
+
+    @property
+    def trailing_stop_config(self) -> Optional[TrailingStop]:
+        return self.config.triple_barrier_config.trailing_stop
+
+    def _known_fee_pct(self) -> Decimal:
+        return self.cum_fees_quote / self.open_filled_amount_quote if self.open_filled_amount_quote != Decimal("0") else Decimal("0")
+
+    def _price_for_net_pnl_pct(self, target_net_pnl_pct: Optional[Decimal]) -> Optional[Decimal]:
+        if target_net_pnl_pct is None:
+            return None
+        if self.entry_price <= Decimal("0"):
+            return None
+        target_pct = Decimal(str(target_net_pnl_pct))
+        fee_pct = self._known_fee_pct()
+        if self.config.side == TradeType.BUY:
+            return self.entry_price * (Decimal("1") + fee_pct + target_pct)
+        else:
+            return self.entry_price * (Decimal("1") - fee_pct - target_pct)
+
+    def _current_trailing_reference_price(self) -> Optional[Decimal]:
+        try:
+            return self._to_decimal(self.current_market_price)
+        except Exception:
+            try:
+                return self._to_decimal(self.entry_price)
+            except Exception:
+                return None
+
+    def _distance_to_trailing_activation_pct(
+        self, activation_price: Optional[Decimal], current_price: Optional[Decimal]
+    ) -> Optional[Decimal]:
+        if activation_price is None or current_price is None or current_price <= Decimal("0"):
+            return None
+        if self.config.side == TradeType.BUY:
+            return max(activation_price - current_price, Decimal("0")) / current_price
+        else:
+            return max(current_price - activation_price, Decimal("0")) / current_price
+
+    def _distance_to_trailing_trigger_pct(
+        self, trigger_price: Optional[Decimal], current_price: Optional[Decimal]
+    ) -> Optional[Decimal]:
+        if trigger_price is None or current_price is None or current_price <= Decimal("0"):
+            return None
+        if self.config.side == TradeType.BUY:
+            return max(current_price - trigger_price, Decimal("0")) / current_price
+        else:
+            return max(trigger_price - current_price, Decimal("0")) / current_price
+
+    def _trailing_status_snapshot(self) -> Dict:
+        trailing_stop = self.trailing_stop_config
+        if trailing_stop is None:
+            return {
+                "trailing_state": "disabled",
+                "trailing_activation_pct": None,
+                "trailing_delta_pct": None,
+                "trailing_activation_price": None,
+                "distance_to_trailing_activation_pct": None,
+                "trailing_stop_trigger_pct": None,
+                "trailing_trigger_price": None,
+                "distance_to_trailing_trigger_pct": None,
+                "trailing_move_count": 0,
+                "trailing_armed_timestamp": None,
+                "trailing_last_update_timestamp": None,
+                "trailing_current_price": None,
+            }
+
+        current_price = self._current_trailing_reference_price()
+        activation_price = self._price_for_net_pnl_pct(trailing_stop.activation_price)
+        trigger_pct = self._trailing_stop_trigger_pct
+        trigger_price = self._price_for_net_pnl_pct(trigger_pct) if trigger_pct is not None else None
+
+        if self.close_type == CloseType.TRAILING_STOP:
+            trailing_state = "triggered"
+        elif trigger_pct is not None:
+            trailing_state = "armed"
+        elif self.open_filled_amount <= Decimal("0"):
+            trailing_state = "pending"
+        else:
+            trailing_state = "waiting"
+
+        return {
+            "trailing_state": trailing_state,
+            "trailing_activation_pct": trailing_stop.activation_price,
+            "trailing_delta_pct": trailing_stop.trailing_delta,
+            "trailing_activation_price": activation_price,
+            "distance_to_trailing_activation_pct": self._distance_to_trailing_activation_pct(activation_price, current_price),
+            "trailing_stop_trigger_pct": trigger_pct,
+            "trailing_trigger_price": trigger_price,
+            "distance_to_trailing_trigger_pct": self._distance_to_trailing_trigger_pct(trigger_price, current_price),
+            "trailing_move_count": self._trailing_stop_move_count,
+            "trailing_armed_timestamp": self._trailing_stop_armed_timestamp,
+            "trailing_last_update_timestamp": self._trailing_stop_last_update_timestamp,
+            "trailing_current_price": current_price,
+        }
 
     @property
     def trade_pnl_pct(self) -> Decimal:
@@ -361,7 +482,12 @@ class PositionExecutor(ExecutorBase):
                 await connector._update_orders_with_error_handler(
                     orders=[in_flight_order],
                     error_handler=connector._handle_update_error_for_lost_order)
-                self.logger().info("Waiting for close order to be filled")
+                self.logger().info(
+                    self._log_message(
+                        f"Waiting for close order fill order_id={self._close_order.order_id} "
+                        f"close_type={self.close_type.name if self.close_type else 'UNKNOWN'}"
+                    )
+                )
             else:
                 self._failed_orders.append(self._close_order)
                 self._close_order = None
@@ -452,7 +578,7 @@ class PositionExecutor(ExecutorBase):
             position_action=PositionAction.OPEN,
         )
         self._open_order = TrackedOrder(order_id=order_id)
-        self.logger().debug(f"Executor ID: {self.config.id} - Placing open order {order_id}")
+        self.logger().debug(self._log_message(f"Placing open order order_id={order_id}"))
 
     def control_barriers(self):
         """
@@ -490,7 +616,12 @@ class PositionExecutor(ExecutorBase):
                 position_action=PositionAction.CLOSE,
             )
             self._close_order = TrackedOrder(order_id=order_id)
-            self.logger().debug(f"Executor ID: {self.config.id} - Placing close order {order_id} --> Filled amount: {self.open_filled_amount}")
+            self.logger().debug(
+                self._log_message(
+                    f"Placing close order order_id={order_id} "
+                    f"close_type={close_type.name} filled_amount={self.open_filled_amount}"
+                )
+            )
         self.close_type = close_type
         self.close_timestamp = self._strategy.current_timestamp
         self._status = RunnableStatus.SHUTTING_DOWN
@@ -515,6 +646,12 @@ class PositionExecutor(ExecutorBase):
         """
         if self.config.triple_barrier_config.stop_loss:
             if self.net_pnl_pct <= -self.config.triple_barrier_config.stop_loss:
+                self.logger().info(
+                    self._log_message(
+                        f"Stop loss triggered net_pnl={self.net_pnl_pct:.5f} "
+                        f"threshold={self.config.triple_barrier_config.stop_loss:.5f}"
+                    )
+                )
                 self.place_close_order_and_cancel_open_orders(close_type=CloseType.STOP_LOSS)
 
     def control_take_profit(self):
@@ -539,6 +676,12 @@ class PositionExecutor(ExecutorBase):
                             not is_within_activation_bounds:
                         self.cancel_take_profit()
             elif self.net_pnl_pct >= self.config.triple_barrier_config.take_profit:
+                self.logger().info(
+                    self._log_message(
+                        f"Take profit triggered net_pnl={self.net_pnl_pct:.5f} "
+                        f"threshold={self.config.triple_barrier_config.take_profit:.5f}"
+                    )
+                )
                 self.place_close_order_and_cancel_open_orders(close_type=CloseType.TAKE_PROFIT)
 
     def control_time_limit(self):
@@ -549,6 +692,7 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         if self.is_expired:
+            self.logger().info(self._log_message("Time limit triggered"))
             self.place_close_order_and_cancel_open_orders(close_type=CloseType.TIME_LIMIT)
 
     def place_take_profit_limit_order(self):
@@ -567,7 +711,7 @@ class PositionExecutor(ExecutorBase):
             side=self.close_order_side,
         )
         self._take_profit_limit_order = TrackedOrder(order_id=order_id)
-        self.logger().debug(f"Executor ID: {self.config.id} - Placing take profit order {order_id}")
+        self.logger().debug(self._log_message(f"Placing take profit order order_id={order_id}"))
 
     def renew_take_profit_order(self):
         """
@@ -577,7 +721,7 @@ class PositionExecutor(ExecutorBase):
         """
         self.cancel_take_profit()
         self.place_take_profit_limit_order()
-        self.logger().debug("Renewing take profit order")
+        self.logger().debug(self._log_message("Renewing take profit order"))
 
     def cancel_take_profit(self):
         """
@@ -590,7 +734,9 @@ class PositionExecutor(ExecutorBase):
             trading_pair=self.config.trading_pair,
             order_id=self._take_profit_limit_order.order_id
         )
-        self.logger().debug("Removing take profit")
+        self.logger().debug(
+            self._log_message(f"Removing take profit order order_id={self._take_profit_limit_order.order_id}")
+        )
 
     def cancel_open_order(self):
         """
@@ -603,7 +749,7 @@ class PositionExecutor(ExecutorBase):
             trading_pair=self.config.trading_pair,
             order_id=self._open_order.order_id
         )
-        self.logger().debug("Removing open order")
+        self.logger().debug(self._log_message(f"Removing open order order_id={self._open_order.order_id}"))
 
     def early_stop(self, keep_position: bool = False):
         """
@@ -680,33 +826,53 @@ class PositionExecutor(ExecutorBase):
         if self._open_order and event.order_id == self._open_order.order_id:
             self._failed_orders.append(self._open_order)
             self._open_order = None
-            self.logger().error(f"Open order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
+            self.logger().error(
+                self._log_message(
+                    f"Open order failed order_id={event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
+            )
             self._current_retries += 1
         elif self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order)
             self._close_order = None
-            self.logger().error(f"Close order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
+            self.logger().error(
+                self._log_message(
+                    f"Close order failed order_id={event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
+            )
             self._current_retries += 1
         elif self._take_profit_limit_order and event.order_id == self._take_profit_limit_order.order_id:
             self._failed_orders.append(self._take_profit_limit_order)
             self._take_profit_limit_order = None
-            self.logger().error(f"Take profit order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
+            self.logger().error(
+                self._log_message(
+                    f"Take profit order failed order_id={event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
+            )
 
     def get_custom_info(self) -> Dict:
         level_id = self.config.level_id
         role = level_id if level_id in {"scout", "runner"} else None
-        return {
+        trailing_snapshot = self._trailing_status_snapshot()
+        custom_info = {
             "level_id": level_id,
             "role": role,
             "current_position_average_price": self.entry_price,
+            "entry_price": self.entry_price,
             "side": self.config.side,
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,
             "close_price": self.close_price,
+            "current_market_price": trailing_snapshot.get("trailing_current_price"),
             "open_order_last_update": self._open_order.last_update_timestamp if self._open_order else None,
             "order_ids": [order.order_id for order in [self._open_order, self._close_order, self._take_profit_limit_order] if order],
             "held_position_orders": self._held_position_orders,
         }
+        custom_info.update(trailing_snapshot)
+        return custom_info
 
     def to_format_status(self, scale=1.0):
         lines = []
@@ -715,17 +881,17 @@ class PositionExecutor(ExecutorBase):
         quote_asset = self.config.trading_pair.split("-")[1]
         if self.is_closed:
             lines.extend([f"""
-| Trading Pair: {self.config.trading_pair} | Exchange: {self.config.connector_name} | Side: {self.config.side}
-| Entry price: {self.entry_price:.6f} | Close price: {self.close_price:.6f} | Amount: {amount_in_quote:.4f} {quote_asset}
-| Realized PNL: {self.trade_pnl_quote:.6f} {quote_asset} | Total Fee: {self.cum_fees_quote:.6f} {quote_asset}
-| PNL (%): {self.net_pnl_pct * 100:.2f}% | PNL (abs): {self.net_pnl_quote:.6f} {quote_asset} | Close Type: {self.close_type}
+| 🎯 Trading Pair: {self.config.trading_pair} | 🏦 Exchange: {self.config.connector_name} | ↔️ Side: {self.config.side}
+| 📍 Entry price: {self.entry_price:.6f} | 🚪 Close price: {self.close_price:.6f} | 📦 Amount: {amount_in_quote:.4f} {quote_asset}
+| 💰 Realized PNL: {self.trade_pnl_quote:.6f} {quote_asset} | 🧾 Total Fee: {self.cum_fees_quote:.6f} {quote_asset}
+| 📊 PNL (%): {self.net_pnl_pct * 100:.2f}% | 💵 PNL (abs): {self.net_pnl_quote:.6f} {quote_asset} | 🏁 Close Type: {self.close_type}
 """])
         else:
             lines.extend([f"""
-| Trading Pair: {self.config.trading_pair} | Exchange: {self.config.connector_name} | Side: {self.config.side} |
-| Entry price: {self.entry_price:.6f} | Close price: {self.close_price:.6f} | Amount: {amount_in_quote:.4f} {quote_asset}
-| Unrealized PNL: {self.trade_pnl_quote:.6f} {quote_asset} | Total Fee: {self.cum_fees_quote:.6f} {quote_asset}
-| PNL (%): {self.net_pnl_pct * 100:.2f}% | PNL (abs): {self.net_pnl_quote:.6f} {quote_asset} | Close Type: {self.close_type}
+| 🎯 Trading Pair: {self.config.trading_pair} | 🏦 Exchange: {self.config.connector_name} | ↔️ Side: {self.config.side} |
+| 📍 Entry price: {self.entry_price:.6f} | 🚪 Close price: {self.close_price:.6f} | 📦 Amount: {amount_in_quote:.4f} {quote_asset}
+| 💹 Unrealized PNL: {self.trade_pnl_quote:.6f} {quote_asset} | 🧾 Total Fee: {self.cum_fees_quote:.6f} {quote_asset}
+| 📊 PNL (%): {self.net_pnl_pct * 100:.2f}% | 💵 PNL (abs): {self.net_pnl_quote:.6f} {quote_asset} | 🏁 Close Type: {self.close_type}
         """])
 
         if self.is_trading:
@@ -735,7 +901,7 @@ class PositionExecutor(ExecutorBase):
                 seconds_remaining = (self.end_time - self._strategy.current_timestamp)
                 time_progress = (self.config.triple_barrier_config.time_limit - seconds_remaining) / self.config.triple_barrier_config.time_limit
                 time_bar = "".join(['*' if i < time_scale * time_progress else '-' for i in range(time_scale)])
-                lines.extend([f"Time limit: {time_bar}"])
+                lines.extend([f"⏳ Time limit: {time_bar}"])
 
             if self.config.triple_barrier_config.take_profit and self.config.triple_barrier_config.stop_loss:
                 price_scale = int(scale * 60)
@@ -754,21 +920,84 @@ class PositionExecutor(ExecutorBase):
                 price_bar.append(f"TP:{take_profit_price:.5f}")
                 lines.extend(["".join(price_bar)])
             if self.config.triple_barrier_config.trailing_stop:
-                lines.extend([f"Trailing stop pnl trigger: {self._trailing_stop_trigger_pct:.5f}"])
+                trailing_snapshot = self._trailing_status_snapshot()
+                trailing_state = trailing_snapshot.get("trailing_state")
+                activation_pct = trailing_snapshot.get("trailing_activation_pct")
+                activation_price = trailing_snapshot.get("trailing_activation_price")
+                activation_gap = trailing_snapshot.get("distance_to_trailing_activation_pct")
+                trigger_pct = trailing_snapshot.get("trailing_stop_trigger_pct")
+                trigger_price = trailing_snapshot.get("trailing_trigger_price")
+                trigger_gap = trailing_snapshot.get("distance_to_trailing_trigger_pct")
+                move_count = trailing_snapshot.get("trailing_move_count", 0)
+                lines.extend([
+                    "🧵 Trailing stop: "
+                    f"{trailing_state} | "
+                    f"arm {self._fmt_decimal(activation_pct)} @ {self._fmt_decimal(activation_price)} | "
+                    f"delta {self._fmt_decimal(trailing_snapshot.get('trailing_delta_pct'))}"
+                ])
+                if trailing_state in ("pending", "waiting"):
+                    lines.extend([
+                        f"🧵 Trailing distance to arm: {self._fmt_decimal(activation_gap * Decimal('100') if activation_gap is not None else None, 2)}%"
+                    ])
+                else:
+                    lines.extend([
+                        "🧵 Trailing trigger: "
+                        f"{self._fmt_decimal(trigger_pct)} @ {self._fmt_decimal(trigger_price)} | "
+                        f"buffer {self._fmt_decimal(trigger_gap * Decimal('100') if trigger_gap is not None else None, 2)}% | "
+                        f"moves {move_count}"
+                    ])
             lines.extend(["-----------------------------------------------------------------------------------------------------------"])
         return lines
 
     def control_trailing_stop(self):
         if self.config.triple_barrier_config.trailing_stop:
             net_pnl_pct = self.get_net_pnl_pct()
-            if not self._trailing_stop_trigger_pct:
+            if self._trailing_stop_trigger_pct is None:
                 if net_pnl_pct > self.config.triple_barrier_config.trailing_stop.activation_price:
                     self._trailing_stop_trigger_pct = net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
+                    self._trailing_stop_move_count = 0
+                    self._trailing_stop_armed_timestamp = self._strategy.current_timestamp
+                    self._trailing_stop_last_update_timestamp = self._strategy.current_timestamp
+                    trailing_snapshot = self._trailing_status_snapshot()
+                    self.logger().info(
+                        self._log_message(
+                            f"Trailing stop armed activation={self.config.triple_barrier_config.trailing_stop.activation_price:.5f} "
+                            f"activation_price={self._fmt_decimal(trailing_snapshot.get('trailing_activation_price'))} "
+                            f"delta={self.config.triple_barrier_config.trailing_stop.trailing_delta:.5f} "
+                            f"trigger={self._trailing_stop_trigger_pct:.5f} "
+                            f"trigger_price={self._fmt_decimal(trailing_snapshot.get('trailing_trigger_price'))} "
+                            f"current_price={self._fmt_decimal(trailing_snapshot.get('trailing_current_price'))} "
+                            f"net_pnl={net_pnl_pct:.5f}"
+                        )
+                    )
             else:
                 if net_pnl_pct < self._trailing_stop_trigger_pct:
+                    trailing_snapshot = self._trailing_status_snapshot()
+                    self.logger().info(
+                        self._log_message(
+                            f"Trailing stop triggered trigger={self._trailing_stop_trigger_pct:.5f} "
+                            f"trigger_price={self._fmt_decimal(trailing_snapshot.get('trailing_trigger_price'))} "
+                            f"current_price={self._fmt_decimal(trailing_snapshot.get('trailing_current_price'))} "
+                            f"net_pnl={net_pnl_pct:.5f}"
+                        )
+                    )
                     self.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
-                if net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta > self._trailing_stop_trigger_pct:
-                    self._trailing_stop_trigger_pct = net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
+                new_trigger = net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
+                if new_trigger > self._trailing_stop_trigger_pct:
+                    previous_trigger = self._trailing_stop_trigger_pct
+                    previous_trigger_price = self._price_for_net_pnl_pct(previous_trigger)
+                    self._trailing_stop_trigger_pct = new_trigger
+                    self._trailing_stop_move_count += 1
+                    self._trailing_stop_last_update_timestamp = self._strategy.current_timestamp
+                    trailing_snapshot = self._trailing_status_snapshot()
+                    self.logger().info(
+                        self._log_message(
+                            f"Trailing stop moved trigger={previous_trigger:.5f}->{self._trailing_stop_trigger_pct:.5f} "
+                            f"trigger_price={self._fmt_decimal(previous_trigger_price)}->{self._fmt_decimal(trailing_snapshot.get('trailing_trigger_price'))} "
+                            f"current_price={self._fmt_decimal(trailing_snapshot.get('trailing_current_price'))} "
+                            f"net_pnl={net_pnl_pct:.5f} moves={self._trailing_stop_move_count}"
+                        )
+                    )
 
     async def validate_sufficient_balance(self):
         if self.is_perpetual:
@@ -793,7 +1022,7 @@ class PositionExecutor(ExecutorBase):
         adjusted_order_candidates = self.adjust_order_candidates(self.config.connector_name, [order_candidate])
         if adjusted_order_candidates[0].amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
+            self.logger().error(self._log_message("Not enough budget to open position"))
             self.stop()
 
     async def _sleep(self, delay: float):

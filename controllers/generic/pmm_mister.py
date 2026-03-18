@@ -681,6 +681,7 @@ class PMMister(ControllerBase):
         status.append("╒" + "═" * inner_width + "╕")
 
         header_line = (
+            f"🤖 "
             f"{self.config.connector_name}:{self.config.trading_pair} @ {current_price:.2f}  "
             f"Alloc: {self.config.portfolio_allocation:.1%}  "
             f"Spread×{self.processed_data['spread_multiplier']:.3f}  "

@@ -138,6 +138,27 @@ class ExecutorBase(RunnableBase):
         """
         return {}
 
+    def _log_context(self) -> str:
+        parts = [f"executor={self.config.id}"]
+        controller_id = getattr(self.config, "controller_id", None)
+        connector_name = getattr(self.config, "connector_name", None)
+        trading_pair = getattr(self.config, "trading_pair", None)
+        side = getattr(self.config, "side", None)
+
+        if controller_id:
+            parts.append(f"controller={controller_id}")
+        if connector_name:
+            parts.append(f"connector={connector_name}")
+        if trading_pair:
+            parts.append(f"pair={trading_pair}")
+        if side is not None:
+            side_value = side.name if hasattr(side, "name") else side
+            parts.append(f"side={side_value}")
+        return " ".join(parts)
+
+    def _log_message(self, message: str) -> str:
+        return f"{message} | {self._log_context()}"
+
     @staticmethod
     def is_perpetual_connector(connector_name: str):
         """

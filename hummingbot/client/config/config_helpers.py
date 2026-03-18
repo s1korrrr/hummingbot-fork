@@ -607,6 +607,13 @@ def read_yml_file(yml_path: Path) -> Dict[str, Any]:
     return dict(data)
 
 
+def _split_client_config_data(config_data: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    valid_keys = set(ClientConfigMap.model_fields.keys())
+    ignored_keys = sorted(key for key in config_data if key not in valid_keys)
+    filtered_config_data = {key: value for key, value in config_data.items() if key in valid_keys}
+    return filtered_config_data, ignored_keys
+
+
 def get_strategy_pydantic_config_cls(strategy_name: str):
     pydantic_cm_class = None
     try:
@@ -651,7 +658,14 @@ def load_client_config_map_from_file() -> ClientConfigAdapter:
         config_data = read_yml_file(yml_path)
     else:
         config_data = {}
-    client_config = ClientConfigMap(**config_data)
+    filtered_config_data, ignored_keys = _split_client_config_data(config_data)
+    if ignored_keys:
+        logging.getLogger().warning(
+            "Ignoring deprecated/unknown client config keys from %s: %s",
+            yml_path,
+            ", ".join(ignored_keys),
+        )
+    client_config = ClientConfigMap(**filtered_config_data)
     config_map = ClientConfigAdapter(client_config)
     save_to_yml(yml_path, config_map)
     return config_map

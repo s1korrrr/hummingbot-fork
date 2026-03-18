@@ -1,4 +1,5 @@
 import asyncio
+import types
 import unittest
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -7,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pandas as pd
 
+import hummingbot.strategy.strategy_v2_base as strategy_v2_base_module
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
 from hummingbot.core.clock import Clock
@@ -15,6 +17,7 @@ from hummingbot.core.data_type.common import PositionMode, TradeType
 from hummingbot.core.event.events import OrderType
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
@@ -23,6 +26,29 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo, Performan
 
 
 class MockScriptStrategy(StrategyV2Base):
+    pass
+
+
+class DummyReloadControllerBase(ControllerBase):
+    def __init__(self, config, market_data_provider, actions_queue):
+        super().__init__(config, market_data_provider, actions_queue)
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+        self._status = RunnableStatus.RUNNING
+
+    def stop(self):
+        self.stop_calls += 1
+        self._status = RunnableStatus.TERMINATED
+
+
+class DummyReloadControllerV1(DummyReloadControllerBase):
+    pass
+
+
+class DummyReloadControllerV2(DummyReloadControllerBase):
     pass
 
 
@@ -179,11 +205,18 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
     async def test_on_stop(self):
         # Make the executor orchestrator stop method async
         self.strategy.executor_orchestrator.stop = AsyncMock()
+        self.strategy.controllers["controller_1"].config = MagicMock()
+        self.strategy.controllers["controller_1"].config.early_stop_keep_position = True
+        self.strategy.controllers["controller_2"].config = MagicMock()
+        self.strategy.controllers["controller_2"].config.early_stop_keep_position = False
 
         await self.strategy.on_stop()
 
         # Check if stop methods are called on each component
-        self.strategy.executor_orchestrator.stop.assert_called_once()
+        self.strategy.executor_orchestrator.stop.assert_called_once_with(
+            self.strategy.max_executors_close_attempts,
+            keep_position_by_controller={"controller_1": True, "controller_2": False},
+        )
         self.strategy.market_data_provider.stop.assert_called_once()
 
         # Check if stop is called on each controller
@@ -222,6 +255,69 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         test_input = "binance.JASMY-USDT.1m.invalid"
         with self.assertRaises(ValueError):
             StrategyV2ConfigBase.parse_candles_config_str(test_input)
+
+    def test_load_controller_module_reloads_when_source_changes(self):
+        mock_module = types.ModuleType("test_controller_module")
+        mock_module.__file__ = "/tmp/rsi_v5.py"
+
+        with patch.object(strategy_v2_base_module.importlib, "import_module", return_value=mock_module):
+            with patch.object(strategy_v2_base_module.importlib, "reload", return_value=mock_module) as mock_reload:
+                with patch.object(strategy_v2_base_module.inspect, "getsourcefile", return_value="/tmp/rsi_v5.py"):
+                    with patch.object(strategy_v2_base_module.os.path, "exists", return_value=True):
+                        with patch.object(strategy_v2_base_module.os.path, "getmtime", side_effect=[10, 20]):
+                            self.strategy_config._load_controller_module("controllers.directional_trading.rsi_v5")
+                            self.strategy_config._load_controller_module(
+                                "controllers.directional_trading.rsi_v5",
+                                reload_changed_modules=True,
+                            )
+
+        mock_reload.assert_called_once_with(mock_module)
+
+    def test_update_controllers_configs_contains_reload_errors(self):
+        mock_logger = MagicMock()
+        self.strategy.config_update_interval = 0
+
+        with patch.object(StrategyV2Base, "logger", return_value=mock_logger):
+            with patch.object(StrategyV2ConfigBase, "load_controller_configs", side_effect=ValueError("boom")):
+                with patch.object(type(self.strategy), "current_timestamp", new_callable=PropertyMock) as mock_timestamp:
+                    mock_timestamp.return_value = 100
+                    self.strategy.update_controllers_configs()
+                    self.strategy.update_controllers_configs()
+
+        self.assertEqual(self.strategy._last_controller_reload_error, "ValueError: boom")
+        mock_logger.error.assert_called_once()
+
+    def test_update_controllers_configs_replaces_controller_when_class_changes(self):
+        self.strategy.config_update_interval = 0
+        self.strategy._controllers_started = True
+        current_controller = DummyReloadControllerV1(
+            config=MagicMock(id="controller_1"),
+            market_data_provider=self.strategy.market_data_provider,
+            actions_queue=self.strategy.actions_queue,
+        )
+        current_controller.executors_info = [MagicMock(name="executor")]
+        current_controller.positions_held = [MagicMock(name="position")]
+        current_controller.performance_report = MagicMock(name="performance")
+        current_controller.processed_data = {"signal": 1, "note": "existing"}
+        self.strategy.controllers = {"controller_1": current_controller}
+
+        replacement_config = MagicMock()
+        replacement_config.id = "controller_1"
+        replacement_config.get_controller_class.return_value = DummyReloadControllerV2
+
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=[replacement_config]):
+            with patch.object(type(self.strategy), "current_timestamp", new_callable=PropertyMock) as mock_timestamp:
+                mock_timestamp.return_value = 100
+                self.strategy.update_controllers_configs()
+
+        replacement_controller = self.strategy.controllers["controller_1"]
+        self.assertIsInstance(replacement_controller, DummyReloadControllerV2)
+        self.assertEqual(current_controller.stop_calls, 1)
+        self.assertEqual(replacement_controller.start_calls, 1)
+        self.assertEqual(replacement_controller.executors_info, current_controller.executors_info)
+        self.assertEqual(replacement_controller.positions_held, current_controller.positions_held)
+        self.assertEqual(replacement_controller.performance_report, current_controller.performance_report)
+        self.assertEqual(replacement_controller.processed_data, current_controller.processed_data)
 
     def create_mock_executor_config(self):
         return MagicMock(
@@ -267,7 +363,19 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             filled_amount_quote=Decimal(0),
             is_active=True,
             is_trading=True,
-            custom_info={}
+            custom_info={
+                "level_id": "entry_1",
+                "current_retries": 1,
+                "max_retries": 3,
+                "order_ids": ["OID-1", "OID-2"],
+                "held_position_orders": [{"order_id": "HP-1"}],
+                "current_position_average_price": Decimal("101"),
+                "trailing_state": "armed",
+                "trailing_move_count": 1,
+                "trailing_activation_price": Decimal("104.7"),
+                "trailing_trigger_price": Decimal("102.3"),
+                "distance_to_trailing_trigger_pct": Decimal("0.018"),
+            }
         )
 
         executors_info = [executor_1, executor_2]
@@ -276,27 +384,46 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         # Assertions to validate the DataFrame structure and content
         self.assertIsInstance(df, pd.DataFrame)
         self.assertEqual(len(df), 2)
-        self.assertEqual(list(df.columns),
-                         ['id',
-                          'timestamp',
-                          'type',
-                          'status',
-                          'config',
-                          'net_pnl_pct',
-                          'net_pnl_quote',
-                          'cum_fees_quote',
-                          'filled_amount_quote',
-                          'is_active',
-                          'is_trading',
-                          'custom_info',
-                          'close_timestamp',
-                          'close_type',
-                          'controller_id',
-                          'side'])
+        self.assertTrue({
+            "id",
+            "timestamp",
+            "type",
+            "status",
+            "config",
+            "net_pnl_pct",
+            "net_pnl_quote",
+            "cum_fees_quote",
+            "filled_amount_quote",
+            "is_active",
+            "is_trading",
+            "custom_info",
+            "close_timestamp",
+            "close_type",
+            "controller_id",
+            "side",
+            "level",
+            "retries",
+            "order_ref",
+            "held_orders",
+            "avg_entry",
+            "trail",
+            "trail_arm",
+            "trail_stop",
+            "trail_gap",
+        }.issubset(df.columns))
         self.assertEqual(df.iloc[0]['id'], '2')  # Since the dataframe is sorted by status
         self.assertEqual(df.iloc[1]['id'], '1')
         self.assertEqual(df.iloc[0]['status'], RunnableStatus.RUNNING)
         self.assertEqual(df.iloc[1]['status'], RunnableStatus.TERMINATED)
+        self.assertEqual(df.iloc[0]["level"], "entry_1")
+        self.assertEqual(df.iloc[0]["retries"], "1/3")
+        self.assertEqual(df.iloc[0]["held_orders"], 1)
+        self.assertEqual(df.iloc[0]["avg_entry"], Decimal("101"))
+        self.assertEqual(df.iloc[0]["trail"], "armed/1")
+        self.assertEqual(df.iloc[0]["trail_arm"], "104.700000")
+        self.assertEqual(df.iloc[0]["trail_stop"], "102.300000")
+        self.assertEqual(df.iloc[0]["trail_gap"], "1.80%")
+        self.assertIn("OID-1", df.iloc[0]["order_ref"])
 
     def create_mock_performance_report(self):
         return PerformanceReport(
@@ -314,6 +441,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         # Mock dependencies
         self.strategy.ready_to_trade = True
         self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
         controller_mock = MagicMock()
         controller_mock.to_format_status.return_value = ["Mock status for controller"]
         self.strategy.controllers = {"controller_1": controller_mock}
@@ -351,6 +479,59 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertIn("$100.00", status)  # Check for performance data in the summary table
         self.assertIn("$50.00", status)
         self.assertIn("$150.00", status)
+
+    def test_format_status_handles_controller_formatter_exception(self):
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+        controller_mock = MagicMock()
+        controller_mock.to_format_status.side_effect = RuntimeError("formatter exploded")
+        self.strategy.controllers = {"controller_1": controller_mock}
+
+        mock_report_controller_1 = MagicMock()
+        mock_report_controller_1.realized_pnl_quote = Decimal("0")
+        mock_report_controller_1.unrealized_pnl_quote = Decimal("0")
+        mock_report_controller_1.global_pnl_quote = Decimal("0")
+        mock_report_controller_1.global_pnl_pct = Decimal("0")
+        mock_report_controller_1.volume_traded = Decimal("1")
+        mock_report_controller_1.close_type_counts = {}
+
+        mock_executor = ExecutorInfo(
+            id="12312", timestamp=1234567890, status=RunnableStatus.RUNNING,
+            config=self.get_position_config_market_short(), net_pnl_pct=Decimal(0), net_pnl_quote=Decimal(0),
+            cum_fees_quote=Decimal(0), filled_amount_quote=Decimal(0), is_active=True, is_trading=True,
+            custom_info={
+                "level_id": "entry_2",
+                "current_retries": 0,
+                "max_retries": 5,
+                "order_ids": ["OID-1", "OID-2"],
+                "trailing_state": "waiting",
+                "trailing_activation_price": Decimal("96.2"),
+                "distance_to_trailing_activation_pct": Decimal("0.021"),
+            },
+            type="position_executor", controller_id="controller_1", close_type=CloseType.EARLY_STOP)
+
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [mock_executor],
+                "positions": [],
+                "performance": mock_report_controller_1
+            }
+        }
+
+        status = self.strategy.format_status()
+
+        self.assertIn("Status formatter error for `controller_1`", status)
+        self.assertIn("Controller-specific status is unavailable", status)
+        self.assertIn("🕘 Recent Executors (Last 3):", status)
+        self.assertIn("1. 🔴 SELL position | 🟢 running | 🧯 early-stop", status)
+        self.assertIn("💰 PnL 0.00% / $0", status)
+        self.assertIn("🎯 Entry 100", status)
+        self.assertIn("🪜 Level entry_2", status)
+        self.assertIn("🧵 Trail waiting", status)
+        self.assertIn("🚀 Arm 96.2", status)
+        self.assertIn("↔ Gap 2.10%", status)
+        self.assertIn("🏷 Refs OID-1, OID-2", status)
 
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()

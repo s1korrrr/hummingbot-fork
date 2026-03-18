@@ -257,8 +257,6 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         ]
 
         status = "\n".join(controller.to_format_status())
-        self.assertIn("📊 RSI v5 Signal Distance", status)
-        self.assertIn("pair=ETH-USDC", status)
         self.assertIn("🟢 BUY  [", status)
         self.assertIn("setup=armed", status)
         self.assertIn("rebound=1.04/1.00", status)

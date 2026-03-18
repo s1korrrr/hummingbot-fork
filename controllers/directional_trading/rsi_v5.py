@@ -1987,11 +1987,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         mid_price = self._get_mid_price()
         rsi = indicators.get("rsi")
         cost_basis = indicators.get("cost_basis")
-        regime_label = processed.get("regime")
         current_signal = processed.get("signal", 0)
         rsi_buy = thresholds.get("rsi_buy", self.config.rsi_buy_threshold)
         rsi_sell = thresholds.get("rsi_sell", self.config.rsi_sell_threshold)
-        summary = self.get_status_summary()
         last_close = state.get("close")
         signal_score = int(state.get("signal_score", 0) or 0)
         raw_reversal = bool(state.get("rsi_reversal"))
@@ -2006,11 +2004,6 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         ) or self._get_total_position_value_usd() > 0
 
         rsi_window = max(6.0, min(15.0, abs(float(rsi_sell) - float(rsi_buy)) * 0.35))
-        header = (
-            f"📊 RSI v5 Signal Distance | controller={self.config.id} | pair={self.config.trading_pair} | "
-            f"state={summary.get('state', 'n/a')} | price={self._fmt(mid_price, 6)} | "
-            f"rsi={self._fmt(rsi, 2)} | regime={self._short_regime_label(regime_label)}"
-        )
         buy_line = self._buy_signal_status_line(
             current_signal=current_signal,
             last_rsi=rsi,
@@ -2031,4 +2024,4 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             cost_basis=Decimal(str(cost_basis)) if cost_basis is not None else None,
             mid_price=mid_price,
         )
-        return [header, buy_line, sell_line]
+        return [buy_line, sell_line]

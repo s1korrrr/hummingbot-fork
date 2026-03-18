@@ -64,7 +64,8 @@ fi
 
 if [[ ! -z "$CONFIG" ]]; then
     if [[ $CONFIG == *.yml ]]; then
-        CMD="$CMD -c \"$CONFIG\""
+        echo "WARNING: '-c' is deprecated for V2 script configs. Forwarding as '--v2 $CONFIG'."
+        CMD="$CMD --v2 \"$CONFIG\""
     else
         echo "Error: Config file must be a .yml file."
         exit 3

@@ -192,9 +192,9 @@ class QuantumGridAllocator(ControllerBase):
         status_lines = []
         total_value = self.metrics.get("total_portfolio_value", Decimal("0"))
         # Portfolio Status
-        status_lines.append(f"Total Portfolio Value: ${total_value:,.2f}")
+        status_lines.append(f"💼 Total Portfolio Value: ${total_value:,.2f}")
         status_lines.append("")
-        status_lines.append("Portfolio Status:")
+        status_lines.append("📊 Portfolio Status:")
         status_lines.append("-" * 80)
         status_lines.append(
             f"{'Asset':<8} | "
@@ -235,7 +235,7 @@ class QuantumGridAllocator(ControllerBase):
         active_grids = self.get_active_grids_by_asset()
         if active_grids:
             status_lines.append("")
-            status_lines.append("Active Grids:")
+            status_lines.append("🧱 Active Grids:")
             status_lines.append("-" * 140)
             status_lines.append(
                 f"{'Asset':<8} {'Side':<6} | "

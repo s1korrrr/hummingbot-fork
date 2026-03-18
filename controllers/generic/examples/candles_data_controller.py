@@ -127,7 +127,7 @@ class CandlesDataController(ControllerBase):
     def to_format_status(self) -> List[str]:
         lines = []
         lines.extend(["\n" + "=" * 100])
-        lines.extend(["                              CANDLES DATA CONTROLLER"])
+        lines.extend(["                              🕯️ CANDLES DATA CONTROLLER"])
         lines.extend(["=" * 100])
 
         if self.all_candles_ready:
@@ -151,7 +151,7 @@ class CandlesDataController(ControllerBase):
                     candles_df["timestamp"] = pd.to_datetime(candles_df["timestamp"], unit="s")
 
                     # Display candles info
-                    lines.extend([f"\n[{i + 1}] {candle_config.connector.upper()} | {candle_config.trading_pair} | {candle_config.interval}"])
+                    lines.extend([f"\n[🕯️ {i + 1}] {candle_config.connector.upper()} | {candle_config.trading_pair} | {candle_config.interval}"])
                     lines.extend(["-" * 80])
 
                     # Show last 5 rows with basic columns (OHLC + volume)

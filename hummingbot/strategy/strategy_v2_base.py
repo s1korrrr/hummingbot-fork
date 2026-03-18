@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 import numpy as np
 import pandas as pd
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 from hummingbot.client import settings
 from hummingbot.client.config.config_data_types import BaseClientModel
@@ -82,6 +82,7 @@ class StrategyV2ConfigBase(BaseClientModel):
             "prompt_on_new": True,
         }
     )
+    _controller_module_mtimes: Dict[str, float] = PrivateAttr(default_factory=dict)
 
     @field_validator("controllers_config", mode="before")
     @classmethod
@@ -95,7 +96,33 @@ class StrategyV2ConfigBase(BaseClientModel):
             return []
         return v
 
-    def load_controller_configs(self):
+    def _load_controller_module(self, module_path: str, reload_changed_modules: bool = False):
+        module = importlib.import_module(module_path)
+        try:
+            module_file = inspect.getsourcefile(module)
+        except TypeError:
+            module_file = None
+        module_file = module_file or getattr(module, "__file__", None)
+        if module_file is not None and module_file.endswith(".pyc"):
+            module_file = module_file[:-1]
+
+        current_mtime = None
+        if module_file is not None and os.path.exists(module_file):
+            current_mtime = os.path.getmtime(module_file)
+            previous_mtime = self._controller_module_mtimes.get(module_path)
+            if (
+                reload_changed_modules
+                and previous_mtime is not None
+                and current_mtime > previous_mtime
+            ):
+                module = importlib.reload(module)
+
+        if current_mtime is not None:
+            self._controller_module_mtimes[module_path] = current_mtime
+
+        return module
+
+    def load_controller_configs(self, reload_changed_modules: bool = False):
         loaded_configs = []
         for config_path in self.controllers_config:
             full_path = os.path.join(settings.CONTROLLERS_CONF_DIR_PATH, config_path)
@@ -109,7 +136,10 @@ class StrategyV2ConfigBase(BaseClientModel):
                 raise ValueError(f"Missing controller_type or controller_name in {config_path}")
 
             module_path = f"{settings.CONTROLLERS_MODULE}.{controller_type}.{controller_name}"
-            module = importlib.import_module(module_path)
+            module = self._load_controller_module(
+                module_path=module_path,
+                reload_changed_modules=reload_changed_modules,
+            )
 
             config_class = next((member for member_name, member in inspect.getmembers(module)
                                  if inspect.isclass(member) and member not in [ControllerConfigBase,
@@ -271,6 +301,8 @@ class StrategyV2Base(StrategyPyBase):
         self.controller_reports: Dict[str, Dict] = {}
         self.market_data_provider = MarketDataProvider(connectors)
         self._is_stop_triggered = False
+        self._controllers_started = False
+        self._last_controller_reload_error: Optional[str] = None
         self.mqtt_enabled = False
         self._pub: Optional[ETopicPublisher] = None
 
@@ -326,6 +358,7 @@ class StrategyV2Base(StrategyPyBase):
         Called when the strategy is stopped. Shuts down controllers, executors, and market data provider.
         """
         self._is_stop_triggered = True
+        self._controllers_started = False
 
         # Stop controllers FIRST to prevent new executor actions
         for controller in self.controllers.values():
@@ -333,12 +366,32 @@ class StrategyV2Base(StrategyPyBase):
 
         if self.listen_to_executor_actions_task:
             self.listen_to_executor_actions_task.cancel()
-        await self.executor_orchestrator.stop(self.max_executors_close_attempts)
+        keep_position_by_controller = self._shutdown_keep_position_preferences()
+        await self.executor_orchestrator.stop(
+            self.max_executors_close_attempts,
+            keep_position_by_controller=keep_position_by_controller,
+        )
         self.market_data_provider.stop()
         self.executor_orchestrator.store_all_executors()
         if self.mqtt_enabled:
             self._pub({controller_id: {} for controller_id in self.controllers.keys()})
             self._pub = None
+
+    def _shutdown_keep_position_preferences(self) -> Dict[str, bool]:
+        preferences: Dict[str, bool] = {}
+        for controller_id, controller in self.controllers.items():
+            config = getattr(controller, "config", None)
+            keep_position = False
+            for attr_name in ("early_stop_keep_position", "keep_position"):
+                attr_value = getattr(config, attr_name, None)
+                if isinstance(attr_value, bool):
+                    keep_position = attr_value
+                    break
+            preferences[controller_id] = keep_position
+            self.logger().info(
+                f"Shutdown preference | controller={controller_id} keep_position={keep_position}"
+            )
+        return preferences
 
     def buy(self,
             connector_name: str,
@@ -495,34 +548,45 @@ class StrategyV2Base(StrategyPyBase):
         if self.controllers:
             # Controller sections
             performance_data = []
+            controller_entries = self._build_controller_status_entries()
+            lines.extend(self._controller_summary_lines(controller_entries))
+            lines.extend(self._controller_attention_lines(controller_entries))
 
-            for controller_id, controller in self.controllers.items():
+            for entry in controller_entries:
+                controller_id = entry["controller_id"]
+                controller = entry["controller"]
+                controller_summary = entry["summary"]
+                executors_list = entry["executors"]
+                positions = entry["positions"]
+                performance_report = entry["performance"]
+
                 lines.append(f"\n{'=' * 60}")
-                lines.append(f"Controller: {controller_id}")
+                lines.append(self._controller_section_header(entry))
                 lines.append(f"{'=' * 60}")
+                if controller_summary.get("note") not in ("", "monitoring"):
+                    lines.append(
+                        f"Focus: {controller_summary.get('note')} | "
+                        f"Exposure {controller_summary.get('exposure', 'n/a')} | "
+                        f"Gate {controller_summary.get('gate', 'n/a')}"
+                    )
 
                 # Controller status
-                lines.extend(controller.to_format_status())
+                try:
+                    lines.extend(controller.to_format_status())
+                except Exception as e:
+                    self.logger().error(f"Error formatting status for controller {controller_id}: {e}", exc_info=True)
+                    lines.extend(self._controller_status_error_lines(controller_id, e))
 
-                # Last 6 executors table
-                executors_list = self.get_executors_by_controller(controller_id)
+                # Recent executors table
                 if executors_list:
-                    lines.append("\n  Recent Executors (Last 3):")
-                    # Sort by timestamp and take last 6
+                    lines.append("\n  🕘 Recent Executors (Last 3):")
+                    # Sort by timestamp and take the most recent rows
                     recent_executors = sorted(executors_list, key=lambda x: x.timestamp, reverse=True)[:3]
-                    executors_df = self.executors_info_to_df(recent_executors)
-                    if not executors_df.empty:
-                        executors_df["age"] = self.current_timestamp - executors_df["timestamp"]
-                        executor_columns = ["type", "side", "status", "net_pnl_pct", "net_pnl_quote",
-                                            "filled_amount_quote", "is_trading", "close_type", "age"]
-                        available_columns = [col for col in executor_columns if col in executors_df.columns]
-                        lines.append(format_df_for_printout(executors_df[available_columns],
-                                                            table_format="psql", index=False))
+                    lines.extend(self._format_recent_executor_lines(recent_executors))
                 else:
                     lines.append("  No executors found.")
 
                 # Positions table
-                positions = self.get_positions_by_controller(controller_id)
                 if positions:
                     lines.append("\n  Positions Held:")
                     positions_data = []
@@ -544,7 +608,6 @@ class StrategyV2Base(StrategyPyBase):
                     lines.append("  No positions held.")
 
                 # Collect performance data for summary table
-                performance_report = self.get_performance_report(controller_id)
                 if performance_report:
                     performance_data.append({
                         "Controller": controller_id,
@@ -626,6 +689,7 @@ class StrategyV2Base(StrategyPyBase):
         # Start controllers
         for controller in self.controllers.values():
             controller.start()
+        self._controllers_started = True
 
     def apply_initial_setting(self):
         """
@@ -669,8 +733,44 @@ class StrategyV2Base(StrategyPyBase):
                 config.id = generate_unique_id()
             controller = config.get_controller_class()(config, self.market_data_provider, self.actions_queue)
             self.controllers[config.id] = controller
+            if self._controllers_started:
+                controller.start()
         except Exception as e:
             self.logger().error(f"Error adding controller: {e}", exc_info=True)
+
+    @staticmethod
+    def _copy_controller_runtime_state(source_controller: ControllerBase, target_controller: ControllerBase):
+        target_controller.executors_info = list(source_controller.executors_info)
+        target_controller.positions_held = list(source_controller.positions_held)
+        target_controller.performance_report = source_controller.performance_report
+        source_processed = source_controller.processed_data
+        if isinstance(source_processed, dict):
+            target_controller.processed_data = dict(source_processed)
+        else:
+            target_controller.processed_data = source_processed
+        target_controller.executors_update_event.set()
+
+    def _replace_controller(self, controller_config: ControllerConfigBase):
+        current_controller = self.controllers.get(controller_config.id)
+        if current_controller is None:
+            self.add_controller(controller_config)
+            return
+
+        replacement_class = controller_config.get_controller_class()
+        replacement_controller = replacement_class(controller_config, self.market_data_provider, self.actions_queue)
+        self._copy_controller_runtime_state(current_controller, replacement_controller)
+
+        current_controller.stop()
+        self.controllers[controller_config.id] = replacement_controller
+        if self._controllers_started:
+            replacement_controller.start()
+
+        self.logger().info(
+            "Reloaded controller implementation | "
+            f"controller={controller_config.id} "
+            f"old_class={current_controller.__class__.__name__} "
+            f"new_class={replacement_class.__name__}"
+        )
 
     def update_controllers_configs(self):
         """
@@ -680,12 +780,27 @@ class StrategyV2Base(StrategyPyBase):
             return
         if self._last_config_update_ts + self.config_update_interval < self.current_timestamp:
             self._last_config_update_ts = self.current_timestamp
-            controllers_configs = self.config.load_controller_configs()
-            for controller_config in controllers_configs:
-                if controller_config.id in self.controllers:
-                    self.controllers[controller_config.id].update_config(controller_config)
-                else:
-                    self.add_controller(controller_config)
+            try:
+                controllers_configs = self.config.load_controller_configs(reload_changed_modules=True)
+                for controller_config in controllers_configs:
+                    current_controller = self.controllers.get(controller_config.id)
+                    if current_controller is None:
+                        self.add_controller(controller_config)
+                        continue
+
+                    if current_controller.__class__ is not controller_config.get_controller_class():
+                        self._replace_controller(controller_config)
+                    else:
+                        current_controller.update_config(controller_config)
+
+                if self._last_controller_reload_error is not None:
+                    self.logger().info("Controller config reload recovered.")
+                    self._last_controller_reload_error = None
+            except Exception as e:
+                error_label = f"{type(e).__name__}: {e}"
+                if error_label != self._last_controller_reload_error:
+                    self.logger().error(f"Controller config reload failed: {error_label}", exc_info=True)
+                    self._last_controller_reload_error = error_label
 
     async def listen_to_executor_actions(self):
         """
@@ -778,6 +893,438 @@ class StrategyV2Base(StrategyPyBase):
         """Get performance report for a specific controller."""
         return self.controller_reports.get(controller_id, {}).get("performance")
 
+    def _safe_controller_status_summary(self, controller_id: str, controller: ControllerBase) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {}
+        try:
+            summary = controller.get_status_summary() or {}
+        except Exception as e:
+            self.logger().error(f"Error building status summary for controller {controller_id}: {e}", exc_info=True)
+
+        config = getattr(controller, "config", None)
+        trading_pair = summary.get("pair") or getattr(config, "trading_pair", None) or controller_id
+        normalized_summary = {
+            "controller_id": controller_id,
+            "pair": trading_pair,
+            "state": summary.get("state", "n/a"),
+            "signal": summary.get("signal", "n/a"),
+            "score": summary.get("score", "n/a"),
+            "regime": summary.get("regime", "n/a"),
+            "exposure": summary.get("exposure", "n/a"),
+            "execs": summary.get("execs", "n/a"),
+            "u_pnl": summary.get("u_pnl", "n/a"),
+            "gate": summary.get("gate", "n/a"),
+            "note": summary.get("note", ""),
+            "attention_score": summary.get("attention_score", 0),
+        }
+        return normalized_summary
+
+    def _build_controller_status_entries(self) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for controller_id, controller in self.controllers.items():
+            entries.append({
+                "controller_id": controller_id,
+                "controller": controller,
+                "summary": self._safe_controller_status_summary(controller_id, controller),
+                "executors": self.get_executors_by_controller(controller_id),
+                "positions": self.get_positions_by_controller(controller_id),
+                "performance": self.get_performance_report(controller_id),
+            })
+        entries.sort(
+            key=lambda entry: (
+                -int(entry["summary"].get("attention_score", 0)),
+                str(entry["summary"].get("pair", entry["controller_id"])),
+                entry["controller_id"],
+            )
+        )
+        return entries
+
+    @staticmethod
+    def _controller_summary_lines(controller_entries: List[Dict[str, Any]]) -> List[str]:
+        if len(controller_entries) == 0:
+            return []
+
+        summary_rows = []
+        for entry in controller_entries:
+            summary = entry["summary"]
+            summary_rows.append({
+                "pair": summary.get("pair", entry["controller_id"]),
+                "state": summary.get("state", "n/a"),
+                "signal": summary.get("signal", "n/a"),
+                "score": summary.get("score", "n/a"),
+                "regime": summary.get("regime", "n/a"),
+                "exposure": summary.get("exposure", "n/a"),
+                "execs": summary.get("execs", "n/a"),
+                "uPnL": summary.get("u_pnl", "n/a"),
+                "gate": summary.get("gate", "n/a"),
+                "note": summary.get("note", ""),
+            })
+
+        summary_df = pd.DataFrame(summary_rows)
+        return [
+            f"\n{'=' * 110}",
+            "CONTROLLERS SUMMARY",
+            f"{'=' * 110}",
+            format_df_for_printout(summary_df, table_format="psql", index=False),
+        ]
+
+    @staticmethod
+    def _controller_attention_lines(controller_entries: List[Dict[str, Any]]) -> List[str]:
+        attention_entries = [
+            entry
+            for entry in controller_entries
+            if int(entry["summary"].get("attention_score", 0)) > 0
+            and entry["summary"].get("note") not in ("", "monitoring")
+        ]
+        if len(attention_entries) == 0:
+            return []
+
+        lines = ["", "Priority Queue:"]
+        for entry in attention_entries[:5]:
+            summary = entry["summary"]
+            lines.append(
+                f"  • {summary.get('pair', entry['controller_id'])} | "
+                f"{summary.get('state', 'n/a')} | {summary.get('note', '')}"
+            )
+        return lines
+
+    @staticmethod
+    def _controller_section_header(entry: Dict[str, Any]) -> str:
+        summary = entry["summary"]
+        return (
+            f"Controller: {entry['controller_id']} | "
+            f"{summary.get('pair', entry['controller_id'])} | "
+            f"{summary.get('state', 'n/a')} | "
+            f"{summary.get('signal', 'n/a')}"
+        )
+
+    @staticmethod
+    def _controller_status_error_lines(controller_id: str, exception: Exception) -> List[str]:
+        error_label = f"{type(exception).__name__}: {exception}"
+        return [
+            f"  Status formatter error for `{controller_id}`: {error_label}",
+            "  Controller-specific status is unavailable; shared executor and position data continue below.",
+        ]
+
+    @staticmethod
+    def _format_executor_status_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "name") and hasattr(value, "value"):
+            return value.name
+        if isinstance(value, list):
+            if len(value) == 0:
+                return 0
+            preview_items = ", ".join(str(item) for item in value[:2])
+            overflow = f" (+{len(value) - 2})" if len(value) > 2 else ""
+            return f"{preview_items}{overflow}"
+        if isinstance(value, dict):
+            return f"{len(value)} keys"
+        if isinstance(value, float):
+            return round(value, 2)
+        return value
+
+    @staticmethod
+    def _format_executor_status_pct(value: Any, precision: int = 2) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return f"{Decimal(str(value)) * Decimal('100'):.{precision}f}%"
+        except Exception:
+            return None
+
+    @staticmethod
+    def _format_executor_status_price(value: Any, precision: int = 6) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return f"{Decimal(str(value)):.{precision}f}"
+        except Exception:
+            return None
+
+    @classmethod
+    def _executor_custom_status_columns(cls, custom_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not custom_info:
+            return {}
+
+        fields: Dict[str, Any] = {}
+        direct_mappings = {
+            "level_id": "level",
+            "current_position_average_price": "avg_entry",
+            "close_price": "close_price",
+        }
+        for source_key, target_key in direct_mappings.items():
+            formatted_value = cls._format_executor_status_value(custom_info.get(source_key))
+            if formatted_value is not None:
+                fields[target_key] = formatted_value
+
+        current_retries = custom_info.get("current_retries")
+        max_retries = custom_info.get("max_retries")
+        if current_retries is not None or max_retries is not None:
+            if current_retries is not None and max_retries is not None:
+                fields["retries"] = f"{current_retries}/{max_retries}"
+            elif current_retries is not None:
+                fields["retries"] = cls._format_executor_status_value(current_retries)
+            else:
+                fields["retries"] = cls._format_executor_status_value(max_retries)
+
+        order_id = custom_info.get("order_id")
+        order_ids = custom_info.get("order_ids")
+        if order_id:
+            fields["order_ref"] = order_id
+        elif order_ids:
+            fields["order_ref"] = cls._format_executor_status_value(order_ids)
+
+        if "held_position_orders" in custom_info:
+            held_position_orders = custom_info.get("held_position_orders") or []
+            fields["held_orders"] = len(held_position_orders)
+
+        trailing_state = custom_info.get("trailing_state")
+        if trailing_state not in (None, "disabled"):
+            trailing_move_count = custom_info.get("trailing_move_count") or 0
+            if trailing_state == "armed" and trailing_move_count:
+                fields["trail"] = f"armed/{trailing_move_count}"
+            else:
+                fields["trail"] = trailing_state
+
+            trailing_activation_price = cls._format_executor_status_price(custom_info.get("trailing_activation_price"))
+            trailing_trigger_price = cls._format_executor_status_price(custom_info.get("trailing_trigger_price"))
+            if trailing_activation_price is not None:
+                fields["trail_arm"] = trailing_activation_price
+            if trailing_trigger_price is not None:
+                fields["trail_stop"] = trailing_trigger_price
+
+            if trailing_state in ("pending", "waiting"):
+                trailing_gap = cls._format_executor_status_pct(custom_info.get("distance_to_trailing_activation_pct"))
+            else:
+                trailing_gap = cls._format_executor_status_pct(custom_info.get("distance_to_trailing_trigger_pct"))
+            if trailing_gap is not None:
+                fields["trail_gap"] = trailing_gap
+
+        return fields
+
+    @staticmethod
+    def _compact_enum_label(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if hasattr(value, "name"):
+            label = value.name
+        else:
+            label = str(value).split(".")[-1]
+        return label.replace("_", "-").lower()
+
+    @staticmethod
+    def _compact_executor_type(executor_type: Any) -> str:
+        label = str(executor_type or "executor")
+        if label.endswith("_executor"):
+            label = label[:-len("_executor")]
+        return label.replace("_", "-")
+
+    @staticmethod
+    def _compact_side_label(side: Any) -> Optional[str]:
+        if side is None:
+            return None
+        if hasattr(side, "name"):
+            return side.name
+        return str(side).split(".")[-1].upper()
+
+    @staticmethod
+    def _format_executor_compact_decimal(value: Any, precision: int = 4) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            decimal_value = Decimal(str(value))
+            if decimal_value.is_nan():
+                return "NaN"
+            formatted_value = f"{decimal_value:.{precision}f}"
+            if "." in formatted_value:
+                formatted_value = formatted_value.rstrip("0").rstrip(".")
+            return formatted_value
+        except Exception:
+            return None
+
+    @classmethod
+    def _format_executor_compact_quote(cls, value: Any, precision: int = 4) -> Optional[str]:
+        formatted_value = cls._format_executor_compact_decimal(value, precision=precision)
+        if formatted_value is None:
+            return None
+        if formatted_value.startswith("-"):
+            return f"-${formatted_value[1:]}"
+        if formatted_value.startswith("+"):
+            return f"+${formatted_value[1:]}"
+        return f"${formatted_value}"
+
+    @staticmethod
+    def _abbreviate_identifier(value: Any, prefix: int = 8, suffix: int = 6) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value)
+        if len(text) <= prefix + suffix + 3:
+            return text
+        return f"{text[:prefix]}...{text[-suffix:]}"
+
+    @classmethod
+    def _compact_order_references(cls, custom_info: Optional[Dict[str, Any]], custom_fields: Dict[str, Any]) -> Optional[str]:
+        references: List[str] = []
+        if custom_info:
+            order_id = custom_info.get("order_id")
+            if order_id:
+                references.append(str(order_id))
+            for order_ref in custom_info.get("order_ids") or []:
+                if order_ref:
+                    references.append(str(order_ref))
+            for held_order in custom_info.get("held_position_orders") or []:
+                if isinstance(held_order, dict) and held_order.get("order_id"):
+                    references.append(str(held_order["order_id"]))
+
+        if not references and custom_fields.get("order_ref"):
+            references.extend(ref.strip() for ref in str(custom_fields["order_ref"]).split(",") if ref.strip())
+
+        deduplicated_refs = list(dict.fromkeys(ref for ref in references if ref))
+        if not deduplicated_refs:
+            return None
+
+        abbreviated_refs = [cls._abbreviate_identifier(ref) or ref for ref in deduplicated_refs]
+        preview = ", ".join(abbreviated_refs[:2])
+        overflow = f" (+{len(abbreviated_refs) - 2})" if len(abbreviated_refs) > 2 else ""
+        return f"{preview}{overflow}"
+
+    @staticmethod
+    def _executor_side_emoji(side: Optional[str]) -> str:
+        if side == "BUY":
+            return "🟢"
+        if side == "SELL":
+            return "🔴"
+        return "⚪"
+
+    @staticmethod
+    def _executor_status_emoji(status_label: str) -> str:
+        status_icons = {
+            "running": "🟢",
+            "shutting-down": "🟡",
+            "terminated": "⏹",
+            "not-started": "⚪",
+        }
+        return status_icons.get(status_label, "🔹")
+
+    @staticmethod
+    def _executor_close_emoji(close_type: Optional[str]) -> str:
+        close_icons = {
+            "time-limit": "⏳",
+            "stop-loss": "🛑",
+            "take-profit": "🎯",
+            "expired": "⌛",
+            "early-stop": "🧯",
+            "trailing-stop": "🧵",
+            "insufficient-balance": "⚠️",
+            "failed": "❌",
+            "completed": "✅",
+            "position-hold": "🧊",
+            "window-end": "🪟",
+        }
+        return close_icons.get(close_type, "🏁")
+
+    def _format_executor_age_short(self, timestamp: Any) -> str:
+        try:
+            age_seconds = max(0, int(float(self.current_timestamp) - float(timestamp)))
+        except Exception:
+            return "n/a"
+
+        days, remainder = divmod(age_seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        if days > 0:
+            return f"{days}d{hours:02d}h"
+        if hours > 0:
+            return f"{hours}h{minutes:02d}m"
+        if minutes > 0:
+            return f"{minutes}m{seconds:02d}s"
+        return f"{seconds}s"
+
+    @classmethod
+    def _executor_status_lines(cls, executor_info: ExecutorInfo, age_label: str, index: int) -> List[str]:
+        custom_fields = cls._executor_custom_status_columns(executor_info.custom_info or {})
+
+        side = cls._compact_side_label(executor_info.side or getattr(executor_info.config, "side", None))
+        executor_type = cls._compact_executor_type(executor_info.type)
+        status_label = cls._compact_enum_label(executor_info.status) or "unknown"
+        close_type = cls._compact_enum_label(executor_info.close_type)
+        pnl_pct = cls._format_executor_status_pct(executor_info.net_pnl_pct)
+        pnl_quote = cls._format_executor_compact_quote(executor_info.net_pnl_quote)
+        filled_quote = cls._format_executor_compact_quote(executor_info.filled_amount_quote)
+
+        side_emoji = cls._executor_side_emoji(side)
+        status_emoji = cls._executor_status_emoji(status_label)
+        close_emoji = cls._executor_close_emoji(close_type) if close_type else None
+
+        headline_title = f"    {index}. {side_emoji} {((side + ' ') if side else '')}{executor_type}"
+        headline_parts = [headline_title, f"{status_emoji} {status_label}"]
+        if close_type:
+            headline_parts.append(f"{close_emoji} {close_type}")
+        headline_parts.append(f"⏱ {age_label}")
+
+        trade_parts: List[str] = []
+        if pnl_pct or pnl_quote:
+            if pnl_pct and pnl_quote:
+                trade_parts.append(f"💰 PnL {pnl_pct} / {pnl_quote}")
+            else:
+                trade_parts.append(f"💰 PnL {pnl_pct or pnl_quote}")
+        if filled_quote:
+            trade_parts.append(f"📦 Fill {filled_quote}")
+
+        entry_price = custom_fields.get("avg_entry")
+        if entry_price is None:
+            entry_price = cls._format_executor_compact_decimal(getattr(executor_info.config, "entry_price", None), precision=6)
+        close_price = custom_fields.get("close_price")
+        if entry_price is not None and close_price is not None:
+            trade_parts.append(f"🎯 Px {entry_price} -> {close_price}")
+        elif entry_price is not None:
+            trade_parts.append(f"🎯 Entry {entry_price}")
+        elif close_price is not None:
+            trade_parts.append(f"🎯 Close {close_price}")
+
+        detail_parts: List[str] = []
+        if custom_fields.get("level") is not None:
+            detail_parts.append(f"🪜 Level {custom_fields['level']}")
+        if custom_fields.get("retries") is not None:
+            detail_parts.append(f"🔁 Retries {custom_fields['retries']}")
+        if custom_fields.get("trail") is not None:
+            detail_parts.append(f"🧵 Trail {custom_fields['trail']}")
+        if custom_fields.get("trail_arm") is not None:
+            detail_parts.append(f"🚀 Arm {custom_fields['trail_arm']}")
+        if custom_fields.get("trail_stop") is not None:
+            detail_parts.append(f"🛑 Stop {custom_fields['trail_stop']}")
+        if custom_fields.get("trail_gap") is not None:
+            detail_parts.append(f"↔ Gap {custom_fields['trail_gap']}")
+        if custom_fields.get("held_orders") is not None:
+            detail_parts.append(f"🧺 Held {custom_fields['held_orders']}")
+        if executor_info.is_trading:
+            trade_state = "live"
+        elif executor_info.is_done:
+            trade_state = "done"
+        else:
+            trade_state = "idle"
+        detail_parts.append(f"📡 {trade_state}")
+
+        lines = [" | ".join(part for part in headline_parts if part)]
+        if trade_parts:
+            lines.append("       " + " | ".join(trade_parts))
+        if detail_parts:
+            lines.append("       " + " | ".join(detail_parts))
+
+        references_line = cls._compact_order_references(executor_info.custom_info or {}, custom_fields)
+        if references_line:
+            lines.append(f"       🏷 Refs {references_line}")
+
+        return lines
+
+    def _format_recent_executor_lines(self, recent_executors: List[ExecutorInfo]) -> List[str]:
+        lines: List[str] = []
+        for index, executor_info in enumerate(recent_executors, start=1):
+            age_label = self._format_executor_age_short(executor_info.timestamp)
+            lines.extend(self._executor_status_lines(executor_info, age_label=age_label, index=index))
+        return lines
+
     def set_leverage(self, connector: str, trading_pair: str, leverage: int):
         self.connectors[connector].set_leverage(trading_pair, leverage)
 
@@ -792,13 +1339,23 @@ class StrategyV2Base(StrategyPyBase):
         """
         Convert a list of executor handler info to a dataframe.
         """
-        df = pd.DataFrame([ei.to_dict() for ei in executors_info])
+        if len(executors_info) == 0:
+            return pd.DataFrame()
+
+        executor_rows = []
+        for executor_info in executors_info:
+            row = executor_info.to_dict()
+            custom_info = row.get("custom_info", {})
+            row.update(StrategyV2Base._executor_custom_status_columns(custom_info))
+            executor_rows.append(row)
+
+        df = pd.DataFrame(executor_rows)
         # Convert the enum values to integers
-        df['status'] = df['status'].apply(lambda x: x.value)
+        df["status"] = df["status"].apply(lambda x: x.value)
 
         # Sort the DataFrame
-        df.sort_values(by='status', ascending=True, inplace=True)
+        df.sort_values(by="status", ascending=True, inplace=True)
 
         # Convert back to enums for display
-        df['status'] = df['status'].apply(RunnableStatus)
+        df["status"] = df["status"].apply(RunnableStatus)
         return df

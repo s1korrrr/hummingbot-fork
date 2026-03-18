@@ -208,6 +208,48 @@ class TestExecutorOrchestrator(unittest.TestCase):
 
         orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
         self.assertEqual(len(orchestrator.cached_performance), 1)
+        self.assertEqual(len(orchestrator.stored_executors["test"]), 0)
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_initialize_cached_performance_loads_stored_recent_executors(self, mock_get_instance: MagicMock):
+        mock_markets_recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = mock_markets_recorder
+
+        stored_executor = ExecutorInfo(
+            id="stored-executor",
+            timestamp=1234,
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            close_type=CloseType.POSITION_HOLD,
+            close_timestamp=1250,
+            config=PositionExecutorConfig(
+                id="stored-executor",
+                timestamp=1234,
+                trading_pair="ETH-USDT",
+                connector_name="binance",
+                side=TradeType.BUY,
+                amount=Decimal(10),
+                entry_price=Decimal(100),
+            ),
+            filled_amount_quote=Decimal(100),
+            net_pnl_quote=Decimal(10),
+            net_pnl_pct=Decimal("0.1"),
+            cum_fees_quote=Decimal("1"),
+            is_trading=False,
+            is_active=False,
+            custom_info={"current_position_average_price": Decimal("100")},
+            controller_id="test",
+        )
+        mock_markets_recorder.get_all_executors.return_value = [stored_executor]
+        mock_markets_recorder.get_all_positions.return_value = []
+        self.mock_strategy.controllers = {"test": MagicMock()}
+
+        orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
+
+        self.assertEqual(len(orchestrator.stored_executors["test"]), 1)
+        restored_executor = orchestrator.stored_executors["test"][0]
+        self.assertEqual(restored_executor.id, "stored-executor")
+        self.assertEqual(restored_executor.custom_info["persistence_source"], "db")
 
     @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
     def test_initialize_cached_performance_with_positions(self, mock_get_instance: MagicMock):
@@ -359,9 +401,77 @@ class TestExecutorOrchestrator(unittest.TestCase):
             position_executor.config = MagicMock()
             self.orchestrator.active_executors["test"] = [position_executor]
             await self.orchestrator.stop()
-            position_executor.early_stop.assert_called_once()
+            position_executor.early_stop.assert_called_once_with(keep_position=False)
 
         asyncio.run(test_async())
+
+    @patch.object(ExecutorOrchestrator, "store_all_positions")
+    @patch.object(ExecutorOrchestrator, "store_all_executors")
+    def test_stop_respects_keep_position_by_controller(self, store_all_executors, store_all_positions):
+        async def test_async():
+            store_all_positions.return_value = None
+            store_all_executors.return_value = None
+            position_executor = MagicMock(spec=PositionExecutor)
+            position_executor.is_closed = False
+            position_executor.early_stop = MagicMock(return_value=None)
+            position_executor.executor_info = MagicMock()
+            position_executor.executor_info.is_done = True
+            position_executor.config = MagicMock()
+            self.orchestrator.active_executors["rsi-v5"] = [position_executor]
+
+            await self.orchestrator.stop(
+                keep_position_by_controller={"rsi-v5": True}
+            )
+
+            position_executor.early_stop.assert_called_once_with(keep_position=True)
+
+        asyncio.run(test_async())
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_store_all_positions_materializes_done_position_hold_executors_before_persisting(self, markets_recorder_mock):
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+        markets_recorder_mock.update_or_store_position = MagicMock(return_value=None)
+
+        config = PositionExecutorConfig(
+            timestamp=1234,
+            trading_pair="ETH-USDT",
+            connector_name="binance",
+            side=TradeType.BUY,
+            amount=Decimal("1"),
+            entry_price=Decimal("100"),
+        )
+        config.id = "held_executor"
+
+        executor = MagicMock()
+        executor.executor_info = ExecutorInfo(
+            id="held_executor",
+            timestamp=1234,
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            config=config,
+            filled_amount_quote=Decimal("100"),
+            net_pnl_quote=Decimal("0"),
+            net_pnl_pct=Decimal("0"),
+            cum_fees_quote=Decimal("1"),
+            is_trading=False,
+            is_active=False,
+            custom_info={"held_position_orders": [
+                {"client_order_id": "order_1", "executed_amount_base": Decimal("1"),
+                 "executed_amount_quote": Decimal("100"), "trade_type": "BUY",
+                 "cumulative_fee_paid_quote": Decimal("1")}
+            ]},
+            close_type=CloseType.POSITION_HOLD,
+            controller_id="test_controller",
+        )
+
+        self.orchestrator.active_executors = {"test_controller": [executor]}
+        self.orchestrator.positions_held = {"test_controller": []}
+        self.orchestrator.executors_ids_position_held = []
+
+        self.orchestrator.store_all_positions()
+
+        markets_recorder_mock.return_value.update_or_store_position.assert_called_once()
+        self.assertEqual(self.orchestrator.positions_held, {})
 
     def test_stop_executor(self):
         position_executor = MagicMock(spec=PositionExecutor)
@@ -707,3 +817,39 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(len(result["controller2"]["executors"]), 0)
         self.assertEqual(len(result["controller3"]["executors"]), 0)
         self.assertEqual(len(result["controller3"]["positions"]), 0)
+
+    def test_get_all_reports_includes_stored_recent_executors(self):
+        stored_executor = ExecutorInfo(
+            id="stored-executor",
+            timestamp=1234,
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            close_type=CloseType.POSITION_HOLD,
+            close_timestamp=1250,
+            config=PositionExecutorConfig(
+                id="stored-executor",
+                timestamp=1234,
+                trading_pair="ETH-USDT",
+                connector_name="binance",
+                side=TradeType.BUY,
+                amount=Decimal(10),
+                entry_price=Decimal(100),
+            ),
+            filled_amount_quote=Decimal(100),
+            net_pnl_quote=Decimal(10),
+            net_pnl_pct=Decimal("0.1"),
+            cum_fees_quote=Decimal("1"),
+            is_trading=False,
+            is_active=False,
+            custom_info={"current_position_average_price": Decimal("100"), "persistence_source": "db"},
+            controller_id="stored-controller",
+        )
+        self.orchestrator.active_executors = {"stored-controller": []}
+        self.orchestrator.stored_executors = {"stored-controller": [stored_executor]}
+        self.orchestrator.positions_held = {"stored-controller": []}
+        self.orchestrator.cached_performance = {"stored-controller": PerformanceReport()}
+
+        result = self.orchestrator.get_all_reports()
+
+        self.assertEqual(len(result["stored-controller"]["executors"]), 1)
+        self.assertEqual(result["stored-controller"]["executors"][0].id, "stored-executor")

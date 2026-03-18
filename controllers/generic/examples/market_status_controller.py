@@ -67,16 +67,16 @@ class MarketStatusController(ControllerBase):
 
     def to_format_status(self) -> List[str]:
         if not self.ready_to_trade:
-            return ["Market connectors are not ready."]
+            return ["⚠️ Market connectors are not ready."]
 
         lines = []
-        lines.extend(["", "  Market Status Data Frame:"])
+        lines.extend(["", "  📊 Market Status Data Frame:"])
 
         try:
             market_status_df = self.get_market_status_df_with_depth()
             lines.extend(["    " + line for line in market_status_df.to_string(index=False).split("\n")])
         except Exception as e:
-            lines.extend([f"    Error: {str(e)}"])
+            lines.extend([f"    ⚠️ Error: {str(e)}"])
 
         return lines
 

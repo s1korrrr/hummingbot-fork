@@ -251,6 +251,7 @@ class MarketsRecorder:
                 existing_position.amount = position.amount
                 existing_position.breakeven_price = position.breakeven_price
                 existing_position.unrealized_pnl_quote = position.unrealized_pnl_quote
+                existing_position.realized_pnl_quote = position.realized_pnl_quote
                 existing_position.cum_fees_quote = position.cum_fees_quote
             else:
                 # Insert new position

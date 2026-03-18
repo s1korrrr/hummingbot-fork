@@ -194,7 +194,7 @@ class MultiGridStrike(ControllerBase):
         status.append("┌" + "─" * box_width + "┐")
 
         # Header
-        header = f"│ Multi-Grid Configuration - {self.config.connector_name} {self.config.trading_pair}"
+        header = f"│ 🧱 Multi-Grid Configuration - {self.config.connector_name} {self.config.trading_pair}"
         header += " " * (box_width - len(header) + 1) + "│"
         status.append(header)
 
@@ -218,7 +218,7 @@ class MultiGridStrike(ControllerBase):
 
             # Grid header
             grid_status = "ACTIVE" if executor else ("READY" if in_bounds else "OUT_OF_BOUNDS")
-            status_header = f"Grid {grid.grid_id}: {grid_status}"
+            status_header = f"📊 Grid {grid.grid_id}: {grid_status}"
             status_line = f"┌ {status_header}" + "─" * (box_width - len(status_header) - 2) + "┐"
             status.append(status_line)
 

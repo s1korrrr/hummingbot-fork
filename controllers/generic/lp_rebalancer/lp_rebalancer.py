@@ -586,22 +586,22 @@ class LPRebalancer(ControllerBase):
 
         # Header
         status.append("+" + "-" * box_width + "+")
-        header = f"| LP Rebalancer: {self.config.trading_pair} on {self.config.connector_name}"
+        header = f"| 🌊 LP Rebalancer: {self.config.trading_pair} on {self.config.connector_name}"
         status.append(header + " " * (box_width - len(header) + 1) + "|")
         status.append("+" + "-" * box_width + "+")
 
         # Network, connector, pool
-        line = f"| Network: {self.config.network}"
+        line = f"| 🌐 Network: {self.config.network}"
         status.append(line + " " * (box_width - len(line) + 1) + "|")
 
-        line = f"| Pool: {self.config.pool_address}"
+        line = f"| 🏊 Pool: {self.config.pool_address}"
         status.append(line + " " * (box_width - len(line) + 1) + "|")
 
         # Position info from current executor (active or transitioning)
         executor = self.active_executor() or self.get_tracked_executor()
         if executor and not executor.is_done:
             position_address = executor.custom_info.get("position_address", "N/A")
-            line = f"| Position: {position_address}"
+            line = f"| 📍 Position: {position_address}"
             status.append(line + " " * (box_width - len(line) + 1) + "|")
 
         # Config summary
@@ -610,7 +610,7 @@ class LPRebalancer(ControllerBase):
         amt = self.config.total_amount_quote
         width = self.config.position_width_pct
         rebal = self.config.rebalance_seconds
-        line = f"| Config: side={side_str}, amount={amt} {self._quote_token}, width={width}%, rebal={rebal}s"
+        line = f"| ⚙️ Config: side={side_str}, amount={amt} {self._quote_token}, width={width}%, rebal={rebal}s"
         status.append(line + " " * (box_width - len(line) + 1) + "|")
 
         # Position fees and assets
@@ -734,7 +734,7 @@ class LPRebalancer(ControllerBase):
                 self.config.connector_name, self._quote_token
             )
 
-            line = "| Balances:"
+            line = "| 💼 Balances:"
             status.append(line + " " * (box_width - len(line) + 1) + "|")
 
             # Table header

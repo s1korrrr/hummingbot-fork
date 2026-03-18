@@ -62,15 +62,15 @@ class LiquidationsMonitorController(ControllerBase):
 
     def to_format_status(self) -> List[str]:
         lines = []
-        lines.extend(["", "LIQUIDATIONS MONITOR"])
+        lines.extend(["", "💥 LIQUIDATIONS MONITOR"])
         lines.extend(["=" * 50])
 
         if not self.binance_liquidations_feed.ready:
-            lines.append("Feed not ready yet!")
+            lines.append("⌛ Feed not ready yet!")
         else:
             try:
                 # Combined liquidations
-                lines.append("Combined liquidations:")
+                lines.append("💥 Combined liquidations:")
                 combined_df = self.binance_liquidations_feed.liquidations_df().tail(10)
                 lines.extend([format_df_for_printout(df=combined_df, table_format="psql")])
                 lines.append("")
@@ -78,12 +78,12 @@ class LiquidationsMonitorController(ControllerBase):
 
                 # Individual trading pairs
                 for trading_pair in self.binance_liquidations_config.trading_pairs:
-                    lines.append("Liquidations for trading pair: {}".format(trading_pair))
+                    lines.append("💥 Liquidations for trading pair: {}".format(trading_pair))
                     pair_df = self.binance_liquidations_feed.liquidations_df(trading_pair).tail(5)
                     lines.extend([format_df_for_printout(df=pair_df, table_format="psql")])
                     lines.append("")
             except Exception as e:
-                lines.append(f"Error displaying liquidations data: {e}")
+                lines.append(f"⚠️ Error displaying liquidations data: {e}")
 
         return lines
 

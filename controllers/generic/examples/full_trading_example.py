@@ -158,20 +158,20 @@ class FullTradingExample(ControllerBase):
             open_orders = self.processed_data["open_orders"]
             open_positions = self.processed_data["open_positions"]
 
-            lines.append("=== Beautiful Trading Example Controller ===")
-            lines.append(f"Trading Pair: {self.config.trading_pair}")
-            lines.append(f"Current Price: {mid_price:.6f}")
-            lines.append(f"Open Orders: {len(open_orders)}")
-            lines.append(f"Open Positions: {len(open_positions)}")
+            lines.append("🎨 === Beautiful Trading Example Controller ===")
+            lines.append(f"🎯 Trading Pair: {self.config.trading_pair}")
+            lines.append(f"📍 Current Price: {mid_price:.6f}")
+            lines.append(f"📬 Open Orders: {len(open_orders)}")
+            lines.append(f"📦 Open Positions: {len(open_positions)}")
 
             if open_orders:
-                lines.append("--- Open Orders ---")
+                lines.append("📬 --- Open Orders ---")
                 for order in open_orders:
                     lines.append(f"  {order['side']} {order['amount']:.4f} @ {order.get('price', 'MARKET')} "
                                  f"(Filled: {order['filled_amount']:.4f}) - {order['status']}")
 
             if open_positions:
-                lines.append("--- Held Positions ---")
+                lines.append("📦 --- Held Positions ---")
                 for position in open_positions:
                     lines.append(f"  {position['side']} {position['amount']:.4f} @ {position['entry_price']:.6f} "
                                  f"(PnL: {position['pnl_percentage']:.2f}%)")

@@ -201,6 +201,21 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT"])
         self.assertEqual(result, {"BTC-USDT": Decimal("0")})
 
+    async def test_safe_get_last_traded_prices_logs_exception_class_for_empty_timeout_message(self):
+        connector = AsyncMock()
+
+        async def slow_last_trade_price(*args, **kwargs):
+            await asyncio.sleep(0.01)
+            return 100
+
+        connector._get_last_traded_price.side_effect = slow_last_trade_price
+
+        with patch("hummingbot.data_feed.market_data_provider.logging.error") as mock_log_error:
+            result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT"], timeout=0.001)
+
+        self.assertEqual(result, {})
+        self.assertIn("TimeoutError", mock_log_error.call_args[0][0])
+
     def test_remove_rate_sources(self):
         # Test removing regular connector rate sources
         connector_pair = ConnectorPair(connector_name="binance", trading_pair="BTC-USDT")

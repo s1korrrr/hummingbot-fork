@@ -111,8 +111,8 @@ class TestArbitrageExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.executor._last_sell_price = Decimal('102')
         self.executor._last_tx_cost = Decimal('0.01')
         format_status = "".join(self.executor.to_format_status())
-        self.assertIn(f"Arbitrage Status: {RunnableStatus.RUNNING}", format_status)
-        self.assertIn("Trade PnL (%): 2.00 % | TX Cost (%): -1.00 % | Net PnL (%): 1.00 %", format_status)
+        self.assertIn(f"⚖️ Arbitrage Status: {RunnableStatus.RUNNING}", format_status)
+        self.assertIn("💰 Trade PnL (%): 2.00 % | 🧾 TX Cost (%): -1.00 % | 📊 Net PnL (%): 1.00 %", format_status)
 
     @patch.object(ArbitrageExecutor, "place_order")
     def test_process_order_failed_event_increments_cumulative_failures(self, _):

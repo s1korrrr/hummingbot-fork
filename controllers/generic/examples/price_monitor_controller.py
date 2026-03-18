@@ -74,7 +74,7 @@ class PriceMonitorController(ControllerBase):
 
     def to_format_status(self) -> List[str]:
         lines = []
-        lines.extend(["", f"PRICE MONITOR - {self.config.trading_pair}"])
+        lines.extend(["", f"📈 PRICE MONITOR - {self.config.trading_pair}"])
         lines.extend(["=" * 60])
 
         if hasattr(self, 'processed_data') and self.processed_data.get("price_data"):
@@ -82,14 +82,14 @@ class PriceMonitorController(ControllerBase):
                 lines.extend([f"\n{connector_name.upper()}:"])
 
                 if "error" in price_info:
-                    lines.extend([f"  Error: {price_info['error']}"])
+                    lines.extend([f"  ⚠️ Error: {price_info['error']}"])
                 else:
-                    lines.extend([f"  Best Ask: {price_info.get('best_ask', 'N/A')}"])
-                    lines.extend([f"  Best Bid: {price_info.get('best_bid', 'N/A')}"])
-                    lines.extend([f"  Mid Price: {price_info.get('mid_price', 'N/A')}"])
+                    lines.extend([f"  🟥 Best Ask: {price_info.get('best_ask', 'N/A')}"])
+                    lines.extend([f"  🟩 Best Bid: {price_info.get('best_bid', 'N/A')}"])
+                    lines.extend([f"  📍 Mid Price: {price_info.get('mid_price', 'N/A')}"])
 
                     if price_info.get('spread') is not None:
-                        lines.extend([f"  Spread: {price_info['spread']:.6f} ({price_info['spread_pct']:.3f}%)"])
+                        lines.extend([f"  ↔️ Spread: {price_info['spread']:.6f} ({price_info['spread_pct']:.3f}%)"])
         else:
             # Get current prices for display
             for connector_name in self.config.exchanges:
@@ -99,21 +99,21 @@ class PriceMonitorController(ControllerBase):
                     mid_price = self.market_data_provider.get_price_by_type(connector_name, self.config.trading_pair, PriceType.MidPrice)
 
                     lines.extend([f"\n{connector_name.upper()}:"])
-                    lines.extend([f"  Best Ask: {best_ask}"])
-                    lines.extend([f"  Best Bid: {best_bid}"])
-                    lines.extend([f"  Mid Price: {mid_price}"])
+                    lines.extend([f"  🟥 Best Ask: {best_ask}"])
+                    lines.extend([f"  🟩 Best Bid: {best_bid}"])
+                    lines.extend([f"  📍 Mid Price: {mid_price}"])
 
                     if best_ask and best_bid and mid_price:
                         spread = best_ask - best_bid
                         spread_pct = spread / mid_price * 100
-                        lines.extend([f"  Spread: {spread:.6f} ({spread_pct:.3f}%)"])
+                        lines.extend([f"  ↔️ Spread: {spread:.6f} ({spread_pct:.3f}%)"])
 
                 except Exception as e:
                     lines.extend([f"\n{connector_name.upper()}:"])
-                    lines.extend([f"  Error: {str(e)}"])
+                    lines.extend([f"  ⚠️ Error: {str(e)}"])
 
         next_log_time = self.last_log_time + self.config.log_interval
         time_until_next_log = max(0, next_log_time - self.market_data_provider.time())
-        lines.extend([f"\nNext price log in: {time_until_next_log:.0f} seconds"])
+        lines.extend([f"\n⏳ Next price log in: {time_until_next_log:.0f} seconds"])
 
         return lines

@@ -218,7 +218,25 @@ class DirectionalTradingControllerBase(ControllerBase):
         )
 
     def to_format_status(self) -> List[str]:
+        lines = [
+            (
+                f"🎯 Signal: {self.processed_data.get('signal', 0)} | "
+                f"🧭 Pair: {self.config.trading_pair} | "
+                f"🏦 Exchange: {self.config.connector_name} | "
+                f"⏳ Cooldown: {self.config.cooldown_time}s | "
+                f"📌 Max executors/side: {self.config.max_executors_per_side}"
+            )
+        ]
         df = self.processed_data.get("features", pd.DataFrame())
         if df.empty:
-            return []
-        return [format_df_for_printout(df.tail(5), table_format="psql",)]
+            lines.append("⌛ No processed features available yet.")
+            return lines
+
+        preview_df = df.tail(5)
+        if len(preview_df.columns) > 8:
+            preview_columns = list(preview_df.columns[:8])
+            preview_df = preview_df[preview_columns]
+
+        lines.append(f"📚 Feature rows: {len(df)} | Preview columns: {', '.join(map(str, preview_df.columns))}")
+        lines.append(format_df_for_printout(preview_df, table_format="psql"))
+        return lines

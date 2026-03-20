@@ -77,8 +77,8 @@ class AILivestreamController(DirectionalTradingControllerBase):
     def to_format_status(self) -> List[str]:
         lines = []
         features = self.processed_data.get("features", {})
-        lines.append(f"Signal: {self.processed_data.get('signal', 'N/A')}")
-        lines.append(f"Timestamp: {features.get('timestamp', 'N/A')}")
-        lines.append(f"Probabilities: {features.get('probabilities', 'N/A')}")
-        lines.append(f"Target Pct: {features.get('target_pct', 'N/A')}")
+        lines.append(f"🎯 Signal: {self.processed_data.get('signal', 'N/A')}")
+        lines.append(f"🕒 Timestamp: {features.get('timestamp', 'N/A')}")
+        lines.append(f"📊 Probabilities: {features.get('probabilities', 'N/A')}")
+        lines.append(f"🎯 Target Pct: {features.get('target_pct', 'N/A')}")
         return lines

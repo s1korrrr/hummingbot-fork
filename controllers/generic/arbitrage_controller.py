@@ -188,4 +188,7 @@ class ArbitrageController(ControllerBase):
 
     def to_format_status(self) -> List[str]:
         all_executors_custom_info = pd.DataFrame(e.custom_info for e in self.executors_info)
-        return [format_df_for_printout(all_executors_custom_info, table_format="psql", )]
+        return [
+            "⚖️ Arbitrage Controller Executors:",
+            format_df_for_printout(all_executors_custom_info, table_format="psql", ),
+        ]

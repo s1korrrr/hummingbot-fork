@@ -149,7 +149,7 @@ class HedgeAssetController(ControllerBase):
 
         # Header
         lines.append(f"\n{'=' * 65}")
-        lines.append(f"  HEDGE ASSET CONTROLLER: {self.config.asset_to_hedge} @ {current_price:.4f} {self.perp_collateral_asset}")
+        lines.append(f"  🛡️ HEDGE ASSET CONTROLLER: {self.config.asset_to_hedge} @ {current_price:.4f} {self.perp_collateral_asset}")
         lines.append(f"{'=' * 65}")
 
         # Calculation flow
@@ -165,7 +165,7 @@ class HedgeAssetController(ControllerBase):
         lines.append("")
 
         # Trading conditions
-        lines.append("  Trading Conditions:")
+        lines.append("  🚦 Trading Conditions:")
         lines.append(f"    Cooldown ({self.config.cooldown_time:.0f}s):      {cooldown_status}")
         lines.append(f"    Min Notional (≥{self.config.min_notional_size:.0f} {self.perp_collateral_asset}): {notional_status}")
 

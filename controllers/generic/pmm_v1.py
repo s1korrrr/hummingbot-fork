@@ -707,12 +707,12 @@ class PMMV1(ControllerBase):
 
         # Header
         status.append(sep("="))
-        header = f"PMM V1 | {self.config.connector_name}:{self.config.trading_pair}"
+        header = f"🤖 PMM V1 | {self.config.connector_name}:{self.config.trading_pair}"
         status.append(f"|{header:^{w - 2}}|")
         status.append(sep("="))
 
         # Inventory & Settings
-        status.append(row2("INVENTORY", "SETTINGS"))
+        status.append(row2("📦 INVENTORY", "⚙️ SETTINGS"))
         status.append(sep())
         inv = [
             f"Base %: {base_pct:.2%} (target {target_pct:.2%})",
@@ -727,7 +727,7 @@ class PMMV1(ControllerBase):
 
         # Market & Price Bands
         status.append(sep())
-        status.append(row2("MARKET", "PRICE BANDS"))
+        status.append(row2("📈 MARKET", "🧱 PRICE BANDS"))
         status.append(sep())
         ceiling_str = f"{ceiling:.8g}" if ceiling else "None"
         floor_str = f"{floor:.8g}" if floor else "None"

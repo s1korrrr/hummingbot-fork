@@ -116,7 +116,7 @@ class GridStrike(ControllerBase):
         # Top Grid Configuration box with simple borders
         status.append("┌" + "─" * box_width + "┐")
         # First line: Grid Configuration and Mid Price
-        left_section = "Grid Configuration:"
+        left_section = "🧱 Grid Configuration:"
         padding = box_width - len(left_section) - 4  # -4 for the border characters and spacing
         config_line1 = f"│ {left_section}{' ' * padding}"
         padding2 = box_width - len(config_line1) + 1  # +1 for correct right border alignment
@@ -138,7 +138,7 @@ class GridStrike(ControllerBase):
             col_width = box_width // 3  # Dividing the total width by 3 for equal columns
             total_width = box_width
             # Grid Status header - use long line and running status
-            status_header = f"Grid Status: {level.id} (RunnableStatus.RUNNING)"
+            status_header = f"📊 Grid Status: {level.id} (RunnableStatus.RUNNING)"
             status_line = f"┌ {status_header}" + "─" * (total_width - len(status_header) - 2) + "┐"
             status.append(status_line)
             # Calculate exact column widths for perfect alignment

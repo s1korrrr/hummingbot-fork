@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Dict, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
@@ -151,7 +151,7 @@ class OrderExecutor(ExecutorBase):
             position_action=self.config.position_action,
         )
         self._order = TrackedOrder(order_id=order_id)
-        self.logger().debug(f"Executor ID: {self.config.id} - Placing order {order_id}")
+        self.logger().debug(self._log_message(f"Placing order order_id={order_id}"))
 
     def get_order_type(self) -> OrderType:
         """
@@ -165,6 +165,27 @@ class OrderExecutor(ExecutorBase):
             return OrderType.LIMIT_MAKER
         else:
             return OrderType.LIMIT
+
+    def _maker_price_buffer(self, candidate_price: Decimal, touch_price: Decimal) -> Decimal:
+        try:
+            trading_rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+            tick_size = Decimal(str(getattr(trading_rules, "min_price_increment", "0")))
+        except Exception:
+            tick_size = Decimal("0")
+
+        # Ignore placeholder/default quanta from incomplete rule objects.
+        if tick_size <= Decimal("0") or tick_size < Decimal("1e-18"):
+            return candidate_price
+
+        rounding = ROUND_FLOOR if self.config.side == TradeType.BUY else ROUND_CEILING
+        aligned_price = (candidate_price / tick_size).to_integral_value(rounding=rounding) * tick_size
+
+        if self.config.side == TradeType.BUY and aligned_price >= touch_price:
+            adjusted_price = aligned_price - tick_size
+            return adjusted_price if adjusted_price > Decimal("0") else aligned_price
+        if self.config.side == TradeType.SELL and aligned_price <= touch_price:
+            return aligned_price + tick_size
+        return aligned_price
 
     def get_order_price(self) -> Decimal:
         """
@@ -180,10 +201,12 @@ class OrderExecutor(ExecutorBase):
             else:
                 return self.current_market_price * (Decimal("1") + self.config.chaser_config.distance)
         elif self.config.execution_strategy == ExecutionStrategy.LIMIT_MAKER:
+            touch_price = self.current_market_price
             if self.config.side == TradeType.BUY:
-                return min(self.config.price, self.current_market_price)
+                candidate_price = min(self.config.price, touch_price)
             else:
-                return max(self.config.price, self.current_market_price)
+                candidate_price = max(self.config.price, touch_price)
+            return self._maker_price_buffer(candidate_price, touch_price)
         else:
             return self.config.price
 
@@ -206,7 +229,7 @@ class OrderExecutor(ExecutorBase):
         """
         self.cancel_order()
         self.place_open_order()
-        self.logger().debug("Renewing order")
+        self.logger().debug(self._log_message("Renewing order"))
 
     def cancel_order(self):
         """
@@ -218,7 +241,7 @@ class OrderExecutor(ExecutorBase):
                 trading_pair=self.config.trading_pair,
                 order_id=self._order.order_id
             )
-            self.logger().debug("Cancelling order")
+            self.logger().debug(self._log_message(f"Cancelling order order_id={self._order.order_id}"))
 
     def update_tracked_order_with_order_id(self, order_id: str):
         """
@@ -270,7 +293,12 @@ class OrderExecutor(ExecutorBase):
         if self._order and event.order_id == self._order.order_id:
             self._failed_orders.append(self._order)
             self._order = None
-            self.logger().error(f"Order failed {event.order_id}. Retrying {self._current_retries}/{self._max_retries}")
+            self.logger().error(
+                self._log_message(
+                    f"Order failed order_id={event.order_id}. "
+                    f"Retrying {self._current_retries}/{self._max_retries}"
+                )
+            )
             self._current_retries += 1
 
     def get_custom_info(self) -> Dict:
@@ -281,6 +309,7 @@ class OrderExecutor(ExecutorBase):
         """
         return {
             "level_id": self.config.level_id,
+            "side": self.config.side,
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,
             "order_id": self._order.order_id if self._order else None,
@@ -296,9 +325,9 @@ class OrderExecutor(ExecutorBase):
         :return: A list of formatted status lines.
         """
         lines = [f"""
-| Trading Pair: {self.config.trading_pair} | Exchange: {self.config.connector_name} | Action: {self.config.position_action}
-| Amount: {self.config.amount} | Price: {self._order.order.price if self._order and self._order.order else 'N/A'}
-| Execution Strategy: {self.config.execution_strategy} | Retries: {self._current_retries}/{self._max_retries}
+| 🎯 Trading Pair: {self.config.trading_pair} | 🏦 Exchange: {self.config.connector_name} | ⚙️ Action: {self.config.position_action}
+| 📦 Amount: {self.config.amount} | 💲 Price: {self._order.order.price if self._order and self._order.order else 'N/A'}
+| 🧭 Execution Strategy: {self.config.execution_strategy} | 🔁 Retries: {self._current_retries}/{self._max_retries}
 """]
         return lines
 
@@ -326,7 +355,7 @@ class OrderExecutor(ExecutorBase):
         adjusted_order_candidates = self.adjust_order_candidates(self.config.connector_name, [order_candidate])
         if adjusted_order_candidates[0].amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
+            self.logger().error(self._log_message("Not enough budget to open position"))
             self.stop()
 
     async def _sleep(self, delay: float):

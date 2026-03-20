@@ -11,7 +11,11 @@ from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import BuyOrderCompletedEvent, MarketOrderFailureEvent, OrderCancelledEvent
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import (
+    PositionExecutorConfig,
+    TrailingStop,
+    TripleBarrierConfig,
+)
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
@@ -57,6 +61,18 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
                                           stop_loss=Decimal("0.05"), take_profit=Decimal("0.1"), time_limit=60,
                                           take_profit_order_type=OrderType.MARKET,
                                           stop_loss_order_type=OrderType.MARKET))
+
+    def get_position_config_market_long_with_trailing(self):
+        return PositionExecutorConfig(id="test-trailing", timestamp=1234567890, trading_pair="ETH-USDT",
+                                      connector_name="binance",
+                                      side=TradeType.BUY, entry_price=Decimal("100"), amount=Decimal("1"),
+                                      triple_barrier_config=TripleBarrierConfig(
+                                          trailing_stop=TrailingStop(
+                                              activation_price=Decimal("0.05"),
+                                              trailing_delta=Decimal("0.02"),
+                                          ),
+                                          stop_loss_order_type=OrderType.MARKET,
+                                          time_limit_order_type=OrderType.MARKET))
 
     def get_position_config_market_short(self):
         return PositionExecutorConfig(id="test-2", timestamp=1234567890, trading_pair="ETH-USDT",
@@ -492,6 +508,73 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         position_executor.process_order_canceled_event(102, market, event)
         self.assertEqual(position_executor._close_order, None)
 
+    def test_control_trailing_stop_logs_trading_pair_context(self):
+        position_config = self.get_position_config_market_long_with_trailing()
+        position_executor = self.get_position_executor_running_from_config(position_config)
+        position_executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.10"))
+
+        with self.assertLogs(position_executor.logger().name, level="INFO") as activation_logs:
+            position_executor.control_trailing_stop()
+
+        activation_output = "\n".join(activation_logs.output)
+        self.assertIn("Trailing stop armed", activation_output)
+        self.assertIn("activation_price=", activation_output)
+        self.assertIn("trigger_price=", activation_output)
+        self.assertIn("pair=ETH-USDT", activation_output)
+
+        position_executor._trailing_stop_trigger_pct = Decimal("0.08")
+        position_executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.05"))
+        position_executor.place_close_order_and_cancel_open_orders = MagicMock()
+
+        with self.assertLogs(position_executor.logger().name, level="INFO") as trigger_logs:
+            position_executor.control_trailing_stop()
+
+        trigger_output = "\n".join(trigger_logs.output)
+        self.assertIn("Trailing stop triggered", trigger_output)
+        self.assertIn("trigger_price=", trigger_output)
+        self.assertIn("current_price=", trigger_output)
+        self.assertIn("pair=ETH-USDT", trigger_output)
+
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
+           return_value=Decimal("110"))
+    def test_to_format_status_includes_trailing_activation_and_trigger_details(self, _):
+        position_config = self.get_position_config_market_long_with_trailing()
+        position_executor = self.get_position_executor_running_from_config(position_config)
+        position_executor._open_order = TrackedOrder("OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=position_config.trading_pair,
+            order_type=position_config.triple_barrier_config.open_order_type,
+            trade_type=TradeType.BUY,
+            amount=position_config.amount,
+            price=position_config.entry_price,
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.FILLED
+        )
+        position_executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair=position_config.trading_pair,
+                fill_price=position_config.entry_price,
+                fill_base_amount=position_config.amount,
+                fill_quote_amount=position_config.amount * position_config.entry_price,
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.2"))]),
+                fill_timestamp=10,
+            )
+        )
+        self.strategy.connectors["binance"].quantize_order_amount.return_value = position_config.amount
+        position_executor._trailing_stop_trigger_pct = Decimal("0.08")
+        position_executor._trailing_stop_move_count = 1
+
+        status = "\n".join(position_executor.to_format_status())
+        self.assertIn("🧵 Trailing stop: armed", status)
+        self.assertIn("arm 0.05000 @ 105.20000", status)
+        self.assertIn("🧵 Trailing trigger: 0.08000 @ 108.20000", status)
+        self.assertIn("moves 1", status)
+
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
            return_value=Decimal("101"))
     def test_to_format_status(self, _):
@@ -525,7 +608,7 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.strategy.connectors["binance"].quantize_order_amount.return_value = position_config.amount
 
         status = position_executor.to_format_status()
-        self.assertIn("Trading Pair: ETH-USDT", status[0])
+        self.assertIn("🎯 Trading Pair: ETH-USDT", status[0])
         self.assertIn("PNL (%): 0.80%", status[0])
 
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
@@ -561,7 +644,7 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         type(position_executor).close_price = PropertyMock(return_value=Decimal(101))
         self.strategy.connectors["binance"].quantize_order_amount.return_value = position_config.amount
         status = position_executor.to_format_status()
-        self.assertIn("Trading Pair: ETH-USDT", status[0])
+        self.assertIn("🎯 Trading Pair: ETH-USDT", status[0])
         self.assertIn("PNL (%): 0.80%", status[0])
 
     @patch.object(PositionExecutor, 'get_trading_rules')
@@ -594,15 +677,32 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
 
     def test_get_custom_info(self):
-        position_config = self.get_position_config_market_long()
+        position_config = self.get_position_config_market_long_with_trailing()
         executor = PositionExecutor(self.strategy, position_config)
+        executor._trailing_stop_trigger_pct = Decimal("0.08")
+        executor._trailing_stop_move_count = 2
         custom_info = executor.get_custom_info()
 
         self.assertEqual(custom_info["level_id"], position_config.level_id)
+        self.assertIsNone(custom_info["role"])
         self.assertEqual(custom_info["current_position_average_price"], executor.entry_price)
         self.assertEqual(custom_info["side"], position_config.side)
         self.assertEqual(custom_info["current_retries"], executor._current_retries)
         self.assertEqual(custom_info["max_retries"], executor._max_retries)
+        self.assertEqual(custom_info["trailing_state"], "armed")
+        self.assertEqual(custom_info["trailing_activation_price"], Decimal("105"))
+        self.assertEqual(custom_info["trailing_trigger_price"], Decimal("108"))
+        self.assertEqual(custom_info["trailing_move_count"], 2)
+
+    def test_get_custom_info_sets_role_for_named_split_legs(self):
+        position_config = self.get_position_config_market_long()
+        position_config.level_id = "scout"
+        executor = PositionExecutor(self.strategy, position_config)
+
+        custom_info = executor.get_custom_info()
+
+        self.assertEqual(custom_info["level_id"], "scout")
+        self.assertEqual(custom_info["role"], "scout")
 
     def test_cancel_close_order_and_process_cancel_event(self):
         position_config = self.get_position_config_market_long()
@@ -616,6 +716,29 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         market = MagicMock()
         position_executor.process_order_canceled_event("102", market, event)
         self.assertEqual(position_executor.close_type, None)
+
+    def test_process_order_failed_event_fail_closes_permanent_min_notional_open_failure(self):
+        position_config = self.get_position_config_market_long()
+        position_executor = self.get_position_executor_running_from_config(position_config)
+        position_executor._open_order = TrackedOrder("OID-BUY-1")
+
+        market = MagicMock()
+        position_executor.process_order_failed_event(
+            "102",
+            market,
+            MarketOrderFailureEvent(
+                timestamp=1640001112.223,
+                order_id="OID-BUY-1",
+                order_type=OrderType.LIMIT_MAKER,
+                error_message="Order notional 1.50 is lower than minimum notional size 5.00 for the pair ETH-USDT.",
+                error_type="ValueError",
+            ),
+        )
+
+        self.assertIsNone(position_executor._open_order)
+        self.assertEqual(position_executor.close_type, CloseType.FAILED)
+        self.assertEqual(position_executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual(position_executor._current_retries, 0)
 
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
            return_value=Decimal("101"))
@@ -646,6 +769,46 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
 
         executor = PositionExecutor(self.strategy, config)
         self.assertEqual(executor.entry_price, Decimal("101"))
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
+           return_value=Decimal("101"))
+    def test_position_executor_entry_price_limit_maker_buffers_touch_price(self, _, mock_get_trading_rules):
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_price_increment = Decimal("0.1")
+        mock_get_trading_rules.return_value = trading_rules
+        config = PositionExecutorConfig(id="test", timestamp=1234567890, trading_pair="ETH-USDT",
+                                        connector_name="binance",
+                                        side=TradeType.BUY, amount=Decimal("1"),
+                                        entry_price=Decimal("102"),
+                                        triple_barrier_config=TripleBarrierConfig(
+                                            open_order_type=OrderType.LIMIT_MAKER,
+                                            stop_loss=Decimal("0.05"), take_profit=Decimal("0.1"), time_limit=60,
+                                            take_profit_order_type=OrderType.LIMIT,
+                                            stop_loss_order_type=OrderType.MARKET))
+
+        executor = PositionExecutor(self.strategy, config)
+        self.assertEqual(executor.entry_price, Decimal("100.9"))
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
+           return_value=Decimal("101.005"))
+    def test_position_executor_entry_price_limit_maker_quantizes_off_grid_touch_price(self, _, mock_get_trading_rules):
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_price_increment = Decimal("0.01")
+        mock_get_trading_rules.return_value = trading_rules
+        config = PositionExecutorConfig(id="test", timestamp=1234567890, trading_pair="ETH-USDT",
+                                        connector_name="binance",
+                                        side=TradeType.BUY, amount=Decimal("1"),
+                                        entry_price=Decimal("102"),
+                                        triple_barrier_config=TripleBarrierConfig(
+                                            open_order_type=OrderType.LIMIT_MAKER,
+                                            stop_loss=Decimal("0.05"), take_profit=Decimal("0.1"), time_limit=60,
+                                            take_profit_order_type=OrderType.LIMIT,
+                                            stop_loss_order_type=OrderType.MARKET))
+
+        executor = PositionExecutor(self.strategy, config)
+        self.assertEqual(executor.entry_price, Decimal("101.00"))
 
     @patch.object(PositionExecutor, "_sleep")
     @patch.object(PositionExecutor, "place_close_order_and_cancel_open_orders")

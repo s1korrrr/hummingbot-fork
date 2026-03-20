@@ -46,6 +46,11 @@ class CmdlineParser(argparse.ArgumentParser):
                           required=False,
                           dest="v2_conf",
                           help="V2 strategy config file name (from conf/scripts/).")
+        self.add_argument("--config", "-c",
+                          type=str,
+                          required=False,
+                          dest="v2_conf",
+                          help="[DEPRECATED] Use --v2 instead. V2 strategy config file name (from conf/scripts/).")
         self.add_argument("--config-password", "-p",
                           type=str,
                           required=False,
@@ -249,6 +254,11 @@ async def run_application(hb: HummingbotApplication, args: argparse.Namespace, c
 
 def main():
     args = CmdlineParser().parse_args()
+
+    # Keep backward compatibility for older V2 launch commands while steering callers to the canonical flag.
+    import sys
+    if "-c" in sys.argv or "--config" in sys.argv:
+        print("WARNING: '-c/--config' is deprecated for V2 script configs. Use '--v2 <config>.yml' instead.")
 
     # Parse environment variables from Dockerfile.
     # If an environment variable is not empty and it's not defined in the arguments, then we'll use the environment

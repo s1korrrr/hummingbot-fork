@@ -467,6 +467,17 @@ class ControllerBase(RunnableBase):
         """
         return []
 
+    def get_status_summary(self) -> Dict:
+        """
+        Optional compact controller summary for multi-controller status views.
+
+        Returns:
+            dict: Small status payload used by shared strategy status rendering.
+                  Typical fields include pair/state/signal and optional display
+                  values such as price. Empty dict by default.
+        """
+        return {}
+
     def get_custom_info(self) -> dict:
         """
         Override this method to provide custom controller-specific information that will be

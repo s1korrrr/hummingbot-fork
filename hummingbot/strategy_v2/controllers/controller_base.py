@@ -473,7 +473,8 @@ class ControllerBase(RunnableBase):
 
         Returns:
             dict: Small status payload used by shared strategy status rendering.
-                  Empty dict by default.
+                  Typical fields include pair/state/signal and optional display
+                  values such as price. Empty dict by default.
         """
         return {}
 

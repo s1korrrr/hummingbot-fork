@@ -30,6 +30,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+class StrictHMMRequiredError(RuntimeError):
+    """Raised when strict HMM mode cannot use a real GaussianHMM backend."""
+
+
 # =============================================================================
 # ENUMS AND DATA CLASSES
 # =============================================================================
@@ -941,7 +945,7 @@ def analyze_multi_timeframe_trend(
 
 class MarketRegimeDetector:
     """
-    HMM-based market regime detection with rule-based fallback.
+    HMM-based market regime detection with optional strict no-fallback mode.
 
     Identifies six regimes:
     - LV_Range: Low volatility, ranging market
@@ -974,7 +978,10 @@ class MarketRegimeDetector:
         hmm_covariance_type: str = "diag",
         hmm_n_iter: int = 100,
         use_hmm: bool = True,
-        random_state: int = 42
+        random_state: int = 42,
+        require_hmm: bool = False,
+        allow_rule_based_fallback: bool = True,
+        min_hmm_samples: int = 200,
     ):
         """
         Initialize the MarketRegimeDetector.
@@ -992,6 +999,9 @@ class MarketRegimeDetector:
             hmm_n_iter: HMM fitting iterations
             use_hmm: Whether to use HMM (False = rule-based only)
             random_state: Random seed for reproducibility
+            require_hmm: When True, fail closed if a real HMM backend cannot be used
+            allow_rule_based_fallback: When False, do not silently downgrade to rule-based detection
+            min_hmm_samples: Minimum prepared samples required to fit/predict with strict HMM mode
         """
         default_features = ["log_return", "volatility", "adx", "volume_ratio"]
         self.n_states = n_hmm_states
@@ -1002,7 +1012,17 @@ class MarketRegimeDetector:
         self.trend_adx_thr = trend_adx_threshold
         self.smoothing_window = smoothing_window
         self.htf_confirm = htf_confirm
+        self.require_hmm = bool(require_hmm)
+        self.allow_rule_based_fallback = bool(allow_rule_based_fallback)
+        self.min_hmm_samples = max(60, int(min_hmm_samples))
         self.use_hmm = use_hmm and (GaussianHMM is not None)
+
+        if self.require_hmm and not use_hmm:
+            raise StrictHMMRequiredError("Strict HMM mode requires use_hmm=True.")
+        if self.require_hmm and not self.use_hmm:
+            raise StrictHMMRequiredError(
+                "Strict HMM mode requires hmmlearn/GaussianHMM. Install `hmmlearn` and `scikit-learn`."
+            )
 
         self.model = None
         if self.use_hmm:
@@ -1035,8 +1055,13 @@ class MarketRegimeDetector:
         """
         with self._fit_lock:
             df_ta, X = self._prepare(df, fit_scaler=True)
-            if X is None or len(X) < 200:
+            if X is None or len(X) < self.min_hmm_samples:
                 self._is_fit = False
+                if self.require_hmm:
+                    raise StrictHMMRequiredError(
+                        f"Strict HMM mode needs at least {self.min_hmm_samples} prepared samples; "
+                        f"received {0 if X is None else len(X)}."
+                    )
                 return
 
             self._update_vol_thresholds(df_ta['volatility'])
@@ -1048,6 +1073,8 @@ class MarketRegimeDetector:
                 self._state2label = self._auto_label_states(states, df_ta)
             else:
                 self._is_fit = False
+                if self.require_hmm:
+                    raise StrictHMMRequiredError("Strict HMM mode could not initialize a GaussianHMM model.")
 
     def detect(
         self,
@@ -1065,10 +1092,14 @@ class MarketRegimeDetector:
             MarketRegime with detection results
         """
         if df is None or df.empty:
+            if self.require_hmm and self._last is None:
+                raise StrictHMMRequiredError("Strict HMM mode requires non-empty candle data.")
             return self._last
 
         df_ta, X = self._prepare(df, fit_scaler=False)
         if df_ta is None:
+            if self.require_hmm:
+                raise StrictHMMRequiredError("Strict HMM mode could not prepare regime features from candle data.")
             return self._last
 
         last = df_ta.iloc[-1]
@@ -1106,11 +1137,17 @@ class MarketRegimeDetector:
                 prob_dict = self._probs_to_labels(pb)
                 raw, conf = self._top_label(prob_dict)
             except (ValueError, IndexError) as e:
+                if self.require_hmm or not self.allow_rule_based_fallback:
+                    raise StrictHMMRequiredError(f"HMM prediction failed: {type(e).__name__}: {e}") from e
                 logger.debug(f"HMM prediction failed, falling back to rule-based: {e}")
                 raw = None
+        elif self.require_hmm:
+            raise StrictHMMRequiredError("Strict HMM mode requires a fitted GaussianHMM before detection.")
 
         # Fallback to rule-based
         if raw is None:
+            if self.require_hmm or not self.allow_rule_based_fallback:
+                raise StrictHMMRequiredError("Strict HMM mode disallows rule-based regime fallback.")
             if is_trend:
                 if tdir == 1:
                     raw = "HV_Trend_Up" if vol_lvl == "high" else "LV_Trend_Up"

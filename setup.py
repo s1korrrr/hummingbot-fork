@@ -70,6 +70,7 @@ def main():
         "ruamel.yaml>=0.2.5",
         "safe-pysha3",
         "scalecodec",
+        "scikit-learn>=1.5.2",
         "scipy>=1.11.1",
         "six>=1.16.0",
         "sqlalchemy>=1.4.49",
@@ -81,6 +82,7 @@ def main():
         "web3",
         "xrpl-py>=4.4.0",
         "PyYaml>=0.2.5",
+        "hmmlearn>=0.3.3",
     ]
 
     # --- 1. Define Flags (But don't pass them to Cython yet) ---

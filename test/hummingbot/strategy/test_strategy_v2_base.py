@@ -3,6 +3,7 @@ import types
 import unittest
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -479,6 +480,196 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertIn("$100.00", status)  # Check for performance data in the summary table
         self.assertIn("$50.00", status)
         self.assertIn("$150.00", status)
+
+    def test_format_status_includes_controller_summary_price(self):
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+
+        controller_mock = MagicMock()
+        controller_mock.to_format_status.return_value = ["Mock status for controller"]
+        controller_mock.get_status_summary.return_value = {
+            "pair": "ETH-USDC",
+            "price": "2191.5",
+            "state": "ENTERING",
+            "signal": "BUY",
+            "score": "3/3",
+            "regime": "HV-down",
+            "avg_buy": "2188.0",
+            "exposure": "$0/$500 (0%)",
+            "execs": "B0 S0 H0",
+            "u_pnl": "n/a",
+            "gate": "ready",
+            "note": "monitoring",
+            "attention_score": 10,
+        }
+        self.strategy.controllers = {"controller_1": controller_mock}
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [],
+                "positions": [],
+                "performance": None,
+            }
+        }
+
+        status = self.strategy.format_status()
+
+        self.assertIn("CONTROLLERS SUMMARY", status)
+        self.assertIn("price", status)
+        self.assertIn("2191.5", status)
+        self.assertIn("ETH-USDC", status)
+        self.assertIn("breakeven", status)
+        self.assertIn("u%", status)
+        self.assertIn("2188", status)
+
+    def test_format_status_surfaces_focus_queue_and_active_executor_pnl(self):
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+
+        controller_mock = MagicMock()
+        controller_mock.to_format_status.return_value = ["Mock status for controller"]
+        controller_mock.get_status_summary.return_value = {
+            "pair": "ETH-USDC",
+            "price": "2191.5",
+            "state": "BUILDING",
+            "signal": "BUY",
+            "score": "3/3",
+            "regime": "HV-down",
+            "avg_buy": "2188.0",
+            "exposure": "$50/$500 (10%)",
+            "execs": "B1 S0 H1",
+            "u_pnl": "n/a",
+            "gate": "ready",
+            "note": "1 buy active",
+            "attention_score": 90,
+        }
+        self.strategy.controllers = {"controller_1": controller_mock}
+
+        mock_report_controller_1 = self.create_mock_performance_report()
+        active_executor = ExecutorInfo(
+            id="exec-active",
+            controller_id="controller_1",
+            type="position_executor",
+            status=RunnableStatus.RUNNING,
+            timestamp=1234567890,
+            config=self.get_position_config_market_short(),
+            net_pnl_pct=Decimal("0.025"),
+            net_pnl_quote=Decimal("12.50"),
+            cum_fees_quote=Decimal("0"),
+            filled_amount_quote=Decimal("250"),
+            is_active=True,
+            is_trading=True,
+            custom_info={},
+        )
+
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [active_executor],
+                "positions": [],
+                "performance": mock_report_controller_1,
+            }
+        }
+
+        status = self.strategy.format_status()
+
+        self.assertIn("Focus Queue (attention):", status)
+        self.assertIn("ETH-USDC | 1 buy active", status)
+        self.assertNotIn("uPnL $50.00 / 5.00%", status)
+        self.assertNotIn("gPnL $150.00 / 15.00%", status)
+        self.assertIn("ACTIVE EXECUTORS (1)", status)
+        self.assertIn("ETH-USDC", status)
+        self.assertIn("$12.50 / 2.50%", status)
+        self.assertIn("$250.00", status)
+        self.assertIn("PERFORMANCE SUMMARY", status)
+        self.assertIn("$150.00", status)
+
+    def test_format_status_surfaces_positions_once_for_all_pairs(self):
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+
+        controller_1 = MagicMock()
+        controller_1.to_format_status.return_value = ["Controller 1 status"]
+        controller_1.get_status_summary.return_value = {
+            "pair": "ETH-USDC",
+            "price": "2191.5",
+            "state": "HOLDING",
+            "signal": "NEUTRAL",
+            "score": "0/3",
+            "regime": "HV-down",
+            "avg_buy": "2188",
+            "exposure": "$25/$500 (5%)",
+            "execs": "B0 S0 H1",
+            "u_pnl": "$5.00 / 1.25%",
+            "u_pnl_pct": "1.25%",
+            "gate": "ready",
+            "note": "held bags 1",
+            "attention_score": 50,
+        }
+        controller_2 = MagicMock()
+        controller_2.to_format_status.return_value = ["Controller 2 status"]
+        controller_2.get_status_summary.return_value = {
+            "pair": "BTC-USDC",
+            "price": "68000",
+            "state": "HOLDING",
+            "signal": "NEUTRAL",
+            "score": "0/3",
+            "regime": "HV-down",
+            "avg_buy": "67000",
+            "exposure": "$20/$500 (4%)",
+            "execs": "B0 S0 H1",
+            "u_pnl": "$2.00 / 0.50%",
+            "u_pnl_pct": "0.50%",
+            "gate": "ready",
+            "note": "held bags 1",
+            "attention_score": 45,
+        }
+        self.strategy.controllers = {"controller_1": controller_1, "controller_2": controller_2}
+
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [],
+                "positions": [
+                    SimpleNamespace(
+                        connector_name="binance",
+                        trading_pair="ETH-USDC",
+                        side=TradeType.BUY,
+                        amount=Decimal("0.0100"),
+                        breakeven_price=Decimal("2188"),
+                        unrealized_pnl_quote=Decimal("5"),
+                        realized_pnl_quote=Decimal("0"),
+                        cum_fees_quote=Decimal("0.20"),
+                    )
+                ],
+                "performance": None,
+            },
+            "controller_2": {
+                "executors": [],
+                "positions": [
+                    SimpleNamespace(
+                        connector_name="binance",
+                        trading_pair="BTC-USDC",
+                        side=TradeType.BUY,
+                        amount=Decimal("0.0003"),
+                        breakeven_price=Decimal("67000"),
+                        unrealized_pnl_quote=Decimal("2"),
+                        realized_pnl_quote=Decimal("0"),
+                        cum_fees_quote=Decimal("0.10"),
+                    )
+                ],
+                "performance": None,
+            },
+        }
+
+        status = self.strategy.format_status()
+
+        self.assertIn("POSITIONS HELD (2)", status)
+        self.assertEqual(status.count("POSITIONS HELD"), 1)
+        self.assertIn("ETH-USDC", status)
+        self.assertIn("BTC-USDC", status)
+        self.assertIn("breakeven", status)
+        self.assertNotIn("No positions held.", status)
 
     def test_format_status_handles_controller_formatter_exception(self):
         self.strategy.ready_to_trade = True

@@ -717,6 +717,29 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         position_executor.process_order_canceled_event("102", market, event)
         self.assertEqual(position_executor.close_type, None)
 
+    def test_process_order_failed_event_fail_closes_permanent_min_notional_open_failure(self):
+        position_config = self.get_position_config_market_long()
+        position_executor = self.get_position_executor_running_from_config(position_config)
+        position_executor._open_order = TrackedOrder("OID-BUY-1")
+
+        market = MagicMock()
+        position_executor.process_order_failed_event(
+            "102",
+            market,
+            MarketOrderFailureEvent(
+                timestamp=1640001112.223,
+                order_id="OID-BUY-1",
+                order_type=OrderType.LIMIT_MAKER,
+                error_message="Order notional 1.50 is lower than minimum notional size 5.00 for the pair ETH-USDT.",
+                error_type="ValueError",
+            ),
+        )
+
+        self.assertIsNone(position_executor._open_order)
+        self.assertEqual(position_executor.close_type, CloseType.FAILED)
+        self.assertEqual(position_executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual(position_executor._current_retries, 0)
+
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
            return_value=Decimal("101"))
     def test_position_executor_created_without_entry_price(self, _):
@@ -746,6 +769,46 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
 
         executor = PositionExecutor(self.strategy, config)
         self.assertEqual(executor.entry_price, Decimal("101"))
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
+           return_value=Decimal("101"))
+    def test_position_executor_entry_price_limit_maker_buffers_touch_price(self, _, mock_get_trading_rules):
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_price_increment = Decimal("0.1")
+        mock_get_trading_rules.return_value = trading_rules
+        config = PositionExecutorConfig(id="test", timestamp=1234567890, trading_pair="ETH-USDT",
+                                        connector_name="binance",
+                                        side=TradeType.BUY, amount=Decimal("1"),
+                                        entry_price=Decimal("102"),
+                                        triple_barrier_config=TripleBarrierConfig(
+                                            open_order_type=OrderType.LIMIT_MAKER,
+                                            stop_loss=Decimal("0.05"), take_profit=Decimal("0.1"), time_limit=60,
+                                            take_profit_order_type=OrderType.LIMIT,
+                                            stop_loss_order_type=OrderType.MARKET))
+
+        executor = PositionExecutor(self.strategy, config)
+        self.assertEqual(executor.entry_price, Decimal("100.9"))
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
+           return_value=Decimal("101.005"))
+    def test_position_executor_entry_price_limit_maker_quantizes_off_grid_touch_price(self, _, mock_get_trading_rules):
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_price_increment = Decimal("0.01")
+        mock_get_trading_rules.return_value = trading_rules
+        config = PositionExecutorConfig(id="test", timestamp=1234567890, trading_pair="ETH-USDT",
+                                        connector_name="binance",
+                                        side=TradeType.BUY, amount=Decimal("1"),
+                                        entry_price=Decimal("102"),
+                                        triple_barrier_config=TripleBarrierConfig(
+                                            open_order_type=OrderType.LIMIT_MAKER,
+                                            stop_loss=Decimal("0.05"), take_profit=Decimal("0.1"), time_limit=60,
+                                            take_profit_order_type=OrderType.LIMIT,
+                                            stop_loss_order_type=OrderType.MARKET))
+
+        executor = PositionExecutor(self.strategy, config)
+        self.assertEqual(executor.entry_price, Decimal("101.00"))
 
     @patch.object(PositionExecutor, "_sleep")
     @patch.object(PositionExecutor, "place_close_order_and_cancel_open_orders")

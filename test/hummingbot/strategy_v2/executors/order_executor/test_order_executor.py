@@ -231,6 +231,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
 
         custom_info = executor.get_custom_info()
         self.assertEqual(custom_info["level_id"], None)
+        self.assertEqual(custom_info["side"], TradeType.BUY)
         self.assertEqual(custom_info["current_retries"], 0)
         self.assertEqual(custom_info["max_retries"], 10)
         self.assertEqual(custom_info["order_id"], "OID-INFO")
@@ -618,6 +619,25 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         # For buy orders: min(config_price, current_price)
         self.assertEqual(price, Decimal("100"))
 
+    @patch.object(OrderExecutor, 'get_trading_rules')
+    @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
+    def test_get_order_price_limit_maker_buy_buffers_touch_price(self, mock_current_market_price, mock_get_trading_rules):
+        mock_current_market_price.return_value = Decimal("120")
+        mock_get_trading_rules.return_value = MagicMock(min_price_increment=Decimal("0.1"))
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.BUY,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("1"),
+            price=Decimal("130"),
+            execution_strategy=ExecutionStrategy.LIMIT_MAKER
+        )
+        executor = self.get_order_executor_from_config(config)
+        price = executor.get_order_price()
+        self.assertEqual(price, Decimal("119.9"))
+
     @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
     def test_get_order_price_limit_maker_sell(self, mock_current_market_price):
         mock_current_market_price.return_value = Decimal("120")
@@ -635,6 +655,44 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         price = executor.get_order_price()
         # For sell orders: max(config_price, current_price)
         self.assertEqual(price, Decimal("120"))
+
+    @patch.object(OrderExecutor, 'get_trading_rules')
+    @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
+    def test_get_order_price_limit_maker_sell_buffers_touch_price(self, mock_current_market_price, mock_get_trading_rules):
+        mock_current_market_price.return_value = Decimal("120")
+        mock_get_trading_rules.return_value = MagicMock(min_price_increment=Decimal("0.1"))
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.SELL,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            execution_strategy=ExecutionStrategy.LIMIT_MAKER
+        )
+        executor = self.get_order_executor_from_config(config)
+        price = executor.get_order_price()
+        self.assertEqual(price, Decimal("120.1"))
+
+    @patch.object(OrderExecutor, 'get_trading_rules')
+    @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
+    def test_get_order_price_limit_maker_sell_quantizes_off_grid_touch_price(self, mock_current_market_price, mock_get_trading_rules):
+        mock_current_market_price.return_value = Decimal("120.005")
+        mock_get_trading_rules.return_value = MagicMock(min_price_increment=Decimal("0.01"))
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.SELL,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            execution_strategy=ExecutionStrategy.LIMIT_MAKER
+        )
+        executor = self.get_order_executor_from_config(config)
+        price = executor.get_order_price()
+        self.assertEqual(price, Decimal("120.01"))
 
     @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
     def test_get_order_price_limit(self, mock_current_market_price):

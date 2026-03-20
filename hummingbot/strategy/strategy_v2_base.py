@@ -548,27 +548,25 @@ class StrategyV2Base(StrategyPyBase):
         if self.controllers:
             # Controller sections
             performance_data = []
+            global_realized = Decimal("0")
+            global_unrealized = Decimal("0")
+            global_total = Decimal("0")
+            global_volume = Decimal("0")
             controller_entries = self._build_controller_status_entries()
             lines.extend(self._controller_summary_lines(controller_entries))
             lines.extend(self._controller_attention_lines(controller_entries))
+            lines.extend(self._active_executor_lines(controller_entries))
+            lines.extend(self._positions_summary_lines(controller_entries))
 
             for entry in controller_entries:
                 controller_id = entry["controller_id"]
                 controller = entry["controller"]
-                controller_summary = entry["summary"]
                 executors_list = entry["executors"]
-                positions = entry["positions"]
                 performance_report = entry["performance"]
 
                 lines.append(f"\n{'=' * 60}")
                 lines.append(self._controller_section_header(entry))
                 lines.append(f"{'=' * 60}")
-                if controller_summary.get("note") not in ("", "monitoring"):
-                    lines.append(
-                        f"Focus: {controller_summary.get('note')} | "
-                        f"Exposure {controller_summary.get('exposure', 'n/a')} | "
-                        f"Gate {controller_summary.get('gate', 'n/a')}"
-                    )
 
                 # Controller status
                 try:
@@ -577,45 +575,29 @@ class StrategyV2Base(StrategyPyBase):
                     self.logger().error(f"Error formatting status for controller {controller_id}: {e}", exc_info=True)
                     lines.extend(self._controller_status_error_lines(controller_id, e))
 
-                # Recent executors table
-                if executors_list:
+                active_executors = [executor for executor in executors_list if executor.is_active]
+                if active_executors:
                     lines.append("\n  🕘 Recent Executors (Last 3):")
-                    # Sort by timestamp and take the most recent rows
-                    recent_executors = sorted(executors_list, key=lambda x: x.timestamp, reverse=True)[:3]
+                    recent_executors = sorted(active_executors, key=lambda x: x.timestamp, reverse=True)[:3]
                     lines.extend(self._format_recent_executor_lines(recent_executors))
-                else:
-                    lines.append("  No executors found.")
-
-                # Positions table
-                if positions:
-                    lines.append("\n  Positions Held:")
-                    positions_data = []
-                    for pos in positions:
-                        positions_data.append({
-                            "Connector": pos.connector_name,
-                            "Trading Pair": pos.trading_pair,
-                            "Side": pos.side.name,
-                            "Amount": f"{pos.amount:.4f}",
-                            "Value (USD)": f"${pos.amount * pos.breakeven_price:.2f}",
-                            "Breakeven Price": f"{pos.breakeven_price:.6f}",
-                            "Unrealized PnL": f"${pos.unrealized_pnl_quote:+.2f}",
-                            "Realized PnL": f"${pos.realized_pnl_quote:+.2f}",
-                            "Fees": f"${pos.cum_fees_quote:.2f}"
-                        })
-                    positions_df = pd.DataFrame(positions_data)
-                    lines.append(format_df_for_printout(positions_df, table_format="psql", index=False))
-                else:
-                    lines.append("  No positions held.")
 
                 # Collect performance data for summary table
                 if performance_report:
+                    realized_pnl_quote = self._safe_decimal(getattr(performance_report, "realized_pnl_quote", 0))
+                    unrealized_pnl_quote = self._safe_decimal(getattr(performance_report, "unrealized_pnl_quote", 0))
+                    global_pnl_quote = self._safe_decimal(getattr(performance_report, "global_pnl_quote", 0))
+                    volume_traded = self._safe_decimal(getattr(performance_report, "volume_traded", 0))
+                    global_realized += realized_pnl_quote
+                    global_unrealized += unrealized_pnl_quote
+                    global_total += global_pnl_quote
+                    global_volume += volume_traded
                     performance_data.append({
                         "Controller": controller_id,
-                        "Realized PnL": f"${performance_report.realized_pnl_quote:.2f}",
-                        "Unrealized PnL": f"${performance_report.unrealized_pnl_quote:.2f}",
-                        "Global PnL": f"${performance_report.global_pnl_quote:.2f}",
-                        "Global PnL %": f"{performance_report.global_pnl_pct:.2f}%",
-                        "Volume Traded": f"${performance_report.volume_traded:.2f}"
+                        "Realized PnL": f"${realized_pnl_quote:.2f}",
+                        "Unrealized PnL": f"${unrealized_pnl_quote:.2f}",
+                        "Global PnL": f"${global_pnl_quote:.2f}",
+                        "Global PnL %": f"{self._safe_decimal(getattr(performance_report, 'global_pnl_pct', 0)):.2f}%",
+                        "Volume Traded": f"${volume_traded:.2f}"
                     })
 
             # Performance summary table
@@ -624,11 +606,6 @@ class StrategyV2Base(StrategyPyBase):
                 lines.append("PERFORMANCE SUMMARY")
                 lines.append(f"{'=' * 80}")
 
-                # Calculate global totals
-                global_realized = sum(Decimal(p["Realized PnL"].replace("$", "")) for p in performance_data)
-                global_unrealized = sum(Decimal(p["Unrealized PnL"].replace("$", "")) for p in performance_data)
-                global_total = global_realized + global_unrealized
-                global_volume = sum(Decimal(p["Volume Traded"].replace("$", "")) for p in performance_data)
                 global_pnl_pct = (global_total / global_volume) * 100 if global_volume > 0 else Decimal(0)
 
                 # Add global row
@@ -905,13 +882,16 @@ class StrategyV2Base(StrategyPyBase):
         normalized_summary = {
             "controller_id": controller_id,
             "pair": trading_pair,
+            "price": summary.get("price", "n/a"),
             "state": summary.get("state", "n/a"),
             "signal": summary.get("signal", "n/a"),
             "score": summary.get("score", "n/a"),
             "regime": summary.get("regime", "n/a"),
+            "avg_buy": summary.get("avg_buy", "n/a"),
             "exposure": summary.get("exposure", "n/a"),
             "execs": summary.get("execs", "n/a"),
             "u_pnl": summary.get("u_pnl", "n/a"),
+            "u_pnl_pct": summary.get("u_pnl_pct", "n/a"),
             "gate": summary.get("gate", "n/a"),
             "note": summary.get("note", ""),
             "attention_score": summary.get("attention_score", 0),
@@ -921,13 +901,23 @@ class StrategyV2Base(StrategyPyBase):
     def _build_controller_status_entries(self) -> List[Dict[str, Any]]:
         entries: List[Dict[str, Any]] = []
         for controller_id, controller in self.controllers.items():
+            executors = self.get_executors_by_controller(controller_id)
+            positions = self.get_positions_by_controller(controller_id)
+            performance = self.get_performance_report(controller_id)
+            summary = self._safe_controller_status_summary(controller_id, controller)
+            summary = self._enrich_controller_status_summary(
+                summary=summary,
+                executors=executors,
+                positions=positions,
+                performance=performance,
+            )
             entries.append({
                 "controller_id": controller_id,
                 "controller": controller,
-                "summary": self._safe_controller_status_summary(controller_id, controller),
-                "executors": self.get_executors_by_controller(controller_id),
-                "positions": self.get_positions_by_controller(controller_id),
-                "performance": self.get_performance_report(controller_id),
+                "summary": summary,
+                "executors": executors,
+                "positions": positions,
+                "performance": performance,
             })
         entries.sort(
             key=lambda entry: (
@@ -939,6 +929,82 @@ class StrategyV2Base(StrategyPyBase):
         return entries
 
     @staticmethod
+    def _safe_decimal(value: Any) -> Decimal:
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return Decimal("0")
+
+    @classmethod
+    def _format_summary_quote(cls, value: Any) -> str:
+        return f"${cls._safe_decimal(value):.2f}"
+
+    @classmethod
+    def _format_summary_quote_pct(cls, quote_value: Any, pct_value: Any) -> str:
+        quote = cls._format_summary_quote(quote_value)
+        try:
+            pct = f"{cls._safe_decimal(pct_value):.2f}%"
+        except Exception:
+            pct = "n/a"
+        return f"{quote} / {pct}"
+
+    @classmethod
+    def _enrich_controller_status_summary(
+        cls,
+        *,
+        summary: Dict[str, Any],
+        executors: List[ExecutorInfo],
+        positions: List[PositionSummary],
+        performance: Any,
+    ) -> Dict[str, Any]:
+        enriched = dict(summary)
+        active_executors = [executor for executor in executors if executor.is_active]
+        active_buy_execs = sum(
+            1
+            for executor in active_executors
+            if cls._compact_side_label(executor.side or getattr(executor.config, "side", None)) == "BUY"
+        )
+        active_sell_execs = sum(
+            1
+            for executor in active_executors
+            if cls._compact_side_label(executor.side or getattr(executor.config, "side", None)) == "SELL"
+        )
+        held_positions = sum(1 for position in positions if getattr(position, "amount", Decimal("0")) > 0)
+
+        if performance is not None:
+            realized_pnl_quote = cls._safe_decimal(getattr(performance, "realized_pnl_quote", 0))
+            unrealized_pnl_quote = cls._safe_decimal(getattr(performance, "unrealized_pnl_quote", 0))
+            unrealized_pnl_pct = getattr(performance, "unrealized_pnl_pct", None)
+            global_pnl_quote = cls._safe_decimal(getattr(performance, "global_pnl_quote", 0))
+            global_pnl_pct = getattr(performance, "global_pnl_pct", None)
+        else:
+            realized_pnl_quote = sum((cls._safe_decimal(position.realized_pnl_quote) for position in positions), Decimal("0"))
+            unrealized_pnl_quote = sum((cls._safe_decimal(position.unrealized_pnl_quote) for position in positions), Decimal("0"))
+            global_pnl_quote = sum((cls._position_global_pnl_quote(position) for position in positions), Decimal("0"))
+            unrealized_pnl_pct = None
+            global_pnl_pct = None
+
+        focus_note = enriched.get("note", "")
+        enriched["focus"] = focus_note
+        enriched["execs"] = f"A{len(active_executors)} | B{active_buy_execs} S{active_sell_execs} H{held_positions}"
+        enriched["r_pnl"] = cls._format_summary_quote(realized_pnl_quote)
+        enriched["u_pnl"] = cls._format_summary_quote_pct(unrealized_pnl_quote, unrealized_pnl_pct)
+        enriched["u_pnl_pct"] = f"{cls._safe_decimal(unrealized_pnl_pct):.2f}%" if unrealized_pnl_pct is not None else enriched.get("u_pnl_pct", "n/a")
+        enriched["g_pnl"] = cls._format_summary_quote_pct(global_pnl_quote, global_pnl_pct)
+        return enriched
+
+    @classmethod
+    def _position_global_pnl_quote(cls, position: Any) -> Decimal:
+        global_pnl = getattr(position, "global_pnl_quote", None)
+        if global_pnl is not None:
+            return cls._safe_decimal(global_pnl)
+        return (
+            cls._safe_decimal(getattr(position, "unrealized_pnl_quote", 0))
+            + cls._safe_decimal(getattr(position, "realized_pnl_quote", 0))
+            - cls._safe_decimal(getattr(position, "cum_fees_quote", 0))
+        )
+
+    @staticmethod
     def _controller_summary_lines(controller_entries: List[Dict[str, Any]]) -> List[str]:
         if len(controller_entries) == 0:
             return []
@@ -948,15 +1014,15 @@ class StrategyV2Base(StrategyPyBase):
             summary = entry["summary"]
             summary_rows.append({
                 "pair": summary.get("pair", entry["controller_id"]),
+                "price": summary.get("price", "n/a"),
                 "state": summary.get("state", "n/a"),
                 "signal": summary.get("signal", "n/a"),
                 "score": summary.get("score", "n/a"),
-                "regime": summary.get("regime", "n/a"),
-                "exposure": summary.get("exposure", "n/a"),
+                "breakeven": summary.get("avg_buy", "n/a"),
+                "u%": summary.get("u_pnl_pct", "n/a"),
                 "execs": summary.get("execs", "n/a"),
-                "uPnL": summary.get("u_pnl", "n/a"),
+                "exposure": summary.get("exposure", "n/a"),
                 "gate": summary.get("gate", "n/a"),
-                "note": summary.get("note", ""),
             })
 
         summary_df = pd.DataFrame(summary_rows)
@@ -978,14 +1044,75 @@ class StrategyV2Base(StrategyPyBase):
         if len(attention_entries) == 0:
             return []
 
-        lines = ["", "Priority Queue:"]
+        lines = ["", "Focus Queue (attention):"]
         for entry in attention_entries[:5]:
             summary = entry["summary"]
             lines.append(
                 f"  • {summary.get('pair', entry['controller_id'])} | "
-                f"{summary.get('state', 'n/a')} | {summary.get('note', '')}"
+                f"{summary.get('focus', '')}"
             )
         return lines
+
+    def _active_executor_lines(self, controller_entries: List[Dict[str, Any]]) -> List[str]:
+        active_rows: List[Dict[str, Any]] = []
+        for entry in controller_entries:
+            pair = entry["summary"].get("pair", entry["controller_id"])
+            for executor in entry["executors"]:
+                if not executor.is_active:
+                    continue
+                side = self._compact_side_label(executor.side or getattr(executor.config, "side", None)) or "n/a"
+                executor_type = self._compact_executor_type(executor.type)
+                status_label = self._compact_enum_label(executor.status) or "unknown"
+                active_rows.append({
+                    "pair": pair,
+                    "side": side,
+                    "type": executor_type,
+                    "status": status_label,
+                    "age": self._format_executor_age_short(executor.timestamp),
+                    "PnL": self._format_summary_quote_pct(executor.net_pnl_quote, self._safe_decimal(executor.net_pnl_pct) * Decimal("100")),
+                    "Fill": self._format_summary_quote(executor.filled_amount_quote),
+                })
+
+        if len(active_rows) == 0:
+            return []
+
+        active_df = pd.DataFrame(active_rows)
+        return [
+            f"\n{'=' * 110}",
+            f"ACTIVE EXECUTORS ({len(active_rows)})",
+            f"{'=' * 110}",
+            format_df_for_printout(active_df, table_format="psql", index=False),
+        ]
+
+    @classmethod
+    def _positions_summary_lines(cls, controller_entries: List[Dict[str, Any]]) -> List[str]:
+        position_rows: List[Dict[str, Any]] = []
+        for entry in controller_entries:
+            pair = entry["summary"].get("pair", entry["controller_id"])
+            controller_id = entry["controller_id"]
+            for position in entry["positions"]:
+                position_rows.append({
+                    "controller": controller_id,
+                    "pair": pair,
+                    "side": getattr(position.side, "name", str(position.side)),
+                    "amount": f"{position.amount:.4f}",
+                    "value": f"${position.amount * position.breakeven_price:.2f}",
+                    "breakeven": f"{position.breakeven_price:.6f}",
+                    "uPnL": f"${position.unrealized_pnl_quote:+.2f}",
+                    "rPnL": f"${position.realized_pnl_quote:+.2f}",
+                    "fees": f"${position.cum_fees_quote:.2f}",
+                })
+
+        if len(position_rows) == 0:
+            return []
+
+        positions_df = pd.DataFrame(position_rows)
+        return [
+            f"\n{'=' * 110}",
+            f"POSITIONS HELD ({len(position_rows)})",
+            f"{'=' * 110}",
+            format_df_for_printout(positions_df, table_format="psql", index=False),
+        ]
 
     @staticmethod
     def _controller_section_header(entry: Dict[str, Any]) -> str:

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Dict, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
@@ -166,6 +166,27 @@ class OrderExecutor(ExecutorBase):
         else:
             return OrderType.LIMIT
 
+    def _maker_price_buffer(self, candidate_price: Decimal, touch_price: Decimal) -> Decimal:
+        try:
+            trading_rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+            tick_size = Decimal(str(getattr(trading_rules, "min_price_increment", "0")))
+        except Exception:
+            tick_size = Decimal("0")
+
+        # Ignore placeholder/default quanta from incomplete rule objects.
+        if tick_size <= Decimal("0") or tick_size < Decimal("1e-18"):
+            return candidate_price
+
+        rounding = ROUND_FLOOR if self.config.side == TradeType.BUY else ROUND_CEILING
+        aligned_price = (candidate_price / tick_size).to_integral_value(rounding=rounding) * tick_size
+
+        if self.config.side == TradeType.BUY and aligned_price >= touch_price:
+            adjusted_price = aligned_price - tick_size
+            return adjusted_price if adjusted_price > Decimal("0") else aligned_price
+        if self.config.side == TradeType.SELL and aligned_price <= touch_price:
+            return aligned_price + tick_size
+        return aligned_price
+
     def get_order_price(self) -> Decimal:
         """
         Get the order price based on the execution strategy.
@@ -180,10 +201,12 @@ class OrderExecutor(ExecutorBase):
             else:
                 return self.current_market_price * (Decimal("1") + self.config.chaser_config.distance)
         elif self.config.execution_strategy == ExecutionStrategy.LIMIT_MAKER:
+            touch_price = self.current_market_price
             if self.config.side == TradeType.BUY:
-                return min(self.config.price, self.current_market_price)
+                candidate_price = min(self.config.price, touch_price)
             else:
-                return max(self.config.price, self.current_market_price)
+                candidate_price = max(self.config.price, touch_price)
+            return self._maker_price_buffer(candidate_price, touch_price)
         else:
             return self.config.price
 
@@ -286,6 +309,7 @@ class OrderExecutor(ExecutorBase):
         """
         return {
             "level_id": self.config.level_id,
+            "side": self.config.side,
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,
             "order_id": self._order.order_id if self._order else None,

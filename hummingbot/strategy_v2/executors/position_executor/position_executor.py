@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
@@ -50,6 +50,26 @@ class PositionExecutor(ExecutorBase):
             return decimal_value if decimal_value.is_finite() else None
         except Exception:
             return None
+
+    def _maker_price_buffer(self, candidate_price: Decimal, touch_price: Decimal) -> Decimal:
+        try:
+            tick_size = Decimal(str(getattr(self.trading_rules, "min_price_increment", "0")))
+        except Exception:
+            tick_size = Decimal("0")
+
+        # Ignore placeholder/default quanta from incomplete rule objects.
+        if tick_size <= Decimal("0") or tick_size < Decimal("1e-18"):
+            return candidate_price
+
+        rounding = ROUND_FLOOR if self.config.side == TradeType.BUY else ROUND_CEILING
+        aligned_price = (candidate_price / tick_size).to_integral_value(rounding=rounding) * tick_size
+
+        if self.config.side == TradeType.BUY and aligned_price >= touch_price:
+            adjusted_price = aligned_price - tick_size
+            return adjusted_price if adjusted_price > Decimal("0") else aligned_price
+        if self.config.side == TradeType.SELL and aligned_price <= touch_price:
+            return aligned_price + tick_size
+        return aligned_price
 
     def __init__(self, strategy: StrategyV2Base, config: PositionExecutorConfig,
                  update_interval: float = 1.0, max_retries: int = 10):
@@ -212,10 +232,12 @@ class PositionExecutor(ExecutorBase):
         elif self.config.triple_barrier_config.open_order_type == OrderType.LIMIT_MAKER:
             if self.config.side == TradeType.BUY:
                 best_bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
-                return min(self.config.entry_price, best_bid)
+                candidate_price = min(self.config.entry_price, best_bid)
             else:
                 best_ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
-                return max(self.config.entry_price, best_ask)
+                candidate_price = max(self.config.entry_price, best_ask)
+            touch_price = best_bid if self.config.side == TradeType.BUY else best_ask
+            return self._maker_price_buffer(candidate_price, touch_price)
         else:
             return self.config.entry_price
 
@@ -826,6 +848,17 @@ class PositionExecutor(ExecutorBase):
         if self._open_order and event.order_id == self._open_order.order_id:
             self._failed_orders.append(self._open_order)
             self._open_order = None
+            if self._is_permanent_validation_failure(event):
+                self.logger().error(
+                    self._log_message(
+                        f"Open order failed permanently order_id={event.order_id}. "
+                        f"error_type={getattr(event, 'error_type', 'unknown')} "
+                        f"error_message={getattr(event, 'error_message', 'n/a')}"
+                    )
+                )
+                self.close_type = CloseType.FAILED
+                self.stop()
+                return
             self.logger().error(
                 self._log_message(
                     f"Open order failed order_id={event.order_id}. "
@@ -852,6 +885,22 @@ class PositionExecutor(ExecutorBase):
                     f"Retrying {self._current_retries}/{self._max_retries}"
                 )
             )
+
+    @staticmethod
+    def _is_permanent_validation_failure(event: MarketOrderFailureEvent) -> bool:
+        error_type = str(getattr(event, "error_type", "") or "").lower()
+        error_message = str(getattr(event, "error_message", "") or "").lower()
+        if not error_message:
+            return False
+        permanent_markers = (
+            "minimum notional size",
+            "minimum order size",
+            "lower than minimum",
+            "order value is lower than minimum",
+        )
+        if error_type and error_type != "valueerror":
+            return False
+        return any(marker in error_message for marker in permanent_markers)
 
     def get_custom_info(self) -> Dict:
         level_id = self.config.level_id

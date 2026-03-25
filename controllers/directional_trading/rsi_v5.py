@@ -42,7 +42,11 @@ from hummingbot.strategy_v2.controllers.directional_trading_controller_base impo
     DirectionalTradingControllerBase,
     DirectionalTradingControllerConfigBase,
 )
-from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
+from hummingbot.strategy_v2.executors.order_executor.data_types import (
+    ExecutionStrategy,
+    LimitChaserConfig,
+    OrderExecutorConfig,
+)
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
     TrailingStop,
@@ -50,6 +54,7 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
 )
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
+from hummingbot.strategy_v2.utils.common import parse_enum_value
 from hummingbot.strategy_v2.utils.market_analysis import (
     MarketRegime,
     MarketRegimeDetector,
@@ -164,6 +169,13 @@ class BuyConfirmationSetup:
     armed_timestamp: float
     trough_rsi: float
     trough_price: float
+    armed_signal_score: int = 0
+    armed_min_signal_score: int = 0
+
+    def score_qualified(self) -> bool:
+        if self.armed_min_signal_score <= 0:
+            return True
+        return self.armed_signal_score >= self.armed_min_signal_score
 
 
 @dataclass
@@ -234,6 +246,9 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     recovery_trail_pullback_pct: float = Field(default=0.0035, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery trailing pullback pct:", prompt_on_new=False, is_updatable=True))
     recovery_rsi_rollover_delta: float = Field(default=2.0, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery RSI rollover delta:", prompt_on_new=False, is_updatable=True))
     recovery_cancel_stale_order_pct: float = Field(default=0.0025, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery stale-order cancel pct:", prompt_on_new=False, is_updatable=True))
+    recovery_sell_execution_strategy: ExecutionStrategy = Field(default=ExecutionStrategy.LIMIT_CHASER, client_data=ClientFieldData(prompt=lambda mi: "Recovery sell execution strategy (LIMIT/LIMIT_MAKER/LIMIT_CHASER/MARKET):", prompt_on_new=False, is_updatable=True))
+    recovery_limit_chaser_distance_pct: Decimal = Field(default=Decimal("0.002"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Recovery limit chaser distance pct:", prompt_on_new=False, is_updatable=True))
+    recovery_limit_chaser_refresh_threshold_pct: Decimal = Field(default=Decimal("0.003"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Recovery limit chaser refresh threshold pct:", prompt_on_new=False, is_updatable=True))
     recovery_partial_exit_fraction: float = Field(default=0.5, gt=0.0, le=1.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery partial exit fraction:", prompt_on_new=False, is_updatable=True))
 
     # --- Core indicators ---
@@ -277,6 +292,8 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     use_trailing_exit: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Use trailing exit?:", prompt_on_new=False, is_updatable=True))
     trailing_activation_pct: float = Field(default=0.047, client_data=ClientFieldData(prompt=lambda mi: "Trailing activation pct:", prompt_on_new=False, is_updatable=True))
     trailing_delta_pct: float = Field(default=0.034, client_data=ClientFieldData(prompt=lambda mi: "Trailing delta pct:", prompt_on_new=False, is_updatable=True))
+    trailing_stop_order_type: OrderType = Field(default=OrderType.LIMIT, client_data=ClientFieldData(prompt=lambda mi: "Trailing close order type (LIMIT/MARKET):", prompt_on_new=False, is_updatable=True))
+    trailing_stop_limit_max_age_seconds: int = Field(default=3, ge=0, client_data=ClientFieldData(prompt=lambda mi: "Trailing limit fallback seconds (0=disabled):", prompt_on_new=False, is_updatable=True))
     use_adaptive_trailing: bool = Field(default=False, client_data=ClientFieldData(prompt=lambda mi: "Volatility-adaptive trailing?:", prompt_on_new=False, is_updatable=True))
     trailing_atr_baseline: float = Field(default=0.002, ge=0.0001, client_data=ClientFieldData(prompt=lambda mi: "Trailing ATR baseline:", prompt_on_new=False, is_updatable=True))
 
@@ -363,6 +380,27 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
             return None
         normalized = str(v).strip()
         return normalized or None
+
+    @field_validator("trailing_stop_order_type", mode="before")
+    @classmethod
+    def validate_trailing_stop_order_type(cls, v) -> OrderType:
+        if v is None:
+            return OrderType.LIMIT
+        if isinstance(v, str):
+            v = v.replace("OrderType.", "")
+        parsed = parse_enum_value(OrderType, v, "trailing_stop_order_type")
+        if parsed == OrderType.LIMIT_MAKER:
+            raise ValueError("trailing_stop_order_type must be LIMIT or MARKET")
+        return parsed
+
+    @field_validator("recovery_sell_execution_strategy", mode="before")
+    @classmethod
+    def validate_recovery_sell_execution_strategy(cls, v) -> ExecutionStrategy:
+        if v is None:
+            return ExecutionStrategy.LIMIT_CHASER
+        if isinstance(v, str):
+            v = v.replace("ExecutionStrategy.", "")
+        return parse_enum_value(ExecutionStrategy, v, "recovery_sell_execution_strategy")
 
     @model_validator(mode="after")
     def harmonize_sell_threshold_fields(self):
@@ -836,6 +874,21 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             "rsi_rollover": rsi_rollover,
             "price_below_ema": price_below_ema,
         }
+
+    def _held_bag_recovery_sell_rsi_threshold(self) -> float:
+        return float(self.config.sell_rsi_overbought)
+
+    def _held_bag_recovery_is_overbought(self, current_rsi: Optional[float]) -> bool:
+        threshold = self._held_bag_recovery_sell_rsi_threshold()
+        return current_rsi is not None and current_rsi >= threshold
+
+    def _recovery_sell_chaser_config(self) -> Optional[LimitChaserConfig]:
+        if self.config.recovery_sell_execution_strategy != ExecutionStrategy.LIMIT_CHASER:
+            return None
+        return LimitChaserConfig(
+            distance=Decimal(str(self.config.recovery_limit_chaser_distance_pct)),
+            refresh_threshold=Decimal(str(self.config.recovery_limit_chaser_refresh_threshold_pct)),
+        )
 
     def _sell_trend_hold_active(
         self,
@@ -1950,7 +2003,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 and pending_setup.trough_price > 0
                 and last_close > pending_setup.trough_price
             )
-            if signal_score < min_score:
+            if not pending_setup.score_qualified():
                 reason = "need-score"
             elif rebound_target > rebound_delta:
                 reason = "need-rebound"
@@ -2141,6 +2194,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 armed_timestamp=timestamp,
                 trough_rsi=last_rsi,
                 trough_price=last_close,
+                armed_signal_score=signal_score,
+                armed_min_signal_score=max(1, int(self.config.min_signal_score)),
             )
             armed = True
             return False, setup, armed
@@ -2148,6 +2203,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if setup is None:
             return False, None, armed
 
+        if signal_score > setup.armed_signal_score:
+            setup.armed_signal_score = signal_score
+        if setup.armed_min_signal_score <= 0:
+            setup.armed_min_signal_score = max(1, int(self.config.min_signal_score))
         if last_rsi < setup.trough_rsi:
             setup.trough_rsi = last_rsi
         if last_close < setup.trough_price:
@@ -2155,7 +2214,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         rsi_rebounded = last_rsi >= (setup.trough_rsi + self.config.buy_confirmation_rsi_delta)
         price_rebounded = last_close > setup.trough_price
-        confirmed = signal_score >= self.config.min_signal_score and rsi_rebounded and price_rebounded
+        confirmed = setup.score_qualified() and rsi_rebounded and price_rebounded
         if confirmed:
             return True, None, armed
 
@@ -3228,6 +3287,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             if should_hold:
                 self._record_gate_reason(target_side, "trend_hold")
                 return False
+            if self._held_bag_count() > 0:
+                self._record_gate_reason(target_side, "held_bag_recovery")
+                return False
 
         # Max total position
         if signal > 0:
@@ -3380,6 +3442,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             trailing_stop=trailing_stop_cfg,
             open_order_type=OrderType.LIMIT_MAKER,
             take_profit_order_type=self.config.take_profit_order_type,
+            trailing_stop_order_type=self.config.trailing_stop_order_type,
+            trailing_stop_limit_max_age_seconds=self.config.trailing_stop_limit_max_age_seconds,
             stop_loss_order_type=OrderType.MARKET,
             # PositionExecutor only supports MARKET stop-loss and time-limit exits.
             time_limit_order_type=OrderType.MARKET,
@@ -3554,7 +3618,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         actions: List[ExecutorAction] = []
         recovery_target = Decimal(str(self.config.bag_recovery_target_pct))
 
-        if current_signal < 0 or self._active_sell_executors():
+        if self._active_sell_executors():
             return actions
 
         base_asset, _ = self._base_quote_assets()
@@ -3573,6 +3637,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         state = (self.processed_data or {}).get("signal_state", {})
         current_rsi = state.get("rsi")
         ema_fast = state.get("ema_fast")
+        recovery_overbought_threshold = self._held_bag_recovery_sell_rsi_threshold()
         effective_target = recovery_target
         if self.config.sell_only_if_profitable:
             effective_target = max(effective_target, Decimal(str(self.config.min_profit_pct_for_sell)))
@@ -3599,6 +3664,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
             trail = self._recovery_trails.get(position_key)
             if trail is None:
+                if not self._held_bag_recovery_is_overbought(current_rsi):
+                    continue
                 trail = RecoveryTrailState(
                     position_key=position_key,
                     armed_timestamp=now_ts,
@@ -3613,7 +3680,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 self.logger().info(
                     f"RECOVERY armed | {self._controller_pair_log_prefix()} "
                     f"breakeven={breakeven} current={current_price} pnl={float(pnl_pct) * 100:.2f}% "
-                    f"target={float(effective_target) * 100:.2f}%"
+                    f"target={float(effective_target) * 100:.2f}% "
+                    f"rsi={self._fmt(current_rsi, 2)} thr={recovery_overbought_threshold:.2f}"
                 )
                 continue
 
@@ -3653,24 +3721,26 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 fallback_price=current_price,
             )
             target_amount = Decimal(str(pos.amount))
-            if self._is_strong_bullish_trend() and not trail.partial_exit_done:
-                partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
-                if Decimal("0") < partial_fraction < Decimal("1"):
-                    target_amount = target_amount * partial_fraction
-                    reversal_reason = f"partial-{reversal_reason}"
+            partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
+            if Decimal("0") < partial_fraction < Decimal("1"):
+                target_amount = target_amount * partial_fraction
+                reversal_reason = f"partial-{reversal_reason}"
             if available_base is not None:
                 target_amount = min(target_amount, available_base)
             sell_amount = target_amount.quantize(min_step)
             if sell_amount <= Decimal("0"):
                 continue
+            recovery_execution_strategy = self.config.recovery_sell_execution_strategy
+            chaser_config = self._recovery_sell_chaser_config()
             sell_config = OrderExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 side=TradeType.SELL,
                 amount=sell_amount,
-                price=ref_price,
-                execution_strategy=ExecutionStrategy.LIMIT_MAKER,
+                price=None if recovery_execution_strategy == ExecutionStrategy.MARKET else ref_price,
+                chaser_config=chaser_config,
+                execution_strategy=recovery_execution_strategy,
                 position_action=PositionAction.CLOSE,
                 leverage=self.config.leverage,
                 level_id=f"recovery_exit:{position_key}",

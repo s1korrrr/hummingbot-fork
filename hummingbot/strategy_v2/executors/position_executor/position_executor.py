@@ -71,6 +71,36 @@ class PositionExecutor(ExecutorBase):
             return aligned_price + tick_size
         return aligned_price
 
+    def _marketable_limit_close_price(self) -> Decimal:
+        if self.close_order_side == TradeType.SELL:
+            touch_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+            return touch_price
+        touch_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+        return touch_price
+
+    def _close_order_type_for(self, close_type: CloseType) -> OrderType:
+        if close_type == CloseType.TRAILING_STOP:
+            if getattr(self, "_trailing_limit_fallback_pending", False):
+                return OrderType.MARKET
+            return self.config.triple_barrier_config.trailing_stop_order_type
+        return OrderType.MARKET
+
+    def _should_fallback_trailing_limit_close(self) -> bool:
+        if self.close_type != CloseType.TRAILING_STOP or self._close_order is None:
+            return False
+        if getattr(self, "_close_order_type", None) != OrderType.LIMIT:
+            return False
+
+        max_age_seconds = max(0, int(self.config.triple_barrier_config.trailing_stop_limit_max_age_seconds))
+        if max_age_seconds <= 0:
+            return False
+
+        reference_ts = self._close_order.creation_timestamp or self.close_timestamp
+        if reference_ts is None:
+            return False
+
+        return (self._strategy.current_timestamp - reference_ts) >= max_age_seconds
+
     def __init__(self, strategy: StrategyV2Base, config: PositionExecutorConfig,
                  update_interval: float = 1.0, max_retries: int = 10):
         """
@@ -108,6 +138,8 @@ class PositionExecutor(ExecutorBase):
         self._trailing_stop_move_count: int = 0
         self._trailing_stop_armed_timestamp: Optional[float] = None
         self._trailing_stop_last_update_timestamp: Optional[float] = None
+        self._close_order_type: Optional[OrderType] = None
+        self._trailing_limit_fallback_pending: bool = False
 
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._current_retries = 0
@@ -500,6 +532,21 @@ class PositionExecutor(ExecutorBase):
                                                        self._close_order.order_id) if not self._close_order.order else self._close_order.order
             if in_flight_order:
                 self._close_order.order = in_flight_order
+                if self._should_fallback_trailing_limit_close() and in_flight_order.is_open:
+                    self.logger().warning(
+                        self._log_message(
+                            f"Trailing limit close stale order_id={self._close_order.order_id} "
+                            f"age={self._strategy.current_timestamp - (self._close_order.creation_timestamp or self.close_timestamp):.1f}s "
+                            f"falling_back=MARKET"
+                        )
+                    )
+                    self._trailing_limit_fallback_pending = True
+                    self._strategy.cancel(
+                        connector_name=self.config.connector_name,
+                        trading_pair=self.config.trading_pair,
+                        order_id=self._close_order.order_id,
+                    )
+                    return
                 connector = self.connectors[self.config.connector_name]
                 await connector._update_orders_with_error_handler(
                     orders=[in_flight_order],
@@ -628,16 +675,22 @@ class PositionExecutor(ExecutorBase):
         """
         self.cancel_open_orders()
         if self.amount_to_close >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+            order_type = self._close_order_type_for(close_type)
+            if order_type.is_limit_type() and not price.is_finite():
+                price = self._marketable_limit_close_price()
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
-                order_type=OrderType.MARKET,
+                order_type=order_type,
                 amount=self.amount_to_close,
                 price=price,
                 side=self.close_order_side,
                 position_action=PositionAction.CLOSE,
             )
             self._close_order = TrackedOrder(order_id=order_id)
+            self._close_order_type = order_type
+            if close_type == CloseType.TRAILING_STOP and order_type == OrderType.MARKET:
+                self._trailing_limit_fallback_pending = False
             self.logger().debug(
                 self._log_message(
                     f"Placing close order order_id={order_id} "
@@ -825,6 +878,9 @@ class PositionExecutor(ExecutorBase):
             self.close_type = CloseType.TAKE_PROFIT
             self._close_order = self._take_profit_limit_order
             self._status = RunnableStatus.SHUTTING_DOWN
+        elif self._close_order and self._close_order.order_id == event.order_id:
+            self._close_order_type = None
+            self._trailing_limit_fallback_pending = False
 
     def process_order_canceled_event(self, _, market: ConnectorBase, event: OrderCancelledEvent):
         """
@@ -833,6 +889,7 @@ class PositionExecutor(ExecutorBase):
         if self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order)
             self._close_order = None
+            self._close_order_type = None
         if self._open_order and event.order_id == self._open_order.order_id:
             self._failed_orders.append(self._open_order)
             self._open_order = None
@@ -869,6 +926,9 @@ class PositionExecutor(ExecutorBase):
         elif self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order)
             self._close_order = None
+            if self.close_type == CloseType.TRAILING_STOP and self._close_order_type == OrderType.LIMIT:
+                self._trailing_limit_fallback_pending = True
+            self._close_order_type = None
             self.logger().error(
                 self._log_message(
                     f"Close order failed order_id={event.order_id}. "

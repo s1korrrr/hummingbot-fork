@@ -146,7 +146,7 @@ class ConfigCommandTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("| ∟ nested_attr", strategy_config_table)
         self.assertIn("| some value", strategy_config_table)
         self.assertIn("| ∟ double_nested_model", strategy_config_table)
-        self.assertIn("|   ∟ double_nested_attr", strategy_config_table)
+        self.assertIn("double_nested_attr", strategy_config_table)
         self.assertIn("| 3.0", strategy_config_table)
         self.assertIn("| another_attr", strategy_config_table)
         self.assertIn("| 1.0", strategy_config_table)

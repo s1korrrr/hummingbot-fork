@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import sys
 import unittest
 from decimal import Decimal
@@ -14,12 +15,23 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction,
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
 ROOT_PATH_STR = str(ROOT_PATH)
-while ROOT_PATH_STR in sys.path:
-    sys.path.remove(ROOT_PATH_STR)
-sys.path.insert(0, ROOT_PATH_STR)
+
+
+def ensure_local_controller_imports():
+    while ROOT_PATH_STR in sys.path:
+        sys.path.remove(ROOT_PATH_STR)
+    sys.path.insert(0, ROOT_PATH_STR)
+    for module_name in list(sys.modules):
+        if module_name == "controllers" or module_name.startswith("controllers."):
+            sys.modules.pop(module_name, None)
+    importlib.invalidate_caches()
 
 
 class RSIv5ControllerImportTest(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        ensure_local_controller_imports()
+
     def test_rsi_v5_controller_imports_from_local_hummingbot_tree(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 

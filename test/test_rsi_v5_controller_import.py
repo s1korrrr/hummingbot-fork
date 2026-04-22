@@ -13,8 +13,10 @@ from hummingbot.strategy_v2.executors.order_executor.data_types import Execution
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
-if str(ROOT_PATH) not in sys.path:
-    sys.path.insert(0, str(ROOT_PATH))
+ROOT_PATH_STR = str(ROOT_PATH)
+while ROOT_PATH_STR in sys.path:
+    sys.path.remove(ROOT_PATH_STR)
+sys.path.insert(0, ROOT_PATH_STR)
 
 
 class RSIv5ControllerImportTest(unittest.TestCase):

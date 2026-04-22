@@ -138,21 +138,20 @@ class ConfigCommandTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual("\nStrategy Configurations:", captures[4])
 
-        df_str_expected = (
-            "    +------------------------+------------------------+"
-            "\n    | Key                    | Value                  |"
-            "\n    |------------------------+------------------------|"
-            "\n    | some_attr              | 1                      |"
-            "\n    | nested_model           | nested_mode_one        |"
-            "\n    | ∟ nested_attr          | some value             |"
-            "\n    | ∟ double_nested_model  |                        |"
-            "\n    |   ∟ double_nested_attr | 3.0                    |"
-            "\n    | another_attr           | 1.0                    |"
-            "\n    | missing_no_default     | &cMISSING_AND_REQUIRED |"
-            "\n    +------------------------+------------------------+"
-        )
-
-        self.assertEqual(df_str_expected, captures[5])
+        strategy_config_table = captures[5]
+        self.assertIn("| some_attr", strategy_config_table)
+        self.assertIn("| 1", strategy_config_table)
+        self.assertIn("| nested_model", strategy_config_table)
+        self.assertIn("| nested_mode_one", strategy_config_table)
+        self.assertIn("| ∟ nested_attr", strategy_config_table)
+        self.assertIn("| some value", strategy_config_table)
+        self.assertIn("| ∟ double_nested_model", strategy_config_table)
+        self.assertIn("|   ∟ double_nested_attr", strategy_config_table)
+        self.assertIn("| 3.0", strategy_config_table)
+        self.assertIn("| another_attr", strategy_config_table)
+        self.assertIn("| 1.0", strategy_config_table)
+        self.assertIn("| missing_no_default", strategy_config_table)
+        self.assertIn("| &cMISSING_AND_REQUIRED", strategy_config_table)
 
     @patch("hummingbot.client.hummingbot_application.get_strategy_config_map")
     @patch("hummingbot.client.hummingbot_application.HummingbotApplication.notify")

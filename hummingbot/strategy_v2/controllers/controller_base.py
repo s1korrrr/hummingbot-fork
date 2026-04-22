@@ -256,6 +256,19 @@ class ControllerBase(RunnableBase):
             if json_schema_extra.get("is_updatable", False):
                 setattr(self.config, name, getattr(new_config, name))
 
+    def build_chart_snapshot_rows(self, bot_name: str) -> List[Dict[str, object]]:
+        """
+        Optional hook for controllers that want to persist per-candle visual state
+        for the reporting dashboard. Default controllers do not emit chart snapshots.
+        """
+        return []
+
+    def chart_snapshot_prune_requests(self) -> List[Dict[str, object]]:
+        """
+        Optional hook for controllers that want recorder-side retention pruning.
+        """
+        return []
+
     async def control_task(self):
         if self.market_data_provider.ready and self.executors_update_event.is_set():
             await self.update_processed_data()

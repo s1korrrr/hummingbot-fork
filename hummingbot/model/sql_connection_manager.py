@@ -3,7 +3,7 @@ from enum import Enum
 from os.path import join
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import MetaData, create_engine, inspect
+from sqlalchemy import MetaData, create_engine, event, inspect
 from sqlalchemy.engine.base import Engine
 from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.schema import DropConstraint, ForeignKeyConstraint, Table
@@ -27,7 +27,8 @@ class SQLConnectionManager(TransactionBase):
     _scm_trade_fills_instance: Optional["SQLConnectionManager"] = None
 
     LOCAL_DB_VERSION_KEY = "local_db_version"
-    LOCAL_DB_VERSION_VALUE = "20230516"
+    LOCAL_DB_VERSION_VALUE = "20260327"
+    SQLITE_BUSY_TIMEOUT_MS = 2_000
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -72,7 +73,12 @@ class SQLConnectionManager(TransactionBase):
         self.db_path = db_path
 
         if connection_type is SQLConnectionType.TRADE_FILLS:
-            self._engine: Engine = create_engine(client_config_map.db_mode.get_url(self.db_path))
+            database_url = client_config_map.db_mode.get_url(self.db_path)
+            engine_kwargs = {}
+            if database_url.startswith("sqlite"):
+                engine_kwargs["connect_args"] = {"timeout": self.SQLITE_BUSY_TIMEOUT_MS / 1000.0}
+            self._engine: Engine = create_engine(database_url, **engine_kwargs)
+            self._configure_sqlite_pragmas()
             self._metadata: MetaData = self.get_declarative_base().metadata
             self._metadata.create_all(self._engine)
 
@@ -96,6 +102,20 @@ class SQLConnectionManager(TransactionBase):
         if connection_type is SQLConnectionType.TRADE_FILLS and (not called_from_migrator):
             self.check_and_migrate_db(client_config_map)
 
+    def _configure_sqlite_pragmas(self):
+        if not str(self._engine.url).startswith("sqlite"):
+            return
+
+        @event.listens_for(self._engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute(f"PRAGMA busy_timeout={self.SQLITE_BUSY_TIMEOUT_MS}")
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+            finally:
+                cursor.close()
+
     @property
     def engine(self) -> Engine:
         return self._engine
@@ -111,6 +131,7 @@ class SQLConnectionManager(TransactionBase):
 
     def check_and_migrate_db(self, client_config_map: "ClientConfigAdapter"):
         from hummingbot.model.db_migration.migrator import Migrator
+        local_db_version_value = None
         with self.get_new_session() as session:
             with session.begin():
                 local_db_version = self.get_local_db_version(session=session)
@@ -118,15 +139,12 @@ class SQLConnectionManager(TransactionBase):
                     version_info: LocalMetadata = LocalMetadata(key=self.LOCAL_DB_VERSION_KEY,
                                                                 value=self.LOCAL_DB_VERSION_VALUE)
                     session.add(version_info)
-                    session.commit()
                 else:
-                    # There's no past db version to upgrade from at this moment. So we'll just update the version value
-                    # if needed.
-                    if local_db_version.value < self.LOCAL_DB_VERSION_VALUE:
-                        was_migration_successful = Migrator().migrate_db_to_version(
-                            client_config_map, self, int(local_db_version.value), int(self.LOCAL_DB_VERSION_VALUE)
-                        )
-                        if was_migration_successful:
-                            # Cannot use variable local_db_version because reference is not valid
-                            # since Migrator changed it
-                            self.get_local_db_version(session=session).value = self.LOCAL_DB_VERSION_VALUE
+                    local_db_version_value = local_db_version.value
+
+        # The migration swaps the database file and reinitializes this connection manager,
+        # so it must not reuse the pre-migration session above.
+        if local_db_version_value is not None and local_db_version_value < self.LOCAL_DB_VERSION_VALUE:
+            Migrator().migrate_db_to_version(
+                client_config_map, self, int(local_db_version_value), int(self.LOCAL_DB_VERSION_VALUE)
+            )

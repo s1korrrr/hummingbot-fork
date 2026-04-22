@@ -3,12 +3,13 @@ import logging
 import uuid
 from collections import deque
 from decimal import Decimal
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.position import Position
+from hummingbot.model.trade_fill import TradeFill
 
 if TYPE_CHECKING:
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -31,6 +32,8 @@ from hummingbot.strategy_v2.models.executor_actions import (
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo, PerformanceReport
 
+PositionScope = Tuple[str, str, str, Optional[TradeType]]
+
 
 class PositionHold:
     def __init__(self, connector_name: str, trading_pair: str, side: TradeType):
@@ -50,38 +53,32 @@ class PositionHold:
         self.sell_amount_base = Decimal("0")
         self.sell_amount_quote = Decimal("0")
 
-    def add_orders_from_executor(self, executor: ExecutorInfo):
-        custom_info = executor.custom_info
-        if "held_position_orders" not in custom_info or len(custom_info["held_position_orders"]) == 0:
+    def add_order_record(self, order: Dict[str, Any]):
+        order_id = order.get("client_order_id") or order.get("order_id")
+        if not order_id or order_id in self.order_ids:
             return
 
-        for order in custom_info["held_position_orders"]:
-            # Skip if we've already processed this order
-            order_id = order.get("client_order_id")
-            if order_id in self.order_ids:
-                continue
+        self.order_ids.add(order_id)
 
-            # Add the order ID to our set
-            self.order_ids.add(order_id)
+        executed_amount_base = Decimal(str(order.get("executed_amount_base", 0)))
+        executed_amount_quote = Decimal(str(order.get("executed_amount_quote", 0)))
+        is_buy = order.get("trade_type") == TradeType.BUY.name
 
-            # Update metrics incrementally
-            executed_amount_base = Decimal(str(order.get("executed_amount_base", 0)))
-            executed_amount_quote = Decimal(str(order.get("executed_amount_quote", 0)))
-            is_buy = order.get("trade_type") == "BUY"
+        self.volume_traded_quote += executed_amount_quote
 
-            # Update volume traded in quote
-            self.volume_traded_quote += executed_amount_quote
+        if is_buy:
+            self.buy_amount_base += executed_amount_base
+            self.buy_amount_quote += executed_amount_quote
+        else:
+            self.sell_amount_base += executed_amount_base
+            self.sell_amount_quote += executed_amount_quote
 
-            # Update buy/sell amounts
-            if is_buy:
-                self.buy_amount_base += executed_amount_base
-                self.buy_amount_quote += executed_amount_quote
-            else:
-                self.sell_amount_base += executed_amount_base
-                self.sell_amount_quote += executed_amount_quote
+        self.cum_fees_quote += Decimal(str(order.get("cumulative_fee_paid_quote", 0)))
 
-            # Update fees
-            self.cum_fees_quote += Decimal(str(order.get("cumulative_fee_paid_quote", 0)))
+    def add_orders_from_executor(self, executor: ExecutorInfo):
+        held_position_orders = (executor.custom_info or {}).get("held_position_orders") or []
+        for order in held_position_orders:
+            self.add_order_record(order)
 
     def get_position_summary(self, mid_price: Decimal):
         # Handle NaN quote amounts by calculating them lazily
@@ -182,19 +179,25 @@ class ExecutorOrchestrator:
                 self.active_executors[controller_id] = []
                 self.stored_executors[controller_id] = []
                 self.positions_held[controller_id] = []
-        db_executors = MarketsRecorder.get_instance().get_all_executors()
+        markets_recorder = MarketsRecorder.get_instance()
+        db_executors = markets_recorder.get_all_executors()
         for executor in db_executors:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
                 continue
-            self._update_cached_performance(controller_id, executor)
+            if not executor.is_active:
+                self._update_cached_performance(controller_id, executor)
             self._record_stored_executor(controller_id, executor)
 
         # Create initial positions from config overrides first
         self._create_initial_positions()
 
+        restored_position_scopes = self._restore_positions_from_ledger(
+            markets_recorder.get_all_position_hold_ledger_entries()
+        )
+
         # Load positions from database only for controllers without initial position overrides
-        db_positions = MarketsRecorder.get_instance().get_all_positions()
+        db_positions = markets_recorder.get_all_positions()
         for position in db_positions:
             controller_id = position.controller_id
             # Skip if this controller has initial position overrides
@@ -206,7 +209,35 @@ class ExecutorOrchestrator:
                 self.logger().warning(f"Skipping position for {position.connector_name}.{position.trading_pair} - "
                                       f"not available in current strategy markets")
                 continue
+            if not self._is_valid_stored_position(position):
+                self.logger().warning(
+                    f"Skipping invalid stored position | controller={controller_id} "
+                    f"pair={position.trading_pair} side={position.side} amount={position.amount} "
+                    f"breakeven={position.breakeven_price}"
+                )
+                continue
+            position_scope = self._position_scope(
+                controller_id=controller_id,
+                connector_name=position.connector_name,
+                trading_pair=position.trading_pair,
+                side=TradeType.BUY if position.side == TradeType.BUY.name else TradeType.SELL,
+            )
+            if self._is_protected_position_scope(restored_position_scopes, position_scope):
+                continue
             self._load_position_from_db(controller_id, position)
+            restored_position_scopes.add(position_scope)
+        self._restore_positions_from_executor_history(
+            executor_infos=db_executors,
+            protected_position_scopes=restored_position_scopes,
+        )
+        trade_fills = []
+        config_file_path = getattr(markets_recorder, "config_file_path", None)
+        if config_file_path:
+            trade_fills = markets_recorder.get_trades_for_config(config_file_path)
+        self._restore_positions_from_trade_fills(
+            trade_fills=trade_fills,
+            protected_position_scopes=self._current_position_scopes(),
+        )
 
     def _update_cached_performance(self, controller_id: str, executor_info: ExecutorInfo):
         """
@@ -226,6 +257,87 @@ class ExecutorOrchestrator:
     @staticmethod
     def _should_store_executor_for_history(executor_info: ExecutorInfo) -> bool:
         return executor_info.is_done or not executor_info.is_active
+
+    @staticmethod
+    def _position_scope(
+        controller_id: str,
+        connector_name: str,
+        trading_pair: str,
+        side: Optional[TradeType],
+    ) -> PositionScope:
+        return controller_id, connector_name, trading_pair, side
+
+    @staticmethod
+    def _is_protected_position_scope(
+        protected_position_scopes: Set[PositionScope],
+        position_scope: PositionScope,
+    ) -> bool:
+        controller_id, connector_name, trading_pair, side = position_scope
+        return any(
+            protected_controller_id == controller_id
+            and protected_connector_name == connector_name
+            and protected_trading_pair == trading_pair
+            and (
+                protected_side is None
+                or side is None
+                or protected_side == side
+            )
+            for protected_controller_id, protected_connector_name, protected_trading_pair, protected_side
+            in protected_position_scopes
+        )
+
+    @staticmethod
+    def _position_hold_amount(position: PositionHold) -> Decimal:
+        return abs(position.buy_amount_base - position.sell_amount_base)
+
+    @staticmethod
+    def _is_valid_stored_position(position: Position) -> bool:
+        try:
+            amount = Decimal(str(position.amount))
+            breakeven = Decimal(str(position.breakeven_price))
+        except Exception:
+            return False
+        return amount > Decimal("0") and breakeven > Decimal("0")
+
+    def _current_position_scopes(self) -> Set[PositionScope]:
+        position_scopes: Set[PositionScope] = set()
+        for controller_id, positions in self.positions_held.items():
+            for position in positions:
+                position_scopes.add(
+                    self._position_scope(
+                        controller_id=controller_id,
+                        connector_name=position.connector_name,
+                        trading_pair=position.trading_pair,
+                        side=position.side,
+                    )
+                )
+        return position_scopes
+
+    def _controller_ids_by_market_pair(self) -> Tuple[Dict[Tuple[str, str], str], Set[Tuple[str, str]]]:
+        controller_by_market_pair: Dict[Tuple[str, str], str] = {}
+        ambiguous_market_pairs: Set[Tuple[str, str]] = set()
+        for controller_id, controller in self.strategy.controllers.items():
+            controller_config = getattr(controller, "config", None)
+            connector_name = getattr(controller_config, "connector_name", None)
+            trading_pair = getattr(controller_config, "trading_pair", None)
+            if connector_name is None or trading_pair is None:
+                connector_name = getattr(controller, "connector_name", None)
+                trading_pair = getattr(controller, "trading_pair", None)
+            if connector_name is None or trading_pair is None:
+                continue
+            market_pair = (connector_name, trading_pair)
+            existing_controller_id = controller_by_market_pair.get(market_pair)
+            if existing_controller_id is not None and existing_controller_id != controller_id:
+                ambiguous_market_pairs.add(market_pair)
+                controller_by_market_pair.pop(market_pair, None)
+            elif market_pair not in ambiguous_market_pairs:
+                controller_by_market_pair[market_pair] = controller_id
+        return controller_by_market_pair, ambiguous_market_pairs
+
+    @staticmethod
+    def _has_held_position_orders(executor_info: ExecutorInfo) -> bool:
+        held_position_orders = (executor_info.custom_info or {}).get("held_position_orders") or []
+        return executor_info.close_type == CloseType.POSITION_HOLD and len(held_position_orders) > 0
 
     def _record_stored_executor(self, controller_id: str, executor_info: ExecutorInfo):
         if not self._should_store_executor_for_history(executor_info):
@@ -249,6 +361,320 @@ class ExecutorOrchestrator:
             reverse=True,
         )
         self.stored_executors[controller_id] = deduped_executors[:20]
+
+    @staticmethod
+    def _position_side_from_name(side: Optional[str]) -> Optional[TradeType]:
+        if side in (None, "", "None"):
+            return None
+        return TradeType.BUY if side == TradeType.BUY.name else TradeType.SELL
+
+    def _apply_order_record_to_positions(
+        self,
+        controller_id: str,
+        connector_name: str,
+        trading_pair: str,
+        position_side: Optional[TradeType],
+        default_side: TradeType,
+        order_record: Dict[str, Any],
+    ):
+        positions = self.positions_held.setdefault(controller_id, [])
+        existing_position = self._find_existing_position(
+            positions=positions,
+            connector_name=connector_name,
+            trading_pair=trading_pair,
+            position_side=position_side,
+        )
+
+        if existing_position:
+            existing_position.add_order_record(order_record)
+        else:
+            position = PositionHold(
+                connector_name,
+                trading_pair,
+                position_side if position_side else default_side,
+            )
+            position.add_order_record(order_record)
+            positions.append(position)
+
+    def _apply_executor_info_to_positions(self, controller_id: str, executor_info: ExecutorInfo):
+        held_position_orders = (executor_info.custom_info or {}).get("held_position_orders") or []
+        if len(held_position_orders) == 0:
+            return
+
+        position_side = self._determine_position_side(executor_info)
+        for order in held_position_orders:
+            self._apply_order_record_to_positions(
+                controller_id=controller_id,
+                connector_name=executor_info.connector_name,
+                trading_pair=executor_info.trading_pair,
+                position_side=position_side,
+                default_side=executor_info.config.side,
+                order_record=order,
+            )
+
+    def _persist_position_hold_entries_from_executor_info(self, executor_info: ExecutorInfo):
+        if not self._has_held_position_orders(executor_info) or executor_info.controller_id is None:
+            return
+        position_side = self._determine_position_side(executor_info)
+
+        MarketsRecorder.get_instance().store_or_update_position_hold_ledger_entries(
+            controller_id=executor_info.controller_id,
+            executor_id=executor_info.id,
+            connector_name=executor_info.connector_name,
+            trading_pair=executor_info.trading_pair,
+            held_position_orders=(executor_info.custom_info or {}).get("held_position_orders") or [],
+            position_side=position_side.name if position_side is not None else None,
+            fallback_timestamp=(
+                executor_info.close_timestamp
+                if executor_info.close_timestamp is not None
+                else int(executor_info.timestamp)
+            ),
+        )
+
+    def _prune_flat_positions(self, controller_id: str):
+        positions = self.positions_held.get(controller_id, [])
+        self.positions_held[controller_id] = [
+            position
+            for position in positions
+            if self._position_hold_amount(position) > Decimal("0")
+        ]
+
+    def _restore_positions_from_ledger(
+        self,
+        ledger_entries,
+    ) -> Set[PositionScope]:
+        restored_position_scopes: Set[PositionScope] = set()
+        restored_controller_ids: Set[str] = set()
+
+        for entry in ledger_entries:
+            controller_id = entry.controller_id
+            if controller_id in self.initial_positions_by_controller or controller_id not in self.strategy.controllers:
+                continue
+            if (
+                entry.connector_name not in self.strategy.markets
+                or entry.trading_pair not in self.strategy.markets.get(entry.connector_name, set())
+            ):
+                continue
+
+            position_side = self._position_side_from_name(entry.position_side)
+            self._apply_order_record_to_positions(
+                controller_id=controller_id,
+                connector_name=entry.connector_name,
+                trading_pair=entry.trading_pair,
+                position_side=position_side,
+                default_side=self._position_side_from_name(entry.order_side) or TradeType.BUY,
+                order_record=entry.to_order_record(),
+            )
+            restored_position_scopes.add(
+                self._position_scope(
+                    controller_id=controller_id,
+                    connector_name=entry.connector_name,
+                    trading_pair=entry.trading_pair,
+                    side=position_side,
+                )
+            )
+            restored_controller_ids.add(controller_id)
+
+        for controller_id in restored_controller_ids:
+            self._prune_flat_positions(controller_id)
+            for position in self.positions_held.get(controller_id, []):
+                try:
+                    mid_price = self.strategy.market_data_provider.get_price_by_type(
+                        position.connector_name, position.trading_pair, PriceType.MidPrice
+                    )
+                except Exception:
+                    mid_price = Decimal("0")
+                position_summary = position.get_position_summary(mid_price or Decimal("0"))
+                self.logger().info(
+                    f"Recovered held position from ledger | controller={controller_id} "
+                    f"pair={position_summary.trading_pair} side={position_summary.side.name} "
+                    f"amount={position_summary.amount} breakeven={position_summary.breakeven_price}"
+                )
+
+        return restored_position_scopes
+
+    def _restore_positions_from_executor_history(
+        self,
+        executor_infos: List[ExecutorInfo],
+        protected_position_scopes: Optional[Set[PositionScope]] = None,
+    ):
+        protected_position_scopes = protected_position_scopes or set()
+        restored_controller_ids: Set[str] = set()
+        restorable_executor_infos = sorted(
+            (
+                executor_info
+                for executor_info in executor_infos
+                if self._has_held_position_orders(executor_info)
+            ),
+            key=lambda info: (
+                info.close_timestamp if info.close_timestamp is not None else info.timestamp,
+                info.timestamp,
+            ),
+        )
+
+        for executor_info in restorable_executor_infos:
+            controller_id = executor_info.controller_id
+            if controller_id in self.initial_positions_by_controller or controller_id not in self.strategy.controllers:
+                continue
+            if (
+                executor_info.connector_name not in self.strategy.markets
+                or executor_info.trading_pair not in self.strategy.markets.get(executor_info.connector_name, set())
+            ):
+                continue
+
+            position_scope = self._position_scope(
+                controller_id=controller_id,
+                connector_name=executor_info.connector_name,
+                trading_pair=executor_info.trading_pair,
+                side=self._determine_position_side(executor_info),
+            )
+            if self._is_protected_position_scope(protected_position_scopes, position_scope):
+                continue
+
+            self._apply_executor_info_to_positions(controller_id, executor_info)
+            self._persist_position_hold_entries_from_executor_info(executor_info)
+            restored_controller_ids.add(controller_id)
+
+        for controller_id in restored_controller_ids:
+            self._prune_flat_positions(controller_id)
+            for position in self.positions_held.get(controller_id, []):
+                try:
+                    mid_price = self.strategy.market_data_provider.get_price_by_type(
+                        position.connector_name, position.trading_pair, PriceType.MidPrice
+                    )
+                except Exception:
+                    mid_price = Decimal("0")
+                position_summary = position.get_position_summary(mid_price or Decimal("0"))
+                self.logger().info(
+                    f"Recovered held position from executor history | controller={controller_id} "
+                    f"pair={position_summary.trading_pair} side={position_summary.side.name} "
+                    f"amount={position_summary.amount} breakeven={position_summary.breakeven_price}"
+                )
+
+    def _restore_positions_from_trade_fills(
+        self,
+        trade_fills: List[TradeFill],
+        protected_position_scopes: Optional[Set[PositionScope]] = None,
+    ):
+        protected_position_scopes = protected_position_scopes or set()
+        if len(trade_fills) == 0:
+            return
+
+        controller_by_market_pair, ambiguous_market_pairs = self._controller_ids_by_market_pair()
+        if len(controller_by_market_pair) == 0 and len(ambiguous_market_pairs) == 0:
+            return
+
+        for connector_name, trading_pair in ambiguous_market_pairs:
+            self.logger().warning(
+                f"Skipping TradeFill recovery for {connector_name}.{trading_pair} due to ambiguous controller mapping"
+            )
+
+        aggregated_order_records: Dict[Tuple[str, str, str, Optional[TradeType], str], Dict[str, Any]] = {}
+        skipped_scopes: Set[Tuple[str, str]] = set()
+        for trade_fill in sorted(
+            trade_fills,
+            key=lambda fill: (
+                fill.timestamp,
+                fill.order_id,
+                fill.exchange_trade_id,
+            ),
+        ):
+            connector_name = trade_fill.market
+            trading_pair = trade_fill.symbol
+            market_pair = (connector_name, trading_pair)
+            controller_id = controller_by_market_pair.get(market_pair)
+            if controller_id is None:
+                continue
+            if controller_id in self.initial_positions_by_controller:
+                continue
+            if connector_name not in self.strategy.markets or trading_pair not in self.strategy.markets.get(connector_name, set()):
+                continue
+            if "_perpetual" in connector_name:
+                if market_pair not in skipped_scopes:
+                    self.logger().warning(
+                        f"Skipping TradeFill recovery for {connector_name}.{trading_pair} because perpetual fills "
+                        "need explicit position-side attribution"
+                    )
+                    skipped_scopes.add(market_pair)
+                continue
+
+            position_scope = self._position_scope(
+                controller_id=controller_id,
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                side=None,
+            )
+            if self._is_protected_position_scope(protected_position_scopes, position_scope):
+                continue
+
+            trade_type = str(trade_fill.trade_type or "").upper()
+            if trade_type not in {TradeType.BUY.name, TradeType.SELL.name}:
+                continue
+
+            aggregate_key = (
+                controller_id,
+                connector_name,
+                trading_pair,
+                None,
+                trade_fill.order_id,
+            )
+            aggregated = aggregated_order_records.setdefault(
+                aggregate_key,
+                {
+                    "client_order_id": trade_fill.order_id,
+                    "order_id": trade_fill.order_id,
+                    "exchange_order_id": trade_fill.order_id,
+                    "trade_type": trade_type,
+                    "price_quote_times_base": Decimal("0"),
+                    "executed_amount_base": Decimal("0"),
+                    "executed_amount_quote": Decimal("0"),
+                    "cumulative_fee_paid_quote": Decimal("0"),
+                    "amount": Decimal("0"),
+                    "last_update_timestamp": int(trade_fill.timestamp),
+                },
+            )
+            executed_amount_base = Decimal(str(trade_fill.amount or 0))
+            executed_amount_quote = Decimal(str(trade_fill.price or 0)) * executed_amount_base
+            aggregated["price_quote_times_base"] += executed_amount_quote
+            aggregated["executed_amount_base"] += executed_amount_base
+            aggregated["executed_amount_quote"] += executed_amount_quote
+            aggregated["cumulative_fee_paid_quote"] += Decimal(str(trade_fill.trade_fee_in_quote or 0))
+            aggregated["amount"] += executed_amount_base
+            aggregated["last_update_timestamp"] = max(aggregated["last_update_timestamp"], int(trade_fill.timestamp))
+
+        restored_controller_ids: Set[str] = set()
+        for (controller_id, connector_name, trading_pair, position_side, _), order_record in aggregated_order_records.items():
+            if order_record["executed_amount_base"] <= Decimal("0"):
+                continue
+            order_record["price"] = (
+                order_record["price_quote_times_base"] / order_record["executed_amount_base"]
+            )
+            order_record.pop("price_quote_times_base", None)
+            self._apply_order_record_to_positions(
+                controller_id=controller_id,
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                position_side=position_side,
+                default_side=TradeType.BUY if order_record["trade_type"] == TradeType.BUY.name else TradeType.SELL,
+                order_record=order_record,
+            )
+            restored_controller_ids.add(controller_id)
+
+        for controller_id in restored_controller_ids:
+            self._prune_flat_positions(controller_id)
+            for position in self.positions_held.get(controller_id, []):
+                try:
+                    mid_price = self.strategy.market_data_provider.get_price_by_type(
+                        position.connector_name, position.trading_pair, PriceType.MidPrice
+                    )
+                except Exception:
+                    mid_price = Decimal("0")
+                position_summary = position.get_position_summary(mid_price or Decimal("0"))
+                self.logger().info(
+                    f"Recovered held position from TradeFill | controller={controller_id} "
+                    f"pair={position_summary.trading_pair} side={position_summary.side.name} "
+                    f"amount={position_summary.amount} breakeven={position_summary.breakeven_price}"
+                )
 
     def _load_position_from_db(self, controller_id: str, db_position: Position):
         """
@@ -399,24 +825,119 @@ class ExecutorOrchestrator:
                 )
                 # Store or update the position in the database
                 markets_recorder.update_or_store_position(position_record)
-                self.logger().info(
-                    f"Stored held position | controller={controller_id} pair={position_summary.trading_pair} "
-                    f"side={position_summary.side.name} amount={position_summary.amount} "
-                    f"breakeven={position_summary.breakeven_price}"
-                )
+                if position_summary.amount > Decimal("0"):
+                    self.logger().info(
+                        f"Stored held position | controller={controller_id} pair={position_summary.trading_pair} "
+                        f"side={position_summary.side.name} amount={position_summary.amount} "
+                        f"breakeven={position_summary.breakeven_price}"
+                    )
+                else:
+                    self.logger().info(
+                        f"Cleared flat held position | controller={controller_id} pair={position_summary.trading_pair} "
+                        f"side={position_summary.side.name}"
+                    )
 
         # Clear all positions after storing (avoid modifying list while iterating)
         self.positions_held.clear()
+
+    def sync_live_positions_to_db(self):
+        """
+        Mirror the current in-memory held positions into the database without clearing them.
+        This keeps SQLite closer to live runtime state while preserving the existing shutdown flow.
+        """
+        self._update_positions_from_done_executors()
+        markets_recorder = MarketsRecorder.get_instance()
+        live_position_keys: Set[Tuple[str, str, str, str]] = set()
+
+        for controller_id, positions_list in self.positions_held.items():
+            if controller_id is None:
+                continue
+            for position in positions_list:
+                if (
+                    position.connector_name not in self.strategy.markets
+                    or position.trading_pair not in self.strategy.markets.get(position.connector_name, set())
+                ):
+                    continue
+                mid_price = self.strategy.market_data_provider.get_price_by_type(
+                    position.connector_name,
+                    position.trading_pair,
+                    PriceType.MidPrice,
+                )
+                position_summary = position.get_position_summary(mid_price)
+                live_position_keys.add(
+                    (
+                        controller_id,
+                        position_summary.connector_name,
+                        position_summary.trading_pair,
+                        position_summary.side.name,
+                    )
+                )
+                position_record = Position(
+                    id=str(uuid.uuid4()),
+                    controller_id=controller_id,
+                    connector_name=position_summary.connector_name,
+                    trading_pair=position_summary.trading_pair,
+                    side=position_summary.side.name,
+                    timestamp=int(self.strategy.current_timestamp * 1e3),
+                    volume_traded_quote=position_summary.volume_traded_quote,
+                    amount=position_summary.amount,
+                    breakeven_price=position_summary.breakeven_price,
+                    unrealized_pnl_quote=position_summary.unrealized_pnl_quote,
+                    realized_pnl_quote=position_summary.realized_pnl_quote,
+                    cum_fees_quote=position_summary.cum_fees_quote,
+                )
+                markets_recorder.update_or_store_position(position_record)
+
+        for controller_id in self.strategy.controllers.keys():
+            for db_position in markets_recorder.get_positions_by_controller(controller_id):
+                position_key = (
+                    controller_id,
+                    db_position.connector_name,
+                    db_position.trading_pair,
+                    db_position.side,
+                )
+                if position_key in live_position_keys:
+                    continue
+                markets_recorder.update_or_store_position(
+                    Position(
+                        id=db_position.id,
+                        controller_id=db_position.controller_id,
+                        connector_name=db_position.connector_name,
+                        trading_pair=db_position.trading_pair,
+                        side=db_position.side,
+                        timestamp=int(self.strategy.current_timestamp * 1e3),
+                        volume_traded_quote=Decimal("0"),
+                        amount=Decimal("0"),
+                        breakeven_price=Decimal("0"),
+                        unrealized_pnl_quote=Decimal("0"),
+                        realized_pnl_quote=Decimal("0"),
+                        cum_fees_quote=db_position.cum_fees_quote,
+                    )
+                )
 
     def store_all_executors(self):
         for controller_id, executors_list in self.active_executors.items():
             for executor in executors_list:
                 # Store the executor in the database
                 MarketsRecorder.get_instance().store_or_update_executor(executor)
+                self._persist_position_hold_entries_from_executor_info(executor.executor_info)
                 self._update_cached_performance(controller_id, executor.executor_info)
                 self._record_stored_executor(controller_id, executor.executor_info)
         # Remove the executors from the list
         self.active_executors = {}
+
+    def sync_live_executors_to_db(self):
+        """
+        Mirror active and recently finished executors into the database without mutating the in-memory sets.
+        """
+        for executors_list in self.active_executors.values():
+            for executor in executors_list:
+                MarketsRecorder.get_instance().store_or_update_executor(executor)
+                self._persist_position_hold_entries_from_executor_info(executor.executor_info)
+
+    def sync_live_state_to_db(self):
+        self.sync_live_positions_to_db()
+        self.sync_live_executors_to_db()
 
     def execute_action(self, action: ExecutorAction):
         """
@@ -507,29 +1028,12 @@ class ExecutorOrchestrator:
             if not executors_to_process:
                 continue
 
-            positions = self.positions_held.get(controller_id, [])
-
             for executor in executors_to_process:
                 executor_info = executor.executor_info
                 self.executors_ids_position_held.append(executor_info.config.id)
-
-                # Determine position side (handling perpetual markets)
-                position_side = self._determine_position_side(executor_info)
-
-                # Find or create position
-                existing_position = self._find_existing_position(positions, executor_info, position_side)
-
-                if existing_position:
-                    existing_position.add_orders_from_executor(executor_info)
-                else:
-                    # Create new position
-                    position = PositionHold(
-                        executor_info.connector_name,
-                        executor_info.trading_pair,
-                        position_side if position_side else executor_info.config.side
-                    )
-                    position.add_orders_from_executor(executor_info)
-                    positions.append(position)
+                self._persist_position_hold_entries_from_executor_info(executor_info)
+                self._apply_executor_info_to_positions(controller_id, executor_info)
+            self._prune_flat_positions(controller_id)
 
     def _determine_position_side(self, executor_info: ExecutorInfo) -> Optional[TradeType]:
         """
@@ -550,15 +1054,19 @@ class ExecutorOrchestrator:
 
         return executor_info.config.side
 
-    def _find_existing_position(self, positions: List[PositionHold],
-                                executor_info: ExecutorInfo,
-                                position_side: Optional[TradeType]) -> Optional[PositionHold]:
+    def _find_existing_position(
+        self,
+        positions: List[PositionHold],
+        connector_name: str,
+        trading_pair: str,
+        position_side: Optional[TradeType],
+    ) -> Optional[PositionHold]:
         """
         Find an existing position that matches the executor's trading pair and side.
         """
         for position in positions:
-            if (position.trading_pair == executor_info.trading_pair and
-                    position.connector_name == executor_info.connector_name):
+            if (position.trading_pair == trading_pair and
+                    position.connector_name == connector_name):
 
                 # If we have a specific position side, match it
                 if position_side is not None:
@@ -588,6 +1096,7 @@ class ExecutorOrchestrator:
             return
         try:
             MarketsRecorder.get_instance().store_or_update_executor(executor)
+            self._persist_position_hold_entries_from_executor_info(executor.executor_info)
             self._update_cached_performance(controller_id, executor.executor_info)
             self._record_stored_executor(controller_id, executor.executor_info)
         except Exception as e:

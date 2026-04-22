@@ -149,3 +149,24 @@ class AddTradeFeeInQuote(DatabaseTransformation):
     @property
     def to_version(self):
         return 20230516
+
+
+class AddPositionHoldLedger(DatabaseTransformation):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        from hummingbot.model.position_hold_ledger import PositionHoldLedger
+
+        PositionHoldLedger.__table__.create(bind=db_handle.engine, checkfirst=True)
+        for index in PositionHoldLedger.__table__.indexes:
+            index.create(bind=db_handle.engine, checkfirst=True)
+        return db_handle
+
+    @property
+    def name(self):
+        return "AddPositionHoldLedger"
+
+    @property
+    def to_version(self):
+        return 20260327

@@ -43,6 +43,8 @@ class ExitCommand:
         self.notify("Winding down notifiers...")
         for notifier in self.trading_core.notifiers:
             notifier.stop()
+        if self._telegram_notifier is not None:
+            self._telegram_notifier.stop()
 
         self.app.exit()
         self.mqtt_stop()

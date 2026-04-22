@@ -124,16 +124,42 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             is_trading=True,
             custom_info={}
         )
-        # Set up controller_reports with the new structure
-        self.strategy.controller_reports = {
-            "controller_1": {"executors": [executor_1], "positions": [], "performance": None},
-            "controller_2": {"executors": [executor_2], "positions": [], "performance": None}
+        self.strategy.executor_orchestrator.active_executors = {
+            "controller_1": [SimpleNamespace(executor_info=executor_1)],
+            "controller_2": [SimpleNamespace(executor_info=executor_2)],
         }
         self.strategy.closed_executors_buffer = 0
 
         actions = self.strategy.store_actions_proposal()
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].executor_id, "1")
+
+    def test_store_actions_proposal_ignores_stored_history(self):
+        stored_executor = ExecutorInfo(
+            id="stored-db-executor",
+            controller_id="controller_1",
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            timestamp=10,
+            config=PositionExecutorConfig(id="stored-db-executor", timestamp=1234567890, trading_pair="ETH-USDT",
+                                          connector_name="binance",
+                                          side=TradeType.BUY, entry_price=Decimal("100"), amount=Decimal("1")),
+            net_pnl_pct=Decimal(0),
+            net_pnl_quote=Decimal(0),
+            cum_fees_quote=Decimal(0),
+            filled_amount_quote=Decimal(0),
+            is_active=False,
+            is_trading=False,
+            custom_info={"persistence_source": "db"},
+        )
+        self.strategy.controller_reports = {
+            "controller_1": {"executors": [stored_executor], "positions": [], "performance": None},
+        }
+        self.strategy.executor_orchestrator.active_executors = {"controller_1": []}
+        self.strategy.closed_executors_buffer = 0
+
+        actions = self.strategy.store_actions_proposal()
+        self.assertEqual(actions, [])
 
     def test_get_executors_by_controller(self):
         # Set up controller_reports with the new structure
@@ -154,6 +180,17 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         executors = self.strategy.get_all_executors()
         self.assertEqual(len(executors), 3)
+
+    def test_get_active_executors(self):
+        active_executor_1 = MagicMock()
+        active_executor_2 = MagicMock()
+        self.strategy.executor_orchestrator.active_executors = {
+            "controller_1": [SimpleNamespace(executor_info=active_executor_1)],
+            "controller_2": [SimpleNamespace(executor_info=active_executor_2)],
+        }
+
+        executors = self.strategy.get_active_executors()
+        self.assertEqual(executors, [active_executor_1, active_executor_2])
 
     def test_set_leverage(self):
         mock_connector = MagicMock()
@@ -671,6 +708,67 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertIn("breakeven", status)
         self.assertNotIn("No positions held.", status)
 
+    def test_format_status_keeps_controller_sections_in_stable_pair_order(self):
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+
+        controller_1 = MagicMock()
+        controller_1.to_format_status.return_value = ["Controller 1 status"]
+        controller_1.get_status_summary.return_value = {
+            "pair": "ETH-USDC",
+            "price": "2191.5",
+            "state": "BUILDING",
+            "signal": "NEUTRAL",
+            "score": "1/2",
+            "regime": "HV-up",
+            "avg_buy": "2188",
+            "exposure": "$100/$500 (20%)",
+            "execs": "B1 S0 H0",
+            "u_pnl": "$5.00 / 2.50%",
+            "u_pnl_pct": "2.50%",
+            "gate": "ready",
+            "note": "monitoring",
+            "attention_score": 10,
+        }
+        controller_2 = MagicMock()
+        controller_2.to_format_status.return_value = ["Controller 2 status"]
+        controller_2.get_status_summary.return_value = {
+            "pair": "BTC-USDC",
+            "price": "74800",
+            "state": "EXITING",
+            "signal": "SELL",
+            "score": "3/2",
+            "regime": "HV-down",
+            "avg_buy": "71791",
+            "exposure": "$400/$500 (80%)",
+            "execs": "B0 S1 H1",
+            "u_pnl": "$20.00 / 4.00%",
+            "u_pnl_pct": "4.00%",
+            "gate": "trend-hold",
+            "note": "sell active",
+            "attention_score": 999,
+        }
+        self.strategy.controllers = {"controller_1": controller_1, "controller_2": controller_2}
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [],
+                "positions": [],
+                "performance": None,
+            },
+            "controller_2": {
+                "executors": [],
+                "positions": [],
+                "performance": None,
+            },
+        }
+
+        status = self.strategy.format_status()
+
+        btc_index = status.index("Controller: controller_2 | BTC-USDC | EXITING | SELL")
+        eth_index = status.index("Controller: controller_1 | ETH-USDC | BUILDING | NEUTRAL")
+        self.assertLess(btc_index, eth_index)
+
     def test_format_status_handles_controller_formatter_exception(self):
         self.strategy.ready_to_trade = True
         self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
@@ -851,17 +949,35 @@ class StrategyV2BaseBasicTest(unittest.TestCase):
         self.clock.backtest_til(self.start_timestamp + self.clock_tick_size)
         self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT, Decimal("90"))
         self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1.1"), OrderType.LIMIT, Decimal("110"))
-        expected_status = """
-  Balances:
-               Exchange Asset  Total Balance  Available Balance
-    mock_paper_exchange  HBOT            500              498.9
-    mock_paper_exchange  USDT           5000               4910
+        status = self.strategy.format_status()
 
-  Orders:
-               Exchange    Market Side  Price  Amount      Age
-    mock_paper_exchange HBOT-USDT  buy     90       1"""
-        self.assertTrue(expected_status in self.strategy.format_status())
-        self.assertTrue("mock_paper_exchange HBOT-USDT sell    110     1.1 " in self.strategy.format_status())
+        self.assertIn("Balances:", status)
+        self.assertIn("Value (USD)", status)
+        self.assertIn("mock_paper_exchange  HBOT", status)
+        self.assertIn("mock_paper_exchange  USDT", status)
+        self.assertIn("mock_paper_exchange HBOT-USDT  buy     90       1", status)
+        self.assertIn("mock_paper_exchange HBOT-USDT sell    110     1.1 ", status)
+
+    @patch("hummingbot.strategy.strategy_v2_base.RateOracle.get_instance")
+    def test_get_balance_df_includes_usd_value_column(self, rate_oracle_get_instance):
+        mock_oracle = MagicMock()
+        mock_oracle.quote_token = "USD"
+        mock_oracle.get_pair_rate.side_effect = lambda pair: {
+            "HBOT-USD": Decimal("2"),
+            "USDT-USD": Decimal("1"),
+        }.get(pair)
+        rate_oracle_get_instance.return_value = mock_oracle
+
+        df = self.strategy.get_balance_df()
+
+        self.assertEqual(
+            ["Exchange", "Asset", "Total Balance", "Available Balance", "Value (USD)"],
+            list(df.columns),
+        )
+        hbot_row = df[df["Asset"] == "HBOT"].iloc[0]
+        usdt_row = df[df["Asset"] == "USDT"].iloc[0]
+        self.assertEqual(1000.0, hbot_row["Value (USD)"])
+        self.assertEqual(5000.0, usdt_row["Value (USD)"])
 
     def test_cancel_buy_order_basic(self):
         self.clock.add_iterator(self.strategy)

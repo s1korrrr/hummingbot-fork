@@ -4,7 +4,9 @@ from typing import Dict, List, Optional
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
+from hummingbot.remote_iface.mqtt import ExternalEventFactory
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
@@ -14,6 +16,15 @@ class V2WithControllersConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
     max_global_drawdown_quote: Optional[float] = None
     max_controller_drawdown_quote: Optional[float] = None
+    runtime_db_sync_enabled: bool = True
+    runtime_db_sync_interval: int = 10
+    runtime_status_snapshot_enabled: bool = True
+    runtime_status_snapshot_interval: int = 10
+    runtime_status_snapshot_dir: str = "data/runtime_status"
+    chart_snapshots_enabled: bool = True
+    chart_snapshot_base_retention_days: int = 30
+    chart_snapshot_higher_interval_retention_days: int = 90
+    chart_snapshot_prune_interval: int = 3600
 
 
 class V2WithControllers(StrategyV2Base):
@@ -37,13 +48,68 @@ class V2WithControllers(StrategyV2Base):
         self.drawdown_exited_controllers = []
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
+        self._operator_event_queue = ExternalEventFactory.create_queue("rsibot.operator")
 
     def on_tick(self):
         super().on_tick()
+        self.process_operator_events()
         if not self._is_stop_triggered:
             self.check_manual_kill_switch()
             self.control_max_drawdown()
             self.send_performance_report()
+
+    def process_operator_events(self):
+        while len(self._operator_event_queue) > 0:
+            event_name, event = self._operator_event_queue.popleft()
+            payload = getattr(event, "data", {}) or {}
+            action = str(payload.get("action") or "").strip()
+            controller_id = payload.get("controller_id")
+            requested_at = payload.get("requested_at")
+            command_id = payload.get("command_id")
+
+            target_controllers = (
+                [self.controllers.get(controller_id)]
+                if controller_id
+                else list(self.controllers.values())
+            )
+            target_controllers = [controller for controller in target_controllers if controller is not None]
+
+            if action in {"global_pause_entries", "bot_pause_entries"}:
+                scope = "global" if action == "global_pause_entries" else "bot"
+                for controller in target_controllers:
+                    if hasattr(controller, "set_operator_entry_pause"):
+                        controller.set_operator_entry_pause(
+                            True,
+                            reason="mobile-operator",
+                            scope=scope,
+                            command_id=command_id,
+                            updated_at=requested_at,
+                        )
+            elif action in {"global_resume_entries", "bot_resume_entries"}:
+                scope = "global" if action == "global_resume_entries" else "bot"
+                for controller in target_controllers:
+                    if hasattr(controller, "set_operator_entry_pause"):
+                        controller.set_operator_entry_pause(
+                            False,
+                            reason="mobile-operator",
+                            scope=scope,
+                            command_id=command_id,
+                            updated_at=requested_at,
+                        )
+            elif action == "bot_cancel_pending_entries":
+                target_controller_ids = {controller.config.id for controller in target_controllers}
+                actions = [
+                    StopExecutorAction(executor_id=executor.id, controller_id=executor.controller_id, keep_position=True)
+                    for executor in self.get_all_executors()
+                    if executor.controller_id in target_controller_ids
+                    and executor.side == TradeType.BUY
+                    and executor.is_active
+                    and not executor.is_trading
+                ]
+                if actions:
+                    self.executor_orchestrator.execute_actions(actions)
+            else:
+                self.logger().warning(f"Unsupported operator event {event_name}: {payload}")
 
     def control_max_drawdown(self):
         if self.config.max_controller_drawdown_quote:

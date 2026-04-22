@@ -31,6 +31,7 @@ from hummingbot.exceptions import ArgumentParserError
 from hummingbot.logger import HummingbotLogger
 from hummingbot.logger.application_warning import ApplicationWarning
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.notifier.telegram_notifier import TelegramNotifier
 from hummingbot.remote_iface.mqtt import MQTTGateway
 
 s_logger = None
@@ -75,6 +76,7 @@ class HummingbotApplication(*commands):
 
         # MQTT management
         self._mqtt: Optional[MQTTGateway] = None
+        self._telegram_notifier: Optional[TelegramNotifier] = None
 
         # Script configuration support
         self.script_config: Optional[str] = None
@@ -89,6 +91,7 @@ class HummingbotApplication(*commands):
             self.parser = None
 
         # MQTT Bridge (always available in both modes)
+        self._init_telegram_notifier()
         if self.client_config_map.mqtt_bridge.mqtt_autostart:
             self.mqtt_start()
 
@@ -260,6 +263,20 @@ class HummingbotApplication(*commands):
         """Initialize notifiers by delegating to TradingCore."""
         for notifier in self.trading_core.notifiers:
             notifier.start()
+        if self._telegram_notifier is not None:
+            self._telegram_notifier.start()
+
+    def _init_telegram_notifier(self):
+        if self.client_config_map.telegram_notifications.telegram_enabled:
+            self._telegram_notifier = TelegramNotifier(self)
+
+    def start_market_event_notifiers(self):
+        if self._telegram_notifier is not None:
+            self._telegram_notifier.start_market_events_fw()
+
+    def stop_market_event_notifiers(self):
+        if self._telegram_notifier is not None:
+            self._telegram_notifier.stop_market_events_fw()
 
     def init_command_tabs(self) -> Dict[str, CommandTab]:
         """

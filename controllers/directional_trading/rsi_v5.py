@@ -17,6 +17,7 @@ Key Features:
 - No time limit on executors - hold until trailing stop or bag freeze
 """
 import logging
+import time as _time
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
@@ -466,6 +467,11 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         self._cost_basis_cache_ts: Optional[float] = None
         self._consecutive_losses: int = 0
         self._last_loss_timestamp: Optional[float] = None
+        self._operator_entry_paused: bool = False
+        self._operator_pause_reason: Optional[str] = None
+        self._operator_pause_scope: Optional[str] = None
+        self._operator_pause_updated_at: Optional[float] = None
+        self._operator_last_command_id: Optional[str] = None
         # Indicator max_records must cover the slowest indicator
         self.max_records = max(500, config.bb_length * 3, config.macd_slow * 3, config.rsi_length * 5)
         if not getattr(self.config, "candles_config", None) or len(self.config.candles_config) == 0:
@@ -541,6 +547,46 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if candles_df is None or candles_df.empty:
             return None
         return candles_df.copy()
+
+    def set_operator_entry_pause(
+        self,
+        enabled: bool,
+        *,
+        reason: Optional[str] = None,
+        scope: Optional[str] = None,
+        command_id: Optional[str] = None,
+        updated_at: Optional[float] = None,
+    ) -> None:
+        self._operator_entry_paused = enabled
+        self._operator_pause_reason = reason
+        self._operator_pause_scope = scope
+        self._operator_pause_updated_at = updated_at or _time.time()
+        self._operator_last_command_id = command_id
+        log_fn = self.logger().warning if enabled else self.logger().info
+        log_fn(
+            f"Operator entry pause {'enabled' if enabled else 'disabled'} | "
+            f"pair={self.config.trading_pair} scope={scope or 'n/a'} reason={reason or 'n/a'}"
+        )
+
+    def get_operator_state(self) -> dict:
+        return {
+            "entry_paused": self._operator_entry_paused,
+            "reason": self._operator_pause_reason,
+            "scope": self._operator_pause_scope,
+            "updated_at": self._operator_pause_updated_at,
+            "last_command_id": self._operator_last_command_id,
+        }
+
+    def get_custom_info(self) -> dict:
+        mid_price = self._get_mid_price()
+        return {
+            "pair": self.config.trading_pair,
+            "signal": (self.processed_data or {}).get("signal", 0),
+            "mid_price": float(mid_price) if mid_price is not None else None,
+            "buy_gate": self._last_gate_reason.get(TradeType.BUY),
+            "sell_gate": self._last_gate_reason.get(TradeType.SELL),
+            "operator": self.get_operator_state(),
+        }
 
     def _split_entries_enabled(self) -> bool:
         return bool(
@@ -705,6 +751,51 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if increment > 0:
             min_amount = self._ceil_to_increment(min_amount, increment)
         return max(min_amount, Decimal("0"))
+
+    def _resolve_recovery_sell_amount(
+        self,
+        *,
+        position_amount: Decimal,
+        target_amount: Decimal,
+        price: Decimal,
+        available_base: Optional[Decimal] = None,
+    ) -> Decimal:
+        if position_amount <= 0 or target_amount <= 0 or price <= 0:
+            return Decimal("0")
+
+        max_sellable = position_amount
+        if available_base is not None:
+            max_sellable = min(max_sellable, available_base)
+        if max_sellable <= 0:
+            return Decimal("0")
+
+        rule = self._get_trading_rule()
+        min_quote = self._minimum_entry_quote(price, rule)
+        min_amount = self._minimum_entry_amount(price, rule)
+        if max_sellable < min_amount or (min_quote > 0 and max_sellable * price < min_quote):
+            return Decimal("0")
+
+        sell_amount = min(target_amount, max_sellable)
+        if sell_amount < min_amount or (min_quote > 0 and sell_amount * price < min_quote):
+            sell_amount = min_amount
+
+        remaining_amount = max_sellable - sell_amount
+        if remaining_amount > 0 and (
+            remaining_amount < min_amount or (min_quote > 0 and remaining_amount * price < min_quote)
+        ):
+            sell_amount = max_sellable
+
+        sell_amount = min(sell_amount, max_sellable)
+        sell_amount = self._quantize_amount(sell_amount)
+        if sell_amount > max_sellable:
+            sell_amount = max_sellable
+        if sell_amount <= 0:
+            return Decimal("0")
+        if sell_amount < min_amount or (min_quote > 0 and sell_amount * price < min_quote):
+            if max_sellable >= min_amount and (min_quote <= 0 or max_sellable * price >= min_quote):
+                return max_sellable
+            return Decimal("0")
+        return sell_amount
 
     def _resolve_buy_entry_plan(
         self,
@@ -1090,6 +1181,49 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             bag_count=len(positions),
             cost_basis=cost_basis,
         )
+
+    def _check_active_executor_drawdown_stop(
+        self,
+        current_price: Decimal,
+        existing_executor_ids: Optional[set] = None,
+    ) -> List[ExecutorAction]:
+        actions: List[ExecutorAction] = []
+        threshold = Decimal(str(self.config.early_stop_drawdown_pct))
+        if threshold <= 0 or current_price <= 0:
+            return actions
+
+        stopped_executor_ids = existing_executor_ids if existing_executor_ids is not None else set()
+        keep_position = self.config.early_stop_keep_position
+        for side in (TradeType.BUY, TradeType.SELL):
+            for executor in self._filter_same_side(side, active_only=True):
+                executor_id = getattr(executor, "id", None)
+                if executor_id is None or executor_id in stopped_executor_ids:
+                    continue
+                ref_price = self._executor_ref_price(executor)
+                if ref_price is None or ref_price <= 0:
+                    continue
+                pnl_pct = (
+                    (current_price - ref_price) / ref_price
+                    if side == TradeType.BUY
+                    else (ref_price - current_price) / ref_price
+                )
+                if pnl_pct > -threshold:
+                    continue
+
+                actions.append(
+                    StopExecutorAction(
+                        executor_id=executor_id,
+                        controller_id=self.config.id,
+                        keep_position=keep_position,
+                    )
+                )
+                stopped_executor_ids.add(executor_id)
+                self.logger().info(
+                    f"Early stop | {self._controller_pair_log_prefix()} executor={executor_id} "
+                    f"side={'BUY' if side == TradeType.BUY else 'SELL'} "
+                    f"ref={ref_price} current={current_price} pnl={pnl_pct} keep={keep_position}"
+                )
+        return actions
 
     def _get_base_balance(self) -> Optional[Decimal]:
         base_asset, _ = self._base_quote_assets()
@@ -1570,25 +1704,26 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         badge = self._lane_badge("buy", progress, ready)
         gauge = self._progress_gauge(progress)
+        headline = normalized_buy_reason if normalized_buy_reason != "ready" else buy_decision
         details: List[str] = [
             f"{badge} {gauge} {progress * 100:.0f}%",
-            f"{buy_decision}:{normalized_buy_reason}",
-            f"RSI {self._fmt(last_rsi, 2)}/{rsi_buy:.2f}",
-            f"score {signal_score}/{min_score} {self._flag_icon(signal_score >= min_score)}",
-            f"rev {self._flag_icon(raw_reversal)}",
+            f"🎯 {headline}",
+            f"📉 RSI {self._fmt(last_rsi, 2)}/{rsi_buy:.2f}",
         ]
         if need_parts and not ready:
-            details.append(f"need {', '.join(need_parts)}")
-        if buy_entry_role not in ("", "none"):
-            details.append(f"{buy_entry_role} {buy_entry_fraction * 100:.0f}%")
-        details.append(f"ctx {buy_context_bias}")
-        details.append(f"parts p{self._flag_icon(raw_prev_was_min)} u{self._flag_icon(raw_turning_up)} o{self._flag_icon(raw_was_oversold)} l{self._flag_icon(raw_near_bottom)}")
-        details.append(f"score r{self._flag_icon(score_rsi_oversold)} b{self._flag_icon(score_bb_touch)} m{self._flag_icon(score_macd_turn)} mr{self._flag_icon(score_mean_reversion)}")
-        if buy_confirmation_active:
+            details.append(f"⏳ {', '.join(need_parts)}")
+        elif signal_score < min_score:
+            details.append(f"⏳ score {min_score - signal_score}")
+        if ready and buy_entry_role not in ("", "none"):
+            details.append(f"🧩 {buy_entry_role} {buy_entry_fraction * 100:.0f}%")
+        if ready and buy_context_bias not in ("", "neutral"):
+            details.append(f"🧭 {buy_context_bias}")
+        if buy_confirmation_active and not ready:
             details.append(
-                f"confirm {self._fmt(buy_confirmation_rebound_delta, 2)}/{self._fmt(buy_confirmation_rebound_target, 2)} {self._flag_icon(buy_confirmation_price_rebounded)}"
+                f"🔁 {self._fmt(buy_confirmation_rebound_delta, 2)}/{self._fmt(buy_confirmation_rebound_target, 2)} {self._flag_icon(buy_confirmation_price_rebounded)}"
             )
-        details.append(f"gate {gate}")
+        if gate != "ready":
+            details.append(f"🧱 {gate}")
         return self._status_row("BUY", *details)
 
     def _sell_signal_status_line(
@@ -1637,11 +1772,11 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         badge = self._lane_badge("sell", progress, current_signal < 0)
         gauge = self._progress_gauge(progress)
+        headline = normalized_sell_reason if normalized_sell_reason != "ready" else sell_decision
         details: List[str] = [
             f"{badge} {gauge} {progress * 100:.0f}%",
-            f"{sell_decision}:{normalized_sell_reason}",
-            f"RSI {self._fmt(last_rsi, 2)}/{rsi_sell:.2f}",
-            f"rev {self._flag_icon(sell_reversal_confirmed)}",
+            f"🎯 {headline}",
+            f"📈 RSI {self._fmt(last_rsi, 2)}/{rsi_sell:.2f}",
         ]
         rsi_gap = max(0.0, (rsi_sell - last_rsi)) if last_rsi is not None else None
         need_parts: List[str] = []
@@ -1650,25 +1785,21 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         if has_inventory:
             if pnl_pct is not None:
-                details.append(f"pnl {float(pnl_pct) * 100:+.2f}%/{float(profit_target) * 100:.2f}%")
+                details.append(f"💰 {float(pnl_pct) * 100:+.2f}%/{float(profit_target) * 100:.2f}%")
                 if self.config.sell_only_if_profitable and pnl_pct < profit_target:
                     need_parts.append(f"pnl {float(profit_target - pnl_pct) * 100:.2f}%")
             else:
-                details.append("pnl n/a")
+                details.append("💰 n/a")
         else:
-            details.append("inv flat")
+            details.append("📦 flat")
         if need_parts and current_signal >= 0:
-            details.append(f"need {', '.join(need_parts)}")
-        details.append(f"profit {self._flag_icon(sell_profitability_ok)}")
-        details.append(f"hold {self._flag_icon(sell_trend_hold)}")
-        details.append(f"roll {self._flag_icon(sell_rsi_rollover)}")
-        details.append(f"ema {self._flag_icon(sell_price_below_ema)}")
-        details.append(f"macd {self._flag_icon(sell_macd_rollover)}")
-        if self.config.sell_only_if_profitable:
-            details.append(f"min {float(profit_target) * 100:.2f}%")
-        details.append(f"mid {self._fmt(mid_price, 4)}")
-        details.append(f"cost {self._fmt(cost_basis, 4)}")
-        details.append(f"gate {gate}")
+            details.append(f"⏳ {', '.join(need_parts)}")
+        if sell_trend_hold:
+            details.append("🌿 trend-hold")
+        if sell_reversal_confirmed and current_signal >= 0:
+            details.append("✅ reversal-ready")
+        if gate != "ready":
+            details.append(f"🧱 {gate}")
         return self._status_row("SELL", *details)
 
     # -----------------------------------------------------------------------
@@ -1793,19 +1924,39 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return pct_gap >= gap_thr
 
     def _last_same_side_ref_price(self, side: TradeType) -> Optional[Decimal]:
-        active = self._filter_same_side(side, active_only=True)
-        if not active:
+        if side == TradeType.SELL:
+            candidates = self.filter_executors(
+                executors=self.executors_info,
+                filter_func=lambda ex: (
+                    ex.connector_name == self.config.connector_name
+                    and ex.trading_pair == self.config.trading_pair
+                    and ex.side == side
+                    and (ex.is_active or self._executor_has_fill(ex))
+                ),
+            )
+        else:
+            candidates = self._filter_same_side(side, active_only=True)
+        if not candidates:
             return None
-        latest = max(active, key=lambda x: x.timestamp)
+        latest = max(
+            candidates,
+            key=lambda x: float(getattr(x, "close_timestamp", None) or getattr(x, "timestamp", 0.0) or 0.0),
+        )
         return self._executor_ref_price(latest)
 
     def _executor_ref_price(self, executor_info) -> Optional[Decimal]:
         try:
+            config = getattr(executor_info, "config", None)
             ci = executor_info.custom_info or {}
-            for key in ("current_position_average_price", "entry_price", "order_price"):
-                val = ci.get(key)
-                if val is not None and float(val) > 0:
-                    return Decimal(str(val))
+            for candidate in (
+                getattr(config, "price", None),
+                getattr(config, "entry_price", None),
+                ci.get("order_price"),
+                ci.get("entry_price"),
+                ci.get("current_position_average_price"),
+            ):
+                if candidate is not None and float(candidate) > 0:
+                    return Decimal(str(candidate))
         except Exception:
             pass
         return None
@@ -3238,6 +3389,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         buy_entry_role = str(state.get("buy_entry_role", "none") or "none")
         runner_entry = signal > 0 and buy_entry_role == "runner"
 
+        if signal > 0 and self._operator_entry_paused:
+            self._record_gate_reason(target_side, "operator_pause")
+            return False
+
         # Consecutive loss pause
         if signal > 0 and self._check_consecutive_loss_pause():
             self._record_gate_reason(target_side, "consecutive_loss_pause")
@@ -3289,6 +3444,13 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 return False
             if self._held_bag_count() > 0:
                 self._record_gate_reason(target_side, "held_bag_recovery")
+                return False
+            sell_price = self._shade_limit_maker_price(
+                trade_type=TradeType.SELL,
+                fallback_price=new_price,
+            )
+            if not self._has_sufficient_price_gap(target_side, sell_price):
+                self._record_gate_reason(target_side, "price_gap")
                 return False
 
         # Max total position
@@ -3509,33 +3671,12 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 self._track_executor_result(ex)
                 ex._v5_tracked = True  # type: ignore[attr-defined]
 
-        # --- Early stop on deep drawdown ---
-        threshold = Decimal(str(self.config.early_stop_drawdown_pct))
-        keep_pos = self.config.early_stop_keep_position
-        if threshold > 0:
-            for side in (TradeType.BUY, TradeType.SELL):
-                inventory = self._aggregate_held_inventory(side)
-                if inventory.total_amount <= Decimal("0"):
-                    continue
-                try:
-                    if inventory.cost_basis is None or inventory.cost_basis <= 0:
-                        continue
-                    if side == TradeType.BUY:
-                        pnl_pct = (current_price - inventory.cost_basis) / inventory.cost_basis
-                    else:
-                        pnl_pct = (inventory.cost_basis - current_price) / inventory.cost_basis
-                except Exception:
-                    continue
-                if pnl_pct <= -threshold:
-                    active_side = self._filter_same_side(side, active_only=True)
-                    for ex in active_side:
-                        actions.append(StopExecutorAction(
-                            executor_id=ex.id, controller_id=self.config.id, keep_position=keep_pos,
-                        ))
-                        self.logger().info(
-                            f"Early stop | {self._controller_pair_log_prefix()} executor={ex.id} "
-                            f"side={'BUY' if side == TradeType.BUY else 'SELL'} pnl={pnl_pct} keep={keep_pos}"
-                        )
+        # --- Early stop on active executor deep drawdown ---
+        existing_stop_ids = {
+            action.executor_id for action in actions
+            if isinstance(action, StopExecutorAction)
+        }
+        actions.extend(self._check_active_executor_drawdown_stop(current_price, existing_stop_ids))
 
         return actions
 
@@ -3715,23 +3856,34 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 else:
                     continue
 
-            min_step = Decimal("1e-8")
             ref_price = self._shade_limit_maker_price(
                 trade_type=TradeType.SELL,
                 fallback_price=current_price,
             )
+            recovery_execution_strategy = self.config.recovery_sell_execution_strategy
+            chaser_config = self._recovery_sell_chaser_config()
+            sell_price = current_price if recovery_execution_strategy == ExecutionStrategy.MARKET else ref_price
             target_amount = Decimal(str(pos.amount))
             partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
             if Decimal("0") < partial_fraction < Decimal("1"):
                 target_amount = target_amount * partial_fraction
                 reversal_reason = f"partial-{reversal_reason}"
-            if available_base is not None:
-                target_amount = min(target_amount, available_base)
-            sell_amount = target_amount.quantize(min_step)
+            sell_amount = self._resolve_recovery_sell_amount(
+                position_amount=Decimal(str(pos.amount)),
+                target_amount=target_amount,
+                price=sell_price,
+                available_base=available_base,
+            )
             if sell_amount <= Decimal("0"):
                 continue
-            recovery_execution_strategy = self.config.recovery_sell_execution_strategy
-            chaser_config = self._recovery_sell_chaser_config()
+            if not self._has_sufficient_price_gap(TradeType.SELL, sell_price):
+                trail.last_reason = "price-gap"
+                self.logger().info(
+                    f"RECOVERY TRAIL HOLD | {self._controller_pair_log_prefix()} "
+                    f"reason=price-gap current={current_price} sell_price={sell_price} "
+                    f"last_sell={self._last_same_side_ref_price(TradeType.SELL)}"
+                )
+                continue
             sell_config = OrderExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=self.config.connector_name,
@@ -3981,7 +4133,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return self._status_row("recovery", *parts)
 
     def to_format_status(self) -> List[str]:
-        """Return a compact operator panel for BUY/SELL readiness and live state."""
+        """Return compact BUY/SELL readiness only; shared header/recent sections render elsewhere."""
         if not self.config:
             return ["Configuration not available."]
 
@@ -4058,32 +4210,4 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             sell_reversal_confirmed=bool(state.get("sell_reversal_confirmed")),
             sell_trend_hold=bool(state.get("sell_trend_hold")),
         )
-        try:
-            now_ts = float(self.market_data_provider.time()) if self.market_data_provider else 0.0
-        except Exception:
-            now_ts = 0.0
-        trend = self._processed_trend_confirmation()
-        market_line = self._status_row(
-            "market",
-            f"◉ {self._fmt(mid_price, 4)}",
-            f"signal={self._summary_signal_label(current_signal)}",
-            f"regime={processed.get('regime', 'n/a')}",
-            f"htf={trend.get('direction', 'unavailable')}",
-            f"conf={self._fmt(trend.get('confidence'), 2)}",
-            f"align={self._fmt(trend.get('alignment_score'), 2)}",
-        )
-        lines = [
-            market_line,
-            buy_line,
-            sell_line,
-            self._status_inventory_line(),
-            self._status_exit_owner_line(current_signal),
-        ]
-        for extra_line in (
-            self._status_buy_executor_line(now_ts),
-            self._status_sell_executor_line(now_ts),
-            self._status_recovery_line(mid_price),
-        ):
-            if extra_line:
-                lines.append(extra_line)
-        return lines
+        return [buy_line, sell_line]

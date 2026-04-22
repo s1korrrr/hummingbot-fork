@@ -141,6 +141,7 @@ class StartCommand(GatewayChainApiManager):
         self._in_start_check = False
 
         # Patch MQTT loggers if MQTT is available
+        self.start_market_event_notifiers()
         if self._mqtt:
             self._mqtt.patch_loggers()
             self._mqtt.start_market_events_fw()

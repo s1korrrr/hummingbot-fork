@@ -293,6 +293,16 @@ class OrderExecutor(ExecutorBase):
         if self._order and event.order_id == self._order.order_id:
             self._failed_orders.append(self._order)
             self._order = None
+            if self._is_permanent_validation_failure(event):
+                self.close_type = CloseType.FAILED
+                self.logger().error(
+                    self._log_message(
+                        f"Order failed permanently order_id={event.order_id}. "
+                        f"Not retrying due to validation error"
+                    )
+                )
+                self.stop()
+                return
             self.logger().error(
                 self._log_message(
                     f"Order failed order_id={event.order_id}. "
@@ -300,6 +310,22 @@ class OrderExecutor(ExecutorBase):
                 )
             )
             self._current_retries += 1
+
+    @staticmethod
+    def _is_permanent_validation_failure(event: MarketOrderFailureEvent) -> bool:
+        error_type = str(getattr(event, "error_type", "") or "").lower()
+        error_message = str(getattr(event, "error_message", "") or "").lower()
+        if not error_message:
+            return False
+        permanent_markers = (
+            "minimum notional size",
+            "minimum order size",
+            "lower than minimum",
+            "order value is lower than minimum",
+        )
+        if error_type and error_type != "valueerror":
+            return False
+        return any(marker in error_message for marker in permanent_markers)
 
     def get_custom_info(self) -> Dict:
         """

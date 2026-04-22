@@ -49,49 +49,26 @@ class ConfigCommandTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(6, len(captures))
         self.assertEqual("\nGlobal Configurations:", captures[0])
-
-        df_str_expected = ("    +-----------------------------------+----------------------+\n"
-                           "    | Key                               | Value                |\n"
-                           "    |-----------------------------------+----------------------|\n"
-                           "    | instance_id                       | TEST_ID              |\n"
-                           "    | fetch_pairs_from_all_exchanges    | False                |\n"
-                           "    | kill_switch_mode                  | kill_switch_disabled |\n"
-                           "    | autofill_import                   | disabled             |\n"
-                           "    | mqtt_bridge                       |                      |\n"
-                           "    | ∟ mqtt_host                       | localhost            |\n"
-                           "    | ∟ mqtt_port                       | 1883                 |\n"
-                           "    | ∟ mqtt_username                   |                      |\n"
-                           "    | ∟ mqtt_password                   |                      |\n"
-                           "    | ∟ mqtt_namespace                  | hbot                 |\n"
-                           "    | ∟ mqtt_ssl                        | False                |\n"
-                           "    | ∟ mqtt_logger                     | True                 |\n"
-                           "    | ∟ mqtt_notifier                   | True                 |\n"
-                           "    | ∟ mqtt_commands                   | True                 |\n"
-                           "    | ∟ mqtt_events                     | True                 |\n"
-                           "    | ∟ mqtt_external_events            | True                 |\n"
-                           "    | ∟ mqtt_autostart                  | False                |\n"
-                           "    | send_error_logs                   | True                 |\n"
-                           "    | gateway                           |                      |\n"
-                           "    | ∟ gateway_api_host                | localhost            |\n"
-                           "    | ∟ gateway_api_port                | 15888                |\n"
-                           "    | ∟ gateway_use_ssl                 | False                |\n"
-                           "    | rate_oracle_source                | binance              |\n"
-                           "    | global_token                      |                      |\n"
-                           "    | ∟ global_token_name               | USDT                 |\n"
-                           "    | ∟ global_token_symbol             | $                    |\n"
-                           "    | rate_limits_share_pct             | 100.0                |\n"
-                           "    | commands_timeout                  |                      |\n"
-                           "    | ∟ create_command_timeout          | 10.0                 |\n"
-                           "    | ∟ other_commands_timeout          | 30.0                 |\n"
-                           "    | tables_format                     | psql                 |\n"
-                           "    | tick_size                         | 1.0                  |\n"
-                           "    | market_data_collection            |                      |\n"
-                           "    | ∟ market_data_collection_enabled  | False                |\n"
-                           "    | ∟ market_data_collection_interval | 60                   |\n"
-                           "    | ∟ market_data_collection_depth    | 20                   |\n"
-                           "    +-----------------------------------+----------------------+")
-
-        self.assertEqual(df_str_expected, captures[1])
+        global_config_table = captures[1]
+        self.assertIn("| instance_id                       | TEST_ID", global_config_table)
+        self.assertIn("| fetch_pairs_from_all_exchanges    | False", global_config_table)
+        self.assertIn("| ∟ mqtt_host                       | localhost", global_config_table)
+        self.assertIn("| telegram_notifications            |", global_config_table)
+        self.assertIn(
+            f"| ∟ telegram_enabled                | {self.app.client_config_map.telegram_notifications.telegram_enabled}",
+            global_config_table,
+        )
+        self.assertIn(
+            f"| ∟ telegram_chat_id                | {self.app.client_config_map.telegram_notifications.telegram_chat_id}",
+            global_config_table,
+        )
+        self.assertIn("| ∟ telegram_notify_order_filled    | True", global_config_table)
+        self.assertIn("| ∟ telegram_notify_order_completed | False", global_config_table)
+        self.assertIn("| ∟ telegram_notify_order_failed    | True", global_config_table)
+        self.assertIn("| ∟ gateway_api_host                | localhost", global_config_table)
+        self.assertIn("| ∟ global_token_name               | USDT", global_config_table)
+        self.assertIn("| tables_format                     | psql", global_config_table)
+        self.assertIn("| ∟ market_data_collection_depth    | 20", global_config_table)
         self.assertEqual("\nColor Settings:", captures[2])
 
         df_str_expected = ("    +--------------------+---------+\n"

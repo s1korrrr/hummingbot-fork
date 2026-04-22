@@ -1,9 +1,11 @@
 import asyncio
 import importlib
 import inspect
+import json
 import logging
 import os
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import numpy as np
@@ -16,11 +18,12 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
-from hummingbot.connector.utils import split_hb_trading_pair
+from hummingbot.connector.utils import combine_to_hb_trading_pair, split_hb_trading_pair
 from hummingbot.core.clock import Clock
-from hummingbot.core.data_type.common import MarketDict, PositionMode
+from hummingbot.core.data_type.common import MarketDict, PositionMode, PriceType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderType, PositionAction
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.exceptions import InvalidController
@@ -45,6 +48,7 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 lsb_logger = None
 s_decimal_nan = Decimal("NaN")
+USD_STABLE_TOKENS = {"USD", "USDT", "USDC", "FDUSD", "BUSD", "DAI", "TUSD", "USDE"}
 
 # Lazy-loaded to avoid circular import (strategy_v2_base -> executor_orchestrator -> executors -> strategy_v2_base)
 ExecutorOrchestrator = None
@@ -303,6 +307,9 @@ class StrategyV2Base(StrategyPyBase):
         self._is_stop_triggered = False
         self._controllers_started = False
         self._last_controller_reload_error: Optional[str] = None
+        self._last_runtime_db_sync_ts: float = 0
+        self._last_runtime_status_snapshot_ts: float = 0
+        self._last_chart_snapshot_prune_ts: float = 0
         self.mqtt_enabled = False
         self._pub: Optional[ETopicPublisher] = None
 
@@ -347,6 +354,9 @@ class StrategyV2Base(StrategyPyBase):
         """
         if self.controllers:
             self.update_executors_info()
+            self._sync_runtime_state_to_db_if_due()
+            self._write_chart_snapshots_if_due()
+            self._write_runtime_status_snapshot_if_due()
             self.update_controllers_configs()
             if self.market_data_provider.ready and not self._is_stop_triggered:
                 executor_actions: List[ExecutorAction] = self.determine_executor_actions()
@@ -490,17 +500,80 @@ class StrategyV2Base(StrategyPyBase):
         """
         Returns a data frame for all asset balances for displaying purpose.
         """
-        columns: List[str] = ["Exchange", "Asset", "Total Balance", "Available Balance"]
+        columns: List[str] = ["Exchange", "Asset", "Total Balance", "Available Balance", "Value (USD)"]
         data: List[Any] = []
         for connector_name, connector in self.connectors.items():
             for asset in self.get_assets(connector_name):
+                total_balance = float(connector.get_balance(asset))
+                available_balance = float(connector.get_available_balance(asset))
+                usd_rate = self._get_asset_usd_rate(connector_name=connector_name, asset=asset)
+                usd_value = round(float(Decimal(str(total_balance)) * usd_rate), 2) if usd_rate is not None else ""
                 data.append([connector_name,
                              asset,
-                             float(connector.get_balance(asset)),
-                             float(connector.get_available_balance(asset))])
+                             total_balance,
+                             available_balance,
+                             usd_value])
         df = pd.DataFrame(data=data, columns=columns).replace(np.nan, '', regex=True)
         df.sort_values(by=["Exchange", "Asset"], inplace=True)
         return df
+
+    def _get_balances_snapshot(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for connector_name, connector in self.connectors.items():
+            for asset in self.get_assets(connector_name):
+                total_balance = float(connector.get_balance(asset))
+                available_balance = float(connector.get_available_balance(asset))
+                usd_rate = self._get_asset_usd_rate(connector_name=connector_name, asset=asset)
+                value_quote = round(float(Decimal(str(total_balance)) * usd_rate), 2) if usd_rate is not None else 0.0
+                rows.append(
+                    {
+                        "exchange": connector_name,
+                        "asset": asset,
+                        "total_balance": total_balance,
+                        "available_balance": available_balance,
+                        "value_quote": value_quote,
+                    }
+                )
+        rows.sort(key=lambda row: (row["exchange"], row["asset"]))
+        return rows
+
+    def _get_asset_usd_rate(self, connector_name: str, asset: str) -> Optional[Decimal]:
+        asset = asset.upper()
+        if asset in USD_STABLE_TOKENS:
+            return Decimal("1")
+
+        connector_pairs = self.markets.get(connector_name, [])
+        for trading_pair in connector_pairs:
+            try:
+                base_asset, quote_asset = split_hb_trading_pair(trading_pair)
+                mid_price = self.market_data_provider.get_price_by_type(
+                    connector_name,
+                    trading_pair,
+                    PriceType.MidPrice,
+                )
+                if mid_price is None:
+                    continue
+                mid_price = Decimal(str(mid_price))
+                if mid_price <= 0:
+                    continue
+                if base_asset == asset and quote_asset.upper() in USD_STABLE_TOKENS:
+                    return mid_price
+                if quote_asset == asset and base_asset.upper() in USD_STABLE_TOKENS:
+                    return Decimal("1") / mid_price
+            except Exception:
+                continue
+
+        oracle = RateOracle.get_instance()
+        quote_candidates = [oracle.quote_token.upper()] if oracle.quote_token else []
+        quote_candidates.extend(token for token in USD_STABLE_TOKENS if token not in quote_candidates)
+        for quote_token in quote_candidates:
+            try:
+                rate = oracle.get_pair_rate(combine_to_hb_trading_pair(base=asset, quote=quote_token))
+            except Exception:
+                rate = None
+            if rate is not None:
+                return Decimal(str(rate))
+        return None
 
     def active_orders_df(self) -> pd.DataFrame:
         """
@@ -524,6 +597,221 @@ class StrategyV2Base(StrategyPyBase):
         df = pd.DataFrame(data=data, columns=columns)
         df.sort_values(by=["Exchange", "Market", "Side"], inplace=True)
         return df
+
+    def _runtime_status_snapshot_enabled(self) -> bool:
+        return bool(getattr(self.config, "runtime_status_snapshot_enabled", False))
+
+    def _runtime_db_sync_enabled(self) -> bool:
+        return bool(getattr(self.config, "runtime_db_sync_enabled", False))
+
+    def _chart_snapshots_enabled(self) -> bool:
+        return bool(getattr(self.config, "chart_snapshots_enabled", True))
+
+    def _chart_snapshot_base_retention_days(self) -> int:
+        try:
+            value = int(getattr(self.config, "chart_snapshot_base_retention_days", 30))
+        except (TypeError, ValueError):
+            value = 30
+        return max(1, value)
+
+    def _chart_snapshot_higher_interval_retention_days(self) -> int:
+        try:
+            value = int(getattr(self.config, "chart_snapshot_higher_interval_retention_days", 90))
+        except (TypeError, ValueError):
+            value = 90
+        return max(1, value)
+
+    def _chart_snapshot_prune_interval(self) -> int:
+        try:
+            value = int(getattr(self.config, "chart_snapshot_prune_interval", 3600))
+        except (TypeError, ValueError):
+            value = 3600
+        return max(300, value)
+
+    def _runtime_db_sync_interval(self) -> int:
+        try:
+            value = int(getattr(self.config, "runtime_db_sync_interval", 10))
+        except (TypeError, ValueError):
+            value = 10
+        return max(5, value)
+
+    def _sync_runtime_state_to_db_if_due(self):
+        if not self._runtime_db_sync_enabled() or not self.ready_to_trade:
+            return
+        if self.current_timestamp - self._last_runtime_db_sync_ts < self._runtime_db_sync_interval():
+            return
+        try:
+            self.executor_orchestrator.sync_live_state_to_db()
+            self._last_runtime_db_sync_ts = self.current_timestamp
+        except Exception as e:
+            self.logger().warning(f"Failed to sync runtime state to db: {e}")
+
+    def _write_chart_snapshots_if_due(self):
+        if not self._chart_snapshots_enabled() or not self.ready_to_trade:
+            return
+        try:
+            recorder = MarketsRecorder.get_instance()
+        except Exception:
+            return
+        bot_name = self._runtime_status_snapshot_bot_name()
+        prune_enabled = self.current_timestamp - self._last_chart_snapshot_prune_ts >= self._chart_snapshot_prune_interval()
+        wrote_rows = False
+        for controller in self.controllers.values():
+            build_fn = getattr(controller, "build_chart_snapshot_rows", None)
+            if not callable(build_fn):
+                continue
+            rows = build_fn(bot_name=bot_name)
+            for row in rows:
+                recorder.store_or_update_chart_snapshot(row)
+                wrote_rows = True
+            if prune_enabled:
+                prune_fn = getattr(controller, "chart_snapshot_prune_requests", None)
+                if callable(prune_fn):
+                    for request in prune_fn():
+                        recorder.prune_chart_snapshots(**request)
+        if prune_enabled and wrote_rows:
+            self._last_chart_snapshot_prune_ts = self.current_timestamp
+
+    def _runtime_status_snapshot_interval(self) -> int:
+        try:
+            value = int(getattr(self.config, "runtime_status_snapshot_interval", 10))
+        except (TypeError, ValueError):
+            value = 10
+        return max(5, value)
+
+    def _runtime_status_snapshot_dir(self) -> Path:
+        configured = str(getattr(self.config, "runtime_status_snapshot_dir", "data/runtime_status") or "data/runtime_status")
+        base_path = Path(configured).expanduser()
+        if base_path.is_absolute():
+            return base_path
+        return settings.root_path() / base_path
+
+    def _runtime_status_snapshot_bot_name(self) -> str:
+        try:
+            config_file_path = MarketsRecorder.get_instance().config_file_path
+        except Exception:
+            config_file_path = ""
+        config_name = Path(str(config_file_path or "")).name
+        if config_name.endswith(".yml"):
+            return config_name[:-4]
+        if config_name.endswith(".yaml"):
+            return config_name[:-5]
+        script_name = Path(str(getattr(self.config, "script_file_name", "strategy_v2"))).stem
+        return config_name or script_name or "strategy_v2"
+
+    def _write_runtime_status_snapshot_if_due(self):
+        if not self._runtime_status_snapshot_enabled() or not self.ready_to_trade:
+            return
+        if self.current_timestamp - self._last_runtime_status_snapshot_ts < self._runtime_status_snapshot_interval():
+            return
+        try:
+            snapshot = self._build_runtime_status_snapshot()
+            snapshot_dir = self._runtime_status_snapshot_dir()
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            snapshot_path = snapshot_dir / f"{snapshot['bot_name']}.status.json"
+            tmp_path = snapshot_path.with_suffix(f"{snapshot_path.suffix}.tmp")
+            tmp_path.write_text(json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True), encoding="utf-8")
+            tmp_path.replace(snapshot_path)
+            self._last_runtime_status_snapshot_ts = self.current_timestamp
+        except Exception as e:
+            self.logger().warning(f"Failed to write runtime status snapshot: {e}")
+
+    def _build_runtime_status_snapshot(self) -> Dict[str, Any]:
+        controller_entries = self._build_controller_status_entries()
+        balances = self._get_balances_snapshot()
+        focus_queue = [
+            {
+                "pair": entry["summary"].get("pair", entry["controller_id"]),
+                "focus": entry["summary"].get("focus", ""),
+            }
+            for entry in controller_entries
+            if int(entry["summary"].get("attention_score", 0)) > 0
+            and entry["summary"].get("note") not in ("", "monitoring")
+        ][:5]
+
+        active_executors: List[Dict[str, Any]] = []
+        positions_held: List[Dict[str, Any]] = []
+        controllers: List[Dict[str, Any]] = []
+
+        for entry in controller_entries:
+            summary = entry["summary"]
+            pair = summary.get("pair", entry["controller_id"])
+            controllers.append(
+                {
+                    "pair": pair,
+                    "price_quote": float(self._safe_decimal(summary.get("price", 0))) if str(summary.get("price", "n/a")) != "n/a" else None,
+                    "state": summary.get("state", "n/a"),
+                    "signal": summary.get("signal", "n/a"),
+                    "score": summary.get("score", "n/a"),
+                    "breakeven_price": float(self._safe_decimal(summary.get("avg_buy", 0))) if str(summary.get("avg_buy", "n/a")) != "n/a" else None,
+                    "unrealized_pnl_pct": float(self._safe_decimal(str(summary.get("u_pnl_pct", "0")).replace("%", ""))) if str(summary.get("u_pnl_pct", "n/a")) != "n/a" else None,
+                    "execs": summary.get("execs", "n/a"),
+                    "exposure_text": summary.get("exposure", "n/a"),
+                    "gate": summary.get("gate", "n/a"),
+                }
+            )
+
+            for executor in entry["executors"]:
+                if not executor.is_active:
+                    continue
+                side = self._compact_side_label(executor.side or getattr(executor.config, "side", None))
+                active_executors.append(
+                    {
+                        "pair": pair,
+                        "side": side.lower() if side else None,
+                        "executor_type": self._compact_executor_type(executor.type),
+                        "status": (self._compact_enum_label(executor.status) or "unknown").lower(),
+                        "age": self._format_executor_age_short(executor.timestamp),
+                        "net_pnl_quote": float(self._safe_decimal(executor.net_pnl_quote)),
+                        "net_pnl_pct": float(self._safe_decimal(executor.net_pnl_pct) * Decimal("100")),
+                        "filled_amount_quote": float(self._safe_decimal(executor.filled_amount_quote)),
+                    }
+                )
+
+            for position in entry["positions"]:
+                positions_held.append(
+                    {
+                        "controller_id": entry["controller_id"],
+                        "pair": pair,
+                        "side": getattr(position.side, "name", str(position.side)).lower(),
+                        "amount_base": float(self._safe_decimal(position.amount)),
+                        "value_quote": float(self._safe_decimal(position.amount) * self._safe_decimal(position.breakeven_price)),
+                        "breakeven_price": float(self._safe_decimal(position.breakeven_price)),
+                        "unrealized_pnl_quote": float(self._safe_decimal(position.unrealized_pnl_quote)),
+                        "realized_pnl_quote": float(self._safe_decimal(position.realized_pnl_quote)),
+                        "fees_quote": float(self._safe_decimal(position.cum_fees_quote)),
+                    }
+                )
+
+        active_orders_count = sum(len(self.get_active_orders(connector_name)) for connector_name in self.connectors)
+        balance_value_quote = round(sum(row["value_quote"] for row in balances), 6)
+        positions_value_quote = round(sum(row["value_quote"] for row in positions_held), 6)
+        realized_pnl_quote = round(sum(row["realized_pnl_quote"] for row in positions_held), 6)
+        unrealized_pnl_quote = round(sum(row["unrealized_pnl_quote"] for row in positions_held), 6)
+        fees_quote = round(sum(row["fees_quote"] for row in positions_held), 6)
+
+        return {
+            "schema_version": 1,
+            "bot_name": self._runtime_status_snapshot_bot_name(),
+            "updated_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
+            "active_orders_count": active_orders_count,
+            "balances": balances,
+            "controllers": controllers,
+            "focus_queue": focus_queue,
+            "active_executors": active_executors,
+            "positions_held": positions_held,
+            "summary": {
+                "balance_value_quote": balance_value_quote,
+                "active_executor_count": len(active_executors),
+                "positions_held_count": len(positions_held),
+                "controller_count": len(controllers),
+                "positions_value_quote": positions_value_quote,
+                "realized_pnl_quote": realized_pnl_quote,
+                "unrealized_pnl_quote": unrealized_pnl_quote,
+                "fees_quote": fees_quote,
+                "net_pnl_quote": round(realized_pnl_quote + unrealized_pnl_quote - fees_quote, 6),
+            },
+        }
 
     def format_status(self) -> str:
         """
@@ -846,7 +1134,7 @@ class StrategyV2Base(StrategyPyBase):
         Create a list of actions to store the executors that have been stopped.
         """
         potential_executors_to_store = self.filter_executors(
-            executors=self.get_all_executors(),
+            executors=self.get_active_executors(),
             filter_func=lambda x: x.is_done)
         sorted_executors = sorted(potential_executors_to_store, key=lambda x: x.timestamp, reverse=True)
         if len(sorted_executors) > self.closed_executors_buffer:
@@ -857,6 +1145,22 @@ class StrategyV2Base(StrategyPyBase):
     def get_executors_by_controller(self, controller_id: str) -> List[ExecutorInfo]:
         """Get executors for a specific controller from the unified reports."""
         return self.controller_reports.get(controller_id, {}).get("executors", [])
+
+    def get_active_executors_by_controller(self, controller_id: str) -> List[ExecutorInfo]:
+        """Get live in-memory executors for a specific controller."""
+        return [
+            executor.executor_info
+            for executor in self.executor_orchestrator.active_executors.get(controller_id, [])
+            if executor
+        ]
+
+    def get_active_executors(self) -> List[ExecutorInfo]:
+        """Get all live in-memory executors across controllers."""
+        return [
+            executor_info
+            for controller_id in self.executor_orchestrator.active_executors.keys()
+            for executor_info in self.get_active_executors_by_controller(controller_id)
+        ]
 
     def get_all_executors(self) -> List[ExecutorInfo]:
         """Get all executors from all controllers."""
@@ -921,7 +1225,6 @@ class StrategyV2Base(StrategyPyBase):
             })
         entries.sort(
             key=lambda entry: (
-                -int(entry["summary"].get("attention_score", 0)),
                 str(entry["summary"].get("pair", entry["controller_id"])),
                 entry["controller_id"],
             )

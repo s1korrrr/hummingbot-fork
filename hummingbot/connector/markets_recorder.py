@@ -5,8 +5,9 @@ import os.path
 import threading
 import time
 from decimal import Decimal
+from enum import Enum
 from shutil import move
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 from sqlalchemy.orm import Query, Session
@@ -33,6 +34,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model.chart_snapshot import ChartSnapshot
 from hummingbot.model.controllers import Controllers
 from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
@@ -41,6 +43,7 @@ from hummingbot.model.market_state import MarketState
 from hummingbot.model.order import Order
 from hummingbot.model.order_status import OrderStatus
 from hummingbot.model.position import Position
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
 from hummingbot.model.range_position_update import RangePositionUpdate
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
@@ -229,6 +232,37 @@ class MarketsRecorder:
                 session.add(new_executor)
             session.commit()
 
+    def store_or_update_chart_snapshot(self, snapshot: Dict[str, Any]):
+        identity = {
+            "controller_id": snapshot["controller_id"],
+            "pair": snapshot["pair"],
+            "interval": snapshot["interval"],
+            "candle_timestamp": snapshot["candle_timestamp"],
+        }
+        with self._sql_manager.get_new_session() as session:
+            existing_snapshot = session.query(ChartSnapshot).filter_by(**identity).one_or_none()
+            if existing_snapshot:
+                for attr, value in snapshot.items():
+                    if attr != "id":
+                        setattr(existing_snapshot, attr, value)
+            else:
+                session.add(ChartSnapshot(**snapshot))
+            session.commit()
+
+    def prune_chart_snapshots(self, *, controller_id: str, pair: str, interval: str, keep_after_timestamp: int):
+        with self._sql_manager.get_new_session() as session:
+            (
+                session.query(ChartSnapshot)
+                .filter(
+                    ChartSnapshot.controller_id == controller_id,
+                    ChartSnapshot.pair == pair,
+                    ChartSnapshot.interval == interval,
+                    ChartSnapshot.candle_timestamp < keep_after_timestamp,
+                )
+                .delete()
+            )
+            session.commit()
+
     def store_position(self, position: Position):
         with self._sql_manager.get_new_session() as session:
             session.add(position)
@@ -244,6 +278,12 @@ class MarketsRecorder:
                 Position.side == position.side
             ).first()
 
+            if Decimal(str(position.amount)) <= Decimal("0"):
+                if existing_position:
+                    session.delete(existing_position)
+                session.commit()
+                return
+
             if existing_position:
                 # Update the existing position
                 existing_position.timestamp = position.timestamp
@@ -258,6 +298,133 @@ class MarketsRecorder:
                 session.add(position)
 
             session.commit()
+
+    @classmethod
+    def _safe_decimal(cls, value: Any) -> Decimal:
+        try:
+            decimal_value = Decimal(str(value))
+        except Exception:
+            return Decimal("0")
+        return decimal_value if decimal_value.is_finite() else Decimal("0")
+
+    @classmethod
+    def _safe_timestamp(cls, value: Any) -> int:
+        try:
+            return int(float(value))
+        except Exception:
+            return 0
+
+    @classmethod
+    def _sanitize_json_value(cls, value: Any):
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, Enum):
+            return value.name
+        if isinstance(value, dict):
+            return {
+                key: cls._sanitize_json_value(nested_value)
+                for key, nested_value in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._sanitize_json_value(item) for item in value]
+        return value
+
+    @staticmethod
+    def _position_hold_ledger_entry_id(
+        controller_id: str,
+        connector_name: str,
+        trading_pair: str,
+        position_side: Optional[str],
+        client_order_id: str,
+    ) -> str:
+        return "|".join([
+            controller_id,
+            connector_name,
+            trading_pair,
+            position_side or "spot",
+            client_order_id,
+        ])
+
+    def store_or_update_position_hold_ledger_entries(
+        self,
+        controller_id: str,
+        executor_id: str,
+        connector_name: str,
+        trading_pair: str,
+        held_position_orders: List[Dict[str, Any]],
+        position_side: Optional[str] = None,
+        fallback_timestamp: Optional[int] = None,
+    ):
+        if not controller_id or not executor_id or len(held_position_orders) == 0:
+            return
+
+        fallback_timestamp = fallback_timestamp or self.db_timestamp
+        with self._sql_manager.get_new_session() as session:
+            for order in held_position_orders:
+                client_order_id = str(order.get("client_order_id") or order.get("order_id") or "")
+                if not client_order_id:
+                    self.logger().warning(
+                        f"Skipping held position order without client_order_id | controller={controller_id} "
+                        f"executor={executor_id} pair={trading_pair}"
+                    )
+                    continue
+
+                executed_amount_base = self._safe_decimal(order.get("executed_amount_base"))
+                if executed_amount_base <= Decimal("0"):
+                    continue
+                order_side = str(order.get("trade_type") or "").upper()
+                if order_side == "":
+                    self.logger().warning(
+                        f"Skipping held position order without trade_type | controller={controller_id} "
+                        f"executor={executor_id} client_order_id={client_order_id}"
+                    )
+                    continue
+
+                entry = PositionHoldLedger(
+                    id=self._position_hold_ledger_entry_id(
+                        controller_id=controller_id,
+                        connector_name=connector_name,
+                        trading_pair=trading_pair,
+                        position_side=position_side,
+                        client_order_id=client_order_id,
+                    ),
+                    controller_id=controller_id,
+                    executor_id=executor_id,
+                    connector_name=connector_name,
+                    trading_pair=trading_pair,
+                    position_side=position_side,
+                    order_side=order_side,
+                    timestamp=self._safe_timestamp(
+                        order.get("last_update_timestamp")
+                        or order.get("creation_timestamp")
+                        or fallback_timestamp
+                    ),
+                    client_order_id=client_order_id,
+                    exchange_order_id=order.get("exchange_order_id"),
+                    price=self._safe_decimal(order.get("price")),
+                    amount=self._safe_decimal(order.get("amount")),
+                    executed_amount_base=executed_amount_base,
+                    executed_amount_quote=self._safe_decimal(order.get("executed_amount_quote")),
+                    cumulative_fee_paid_quote=self._safe_decimal(order.get("cumulative_fee_paid_quote")),
+                    order_payload=self._sanitize_json_value(order),
+                )
+                session.merge(entry)
+            session.commit()
+
+    def get_position_hold_ledger_entries_by_controller(
+        self, controller_id: Optional[str] = None
+    ) -> List[PositionHoldLedger]:
+        with self._sql_manager.get_new_session() as session:
+            query = session.query(PositionHoldLedger).order_by(
+                PositionHoldLedger.timestamp.asc(),
+                PositionHoldLedger.client_order_id.asc(),
+            )
+            if controller_id is not None:
+                query = query.filter(PositionHoldLedger.controller_id == controller_id)
+            return query.all()
+
+    def get_all_position_hold_ledger_entries(self) -> List[PositionHoldLedger]:
+        return self.get_position_hold_ledger_entries_by_controller(controller_id=None)
 
     def store_controller_config(self, controller_config: ControllerConfigBase):
         with self._sql_manager.get_new_session() as session:

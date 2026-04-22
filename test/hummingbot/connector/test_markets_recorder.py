@@ -26,6 +26,7 @@ from hummingbot.model.executors import Executors
 from hummingbot.model.market_data import MarketData
 from hummingbot.model.order import Order
 from hummingbot.model.position import Position
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -579,6 +580,34 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         # Should now have 3 positions
         self.assertEqual(3, len(positions))
 
+        # Test clearing an existing position by persisting a flat amount
+        flat_position = Position(
+            id="1213",
+            timestamp=1213,
+            controller_id="test_controller",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("0"),
+            breakeven_price=Decimal("0"),
+            unrealized_pnl_quote=Decimal("0"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("0")
+        )
+        recorder.update_or_store_position(flat_position)
+
+        with self.manager.get_new_session() as session:
+            positions = session.query(Position).all()
+        self.assertEqual(2, len(positions))
+        self.assertFalse(any(
+            position.controller_id == "test_controller"
+            and position.connector_name == "binance"
+            and position.trading_pair == "ETH-USDT"
+            and position.side == TradeType.BUY.name
+            for position in positions
+        ))
+
     def test_get_positions_methods(self):
         recorder = MarketsRecorder(
             sql=self.manager,
@@ -663,6 +692,60 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("pos1", [p.id for p in positions_by_ids])
         self.assertIn("pos3", [p.id for p in positions_by_ids])
         self.assertNotIn("pos2", [p.id for p in positions_by_ids])
+
+    def test_store_or_update_position_hold_ledger_entries(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        held_order = {
+            "client_order_id": "OID-1",
+            "exchange_order_id": "EX-1",
+            "trade_type": "BUY",
+            "price": "100",
+            "amount": "1",
+            "executed_amount_base": "1",
+            "executed_amount_quote": "100",
+            "cumulative_fee_paid_quote": "1",
+            "last_update_timestamp": 1234,
+        }
+        recorder.store_or_update_position_hold_ledger_entries(
+            controller_id="controller1",
+            executor_id="executor1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            held_position_orders=[held_order],
+        )
+
+        with self.manager.get_new_session() as session:
+            entries = session.query(PositionHoldLedger).all()
+        self.assertEqual(1, len(entries))
+        self.assertIsNone(entries[0].position_side)
+        self.assertEqual("BUY", entries[0].order_side)
+        self.assertEqual(Decimal("100"), entries[0].executed_amount_quote)
+
+        updated_held_order = dict(held_order, executed_amount_quote="110", cumulative_fee_paid_quote="1.5")
+        recorder.store_or_update_position_hold_ledger_entries(
+            controller_id="controller1",
+            executor_id="executor1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            held_position_orders=[updated_held_order],
+        )
+
+        controller_entries = recorder.get_position_hold_ledger_entries_by_controller("controller1")
+        self.assertEqual(1, len(controller_entries))
+        self.assertEqual(Decimal("110"), controller_entries[0].executed_amount_quote)
+        self.assertEqual(Decimal("1.5"), controller_entries[0].cumulative_fee_paid_quote)
+        self.assertEqual("OID-1", controller_entries[0].to_order_record()["client_order_id"])
 
     def test_store_or_update_executor(self):
         recorder = MarketsRecorder(

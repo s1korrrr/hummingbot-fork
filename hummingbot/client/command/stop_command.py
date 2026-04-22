@@ -34,6 +34,7 @@ class StopCommand:
         # Stop strategy if running
         if self.trading_core._strategy_running:
             await self.trading_core.stop_strategy()
+        self.stop_market_event_notifiers()
 
         # Cancel outstanding orders
         if not skip_order_cancellation:

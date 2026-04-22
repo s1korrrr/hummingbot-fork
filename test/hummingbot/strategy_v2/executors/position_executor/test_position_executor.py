@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
@@ -71,6 +71,8 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
                                               activation_price=Decimal("0.05"),
                                               trailing_delta=Decimal("0.02"),
                                           ),
+                                          trailing_stop_order_type=OrderType.LIMIT,
+                                          trailing_stop_limit_max_age_seconds=3,
                                           stop_loss_order_type=OrderType.MARKET,
                                           time_limit_order_type=OrderType.MARKET))
 
@@ -534,6 +536,133 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertIn("trigger_price=", trigger_output)
         self.assertIn("current_price=", trigger_output)
         self.assertIn("pair=ETH-USDT", trigger_output)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_trailing_stop_places_marketable_limit_close_order(self, mock_get_price, mock_get_trading_rules):
+        mock_get_price.side_effect = lambda connector, pair, price_type=PriceType.MidPrice: (
+            Decimal("109") if price_type == PriceType.BestBid else Decimal("110")
+        )
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        mock_get_trading_rules.return_value = trading_rules
+
+        position_executor = self.get_position_executor_running_from_config(self.get_position_config_market_long_with_trailing())
+        position_executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.FILLED,
+        )
+        position_executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("100"),
+                fill_base_amount=Decimal("1"),
+                fill_quote_amount=Decimal("100"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.2"))]),
+                fill_timestamp=10,
+            )
+        )
+        self.strategy.connectors["binance"].quantize_order_amount.return_value = Decimal("1")
+
+        position_executor.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
+
+        self.assertEqual(
+            self.strategy.sell.call_args.args,
+            ("binance", "ETH-USDT", Decimal("1"), OrderType.LIMIT, Decimal("109"), PositionAction.CLOSE),
+        )
+        self.assertEqual(position_executor._close_order.order_id, "OID-SELL-1")
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    async def test_trailing_limit_close_falls_back_to_market_after_timeout(self, mock_get_price, mock_get_trading_rules):
+        mock_get_price.side_effect = lambda connector, pair, price_type=PriceType.MidPrice: (
+            Decimal("109") if price_type == PriceType.BestBid else Decimal("110")
+        )
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        mock_get_trading_rules.return_value = trading_rules
+
+        position_executor = self.get_position_executor_running_from_config(self.get_position_config_market_long_with_trailing())
+        position_executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.FILLED,
+        )
+        position_executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("100"),
+                fill_base_amount=Decimal("1"),
+                fill_quote_amount=Decimal("100"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.2"))]),
+                fill_timestamp=10,
+            )
+        )
+        self.strategy.connectors["binance"].quantize_order_amount.return_value = Decimal("1")
+        position_executor.close_type = CloseType.TRAILING_STOP
+        position_executor.close_timestamp = 1234567890
+        position_executor._close_order = TrackedOrder("OID-SELL-LIMIT")
+        position_executor._close_order_type = OrderType.LIMIT
+        position_executor._close_order.order = InFlightOrder(
+            client_order_id="OID-SELL-LIMIT",
+            exchange_order_id="EOID5",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("109"),
+            creation_timestamp=1234567890,
+            initial_state=OrderState.OPEN,
+        )
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567894)
+
+        connector = self.strategy.connectors["binance"]
+        connector._update_orders_with_error_handler = MagicMock()
+
+        await position_executor.control_close_order()
+
+        self.strategy.cancel.assert_called_with(
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            order_id="OID-SELL-LIMIT",
+        )
+        self.assertFalse(self.strategy.sell.called)
+
+        position_executor.process_order_canceled_event(
+            "102",
+            MagicMock(),
+            OrderCancelledEvent(timestamp=1234567894, order_id="OID-SELL-LIMIT"),
+        )
+        await position_executor.control_close_order()
+
+        sell_args = self.strategy.sell.call_args.args
+        self.assertEqual(sell_args[:4], ("binance", "ETH-USDT", Decimal("1"), OrderType.MARKET))
+        self.assertFalse(sell_args[4].is_finite())
+        self.assertEqual(sell_args[5], PositionAction.CLOSE)
+        self.assertFalse(position_executor._trailing_limit_fallback_pending)
 
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price",
            return_value=Decimal("110"))

@@ -9,6 +9,8 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.model.position import Position
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
+from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor import ArbitrageExecutor
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
@@ -33,10 +35,14 @@ class TestExecutorOrchestrator(unittest.TestCase):
     @patch.object(MarketsRecorder, "get_instance")
     def setUp(self, markets_recorder: MagicMock):
         markets_recorder.return_value = MagicMock(spec=MarketsRecorder)
-        markets_recorder.get_all_executors = MagicMock(return_value=[])
-        markets_recorder.get_all_positions = MagicMock(return_value=[])
-        markets_recorder.store_or_update_executor = MagicMock(return_value=None)
-        markets_recorder.update_or_store_position = MagicMock(return_value=None)
+        markets_recorder.return_value.get_all_executors = MagicMock(return_value=[])
+        markets_recorder.return_value.get_all_positions = MagicMock(return_value=[])
+        markets_recorder.return_value.get_all_position_hold_ledger_entries = MagicMock(return_value=[])
+        markets_recorder.return_value.get_trades_for_config = MagicMock(return_value=[])
+        markets_recorder.return_value.config_file_path = "test.yml"
+        markets_recorder.return_value.store_or_update_executor = MagicMock(return_value=None)
+        markets_recorder.return_value.store_or_update_position_hold_ledger_entries = MagicMock(return_value=None)
+        markets_recorder.return_value.update_or_store_position = MagicMock(return_value=None)
         self.mock_strategy = self.create_mock_strategy()
         self.orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
 
@@ -61,6 +67,14 @@ class TestExecutorOrchestrator(unittest.TestCase):
         # Add the markets attribute that ExecutorOrchestrator now checks for
         strategy.markets = {"binance": {"ETH-USDT", "BTC-USDT"}}
         return strategy
+
+    @staticmethod
+    def create_mock_controller(connector_name: str, trading_pair: str):
+        controller = MagicMock()
+        controller.config = MagicMock()
+        controller.config.connector_name = connector_name
+        controller.config.trading_pair = trading_pair
+        return controller
 
     @patch.object(PositionExecutor, "start")
     @patch.object(DCAExecutor, "start")
@@ -325,6 +339,399 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(position_hold2.volume_traded_quote, Decimal("5000"))
         self.assertEqual(position_hold2.cum_fees_quote, Decimal("10"))
 
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_initialize_cached_performance_recovers_positions_from_executor_history_when_db_rows_are_invalid(
+        self, mock_get_instance: MagicMock
+    ):
+        mock_markets_recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = mock_markets_recorder
+
+        invalid_position = Position(
+            id="pos1",
+            timestamp=1235,
+            controller_id="controller1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("0"),
+            breakeven_price=Decimal("0"),
+            unrealized_pnl_quote=Decimal("0"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("0")
+        )
+        buy_hold_executor = ExecutorInfo(
+            id="buy-held",
+            timestamp=1234,
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            close_type=CloseType.POSITION_HOLD,
+            close_timestamp=1234,
+            config=PositionExecutorConfig(
+                id="buy-held",
+                timestamp=1234,
+                trading_pair="ETH-USDT",
+                connector_name="binance",
+                side=TradeType.BUY,
+                amount=Decimal("1"),
+                entry_price=Decimal("100"),
+            ),
+            filled_amount_quote=Decimal("0"),
+            net_pnl_quote=Decimal("0"),
+            net_pnl_pct=Decimal("0"),
+            cum_fees_quote=Decimal("1"),
+            is_trading=False,
+            is_active=False,
+            custom_info={"held_position_orders": [
+                {"client_order_id": "buy-order", "executed_amount_base": Decimal("1"),
+                 "executed_amount_quote": Decimal("100"), "trade_type": "BUY",
+                 "cumulative_fee_paid_quote": Decimal("1")}
+            ]},
+            controller_id="controller1",
+        )
+        sell_hold_executor = ExecutorInfo(
+            id="sell-held",
+            timestamp=1236,
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            close_type=CloseType.POSITION_HOLD,
+            close_timestamp=1236,
+            config=PositionExecutorConfig(
+                id="sell-held",
+                timestamp=1236,
+                trading_pair="ETH-USDT",
+                connector_name="binance",
+                side=TradeType.SELL,
+                amount=Decimal("0.4"),
+                entry_price=Decimal("120"),
+            ),
+            filled_amount_quote=Decimal("0"),
+            net_pnl_quote=Decimal("0"),
+            net_pnl_pct=Decimal("0"),
+            cum_fees_quote=Decimal("0.5"),
+            is_trading=False,
+            is_active=False,
+            custom_info={"held_position_orders": [
+                {"client_order_id": "sell-order", "executed_amount_base": Decimal("0.4"),
+                 "executed_amount_quote": Decimal("48"), "trade_type": "SELL",
+                 "cumulative_fee_paid_quote": Decimal("0.5")}
+            ]},
+            controller_id="controller1",
+        )
+
+        mock_markets_recorder.get_all_executors.return_value = [buy_hold_executor, sell_hold_executor]
+        mock_markets_recorder.get_all_positions.return_value = [invalid_position]
+        self.mock_strategy.controllers = {"controller1": MagicMock()}
+
+        orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
+
+        self.assertEqual(len(orchestrator.positions_held["controller1"]), 1)
+        recovered_position = orchestrator.positions_held["controller1"][0]
+        self.assertEqual(recovered_position.buy_amount_base, Decimal("1"))
+        self.assertEqual(recovered_position.sell_amount_base, Decimal("0.4"))
+
+        recovered_summary = recovered_position.get_position_summary(Decimal("110"))
+        self.assertEqual(recovered_summary.amount, Decimal("0.6"))
+        self.assertEqual(recovered_summary.breakeven_price, Decimal("100"))
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_initialize_cached_performance_restores_positions_from_ledger_before_snapshot(
+        self, mock_get_instance: MagicMock
+    ):
+        mock_markets_recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = mock_markets_recorder
+
+        ledger_entry_buy = PositionHoldLedger(
+            id="controller1|binance|ETH-USDT|spot|buy-order",
+            controller_id="controller1",
+            executor_id="buy-held",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            position_side=None,
+            order_side="BUY",
+            timestamp=1234,
+            client_order_id="buy-order",
+            exchange_order_id="buy-ex",
+            price=Decimal("100"),
+            amount=Decimal("1"),
+            executed_amount_base=Decimal("1"),
+            executed_amount_quote=Decimal("100"),
+            cumulative_fee_paid_quote=Decimal("1"),
+            order_payload={
+                "client_order_id": "buy-order",
+                "trade_type": "BUY",
+                "executed_amount_base": "1",
+                "executed_amount_quote": "100",
+                "cumulative_fee_paid_quote": "1",
+            },
+        )
+        ledger_entry_sell = PositionHoldLedger(
+            id="controller1|binance|ETH-USDT|spot|sell-order",
+            controller_id="controller1",
+            executor_id="sell-held",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            position_side=None,
+            order_side="SELL",
+            timestamp=1236,
+            client_order_id="sell-order",
+            exchange_order_id="sell-ex",
+            price=Decimal("120"),
+            amount=Decimal("0.4"),
+            executed_amount_base=Decimal("0.4"),
+            executed_amount_quote=Decimal("48"),
+            cumulative_fee_paid_quote=Decimal("0.5"),
+            order_payload={
+                "client_order_id": "sell-order",
+                "trade_type": "SELL",
+                "executed_amount_base": "0.4",
+                "executed_amount_quote": "48",
+                "cumulative_fee_paid_quote": "0.5",
+            },
+        )
+        snapshot_position = Position(
+            id="snapshot1",
+            timestamp=1300,
+            controller_id="controller1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("5"),
+            breakeven_price=Decimal("200"),
+            unrealized_pnl_quote=Decimal("0"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("1000"),
+        )
+
+        mock_markets_recorder.get_all_executors.return_value = []
+        mock_markets_recorder.get_all_position_hold_ledger_entries.return_value = [ledger_entry_buy, ledger_entry_sell]
+        mock_markets_recorder.get_all_positions.return_value = [snapshot_position]
+        self.mock_strategy.controllers = {"controller1": MagicMock()}
+        self.mock_strategy.markets = {"binance": {"ETH-USDT"}}
+
+        orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
+
+        self.assertEqual(len(orchestrator.positions_held["controller1"]), 1)
+        recovered_summary = orchestrator.positions_held["controller1"][0].get_position_summary(Decimal("110"))
+        self.assertEqual(recovered_summary.amount, Decimal("0.6"))
+        self.assertEqual(recovered_summary.breakeven_price, Decimal("100"))
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_initialize_cached_performance_backfills_ledger_from_executor_history_when_ledger_missing(
+        self, mock_get_instance: MagicMock
+    ):
+        mock_markets_recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = mock_markets_recorder
+
+        invalid_position = Position(
+            id="pos1",
+            timestamp=1235,
+            controller_id="controller1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("0"),
+            breakeven_price=Decimal("0"),
+            unrealized_pnl_quote=Decimal("0"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("0"),
+        )
+        buy_hold_executor = ExecutorInfo(
+            id="buy-held",
+            timestamp=1234,
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            close_type=CloseType.POSITION_HOLD,
+            close_timestamp=1234,
+            config=PositionExecutorConfig(
+                id="buy-held",
+                timestamp=1234,
+                trading_pair="ETH-USDT",
+                connector_name="binance",
+                side=TradeType.BUY,
+                amount=Decimal("1"),
+                entry_price=Decimal("100"),
+            ),
+            filled_amount_quote=Decimal("0"),
+            net_pnl_quote=Decimal("0"),
+            net_pnl_pct=Decimal("0"),
+            cum_fees_quote=Decimal("1"),
+            is_trading=False,
+            is_active=False,
+            custom_info={"held_position_orders": [
+                {"client_order_id": "buy-order", "executed_amount_base": Decimal("1"),
+                 "executed_amount_quote": Decimal("100"), "trade_type": "BUY",
+                 "cumulative_fee_paid_quote": Decimal("1")}
+            ]},
+            controller_id="controller1",
+        )
+
+        mock_markets_recorder.get_all_executors.return_value = [buy_hold_executor]
+        mock_markets_recorder.get_all_position_hold_ledger_entries.return_value = []
+        mock_markets_recorder.get_all_positions.return_value = [invalid_position]
+        mock_markets_recorder.store_or_update_position_hold_ledger_entries = MagicMock(return_value=None)
+        self.mock_strategy.controllers = {"controller1": MagicMock()}
+
+        ExecutorOrchestrator(strategy=self.mock_strategy)
+
+        mock_markets_recorder.store_or_update_position_hold_ledger_entries.assert_called_once()
+        self.assertEqual(
+            mock_markets_recorder.store_or_update_position_hold_ledger_entries.call_args.kwargs["controller_id"],
+            "controller1",
+        )
+        self.assertEqual(
+            mock_markets_recorder.store_or_update_position_hold_ledger_entries.call_args.kwargs["executor_id"],
+            "buy-held",
+        )
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_initialize_cached_performance_recovers_positions_from_trade_fills_when_ledger_and_executor_history_are_stale(
+        self, mock_get_instance: MagicMock
+    ):
+        mock_markets_recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = mock_markets_recorder
+        mock_markets_recorder.config_file_path = "rsi_v5.yml"
+
+        invalid_position = Position(
+            id="pos1",
+            timestamp=1235,
+            controller_id="controller1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("0"),
+            breakeven_price=Decimal("0"),
+            unrealized_pnl_quote=Decimal("0"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("0"),
+        )
+        trade_fill_buy_part_1 = TradeFill(
+            config_file_path="rsi_v5.yml",
+            strategy="v2_with_controllers",
+            market="binance",
+            symbol="ETH-USDT",
+            base_asset="ETH",
+            quote_asset="USDT",
+            timestamp=1234,
+            order_id="buy-order",
+            trade_type=TradeType.BUY.name,
+            order_type="LIMIT",
+            price=Decimal("100"),
+            amount=Decimal("0.4"),
+            leverage=1,
+            trade_fee={},
+            trade_fee_in_quote=Decimal("0.4"),
+            exchange_trade_id="buy-fill-1",
+            position="NIL",
+        )
+        trade_fill_buy_part_2 = TradeFill(
+            config_file_path="rsi_v5.yml",
+            strategy="v2_with_controllers",
+            market="binance",
+            symbol="ETH-USDT",
+            base_asset="ETH",
+            quote_asset="USDT",
+            timestamp=1235,
+            order_id="buy-order",
+            trade_type=TradeType.BUY.name,
+            order_type="LIMIT",
+            price=Decimal("100"),
+            amount=Decimal("0.6"),
+            leverage=1,
+            trade_fee={},
+            trade_fee_in_quote=Decimal("0.6"),
+            exchange_trade_id="buy-fill-2",
+            position="NIL",
+        )
+        trade_fill_sell = TradeFill(
+            config_file_path="rsi_v5.yml",
+            strategy="v2_with_controllers",
+            market="binance",
+            symbol="ETH-USDT",
+            base_asset="ETH",
+            quote_asset="USDT",
+            timestamp=1236,
+            order_id="sell-order",
+            trade_type=TradeType.SELL.name,
+            order_type="LIMIT",
+            price=Decimal("120"),
+            amount=Decimal("0.4"),
+            leverage=1,
+            trade_fee={},
+            trade_fee_in_quote=Decimal("0.5"),
+            exchange_trade_id="sell-fill-1",
+            position="NIL",
+        )
+
+        mock_markets_recorder.get_all_executors.return_value = []
+        mock_markets_recorder.get_all_position_hold_ledger_entries.return_value = []
+        mock_markets_recorder.get_all_positions.return_value = [invalid_position]
+        mock_markets_recorder.get_trades_for_config.return_value = [
+            trade_fill_sell,
+            trade_fill_buy_part_2,
+            trade_fill_buy_part_1,
+        ]
+        self.mock_strategy.controllers = {
+            "controller1": self.create_mock_controller("binance", "ETH-USDT"),
+        }
+        self.mock_strategy.markets = {"binance": {"ETH-USDT"}}
+
+        orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
+
+        mock_markets_recorder.get_trades_for_config.assert_called_once_with("rsi_v5.yml")
+        self.assertEqual(len(orchestrator.positions_held["controller1"]), 1)
+        recovered_position = orchestrator.positions_held["controller1"][0]
+        recovered_summary = recovered_position.get_position_summary(Decimal("110"))
+        self.assertEqual(recovered_summary.amount, Decimal("0.6"))
+        self.assertEqual(recovered_summary.breakeven_price, Decimal("100"))
+        self.assertEqual(recovered_summary.cum_fees_quote, Decimal("1.5"))
+
+    @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
+    def test_initialize_cached_performance_skips_trade_fill_recovery_when_controller_mapping_is_ambiguous(
+        self, mock_get_instance: MagicMock
+    ):
+        mock_markets_recorder = MagicMock(spec=MarketsRecorder)
+        mock_get_instance.return_value = mock_markets_recorder
+        mock_markets_recorder.config_file_path = "rsi_v5.yml"
+
+        trade_fill_buy = TradeFill(
+            config_file_path="rsi_v5.yml",
+            strategy="v2_with_controllers",
+            market="binance",
+            symbol="ETH-USDT",
+            base_asset="ETH",
+            quote_asset="USDT",
+            timestamp=1234,
+            order_id="buy-order",
+            trade_type=TradeType.BUY.name,
+            order_type="LIMIT",
+            price=Decimal("100"),
+            amount=Decimal("1"),
+            leverage=1,
+            trade_fee={},
+            trade_fee_in_quote=Decimal("1"),
+            exchange_trade_id="buy-fill-1",
+            position="NIL",
+        )
+
+        mock_markets_recorder.get_all_executors.return_value = []
+        mock_markets_recorder.get_all_position_hold_ledger_entries.return_value = []
+        mock_markets_recorder.get_all_positions.return_value = []
+        mock_markets_recorder.get_trades_for_config.return_value = [trade_fill_buy]
+        self.mock_strategy.controllers = {
+            "controller1": self.create_mock_controller("binance", "ETH-USDT"),
+            "controller2": self.create_mock_controller("binance", "ETH-USDT"),
+        }
+        self.mock_strategy.markets = {"binance": {"ETH-USDT"}}
+
+        orchestrator = ExecutorOrchestrator(strategy=self.mock_strategy)
+
+        self.assertEqual(orchestrator.positions_held["controller1"], [])
+        self.assertEqual(orchestrator.positions_held["controller2"], [])
+
     @patch.object(MarketsRecorder, "get_instance")
     def test_store_all_positions(self, markets_recorder_mock):
         markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
@@ -471,6 +878,24 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.orchestrator.store_all_positions()
 
         markets_recorder_mock.return_value.update_or_store_position.assert_called_once()
+        self.assertEqual(self.orchestrator.positions_held, {})
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_store_all_positions_clears_flat_positions_in_db(self, markets_recorder_mock):
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+        markets_recorder_mock.update_or_store_position = MagicMock(return_value=None)
+
+        flat_position = PositionHold("binance", "ETH-USDT", side=TradeType.BUY)
+        flat_position.buy_amount_base = Decimal("1")
+        flat_position.buy_amount_quote = Decimal("100")
+        flat_position.sell_amount_base = Decimal("1")
+        flat_position.sell_amount_quote = Decimal("110")
+
+        self.orchestrator.positions_held = {"main": [flat_position]}
+        self.orchestrator.store_all_positions()
+
+        stored_position = markets_recorder_mock.return_value.update_or_store_position.call_args.args[0]
+        self.assertEqual(stored_position.amount, Decimal("0"))
         self.assertEqual(self.orchestrator.positions_held, {})
 
     def test_stop_executor(self):
@@ -669,6 +1094,55 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertIn("executors", result["test_controller"])
         self.assertIn("positions", result["test_controller"])
         self.assertIn("performance", result["test_controller"])
+
+    @patch.object(MarketsRecorder, "get_instance")
+    def test_get_all_reports_persists_position_hold_ledger_for_done_executors(self, markets_recorder_mock):
+        markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)
+        markets_recorder_mock.return_value.store_or_update_position_hold_ledger_entries = MagicMock(return_value=None)
+        markets_recorder_mock.return_value.get_all_executors = MagicMock(return_value=[])
+        markets_recorder_mock.return_value.get_all_positions = MagicMock(return_value=[])
+        markets_recorder_mock.return_value.get_all_position_hold_ledger_entries = MagicMock(return_value=[])
+
+        config = PositionExecutorConfig(
+            timestamp=1234,
+            trading_pair="ETH-USDT",
+            connector_name="binance",
+            side=TradeType.BUY,
+            amount=Decimal("1"),
+            entry_price=Decimal("100"),
+        )
+        config.id = "persist-ledger"
+
+        executor = MagicMock()
+        executor.executor_info = ExecutorInfo(
+            id="persist-ledger",
+            timestamp=1234,
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            config=config,
+            filled_amount_quote=Decimal("100"),
+            net_pnl_quote=Decimal("0"),
+            net_pnl_pct=Decimal("0"),
+            cum_fees_quote=Decimal("1"),
+            is_trading=False,
+            is_active=False,
+            custom_info={"held_position_orders": [
+                {"client_order_id": "order_1", "executed_amount_base": Decimal("1"),
+                 "executed_amount_quote": Decimal("100"), "trade_type": "BUY",
+                 "cumulative_fee_paid_quote": Decimal("1")}
+            ]},
+            close_type=CloseType.POSITION_HOLD,
+            controller_id="test_controller",
+        )
+
+        self.orchestrator.active_executors = {"test_controller": [executor]}
+        self.orchestrator.positions_held = {"test_controller": []}
+        self.orchestrator.executors_ids_position_held = []
+        self.orchestrator.cached_performance = {"test_controller": PerformanceReport()}
+
+        self.orchestrator.get_all_reports()
+
+        markets_recorder_mock.return_value.store_or_update_position_hold_ledger_entries.assert_called_once()
 
     def test_get_all_reports_with_perpetual_executors(self):
         """Test get_all_reports with perpetual market executors to exercise position side logic"""

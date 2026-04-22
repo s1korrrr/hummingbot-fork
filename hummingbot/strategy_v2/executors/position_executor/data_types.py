@@ -21,6 +21,8 @@ class TripleBarrierConfig(BaseModel):
     trailing_stop: Optional[TrailingStop] = None
     open_order_type: OrderType = OrderType.LIMIT
     take_profit_order_type: OrderType = OrderType.MARKET
+    trailing_stop_order_type: OrderType = OrderType.MARKET
+    trailing_stop_limit_max_age_seconds: int = 0
     stop_loss_order_type: OrderType = OrderType.MARKET
     time_limit_order_type: OrderType = OrderType.MARKET
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -40,6 +42,8 @@ class TripleBarrierConfig(BaseModel):
             trailing_stop=new_trailing_stop,
             open_order_type=self.open_order_type,
             take_profit_order_type=self.take_profit_order_type,
+            trailing_stop_order_type=self.trailing_stop_order_type,
+            trailing_stop_limit_max_age_seconds=self.trailing_stop_limit_max_age_seconds,
             stop_loss_order_type=self.stop_loss_order_type,
             time_limit_order_type=self.time_limit_order_type
         )

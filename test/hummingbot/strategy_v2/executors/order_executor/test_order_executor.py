@@ -147,6 +147,51 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertTrue(self.is_partially_logged("ERROR", "Order failed order_id=OID-FAIL"))
         self.assertTrue(self.is_partially_logged("ERROR", "pair=ETH-USDT"))
 
+    def test_process_order_failed_event_fail_closes_permanent_min_notional_failure(self):
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.SELL,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("0.02"),
+            price=Decimal("100"),
+            execution_strategy=ExecutionStrategy.LIMIT_MAKER,
+        )
+        executor = self.get_order_executor_from_config(config)
+        executor._status = RunnableStatus.RUNNING
+
+        order_id = "OID-FAIL"
+        order = InFlightOrder(
+            client_order_id=order_id,
+            trading_pair=config.trading_pair,
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=config.side,
+            price=Decimal("100"),
+            amount=Decimal("0.02"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.OPEN,
+        )
+        tracked_order = TrackedOrder(order_id)
+        tracked_order.order = order
+        executor._order = tracked_order
+
+        failure_event = MarketOrderFailureEvent(
+            order_id=order_id,
+            timestamp=1640001112.223,
+            order_type=OrderType.LIMIT_MAKER,
+            error_message="Order notional 1.50 is lower than minimum notional size 5.00 for the pair ETH-USDT.",
+            error_type="ValueError",
+        )
+        executor.process_order_failed_event(1, self.strategy.connectors["binance"], failure_event)
+
+        self.assertIn(tracked_order, executor._failed_orders)
+        self.assertIsNone(executor._order)
+        self.assertEqual(executor.close_type, CloseType.FAILED)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual(executor._current_retries, 0)
+        self.assertTrue(self.is_partially_logged("ERROR", "Order failed permanently order_id=OID-FAIL"))
+
     @patch.object(OrderExecutor, "get_in_flight_order")
     def test_process_order_completed_event(self, in_flight_order_mock):
         # Create the order that will be returned by get_in_flight_order

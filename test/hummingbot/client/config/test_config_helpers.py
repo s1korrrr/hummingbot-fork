@@ -132,6 +132,64 @@ command_shortcuts:
             "\n".join(log_records.output),
         )
 
+    @patch("hummingbot.client.config.config_helpers.save_to_yml")
+    def test_load_client_config_map_from_file_preserves_secure_fields_before_secrets_manager_ready(
+        self, save_to_yml_mock: MagicMock
+    ):
+        telegram_config = """\
+telegram_notifications:
+  telegram_enabled: true
+  telegram_bot_token: some-plain-token
+  telegram_chat_id: '123456'
+"""
+        with TemporaryDirectory() as d:
+            d = Path(d)
+            temp_file_name = d / "conf_client.yml"
+            temp_file_name.write_text(telegram_config, encoding="utf-8")
+            config_helpers.CLIENT_CONFIG_PATH = temp_file_name
+            Security.secrets_manager = None
+
+            cm_loaded = load_client_config_map_from_file()
+
+        self.assertTrue(cm_loaded.telegram_notifications.telegram_enabled)
+        self.assertEqual(
+            "some-plain-token",
+            cm_loaded.telegram_notifications.telegram_bot_token.get_secret_value(),
+        )
+        self.assertEqual("123456", cm_loaded.telegram_notifications.telegram_chat_id)
+        save_to_yml_mock.assert_not_called()
+
+    @patch("hummingbot.client.config.config_helpers.save_to_yml")
+    def test_load_client_config_map_from_file_decrypts_secure_fields_when_secrets_manager_ready(
+        self, save_to_yml_mock: MagicMock
+    ):
+        with TemporaryDirectory() as d:
+            d = Path(d)
+            temp_file_name = d / "conf_client.yml"
+            config_helpers.CLIENT_CONFIG_PATH = temp_file_name
+
+            Security.secrets_manager = ETHKeyFileSecretManger("some-password")
+            encrypted_token = Security.secrets_manager.encrypt_secret_value("telegram_bot_token", "telegram-token")
+            temp_file_name.write_text(
+                "\n".join(
+                    [
+                        "telegram_notifications:",
+                        "  telegram_enabled: true",
+                        f"  telegram_bot_token: {encrypted_token}",
+                        "  telegram_chat_id: '123456'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            cm_loaded = load_client_config_map_from_file()
+
+        self.assertEqual(
+            "telegram-token",
+            cm_loaded.telegram_notifications.telegram_bot_token.get_secret_value(),
+        )
+        save_to_yml_mock.assert_called_once()
+
     def test_decrypt_config_map_secret_values(self):
         class DummySubModel(BaseClientModel):
             secret_attr: SecretStr

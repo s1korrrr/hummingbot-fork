@@ -89,6 +89,75 @@ class MQTTBridgeConfigMap(BaseClientModel):
     model_config = ConfigDict(title="mqtt_bridge")
 
 
+class TelegramNotificationsConfigMap(BaseClientModel):
+    telegram_enabled: bool = Field(
+        default=False,
+        json_schema_extra={"prompt": lambda cm: "Enable Telegram order notifications? (True/False)"},
+    )
+    telegram_bot_token: SecretStr = Field(
+        default=SecretStr(""),
+        description="Telegram bot token used to send order notifications.",
+        json_schema_extra={
+            "prompt": lambda cm: "Enter the Telegram bot token",
+            "prompt_on_new": True,
+            "is_secure": True,
+        },
+    )
+    telegram_chat_id: str = Field(
+        default="",
+        description="Telegram chat id used to receive order notifications.",
+        json_schema_extra={
+            "prompt": lambda cm: "Enter the Telegram chat id (leave empty to auto-bind on first /start message)",
+            "prompt_on_new": True,
+        },
+    )
+    telegram_commands_enabled: bool = Field(
+        default=True,
+        json_schema_extra={"prompt": lambda cm: "Enable Telegram bot commands? (True/False)"},
+    )
+    telegram_set_my_commands: bool = Field(
+        default=True,
+        json_schema_extra={"prompt": lambda cm: "Publish the Telegram command menu on startup? (True/False)"},
+    )
+    telegram_notify_order_filled: bool = Field(
+        default=True,
+        json_schema_extra={"prompt": lambda cm: "Notify on each filled buy/sell execution? (True/False)"},
+    )
+    telegram_notify_order_completed: bool = Field(
+        default=False,
+        json_schema_extra={"prompt": lambda cm: "Notify when an order is fully completed? (True/False)"},
+    )
+    telegram_notify_order_failed: bool = Field(
+        default=True,
+        json_schema_extra={"prompt": lambda cm: "Notify when an order fails? (True/False)"},
+    )
+    model_config = ConfigDict(title="telegram_notifications")
+
+    @field_validator(
+        "telegram_enabled",
+        "telegram_notify_order_filled",
+        "telegram_notify_order_completed",
+        "telegram_notify_order_failed",
+        "telegram_commands_enabled",
+        "telegram_set_my_commands",
+        mode="before",
+    )
+    @classmethod
+    def validate_bool_fields(cls, v: str):
+        if isinstance(v, str):
+            ret = validate_bool(v)
+            if ret is not None:
+                raise ValueError(ret)
+        return v
+
+    @model_validator(mode="after")
+    def validate_required_fields(self):
+        if self.telegram_enabled:
+            if len(self.telegram_bot_token.get_secret_value()) == 0:
+                raise ValueError("telegram_bot_token is required when telegram notifications are enabled.")
+        return self
+
+
 class MarketDataCollectionConfigMap(BaseClientModel):
     market_data_collection_enabled: bool = Field(
         default=False,
@@ -716,6 +785,10 @@ class ClientConfigMap(BaseClientModel):
     mqtt_bridge: MQTTBridgeConfigMap = Field(
         default=MQTTBridgeConfigMap(),
         description=('MQTT Bridge configuration.'),
+    )
+    telegram_notifications: TelegramNotificationsConfigMap = Field(
+        default=TelegramNotificationsConfigMap(),
+        description="Telegram order notification settings.",
     )
     send_error_logs: bool = Field(
         default=True,

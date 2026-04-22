@@ -100,6 +100,7 @@ async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsMana
         return
 
     await Security.wait_til_decryption_done()
+    client_config_map.decrypt_all_secure_data()
     await create_yml_files_legacy()
     # Initialize logging with basic setup first - will be re-initialized later with correct strategy file name if needed
     init_logging("hummingbot_logs.yml", client_config_map)

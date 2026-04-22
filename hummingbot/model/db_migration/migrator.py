@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.model.db_migration.base_transformation import DatabaseTransformation
+from hummingbot.model.metadata import Metadata as LocalMetadata
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 
 
@@ -48,6 +49,16 @@ class Migrator:
                 logging.getLogger().info(f"Applying {transformation.name} to DB...")
                 new_db_handle = transformation.apply(new_db_handle)
                 logging.getLogger().info(f"DONE with {transformation.name}")
+            with new_db_handle.get_new_session() as session:
+                with session.begin():
+                    local_db_version = new_db_handle.get_local_db_version(session=session)
+                    if local_db_version is None:
+                        session.add(LocalMetadata(
+                            key=SQLConnectionManager.LOCAL_DB_VERSION_KEY,
+                            value=str(to_version),
+                        ))
+                    else:
+                        local_db_version.value = str(to_version)
             migration_successful = True
         except SQLAlchemyError:
             logging.getLogger().error("Unexpected error while checking and upgrading the local database.",
@@ -57,7 +68,12 @@ class Migrator:
                 new_db_handle.engine.dispose()
                 if migration_successful:
                     move(new_db_path, original_db_path)
-                db_handle.__init__(SQLConnectionType.TRADE_FILLS, original_db_path, original_db_name, True)
+                db_handle.__init__(
+                    client_config_map,
+                    SQLConnectionType.TRADE_FILLS,
+                    db_path=original_db_path,
+                    called_from_migrator=True,
+                )
             except Exception as e:
                 logging.getLogger().error(f"Fatal error migrating DB {original_db_path}")
                 raise e

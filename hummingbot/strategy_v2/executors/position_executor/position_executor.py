@@ -101,6 +101,33 @@ class PositionExecutor(ExecutorBase):
 
         return (self._strategy.current_timestamp - reference_ts) >= max_age_seconds
 
+    def _open_order_age_seconds(self) -> Optional[float]:
+        if self._open_order is None or self._open_order.order is None:
+            return None
+        reference_ts = self._open_order.order.creation_timestamp or self._open_order.last_update_timestamp
+        if reference_ts is None:
+            return None
+        return max(0.0, float(self._strategy.current_timestamp - reference_ts))
+
+    def _should_cancel_stale_unfilled_open_limit_order(self) -> bool:
+        if self._open_order is None or self._open_order.order is None:
+            return False
+        if not self.config.triple_barrier_config.open_order_type.is_limit_type():
+            return False
+        if self._open_order.is_filled or not self._open_order.order.is_open:
+            return False
+        if self.open_filled_amount > Decimal("0"):
+            return False
+
+        max_age_seconds = max(0, int(self.config.triple_barrier_config.open_order_limit_max_age_seconds))
+        if max_age_seconds <= 0:
+            return False
+
+        age_seconds = self._open_order_age_seconds()
+        if age_seconds is None:
+            return False
+        return age_seconds >= max_age_seconds
+
     def __init__(self, strategy: StrategyV2Base, config: PositionExecutorConfig,
                  update_interval: float = 1.0, max_retries: int = 10):
         """
@@ -598,6 +625,20 @@ class PositionExecutor(ExecutorBase):
                                                  self.config.triple_barrier_config.open_order_type):
                 self.place_open_order()
         else:
+            if self._should_cancel_stale_unfilled_open_limit_order():
+                self.logger().warning(
+                    self._log_message(
+                        f"Open limit entry stale order_id={self._open_order.order_id} "
+                        f"age={self._open_order_age_seconds():.1f}s "
+                        f"max_age={self.config.triple_barrier_config.open_order_limit_max_age_seconds}s "
+                        f"filled_amount={self.open_filled_amount}"
+                    )
+                )
+                self.cancel_open_order()
+                self.close_type = CloseType.EXPIRED
+                self.close_timestamp = self._strategy.current_timestamp
+                self._status = RunnableStatus.SHUTTING_DOWN
+                return
             if self._open_order.order and not self._open_order.is_filled and \
                     not self._is_within_activation_bounds(self.config.entry_price, self.config.side,
                                                           self.config.triple_barrier_config.open_order_type):
@@ -977,6 +1018,11 @@ class PositionExecutor(ExecutorBase):
             "close_price": self.close_price,
             "current_market_price": trailing_snapshot.get("trailing_current_price"),
             "open_order_last_update": self._open_order.last_update_timestamp if self._open_order else None,
+            "open_order_type": self.config.triple_barrier_config.open_order_type.name,
+            "open_order_limit_max_age_seconds": self.config.triple_barrier_config.open_order_limit_max_age_seconds,
+            "open_order_age_seconds": self._open_order_age_seconds(),
+            "open_order_filled_amount_base": self.open_filled_amount,
+            "open_order_filled_amount_quote": self.open_filled_amount_quote,
             "order_ids": [order.order_id for order in [self._open_order, self._close_order, self._take_profit_limit_order] if order],
             "held_position_orders": self._held_position_orders,
         }

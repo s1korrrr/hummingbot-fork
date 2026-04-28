@@ -423,6 +423,49 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertFalse(controller.can_create_executor(1))
         self.assertEqual(controller._last_gate_reason[TradeType.BUY], "max_position")
 
+    def test_rsi_v5_buy_gate_reuses_price_gap_against_held_avg_entry(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1000.0
+        market_data_provider.get_price_by_type.return_value = Decimal("99")
+        market_data_provider.get_balance.return_value = Decimal("1000")
+        market_data_provider.get_trading_rules.return_value = SimpleNamespace()
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                usd_per_entry=Decimal("20"),
+                max_total_position_usd=Decimal("500"),
+                executor_price_gap_threshold=Decimal("0.02"),
+                use_adaptive_filters=False,
+                dynamic_position_sizing=False,
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.processed_data = {"signal_state": {"condition_ok": True, "size_multiplier": 1.0}}
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                side=TradeType.BUY,
+                amount=Decimal("1"),
+                breakeven_price=Decimal("100"),
+            )
+        ]
+
+        self.assertFalse(controller.can_create_executor(1))
+        self.assertEqual(controller._last_gate_reason[TradeType.BUY], "avg_entry_gap")
+
+        market_data_provider.get_price_by_type.return_value = Decimal("98")
+
+        self.assertTrue(controller.can_create_executor(1))
+        self.assertEqual(controller._last_gate_reason[TradeType.BUY], "ready")
+
     def test_rsi_v5_buy_signal_log_includes_controller_and_pair_context(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
@@ -518,8 +561,9 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertIsNone(controller._pending_buy_confirmation)
 
         info_messages = [call.args[0] for call in mock_logger.return_value.info.call_args_list]
-        self.assertTrue(any("BUY setup armed" in message for message in info_messages))
-        self.assertTrue(any("BUY not ready" in message and "reason=need-rebound" in message for message in info_messages))
+        debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
+        self.assertTrue(any("BUY setup armed" in message for message in debug_messages))
+        self.assertTrue(any("BUY not ready" in message and "reason=need-rebound" in message for message in debug_messages))
         self.assertTrue(any("BUY signal (rebound-confirmed)" in message for message in info_messages))
 
     def test_rsi_v5_rebound_confirmation_preserves_arm_time_score_quality(self):
@@ -874,9 +918,9 @@ class RSIv5ControllerImportTest(unittest.TestCase):
             )
 
         self.assertEqual(signal, 0)
-        info_messages = [call.args[0] for call in mock_logger.return_value.info.call_args_list]
-        self.assertTrue(any("SELL not ready" in message and "reason=inventory-flat" in message for message in info_messages))
-        self.assertFalse(any("SELL not ready" in message and "reason=no-cost-basis" in message for message in info_messages))
+        debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
+        self.assertTrue(any("SELL not ready" in message and "reason=inventory-flat" in message for message in debug_messages))
+        self.assertFalse(any("SELL not ready" in message and "reason=no-cost-basis" in message for message in debug_messages))
 
     def test_rsi_v5_sell_requires_reversal_confirmation_before_signal(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
@@ -921,8 +965,8 @@ class RSIv5ControllerImportTest(unittest.TestCase):
             )
 
         self.assertEqual(signal, 0)
-        info_messages = [call.args[0] for call in mock_logger.return_value.info.call_args_list]
-        self.assertTrue(any("SELL not ready" in message and "reason=need-reversal" in message for message in info_messages))
+        debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
+        self.assertTrue(any("SELL not ready" in message and "reason=need-reversal" in message for message in debug_messages))
 
     def test_rsi_v5_sell_uses_aggregated_cost_basis_for_profit_gate(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
@@ -977,8 +1021,8 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertEqual(signal, 0)
         self.assertEqual(controller._get_position_cost_basis(), Decimal("106"))
-        info_messages = [call.args[0] for call in mock_logger.return_value.info.call_args_list]
-        self.assertTrue(any("SELL not ready" in message and "reason=need-profit" in message for message in info_messages))
+        debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
+        self.assertTrue(any("SELL not ready" in message and "reason=need-profit" in message for message in debug_messages))
 
     def test_rsi_v5_direct_sell_requires_held_inventory_not_only_active_buy_executor(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
@@ -1026,8 +1070,8 @@ class RSIv5ControllerImportTest(unittest.TestCase):
             )
 
         self.assertEqual(signal, 0)
-        info_messages = [call.args[0] for call in mock_logger.return_value.info.call_args_list]
-        self.assertTrue(any("SELL not ready" in message and "reason=inventory-flat" in message for message in info_messages))
+        debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
+        self.assertTrue(any("SELL not ready" in message and "reason=inventory-flat" in message for message in debug_messages))
 
     def test_rsi_v5_sell_without_profit_gate_still_requires_reversal_confirmation(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
@@ -1089,7 +1133,8 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertEqual(first_signal, 0)
         self.assertEqual(second_signal, -1)
         info_messages = [call.args[0] for call in mock_logger.return_value.info.call_args_list]
-        self.assertTrue(any("SELL not ready" in message and "reason=need-reversal" in message for message in info_messages))
+        debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
+        self.assertTrue(any("SELL not ready" in message and "reason=need-reversal" in message for message in debug_messages))
         self.assertTrue(any("SELL signal" in message for message in info_messages))
 
     def test_rsi_v5_sell_without_profit_gate_still_respects_trend_hold(self):
@@ -1140,8 +1185,8 @@ class RSIv5ControllerImportTest(unittest.TestCase):
             )
 
         self.assertEqual(signal, 0)
-        info_messages = [call.args[0] for call in mock_logger.return_value.info.call_args_list]
-        self.assertTrue(any("SELL not ready" in message and "reason=trend-hold" in message for message in info_messages))
+        debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
+        self.assertTrue(any("SELL not ready" in message and "reason=trend-hold" in message for message in debug_messages))
 
     def test_rsi_v5_direct_sell_executor_aggregates_bags_and_caps_to_available_balance(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
@@ -1834,7 +1879,7 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertFalse(any("BUY not ready" in message for message in info_messages))
         self.assertFalse(any("SELL not ready" in message for message in info_messages))
 
-    def test_rsi_v5_status_shows_detailed_buy_and_sell_diagnostics(self):
+    def test_rsi_v5_status_shows_inventory_sell_map_and_pnl_gates(self):
         from controllers.directional_trading.rsi_v5 import RecoveryTrailState, RSIv5Controller, RSIv5ControllerConfig
 
         market_data_provider = MagicMock()
@@ -1956,27 +2001,75 @@ class RSIv5ControllerImportTest(unittest.TestCase):
             key: trail.as_dict() for key, trail in controller._recovery_trails.items()
         }
 
-        status = "\n".join(controller.to_format_status())
-        self.assertIn("BUY", status)
-        self.assertIn("🎯 need-rebound", status)
-        self.assertIn("📉 RSI 28.90/35.00", status)
-        self.assertIn("🔁 1.04/1.00 ✓", status)
-        self.assertIn("SELL", status)
-        self.assertIn("🎯 need-profit", status)
-        self.assertIn("💰 +0.16%/0.20%", status)
-        self.assertIn("⏳ rsi 46.10, pnl 0.04%", status)
-        self.assertIn("🌿 trend-hold", status)
-        self.assertNotIn("market   ◉", status)
-        self.assertNotIn("position ", status)
-        self.assertNotIn("orders ", status)
-        self.assertNotIn("buy_exec", status)
-        self.assertNotIn("sell_exec", status)
-        self.assertNotIn("recovery ", status)
-        self.assertNotIn("   checks", status)
-        self.assertNotIn("Hold Plan:", status)
-        self.assertNotIn("Active Executors:", status)
-        self.assertNotIn("raw(prev_min=", status)
-        self.assertNotIn("score_parts(", status)
+        # Per-controller body is intentionally empty post-2026-04-28: PLAN, SIGNALS,
+        # and gate truthtable now live in the parent strategy's CONTROLLERS / SIGNALS
+        # / PLANS summary tables, and per-executor / per-position runtime detail lives
+        # in the parent's ACTIVE EXECUTORS / POSITIONS HELD tables. The parent now
+        # suppresses the per-controller ``=== Controller: ... ===`` block entirely
+        # whenever the body is empty (regardless of whether there are active executors).
+        status_lines = controller.to_format_status()
+        self.assertEqual(status_lines, [], msg=f"expected empty body, got: {status_lines}")
+
+        summary = controller.get_status_summary()
+        self.assertEqual("28.90", summary["rsi"])
+        self.assertEqual("28.9/75.0", summary["rsi_proximity"])
+        self.assertIn("█", summary["buy_gauge"])
+        self.assertTrue(
+            summary["buy_gauge"].endswith("BUY") or "%" in summary["buy_gauge"],
+            msg=f"unexpected buy gauge: {summary['buy_gauge']!r}",
+        )
+        self.assertIn("░", summary["sell_gauge"])
+        self.assertIn("%", summary["sell_gauge"])
+        self.assertIn("P✗", summary["gates_mask"])
+        self.assertIn("R✗", summary["gates_mask"])
+        self.assertIn("V✗", summary["gates_mask"])
+        self.assertEqual(summary["focus"], summary["note"])
+
+        # Plan row contract: TRAIL inventory flow.
+        self.assertEqual("TRAIL", summary["plan_mode"])
+        self.assertIn("0.30%", summary["plan_target"])
+        self.assertIn("peak 2204", summary["plan_anchor"])
+        self.assertIn("pullback 0.57%", summary["plan_next"])
+        self.assertIn("partial-done", summary["plan_next"])
+        self.assertIn("50%", summary["plan_slice"])
+        self.assertIn("ETH ($8.67)", summary["plan_slice"])
+        self.assertIn("sellable 0.0060/0.0079 ETH", summary["plan_liquidity"])
+        self.assertIn("idle $0.00", summary["plan_liquidity"])
+
+        # Plan strings must not leak any legacy operator-console emoji / keys.
+        plan_blob = " ".join(
+            str(summary.get(field, ""))
+            for field in (
+                "plan_mode",
+                "plan_target",
+                "plan_anchor",
+                "plan_next",
+                "plan_slice",
+                "plan_liquidity",
+            )
+        )
+        for legacy_token in (
+            "🎯 PLAN",
+            "📡 SIGNALS",
+            "🚦 GATES",
+            "🎯 EXITS",
+            "📦 Inventory",
+            "Sell Map",
+            "PnL Gates",
+            "wallet=$",
+            "managed=$",
+            "uPnL=",
+            "rPnL=",
+            "fees=$",
+            "held=",
+            "to_min=",
+            "to_recovery=",
+            "trail ARMED (peak",
+            "regime HV-down",
+            "role scout",
+            "cooldown none",
+        ):
+            self.assertNotIn(legacy_token, plan_blob)
 
     def test_rsi_v5_backtest_signal_series_matches_live_score_components(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig

@@ -325,6 +325,11 @@ class CandlesBase(NetworkBase):
         """
         while not self.ready:
             await self._ws_candle_available.wait()
+            if len(self._candles) == 0:
+                # A reset can clear the deque after the availability event was set. Drop the stale
+                # signal and wait for a fresh websocket candle instead of retrying on deque[0].
+                self._ws_candle_available.clear()
+                continue
             try:
                 end_time = self._round_timestamp_to_interval_multiple(self._candles[0][0])
                 missing_records = self._candles.maxlen - len(self._candles)

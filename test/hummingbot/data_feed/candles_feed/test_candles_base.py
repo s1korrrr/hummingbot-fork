@@ -328,6 +328,19 @@ class TestCandlesBase(IsolatedAsyncioWrapperTestCase, ABC):
         self.assertEqual(self.data_feed.candles_df.shape[0], 2)
         self.assertEqual(self.data_feed.candles_df.shape[1], 10)
 
+    async def test_fill_historical_candles_clears_stale_event_when_seed_candle_was_reset(self):
+        self.data_feed._ws_candle_available.set()
+
+        fill_task = asyncio.create_task(self.data_feed.fill_historical_candles())
+        await asyncio.sleep(0)
+
+        self.assertFalse(self.data_feed._ws_candle_available.is_set())
+        self.assertFalse(fill_task.done())
+
+        fill_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await fill_task
+
     def _create_exception_and_unlock_test_with_event(self, exception):
         self.resume_test_event.set()
         raise exception

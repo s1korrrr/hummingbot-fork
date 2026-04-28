@@ -1,4 +1,6 @@
 import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from test.mock.mock_mqtt_server import FakeMQTTBroker
 from typing import Awaitable
@@ -671,7 +673,7 @@ class RemoteIfaceMQTTTests(TestCase):
             self.wait_for_logged("WARNING", "MQTT Gateway is disconnected, attempting to reconnect."), timeout=10)
         fake_err = "'<=' not supported between instances of 'NoneType' and 'int'"
         self.async_run_with_timeout(self.wait_for_logged("ERROR",
-                                                         f"MQTT Gateway failed to reconnect: {fake_err}. Sleeping 10 seconds before retry."),
+                                                         f"MQTT Gateway failed to reconnect: TypeError: {fake_err}. Sleeping 10 seconds before retry."),
                                     timeout=10)
         self.assertFalse(
             self._is_logged(
@@ -936,3 +938,150 @@ class RemoteIfaceMQTTTests(TestCase):
         pub2.send("test/a/b", test_msg)
         pub2.send("test/c/d", test_msg)
         self.assertTrue(1)
+
+
+class MQTTGatewayRuntimeBoundaryTests(TestCase):
+    def test_mqtt_log_handler_drops_publish_failure_without_raising(self):
+        from hummingbot.remote_iface.mqtt import MQTTLogHandler
+
+        hb_app = MagicMock()
+        hb_app.ev_loop = MagicMock()
+        hb_app.instance_id = "TEST_ID"
+        node = MagicMock()
+        node.namespace = "hbot"
+        handler = MQTTLogHandler(hb_app, node)
+        handler.log_pub.publish = MagicMock(side_effect=ConnectionError("offline"))
+
+        handler.emit(logging.LogRecord('', 1, '', '', '', '', ''))
+
+        self.assertEqual(1, handler.dropped_log_count)
+
+    def test_mqtt_status_updates_drop_publish_failure_without_raising(self):
+        from hummingbot.remote_iface.mqtt import MQTTStatusUpdates
+
+        hb_app = MagicMock()
+        hb_app.ev_loop = MagicMock()
+        hb_app.instance_id = "TEST_ID"
+        node = MagicMock()
+        node.namespace = "hbot"
+        status_updates = MQTTStatusUpdates(hb_app, node)
+        status_updates.status_updates_pub.publish = MagicMock(side_effect=ConnectionError("offline"))
+
+        status_updates.add_msg_to_queue("offline", msg_type="availability")
+
+        self.assertEqual(1, status_updates.dropped_status_update_count)
+
+    def test_mqtt_gateway_reset_node_executor_after_stop_allows_future_submission(self):
+        gateway = object.__new__(MQTTGateway)
+        gateway.stop = MagicMock()
+        old_executor = ThreadPoolExecutor()
+        gateway._executor = old_executor
+        gateway._workers = ["stale-worker"]
+
+        gateway._reset_node_executor_after_stop()
+
+        with self.assertRaises(RuntimeError):
+            old_executor.submit(lambda: "stale")
+
+        future = gateway._executor.submit(lambda: "ok")
+        self.assertEqual("ok", future.result(timeout=1))
+        self.assertEqual([], gateway._workers)
+        gateway._executor.shutdown(wait=False, cancel_futures=True)
+
+    def test_mqtt_gateway_reconnect_failure_clears_restarting_and_uses_fresh_params(self):
+        gateway = object.__new__(MQTTGateway)
+        logger = MagicMock()
+        hb_app = MagicMock()
+        hb_app.logger.return_value = logger
+        hb_app.strategy = None
+        gateway._hb_app = hb_app
+        gateway._restarting = False
+        gateway._health = True
+        gateway._publishers = ["old-publisher"]
+        gateway._subscribers = ["old-subscriber"]
+        gateway._rpc_services = ["old-rpc"]
+        gateway._INTERVAL_RESTART_SHORT = 0.0
+        gateway._INTERVAL_RESTART_LONG = 0.0
+        gateway.stop = MagicMock()
+        gateway._reset_node_executor_after_stop = MagicMock()
+        gateway._create_mqtt_params_from_conf = MagicMock(return_value="new-params")
+        gateway.start = MagicMock(side_effect=RuntimeError("broker down"))
+
+        async def run_restart():
+            gateway._ev_loop = asyncio.get_running_loop()
+            await gateway._restart_gateway()
+
+        asyncio.run(run_restart())
+
+        gateway.stop.assert_called_once_with(False)
+        gateway._reset_node_executor_after_stop.assert_called_once()
+        gateway.start.assert_called_once_with(False)
+        self.assertEqual("new-params", gateway._params)
+        self.assertEqual("new-params", gateway._conn_params)
+        self.assertEqual([], gateway._publishers)
+        self.assertEqual([], gateway._subscribers)
+        self.assertEqual([], gateway._rpc_services)
+        self.assertFalse(gateway.health)
+        self.assertFalse(gateway._restarting)
+        self.assertIn("RuntimeError: broker down", logger.error.call_args.args[0])
+        self.assertTrue(logger.error.call_args.kwargs["exc_info"])
+
+    def test_mqtt_gateway_reconnect_success_restarts_market_events(self):
+        gateway = object.__new__(MQTTGateway)
+        logger = MagicMock()
+        hb_app = MagicMock()
+        hb_app.logger.return_value = logger
+        hb_app.strategy = object()
+        gateway._hb_app = hb_app
+        gateway._restarting = False
+        gateway._health = False
+        gateway._publishers = ["old-publisher"]
+        gateway._subscribers = ["old-subscriber"]
+        gateway._rpc_services = ["old-rpc"]
+        gateway._INTERVAL_RESTART_SHORT = 0.0
+        gateway._INTERVAL_RESTART_LONG = 0.0
+        gateway.stop = MagicMock()
+        gateway._reset_node_executor_after_stop = MagicMock()
+        gateway._create_mqtt_params_from_conf = MagicMock(return_value="new-params")
+        gateway.start = MagicMock()
+        gateway.start_market_events_fw = MagicMock()
+        gateway._check_connections = MagicMock(return_value=True)
+
+        async def run_restart():
+            gateway._ev_loop = asyncio.get_running_loop()
+            await gateway._restart_gateway()
+
+        asyncio.run(run_restart())
+
+        gateway.stop.assert_called_once_with(False)
+        gateway._reset_node_executor_after_stop.assert_called_once()
+        gateway.start.assert_called_once_with(False)
+        gateway.start_market_events_fw.assert_called_once()
+        gateway._check_connections.assert_called_once()
+        self.assertEqual("new-params", gateway._params)
+        self.assertEqual("new-params", gateway._conn_params)
+        self.assertTrue(gateway.health)
+        self.assertFalse(gateway._restarting)
+        logger.warning.assert_any_call("MQTT Gateway successfully reconnected.")
+
+    def test_mqtt_gateway_disconnect_callback_does_not_raise_from_commlib_connection_error(self):
+        gateway = object.__new__(MQTTGateway)
+        gateway.stop = MagicMock()
+        gateway._health = True
+        gateway._transport_disconnect_errors = 0
+        endpoint = MagicMock()
+        endpoint._transport = MagicMock()
+        endpoint._transport._client = MagicMock()
+
+        def raise_connection_error(*_args, **_kwargs):
+            endpoint._transport._connected = False
+            raise ConnectionError()
+
+        endpoint._transport._client.on_disconnect = raise_connection_error
+
+        gateway._patch_endpoint_disconnect_handler(endpoint)
+        endpoint._transport._client.on_disconnect(None, None, 1)
+
+        self.assertFalse(gateway.health)
+        self.assertEqual(1, gateway._transport_disconnect_errors)
+        self.assertTrue(endpoint._transport._hbot_disconnect_handler_patched)

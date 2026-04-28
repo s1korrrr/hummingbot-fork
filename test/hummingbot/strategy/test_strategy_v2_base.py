@@ -536,9 +536,21 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             "exposure": "$0/$500 (0%)",
             "execs": "B0 S0 H0",
             "u_pnl": "n/a",
+            "rsi": "28.90",
+            "rsi_proximity": "28.9/35.0",
+            "buy_gauge": "██████████  BUY",
+            "sell_gauge": "░░░░░░░░░░    —",
+            "gates_mask": "buy:ok",
             "gate": "ready",
             "note": "monitoring",
+            "focus": "monitoring",
             "attention_score": 10,
+            "plan_mode": "ENTRIES",
+            "plan_target": "rsi≤35.00",
+            "plan_anchor": "scout $25.00 (35%)",
+            "plan_next": "runner $46.00 (65%)",
+            "plan_slice": "—",
+            "plan_liquidity": "idle $1303.42",
         }
         self.strategy.controllers = {"controller_1": controller_mock}
         self.strategy.controller_reports = {
@@ -551,13 +563,39 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         status = self.strategy.format_status()
 
-        self.assertIn("CONTROLLERS SUMMARY", status)
-        self.assertIn("price", status)
-        self.assertIn("2191.5", status)
-        self.assertIn("ETH-USDC", status)
-        self.assertIn("breakeven", status)
-        self.assertIn("u%", status)
-        self.assertIn("2188", status)
+        # 4-table operator-console layout: CONTROLLERS / SIGNALS / PLANS / (POSITIONS HELD).
+        self.assertIn("\nCONTROLLERS\n", status)
+        self.assertIn("\nSIGNALS\n", status)
+        self.assertIn("\nPLANS\n", status)
+        self.assertNotIn("CONTROLLERS SUMMARY", status)
+
+        # CONTROLLERS section is the slim overview (pair / price / avg / state / execs / exposure / focus).
+        controllers_block = status.split("\nCONTROLLERS\n", 1)[1].split("\nSIGNALS\n", 1)[0]
+        self.assertIn("ETH-USDC", controllers_block)
+        self.assertIn("2191.5", controllers_block)
+        self.assertIn("2188", controllers_block)
+        self.assertIn("monitoring", controllers_block)
+        self.assertNotIn("buy:ok", controllers_block)
+        self.assertNotIn("28.9/35.0", controllers_block)
+
+        # SIGNALS section owns RSI proximity + buy/sell gauges + gate truthtable.
+        signals_block = status.split("\nSIGNALS\n", 1)[1].split("\nPLANS\n", 1)[0]
+        self.assertIn("28.9/35.0", signals_block)
+        self.assertIn("buy:ok", signals_block)
+        self.assertIn("ETH-USDC", signals_block)
+
+        # PLANS section owns the per-controller exit/entry plan detail.
+        plans_block = status.split("\nPLANS\n", 1)[1]
+        self.assertIn("ENTRIES", plans_block)
+        self.assertIn("rsi≤35.00", plans_block)
+        self.assertIn("scout $25.00 (35%)", plans_block)
+        self.assertIn("runner $46.00 (65%)", plans_block)
+        self.assertIn("idle $1303.42", plans_block)
+
+        # Legacy columns are gone (no verbose breakeven / u% in any controller-summary table).
+        controller_tables = status.split("PERFORMANCE SUMMARY")[0].split("POSITIONS HELD")[0]
+        self.assertNotIn("breakeven", controller_tables)
+        self.assertNotIn("u%", controller_tables)
 
     def test_format_status_surfaces_focus_queue_and_active_executor_pnl(self):
         self.strategy.ready_to_trade = True
@@ -577,8 +615,14 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             "exposure": "$50/$500 (10%)",
             "execs": "B1 S0 H1",
             "u_pnl": "n/a",
+            "rsi": "28.90",
+            "rsi_proximity": "28.9/35.0",
+            "buy_gauge": "██████████  BUY",
+            "sell_gauge": "██░░░░░░░░ 24%",
+            "gates_mask": "P✗ R✗ V✓",
             "gate": "ready",
             "note": "1 buy active",
+            "focus": "1 buy active",
             "attention_score": 90,
         }
         self.strategy.controllers = {"controller_1": controller_mock}
@@ -610,8 +654,11 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         status = self.strategy.format_status()
 
-        self.assertIn("Focus Queue (attention):", status)
-        self.assertIn("ETH-USDC | 1 buy active", status)
+        # Focus information is now a column inside CONTROLLERS SUMMARY, not a separate
+        # standalone "Focus Queue (attention):" block. The dashboard runtime-status
+        # parser falls back to the column when the bullet list is absent.
+        self.assertNotIn("Focus Queue (attention):", status)
+        self.assertIn("1 buy active", status)
         self.assertNotIn("uPnL $50.00 / 5.00%", status)
         self.assertNotIn("gPnL $150.00 / 15.00%", status)
         self.assertIn("ACTIVE EXECUTORS (1)", status)
@@ -812,15 +859,77 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         self.assertIn("Status formatter error for `controller_1`", status)
         self.assertIn("Controller-specific status is unavailable", status)
-        self.assertIn("🕘 Recent Executors (Last 3):", status)
-        self.assertIn("1. 🔴 SELL position | 🟢 running | 🧯 early-stop", status)
-        self.assertIn("💰 PnL 0.00% / $0", status)
-        self.assertIn("🎯 Entry 100", status)
-        self.assertIn("🪜 Level entry_2", status)
-        self.assertIn("🧵 Trail waiting", status)
-        self.assertIn("🚀 Arm 96.2", status)
-        self.assertIn("↔ Gap 2.10%", status)
-        self.assertIn("🏷 Refs OID-1, OID-2", status)
+        self.assertIn("ACTIVE EXECUTORS (1)", status)
+        self.assertIn("active_exec total=1 | buy=0 sell=1", status)
+        self.assertIn("pnl=$0.00 / 0.00%", status)
+        self.assertIn("fill=$0", status)
+        self.assertIn("trail=waiting:1", status)
+        self.assertIn("entry_2", status)
+        self.assertIn("2.10%", status)
+        self.assertIn("0/5", status)
+        self.assertNotIn("🕘 Recent Executors (Last 3):", status)
+        self.assertNotIn("🏷 Refs OID-1, OID-2", status)
+
+    def test_format_status_suppresses_empty_per_controller_block(self):
+        """Per-controller ``=== Controller: ... ===`` block disappears when
+        ``to_format_status()`` returns ``[]`` and the controller has no active
+        executor needing a runtime line — preventing 4 lines of pure noise per
+        controller in the operator console (RSIv5Controller is the canonical
+        empty-body case post-2026-04-28)."""
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+
+        controller_mock = MagicMock()
+        controller_mock.to_format_status.return_value = []
+        controller_mock.get_status_summary.return_value = {
+            "pair": "ETH-USDC",
+            "price": "2191.5",
+            "state": "HOLDING",
+            "signal": "NEUTRAL",
+            "score": "0/3",
+            "regime": "HV-down",
+            "avg_buy": "2188.0",
+            "exposure": "$25/$500 (5%)",
+            "execs": "B0 S0 H1",
+            "u_pnl": "$0.00 / 0.00%",
+            "u_pnl_pct": "0.00%",
+            "rsi": "50.00",
+            "rsi_proximity": "50.0/80.0",
+            "buy_gauge": "░░░░░░░░░░    —",
+            "sell_gauge": "██░░░░░░░░ 24%",
+            "gates_mask": "P✗ R✗ V✗",
+            "gate": "ready",
+            "note": "sell buffer 5.0%",
+            "focus": "sell buffer 5.0%",
+            "attention_score": 80,
+            "plan_mode": "EXITS",
+            "plan_target": "7.00%",
+            "plan_anchor": "min 2192.38 (+0.04%)",
+            "plan_next": "arm 2341.16 (+6.83%)",
+            "plan_slice": "15% ≈ 0.0017 ETH ($3.97)",
+            "plan_liquidity": "sellable 0.0114 ETH · idle $0.00",
+        }
+        self.strategy.controllers = {"controller_1": controller_mock}
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [],
+                "positions": [],
+                "performance": None,
+            }
+        }
+
+        status = self.strategy.format_status()
+
+        self.assertNotIn("Controller: controller_1", status)
+        self.assertIn("\nCONTROLLERS\n", status)
+        self.assertIn("\nSIGNALS\n", status)
+        self.assertIn("\nPLANS\n", status)
+        # Plan information lives in the parent PLANS table, not in a per-controller block.
+        plans_block = status.split("\nPLANS\n", 1)[1]
+        self.assertIn("EXITS", plans_block)
+        self.assertIn("min 2192.38 (+0.04%)", plans_block)
+        self.assertIn("arm 2341.16 (+6.83%)", plans_block)
 
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()

@@ -20,6 +20,7 @@ class TripleBarrierConfig(BaseModel):
     time_limit: Optional[int] = None
     trailing_stop: Optional[TrailingStop] = None
     open_order_type: OrderType = OrderType.LIMIT
+    open_order_limit_max_age_seconds: int = 0
     take_profit_order_type: OrderType = OrderType.MARKET
     trailing_stop_order_type: OrderType = OrderType.MARKET
     trailing_stop_limit_max_age_seconds: int = 0
@@ -41,6 +42,7 @@ class TripleBarrierConfig(BaseModel):
             time_limit=self.time_limit,
             trailing_stop=new_trailing_stop,
             open_order_type=self.open_order_type,
+            open_order_limit_max_age_seconds=self.open_order_limit_max_age_seconds,
             take_profit_order_type=self.take_profit_order_type,
             trailing_stop_order_type=self.trailing_stop_order_type,
             trailing_stop_limit_max_age_seconds=self.trailing_stop_limit_max_age_seconds,

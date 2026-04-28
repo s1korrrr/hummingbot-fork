@@ -176,6 +176,84 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(position_executor.trade_pnl_pct, Decimal("0"))
 
     @patch.object(PositionExecutor, "get_trading_rules")
+    async def test_control_open_order_cancels_unfilled_stale_limit_entry(self, trading_rules_mock):
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        trading_rules_mock.return_value = trading_rules
+        position_config = self.get_position_config_market_long()
+        position_config.triple_barrier_config.open_order_type = OrderType.LIMIT
+        position_config.triple_barrier_config.open_order_limit_max_age_seconds = 3
+        position_executor = self.get_position_executor_running_from_config(position_config)
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567894)
+        self.strategy.connectors["binance"].quantize_order_amount.return_value = Decimal("0")
+        position_executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=position_config.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=position_config.amount,
+            price=position_config.entry_price,
+            creation_timestamp=1234567890,
+            initial_state=OrderState.OPEN,
+        )
+
+        await position_executor.control_task()
+
+        position_executor._strategy.cancel.assert_called_with(
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            order_id="OID-BUY-1",
+        )
+        self.assertEqual(position_executor.close_type, CloseType.EXPIRED)
+        self.assertEqual(position_executor.status, RunnableStatus.SHUTTING_DOWN)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    async def test_control_open_order_does_not_cancel_partially_filled_stale_limit_entry(self, trading_rules_mock):
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        trading_rules_mock.return_value = trading_rules
+        position_config = self.get_position_config_market_long()
+        position_config.triple_barrier_config.open_order_type = OrderType.LIMIT
+        position_config.triple_barrier_config.open_order_limit_max_age_seconds = 3
+        position_executor = self.get_position_executor_running_from_config(position_config)
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567894)
+        self.strategy.connectors["binance"].quantize_order_amount.return_value = Decimal("0.2")
+        position_executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair=position_config.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=position_config.amount,
+            price=position_config.entry_price,
+            creation_timestamp=1234567890,
+            initial_state=OrderState.OPEN,
+        )
+        position_executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair=position_config.trading_pair,
+                fill_price=position_config.entry_price,
+                fill_base_amount=Decimal("0.2"),
+                fill_quote_amount=Decimal("20"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.02"))]),
+                fill_timestamp=1234567891,
+            )
+        )
+
+        await position_executor.control_task()
+
+        position_executor._strategy.cancel.assert_not_called()
+        self.assertEqual(position_executor.status, RunnableStatus.RUNNING)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
     async def test_control_position_order_placed_not_cancel_open_order(self, trading_rules_mock):
         trading_rules = MagicMock(spec=TradingRule)
         trading_rules.min_order_size = Decimal("0.1")

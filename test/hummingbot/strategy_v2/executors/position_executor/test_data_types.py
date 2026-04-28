@@ -52,6 +52,7 @@ class TestPositionExecutorDataTypes(TestCase):
             time_limit=100,
             trailing_stop=TrailingStop(activation_price=Decimal("0.1"), trailing_delta=Decimal("0.1")),
             open_order_type=OrderType.LIMIT,
+            open_order_limit_max_age_seconds=3,
             take_profit_order_type=OrderType.MARKET,
             stop_loss_order_type=OrderType.MARKET,
             time_limit_order_type=OrderType.MARKET
@@ -63,6 +64,7 @@ class TestPositionExecutorDataTypes(TestCase):
         self.assertEqual(triple_barrier_new.trailing_stop.activation_price, Decimal("0.15"))
         self.assertEqual(triple_barrier_new.trailing_stop.trailing_delta, Decimal("0.15"))
         self.assertEqual(triple_barrier_new.open_order_type, OrderType.LIMIT)
+        self.assertEqual(triple_barrier_new.open_order_limit_max_age_seconds, 3)
         self.assertEqual(triple_barrier_new.take_profit_order_type, OrderType.MARKET)
         self.assertEqual(triple_barrier_new.stop_loss_order_type, OrderType.MARKET)
 

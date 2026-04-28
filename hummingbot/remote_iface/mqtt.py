@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -527,6 +528,7 @@ class MQTTStatusUpdates:
             topic=self._topic,
             msg_type=StatusUpdateMessage
         )
+        self.dropped_status_update_count = 0
 
         if self._node.state == NodeState.RUNNING:
             self.status_updates_pub.run()
@@ -536,13 +538,16 @@ class MQTTStatusUpdates:
             self._ev_loop.call_soon_threadsafe(self.add_msg_to_queue, msg, msg_type)
             return
 
-        self.status_updates_pub.publish(
-            StatusUpdateMessage(
-                msg=msg,
-                type=msg_type,
-                timestamp=int(time.time() * 1e3)
+        try:
+            self.status_updates_pub.publish(
+                StatusUpdateMessage(
+                    msg=msg,
+                    type=msg_type,
+                    timestamp=int(time.time() * 1e3)
+                )
             )
-        )
+        except Exception:
+            self.dropped_status_update_count += 1
 
     def stop(self):
         self.status_updates_pub.stop()
@@ -580,6 +585,8 @@ class MQTTGateway(Node):
         self._commands: MQTTCommands = None
         self._logh: MQTTLogHandler = None
         self._external_events: MQTTExternalEvents = None
+        self._transport_disconnect_errors = 0
+        self._last_transport_disconnect_error: Optional[Exception] = None
         self._hb_app: "HummingbotApplication" = hb_app
         self._ev_loop = self._hb_app.ev_loop
         self._params = self._create_mqtt_params_from_conf()
@@ -668,6 +675,74 @@ class MQTTGateway(Node):
 
     def add_log_handler(self, logger: HummingbotLogger):
         logger.addHandler(self._logh)
+
+    def _reset_node_executor_after_stop(self):
+        old_executor = getattr(self, "_executor", None)
+        if old_executor is not None:
+            try:
+                old_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:  # pragma: no cover - for older ThreadPoolExecutor implementations
+                old_executor.shutdown(wait=False)
+            except Exception:
+                self.logger().debug("Failed to shut down stale MQTT node executor.", exc_info=True)
+
+        self._executor = ThreadPoolExecutor()
+        self._workers = []
+
+    def _patch_endpoint_disconnect_handler(self, endpoint):
+        transport = getattr(endpoint, "_transport", None)
+        client = getattr(transport, "_client", None)
+        if (
+            transport is None
+            or client is None
+            or getattr(transport, "_hbot_disconnect_handler_patched", False) is True
+        ):
+            return endpoint
+
+        original_on_disconnect = client.on_disconnect
+
+        def safe_on_disconnect(client_obj, userdata, rc, *args, **kwargs):
+            try:
+                if original_on_disconnect is not None:
+                    return original_on_disconnect(client_obj, userdata, rc, *args, **kwargs)
+            except Exception as exc:
+                self._health = False
+                self._transport_disconnect_errors += 1
+                self._last_transport_disconnect_error = exc
+                return None
+            finally:
+                current_client = getattr(transport, "_client", None)
+                if current_client is not None:
+                    current_client.on_disconnect = safe_on_disconnect
+            return None
+
+        client.on_disconnect = safe_on_disconnect
+        transport._hbot_disconnect_handler_patched = True
+        return endpoint
+
+    def create_publisher(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_publisher(*args, **kwargs))
+
+    def create_mpublisher(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_mpublisher(*args, **kwargs))
+
+    def create_subscriber(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_subscriber(*args, **kwargs))
+
+    def create_psubscriber(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_psubscriber(*args, **kwargs))
+
+    def create_rpc(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_rpc(*args, **kwargs))
+
+    def create_rpc_client(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_rpc_client(*args, **kwargs))
+
+    def create_action(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_action(*args, **kwargs))
+
+    def create_action_client(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_action_client(*args, **kwargs))
 
     def _init_notifier(self):
         if self._hb_app.client_config_map.mqtt_bridge.mqtt_notifier:
@@ -787,8 +862,12 @@ class MQTTGateway(Node):
 
         try:
             self._restarting = True
+            self._health = False
             self.stop(False)
             await asyncio.sleep(self._INTERVAL_RESTART_SHORT)
+            self._reset_node_executor_after_stop()
+            self._params = self._create_mqtt_params_from_conf()
+            self._conn_params = self._params
 
             self._publishers = []
             self._subscribers = []
@@ -810,7 +889,13 @@ class MQTTGateway(Node):
                 self._hb_app.logger().warning('MQTT Gateway successfully reconnected.')
 
         except Exception as e:
-            self._hb_app.logger().error(f'MQTT Gateway failed to reconnect: {e}. Sleeping 10 seconds before retry.')
+            self._health = False
+            self._hb_app.logger().error(
+                f'MQTT Gateway failed to reconnect: {type(e).__name__}: {e}. Sleeping 10 seconds before retry.',
+                exc_info=True,
+            )
+        finally:
+            self._restarting = False
 
         await asyncio.sleep(self._INTERVAL_RESTART_LONG)
 
@@ -869,10 +954,14 @@ class MQTTLogHandler(logging.Handler):
         self.name = self.__class__.__name__
         self.log_pub = self._node.create_publisher(topic=self._topic,
                                                    msg_type=LogMessage)
+        self.dropped_log_count = 0
 
     def emit(self, record: logging.LogRecord):
         if threading.current_thread() != threading.main_thread():  # pragma: no cover
-            self._ev_loop.call_soon_threadsafe(self.emit, record)
+            try:
+                self._ev_loop.call_soon_threadsafe(self.emit, record)
+            except Exception:
+                self.dropped_log_count += 1
             return
         msg_str = self.format(record)
         msg = LogMessage(
@@ -883,7 +972,10 @@ class MQTTLogHandler(logging.Handler):
             logger_name=record.name
 
         )
-        self.log_pub.publish(msg)
+        try:
+            self.log_pub.publish(msg)
+        except Exception:
+            self.dropped_log_count += 1
 
 
 class MQTTExternalEvents:

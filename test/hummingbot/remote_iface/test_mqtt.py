@@ -3,6 +3,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from test.mock.mock_mqtt_server import FakeMQTTBroker
+from types import SimpleNamespace
 from typing import Awaitable
 from unittest import TestCase
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
@@ -1063,6 +1064,38 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
         self.assertTrue(gateway.health)
         self.assertFalse(gateway._restarting)
         logger.warning.assert_any_call("MQTT Gateway successfully reconnected.")
+
+    def test_mqtt_gateway_reconnect_uses_trading_core_strategy(self):
+        gateway = object.__new__(MQTTGateway)
+        logger = MagicMock()
+        hb_app = SimpleNamespace(
+            logger=lambda: logger,
+            trading_core=SimpleNamespace(strategy=object()),
+        )
+        gateway._hb_app = hb_app
+        gateway._restarting = False
+        gateway._health = False
+        gateway._publishers = ["old-publisher"]
+        gateway._subscribers = ["old-subscriber"]
+        gateway._rpc_services = ["old-rpc"]
+        gateway._INTERVAL_RESTART_SHORT = 0.0
+        gateway._INTERVAL_RESTART_LONG = 0.0
+        gateway.stop = MagicMock()
+        gateway._reset_node_executor_after_stop = MagicMock()
+        gateway._create_mqtt_params_from_conf = MagicMock(return_value="new-params")
+        gateway.start = MagicMock()
+        gateway.start_market_events_fw = MagicMock()
+        gateway._check_connections = MagicMock(return_value=True)
+
+        async def run_restart():
+            gateway._ev_loop = asyncio.get_running_loop()
+            await gateway._restart_gateway()
+
+        asyncio.run(run_restart())
+
+        gateway.start_market_events_fw.assert_called_once()
+        self.assertTrue(gateway.health)
+        logger.error.assert_not_called()
 
     def test_mqtt_gateway_disconnect_callback_does_not_raise_from_commlib_connection_error(self):
         gateway = object.__new__(MQTTGateway)

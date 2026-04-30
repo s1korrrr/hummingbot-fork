@@ -2227,6 +2227,7 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         )
         controller.processed_data = {
             "indicators": {"cost_basis": Decimal("2188.0")},
+            "candle_timestamp": 1234567800.0,
             "signal_state": {"signal_score": 0},
             "signal": 0,
             "regime": "HV_Trend_Down",
@@ -2236,6 +2237,7 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertEqual(summary["pair"], "ETH-USDC")
         self.assertEqual(summary["price"], "2191.5")
+        self.assertEqual(summary["timestamp"], "2009-02-13 23:30:00 UTC")
         self.assertEqual(summary["avg_buy"], "2188")
         self.assertEqual(summary["u_pnl_pct"], "0.2%")
 

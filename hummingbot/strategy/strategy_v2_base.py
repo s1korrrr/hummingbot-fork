@@ -1195,6 +1195,7 @@ class StrategyV2Base(StrategyPyBase):
             "controller_id": controller_id,
             "pair": trading_pair,
             "price": summary.get("price", "n/a"),
+            "timestamp": summary.get("timestamp", "n/a"),
             "state": summary.get("state", "n/a"),
             "signal": summary.get("signal", "n/a"),
             "score": summary.get("score", "n/a"),
@@ -1350,7 +1351,7 @@ class StrategyV2Base(StrategyPyBase):
     def _controller_summary_lines(cls, controller_entries: List[Dict[str, Any]]) -> List[str]:
         """Render the slim operator-console ``CONTROLLERS`` overview table.
 
-        Columns: ``pair / price / avg / state / execs / exposure / focus``.
+        Columns: ``pair / price / timestamp / avg / state / execs / exposure / focus``.
 
         Signal-proximity gauges live in the dedicated ``SIGNALS`` table (rendered
         below this one) and exit/entry plan detail lives in the ``PLANS`` table —
@@ -1367,6 +1368,7 @@ class StrategyV2Base(StrategyPyBase):
             summary_rows.append({
                 "pair": summary.get("pair", entry["controller_id"]),
                 "price": summary.get("price", "n/a"),
+                "timestamp": summary.get("timestamp", "n/a"),
                 "avg": summary.get("avg_buy", "n/a"),
                 "state": summary.get("state", "n/a"),
                 "execs": summary.get("execs", "n/a"),

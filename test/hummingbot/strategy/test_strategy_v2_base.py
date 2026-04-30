@@ -528,6 +528,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         controller_mock.get_status_summary.return_value = {
             "pair": "ETH-USDC",
             "price": "2191.5",
+            "timestamp": "2009-02-13 23:30:00 UTC",
             "state": "ENTERING",
             "signal": "BUY",
             "score": "3/3",
@@ -569,10 +570,11 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertIn("\nPLANS\n", status)
         self.assertNotIn("CONTROLLERS SUMMARY", status)
 
-        # CONTROLLERS section is the slim overview (pair / price / avg / state / execs / exposure / focus).
+        # CONTROLLERS section is the slim overview (pair / price / timestamp / avg / state / execs / exposure / focus).
         controllers_block = status.split("\nCONTROLLERS\n", 1)[1].split("\nSIGNALS\n", 1)[0]
         self.assertIn("ETH-USDC", controllers_block)
         self.assertIn("2191.5", controllers_block)
+        self.assertIn("2009-02-13 23:30:00 UTC", controllers_block)
         self.assertIn("2188", controllers_block)
         self.assertIn("monitoring", controllers_block)
         self.assertNotIn("buy:ok", controllers_block)

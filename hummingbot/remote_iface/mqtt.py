@@ -875,7 +875,7 @@ class MQTTGateway(Node):
             # self._rpc_clients = []
 
             self.start(False)
-            if self._hb_app.strategy is not None:
+            if getattr(getattr(self._hb_app, "trading_core", None), "strategy", None) is not None:
                 self.start_market_events_fw()
 
             await asyncio.sleep(self._INTERVAL_RESTART_SHORT)

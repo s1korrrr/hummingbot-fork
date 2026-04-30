@@ -19,6 +19,7 @@ Key Features:
 import logging
 import time as _time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
@@ -1437,6 +1438,19 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return f"{numeric:.{precision}f}".rstrip("0").rstrip(".")
 
     @staticmethod
+    def _summary_timestamp_label(value: Optional[object]) -> str:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return "n/a"
+        if numeric != numeric or numeric in (float("inf"), float("-inf")):
+            return "n/a"
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc).strftime("%H:%M:%S")
+        except (OSError, OverflowError, ValueError):
+            return "n/a"
+
+    @staticmethod
     def _short_regime_label(regime_label: Optional[str]) -> str:
         if not regime_label:
             return "detecting"
@@ -1608,6 +1622,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return {
             "pair": self.config.trading_pair,
             "price": self._summary_price(mid_price),
+            "timestamp": self._summary_timestamp_label(processed.get("timestamp")),
             "controller_id": self.config.id,
             "state": state_label,
             "signal": self._summary_signal_label(current_signal),
@@ -3150,6 +3165,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             "regime_error": regime_error,
             "trend_confirmation": self._trend_confirmation_dict(trend_confirmation),
             "timestamp": now_ts,
+            "candle_timestamp": last_candle_ts,
             "thresholds": {
                 "rsi_buy": rsi_buy_eff, "rsi_sell": rsi_sell_eff,
                 "cooldown": effective_cooldown,

@@ -292,6 +292,11 @@ class BtcMarketsSpotCandles(CandlesBase):
         self._historical_fill_in_progress = True
 
         try:
+            while len(self._candles) == 0:
+                await self._ws_candle_available.wait()
+                if len(self._candles) == 0:
+                    self._ws_candle_available.clear()
+
             iteration = 0
             max_iterations = 20
 

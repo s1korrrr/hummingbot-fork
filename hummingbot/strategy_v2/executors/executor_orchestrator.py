@@ -676,6 +676,172 @@ class ExecutorOrchestrator:
                     f"amount={position_summary.amount} breakeven={position_summary.breakeven_price}"
                 )
 
+    @staticmethod
+    def _trade_fill_order_record(trade_fill: TradeFill) -> Dict[str, Any]:
+        executed_amount_base = Decimal(str(trade_fill.amount or 0))
+        executed_amount_quote = Decimal(str(trade_fill.price or 0)) * executed_amount_base
+        client_order_id = f"{trade_fill.order_id}:{trade_fill.exchange_trade_id}"
+        return {
+            "client_order_id": client_order_id,
+            "order_id": trade_fill.order_id,
+            "exchange_order_id": trade_fill.order_id,
+            "trade_type": str(trade_fill.trade_type or "").upper(),
+            "price": Decimal(str(trade_fill.price or 0)),
+            "executed_amount_base": executed_amount_base,
+            "executed_amount_quote": executed_amount_quote,
+            "cumulative_fee_paid_quote": Decimal(str(trade_fill.trade_fee_in_quote or 0)),
+            "amount": executed_amount_base,
+            "last_update_timestamp": int(trade_fill.timestamp),
+        }
+
+    @staticmethod
+    def _subtract_active_buy_inventory(position: PositionHold, active_base: Decimal, active_quote: Decimal):
+        if active_base <= Decimal("0") or position.buy_amount_base <= position.sell_amount_base:
+            return
+        reducible_base = min(active_base, position.buy_amount_base - position.sell_amount_base, position.buy_amount_base)
+        if reducible_base <= Decimal("0"):
+            return
+        if active_quote > Decimal("0"):
+            quote_reduction = active_quote * (reducible_base / active_base)
+        elif position.buy_amount_base > Decimal("0"):
+            quote_reduction = reducible_base * (position.buy_amount_quote / position.buy_amount_base)
+        else:
+            quote_reduction = Decimal("0")
+        quote_reduction = min(quote_reduction, position.buy_amount_quote)
+        position.buy_amount_base -= reducible_base
+        position.buy_amount_quote -= quote_reduction
+        position.volume_traded_quote = max(Decimal("0"), position.volume_traded_quote - quote_reduction)
+
+    def _active_buy_inventory_by_market_pair(self) -> Dict[Tuple[str, str, str], Tuple[Decimal, Decimal]]:
+        active_inventory: Dict[Tuple[str, str, str], Tuple[Decimal, Decimal]] = {}
+        for controller_id, executors in self.active_executors.items():
+            for executor in executors:
+                executor_info = getattr(executor, "executor_info", None)
+                if executor_info is None or executor_info.is_done:
+                    continue
+                config = executor_info.config
+                if getattr(config, "side", None) != TradeType.BUY:
+                    continue
+                connector_name = getattr(config, "connector_name", executor_info.connector_name)
+                trading_pair = getattr(config, "trading_pair", executor_info.trading_pair)
+                try:
+                    filled_quote = Decimal(str(executor_info.filled_amount_quote or 0))
+                    entry_price = Decimal(str(getattr(config, "entry_price", Decimal("0")) or Decimal("0")))
+                except Exception:
+                    continue
+                if filled_quote <= Decimal("0") or entry_price <= Decimal("0"):
+                    continue
+                key = (controller_id, connector_name, trading_pair)
+                current_base, current_quote = active_inventory.get(key, (Decimal("0"), Decimal("0")))
+                active_inventory[key] = (current_base + (filled_quote / entry_price), current_quote + filled_quote)
+        return active_inventory
+
+    def _build_reconciled_positions_from_trade_fills(
+        self,
+        trade_fills: List[TradeFill],
+    ) -> Tuple[Set[Tuple[str, str, str]], Dict[Tuple[str, str, str], PositionHold]]:
+        controller_by_market_pair, ambiguous_market_pairs = self._controller_ids_by_market_pair()
+        if len(controller_by_market_pair) == 0 and len(ambiguous_market_pairs) == 0:
+            return set(), {}
+
+        positions_by_market_pair: Dict[Tuple[str, str, str], PositionHold] = {}
+        seen_market_pairs: Set[Tuple[str, str, str]] = set()
+        for trade_fill in sorted(
+            trade_fills,
+            key=lambda fill: (
+                fill.timestamp,
+                fill.order_id,
+                fill.exchange_trade_id,
+            ),
+        ):
+            connector_name = trade_fill.market
+            trading_pair = trade_fill.symbol
+            if (connector_name, trading_pair) in ambiguous_market_pairs:
+                continue
+            controller_id = controller_by_market_pair.get((connector_name, trading_pair))
+            if controller_id is None or controller_id in self.initial_positions_by_controller:
+                continue
+            if connector_name not in self.strategy.markets or trading_pair not in self.strategy.markets.get(connector_name, set()):
+                continue
+            if "_perpetual" in connector_name:
+                continue
+            order_record = self._trade_fill_order_record(trade_fill)
+            if order_record["trade_type"] not in {TradeType.BUY.name, TradeType.SELL.name}:
+                continue
+            key = (controller_id, connector_name, trading_pair)
+            seen_market_pairs.add(key)
+            position = positions_by_market_pair.get(key)
+            if position is None:
+                default_side = TradeType.BUY if order_record["trade_type"] == TradeType.BUY.name else TradeType.SELL
+                position = PositionHold(connector_name, trading_pair, default_side)
+                positions_by_market_pair[key] = position
+            position.add_order_record(order_record)
+
+        active_inventory = self._active_buy_inventory_by_market_pair()
+        reconciled_positions: Dict[Tuple[str, str, str], PositionHold] = {}
+        for key, position in positions_by_market_pair.items():
+            active_base, active_quote = active_inventory.get(key, (Decimal("0"), Decimal("0")))
+            self._subtract_active_buy_inventory(position, active_base, active_quote)
+            try:
+                mid_price = self.strategy.market_data_provider.get_price_by_type(
+                    position.connector_name, position.trading_pair, PriceType.MidPrice
+                )
+            except Exception:
+                mid_price = Decimal("0")
+            position_summary = position.get_position_summary(mid_price or Decimal("0"))
+            if position_summary.amount > Decimal("0"):
+                reconciled_positions[key] = position
+        return seen_market_pairs, reconciled_positions
+
+    def _reconcile_positions_from_trade_fills(self):
+        try:
+            markets_recorder = MarketsRecorder.get_instance()
+        except TypeError:
+            return
+        config_file_path = getattr(markets_recorder, "config_file_path", None)
+        if not config_file_path:
+            return
+        try:
+            trade_fills = markets_recorder.get_trades_for_config(config_file_path)
+        except Exception as e:
+            self.logger().warning(f"Failed to reconcile positions from TradeFill: {e}")
+            return
+        if len(trade_fills) == 0:
+            return
+        seen_market_pairs, reconciled_positions = self._build_reconciled_positions_from_trade_fills(trade_fills)
+        for controller_id, connector_name, trading_pair in seen_market_pairs:
+            positions = self.positions_held.setdefault(controller_id, [])
+            existing_position = self._find_existing_position(
+                positions=positions,
+                connector_name=connector_name,
+                trading_pair=trading_pair,
+                position_side=None,
+            )
+            replacement_position = reconciled_positions.get((controller_id, connector_name, trading_pair))
+            positions = [
+                position for position in positions
+                if not (position.connector_name == connector_name and position.trading_pair == trading_pair)
+            ]
+            if replacement_position is not None:
+                positions.append(replacement_position)
+                try:
+                    mid_price = self.strategy.market_data_provider.get_price_by_type(
+                        connector_name, trading_pair, PriceType.MidPrice
+                    )
+                except Exception:
+                    mid_price = Decimal("0")
+                replacement_summary = replacement_position.get_position_summary(mid_price or Decimal("0"))
+                existing_amount = Decimal("0")
+                if existing_position is not None:
+                    existing_amount = existing_position.get_position_summary(mid_price or Decimal("0")).amount
+                if existing_amount != replacement_summary.amount:
+                    self.logger().info(
+                        f"Reconciled held position from TradeFill | controller={controller_id} "
+                        f"pair={trading_pair} amount={replacement_summary.amount} "
+                        f"breakeven={replacement_summary.breakeven_price}"
+                    )
+            self.positions_held[controller_id] = positions
+
     def _load_position_from_db(self, controller_id: str, db_position: Position):
         """
         Load a position from the database and recreate it as a PositionHold object.
@@ -1145,6 +1311,7 @@ class ExecutorOrchestrator:
         """
         # Update any pending position holds from done executors
         self._update_positions_from_done_executors()
+        self._reconcile_positions_from_trade_fills()
 
         # Generate all reports
         executors_report = self.get_executors_report()

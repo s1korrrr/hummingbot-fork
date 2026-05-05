@@ -223,6 +223,13 @@ class StrategyV2Base(StrategyPyBase):
     closed_executors_buffer: int = 100
     max_executors_close_attempts: int = 10
     config_update_interval: int = 10
+    STATUS_SECTION_ICONS: Dict[str, str] = {
+        "SIGNALS": "📡",
+        "PLANS": "🧭",
+        "ACTIVE EXECUTORS": "⚙️",
+        "POSITIONS HELD": "👜",
+        "PERFORMANCE SUMMARY": "💰",
+    }
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -841,12 +848,9 @@ class StrategyV2Base(StrategyPyBase):
             global_total = Decimal("0")
             global_volume = Decimal("0")
             controller_entries = self._build_controller_status_entries()
-            # Operator console: 4-table layout (CONTROLLERS / SIGNALS / PLANS / POSITIONS HELD)
-            # plus optional ACTIVE EXECUTORS, with per-controller ``=== Controller: ... ===``
-            # blocks suppressed entirely when ``to_format_status()`` returns an empty body —
-            # the ACTIVE EXECUTORS / POSITIONS HELD tables already carry the per-runtime detail
-            # and the aggregate ``active_exec`` line was redundant on multi-pair desks.
-            lines.extend(self._controller_summary_lines(controller_entries))
+            # Operator console: shared summary layout (SIGNALS / PLANS / runtime tables).
+            # Per-controller sections are suppressed entirely when ``to_format_status()`` returns an empty body;
+            # the ACTIVE EXECUTORS / POSITIONS HELD tables already carry the per-runtime detail.
             lines.extend(self._signals_summary_lines(controller_entries))
             lines.extend(self._plans_summary_lines(controller_entries))
             lines.extend(self._active_executor_lines(controller_entries))
@@ -870,9 +874,7 @@ class StrategyV2Base(StrategyPyBase):
                     exec_stats_line = (
                         self._active_executor_stats_line(active_executors) if active_executors else None
                     )
-                    lines.append(f"\n{'=' * 60}")
-                    lines.append(self._controller_section_header(entry))
-                    lines.append(f"{'=' * 60}")
+                    lines.append(f"\n{self._controller_section_header(entry)}")
                     lines.extend(controller_body)
                     if exec_stats_line is not None:
                         lines.append(exec_stats_line)
@@ -898,9 +900,7 @@ class StrategyV2Base(StrategyPyBase):
 
             # Performance summary table
             if performance_data:
-                lines.append(f"\n{'=' * 80}")
-                lines.append("PERFORMANCE SUMMARY")
-                lines.append(f"{'=' * 80}")
+                lines.append(f"\n{self._status_section_title('PERFORMANCE SUMMARY')}")
 
                 global_pnl_pct = (global_total / global_volume) * 100 if global_volume > 0 else Decimal(0)
 
@@ -1220,6 +1220,12 @@ class StrategyV2Base(StrategyPyBase):
             "plan_next": summary.get("plan_next"),
             "plan_slice": summary.get("plan_slice"),
             "plan_liquidity": summary.get("plan_liquidity"),
+            "plan_sellable": summary.get("plan_sellable"),
+            "plan_held": summary.get("plan_held"),
+            "plan_active": summary.get("plan_active"),
+            "plan_untracked": summary.get("plan_untracked"),
+            "plan_free": summary.get("plan_free"),
+            "plan_managed": summary.get("plan_managed"),
         }
         return normalized_summary
 
@@ -1334,9 +1340,9 @@ class StrategyV2Base(StrategyPyBase):
     ) -> List[Dict[str, Any]]:
         """Sort controller entries by ``attention_score`` desc, then by pair / id for stability.
 
-        Used by the ``CONTROLLERS`` / ``SIGNALS`` / ``PLANS`` summary tables so
-        high-attention controllers bubble to the top and the three tables share
-        a single, predictable row ordering for the operator's eye to scan.
+        Used by the ``SIGNALS`` / ``PLANS`` summary tables so high-attention
+        controllers bubble to the top and the tables share a single, predictable
+        row ordering for the operator's eye to scan.
         """
         return sorted(
             controller_entries,
@@ -1348,52 +1354,21 @@ class StrategyV2Base(StrategyPyBase):
         )
 
     @classmethod
-    def _controller_summary_lines(cls, controller_entries: List[Dict[str, Any]]) -> List[str]:
-        """Render the slim operator-console ``CONTROLLERS`` overview table.
-
-        Columns: ``pair / price / timestamp / avg / state / execs / exposure / focus``.
-
-        Signal-proximity gauges live in the dedicated ``SIGNALS`` table (rendered
-        below this one) and exit/entry plan detail lives in the ``PLANS`` table —
-        keeping this overview table narrow enough to fit in a typical operator
-        terminal without row wrapping. Rows are sorted by ``attention_score`` desc.
-        """
-        if len(controller_entries) == 0:
-            return []
-
-        ranked_entries = cls._ranked_controller_entries(controller_entries)
-        summary_rows = []
-        for entry in ranked_entries:
-            summary = entry["summary"]
-            summary_rows.append({
-                "pair": summary.get("pair", entry["controller_id"]),
-                "price": summary.get("price", "n/a"),
-                "timestamp": summary.get("timestamp", "n/a"),
-                "avg": summary.get("avg_buy", "n/a"),
-                "state": summary.get("state", "n/a"),
-                "execs": summary.get("execs", "n/a"),
-                "exposure": summary.get("exposure", "n/a"),
-                "focus": summary.get("focus") or summary.get("note") or "—",
-            })
-
-        summary_df = pd.DataFrame(summary_rows)
-        return [
-            f"\n{'=' * 110}",
-            "CONTROLLERS",
-            f"{'=' * 110}",
-            format_df_for_printout(summary_df, table_format="psql", index=False),
-        ]
+    def _status_section_title(cls, title: str) -> str:
+        icon = cls.STATUS_SECTION_ICONS.get(title)
+        return f"{icon} {title}" if icon else title
 
     @classmethod
     def _signals_summary_lines(cls, controller_entries: List[Dict[str, Any]]) -> List[str]:
         """Render the operator-console ``SIGNALS`` table.
 
-        Columns: ``pair / rsi / buy / sell / gates``. Buy and sell are ASCII gauges
-        (``██░░░░░░░░ 24%``) for proximity to the BUY trigger and the SELL profit
-        target; ``gates`` is the compact gate truth table (HOLDING) or buy-gate
-        label (FLAT). Controllers that do not provide gauge / proximity fields
-        render ``—`` so non-RSI strategies degrade gracefully. The table is
-        skipped entirely when no controller exposes any signal field.
+        Columns: ``pair / timestamp / price / avg / rsi / buy / sell / gates /
+        focus``. Buy and sell are ASCII gauges (``██░░░░░░░░ 24%``) for proximity
+        to the BUY trigger and the SELL profit target; ``gates`` is the compact
+        gate truth table (HOLDING) or buy-gate label (FLAT). Controllers that do
+        not provide gauge / proximity fields render ``—`` so non-RSI strategies
+        degrade gracefully. The table is skipped entirely when no controller
+        exposes any signal field.
         """
         if len(controller_entries) == 0:
             return []
@@ -1407,14 +1382,28 @@ class StrategyV2Base(StrategyPyBase):
             buy_cell = summary.get("buy_gauge") or "—"
             sell_cell = summary.get("sell_gauge") or "—"
             gates_cell = summary.get("gates_mask") or "—"
-            if any(value not in (None, "", "—") for value in (rsi_cell, buy_cell, sell_cell, gates_cell)):
+            focus_cell = summary.get("focus") or summary.get("note") or "—"
+            if any(value not in (None, "", "—") for value in (
+                summary.get("timestamp"),
+                summary.get("price"),
+                summary.get("avg_buy"),
+                rsi_cell,
+                buy_cell,
+                sell_cell,
+                gates_cell,
+                focus_cell,
+            )):
                 any_signal_field = True
             signal_rows.append({
                 "pair": summary.get("pair", entry["controller_id"]),
+                "timestamp": summary.get("timestamp", "n/a"),
+                "price": summary.get("price", "n/a"),
+                "avg": summary.get("avg_buy", "n/a"),
                 "rsi": rsi_cell,
                 "buy": buy_cell,
                 "sell": sell_cell,
                 "gates": gates_cell,
+                "focus": focus_cell,
             })
 
         if not any_signal_field:
@@ -1422,18 +1411,84 @@ class StrategyV2Base(StrategyPyBase):
 
         signals_df = pd.DataFrame(signal_rows)
         return [
-            f"\n{'=' * 110}",
-            "SIGNALS",
-            f"{'=' * 110}",
+            f"\n{cls._status_section_title('SIGNALS')}",
             format_df_for_printout(signals_df, table_format="psql", index=False),
         ]
+
+    @staticmethod
+    def _status_cell_is_empty(value: Any) -> bool:
+        return value in (None, "", "—")
+
+    @classmethod
+    def _inventory_cells_from_summary(cls, summary: Dict[str, Any]) -> Dict[str, str]:
+        """Normalize legacy ``plan_liquidity`` into explicit inventory columns.
+
+        Older controller summaries only exposed ``plan_liquidity``. Treating that
+        value as ``sellable`` made flat entry rows show idle wallet cash in the
+        sellable column. Keep the compatibility path, but classify ``idle`` /
+        ``free`` text as wallet headroom instead of inventory.
+        """
+        liquidity = str(summary.get("plan_liquidity") or "")
+        sellable = summary.get("plan_sellable")
+        free = summary.get("plan_free") or summary.get("plan_untracked")
+
+        if cls._status_cell_is_empty(sellable):
+            if liquidity.startswith("sellable "):
+                sellable_part, _, free_part = liquidity.partition(" · ")
+                sellable = sellable_part.removeprefix("sellable ").strip() or "—"
+                if cls._status_cell_is_empty(free) and free_part.startswith(("idle ", "free ")):
+                    free = free_part
+            elif liquidity.startswith("sell "):
+                sellable_part, _, free_part = liquidity.partition(" · ")
+                sellable = sellable_part.removeprefix("sell ").strip() or "—"
+                if cls._status_cell_is_empty(free) and free_part.startswith(("idle ", "free ")):
+                    free = free_part
+            else:
+                sellable = "—"
+
+        if cls._status_cell_is_empty(free):
+            free = liquidity if liquidity.startswith(("idle ", "free ")) else "—"
+
+        return {
+            "sellable": str(sellable or "—"),
+            "bag": str(summary.get("plan_held") or "—"),
+            "active": str(summary.get("plan_active") or "—"),
+            "free": str(free or "—"),
+            "managed": str(summary.get("plan_managed") or "—"),
+        }
+
+    @classmethod
+    def _compact_inventory_cell(cls, inventory_cells: Dict[str, str]) -> str:
+        """Render inventory reconciliation as one scan-friendly PLANS cell."""
+        sellable = inventory_cells.get("sellable", "—")
+        bag = inventory_cells.get("bag", "—")
+        active = inventory_cells.get("active", "—")
+        free = inventory_cells.get("free", "—")
+        managed = inventory_cells.get("managed", "—")
+
+        parts: List[str] = []
+        if not cls._status_cell_is_empty(sellable):
+            parts.append(f"sell {sellable}")
+        if not cls._status_cell_is_empty(bag):
+            parts.append(f"bag {bag}")
+        if not cls._status_cell_is_empty(active) and active != "$0":
+            parts.append(f"active {active}")
+        if not cls._status_cell_is_empty(free) and free != "$0":
+            parts.append(str(free))
+        if (
+            not cls._status_cell_is_empty(managed)
+            and managed not in ("$0", bag)
+        ):
+            parts.append(f"managed {managed}")
+        return " · ".join(parts) if parts else "—"
 
     @classmethod
     def _plans_summary_lines(cls, controller_entries: List[Dict[str, Any]]) -> List[str]:
         """Render the operator-console ``PLANS`` table.
 
-        Columns: ``pair / mode / target / anchor / next / slice / liquidity``. Cell
-        semantics adapt per ``plan_mode``:
+        The ``PLANS`` table carries action mechanics plus compact inventory
+        reconciliation: ``pair / mode / target / anchor / next / slice /
+        inventory``. Cell semantics adapt per ``plan_mode``:
 
         - ``EXITS``   → ``anchor`` = min-profit price, ``next`` = recovery arm price.
         - ``TRAIL``   → ``anchor`` = peak price, ``next`` = pullback % + partial flag.
@@ -1442,7 +1497,7 @@ class StrategyV2Base(StrategyPyBase):
 
         Controllers that do not expose ``plan_*`` fields render ``—`` so non-RSI
         strategies still appear in the table. The table is skipped entirely when
-        no controller exposes any plan field.
+        no controller exposes any plan or inventory field.
         """
         if len(controller_entries) == 0:
             return []
@@ -1450,6 +1505,7 @@ class StrategyV2Base(StrategyPyBase):
         ranked_entries = cls._ranked_controller_entries(controller_entries)
         plan_rows = []
         any_plan_field = False
+        any_inventory_field = False
         for entry in ranked_entries:
             summary = entry["summary"]
             plan_mode = summary.get("plan_mode") or "—"
@@ -1457,11 +1513,23 @@ class StrategyV2Base(StrategyPyBase):
             plan_anchor = summary.get("plan_anchor") or "—"
             plan_next = summary.get("plan_next") or "—"
             plan_slice = summary.get("plan_slice") or "—"
-            plan_liquidity = summary.get("plan_liquidity") or "—"
+            inventory_cells = cls._inventory_cells_from_summary(summary)
             if any(value not in (None, "", "—") for value in (
-                plan_mode, plan_target, plan_anchor, plan_next, plan_slice, plan_liquidity,
+                plan_mode,
+                plan_target,
+                plan_anchor,
+                plan_next,
+                plan_slice,
             )):
                 any_plan_field = True
+            if any(value not in (None, "", "—") for value in (
+                inventory_cells["sellable"],
+                inventory_cells["bag"],
+                inventory_cells["active"],
+                inventory_cells["free"],
+                inventory_cells["managed"],
+            )):
+                any_inventory_field = True
             plan_rows.append({
                 "pair": summary.get("pair", entry["controller_id"]),
                 "mode": plan_mode,
@@ -1469,23 +1537,21 @@ class StrategyV2Base(StrategyPyBase):
                 "anchor": plan_anchor,
                 "next": plan_next,
                 "slice": plan_slice,
-                "liquidity": plan_liquidity,
+                "inventory": cls._compact_inventory_cell(inventory_cells),
             })
 
-        if not any_plan_field:
+        if not any_plan_field and not any_inventory_field:
             return []
 
         plans_df = pd.DataFrame(plan_rows)
         return [
-            f"\n{'=' * 110}",
-            "PLANS",
-            f"{'=' * 110}",
+            f"\n{cls._status_section_title('PLANS')}",
             format_df_for_printout(plans_df, table_format="psql", index=False),
         ]
 
     @staticmethod
     def _controller_attention_lines(controller_entries: List[Dict[str, Any]]) -> List[str]:
-        """Deprecated: focus information is now folded into the CONTROLLERS ``focus`` column.
+        """Deprecated: focus information is now folded into the SIGNALS ``focus`` column.
 
         Kept as a no-op so external callers / regression tests that rely on the API
         keep working; the live ``format_status()`` render path no longer calls it.
@@ -1535,9 +1601,7 @@ class StrategyV2Base(StrategyPyBase):
 
         active_df = pd.DataFrame(active_rows)
         return [
-            f"\n{'=' * 110}",
-            f"ACTIVE EXECUTORS ({len(active_rows)})",
-            f"{'=' * 110}",
+            f"\n{self._status_section_title('ACTIVE EXECUTORS')} ({len(active_rows)})",
             format_df_for_printout(active_df, table_format="psql", index=False),
         ]
 
@@ -1588,12 +1652,9 @@ class StrategyV2Base(StrategyPyBase):
         position_rows: List[Dict[str, Any]] = []
         for entry in controller_entries:
             pair = entry["summary"].get("pair", entry["controller_id"])
-            controller_id = entry["controller_id"]
             for position in entry["positions"]:
                 position_rows.append({
-                    "controller": controller_id,
                     "pair": pair,
-                    "side": getattr(position.side, "name", str(position.side)),
                     "amount": f"{position.amount:.4f}",
                     "value": f"${position.amount * position.breakeven_price:.2f}",
                     "breakeven": f"{position.breakeven_price:.6f}",
@@ -1607,9 +1668,7 @@ class StrategyV2Base(StrategyPyBase):
 
         positions_df = pd.DataFrame(position_rows)
         return [
-            f"\n{'=' * 110}",
-            f"POSITIONS HELD ({len(position_rows)})",
-            f"{'=' * 110}",
+            f"\n{cls._status_section_title('POSITIONS HELD')} ({len(position_rows)})",
             format_df_for_printout(positions_df, table_format="psql", index=False),
         ]
 

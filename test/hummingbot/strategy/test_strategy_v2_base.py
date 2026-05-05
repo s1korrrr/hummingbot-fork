@@ -54,6 +54,11 @@ class DummyReloadControllerV2(DummyReloadControllerBase):
 
 
 class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
+    CONTROLLERS_TITLE = "📊 CONTROLLERS"
+    SIGNALS_TITLE = "📡 SIGNALS"
+    PLANS_TITLE = "🧭 PLANS"
+    INVENTORY_TITLE = "🎒 INVENTORY"
+
     def setUp(self):
         self.start: pd.Timestamp = pd.Timestamp("2021-01-01", tz="UTC")
         self.end: pd.Timestamp = pd.Timestamp("2021-01-01 01:00:00", tz="UTC")
@@ -76,6 +81,12 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                         self.strategy.market_data_provider = MockMarketDataProvider.return_value
                         self.strategy.controllers = {'controller_1': MagicMock(), 'controller_2': MagicMock()}
         self.strategy.logger().setLevel(1)
+
+    def assert_no_status_separator_blocks(self, status: str):
+        self.assertFalse(
+            any(line.strip() and set(line.strip()) == {"="} for line in status.splitlines()),
+            status,
+        )
 
     async def test_start(self):
         self.assertFalse(self.strategy.ready_to_trade)
@@ -517,6 +528,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertIn("$100.00", status)  # Check for performance data in the summary table
         self.assertIn("$50.00", status)
         self.assertIn("$150.00", status)
+        self.assert_no_status_separator_blocks(status)
 
     def test_format_status_includes_controller_summary_price(self):
         self.strategy.ready_to_trade = True
@@ -564,34 +576,34 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         status = self.strategy.format_status()
 
-        # 4-table operator-console layout: CONTROLLERS / SIGNALS / PLANS / (POSITIONS HELD).
-        self.assertIn("\nCONTROLLERS\n", status)
-        self.assertIn("\nSIGNALS\n", status)
-        self.assertIn("\nPLANS\n", status)
+        # Shared operator-console layout: SIGNALS / PLANS / runtime tables.
+        self.assertNotIn(f"\n{self.CONTROLLERS_TITLE}\n", status)
+        self.assertIn(f"\n{self.SIGNALS_TITLE}\n", status)
+        self.assertIn(f"\n{self.PLANS_TITLE}\n", status)
+        self.assertNotIn(f"\n{self.INVENTORY_TITLE}\n", status)
         self.assertNotIn("CONTROLLERS SUMMARY", status)
+        self.assert_no_status_separator_blocks(status)
 
-        # CONTROLLERS section is the slim overview (pair / price / timestamp / avg / state / execs / exposure / focus).
-        controllers_block = status.split("\nCONTROLLERS\n", 1)[1].split("\nSIGNALS\n", 1)[0]
-        self.assertIn("ETH-USDC", controllers_block)
-        self.assertIn("2191.5", controllers_block)
-        self.assertIn("2009-02-13 23:30:00 UTC", controllers_block)
-        self.assertIn("2188", controllers_block)
-        self.assertIn("monitoring", controllers_block)
-        self.assertNotIn("buy:ok", controllers_block)
-        self.assertNotIn("28.9/35.0", controllers_block)
-
-        # SIGNALS section owns RSI proximity + buy/sell gauges + gate truthtable.
-        signals_block = status.split("\nSIGNALS\n", 1)[1].split("\nPLANS\n", 1)[0]
+        # SIGNALS section owns the per-pair overview plus RSI proximity + gates.
+        signals_block = status.split(f"\n{self.SIGNALS_TITLE}\n", 1)[1].split(f"\n{self.PLANS_TITLE}\n", 1)[0]
+        self.assertLess(signals_block.index("pair"), signals_block.index("timestamp"))
+        self.assertLess(signals_block.index("timestamp"), signals_block.index("price"))
+        self.assertLess(signals_block.index("price"), signals_block.index("avg"))
+        self.assertIn("ETH-USDC", signals_block)
+        self.assertIn("2191.5", signals_block)
+        self.assertIn("2009-02-13 23:30:00 UTC", signals_block)
+        self.assertIn("2188", signals_block)
         self.assertIn("28.9/35.0", signals_block)
         self.assertIn("buy:ok", signals_block)
-        self.assertIn("ETH-USDC", signals_block)
+        self.assertIn("monitoring", signals_block)
 
-        # PLANS section owns the per-controller exit/entry plan detail.
-        plans_block = status.split("\nPLANS\n", 1)[1]
+        # PLANS section owns the per-controller exit/entry decision detail and compact inventory scale.
+        plans_block = status.split(f"\n{self.PLANS_TITLE}\n", 1)[1]
         self.assertIn("ENTRIES", plans_block)
         self.assertIn("rsi≤35.00", plans_block)
         self.assertIn("scout $25.00 (35%)", plans_block)
         self.assertIn("runner $46.00 (65%)", plans_block)
+        self.assertIn("inventory", plans_block)
         self.assertIn("idle $1303.42", plans_block)
 
         # Legacy columns are gone (no verbose breakeven / u% in any controller-summary table).
@@ -656,7 +668,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         status = self.strategy.format_status()
 
-        # Focus information is now a column inside CONTROLLERS SUMMARY, not a separate
+        # Focus information is now a column inside SIGNALS, not a separate
         # standalone "Focus Queue (attention):" block. The dashboard runtime-status
         # parser falls back to the column when the bullet list is absent.
         self.assertNotIn("Focus Queue (attention):", status)
@@ -752,9 +764,12 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         self.assertIn("POSITIONS HELD (2)", status)
         self.assertEqual(status.count("POSITIONS HELD"), 1)
-        self.assertIn("ETH-USDC", status)
-        self.assertIn("BTC-USDC", status)
-        self.assertIn("breakeven", status)
+        positions_block = status.split("POSITIONS HELD (2)", 1)[1].split("\n\nController:", 1)[0]
+        self.assertIn("ETH-USDC", positions_block)
+        self.assertIn("BTC-USDC", positions_block)
+        self.assertIn("breakeven", positions_block)
+        self.assertNotIn("controller", positions_block)
+        self.assertNotIn("side", positions_block)
         self.assertNotIn("No positions held.", status)
 
     def test_format_status_keeps_controller_sections_in_stable_pair_order(self):
@@ -873,7 +888,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("🏷 Refs OID-1, OID-2", status)
 
     def test_format_status_suppresses_empty_per_controller_block(self):
-        """Per-controller ``=== Controller: ... ===`` block disappears when
+        """Per-controller section disappears when
         ``to_format_status()`` returns ``[]`` and the controller has no active
         executor needing a runtime line — preventing 4 lines of pure noise per
         controller in the operator console (RSIv5Controller is the canonical
@@ -911,6 +926,12 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             "plan_next": "arm 2341.16 (+6.83%)",
             "plan_slice": "15% ≈ 0.0017 ETH ($3.97)",
             "plan_liquidity": "sellable 0.0114 ETH · idle $0.00",
+            "plan_sellable": "0.0114 ETH",
+            "plan_held": "$25",
+            "plan_active": "$0",
+            "plan_untracked": "$0",
+            "plan_free": "$0",
+            "plan_managed": "$25",
         }
         self.strategy.controllers = {"controller_1": controller_mock}
         self.strategy.controller_reports = {
@@ -924,14 +945,24 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         status = self.strategy.format_status()
 
         self.assertNotIn("Controller: controller_1", status)
-        self.assertIn("\nCONTROLLERS\n", status)
-        self.assertIn("\nSIGNALS\n", status)
-        self.assertIn("\nPLANS\n", status)
-        # Plan information lives in the parent PLANS table, not in a per-controller block.
-        plans_block = status.split("\nPLANS\n", 1)[1]
+        self.assertNotIn(f"\n{self.CONTROLLERS_TITLE}\n", status)
+        self.assertIn(f"\n{self.SIGNALS_TITLE}\n", status)
+        self.assertIn(f"\n{self.PLANS_TITLE}\n", status)
+        self.assertNotIn(f"\n{self.INVENTORY_TITLE}\n", status)
+        self.assert_no_status_separator_blocks(status)
+        # Plan and inventory information live in the parent PLANS table, not in a per-controller block.
+        plans_block = status.split(f"\n{self.PLANS_TITLE}\n", 1)[1]
         self.assertIn("EXITS", plans_block)
         self.assertIn("min 2192.38 (+0.04%)", plans_block)
         self.assertIn("arm 2341.16 (+6.83%)", plans_block)
+        self.assertIn("15% ≈ 0.0017 ETH ($3.97)", plans_block)
+        self.assertIn("inventory", plans_block)
+        self.assertIn("sell 0.0114 ETH", plans_block)
+        self.assertIn("bag $25", plans_block)
+        self.assertNotIn("sellable", plans_block)
+        self.assertNotIn("active buys$", plans_block)
+        self.assertNotIn("frees$", plans_block)
+        self.assertNotIn("managed$", plans_block)
 
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()

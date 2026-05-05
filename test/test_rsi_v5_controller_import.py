@@ -102,6 +102,42 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertEqual(list(result["close"]), [Decimal("100"), Decimal("101")])
         self.assertIsNot(result, candles)
 
+    def test_rsi_v5_update_processed_data_marks_stale_candles_unhealthy_and_suppresses_signal(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        stale_last_ts = 700.0
+        candles = pd.DataFrame(
+            {
+                "timestamp": [stale_last_ts - (59 - idx) * 60 for idx in range(60)],
+                "open": [100 + idx * 0.01 for idx in range(60)],
+                "high": [101 + idx * 0.01 for idx in range(60)],
+                "low": [99 + idx * 0.01 for idx in range(60)],
+                "close": [100 + idx * 0.01 for idx in range(60)],
+                "volume": [10 for _ in range(60)],
+            }
+        )
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1000.0
+        market_data_provider.get_candles_df.return_value = candles
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                interval="1m",
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+
+        asyncio.run(controller.update_processed_data())
+
+        self.assertEqual(controller.processed_data["signal"], 0)
+        self.assertFalse(controller.processed_data["data_health"]["ready"])
+        self.assertEqual(controller.processed_data["data_health"]["reason"], "stale_candle")
+
     def test_rsi_v5_operator_entry_pause_sets_state_without_explicit_timestamp(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
@@ -422,6 +458,66 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertAlmostEqual(controller._get_position_utilization(), 27.5 / 40.0, places=6)
         self.assertFalse(controller.can_create_executor(1))
         self.assertEqual(controller._last_gate_reason[TradeType.BUY], "max_position")
+
+    def test_rsi_v5_buy_gate_uses_available_quote_balance_and_blocks_zero(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1000.0
+        market_data_provider.get_price_by_type.return_value = Decimal("100")
+        market_data_provider.get_balance.return_value = Decimal("1000")
+        market_data_provider.get_available_balance.side_effect = lambda connector, asset: (
+            Decimal("0") if asset == "USDT" else Decimal("1000")
+        )
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                usd_per_entry=Decimal("20"),
+                max_total_position_usd=Decimal("500"),
+                dynamic_position_sizing=False,
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.processed_data = {"signal_state": {"condition_ok": True, "size_multiplier": 1.0}}
+
+        self.assertFalse(controller.can_create_executor(1))
+        self.assertEqual(controller._last_gate_reason[TradeType.BUY], "balance_low")
+
+    def test_rsi_v5_sellable_inventory_uses_available_base_balance_and_blocks_zero(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.get_balance.return_value = Decimal("1")
+        market_data_provider.get_available_balance.side_effect = lambda connector, asset: (
+            Decimal("0") if asset == "BNB" else Decimal("1000")
+        )
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                side=TradeType.BUY,
+                amount=Decimal("1"),
+                breakeven_price=Decimal("100"),
+            )
+        ]
+
+        self.assertEqual(controller._get_sellable_inventory_amount(), Decimal("0"))
 
     def test_rsi_v5_buy_gate_reuses_price_gap_against_held_avg_entry(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
@@ -1024,6 +1120,54 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         debug_messages = [call.args[0] for call in mock_logger.return_value.debug.call_args_list]
         self.assertTrue(any("SELL not ready" in message and "reason=need-profit" in message for message in debug_messages))
 
+    def test_rsi_v5_sell_profit_gate_accounts_for_position_fees(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1710785880.0
+        market_data_provider.get_price_by_type.return_value = Decimal("100.25")
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                sell_only_if_profitable=True,
+                min_profit_pct_for_sell=Decimal("0.002"),
+                trend_confirmation_enabled=False,
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                side=TradeType.BUY,
+                amount=Decimal("1"),
+                breakeven_price=Decimal("100"),
+                cum_fees_quote=Decimal("0.10"),
+            )
+        ]
+
+        signal = controller._determine_signal(
+            last_rsi=82.0,
+            signal_score=0,
+            rsi_buy_eff=35.0,
+            rsi_sell_eff=74.0,
+            last_close=Decimal("100.25"),
+            rsi_prev=82.2,
+            ema_fast=101.0,
+            macd_hist=0.9,
+            macd_hist_prev=1.1,
+            raw_buy_reversal=False,
+            signal_timestamp=1710785880.0,
+            candle_timestamp=1710785880.0,
+        )
+
+        self.assertEqual(signal, 0)
+
     def test_rsi_v5_direct_sell_requires_held_inventory_not_only_active_buy_executor(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
@@ -1401,11 +1545,65 @@ class RSIv5ControllerImportTest(unittest.TestCase):
                 close_timestamp=1234567850.0,
                 filled_amount_quote=Decimal("104.80"),
                 custom_info={"level_id": "signal_exit", "order_price": Decimal("105.00")},
+            ),
+            SimpleNamespace(
+                is_active=True,
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                side=TradeType.BUY,
+                timestamp=1234567800.0,
+                close_timestamp=1234567850.0,
+                filled_amount_quote=Decimal("104.80"),
+                custom_info={"level_id": "scout", "order_price": Decimal("105.00")},
             )
         ]
 
         self.assertEqual(controller._last_same_side_ref_price(TradeType.SELL), Decimal("105.00"))
         self.assertFalse(controller._has_sufficient_price_gap(TradeType.SELL, Decimal("105.20")))
+
+    def test_rsi_v5_sell_gap_uses_dedicated_one_percent_threshold(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                executor_price_gap_threshold=Decimal("0.02"),
+                sell_executor_price_gap_threshold=Decimal("0.01"),
+                use_adaptive_filters=False,
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.executors_info = [
+            SimpleNamespace(
+                is_active=False,
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                side=TradeType.SELL,
+                timestamp=1234567800.0,
+                close_timestamp=1234567850.0,
+                filled_amount_quote=Decimal("104.80"),
+                custom_info={"level_id": "signal_exit", "order_price": Decimal("105.00")},
+            ),
+            SimpleNamespace(
+                is_active=True,
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                side=TradeType.BUY,
+                timestamp=1234567800.0,
+                close_timestamp=1234567850.0,
+                filled_amount_quote=Decimal("104.80"),
+                custom_info={"level_id": "scout", "order_price": Decimal("105.00")},
+            )
+        ]
+
+        self.assertTrue(controller._has_sufficient_price_gap(TradeType.SELL, Decimal("106.06")))
+        self.assertFalse(controller._has_sufficient_price_gap(TradeType.BUY, Decimal("106.06")))
 
     def test_rsi_v5_recovery_sell_is_blocked_when_last_filled_sell_is_within_gap(self):
         from controllers.directional_trading.rsi_v5 import RecoveryTrailState, RSIv5Controller, RSIv5ControllerConfig
@@ -1614,6 +1812,38 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         actions = controller.stop_actions_proposal()
 
         self.assertEqual(actions, [])
+
+    def test_rsi_v5_consecutive_loss_tracking_is_idempotent_across_refreshed_executor_reports(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1234567890.0
+        market_data_provider.get_price_by_type.return_value = Decimal("100")
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                use_bag_freeze=False,
+                early_stop_drawdown_pct=Decimal("0"),
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.processed_data = {"signal": 0, "signal_state": {}}
+        controller.executors_info = [
+            SimpleNamespace(id="loss-1", is_active=False, net_pnl_quote=Decimal("-1"))
+        ]
+        controller.stop_actions_proposal()
+
+        controller.executors_info = [
+            SimpleNamespace(id="loss-1", is_active=False, net_pnl_quote=Decimal("-1"))
+        ]
+        controller.stop_actions_proposal()
+
+        self.assertEqual(controller._consecutive_losses, 1)
 
     def test_rsi_v5_recovery_trail_arms_then_exits_on_pullback(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
@@ -2033,8 +2263,16 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertIn("partial-done", summary["plan_next"])
         self.assertIn("50%", summary["plan_slice"])
         self.assertIn("ETH ($8.67)", summary["plan_slice"])
-        self.assertIn("sellable 0.0060/0.0079 ETH", summary["plan_liquidity"])
-        self.assertIn("idle $0.00", summary["plan_liquidity"])
+        self.assertIn("sell 0.0060/0.0079 ETH", summary["plan_liquidity"])
+        self.assertIn("H$17", summary["plan_liquidity"])
+        self.assertIn("A$80", summary["plan_liquidity"])
+        self.assertIn("U$0", summary["plan_liquidity"])
+        self.assertEqual("0.0060/0.0079 ETH", summary["plan_sellable"])
+        self.assertEqual("$17", summary["plan_held"])
+        self.assertEqual("$80", summary["plan_active"])
+        self.assertEqual("$0", summary["plan_untracked"])
+        self.assertEqual("$0", summary["plan_free"])
+        self.assertEqual("$97", summary["plan_managed"])
 
         # Plan strings must not leak any legacy operator-console emoji / keys.
         plan_blob = " ".join(

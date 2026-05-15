@@ -19,7 +19,7 @@ Key Features:
 import logging
 import time as _time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
@@ -1503,7 +1503,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if numeric != numeric or numeric in (float("inf"), float("-inf")):
             return "n/a"
         try:
-            return datetime.fromtimestamp(numeric).strftime("%H:%M:%S")
+            return datetime.fromtimestamp(numeric, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         except (OSError, OverflowError, ValueError):
             return "n/a"
 

@@ -519,13 +519,13 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertEqual(controller._get_sellable_inventory_amount(), Decimal("0"))
 
-    def test_rsi_v5_buy_gate_reuses_price_gap_against_held_avg_entry(self):
+    def test_rsi_v5_buy_gate_blocks_only_inside_avg_entry_gap_band(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
         market_data_provider = MagicMock()
         market_data_provider.initialize_rate_sources.return_value = None
         market_data_provider.time.return_value = 1000.0
-        market_data_provider.get_price_by_type.return_value = Decimal("99")
+        market_data_provider.get_price_by_type.return_value = Decimal("101")
         market_data_provider.get_balance.return_value = Decimal("1000")
         market_data_provider.get_trading_rules.return_value = SimpleNamespace()
 
@@ -556,6 +556,11 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertFalse(controller.can_create_executor(1))
         self.assertEqual(controller._last_gate_reason[TradeType.BUY], "avg_entry_gap")
+
+        market_data_provider.get_price_by_type.return_value = Decimal("102")
+
+        self.assertTrue(controller.can_create_executor(1))
+        self.assertEqual(controller._last_gate_reason[TradeType.BUY], "ready")
 
         market_data_provider.get_price_by_type.return_value = Decimal("98")
 

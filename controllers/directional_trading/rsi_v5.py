@@ -19,7 +19,7 @@ Key Features:
 import logging
 import time as _time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
@@ -1503,7 +1503,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if numeric != numeric or numeric in (float("inf"), float("-inf")):
             return "n/a"
         try:
-            return datetime.fromtimestamp(numeric, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            return datetime.fromtimestamp(numeric).strftime("%H:%M:%S")
         except (OSError, OverflowError, ValueError):
             return "n/a"
 
@@ -2354,8 +2354,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         avg_entry = self._get_position_cost_basis()
         if avg_entry is None or avg_entry <= 0:
             return True
-        max_buy_price = avg_entry * (Decimal("1") - gap_thr)
-        return new_price <= max_buy_price
+        pct_gap = abs(new_price - avg_entry) / avg_entry
+        return pct_gap >= gap_thr
 
     def _last_same_side_ref_price(self, side: TradeType) -> Optional[Decimal]:
         if side == TradeType.SELL:

@@ -141,6 +141,8 @@ class TelegramNotifier(NotifierBase):
             self._kv("Fee", fee_text, "🧾"),
             self._kv("Status", "filled", "✅"),
         ]
+        if side == "SELL":
+            lines[-1:-1] = self._pair_pnl_lines(self._pair_performance_context(event.trading_pair))
         return "\n".join(lines)
 
     def _format_order_completed_message(self, side: str, event) -> str:
@@ -165,15 +167,8 @@ class TelegramNotifier(NotifierBase):
             lines.insert(-1, self._kv("Fee", f"{self._format_decimal(fee_quote)} {event.quote_asset}", "🧾"))
         if net_quote is not None:
             lines.insert(-1, self._kv("Net Quote", f"{self._format_decimal(net_quote)} {event.quote_asset}", "💵"))
-        if side == "SELL" and pair_performance is not None:
-            lines.insert(
-                -1,
-                self._kv("Pair Realized PnL", f"${self._format_number(pair_performance['realized_pnl_quote'], 2)}", "📈"),
-            )
-            lines.insert(
-                -1,
-                self._kv("Pair Global PnL", f"${self._format_number(pair_performance['global_pnl_quote'], 2)}", "💹"),
-            )
+        if side == "SELL":
+            lines[-1:-1] = self._pair_pnl_lines(pair_performance)
         return "\n".join(lines)
 
     def _format_order_failed_message(self, event: events.MarketOrderFailureEvent) -> str:
@@ -657,6 +652,14 @@ class TelegramNotifier(NotifierBase):
                 "global_pnl_quote": Decimal(str(getattr(performance, "global_pnl_quote", 0))),
             }
         return None
+
+    def _pair_pnl_lines(self, pair_performance: Optional[Dict[str, Decimal]]) -> List[str]:
+        if pair_performance is None:
+            return []
+        return [
+            self._kv("Pair Realized PnL", f"${self._format_number(pair_performance['realized_pnl_quote'], 2)}", "📈"),
+            self._kv("Pair Global PnL", f"${self._format_number(pair_performance['global_pnl_quote'], 2)}", "💹"),
+        ]
 
     def _order_completion_context(self, order_id: str, base_asset: str, quote_asset: str) -> Dict[str, Any]:
         trading_pair = f"{base_asset}-{quote_asset}"

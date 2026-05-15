@@ -61,6 +61,33 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("🏦 Exchange Order ID:", message)
         self.assertNotIn("🔁 Exchange Trade ID:", message)
 
+    def test_format_sell_filled_message_includes_pair_pnl_context(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._pair_performance_context = Mock(return_value={
+            "realized_pnl_quote": Decimal("8.91"),
+            "global_pnl_quote": Decimal("10.12"),
+        })
+        event = events.OrderFilledEvent(
+            timestamp=1712745600,
+            order_id="OID-SELL-FILL-1",
+            trading_pair="ETH-USDC",
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("2144.82"),
+            amount=Decimal("0.0342"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.21"))]),
+            exchange_trade_id="TID-SELL-1",
+            exchange_order_id="EX-SELL-1",
+        )
+
+        message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
+
+        notifier._pair_performance_context.assert_called_once_with("ETH-USDC")
+        self.assertIn("🔴 SELL FILLED", message)
+        self.assertIn("📈 Pair Realized PnL: $8.91", message)
+        self.assertIn("💹 Pair Global PnL: $10.12", message)
+        self.assertIn("✅ Status: filled", message)
+
     def test_format_sell_completed_message_includes_fee_and_pair_pnl_context(self):
         notifier = TelegramNotifier(self.hb_app)
         notifier._order_completion_context = Mock(return_value={

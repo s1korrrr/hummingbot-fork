@@ -142,18 +142,23 @@ class TelegramNotifier(NotifierBase):
             self._kv("Status", "filled", "✅"),
         ]
         if side == "SELL":
-            lines[-1:-1] = self._pair_pnl_lines(self._pair_performance_context(event.trading_pair))
+            lines[-1:-1] = self._trade_realized_pnl_lines(self._sell_fill_realized_pnl_quote(event))
         return "\n".join(lines)
 
     def _format_order_completed_message(self, side: str, event) -> str:
         average_price = Decimal("0")
         if event.base_asset_amount != Decimal("0"):
             average_price = event.quote_asset_amount / event.base_asset_amount
-        context = self._order_completion_context(event.order_id, event.base_asset, event.quote_asset)
+        context = self._order_completion_context(
+            event.order_id,
+            event.base_asset,
+            event.quote_asset,
+            include_trade_realized_pnl=side == "SELL",
+        )
         trading_pair = context["trading_pair"]
         fee_quote = context["fee_quote"]
         net_quote = event.quote_asset_amount - fee_quote if fee_quote is not None else None
-        pair_performance = context["pair_performance"]
+        trade_realized_pnl_quote = context.get("trade_realized_pnl_quote")
         lines = [
             self._title("🟢" if side == "BUY" else "🔴", f"{side} COMPLETED"),
             self._kv("Pair", f"{self._pair_marker(trading_pair)} {trading_pair}", "📍"),
@@ -168,7 +173,7 @@ class TelegramNotifier(NotifierBase):
         if net_quote is not None:
             lines.insert(-1, self._kv("Net Quote", f"{self._format_decimal(net_quote)} {event.quote_asset}", "💵"))
         if side == "SELL":
-            lines[-1:-1] = self._pair_pnl_lines(pair_performance)
+            lines[-1:-1] = self._trade_realized_pnl_lines(trade_realized_pnl_quote)
         return "\n".join(lines)
 
     def _format_order_failed_message(self, event: events.MarketOrderFailureEvent) -> str:
@@ -630,6 +635,36 @@ class TelegramNotifier(NotifierBase):
                 .all()
             )
 
+    def _fills_for_pair(
+        self,
+        trading_pair: str,
+        *,
+        market: Optional[str],
+        end_timestamp: Optional[Decimal] = None,
+    ) -> List[TradeFill]:
+        if not market:
+            return []
+        recorder = self._markets_recorder()
+        if recorder is None:
+            return []
+        config_file_path = getattr(recorder, "config_file_path", None)
+        if not config_file_path:
+            return []
+        filters = [
+            TradeFill.config_file_path == config_file_path,
+            TradeFill.market == market,
+            TradeFill.symbol == trading_pair,
+        ]
+        if end_timestamp is not None:
+            filters.append(TradeFill.timestamp <= end_timestamp)
+        with recorder.sql_manager.get_new_session() as session:
+            return (
+                session.query(TradeFill)
+                .filter(*filters)
+                .order_by(TradeFill.timestamp.asc())
+                .all()
+            )
+
     def _pair_performance_context(self, trading_pair: str) -> Optional[Dict[str, Decimal]]:
         strategy = self._current_strategy()
         if strategy is None or not hasattr(strategy, "_build_controller_status_entries"):
@@ -661,18 +696,171 @@ class TelegramNotifier(NotifierBase):
             self._kv("Pair Global PnL", f"${self._format_number(pair_performance['global_pnl_quote'], 2)}", "💹"),
         ]
 
-    def _order_completion_context(self, order_id: str, base_asset: str, quote_asset: str) -> Dict[str, Any]:
+    def _trade_realized_pnl_lines(self, realized_pnl_quote: Optional[Decimal]) -> List[str]:
+        if realized_pnl_quote is None:
+            return []
+        return [
+            self._kv("Trade Realized PnL", f"${self._format_number(realized_pnl_quote, 2)}", "📈"),
+        ]
+
+    @staticmethod
+    def _normalized_fill_timestamp(timestamp: Any) -> Decimal:
+        try:
+            value = Decimal(str(timestamp or 0))
+        except Exception:
+            return Decimal("0")
+        return value * Decimal("1000") if value and value < Decimal("100000000000") else value
+
+    def _sell_fill_realized_pnl_quote(self, event: events.OrderFilledEvent) -> Optional[Decimal]:
+        order = self._order_record(event.order_id)
+        market = getattr(order, "market", None)
+        if not market or not event.exchange_trade_id:
+            return None
+        event_timestamp = self._normalized_fill_timestamp(event.timestamp)
+        fee_quote = self._fee_quote_from_trade_fee(
+            event.trade_fee,
+            event.trading_pair,
+            event.price,
+            event.amount,
+        )
+        current_fill = {
+            "order_id": event.order_id,
+            "exchange_trade_id": event.exchange_trade_id,
+            "trade_type": "SELL",
+            "price": event.price,
+            "amount": event.amount,
+            "trade_fee_in_quote": fee_quote,
+            "timestamp": event_timestamp,
+        }
+        return self._trade_realized_pnl_from_sell_fills(
+            sell_fills=[current_fill],
+            inventory_fills=self._fills_for_pair(event.trading_pair, market=market, end_timestamp=event_timestamp),
+            current_order_id=None,
+            current_trade_id=event.exchange_trade_id,
+        )
+
+    def _sell_order_realized_pnl_quote(self, order_id: str, trading_pair: str, *, market: Optional[str]) -> Optional[Decimal]:
+        sell_fills = [
+            fill for fill in self._fills_for_order(order_id)
+            if self._trade_fill_side(fill) == "SELL"
+        ]
+        if not sell_fills or not market:
+            return None
+        end_timestamp = max(self._normalized_fill_timestamp(getattr(fill, "timestamp", 0)) for fill in sell_fills)
+        return self._trade_realized_pnl_from_sell_fills(
+            sell_fills=sell_fills,
+            inventory_fills=self._fills_for_pair(trading_pair, market=market, end_timestamp=end_timestamp),
+            current_order_id=order_id,
+        )
+
+    @staticmethod
+    def _trade_fill_side(fill: Any) -> str:
+        value = fill.get("trade_type") if isinstance(fill, dict) else getattr(fill, "trade_type", None)
+        if hasattr(value, "name"):
+            return str(value.name).upper()
+        return str(value or "").upper()
+
+    def _trade_realized_pnl_from_sell_fills(
+        self,
+        *,
+        sell_fills: List[Any],
+        inventory_fills: List[Any],
+        current_order_id: Optional[str] = None,
+        current_trade_id: Optional[str] = None,
+    ) -> Optional[Decimal]:
+        lots: List[Dict[str, Decimal]] = []
+
+        def decimal_attr(fill: Any, name: str, default: Decimal = Decimal("0")) -> Decimal:
+            value = fill.get(name, default) if isinstance(fill, dict) else getattr(fill, name, default)
+            if value is None:
+                return default
+            try:
+                return Decimal(str(value))
+            except Exception:
+                return default
+
+        def string_attr(fill: Any, name: str) -> str:
+            value = fill.get(name) if isinstance(fill, dict) else getattr(fill, name, None)
+            if hasattr(value, "name"):
+                return str(value.name)
+            return str(value or "")
+
+        def consume(amount: Decimal) -> Optional[Decimal]:
+            remaining = amount
+            cost = Decimal("0")
+            while remaining > 0 and lots:
+                lot = lots[0]
+                matched = min(remaining, lot["amount"])
+                cost += matched * lot["cost_per_base"]
+                lot["amount"] -= matched
+                remaining -= matched
+                if lot["amount"] <= 0:
+                    lots.pop(0)
+            if remaining > 0:
+                return None
+            return cost
+
+        for fill in sorted(inventory_fills, key=lambda item: decimal_attr(item, "timestamp")):
+            order_id = string_attr(fill, "order_id")
+            trade_id = string_attr(fill, "exchange_trade_id")
+            if current_order_id is not None and order_id == current_order_id:
+                continue
+            if current_trade_id is not None and trade_id == current_trade_id:
+                continue
+
+            amount = decimal_attr(fill, "amount")
+            price = decimal_attr(fill, "price")
+            if amount <= 0 or price <= 0:
+                continue
+
+            trade_type = string_attr(fill, "trade_type").upper()
+            if trade_type == "BUY":
+                fee_quote = decimal_attr(fill, "trade_fee_in_quote")
+                lots.append({"amount": amount, "cost_per_base": ((price * amount) + fee_quote) / amount})
+            elif trade_type == "SELL" and consume(amount) is None:
+                return None
+
+        realized_pnl = Decimal("0")
+        matched_any = False
+        for fill in sorted(sell_fills, key=lambda item: decimal_attr(item, "timestamp")):
+            amount = decimal_attr(fill, "amount")
+            price = decimal_attr(fill, "price")
+            if amount <= 0 or price <= 0:
+                continue
+            cost = consume(amount)
+            if cost is None:
+                return None
+            sell_fee_quote = decimal_attr(fill, "trade_fee_in_quote")
+            realized_pnl += (price * amount) - cost - sell_fee_quote
+            matched_any = True
+
+        return realized_pnl if matched_any else None
+
+    def _order_completion_context(
+        self,
+        order_id: str,
+        base_asset: str,
+        quote_asset: str,
+        *,
+        include_trade_realized_pnl: bool = False,
+    ) -> Dict[str, Any]:
         trading_pair = f"{base_asset}-{quote_asset}"
         order = self._order_record(order_id)
         if order is not None and getattr(order, "symbol", None):
-            trading_pair = order.symbol
+            trading_pair = str(order.symbol)
         fills = self._fills_for_order(order_id)
         fee_quote = sum((Decimal(str(fill.trade_fee_in_quote or 0)) for fill in fills), Decimal("0")) if fills else None
-        return {
+        context = {
             "trading_pair": trading_pair,
             "fee_quote": fee_quote,
-            "pair_performance": self._pair_performance_context(trading_pair),
         }
+        if include_trade_realized_pnl:
+            context["trade_realized_pnl_quote"] = self._sell_order_realized_pnl_quote(
+                order_id,
+                trading_pair,
+                market=getattr(order, "market", None),
+            )
+        return context
 
     def _recent_orders(self, limit: int) -> List[Order]:
         recorder = self._markets_recorder()
@@ -705,6 +893,25 @@ class TelegramNotifier(NotifierBase):
             return MarketsRecorder.get_instance()
         except Exception:
             return None
+
+    @classmethod
+    def _fee_quote_from_trade_fee(
+        cls,
+        trade_fee: TradeFeeBase,
+        trading_pair: str,
+        price: Decimal,
+        amount: Decimal,
+    ) -> Decimal:
+        _, quote_asset = split_hb_trading_pair(trading_pair)
+        try:
+            return Decimal(str(trade_fee.fee_amount_in_token(
+                trading_pair=trading_pair,
+                price=price,
+                order_amount=amount,
+                token=quote_asset,
+            )))
+        except Exception:
+            return Decimal("0")
 
     @classmethod
     def _format_number(cls, value: Any, decimals: int) -> str:

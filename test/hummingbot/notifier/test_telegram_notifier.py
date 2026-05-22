@@ -61,12 +61,9 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("🏦 Exchange Order ID:", message)
         self.assertNotIn("🔁 Exchange Trade ID:", message)
 
-    def test_format_sell_filled_message_includes_pair_pnl_context(self):
+    def test_format_sell_filled_message_includes_trade_realized_pnl_context(self):
         notifier = TelegramNotifier(self.hb_app)
-        notifier._pair_performance_context = Mock(return_value={
-            "realized_pnl_quote": Decimal("8.91"),
-            "global_pnl_quote": Decimal("10.12"),
-        })
+        notifier._sell_fill_realized_pnl_quote = Mock(return_value=Decimal("8.91"))
         event = events.OrderFilledEvent(
             timestamp=1712745600,
             order_id="OID-SELL-FILL-1",
@@ -82,21 +79,19 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
 
         message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
 
-        notifier._pair_performance_context.assert_called_once_with("ETH-USDC")
+        notifier._sell_fill_realized_pnl_quote.assert_called_once_with(event)
         self.assertIn("🔴 SELL FILLED", message)
-        self.assertIn("📈 Pair Realized PnL: $8.91", message)
-        self.assertIn("💹 Pair Global PnL: $10.12", message)
+        self.assertIn("📈 Trade Realized PnL: $8.91", message)
+        self.assertNotIn("Pair Realized PnL", message)
+        self.assertNotIn("Pair Global PnL", message)
         self.assertIn("✅ Status: filled", message)
 
-    def test_format_sell_completed_message_includes_fee_and_pair_pnl_context(self):
+    def test_format_sell_completed_message_includes_fee_and_trade_realized_pnl_context(self):
         notifier = TelegramNotifier(self.hb_app)
         notifier._order_completion_context = Mock(return_value={
             "trading_pair": "ETH-USDC",
             "fee_quote": Decimal("0.21"),
-            "pair_performance": {
-                "realized_pnl_quote": Decimal("12.34"),
-                "global_pnl_quote": Decimal("15.67"),
-            },
+            "trade_realized_pnl_quote": Decimal("12.34"),
         })
         event = events.SellOrderCompletedEvent(
             timestamp=1712745600,
@@ -117,9 +112,171 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("💰 Gross Quote: 73.352844 USDC", message)
         self.assertIn("🧾 Fee: 0.21 USDC", message)
         self.assertIn("💵 Net Quote: 73.142844 USDC", message)
-        self.assertIn("📈 Pair Realized PnL: $12.34", message)
-        self.assertIn("💹 Pair Global PnL: $15.67", message)
+        self.assertIn("📈 Trade Realized PnL: $12.34", message)
+        self.assertNotIn("Pair Realized PnL", message)
+        self.assertNotIn("Pair Global PnL", message)
         self.assertIn("✅ Status: completed", message)
+
+    def test_trade_realized_pnl_uses_fifo_basis_for_current_sell_order_only(self):
+        notifier = TelegramNotifier(self.hb_app)
+        fills = [
+            SimpleNamespace(order_id="BUY-1", trade_type="BUY", price=Decimal("100"), amount=Decimal("1"), trade_fee_in_quote=Decimal("0.10"), timestamp=1),
+            SimpleNamespace(order_id="BUY-2", trade_type="BUY", price=Decimal("110"), amount=Decimal("1"), trade_fee_in_quote=Decimal("0.20"), timestamp=2),
+            SimpleNamespace(order_id="SELL-PRIOR", trade_type="SELL", price=Decimal("120"), amount=Decimal("0.5"), trade_fee_in_quote=Decimal("0.05"), timestamp=3),
+            SimpleNamespace(order_id="SELL-CURRENT", trade_type="SELL", price=Decimal("130"), amount=Decimal("0.75"), trade_fee_in_quote=Decimal("0.075"), timestamp=4),
+        ]
+
+        realized_pnl = notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[fills[-1]],
+            inventory_fills=fills,
+            current_order_id="SELL-CURRENT",
+        )
+
+        self.assertEqual(Decimal("19.825"), realized_pnl)
+
+    def test_sell_fill_realized_pnl_requires_exchange_trade_id_for_partial_fill_safety(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._order_record = Mock(return_value=SimpleNamespace(market="binance_paper_trade"))
+        notifier._fills_for_pair = Mock()
+        event = events.OrderFilledEvent(
+            timestamp=1712745600,
+            order_id="OID-SELL-FILL-NO-TRADE-ID",
+            trading_pair="ETH-USDC",
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("2200"),
+            amount=Decimal("0.01"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.1"))]),
+            exchange_trade_id="",
+        )
+
+        self.assertIsNone(notifier._sell_fill_realized_pnl_quote(event))
+        notifier._fills_for_pair.assert_not_called()
+
+    def test_sell_order_realized_pnl_scopes_inventory_by_market_and_sell_timestamp(self):
+        notifier = TelegramNotifier(self.hb_app)
+        sell_fill = SimpleNamespace(order_id="SELL-CURRENT", trade_type="SELL", price=Decimal("130"), amount=Decimal("0.75"), trade_fee_in_quote=Decimal("0.075"), timestamp=4_000_000_000_000)
+        notifier._fills_for_order = Mock(return_value=[sell_fill])
+        notifier._fills_for_pair = Mock(return_value=[
+            SimpleNamespace(order_id="BUY-1", trade_type="BUY", price=Decimal("100"), amount=Decimal("1"), trade_fee_in_quote=Decimal("0.10"), timestamp=1_000_000_000_000),
+        ])
+
+        realized_pnl = notifier._sell_order_realized_pnl_quote("SELL-CURRENT", "ETH-USDC", market="binance_paper_trade")
+
+        notifier._fills_for_pair.assert_called_once_with(
+            "ETH-USDC",
+            market="binance_paper_trade",
+            end_timestamp=Decimal("4000000000000"),
+        )
+        self.assertEqual(Decimal("22.35"), realized_pnl)
+
+    def test_sell_order_realized_pnl_omits_authoritative_value_without_market_scope(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._fills_for_order = Mock(return_value=[
+            SimpleNamespace(order_id="SELL-CURRENT", trade_type="SELL", price=Decimal("130"), amount=Decimal("0.75"), trade_fee_in_quote=Decimal("0.075"), timestamp=4_000),
+        ])
+        notifier._fills_for_pair = Mock()
+
+        self.assertIsNone(notifier._sell_order_realized_pnl_quote("SELL-CURRENT", "ETH-USDC", market=None))
+        notifier._fills_for_pair.assert_not_called()
+
+    def test_trade_realized_helpers_cover_fail_closed_edges(self):
+        notifier = TelegramNotifier(self.hb_app)
+
+        self.assertEqual([], notifier._trade_realized_pnl_lines(None))
+        self.assertEqual(Decimal("1712745600000"), notifier._normalized_fill_timestamp(1712745600))
+        self.assertEqual(Decimal("0"), notifier._normalized_fill_timestamp(object()))
+        self.assertEqual("SELL", notifier._trade_fill_side({"trade_type": TradeType.SELL}))
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[{"trade_type": "SELL", "price": Decimal("130"), "amount": Decimal("2"), "timestamp": 2}],
+            inventory_fills=[{"trade_type": "BUY", "price": Decimal("100"), "amount": Decimal("1"), "timestamp": 1}],
+        ))
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[{"trade_type": "SELL", "price": Decimal("0"), "amount": Decimal("1"), "timestamp": 2}],
+            inventory_fills=[{"trade_type": "BUY", "price": Decimal("100"), "amount": Decimal("1"), "timestamp": 1}],
+        ))
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[{"trade_type": "SELL", "price": Decimal("130"), "amount": Decimal("1"), "timestamp": 2}],
+            inventory_fills=[{"trade_type": "SELL", "price": Decimal("120"), "amount": Decimal("1"), "timestamp": 1}],
+        ))
+
+    def test_fills_for_pair_scopes_query_and_fails_closed_without_scope(self):
+        notifier = TelegramNotifier(self.hb_app)
+        self.assertEqual([], notifier._fills_for_pair("ETH-USDC", market=None))
+
+        notifier._markets_recorder = Mock(return_value=None)
+        self.assertEqual([], notifier._fills_for_pair("ETH-USDC", market="binance"))
+
+        recorder_without_config = SimpleNamespace(config_file_path="")
+        notifier._markets_recorder = Mock(return_value=recorder_without_config)
+        self.assertEqual([], notifier._fills_for_pair("ETH-USDC", market="binance"))
+
+        query = Mock()
+        query.filter.return_value = query
+        query.order_by.return_value = query
+        query.all.return_value = ["fill"]
+        session = Mock()
+        session.query.return_value = query
+        session_scope = Mock()
+        session_scope.__enter__ = Mock(return_value=session)
+        session_scope.__exit__ = Mock(return_value=None)
+        recorder = SimpleNamespace(
+            config_file_path="conf.yml",
+            sql_manager=SimpleNamespace(get_new_session=Mock(return_value=session_scope)),
+        )
+        notifier._markets_recorder = Mock(return_value=recorder)
+
+        fills = notifier._fills_for_pair("ETH-USDC", market="binance", end_timestamp=Decimal("123"))
+
+        self.assertEqual(["fill"], fills)
+        session.query.assert_called_once()
+        query.filter.assert_called_once()
+        query.order_by.assert_called_once()
+        query.all.assert_called_once()
+
+    def test_sell_fill_realized_pnl_uses_scoped_inventory_and_quote_fee(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._order_record = Mock(return_value=SimpleNamespace(market="binance_paper_trade"))
+        notifier._fills_for_pair = Mock(return_value=[
+            {"order_id": "BUY-1", "exchange_trade_id": "B1", "trade_type": "BUY", "price": Decimal("100"), "amount": Decimal("1"), "trade_fee_in_quote": Decimal("0.10"), "timestamp": Decimal("1712745599000")},
+        ])
+        event = events.OrderFilledEvent(
+            timestamp=1712745600,
+            order_id="OID-SELL-FILL-1",
+            trading_pair="ETH-USDC",
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("130"),
+            amount=Decimal("0.5"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.05"))]),
+            exchange_trade_id="TID-SELL-1",
+        )
+
+        realized_pnl = notifier._sell_fill_realized_pnl_quote(event)
+
+        notifier._fills_for_pair.assert_called_once_with(
+            "ETH-USDC",
+            market="binance_paper_trade",
+            end_timestamp=Decimal("1712745600000"),
+        )
+        self.assertEqual(Decimal("14.900"), realized_pnl)
+
+    def test_order_completion_context_uses_order_market_for_trade_pnl(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._order_record = Mock(return_value=SimpleNamespace(symbol="ETH-USDC", market="binance_paper_trade"))
+        notifier._fills_for_order = Mock(return_value=[SimpleNamespace(trade_fee_in_quote=Decimal("0.21"))])
+        notifier._sell_order_realized_pnl_quote = Mock(return_value=Decimal("12.34"))
+
+        context = notifier._order_completion_context("OID-SELL-1", "ETH", "USDC", include_trade_realized_pnl=True)
+
+        self.assertEqual("ETH-USDC", context["trading_pair"])
+        self.assertEqual(Decimal("0.21"), context["fee_quote"])
+        self.assertEqual(Decimal("12.34"), context["trade_realized_pnl_quote"])
+        notifier._sell_order_realized_pnl_quote.assert_called_once_with(
+            "OID-SELL-1",
+            "ETH-USDC",
+            market="binance_paper_trade",
+        )
 
     def test_market_event_forwarder_registers_selected_listeners(self):
         market = Mock()

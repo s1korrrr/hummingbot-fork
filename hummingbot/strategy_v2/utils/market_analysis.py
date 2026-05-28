@@ -531,13 +531,17 @@ def analyze_volume(
 
     if vol_series is None or vol_series.empty:
         return result
+    vol_series = pd.to_numeric(vol_series, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     # Basic metrics
-    result.current_volume = float(vol_series.iloc[-1])
-    result.average_volume = float(vol_series.tail(lookback).mean())
+    current_volume = float(vol_series.iloc[-1])
+    average_volume = float(vol_series.tail(lookback).mean())
+    if not np.isfinite(current_volume) or not np.isfinite(average_volume) or average_volume <= 0:
+        return result
+    result.current_volume = current_volume
+    result.average_volume = average_volume
 
-    if result.average_volume > 0:
-        result.volume_ratio = round(result.current_volume / result.average_volume, 3)
+    result.volume_ratio = round(result.current_volume / result.average_volume, 3)
 
     # Classify condition
     ratio = result.volume_ratio
@@ -608,7 +612,7 @@ def detect_support_resistance(
 
     recent = df.tail(lookback).copy()
 
-    if "high" not in recent.columns or "low" not in recent.columns:
+    if not {"high", "low", "close"}.issubset(set(recent.columns)):
         return result
 
     high = recent["high"].astype(float)

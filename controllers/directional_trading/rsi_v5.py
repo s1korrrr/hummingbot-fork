@@ -286,6 +286,7 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     sell_only_if_profitable: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Only sell if profitable?:", prompt_on_new=False, is_updatable=True))
     sell_rsi_overbought: float = Field(default=76.0, ge=50.0, le=100.0, client_data=ClientFieldData(prompt=lambda mi: "RSI overbought trigger for sell:", prompt_on_new=False, is_updatable=True))
     min_profit_pct_for_sell: Decimal = Field(default=Decimal("0.002"), client_data=ClientFieldData(prompt=lambda mi: "Min profit pct for sell:", prompt_on_new=False, is_updatable=True))
+    signal_sell_inventory_slice_multiplier: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Signal SELL inventory slice multiplier (0=all):", prompt_on_new=False, is_updatable=True))
     recent_trades_lookback: int = Field(default=15, client_data=ClientFieldData(prompt=lambda mi: "Recent trades lookback:", prompt_on_new=False, is_updatable=False))
 
     # --- Position sizing & risk limits ---
@@ -417,7 +418,10 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
         rsi_sell_custom = abs(rsi_sell - default_rsi_sell) > 1e-9
         sell_overbought_custom = abs(sell_overbought - default_sell_overbought) > 1e-9
 
-        if sell_overbought_custom and not rsi_sell_custom:
+        if not rsi_sell_custom and not sell_overbought_custom:
+            object.__setattr__(self, "rsi_sell_threshold", default_sell_overbought)
+            object.__setattr__(self, "sell_rsi_overbought", default_sell_overbought)
+        elif sell_overbought_custom and not rsi_sell_custom:
             object.__setattr__(self, "rsi_sell_threshold", sell_overbought)
         elif rsi_sell_custom and not sell_overbought_custom:
             object.__setattr__(self, "sell_rsi_overbought", rsi_sell)
@@ -3520,7 +3524,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         bbl_col = f"BBL_{self.config.bb_length}_{self.config.bb_std}"
         if bbl_col in df.columns:
             bbl = pd.to_numeric(df[bbl_col], errors="coerce")
-            score = score + (close <= bbl).astype(int)
+            score = score + (rsi_oversold_now & (close <= bbl)).astype(int)
 
         hist_col = f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"
         ema_fast_col = f"EMA_{self.config.ema_fast_length}"
@@ -3530,7 +3534,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             macd_h = pd.to_numeric(df[hist_col], errors="coerce")
             macd_h_prev = macd_h.shift(1)
             macd_turn = ((macd_h > macd_h_prev) & ((macd_h > 0) | (macd_h_prev < 0))).fillna(False)
-            score = score + macd_turn.astype(int)
+            score = score + (rsi_oversold_now & macd_turn).astype(int)
 
         mean_reversion_score = rsi.apply(calculate_rsi_mean_reversion_score)
         score = score + (rsi_oversold_now & (mean_reversion_score >= 0.5)).astype(int)
@@ -4112,9 +4116,14 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 fallback_price=price,
             )
             position_amount = self._get_sellable_inventory_amount()
+            target_amount = position_amount
+            slice_multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
+            if slice_multiplier > 0 and ref_price > 0:
+                target_quote = self.config.usd_per_entry * slice_multiplier
+                target_amount = min(position_amount, target_quote / ref_price)
             sell_amount = self._resolve_recovery_sell_amount(
                 position_amount=position_amount,
-                target_amount=position_amount,
+                target_amount=target_amount,
                 price=ref_price,
                 available_base=position_amount,
             )
@@ -4345,12 +4354,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         base_asset, _ = self._base_quote_assets()
         available_base: Optional[Decimal] = None
         if base_asset is not None:
-            try:
-                balance = self.market_data_provider.get_balance(self.config.connector_name, base_asset)
-                if balance is not None:
-                    available_base = Decimal(str(balance))
-            except Exception:
-                available_base = None
+            available_base = self._get_available_asset_balance(base_asset)
 
         if available_base is not None and available_base <= Decimal("0"):
             return actions

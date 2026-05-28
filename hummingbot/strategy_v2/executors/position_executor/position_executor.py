@@ -160,6 +160,7 @@ class PositionExecutor(ExecutorBase):
         self._open_order: Optional[TrackedOrder] = None
         self._close_order: Optional[TrackedOrder] = None
         self._take_profit_limit_order: Optional[TrackedOrder] = None
+        self._completed_close_orders: List[TrackedOrder] = []
         self._failed_orders: List[TrackedOrder] = []
         self._trailing_stop_trigger_pct: Optional[Decimal] = None
         self._trailing_stop_move_count: int = 0
@@ -217,6 +218,34 @@ class PositionExecutor(ExecutorBase):
         """
         return self.open_filled_amount - self.close_filled_amount
 
+    def _close_order_amount(self) -> Decimal:
+        close_amount = self.amount_to_close
+        if close_amount <= Decimal("0") or self.is_perpetual or self.close_order_side != TradeType.SELL:
+            return close_amount
+
+        base_asset = self.config.trading_pair.split("-")[0]
+        available_base = self._to_decimal(self.get_available_balance(self.config.connector_name, base_asset))
+        if available_base is None:
+            return close_amount
+
+        capped_amount = min(close_amount, max(available_base, Decimal("0")))
+        try:
+            capped_amount = self.connectors[self.config.connector_name].quantize_order_amount(
+                trading_pair=self.config.trading_pair,
+                amount=capped_amount,
+            )
+        except Exception:
+            pass
+        if capped_amount < close_amount:
+            self.logger().warning(
+                self._log_message(
+                    f"Capping close order amount to available base balance "
+                    f"amount_to_close={close_amount} available_{base_asset}={available_base} "
+                    f"order_amount={capped_amount}"
+                )
+            )
+        return capped_amount
+
     @property
     def open_filled_amount_quote(self) -> Decimal:
         """
@@ -233,7 +262,9 @@ class PositionExecutor(ExecutorBase):
 
         :return: The filled amount of the close order if it exists, otherwise 0.
         """
-        return self._close_order.executed_amount_base if self._close_order else Decimal("0")
+        completed_close_amount = sum(order.executed_amount_base for order in self._completed_close_orders)
+        current_close_amount = self._close_order.executed_amount_base if self._close_order else Decimal("0")
+        return completed_close_amount + current_close_amount
 
     @property
     def close_filled_amount_quote(self) -> Decimal:
@@ -242,7 +273,9 @@ class PositionExecutor(ExecutorBase):
 
         :return: The filled amount of the close order in quote currency.
         """
-        return self.close_filled_amount * self.close_price
+        completed_close_quote = sum(order.executed_amount_quote for order in self._completed_close_orders)
+        current_close_quote = self._close_order.executed_amount_quote if self._close_order else Decimal("0")
+        return completed_close_quote + current_close_quote
 
     @property
     def filled_amount(self) -> Decimal:
@@ -308,7 +341,9 @@ class PositionExecutor(ExecutorBase):
 
         :return: The close price.
         """
-        if self._close_order and self._close_order.is_done:
+        if self.close_filled_amount > Decimal("0"):
+            return self.close_filled_amount_quote / self.close_filled_amount
+        elif self._close_order and self._close_order.is_done:
             return self._close_order.average_executed_price
         else:
             return self.current_market_price
@@ -450,7 +485,7 @@ class PositionExecutor(ExecutorBase):
 
         :return: The cumulative fees in quote asset.
         """
-        orders = [self._open_order, self._close_order]
+        orders = [self._open_order, self._close_order, *self._completed_close_orders]
         return sum([order.cum_fees_quote for order in orders if order])
 
     def get_net_pnl_pct(self) -> Decimal:
@@ -546,7 +581,7 @@ class PositionExecutor(ExecutorBase):
         if self.open_filled_amount == Decimal("0"):
             return True
         else:
-            return self._close_order and self._close_order.is_filled
+            return self._close_order and self._close_order.is_filled and self.amount_to_close <= Decimal("0")
 
     async def control_close_order(self):
         """
@@ -554,6 +589,11 @@ class PositionExecutor(ExecutorBase):
         completed, it stops the executor. If the close order is not placed, it places the close order. If the close order
         is not filled, it waits for the close order to be filled and requests the order information to the connector.
         """
+        if self._close_order and self._close_order.is_done and self.amount_to_close > Decimal("0"):
+            self._completed_close_orders.append(self._close_order)
+            self._close_order = None
+            self._close_order_type = None
+
         if self._close_order:
             in_flight_order = self.get_in_flight_order(self.config.connector_name,
                                                        self._close_order.order_id) if not self._close_order.order else self._close_order.order
@@ -715,7 +755,8 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         self.cancel_open_orders()
-        if self.amount_to_close >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+        close_amount = self._close_order_amount()
+        if close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
             order_type = self._close_order_type_for(close_type)
             if order_type.is_limit_type() and not price.is_finite():
                 price = self._marketable_limit_close_price()
@@ -723,7 +764,7 @@ class PositionExecutor(ExecutorBase):
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
                 order_type=order_type,
-                amount=self.amount_to_close,
+                amount=close_amount,
                 price=price,
                 side=self.close_order_side,
                 position_action=PositionAction.CLOSE,

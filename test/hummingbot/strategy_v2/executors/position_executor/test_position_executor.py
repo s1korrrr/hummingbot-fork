@@ -664,6 +664,167 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
 
     @patch.object(PositionExecutor, "get_trading_rules")
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_spot_long_close_order_caps_to_available_base_balance(self, mock_get_price, mock_get_trading_rules):
+        mock_get_price.side_effect = lambda connector, pair, price_type=PriceType.MidPrice: (
+            Decimal("109") if price_type == PriceType.BestBid else Decimal("110")
+        )
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        mock_get_trading_rules.return_value = trading_rules
+
+        position_executor = self.get_position_executor_running_from_config(
+            self.get_position_config_market_long_with_trailing()
+        )
+        position_executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.FILLED,
+        )
+        position_executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("100"),
+                fill_base_amount=Decimal("1"),
+                fill_quote_amount=Decimal("100"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.2"))]),
+                fill_timestamp=10,
+            )
+        )
+        self.strategy.connectors["binance"].get_available_balance.return_value = Decimal("0.75")
+        self.strategy.connectors["binance"].quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+
+        position_executor.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
+
+        self.assertEqual(
+            self.strategy.sell.call_args.args,
+            ("binance", "ETH-USDT", Decimal("0.75"), OrderType.LIMIT, Decimal("109"), PositionAction.CLOSE),
+        )
+        self.assertEqual(position_executor._close_order.order_id, "OID-SELL-1")
+        position_executor._close_order.order = InFlightOrder(
+            client_order_id="OID-SELL-1",
+            exchange_order_id="EOID5",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("0.75"),
+            price=Decimal("109"),
+            creation_timestamp=1640001113.223,
+            initial_state=OrderState.FILLED,
+        )
+        position_executor._close_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="2",
+                client_order_id="OID-SELL-1",
+                exchange_order_id="EOID5",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("109"),
+                fill_base_amount=Decimal("0.75"),
+                fill_quote_amount=Decimal("81.75"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.1"))]),
+                fill_timestamp=11,
+            )
+        )
+        self.assertFalse(position_executor.open_and_close_volume_match())
+
+    @patch.object(PositionExecutor, "_sleep")
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    async def test_spot_long_partial_close_continues_closing_remaining_amount(
+        self, mock_get_price, mock_get_trading_rules, _
+    ):
+        mock_get_price.side_effect = lambda connector, pair, price_type=PriceType.MidPrice: (
+            Decimal("109") if price_type == PriceType.BestBid else Decimal("110")
+        )
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        mock_get_trading_rules.return_value = trading_rules
+
+        position_executor = self.get_position_executor_running_from_config(
+            self.get_position_config_market_long_with_trailing()
+        )
+        position_executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.FILLED,
+        )
+        position_executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("100"),
+                fill_base_amount=Decimal("1"),
+                fill_quote_amount=Decimal("100"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.2"))]),
+                fill_timestamp=10,
+            )
+        )
+        position_executor._close_order = TrackedOrder(order_id="OID-SELL-1")
+        position_executor._close_order.order = InFlightOrder(
+            client_order_id="OID-SELL-1",
+            exchange_order_id="EOID5",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("0.75"),
+            price=Decimal("109"),
+            creation_timestamp=1640001113.223,
+            initial_state=OrderState.FILLED,
+        )
+        position_executor._close_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="2",
+                client_order_id="OID-SELL-1",
+                exchange_order_id="EOID5",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("109"),
+                fill_base_amount=Decimal("0.75"),
+                fill_quote_amount=Decimal("81.75"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.1"))]),
+                fill_timestamp=11,
+            )
+        )
+        position_executor.close_type = CloseType.TRAILING_STOP
+        position_executor._status = RunnableStatus.SHUTTING_DOWN
+        self.strategy.sell.side_effect = ["OID-SELL-2"]
+        self.strategy.connectors["binance"].get_available_balance.return_value = Decimal("0.25")
+        self.strategy.connectors["binance"].quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+
+        await position_executor.control_shutdown_process()
+
+        self.assertEqual(
+            self.strategy.sell.call_args.args,
+            ("binance", "ETH-USDT", Decimal("0.25"), OrderType.LIMIT, Decimal("109"), PositionAction.CLOSE),
+        )
+        self.assertEqual(position_executor.close_filled_amount, Decimal("0.75"))
+        self.assertEqual(position_executor.close_filled_amount_quote, Decimal("81.75"))
+        self.assertEqual(position_executor.close_price, Decimal("109"))
+        self.assertEqual(position_executor.cum_fees_quote, Decimal("0.3"))
+        self.assertEqual(position_executor.amount_to_close, Decimal("0.25"))
+        self.assertEqual(position_executor._close_order.order_id, "OID-SELL-2")
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
     async def test_trailing_limit_close_falls_back_to_market_after_timeout(self, mock_get_price, mock_get_trading_rules):
         mock_get_price.side_effect = lambda connector, pair, price_type=PriceType.MidPrice: (
             Decimal("109") if price_type == PriceType.BestBid else Decimal("110")

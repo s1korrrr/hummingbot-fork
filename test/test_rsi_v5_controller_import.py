@@ -38,6 +38,18 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertIsNotNone(RSIv5Controller)
         self.assertIsNotNone(RSIv5ControllerConfig)
 
+    def test_rsi_v5_default_sell_threshold_harmonization_preserves_overbought_default(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5ControllerConfig
+
+        config = RSIv5ControllerConfig(
+            id="rsi-v5-test",
+            connector_name="binance",
+            trading_pair="BNB-USDT",
+        )
+
+        self.assertEqual(config.rsi_sell_threshold, 76.0)
+        self.assertEqual(config.sell_rsi_overbought, 76.0)
+
     def test_rsi_v5_buy_executor_config_uses_supported_barrier_order_types(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
@@ -1388,6 +1400,52 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertEqual(executor_config.amount, Decimal("0.75000000"))
         self.assertEqual(executor_config.level_id, "signal_exit")
 
+    def test_rsi_v5_direct_sell_executor_caps_to_configured_entry_slices(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1234567890.0
+        market_data_provider.get_trading_rules.return_value = SimpleNamespace(min_price_increment=Decimal("0.01"))
+        market_data_provider.get_price_by_type.side_effect = lambda connector, pair, price_type: (
+            Decimal("100.50") if price_type == PriceType.BestAsk else Decimal("100.00")
+        )
+        market_data_provider.get_balance.return_value = Decimal("5")
+        market_data_provider.quantize_order_amount.side_effect = (
+            lambda connector, pair, amount: amount.quantize(Decimal("1e-8"))
+        )
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                usd_per_entry=Decimal("150"),
+                signal_sell_inventory_slice_multiplier=Decimal("2"),
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.processed_data = {"signal_state": {}}
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                side=TradeType.BUY,
+                amount=Decimal("5"),
+                breakeven_price=Decimal("90.00"),
+            )
+        ]
+
+        executor_config = controller.get_executor_config(
+            trade_type=TradeType.SELL,
+            price=Decimal("100"),
+            amount=Decimal("1"),
+        )
+
+        self.assertEqual(executor_config.price, Decimal("100.51"))
+        self.assertEqual(executor_config.amount, Decimal("2.98477763"))
+
     def test_rsi_v5_stale_signal_sell_executor_is_cancelled_for_repricing(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
@@ -1818,6 +1876,66 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertEqual(actions, [])
 
+    def test_rsi_v5_bag_recovery_uses_available_base_balance_not_total_balance(self):
+        from controllers.directional_trading.rsi_v5 import RecoveryTrailState, RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1234567890.0
+        market_data_provider.get_price_by_type.return_value = Decimal("105.00")
+        market_data_provider.get_balance.return_value = Decimal("1")
+        market_data_provider.get_available_balance.return_value = Decimal("0")
+        market_data_provider.get_trading_rules.return_value = SimpleNamespace(
+            min_order_size=Decimal("0"),
+            min_base_amount_increment=Decimal("0.00000001"),
+            min_notional_size=Decimal("5"),
+            min_order_value=Decimal("5"),
+            min_price_increment=Decimal("0.01"),
+        )
+        market_data_provider.quantize_order_amount.side_effect = lambda connector, pair, amount: amount
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                use_bag_freeze=False,
+                early_stop_drawdown_pct=Decimal("0"),
+                bag_recovery_target_pct=Decimal("0.05"),
+                sell_rsi_overbought=80.0,
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        position = SimpleNamespace(
+            connector_name="binance",
+            trading_pair="ETH-USDC",
+            side=TradeType.BUY,
+            amount=Decimal("1"),
+            breakeven_price=Decimal("100.00"),
+        )
+        position_key = controller._recovery_position_key(position)
+        controller.positions_held = [position]
+        controller.processed_data = {
+            "signal": -1,
+            "trend_confirmation": {"direction": "neutral", "confidence": 0.0, "alignment_score": 0.0, "states": {}},
+            "signal_state": {"rsi": 82.0, "rsi_prev": 81.0, "ema_fast": 104.0},
+        }
+        controller._recovery_trails[position_key] = RecoveryTrailState(
+            position_key=position_key,
+            armed_timestamp=1234567800.0,
+            arm_price=Decimal("105.00"),
+            peak_price=Decimal("106.00"),
+            tracked_amount=Decimal("1"),
+            peak_rsi=84.0,
+            target_profit_pct=Decimal("0.05"),
+        )
+
+        actions = controller.stop_actions_proposal()
+
+        self.assertEqual(actions, [])
+        market_data_provider.get_available_balance.assert_called()
+
     def test_rsi_v5_consecutive_loss_tracking_is_idempotent_across_refreshed_executor_reports(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
@@ -2247,7 +2365,7 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         summary = controller.get_status_summary()
         self.assertEqual("28.90", summary["rsi"])
-        self.assertEqual("28.9/75.0", summary["rsi_proximity"])
+        self.assertEqual("28.9/76.0", summary["rsi_proximity"])
         self.assertIn("█", summary["buy_gauge"])
         self.assertTrue(
             summary["buy_gauge"].endswith("BUY") or "%" in summary["buy_gauge"],
@@ -2349,6 +2467,59 @@ class RSIv5ControllerImportTest(unittest.TestCase):
             rsi_sell_eff=75.0,
         )
 
+        self.assertEqual(signal_series.iloc[-1], 0)
+
+    def test_rsi_v5_backtest_buy_score_requires_current_rsi_oversold_like_live(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="BNB-USDT",
+                rsi_length=4,
+                min_signal_score=2,
+                buy_confirmation_mode="none",
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+
+        df = pd.DataFrame(
+            {
+                "timestamp": [1.0, 2.0, 3.0, 4.0],
+                "close": [100.0, 99.0, 98.0, 97.0],
+                "RSI_4": [40.0, 28.0, 34.0, 39.0],
+                "BBL_20_2.0": [98.0, 98.0, 98.0, 98.0],
+                "MACDh_12_26_9": [-0.3, -0.2, -0.4, -0.1],
+            }
+        )
+
+        with patch.object(
+            controller,
+            "_compute_raw_buy_reversal_series",
+            return_value=pd.Series([False, False, False, True], index=df.index, dtype=bool),
+        ):
+            signal_series = controller._build_backtest_signal_series(
+                df,
+                rsi_buy_eff=35.0,
+                rsi_sell_eff=75.0,
+            )
+
+        live_score = controller._compute_signal_score_details(
+            last_rsi=39.0,
+            last_close=97.0,
+            bb_lower=98.0,
+            macd_hist=-0.1,
+            macd_hist_prev=-0.4,
+            rsi_buy_threshold=35.0,
+            mean_reversion_score=0.5,
+        )
+
+        self.assertEqual(live_score["score"], 0)
         self.assertEqual(signal_series.iloc[-1], 0)
 
     def test_rsi_v5_backtest_sell_series_tracks_inventory_and_profitability(self):

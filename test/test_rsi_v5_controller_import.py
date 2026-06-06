@@ -2622,6 +2622,58 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertIsNone(controller._get_position_cost_basis())
 
+    def test_rsi_v5_status_summary_uses_held_basis_when_stale_candles_hide_indicators(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
+
+        market_data_provider = MagicMock()
+        market_data_provider.initialize_rate_sources.return_value = None
+        market_data_provider.time.return_value = 1234567890.0
+        market_data_provider.get_price_by_type.return_value = Decimal("10.00")
+        market_data_provider.get_available_balance.return_value = Decimal("3.0")
+
+        controller = RSIv5Controller(
+            config=RSIv5ControllerConfig(
+                id="rsi-v5-test",
+                connector_name="binance",
+                trading_pair="ABC-USDC",
+                min_profit_pct_for_sell=Decimal("0.04"),
+                bag_recovery_target_pct=Decimal("0.05"),
+            ),
+            market_data_provider=market_data_provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.processed_data = {
+            "signal": 0,
+            "features": pd.DataFrame(),
+            "data_health": {"ready": False, "reason": "stale_candle"},
+            "timestamp": 1234567890.0,
+            "candle_timestamp": 1234567800.0,
+            "signal_state": {
+                "condition_ok": False,
+                "condition_reason": "stale_candle",
+            },
+        }
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="binance",
+                trading_pair="ABC-USDC",
+                side=TradeType.BUY,
+                amount=Decimal("5.0"),
+                breakeven_price=Decimal("20.00"),
+            )
+        ]
+
+        summary = controller.get_status_summary()
+
+        self.assertEqual(summary["rsi"], "n/a")
+        self.assertEqual(summary["rsi_proximity"], "n/a")
+        self.assertEqual(summary["avg_buy"], "20")
+        self.assertEqual(summary["u_pnl_pct"], "-50.0%")
+        self.assertIn("0%", summary["sell_gauge"])
+        self.assertIn("sell gap", summary["focus"])
+        self.assertIn("3.0000/5.0000 ABC", summary["plan_liquidity"])
+        self.assertIn("short $20", summary["plan_liquidity"])
+
     def test_rsi_v5_status_summary_includes_price(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 

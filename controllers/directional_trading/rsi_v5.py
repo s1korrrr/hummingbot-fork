@@ -1286,6 +1286,30 @@ class RSIv5Controller(DirectionalTradingControllerBase):
     def _get_position_cost_basis(self) -> Optional[Decimal]:
         return self._aggregate_held_inventory(TradeType.BUY).cost_basis
 
+    def _inventory_balance_shortfall_amount(
+        self,
+        inventory: Optional[AggregatedInventoryState] = None,
+    ) -> Optional[Decimal]:
+        inventory_state = inventory if inventory is not None else self._aggregate_held_inventory(TradeType.BUY)
+        if inventory_state.total_amount <= 0:
+            return Decimal("0")
+        base_balance = self._get_base_balance()
+        if base_balance is None:
+            return None
+        return max(inventory_state.total_amount - base_balance, Decimal("0"))
+
+    def _inventory_balance_shortfall_value(
+        self,
+        current_price: Optional[Decimal],
+        inventory: Optional[AggregatedInventoryState] = None,
+    ) -> Optional[Decimal]:
+        if current_price is None or current_price <= 0:
+            return None
+        shortfall_amount = self._inventory_balance_shortfall_amount(inventory)
+        if shortfall_amount is None:
+            return None
+        return shortfall_amount * current_price
+
     def _inventory_net_pnl_pct(self, current_price: Optional[Decimal]) -> Optional[Decimal]:
         if current_price is None or current_price <= 0:
             return None
@@ -1543,7 +1567,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         state = processed.get("signal_state", {})
         current_signal = processed.get("signal", 0)
         regime_label = processed.get("regime")
-        cost_basis = indicators.get("cost_basis")
+        cost_basis = self._decimal_or_none(indicators.get("cost_basis"))
+        if cost_basis is None:
+            cost_basis = self._get_position_cost_basis()
         buy_role = str(state.get("buy_entry_role", "none") or "none")
 
         mid_price = self._get_mid_price()
@@ -1562,9 +1588,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         unrealized_pnl_pct: Optional[Decimal] = None
         profit_headroom_pct: Optional[Decimal] = None
-        if cost_basis is not None and mid_price is not None and Decimal(str(cost_basis)) > 0:
-            basis = Decimal(str(cost_basis))
-            unrealized_pnl_pct = (mid_price - basis) / basis
+        if cost_basis is not None and mid_price is not None and cost_basis > 0:
+            unrealized_pnl_pct = (mid_price - cost_basis) / cost_basis
             profit_headroom_pct = unrealized_pnl_pct - self.config.min_profit_pct_for_sell
 
         now_ts = self.market_data_provider.time() if self.market_data_provider else 0.0
@@ -1690,7 +1715,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             "score": f"{state.get('signal_score', 0)}/{self.config.min_signal_score}",
             "regime": self._short_regime_label(regime_label),
             "trend": self._processed_trend_confirmation().get("direction", "unavailable"),
-            "avg_buy": self._summary_price(Decimal(str(cost_basis)) if cost_basis is not None else None),
+            "avg_buy": self._summary_price(cost_basis),
             "exposure": exposure_text,
             "execs": f"B{len(active_buys)} S{len(active_sells)} H{len(held_bags)}",
             "u_pnl": self._summary_pct(unrealized_pnl_pct),
@@ -4614,21 +4639,26 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         base_balance = self._get_base_balance()
         base_asset, _ = self._base_quote_assets()
         amount_suffix = f" {base_asset}" if base_asset else ""
+        shortfall_amount = self._inventory_balance_shortfall_amount(inventory)
         position_value = self._get_total_position_value_usd()
         try:
             max_position = Decimal(str(getattr(self.config, "max_total_position_usd", Decimal("0"))))
         except (InvalidOperation, TypeError, ValueError):
             max_position = Decimal("0")
         utilization = self._get_position_utilization()
-        return self._status_row(
-            "position",
+        parts = [
             f"held={inventory.total_amount:.8f}{amount_suffix}",
             f"sellable={sellable_amount:.8f}{amount_suffix}",
+        ]
+        if shortfall_amount is not None and shortfall_amount > 0:
+            parts.append(f"short={shortfall_amount:.8f}{amount_suffix}")
+        parts.extend([
             f"bags={inventory.bag_count}",
             f"base={self._fmt(base_balance, 8)}",
             f"cost={self._fmt(inventory.cost_basis, 4)}",
             f"exp=${float(position_value):.0f}/${float(max_position):.0f} ({utilization:.0%})",
-        )
+        ])
+        return self._status_row("position", *parts)
 
     def _status_exit_owner_line(self, current_signal: int) -> str:
         signal_sells = self._active_signal_sell_executors()
@@ -4794,9 +4824,14 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return held_value, active_value, untracked_value
 
     def _inventory_reconciliation_label(self, current_price: Optional[Decimal]) -> str:
+        inventory = self._aggregate_held_inventory(TradeType.BUY)
         held_value, active_value, untracked_value = self._inventory_reconciliation_values(current_price)
-        return (
-            f"H{self._status_compact_money_label(held_value)} "
-            f"A{self._status_compact_money_label(active_value)} "
-            f"U{self._status_compact_money_label(untracked_value)}"
-        )
+        parts = [
+            f"H{self._status_compact_money_label(held_value)}",
+            f"A{self._status_compact_money_label(active_value)}",
+            f"U{self._status_compact_money_label(untracked_value)}",
+        ]
+        shortfall_value = self._inventory_balance_shortfall_value(current_price, inventory)
+        if shortfall_value is not None and shortfall_value > 0:
+            parts.append(f"short {self._status_compact_money_label(shortfall_value)}")
+        return " ".join(parts)

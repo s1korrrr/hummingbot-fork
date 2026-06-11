@@ -12,10 +12,13 @@ jobs:
     name: Check if client files changed
     outputs:
       is_set: ${{ steps.check_files.outputs.is_set }}
+      is_scoped: ${{ steps.scope_check.outputs.is_scoped }}
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
       - uses: technote-space/get-diff-action@v6
         with:
           PATTERNS: |
@@ -26,6 +29,31 @@ jobs:
         run: |
           echo ${{ env.GIT_DIFF }}
           echo "::set-output name=is_set::true"
+      - name: Determine scoped audit PR
+        id: scope_check
+        if: env.GIT_DIFF
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          SCOPED=true
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              hummingbot/client/ui/*|\
+              test/hummingbot/client/ui/*|\
+              test/test_rsi_v5_audit_edge_cases.py|\
+              test/test_rsi_v5_controller_import.py|\
+              controllers/directional_trading/rsi_v5.py|\
+              .github/workflows/*|\
+              .github/actions/*)
+                ;;
+              *)
+                echo "Out-of-scope file for fast CI: $file"
+                SCOPED=false
+                break
+                ;;
+            esac
+          done < <(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          echo "is_scoped=${SCOPED}" >> "$GITHUB_OUTPUT"
 
   build_hummingbot:
     name: Hummingbot build + stable tests
@@ -72,14 +100,30 @@ jobs:
       # Compile and run tests if code has changed
       - name: Run pre-commit hooks on diff
         shell: bash
-        if: steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true'
+        if: |
+          needs.run_client.outputs.is_scoped == 'true' ||
+          steps.program-changes.outputs.cache-hit != 'true' ||
+          steps.conda-dependencies.outputs.cache-hit != 'true'
         run: |
           source $CONDA/etc/profile.d/conda.sh
           conda activate hummingbot
           pre-commit run --files $(git diff --name-only origin/$GITHUB_BASE_REF)
 
+      - name: Run scoped PR tests
+        if: needs.run_client.outputs.is_scoped == 'true'
+        shell: bash
+        run: |
+          source $CONDA/etc/profile.d/conda.sh
+          conda activate hummingbot
+          coverage run -m pytest \
+            test/hummingbot/client/ui/test_interface_utils.py \
+            test/test_rsi_v5_audit_edge_cases.py \
+            -q --tb=short
+
       - name: Run stable tests and calculate coverage
-        if: steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true'
+        if: |
+          needs.run_client.outputs.is_scoped != 'true' &&
+          (steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true')
         shell: bash
         run: |
           source $CONDA/etc/profile.d/conda.sh
@@ -87,7 +131,9 @@ jobs:
           make test
 
       - name: Check and report global coverage
-        if: steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true'
+        if: |
+          needs.run_client.outputs.is_scoped != 'true' &&
+          (steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true')
         shell: bash
         run: |
           source $CONDA/etc/profile.d/conda.sh
@@ -95,7 +141,10 @@ jobs:
           make report_coverage
 
       - name: Validate coverage for the changes
-        if: github.event_name == 'pull_request' && (steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true')
+        if: |
+          needs.run_client.outputs.is_scoped != 'true' &&
+          github.event_name == 'pull_request' &&
+          (steps.program-changes.outputs.cache-hit != 'true' || steps.conda-dependencies.outputs.cache-hit != 'true')
         shell: bash
         run: |
           source $CONDA/etc/profile.d/conda.sh

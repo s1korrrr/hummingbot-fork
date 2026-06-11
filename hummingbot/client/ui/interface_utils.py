@@ -1,6 +1,7 @@
 import asyncio
+from collections import defaultdict
 from decimal import Decimal
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import psutil
@@ -41,6 +42,28 @@ async def _sleep(delay):
     await asyncio.sleep(delay)
 
 
+def _trade_quote_asset(trade: TradeFill) -> str:
+    quote_asset = getattr(trade, "quote_asset", None)
+    if isinstance(quote_asset, str) and quote_asset:
+        return quote_asset
+
+    symbol = getattr(trade, "symbol", "")
+    if isinstance(symbol, str) and "-" in symbol:
+        return symbol.rsplit("-", 1)[1]
+
+    return "UNKNOWN"
+
+
+def _format_total_pnls_by_quote(pnls_by_quote: Dict[str, Decimal]) -> str:
+    if len(pnls_by_quote) == 0:
+        return "0.00"
+
+    return ", ".join(
+        f"{PerformanceMetrics.smart_round(pnls_by_quote[quote])} {quote}"
+        for quote in sorted(pnls_by_quote)
+    )
+
+
 async def start_process_monitor(process_monitor):
     hb_process = psutil.Process()
     while True:
@@ -71,20 +94,16 @@ async def start_trade_monitor(trade_monitor):
                             config_file_path=hb.strategy_file_name)
                         if len(trades) > 0:
                             return_pcts = []
-                            pnls = []
-                            market_info: Set[Tuple[str, str]] = set((t.market, t.symbol) for t in trades)
+                            pnls_by_quote = defaultdict(lambda: s_decimal_0)
+                            market_info: List[Tuple[str, str]] = sorted(set((t.market, t.symbol) for t in trades))
                             for market, symbol in market_info:
                                 cur_trades = [t for t in trades if t.market == market and t.symbol == symbol]
                                 cur_balances = await hb.trading_core.get_current_balances(market)
                                 perf = await PerformanceMetrics.create(symbol, cur_trades, cur_balances)
                                 return_pcts.append(perf.return_pct)
-                                pnls.append(perf.total_pnl)
+                                pnls_by_quote[_trade_quote_asset(cur_trades[0])] += perf.total_pnl
                             avg_return = sum(return_pcts) / len(return_pcts) if len(return_pcts) > 0 else s_decimal_0
-                            quote_assets = set(t.symbol.split("-")[1] for t in trades)
-                            if len(quote_assets) == 1:
-                                total_pnls = f"{PerformanceMetrics.smart_round(sum(pnls))} {list(quote_assets)[0]}"
-                            else:
-                                total_pnls = "N/A"
+                            total_pnls = _format_total_pnls_by_quote(pnls_by_quote)
                             trade_monitor.log(f"Trades: {len(trades)}, Total P&L: {total_pnls}, "
                                               f"Return %: {avg_return:.2%}")
             await _sleep(2.0)  # sleeping for longer to manage resources

@@ -275,6 +275,17 @@ class RSIv5AuditEdgeCaseTest(unittest.TestCase):
 
         self.assertFalse(controller._check_consecutive_loss_pause())
 
+    def test_zero_pnl_executor_does_not_clear_consecutive_loss_streak(self):
+        provider = _make_market_data_provider()
+        controller = self._build_controller(market_data_provider=provider)
+        controller._consecutive_losses = 2
+        controller._last_loss_timestamp = 1000000.0
+
+        controller._track_executor_result(SimpleNamespace(net_pnl_quote=Decimal("0")))
+
+        self.assertEqual(controller._consecutive_losses, 2)
+        self.assertEqual(controller._last_loss_timestamp, 1000000.0)
+
     # ------------------------------------------------------------------
     # Flash-crash drop boundary
     # ------------------------------------------------------------------
@@ -326,6 +337,42 @@ class RSIv5AuditEdgeCaseTest(unittest.TestCase):
         )
 
         self.assertEqual(config.trailing_stop_order_type, OrderType.MARKET)
+
+    def test_config_rejects_inverted_rsi_thresholds(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5ControllerConfig
+
+        with self.assertRaises(Exception):
+            RSIv5ControllerConfig(
+                id="rsi-v5-audit-test",
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                rsi_buy_threshold=80.0,
+                rsi_sell_threshold=70.0,
+            )
+
+    def test_config_rejects_entry_size_above_position_cap(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5ControllerConfig
+
+        with self.assertRaises(Exception):
+            RSIv5ControllerConfig(
+                id="rsi-v5-audit-test",
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                usd_per_entry=Decimal("100"),
+                max_total_position_usd=Decimal("50"),
+            )
+
+    def test_config_rejects_inverted_dynamic_size_bounds(self):
+        from controllers.directional_trading.rsi_v5 import RSIv5ControllerConfig
+
+        with self.assertRaises(Exception):
+            RSIv5ControllerConfig(
+                id="rsi-v5-audit-test",
+                connector_name="binance",
+                trading_pair="ETH-USDC",
+                min_position_size_multiplier=2.0,
+                max_position_size_multiplier=1.0,
+            )
 
     def test_interval_to_seconds_handles_invalid_inputs(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller

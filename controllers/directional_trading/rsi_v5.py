@@ -260,8 +260,8 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     atr_length: int = Field(default=14, ge=2, client_data=ClientFieldData(prompt=lambda mi: "ATR length:", is_updatable=False))
     ema_fast_length: int = Field(default=9, ge=2, client_data=ClientFieldData(prompt=lambda mi: "EMA fast:", prompt_on_new=False, is_updatable=False))
     ema_slow_length: int = Field(default=21, ge=2, client_data=ClientFieldData(prompt=lambda mi: "EMA slow:", prompt_on_new=False, is_updatable=False))
-    rsi_buy_threshold: float = Field(default=31.0, client_data=ClientFieldData(prompt=lambda mi: "RSI buy threshold:", prompt_on_new=False, is_updatable=True))
-    rsi_sell_threshold: float = Field(default=75.0, client_data=ClientFieldData(prompt=lambda mi: "RSI sell threshold:", prompt_on_new=False, is_updatable=True))
+    rsi_buy_threshold: float = Field(default=31.0, gt=0.0, lt=100.0, client_data=ClientFieldData(prompt=lambda mi: "RSI buy threshold:", prompt_on_new=False, is_updatable=True))
+    rsi_sell_threshold: float = Field(default=75.0, gt=0.0, lt=100.0, client_data=ClientFieldData(prompt=lambda mi: "RSI sell threshold:", prompt_on_new=False, is_updatable=True))
 
     # --- Bollinger Bands ---
     bb_length: int = Field(default=20, ge=5, client_data=ClientFieldData(prompt=lambda mi: "BB length:", prompt_on_new=False, is_updatable=False))
@@ -290,8 +290,8 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     recent_trades_lookback: int = Field(default=15, client_data=ClientFieldData(prompt=lambda mi: "Recent trades lookback:", prompt_on_new=False, is_updatable=False))
 
     # --- Position sizing & risk limits ---
-    usd_per_entry: Decimal = Field(default=Decimal("30"), client_data=ClientFieldData(prompt=lambda mi: "USD per entry:", prompt_on_new=True, is_updatable=True))
-    max_total_position_usd: Decimal = Field(default=Decimal("500"), client_data=ClientFieldData(prompt=lambda mi: "Max total position USD:", prompt_on_new=True, is_updatable=True))
+    usd_per_entry: Decimal = Field(default=Decimal("30"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "USD per entry:", prompt_on_new=True, is_updatable=True))
+    max_total_position_usd: Decimal = Field(default=Decimal("500"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Max total position USD:", prompt_on_new=True, is_updatable=True))
 
     # --- Trailing take profit ---
     use_trailing_exit: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Use trailing exit?:", prompt_on_new=False, is_updatable=True))
@@ -429,6 +429,13 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
             object.__setattr__(self, "rsi_sell_threshold", sell_overbought)
         else:
             object.__setattr__(self, "sell_rsi_overbought", rsi_sell)
+
+        if float(self.rsi_buy_threshold) >= float(self.sell_rsi_overbought):
+            raise ValueError("rsi_buy_threshold must be below the effective RSI sell threshold")
+        if self.usd_per_entry > self.max_total_position_usd:
+            raise ValueError("usd_per_entry must be less than or equal to max_total_position_usd")
+        if float(self.min_position_size_multiplier) > float(self.max_position_size_multiplier):
+            raise ValueError("min_position_size_multiplier must be less than or equal to max_position_size_multiplier")
 
         return self
 
@@ -2272,10 +2279,14 @@ class RSIv5Controller(DirectionalTradingControllerBase):
     def _track_executor_result(self, executor) -> None:
         if not hasattr(executor, "net_pnl_quote") or executor.net_pnl_quote is None:
             return
-        if executor.net_pnl_quote < 0:
+        try:
+            net_pnl_quote = Decimal(str(executor.net_pnl_quote))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+        if net_pnl_quote < Decimal("0"):
             self._consecutive_losses += 1
             self._last_loss_timestamp = self.market_data_provider.time()
-        else:
+        elif net_pnl_quote > Decimal("0"):
             self._consecutive_losses = 0
             self._last_loss_timestamp = None
 

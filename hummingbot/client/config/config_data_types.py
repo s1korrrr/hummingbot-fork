@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from pydantic.json_schema import DEFAULT_REF_TEMPLATE, GenerateJsonSchema, JsonSchemaMode, model_json_schema
 
 from hummingbot.client.config.config_validators import validate_connector
@@ -24,9 +24,13 @@ class ClientFieldData:
 
 
 class BaseClientModel(BaseModel):
-    model_config = ConfigDict(validate_assignment=True, title=None, extra="forbid", json_encoders={
-        datetime: lambda dt: dt.strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    model_config = ConfigDict(validate_assignment=True, title=None, extra="forbid")
+
+    @field_serializer("*", check_fields=False, when_used="json")
+    def serialize_datetime_fields(self, value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        return value
 
     @classmethod
     def _clear_schema_cache(cls):

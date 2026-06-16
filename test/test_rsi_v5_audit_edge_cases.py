@@ -15,6 +15,7 @@ cover explicitly:
 They are read-only with respect to the live controller: they assert current
 behavior and must keep passing without any live-file change.
 """
+import ast
 import asyncio
 import importlib
 import sys
@@ -56,6 +57,20 @@ class RSIv5AuditEdgeCaseTest(unittest.TestCase):
     def setUp(self):
         super().setUp()
         ensure_local_controller_imports()
+
+    def test_rsi_v5_has_no_generic_exception_handlers(self):
+        controller_path = ROOT_PATH / "controllers" / "directional_trading" / "rsi_v5.py"
+        tree = ast.parse(controller_path.read_text())
+        generic_handlers = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            if node.type is None:
+                generic_handlers.append(node.lineno)
+            elif isinstance(node.type, ast.Name) and node.type.id in {"BaseException", "Exception"}:
+                generic_handlers.append(node.lineno)
+
+        self.assertEqual(generic_handlers, [])
 
     def _build_controller(self, market_data_provider=None, **config_overrides):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig

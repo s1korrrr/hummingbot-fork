@@ -18,13 +18,22 @@ Key Features:
 """
 import logging
 import time as _time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import pandas_ta as ta  # noqa: F401
+from pandas.errors import Pandas4Warning
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        category=Pandas4Warning,
+        message=".*mode.copy_on_write.*",
+    )
+    import pandas_ta as ta  # noqa: F401
 from pydantic import Field as PydanticField, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
@@ -69,6 +78,12 @@ from hummingbot.strategy_v2.utils.market_analysis import (
 # Pydantic Field helper (same as rsi_v1 for prompt/client_data compat)
 # ---------------------------------------------------------------------------
 _CLIENT_FIELD_SCHEMA_KEYS = ("prompt", "prompt_on_new", "is_secure", "is_connect_key", "is_updatable")
+_DECIMAL_CONVERSION_ERRORS = (ArithmeticError, TypeError, ValueError)
+_DECIMAL_ATTRIBUTE_ERRORS = (AttributeError, ArithmeticError, TypeError, ValueError)
+_MARKET_DATA_ERRORS = (AttributeError, KeyError, RuntimeError, TypeError, ValueError, ArithmeticError)
+_PROVIDER_ERRORS = (AttributeError, KeyError, RuntimeError, TypeError, ValueError)
+_INDICATOR_ERRORS = (AttributeError, KeyError, IndexError, RuntimeError, TypeError, ValueError, ArithmeticError)
+_STATUS_FORMAT_ERRORS = (AttributeError, KeyError, OSError, TypeError, ValueError, ArithmeticError)
 
 
 def _extract_client_field_value(client_data: Optional[ClientFieldData], key: str):
@@ -558,7 +573,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 interval=interval,
                 max_records=self.max_records,
             )
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             return None
         if candles_df is None or candles_df.empty:
             return None
@@ -669,7 +684,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         try:
             if explicit_fraction is not None and Decimal(str(explicit_fraction)) > 0:
                 return max(Decimal("0"), min(Decimal("1"), Decimal(str(explicit_fraction))))
-        except Exception:
+        except _DECIMAL_CONVERSION_ERRORS:
             pass
         if role == "scout":
             return self._effective_scout_fraction(context_bias)
@@ -704,7 +719,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 f"Trading rule unavailable | {self._controller_pair_log_prefix()} "
                 f"connector={self.config.connector_name}"
             )
-        except Exception as e:
+        except _PROVIDER_ERRORS as e:
             self.logger().warning(
                 f"Trading rule lookup failed | {self._controller_pair_log_prefix()} "
                 f"error={type(e).__name__}: {e}"
@@ -719,7 +734,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             value = getattr(rule, attr_name, Decimal("0")) or Decimal("0")
             decimal_value = Decimal(str(value))
             return decimal_value if decimal_value.is_finite() and decimal_value > 0 else Decimal("0")
-        except Exception:
+        except _DECIMAL_ATTRIBUTE_ERRORS:
             return Decimal("0")
 
     def _quantize_amount(self, amount: Decimal) -> Decimal:
@@ -731,7 +746,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     )
                 )
             )
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             return amount
 
     @staticmethod
@@ -902,7 +917,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         side = getattr(getattr(position, "side", None), "name", str(getattr(position, "side", "unknown")))
         try:
             breakeven = Decimal(str(getattr(position, "breakeven_price", "0"))).quantize(Decimal("1e-8"))
-        except Exception:
+        except _DECIMAL_CONVERSION_ERRORS:
             breakeven = Decimal("0")
         return f"{connector}|{pair}|{side}|{breakeven}"
 
@@ -1085,7 +1100,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             order_price = getattr(executor.config, "price", None)
             try:
                 order_price_decimal = Decimal(str(order_price)) if order_price is not None else None
-            except Exception:
+            except _DECIMAL_CONVERSION_ERRORS:
                 order_price_decimal = None
             if order_price_decimal is None or order_price_decimal <= 0:
                 continue
@@ -1123,7 +1138,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             order_price = getattr(executor_config, "price", None)
             try:
                 order_price_decimal = Decimal(str(order_price)) if order_price is not None else None
-            except Exception:
+            except _DECIMAL_CONVERSION_ERRORS:
                 order_price_decimal = None
             if order_price_decimal is None or order_price_decimal <= 0:
                 continue
@@ -1184,12 +1199,12 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 return available
         except AttributeError:
             pass
-        except Exception:
+        except _PROVIDER_ERRORS:
             pass
         try:
             raw_balance = self.market_data_provider.get_balance(self.config.connector_name, asset)
             return self._decimal_or_none(raw_balance)
-        except Exception:
+        except _PROVIDER_ERRORS:
             return None
 
     def _aggregate_held_inventory(self, side: TradeType = TradeType.BUY) -> AggregatedInventoryState:
@@ -1445,7 +1460,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                         f"reason={normalized_reason} {self._position_log_context()}"
                     ),
                 )
-        except Exception:
+        except _STATUS_FORMAT_ERRORS:
             pass
 
     @staticmethod
@@ -2309,7 +2324,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             atr = tr.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
             last_val = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else None
             return atr, last_val
-        except Exception:
+        except _INDICATOR_ERRORS:
             return None, None
 
     # -----------------------------------------------------------------------
@@ -2431,7 +2446,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             ):
                 if candidate is not None and float(candidate) > 0:
                     return Decimal(str(candidate))
-        except Exception:
+        except _DECIMAL_ATTRIBUTE_ERRORS:
             pass
         return None
 
@@ -2441,14 +2456,14 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 self.config.connector_name,
                 self.config.trading_pair,
             )
-        except Exception:
+        except _PROVIDER_ERRORS:
             return None
         try:
             tick_size = getattr(rule, "min_price_increment", None)
             tick = Decimal(str(tick_size)) if tick_size is not None else None
             if tick is not None and tick > 0:
                 return tick
-        except Exception:
+        except _DECIMAL_CONVERSION_ERRORS:
             return None
         return None
 
@@ -2487,7 +2502,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 price_type,
             )
             ref_price = Decimal(str(ref_price_val)) if ref_price_val is not None else fallback_price
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             ref_price = fallback_price
 
         tick = self._get_min_price_increment()
@@ -3060,7 +3075,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         try:
             if last_candle_ts is None and "timestamp" in df.columns and pd.notna(df["timestamp"].iloc[-1]):
                 last_candle_ts = float(df["timestamp"].iloc[-1])
-        except Exception:
+        except _INDICATOR_ERRORS:
             last_candle_ts = None
 
         last_close: Optional[float] = None
@@ -3085,7 +3100,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 last_rsi = float(df[rsi_col].iloc[-1]) if pd.notna(df[rsi_col].iloc[-1]) else None
                 if len(df) > 1 and pd.notna(df[rsi_col].iloc[-2]):
                     rsi_prev = float(df[rsi_col].iloc[-2])
-        except Exception as e:
+        except _INDICATOR_ERRORS as e:
             self.logger().error(
                 f"RSI error | {self._controller_pair_log_prefix()} error={type(e).__name__}: {e}",
                 exc_info=True,
@@ -3100,7 +3115,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 last_atr = atr_value
                 if last_close and last_close > 0:
                     atr_pct = atr_value / last_close
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         # --- EMAs ---
@@ -3113,7 +3128,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 ema_fast = float(df[ema_fast_col].iloc[-1])
             if ema_slow_col in df.columns and pd.notna(df[ema_slow_col].iloc[-1]):
                 ema_slow = float(df[ema_slow_col].iloc[-1])
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         # --- Bollinger Bands ---
@@ -3128,7 +3143,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 bb_upper = float(df[bbu_col].iloc[-1])
             if bbm_col in df.columns and pd.notna(df[bbm_col].iloc[-1]):
                 bb_mid = float(df[bbm_col].iloc[-1])
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         # --- MACD ---
@@ -3139,7 +3154,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 macd_hist = float(df[hist_col].iloc[-1])
                 if len(df) > 1 and pd.notna(df[hist_col].iloc[-2]):
                     macd_hist_prev = float(df[hist_col].iloc[-2])
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         self._latest_atr_pct = atr_pct
@@ -3181,7 +3196,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 level=logging.WARNING,
             )
             regime = None
-        except Exception as e:
+        except _INDICATOR_ERRORS as e:
             regime_error = f"{type(e).__name__}: {e}"
             self._log_signal_transition(
                 key="regime_error",
@@ -3212,12 +3227,12 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         mean_reversion_score: float = 0.0
         try:
             volume_ratio = calculate_volume_ratio(df)
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
         if last_rsi is not None:
             try:
                 mean_reversion_score = calculate_rsi_mean_reversion_score(last_rsi)
-            except Exception:
+            except (TypeError, ValueError, ArithmeticError):
                 pass
 
         # --- BUY reversal detection ---
@@ -3243,7 +3258,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     "was_oversold": bool(raw_reversal_series["was_oversold"].iloc[-1]),
                     "near_bottom": bool(raw_reversal_series["near_bottom"].iloc[-1]),
                 }
-        except Exception:
+        except _INDICATOR_ERRORS:
             raw_buy_reversal = False
 
         # --- Signal scoring (RSI is mandatory gate) ---
@@ -3407,7 +3422,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 signal_series = signal_frame["signal"]
                 df["signal_state"] = signal_frame["signal_state"]
             df["signal"] = signal_series
-        except Exception:
+        except _INDICATOR_ERRORS:
             if "signal" not in df.columns:
                 df["signal"] = 0
 
@@ -3580,7 +3595,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             atr_series, _ = self._compute_atr_series(df.copy(), self.config.atr_length)
             if atr_series is not None:
                 atr_pct = pd.to_numeric(atr_series, errors="coerce") / close.replace(0, pd.NA)
-        except Exception:
+        except _INDICATOR_ERRORS:
             atr_pct = pd.Series(index=df.index, dtype=float)
 
         condition_ok = pd.Series(True, index=df.index, dtype=bool)
@@ -4043,7 +4058,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 self.config.connector_name, self.config.trading_pair, PriceType.MidPrice,
             )
             new_price = Decimal(str(mp_val)) if mp_val is not None else None
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             new_price = None
         if new_price is None or new_price <= 0:
             self._record_gate_reason(target_side, "price_unavailable")
@@ -4203,7 +4218,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     delta = base_delta
                 if activation > 0 and delta > 0:
                     trailing_stop_cfg = TrailingStop(activation_price=activation, trailing_delta=delta)
-            except Exception as e:
+            except (TypeError, ValueError, ArithmeticError) as e:
                 self.logger().warning(
                     f"Trailing stop config failed | {self._controller_pair_log_prefix()} "
                     f"error={type(e).__name__}: {e}"
@@ -4251,7 +4266,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             current_price = self._get_mid_price()
             if current_price is None:
                 return actions
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             return actions
 
         now_ts = self.market_data_provider.time()

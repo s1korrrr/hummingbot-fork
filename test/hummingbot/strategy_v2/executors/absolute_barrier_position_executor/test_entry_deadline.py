@@ -8,8 +8,8 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 from pydantic import ValidationError
 
-from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.event.events import OrderCancelledEvent
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
 from hummingbot.strategy_v2.executors.absolute_barrier_position_executor.absolute_barrier_position_executor import (
     AbsoluteBarrierPositionExecutor,
 )
@@ -188,6 +188,28 @@ class TestAbsoluteBarrierEntryDeadline(TestCase):
         self.assertFalse(executor._entry_remainder_cancel_pending)
         self.assertTrue(executor._entry_remainder_cancelled)
         self.assertIsNone(executor._entry_remainder_cancel_requested_at)
+
+    def test_failure_event_after_partial_fill_retains_accounting_and_blocks_reentry(self) -> None:
+        executor = self.make_executor(current_timestamp=105.0)
+        open_order = TrackedOrder("OID-ENTRY")
+        open_order.order = MagicMock(is_open=False, is_filled=False, creation_timestamp=100.0)
+        executor._open_order = open_order
+        event = MarketOrderFailureEvent(
+            order_id="OID-ENTRY",
+            timestamp=105.0,
+            order_type=OrderType.LIMIT,
+        )
+        with patch.object(
+            AbsoluteBarrierPositionExecutor,
+            "open_filled_amount",
+            new_callable=PropertyMock,
+            return_value=Decimal("0.25"),
+        ):
+            executor.process_order_failed_event(0, MagicMock(), event)
+        self.assertIs(open_order, executor._open_order)
+        self.assertTrue(executor._entry_remainder_cancelled)
+        self.assertFalse(executor._entry_remainder_cancel_pending)
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
 
     def test_custom_info_contains_signed_deadline_and_remainder_state(self) -> None:
         executor = self.make_executor()

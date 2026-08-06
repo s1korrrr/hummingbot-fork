@@ -42,7 +42,11 @@ jobs:
               test/hummingbot/client/ui/*|\
               test/test_rsi_v5_audit_edge_cases.py|\
               test/test_rsi_v5_controller_import.py|\
+              test/test_rsi_v5_runtime.py|\
+              test/test_rsi_v5_hyperliquid.py|\
               controllers/directional_trading/rsi_v5.py|\
+              controllers/directional_trading/rsi_v5_runtime.py|\
+              controllers/directional_trading/rsi_v5_hyperliquid.py|\
               .github/workflows/*|\
               .github/actions/*)
                 ;;
@@ -66,23 +70,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Use cache's hashFiles function to check for changes in core code
       - name: Check for code changes
         id: program-changes
         uses: actions/cache@v3
         env:
-          # Increase this value to manually reset cache if program files have not changed
           CACHE_NUMBER: 0
         with:
-          path: README.md # placeholder file
+          path: README.md
           key: ${{ runner.os }}-build-${{ env.CACHE_NUMBER }}-${{ hashFiles('hummingbot/*', '**/*.py', '**/*.py*', '**/*.pxd', 'test/*') }}
 
-      # Check for setup/environment.yml changes
       - name: Cache conda dependencies
         id: conda-dependencies
         uses: actions/cache@v3
         env:
-          # Increase this value to manually reset cache if setup/environment.yml has not changed
           CONDA_CACHE_NUMBER: 0
         with:
           path: |
@@ -90,14 +90,12 @@ jobs:
             /usr/share/miniconda/envs
           key: ${{ runner.os }}-conda-${{ env.CONDA_CACHE_NUMBER }}-${{ hashFiles('setup/environment.yml') }}
 
-      # Install environment and Hummingbot
       - name: Install environment and Hummingbot
         uses: ./.github/actions/install_env_and_hb
         with:
           program-cache-hit: ${{steps.program-changes.outputs.cache-hit}}
           dependencies-cache-hit: ${{steps.conda-dependencies.outputs.cache-hit}}
 
-      # Compile and run tests if code has changed
       - name: Run pre-commit hooks on diff
         shell: bash
         if: |
@@ -118,6 +116,8 @@ jobs:
           coverage run -m pytest \
             test/hummingbot/client/ui/test_interface_utils.py \
             test/test_rsi_v5_audit_edge_cases.py \
+            test/test_rsi_v5_runtime.py \
+            test/test_rsi_v5_hyperliquid.py \
             -q --tb=short
 
       - name: Run stable tests and calculate coverage
@@ -154,7 +154,6 @@ jobs:
           coverage xml
           diff-cover --compare-branch=origin/$GITHUB_BASE_REF --fail-under=80 coverage.xml
 
-      # Notify results to discord
       - name: Discord Webhook Action
         id: discord-direct-webhook
         if: always() && github.event_name == 'pull_request'
@@ -164,7 +163,6 @@ jobs:
           webhook-url: ${{ secrets.WEBHOOK_URL }}
           raw-data: ${{ matrix.target }}-build_report.json
 
-      # Notify results to discord
       - uses: ruby/setup-ruby@v1
         if: github.event_name != 'pull_request' && steps.discord-direct-webhook.outcome == 'failure'
       - name: Send Webhook Notification

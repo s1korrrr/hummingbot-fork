@@ -39,7 +39,10 @@ class ExecutorExposure:
     def pending_notional(self, mark_price: Decimal) -> Decimal:
         if not self.active or self.side != "BUY" or self.executor_type != "position_executor":
             return _ZERO
-        conservative_price = max(_non_negative(mark_price), _non_negative(self.reference_price))
+        conservative_price = max(
+            _non_negative(mark_price),
+            _non_negative(self.reference_price),
+        )
         return self.pending_base * conservative_price
 
 
@@ -73,7 +76,7 @@ class EpisodeOutcome:
     ended_at: float
     executor_ids: tuple[str, ...]
     net_pnl_quote: Decimal
-    max_planned_notional: Decimal
+    total_planned_notional: Decimal
 
 
 @dataclass
@@ -104,42 +107,72 @@ class EpisodeTracker:
             )
         return self._episode.episode_id
 
-    def register_executor(self, executor_id: str, planned_notional: Decimal) -> None:
+    def register_executor(
+        self,
+        executor_id: str,
+        planned_notional: Decimal,
+    ) -> None:
         if self._episode is None:
-            raise RuntimeError("cannot register an executor without an open episode")
+            raise RuntimeError(
+                "cannot register an executor without an open episode"
+            )
         self._episode.planned_notional_by_executor.setdefault(
-            str(executor_id), _non_negative(Decimal(str(planned_notional)))
+            str(executor_id),
+            _non_negative(Decimal(str(planned_notional))),
         )
 
-    def record_executor_result(self, executor_id: str, net_pnl_quote: Decimal) -> None:
+    def record_executor_result(
+        self,
+        executor_id: str,
+        net_pnl_quote: Decimal,
+    ) -> bool:
         if self._episode is None:
-            return
+            return False
         executor_id = str(executor_id)
         if executor_id not in self._episode.planned_notional_by_executor:
-            self._episode.planned_notional_by_executor[executor_id] = _ZERO
+            return False
         self._episode.net_pnl_by_executor.setdefault(
-            executor_id, Decimal(str(net_pnl_quote))
+            executor_id,
+            Decimal(str(net_pnl_quote)),
         )
+        return True
 
-    def close_if_flat(self, *, is_flat: bool, timestamp: float) -> Optional[EpisodeOutcome]:
+    def close_if_flat(
+        self,
+        *,
+        is_flat: bool,
+        timestamp: float,
+    ) -> Optional[EpisodeOutcome]:
         episode = self._episode
         if episode is None or not is_flat:
             return None
-        if not episode.planned_notional_by_executor:
+        registered_ids = set(episode.planned_notional_by_executor)
+        if not registered_ids:
+            return None
+        if registered_ids != set(episode.net_pnl_by_executor):
             return None
         outcome = EpisodeOutcome(
             episode_id=episode.episode_id,
             started_at=episode.started_at,
             ended_at=float(timestamp),
-            executor_ids=tuple(sorted(episode.planned_notional_by_executor)),
-            net_pnl_quote=sum(episode.net_pnl_by_executor.values(), _ZERO),
-            max_planned_notional=sum(episode.planned_notional_by_executor.values(), _ZERO),
+            executor_ids=tuple(sorted(registered_ids)),
+            net_pnl_quote=sum(
+                episode.net_pnl_by_executor.values(),
+                _ZERO,
+            ),
+            total_planned_notional=sum(
+                episode.planned_notional_by_executor.values(),
+                _ZERO,
+            ),
         )
         self._episode = None
         return outcome
 
 
-def build_exit_plan(executors: Iterable[ExecutorExposure], reason: str) -> ExitPlan:
+def build_exit_plan(
+    executors: Iterable[ExecutorExposure],
+    reason: str,
+) -> ExitPlan:
     executor_ids = tuple(
         executor.executor_id
         for executor in executors
@@ -147,7 +180,10 @@ def build_exit_plan(executors: Iterable[ExecutorExposure], reason: str) -> ExitP
         and executor.side == "BUY"
         and executor.executor_type == "position_executor"
     )
-    return ExitPlan(executor_ids=executor_ids, reason=str(reason))
+    return ExitPlan(
+        executor_ids=executor_ids,
+        reason=str(reason),
+    )
 
 
 def calculate_exposure(
@@ -161,18 +197,30 @@ def calculate_exposure(
     return ExposureSnapshot(
         held_notional=_non_negative(Decimal(str(held_notional))),
         filled_notional=sum(
-            (executor.filled_notional(Decimal(str(mark_price))) for executor in executor_list),
+            (
+                executor.filled_notional(Decimal(str(mark_price)))
+                for executor in executor_list
+            ),
             _ZERO,
         ),
         pending_notional=sum(
-            (executor.pending_notional(Decimal(str(mark_price))) for executor in executor_list),
+            (
+                executor.pending_notional(Decimal(str(mark_price)))
+                for executor in executor_list
+            ),
             _ZERO,
         ),
-        proposed_notional=_non_negative(Decimal(str(proposed_notional))),
+        proposed_notional=_non_negative(
+            Decimal(str(proposed_notional))
+        ),
     )
 
 
-def update_loss_streak(*, current_streak: int, outcome: Optional[EpisodeOutcome]) -> int:
+def update_loss_streak(
+    *,
+    current_streak: int,
+    outcome: Optional[EpisodeOutcome],
+) -> int:
     if outcome is None:
         return max(0, int(current_streak))
     if outcome.net_pnl_quote < _ZERO:

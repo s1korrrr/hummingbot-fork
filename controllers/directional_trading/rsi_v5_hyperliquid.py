@@ -22,9 +22,16 @@ from controllers.directional_trading.rsi_v5_runtime import (
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.rsi_position_executor import (
+    RSIPositionExecutorConfig,
+    register_rsi_position_executor,
+)
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
 
 _ZERO = Decimal("0")
+_POSITION_EXECUTOR_TYPES = {"position_executor", "rsi_position_executor"}
+
+register_rsi_position_executor()
 
 
 class RSIv5HyperliquidControllerConfig(RSIv5ControllerConfig):
@@ -197,7 +204,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
             executors=self.executors_info,
             filter_func=lambda executor: (
                 executor.is_active
-                and executor.type == "position_executor"
+                and executor.type in _POSITION_EXECUTOR_TYPES
                 and executor.connector_name == self.config.connector_name
                 and executor.trading_pair == self.config.trading_pair
                 and executor.side == TradeType.BUY
@@ -503,12 +510,15 @@ class RSIv5HyperliquidController(RSIv5Controller):
                 "stop_loss_order_type": OrderType.MARKET,
             }
         )
-        executor_config = executor_config.model_copy(
-            update={
+        payload = executor_config.model_dump()
+        payload.update(
+            {
+                "type": "rsi_position_executor",
                 "triple_barrier_config": triple_barrier,
                 "leverage": self.config.leverage,
             }
         )
+        executor_config = RSIPositionExecutorConfig.model_validate(payload)
         self._register_created_executor(executor_config)
         return executor_config
 

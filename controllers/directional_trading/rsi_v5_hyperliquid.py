@@ -26,21 +26,21 @@ from hummingbot.strategy_v2.executors.rsi_position_executor import (
     RSIPositionExecutorConfig,
     register_rsi_position_executor,
 )
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
 
 _ZERO = Decimal("0")
-_POSITION_EXECUTOR_TYPES = {"position_executor", "rsi_position_executor"}
+_POSITION_EXECUTOR_TYPES = {"position_executor"}
 
 register_rsi_position_executor()
 
 
 class RSIv5HyperliquidControllerConfig(RSIv5ControllerConfig):
-    """Hyperliquid-perpetual safety profile for RSI v5.
+    """Fail-closed Hyperliquid-perpetual safety profile for RSI v5.
 
-    The controller intentionally forbids controller-created opposite-side SELL
-    executors for active positions. Deterministic exits stop the PositionExecutor
-    that owns each entry/fill, allowing that executor to close its exact residual
-    amount with the runtime's perpetual close semantics.
+    Active entry executors own their residual exposure. Deterministic exits stop
+    each owning executor; the controller never creates an aggregate opposite-side
+    SELL executor against exposure still managed by a PositionExecutor.
     """
 
     controller_name: str = "rsi_v5_hyperliquid"
@@ -169,7 +169,7 @@ class RSIv5HyperliquidControllerConfig(RSIv5ControllerConfig):
 
 
 class RSIv5HyperliquidController(RSIv5Controller):
-    """RSI v5 adapter whose active perpetual exits remain executor-owned."""
+    """RSI v5 adapter with executor-owned perpetual exits and episode accounting."""
 
     def __init__(self, config: RSIv5HyperliquidControllerConfig, *args, **kwargs):
         self._episode_tracker = EpisodeTracker()
@@ -199,15 +199,44 @@ class RSIv5HyperliquidController(RSIv5Controller):
             return str(value.name)
         return str(value or "").replace("TradeType.", "").upper()
 
-    def _active_buy_position_executors(self) -> List[object]:
+    @staticmethod
+    def _executor_is_done(executor: object) -> bool:
+        explicit = getattr(executor, "is_done", None)
+        if isinstance(explicit, bool):
+            return explicit
+        return getattr(executor, "status", None) == RunnableStatus.TERMINATED
+
+    def _matches_buy_position_executor(self, executor: object) -> bool:
+        return bool(
+            getattr(executor, "type", None) in _POSITION_EXECUTOR_TYPES
+            and getattr(executor, "connector_name", None) == self.config.connector_name
+            and getattr(executor, "trading_pair", None) == self.config.trading_pair
+            and getattr(executor, "side", None) == TradeType.BUY
+        )
+
+    def _owned_buy_position_executors(self) -> List[object]:
+        """Executors that still own open or closing exposure.
+
+        ``ExecutorInfo.is_active`` becomes false as soon as an executor enters
+        ``SHUTTING_DOWN``. Its filled amount remains economic exposure until the
+        executor terminates, so risk, cost basis, and episode flatness use this
+        broader ownership view.
+        """
         return self.filter_executors(
             executors=self.executors_info,
             filter_func=lambda executor: (
-                executor.is_active
-                and executor.type in _POSITION_EXECUTOR_TYPES
-                and executor.connector_name == self.config.connector_name
-                and executor.trading_pair == self.config.trading_pair
-                and executor.side == TradeType.BUY
+                self._matches_buy_position_executor(executor)
+                and not self._executor_is_done(executor)
+            ),
+        )
+
+    def _active_buy_position_executors(self) -> List[object]:
+        """Executors that can still accept a StopExecutorAction."""
+        return self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda executor: (
+                self._matches_buy_position_executor(executor)
+                and bool(getattr(executor, "is_active", False))
             ),
         )
 
@@ -238,11 +267,18 @@ class RSIv5HyperliquidController(RSIv5Controller):
         if filled_quote <= _ZERO and filled_base > _ZERO:
             filled_quote = filled_base * max(reference_price, _ZERO)
 
+        done = self._executor_is_done(executor)
+        is_stoppable = bool(getattr(executor, "is_active", False))
+        if not is_stoppable and not done:
+            # Entry cancellation has begun. Preserve only filled exposure; the
+            # unfilled remainder is no longer a valid pending-risk reservation.
+            configured_base = filled_base
+
         return ExecutorExposure(
             executor_id=str(getattr(executor, "id", "")),
             side=self._side_name(getattr(executor, "side", None)),
             executor_type=str(getattr(executor, "type", "")),
-            active=bool(getattr(executor, "is_active", False)),
+            active=not done,
             configured_base=max(configured_base, _ZERO),
             filled_base=max(filled_base, _ZERO),
             filled_quote=max(filled_quote, _ZERO),
@@ -250,13 +286,14 @@ class RSIv5HyperliquidController(RSIv5Controller):
             net_pnl_quote=self._decimal(
                 getattr(executor, "net_pnl_quote", _ZERO)
             ),
-            done=not bool(getattr(executor, "is_active", False)),
+            done=done,
         )
 
     def _active_executor_exposures(self) -> Tuple[ExecutorExposure, ...]:
+        # Compatibility name retained for the existing RSI v5 status surface.
         return tuple(
             self._executor_exposure(executor)
-            for executor in self._active_buy_position_executors()
+            for executor in self._owned_buy_position_executors()
         )
 
     def _active_buy_filled_amount(self) -> Decimal:
@@ -271,8 +308,8 @@ class RSIv5HyperliquidController(RSIv5Controller):
         return base, self.config.collateral_asset
 
     def _get_base_balance(self) -> Optional[Decimal]:
-        # A perpetual held position is closable by its position amount; spot-wallet
-        # base balance is not a valid source of truth for that close capacity.
+        # Perpetual close capacity is the position amount, not a spot-wallet base
+        # balance. The execution connector owns final reduce-only validation.
         return self._position_amount(TradeType.BUY)
 
     def _has_buy_inventory(self) -> bool:
@@ -352,7 +389,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
         fees = held.cum_fees_quote + sum(
             (
                 self._decimal(getattr(executor, "cum_fees_quote", _ZERO))
-                for executor in self._active_buy_position_executors()
+                for executor in self._owned_buy_position_executors()
             ),
             _ZERO,
         )
@@ -362,9 +399,9 @@ class RSIv5HyperliquidController(RSIv5Controller):
         return (((current_price - cost_basis) * total_amount) - fees) / cost_quote
 
     def _sync_episode_tracker(self) -> None:
-        active_executors = self._active_buy_position_executors()
+        owned_executors = self._owned_buy_position_executors()
         held_amount = self._position_amount(TradeType.BUY)
-        if not active_executors and held_amount <= _ZERO:
+        if not owned_executors and held_amount <= _ZERO:
             return
 
         if not self._episode_tracker.is_open:
@@ -376,7 +413,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
                         self.market_data_provider.time(),
                     )
                 )
-                for executor in active_executors
+                for executor in owned_executors
             ]
             self._episode_tracker.open(
                 timestamp=min(
@@ -385,7 +422,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
                 )
             )
 
-        for executor in active_executors:
+        for executor in owned_executors:
             exposure = self._executor_exposure(executor)
             planned_notional = (
                 exposure.configured_base * max(exposure.reference_price, _ZERO)
@@ -433,7 +470,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
             else self.market_data_provider.time()
         )
         is_flat = (
-            not self._active_buy_position_executors()
+            not self._owned_buy_position_executors()
             and self._position_amount(TradeType.BUY) <= _ZERO
         )
         outcome = self._episode_tracker.close_if_flat(
@@ -467,6 +504,12 @@ class RSIv5HyperliquidController(RSIv5Controller):
                 TradeType.SELL,
                 "executor_owned_exit",
             )
+            return False
+        if signal > 0 and any(
+            not bool(getattr(executor, "is_active", False))
+            for executor in self._owned_buy_position_executors()
+        ):
+            self._record_gate_reason(TradeType.BUY, "exit_pending")
             return False
         if (
             signal > 0
@@ -513,7 +556,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
         payload = executor_config.model_dump()
         payload.update(
             {
-                "type": "rsi_position_executor",
+                "type": "position_executor",
                 "triple_barrier_config": triple_barrier,
                 "leverage": self.config.leverage,
             }
@@ -541,20 +584,20 @@ class RSIv5HyperliquidController(RSIv5Controller):
         existing_stop_ids: set[str],
         reason: str,
     ) -> List[StopExecutorAction]:
-        active_executors = self._active_buy_position_executors()
-        active_ids = {
+        stoppable_executors = self._active_buy_position_executors()
+        stoppable_ids = {
             str(getattr(executor, "id", ""))
-            for executor in active_executors
+            for executor in stoppable_executors
         }
         self._exit_request_timestamps = {
             executor_id: timestamp
             for executor_id, timestamp in self._exit_request_timestamps.items()
-            if executor_id in active_ids
+            if executor_id in stoppable_ids
         }
         plan = build_exit_plan(
             (
                 self._executor_exposure(executor)
-                for executor in active_executors
+                for executor in stoppable_executors
             ),
             reason=reason,
         )

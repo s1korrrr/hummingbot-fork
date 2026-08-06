@@ -39,7 +39,9 @@ jobs:
             [ -z "$file" ] && continue
             case "$file" in
               hummingbot/client/ui/*|\
+              hummingbot/strategy_v2/executors/rsi_position_executor/*|\
               test/hummingbot/client/ui/*|\
+              test/rsi_v5/*|\
               test/test_rsi_v5_audit_edge_cases.py|\
               test/test_rsi_v5_controller_import.py|\
               test/test_rsi_v5_runtime.py|\
@@ -118,6 +120,7 @@ jobs:
             test/test_rsi_v5_audit_edge_cases.py \
             test/test_rsi_v5_runtime.py \
             test/test_rsi_v5_hyperliquid.py \
+            test/rsi_v5/test_position_executor_contract.py \
             -q --tb=short
 
       - name: Run stable tests and calculate coverage

@@ -9,11 +9,11 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
-from hummingbot.strategy_v2.executors.position_executor.data_types import (
-    PositionExecutorConfig,
-    TripleBarrierConfig,
+from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
+from hummingbot.strategy_v2.executors.rsi_position_executor import (
+    RSIPositionExecutor,
+    RSIPositionExecutorConfig,
 )
-from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
@@ -48,8 +48,12 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
             min_notional_size=Decimal("5"),
         )
 
-    def _config(self, executor_id: str, amount: Decimal = Decimal("1")) -> PositionExecutorConfig:
-        return PositionExecutorConfig(
+    def _config(
+        self,
+        executor_id: str,
+        amount: Decimal = Decimal("1"),
+    ) -> RSIPositionExecutorConfig:
+        return RSIPositionExecutorConfig(
             id=executor_id,
             controller_id="btc-rsi-v5-hyperliquid",
             timestamp=1_700_000_000.0,
@@ -67,13 +71,22 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
             ),
         )
 
-    def _executor(self, executor_id: str, amount: Decimal = Decimal("1"), max_retries: int = 3) -> PositionExecutor:
-        with patch.object(PositionExecutor, "get_trading_rules", return_value=self.trading_rule), patch.object(
-            PositionExecutor,
+    def _executor(
+        self,
+        executor_id: str,
+        amount: Decimal = Decimal("1"),
+        max_retries: int = 3,
+    ) -> RSIPositionExecutor:
+        with patch.object(
+            RSIPositionExecutor,
+            "get_trading_rules",
+            return_value=self.trading_rule,
+        ), patch.object(
+            RSIPositionExecutor,
             "get_price",
             return_value=Decimal("100"),
         ):
-            executor = PositionExecutor(
+            executor = RSIPositionExecutor(
                 strategy=self.strategy,
                 config=self._config(executor_id, amount),
                 max_retries=max_retries,
@@ -83,7 +96,7 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
 
     @staticmethod
     def _open_order(
-        executor: PositionExecutor,
+        executor: RSIPositionExecutor,
         *,
         order_id: str,
         configured_amount: Decimal,
@@ -113,12 +126,22 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
                     fill_base_amount=fill_amount,
                     fill_quote_amount=fill_amount * Decimal("100"),
                     fee=AddedToCostTradeFee(
-                        flat_fees=[TokenAmount(token="USDC", amount=Decimal("0.01"))]
+                        flat_fees=[
+                            TokenAmount(
+                                token="USDC",
+                                amount=Decimal("0.01"),
+                            )
+                        ]
                     ),
                     fill_timestamp=1_700_000_001.0,
                 )
             )
         executor._open_order = tracked
+
+    def test_executor_config_uses_isolated_orchestrator_type(self):
+        config = self._config("typed")
+
+        self.assertEqual(config.type, "rsi_position_executor")
 
     async def test_early_stop_unfilled_entry_cancels_without_close_order(self):
         executor = self._executor("unfilled")
@@ -188,6 +211,10 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
         self.assertEqual(executor.open_filled_amount, Decimal("0.4"))
         self.assertEqual(executor.amount_to_close, Decimal("0.4"))
         self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        self.assertEqual(
+            executor.get_custom_info()["archived_open_order_ids"],
+            ["OPEN-PARTIAL"],
+        )
 
     async def test_early_stop_filled_entry_places_owner_close_immediately(self):
         executor = self._executor("filled")
@@ -235,10 +262,22 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
             await scout.control_task()
             await runner.control_task()
 
-        close_amounts = [call.args[2] for call in self.strategy.sell.call_args_list]
-        close_actions = [call.args[5] for call in self.strategy.sell.call_args_list]
-        self.assertEqual(close_amounts, [Decimal("0.4"), Decimal("0.6")])
-        self.assertEqual(close_actions, [PositionAction.CLOSE, PositionAction.CLOSE])
+        close_amounts = [
+            call.args[2]
+            for call in self.strategy.sell.call_args_list
+        ]
+        close_actions = [
+            call.args[5]
+            for call in self.strategy.sell.call_args_list
+        ]
+        self.assertEqual(
+            close_amounts,
+            [Decimal("0.4"), Decimal("0.6")],
+        )
+        self.assertEqual(
+            close_actions,
+            [PositionAction.CLOSE, PositionAction.CLOSE],
+        )
 
     async def test_failed_close_is_retried_for_same_residual_amount(self):
         executor = self._executor("retry", max_retries=3)
@@ -267,6 +306,12 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
         with patch.object(executor, "_sleep", new=AsyncMock()):
             await executor.control_task()
 
-        close_amounts = [call.args[2] for call in self.strategy.sell.call_args_list]
-        self.assertEqual(close_amounts, [Decimal("0.25"), Decimal("0.25")])
+        close_amounts = [
+            call.args[2]
+            for call in self.strategy.sell.call_args_list
+        ]
+        self.assertEqual(
+            close_amounts,
+            [Decimal("0.25"), Decimal("0.25")],
+        )
         self.assertEqual(executor.close_type, CloseType.EARLY_STOP)

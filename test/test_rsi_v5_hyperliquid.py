@@ -39,7 +39,9 @@ def make_provider(mark: Decimal = Decimal("100")):
         min_notional_size=Decimal("5"),
         min_order_value=Decimal("5"),
     )
-    provider.quantize_order_amount.side_effect = lambda connector, pair, amount: amount
+    provider.quantize_order_amount.side_effect = (
+        lambda connector, pair, amount: amount
+    )
     return provider
 
 
@@ -50,12 +52,13 @@ def active_buy(
     filled_base: str = "0",
     filled_quote: str = "0",
     entry_price: str = "100",
+    executor_type: str = "rsi_position_executor",
 ):
     return SimpleNamespace(
         id=executor_id,
         is_active=True,
         is_trading=Decimal(filled_base) > 0,
-        type="position_executor",
+        type=executor_type,
         connector_name="hyperliquid_perpetual",
         trading_pair="BTC-USD",
         side=TradeType.BUY,
@@ -102,12 +105,17 @@ class TestRSIv5HyperliquidController:
         controller.executors_info = []
         controller.processed_data = {
             "signal": 0,
-            "signal_state": {"condition_ok": True, "sell_reason": "rsi-reversal"},
+            "signal_state": {
+                "condition_ok": True,
+                "sell_reason": "rsi-reversal",
+            },
         }
         return controller
 
     def test_defaults_are_hyperliquid_oneway_and_no_position_hold(self):
-        from controllers.directional_trading.rsi_v5_hyperliquid import RSIv5HyperliquidControllerConfig
+        from controllers.directional_trading.rsi_v5_hyperliquid import (
+            RSIv5HyperliquidControllerConfig,
+        )
 
         config = RSIv5HyperliquidControllerConfig(id="defaults")
 
@@ -130,13 +138,17 @@ class TestRSIv5HyperliquidController:
         ],
     )
     def test_unsafe_perpetual_configuration_is_rejected(self, overrides):
-        from controllers.directional_trading.rsi_v5_hyperliquid import RSIv5HyperliquidControllerConfig
+        from controllers.directional_trading.rsi_v5_hyperliquid import (
+            RSIv5HyperliquidControllerConfig,
+        )
 
         with pytest.raises(Exception):
             RSIv5HyperliquidControllerConfig(id="invalid", **overrides)
 
     def test_active_partial_fill_counts_as_inventory_and_reserves_pending_notional(self):
-        controller = self.build_controller(provider=make_provider(Decimal("110")))
+        controller = self.build_controller(
+            provider=make_provider(Decimal("110"))
+        )
         controller.executors_info = [
             active_buy(
                 "partial",
@@ -149,12 +161,36 @@ class TestRSIv5HyperliquidController:
 
         assert controller._has_buy_inventory() is True
         assert controller._get_position_cost_basis() == Decimal("100")
-        assert controller._get_active_buy_executor_position_value_usd() == Decimal("44")
-        assert controller._get_pending_buy_executor_notional_usd() == Decimal("66")
+        assert (
+            controller._get_active_buy_executor_position_value_usd()
+            == Decimal("44")
+        )
+        assert (
+            controller._get_pending_buy_executor_notional_usd()
+            == Decimal("66")
+        )
+        assert controller._get_total_position_value_usd() == Decimal("110")
+
+    def test_legacy_position_executor_is_included_during_migration(self):
+        controller = self.build_controller(
+            provider=make_provider(Decimal("110"))
+        )
+        controller.executors_info = [
+            active_buy(
+                "legacy",
+                filled_base="0.4",
+                filled_quote="40",
+                executor_type="position_executor",
+            )
+        ]
+
+        assert controller._has_buy_inventory() is True
         assert controller._get_total_position_value_usd() == Decimal("110")
 
     def test_executor_exposure_recovers_fill_amount_when_custom_base_field_is_missing(self):
-        controller = self.build_controller(provider=make_provider(Decimal("110")))
+        controller = self.build_controller(
+            provider=make_provider(Decimal("110"))
+        )
         executor = active_buy(
             "fallback",
             configured_base="1",
@@ -183,17 +219,34 @@ class TestRSIv5HyperliquidController:
 
         actions = controller.stop_actions_proposal()
 
-        exit_actions = [action for action in actions if isinstance(action, StopExecutorAction)]
-        assert {action.executor_id for action in exit_actions} == {"unfilled", "partial", "filled"}
+        exit_actions = [
+            action
+            for action in actions
+            if isinstance(action, StopExecutorAction)
+        ]
+        assert {action.executor_id for action in exit_actions} == {
+            "unfilled",
+            "partial",
+            "filled",
+        }
         assert all(action.keep_position is False for action in exit_actions)
         assert controller.can_create_executor(-1) is False
         with pytest.raises(RuntimeError, match="owning PositionExecutor"):
-            controller.get_executor_config(TradeType.SELL, Decimal("100"), Decimal("1"))
+            controller.get_executor_config(
+                TradeType.SELL,
+                Decimal("100"),
+                Decimal("1"),
+            )
 
     def test_exit_request_is_idempotent_until_retry_interval(self):
         provider = make_provider()
-        controller = self.build_controller(provider=provider, executor_exit_retry_seconds=5)
-        controller.executors_info = [active_buy("filled", filled_base="1", filled_quote="100")]
+        controller = self.build_controller(
+            provider=provider,
+            executor_exit_retry_seconds=5,
+        )
+        controller.executors_info = [
+            active_buy("filled", filled_base="1", filled_quote="100")
+        ]
         controller.processed_data["signal"] = -1
 
         first = controller.stop_actions_proposal()
@@ -201,17 +254,49 @@ class TestRSIv5HyperliquidController:
         provider.time.return_value += 5
         retry = controller.stop_actions_proposal()
 
-        assert [a.executor_id for a in first if isinstance(a, StopExecutorAction)] == ["filled"]
-        assert [a.executor_id for a in second if isinstance(a, StopExecutorAction)] == []
-        assert [a.executor_id for a in retry if isinstance(a, StopExecutorAction)] == ["filled"]
+        assert [
+            action.executor_id
+            for action in first
+            if isinstance(action, StopExecutorAction)
+        ] == ["filled"]
+        assert [
+            action.executor_id
+            for action in second
+            if isinstance(action, StopExecutorAction)
+        ] == []
+        assert [
+            action.executor_id
+            for action in retry
+            if isinstance(action, StopExecutorAction)
+        ] == ["filled"]
 
-    def test_buy_executor_has_deterministic_hard_stop(self):
-        controller = self.build_controller(perpetual_hard_stop_loss_pct=Decimal("0.08"))
-        config = controller.get_executor_config(TradeType.BUY, Decimal("100"), Decimal("0.3"))
+    def test_buy_executor_uses_registered_partial_fill_safe_type_and_hard_stop(self):
+        from hummingbot.strategy_v2.executors.executor_orchestrator import (
+            ExecutorOrchestrator,
+        )
+        from hummingbot.strategy_v2.executors.rsi_position_executor import (
+            RSIPositionExecutor,
+            RSIPositionExecutorConfig,
+        )
 
+        controller = self.build_controller(
+            perpetual_hard_stop_loss_pct=Decimal("0.08")
+        )
+        config = controller.get_executor_config(
+            TradeType.BUY,
+            Decimal("100"),
+            Decimal("0.3"),
+        )
+
+        assert isinstance(config, RSIPositionExecutorConfig)
+        assert config.type == "rsi_position_executor"
         assert config.connector_name == "hyperliquid_perpetual"
         assert config.leverage == 1
         assert config.triple_barrier_config.stop_loss == Decimal("0.08")
+        assert (
+            ExecutorOrchestrator._executor_mapping["rsi_position_executor"]
+            is RSIPositionExecutor
+        )
 
     def test_perpetual_held_position_uses_position_amount_not_spot_wallet_balance(self):
         provider = make_provider()
@@ -238,12 +323,22 @@ class TestRSIv5HyperliquidController:
     def test_loss_streak_changes_once_for_aggregate_episode(self):
         controller = self.build_controller()
         controller._episode_tracker.open(timestamp=100)
-        controller._episode_tracker.register_executor("scout", Decimal("30"))
-        controller._episode_tracker.register_executor("runner", Decimal("70"))
+        controller._episode_tracker.register_executor(
+            "scout",
+            Decimal("30"),
+        )
+        controller._episode_tracker.register_executor(
+            "runner",
+            Decimal("70"),
+        )
         controller._consecutive_losses = 2
 
-        controller._track_executor_result(SimpleNamespace(id="scout", net_pnl_quote=Decimal("2")))
-        controller._track_executor_result(SimpleNamespace(id="runner", net_pnl_quote=Decimal("-5")))
+        controller._track_executor_result(
+            SimpleNamespace(id="scout", net_pnl_quote=Decimal("2"))
+        )
+        controller._track_executor_result(
+            SimpleNamespace(id="runner", net_pnl_quote=Decimal("-5"))
+        )
         controller.executors_info = []
         controller.positions_held = []
         controller._finalize_episode_if_flat(timestamp=130)

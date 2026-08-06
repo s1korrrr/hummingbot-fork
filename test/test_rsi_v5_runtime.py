@@ -89,8 +89,36 @@ def test_episode_aggregates_executor_results_before_updating_loss_streak():
     assert outcome.episode_id == episode_id
     assert outcome.net_pnl_quote == Decimal("-3")
     assert outcome.executor_ids == ("runner", "scout")
-    assert outcome.max_planned_notional == Decimal("100")
+    assert outcome.total_planned_notional == Decimal("100")
     assert update_loss_streak(current_streak=2, outcome=outcome) == 3
+
+
+def test_episode_waits_for_every_registered_executor_result_even_when_flat():
+    tracker = EpisodeTracker()
+    tracker.open(timestamp=100.0)
+    tracker.register_executor("scout", planned_notional=Decimal("30"))
+    tracker.register_executor("runner", planned_notional=Decimal("70"))
+    tracker.record_executor_result("scout", net_pnl_quote=Decimal("2"))
+
+    assert tracker.close_if_flat(is_flat=True, timestamp=130.0) is None
+
+    tracker.record_executor_result("runner", net_pnl_quote=Decimal("0"))
+    assert tracker.close_if_flat(is_flat=True, timestamp=131.0) is not None
+
+
+def test_unregistered_historical_executor_result_is_ignored():
+    tracker = EpisodeTracker()
+    tracker.open(timestamp=100.0)
+    tracker.register_executor("current", planned_notional=Decimal("30"))
+
+    assert tracker.record_executor_result("historical", net_pnl_quote=Decimal("-999")) is False
+    assert tracker.record_executor_result("current", net_pnl_quote=Decimal("1")) is True
+
+    outcome = tracker.close_if_flat(is_flat=True, timestamp=130.0)
+
+    assert outcome is not None
+    assert outcome.executor_ids == ("current",)
+    assert outcome.net_pnl_quote == Decimal("1")
 
 
 def test_profitable_episode_resets_loss_streak_but_zero_episode_does_not():

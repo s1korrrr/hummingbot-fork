@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
@@ -31,6 +32,7 @@ class TestAbsoluteBarrierPositionExecutor(TestCase):
             trading_pair="BTC-USD",
             side=side,
             entry_price=Decimal(entry),
+            entry_deadline=datetime.fromtimestamp(61, tz=UTC),
             amount=Decimal("1"),
             triple_barrier_config=AbsoluteBarrierConfig(
                 stop_loss_price=Decimal(stop),
@@ -56,7 +58,10 @@ class TestAbsoluteBarrierPositionExecutor(TestCase):
             min_order_size=Decimal("0.1"),
             min_notional_size=Decimal("1"),
         )
+        executor._strategy = SimpleNamespace(current_timestamp=1)
         executor._open_order = MagicMock()
+        executor._entry_remainder_cancel_pending = False
+        executor._entry_remainder_cancelled = False
         return executor
 
     def test_constructor_keeps_absolute_config_type(self):
@@ -66,6 +71,8 @@ class TestAbsoluteBarrierPositionExecutor(TestCase):
         ) as validate:
             executor = AbsoluteBarrierPositionExecutor(MagicMock(), config)
         self.assertIs(config, executor.config)
+        self.assertFalse(executor._entry_remainder_cancel_pending)
+        self.assertFalse(executor._entry_remainder_cancelled)
         validate.assert_called_once_with()
 
     def test_tick_alignment_fails_closed(self):
@@ -166,4 +173,5 @@ class TestAbsoluteBarrierPositionExecutor(TestCase):
         self.assertEqual("ABSOLUTE", custom_info["barrier_mode"])
         self.assertEqual(Decimal("102"), custom_info["absolute_stop_loss_price"])
         self.assertEqual(Decimal("96"), custom_info["absolute_take_profit_price"])
+        self.assertEqual("1970-01-01T00:01:01Z", custom_info["entry_deadline"])
         self.assertTrue(custom_info["existing"])

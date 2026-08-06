@@ -6,7 +6,7 @@ from typing import Dict
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.event.events import OrderCancelledEvent
+from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
 from hummingbot.strategy_v2.executors.absolute_barrier_position_executor.data_types import (
     AbsoluteBarrierPositionExecutorConfig,
 )
@@ -122,6 +122,18 @@ class AbsoluteBarrierPositionExecutor(PositionExecutor):
             )
             return
         super().process_order_canceled_event(_, market, event)
+
+    def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
+        if self._open_order and event.order_id == self._open_order.order_id and self.open_filled_amount > Decimal("0"):
+            self._mark_entry_remainder_cancelled()
+            self.logger().error(
+                self._log_message(
+                    "Entry order failed after a partial fill; retaining tracked entry and blocking replacement "
+                    f"order_id={event.order_id} filled_amount={self.open_filled_amount}"
+                )
+            )
+            return
+        super().process_order_failed_event(_, market, event)
 
     @property
     def stop_loss_price(self) -> Decimal:

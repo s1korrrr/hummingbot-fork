@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from hummingbot.core.data_type.common import PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import PositionMode, TradeType
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
@@ -64,6 +64,7 @@ def active_buy(
         close_type=None,
         net_pnl_pct=Decimal("0"),
         net_pnl_quote=Decimal("0"),
+        cum_fees_quote=Decimal("0"),
         filled_amount_quote=Decimal(filled_quote),
         config=SimpleNamespace(
             amount=Decimal(configured_base),
@@ -150,6 +151,25 @@ class TestRSIv5HyperliquidController:
         assert controller._get_position_cost_basis() == Decimal("100")
         assert controller._get_active_buy_executor_position_value_usd() == Decimal("44")
         assert controller._get_pending_buy_executor_notional_usd() == Decimal("66")
+        assert controller._get_total_position_value_usd() == Decimal("110")
+
+    def test_executor_exposure_recovers_fill_amount_when_custom_base_field_is_missing(self):
+        controller = self.build_controller(provider=make_provider(Decimal("110")))
+        executor = active_buy(
+            "fallback",
+            configured_base="1",
+            filled_base="0",
+            filled_quote="40",
+            entry_price="100",
+        )
+        executor.custom_info.pop("open_order_filled_amount_base")
+        executor.custom_info.pop("open_order_filled_amount_quote")
+        controller.executors_info = [executor]
+
+        exposure = controller._executor_exposure(executor)
+
+        assert exposure.filled_base == Decimal("0.4")
+        assert exposure.pending_base == Decimal("0.6")
         assert controller._get_total_position_value_usd() == Decimal("110")
 
     def test_rsi_exit_stops_every_owning_buy_executor_without_creating_sell_executor(self):

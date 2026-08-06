@@ -10,8 +10,13 @@ from pydantic import ValidationError
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.event.events import OrderCancelledEvent
-from hummingbot.strategy_v2.executors.absolute_barrier_position_executor.absolute_barrier_position_executor import AbsoluteBarrierPositionExecutor
-from hummingbot.strategy_v2.executors.absolute_barrier_position_executor.data_types import AbsoluteBarrierConfig, AbsoluteBarrierPositionExecutorConfig
+from hummingbot.strategy_v2.executors.absolute_barrier_position_executor.absolute_barrier_position_executor import (
+    AbsoluteBarrierPositionExecutor,
+)
+from hummingbot.strategy_v2.executors.absolute_barrier_position_executor.data_types import (
+    AbsoluteBarrierConfig,
+    AbsoluteBarrierPositionExecutorConfig,
+)
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
@@ -49,6 +54,8 @@ class TestAbsoluteBarrierEntryDeadline(TestCase):
         executor._failed_orders = []
         executor._entry_remainder_cancel_pending = False
         executor._entry_remainder_cancelled = False
+        executor._entry_remainder_cancel_requested_at = None
+        executor._entry_cancel_retry_seconds = 5.0
         executor.close_type = None
         executor.close_timestamp = None
         executor._status = RunnableStatus.RUNNING
@@ -64,49 +71,132 @@ class TestAbsoluteBarrierEntryDeadline(TestCase):
         with self.assertRaises(ValidationError):
             self.make_config(entry_deadline=datetime.fromtimestamp(99, tz=UTC))
 
-    def test_no_fill_at_deadline_cancels_entry_and_expires(self) -> None:
+    def test_no_fill_at_exact_deadline_cancels_entry_and_expires_executor(self) -> None:
         executor = self.make_executor()
         open_order = TrackedOrder("OID-ENTRY")
         open_order.order = MagicMock(is_open=True, is_filled=False, creation_timestamp=100.0)
         executor._open_order = open_order
         executor.cancel_open_order = MagicMock()
         executor._is_within_activation_bounds = MagicMock(return_value=True)
-        with patch.object(AbsoluteBarrierPositionExecutor, "open_filled_amount", new_callable=PropertyMock, return_value=Decimal("0")):
+        with patch.object(
+            AbsoluteBarrierPositionExecutor,
+            "open_filled_amount",
+            new_callable=PropertyMock,
+            return_value=Decimal("0"),
+        ):
             executor.control_open_order()
         executor.cancel_open_order.assert_called_once_with()
         self.assertEqual(RunnableStatus.SHUTTING_DOWN, executor.status)
         self.assertEqual("EXPIRED", executor.close_type.name)
 
-    def test_partial_fill_at_deadline_cancels_only_remainder(self) -> None:
+    def test_partial_fill_at_deadline_cancels_only_remainder_and_keeps_running(self) -> None:
         executor = self.make_executor()
         open_order = TrackedOrder("OID-ENTRY")
         open_order.order = MagicMock(is_open=True, is_filled=False, creation_timestamp=100.0)
         executor._open_order = open_order
         executor.cancel_open_order = MagicMock()
         executor._is_within_activation_bounds = MagicMock(return_value=True)
-        with patch.object(AbsoluteBarrierPositionExecutor, "open_filled_amount", new_callable=PropertyMock, return_value=Decimal("0.25")):
+        with patch.object(
+            AbsoluteBarrierPositionExecutor,
+            "open_filled_amount",
+            new_callable=PropertyMock,
+            return_value=Decimal("0.25"),
+        ):
             executor.control_open_order()
         executor.cancel_open_order.assert_called_once_with()
         self.assertEqual(RunnableStatus.RUNNING, executor.status)
         self.assertTrue(executor._entry_remainder_cancel_pending)
+        self.assertEqual(111.0, executor._entry_remainder_cancel_requested_at)
         self.assertIs(open_order, executor._open_order)
 
-    def test_cancel_event_retains_partially_filled_order(self) -> None:
+    def test_pending_cancel_retries_after_interval_when_order_remains_open(self) -> None:
+        executor = self.make_executor(current_timestamp=117.0)
+        open_order = TrackedOrder("OID-ENTRY")
+        open_order.order = MagicMock(is_open=True, is_filled=False, creation_timestamp=100.0)
+        executor._open_order = open_order
+        executor._entry_remainder_cancel_pending = True
+        executor._entry_remainder_cancel_requested_at = 111.0
+        executor.cancel_open_order = MagicMock()
+        with patch.object(
+            AbsoluteBarrierPositionExecutor,
+            "open_filled_amount",
+            new_callable=PropertyMock,
+            return_value=Decimal("0.25"),
+        ):
+            executor.control_open_order()
+        executor.cancel_open_order.assert_called_once_with()
+        self.assertEqual(117.0, executor._entry_remainder_cancel_requested_at)
+        self.assertTrue(executor._entry_remainder_cancel_pending)
+
+    def test_pending_cancel_does_not_retry_before_interval(self) -> None:
+        executor = self.make_executor(current_timestamp=114.0)
+        open_order = TrackedOrder("OID-ENTRY")
+        open_order.order = MagicMock(is_open=True, is_filled=False, creation_timestamp=100.0)
+        executor._open_order = open_order
+        executor._entry_remainder_cancel_pending = True
+        executor._entry_remainder_cancel_requested_at = 111.0
+        executor.cancel_open_order = MagicMock()
+        with patch.object(
+            AbsoluteBarrierPositionExecutor,
+            "open_filled_amount",
+            new_callable=PropertyMock,
+            return_value=Decimal("0.25"),
+        ):
+            executor.control_open_order()
+        executor.cancel_open_order.assert_not_called()
+        self.assertEqual(111.0, executor._entry_remainder_cancel_requested_at)
+
+    def test_pending_cancel_reconciles_closed_order_without_event(self) -> None:
+        executor = self.make_executor(current_timestamp=117.0)
+        open_order = TrackedOrder("OID-ENTRY")
+        open_order.order = MagicMock(is_open=False, is_filled=False, creation_timestamp=100.0)
+        executor._open_order = open_order
+        executor._entry_remainder_cancel_pending = True
+        executor._entry_remainder_cancel_requested_at = 111.0
+        executor.cancel_open_order = MagicMock()
+        with patch.object(
+            AbsoluteBarrierPositionExecutor,
+            "open_filled_amount",
+            new_callable=PropertyMock,
+            return_value=Decimal("0.25"),
+        ):
+            executor.control_open_order()
+        executor.cancel_open_order.assert_not_called()
+        self.assertFalse(executor._entry_remainder_cancel_pending)
+        self.assertTrue(executor._entry_remainder_cancelled)
+        self.assertIsNone(executor._entry_remainder_cancel_requested_at)
+
+    def test_cancel_event_retains_partially_filled_order_for_position_accounting(self) -> None:
         executor = self.make_executor()
         open_order = TrackedOrder("OID-ENTRY")
         open_order.order = MagicMock(is_open=False, is_filled=False, creation_timestamp=100.0)
         executor._open_order = open_order
         executor._entry_remainder_cancel_pending = True
-        with patch.object(AbsoluteBarrierPositionExecutor, "open_filled_amount", new_callable=PropertyMock, return_value=Decimal("0.25")):
-            executor.process_order_canceled_event(0, MagicMock(), OrderCancelledEvent(timestamp=111.0, order_id="OID-ENTRY"))
+        executor._entry_remainder_cancel_requested_at = 111.0
+        with patch.object(
+            AbsoluteBarrierPositionExecutor,
+            "open_filled_amount",
+            new_callable=PropertyMock,
+            return_value=Decimal("0.25"),
+        ):
+            executor.process_order_canceled_event(
+                0,
+                MagicMock(),
+                OrderCancelledEvent(timestamp=111.0, order_id="OID-ENTRY"),
+            )
         self.assertIs(open_order, executor._open_order)
         self.assertFalse(executor._entry_remainder_cancel_pending)
         self.assertTrue(executor._entry_remainder_cancelled)
+        self.assertIsNone(executor._entry_remainder_cancel_requested_at)
 
-    def test_custom_info_contains_signed_deadline(self) -> None:
+    def test_custom_info_contains_signed_deadline_and_remainder_state(self) -> None:
         executor = self.make_executor()
         executor._entry_remainder_cancelled = True
-        with patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_custom_info", return_value={}):
+        with patch(
+            "hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_custom_info",
+            return_value={},
+        ):
             custom_info = executor.get_custom_info()
         self.assertEqual("1970-01-01T00:01:50Z", custom_info["entry_deadline"])
         self.assertTrue(custom_info["entry_remainder_cancelled"])
+        self.assertEqual(5.0, custom_info["entry_cancel_retry_seconds"])

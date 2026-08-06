@@ -27,6 +27,8 @@ class AbsoluteBarrierPositionExecutor(PositionExecutor):
         self.config: AbsoluteBarrierPositionExecutorConfig = config
         self._entry_remainder_cancel_pending = False
         self._entry_remainder_cancelled = False
+        self._entry_remainder_cancel_requested_at = None
+        self._entry_cancel_retry_seconds = max(1.0, float(update_interval) * 2.0)
         self._validate_tick_aligned_prices()
 
     @property
@@ -41,8 +43,45 @@ class AbsoluteBarrierPositionExecutor(PositionExecutor):
         self.close_timestamp = self._strategy.current_timestamp
         self._status = RunnableStatus.SHUTTING_DOWN
 
+    def _mark_entry_remainder_cancelled(self) -> None:
+        self._entry_remainder_cancel_pending = False
+        self._entry_remainder_cancelled = True
+        self._entry_remainder_cancel_requested_at = None
+
+    def _request_entry_remainder_cancel(self) -> None:
+        self.cancel_open_order()
+        self._entry_remainder_cancel_pending = True
+        self._entry_remainder_cancel_requested_at = self._strategy.current_timestamp
+
+    def _control_pending_entry_remainder_cancel(self) -> None:
+        order = self._open_order.order if self._open_order is not None else None
+        if order is not None and not order.is_open:
+            self._mark_entry_remainder_cancelled()
+            self.logger().info(
+                self._log_message(
+                    "Entry remainder reconciled as closed without a cancellation event "
+                    f"order_id={self._open_order.order_id if self._open_order else 'unknown'}"
+                )
+            )
+            return
+        requested_at = self._entry_remainder_cancel_requested_at
+        if requested_at is None or (
+            self._strategy.current_timestamp - requested_at
+        ) >= self._entry_cancel_retry_seconds:
+            self.logger().warning(
+                self._log_message(
+                    "Entry remainder cancellation is still unacknowledged; retrying "
+                    f"order_id={self._open_order.order_id if self._open_order else 'unknown'} "
+                    f"last_requested_at={requested_at}"
+                )
+            )
+            self._request_entry_remainder_cancel()
+
     def control_open_order(self):
-        if self._entry_remainder_cancel_pending or self._entry_remainder_cancelled:
+        if self._entry_remainder_cancelled:
+            return
+        if self._entry_remainder_cancel_pending:
+            self._control_pending_entry_remainder_cancel()
             return
         if not self._entry_deadline_reached():
             return super().control_open_order()
@@ -54,9 +93,8 @@ class AbsoluteBarrierPositionExecutor(PositionExecutor):
         filled_amount = self.open_filled_amount
         order = self._open_order.order
         if order is None or order.is_open:
-            self.cancel_open_order()
             if filled_amount > Decimal("0"):
-                self._entry_remainder_cancel_pending = True
+                self._request_entry_remainder_cancel()
                 self.logger().warning(
                     self._log_message(
                         "Signed entry deadline reached; cancelling unfilled remainder "
@@ -64,9 +102,10 @@ class AbsoluteBarrierPositionExecutor(PositionExecutor):
                     )
                 )
                 return
+            self.cancel_open_order()
 
         if filled_amount > Decimal("0"):
-            self._entry_remainder_cancelled = True
+            self._mark_entry_remainder_cancelled()
             return
 
         self.logger().info(self._log_message("Signed entry deadline reached with no fill"))
@@ -74,8 +113,7 @@ class AbsoluteBarrierPositionExecutor(PositionExecutor):
 
     def process_order_canceled_event(self, _, market: ConnectorBase, event: OrderCancelledEvent):
         if self._open_order and event.order_id == self._open_order.order_id and self.open_filled_amount > Decimal("0"):
-            self._entry_remainder_cancel_pending = False
-            self._entry_remainder_cancelled = True
+            self._mark_entry_remainder_cancelled()
             self.logger().info(
                 self._log_message(
                     "Entry remainder cancelled after partial fill; retaining tracked entry for position accounting "
@@ -195,6 +233,8 @@ class AbsoluteBarrierPositionExecutor(PositionExecutor):
                 "entry_deadline_reached": self._entry_deadline_reached(),
                 "entry_remainder_cancel_pending": self._entry_remainder_cancel_pending,
                 "entry_remainder_cancelled": self._entry_remainder_cancelled,
+                "entry_remainder_cancel_requested_at": self._entry_remainder_cancel_requested_at,
+                "entry_cancel_retry_seconds": self._entry_cancel_retry_seconds,
             }
         )
         return custom_info

@@ -9,13 +9,19 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
     TripleBarrierConfig,
 )
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.executors.rsi_position_executor import (
+    RSIPositionExecutor,
+    register_rsi_position_executor,
+)
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
 class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCase):
@@ -24,6 +30,7 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
 
     def setUp(self) -> None:
         super().setUp()
+        register_rsi_position_executor()
         connector = MagicMock(spec=ExchangePyBase)
         connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
         connector._update_orders_with_error_handler = AsyncMock()
@@ -77,16 +84,18 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
         amount: Decimal = Decimal("1"),
         max_retries: int = 3,
     ) -> PositionExecutor:
+        executor_class = ExecutorOrchestrator._executor_mapping["position_executor"]
+        self.assertIs(executor_class, RSIPositionExecutor)
         with patch.object(
-            PositionExecutor,
+            executor_class,
             "get_trading_rules",
             return_value=self.trading_rule,
         ), patch.object(
-            PositionExecutor,
+            executor_class,
             "get_price",
             return_value=Decimal("100"),
         ):
-            executor = PositionExecutor(
+            executor = executor_class(
                 strategy=self.strategy,
                 config=self._config(executor_id, amount),
                 max_retries=max_retries,
@@ -137,6 +146,39 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
                 )
             )
         executor._open_order = tracked
+
+    def test_runtime_mapping_preserves_standard_executor_discriminator(self):
+        config = self._config("typed")
+
+        self.assertEqual(config.type, "position_executor")
+        self.assertIs(
+            ExecutorOrchestrator._executor_mapping["position_executor"],
+            RSIPositionExecutor,
+        )
+
+    def test_standard_executor_config_round_trips_through_executor_info(self):
+        config = self._config("round-trip")
+        info = ExecutorInfo(
+            id=config.id,
+            timestamp=float(config.timestamp),
+            type=config.type,
+            status=RunnableStatus.RUNNING,
+            config=config,
+            net_pnl_pct=Decimal("0"),
+            net_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            filled_amount_quote=Decimal("0"),
+            is_active=True,
+            is_trading=False,
+            custom_info={"side": TradeType.BUY},
+            controller_id=config.controller_id,
+        )
+
+        restored = ExecutorInfo.model_validate(info.model_dump())
+
+        self.assertEqual(restored.type, "position_executor")
+        self.assertEqual(restored.config.type, "position_executor")
+        self.assertEqual(restored.config.id, "round-trip")
 
     async def test_early_stop_unfilled_entry_cancels_without_close_order(self):
         executor = self._executor("unfilled")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import ConfigDict, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
@@ -18,6 +18,8 @@ class AbsoluteBarrierConfig(TripleBarrierConfig):
     open_order_type: OrderType = OrderType.LIMIT
     take_profit_order_type: OrderType = OrderType.MARKET
     stop_loss_order_type: OrderType = OrderType.MARKET
+    time_limit: int = Field(ge=1, le=604800)
+    open_order_limit_max_age_seconds: int = Field(ge=1, le=300)
     time_limit_order_type: OrderType = OrderType.MARKET
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
@@ -28,20 +30,6 @@ class AbsoluteBarrierConfig(TripleBarrierConfig):
         if not parsed.is_finite() or parsed <= Decimal("0"):
             raise ValueError("absolute barrier prices must be finite and positive")
         return parsed
-
-    @field_validator("time_limit")
-    @classmethod
-    def validate_time_limit(cls, value: int | None) -> int:
-        if value is None or value <= 0 or value > 604800:
-            raise ValueError("absolute barrier executor requires a time limit between 1 and 604800 seconds")
-        return value
-
-    @field_validator("open_order_limit_max_age_seconds")
-    @classmethod
-    def validate_entry_order_age(cls, value: int) -> int:
-        if value <= 0 or value > 300:
-            raise ValueError("absolute barrier executor requires entry max age between 1 and 300 seconds")
-        return value
 
     @model_validator(mode="after")
     def validate_supported_orders(self) -> "AbsoluteBarrierConfig":

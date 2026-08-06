@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
@@ -15,6 +14,7 @@ from controllers.directional_trading.rsi_v5_runtime import (
     EpisodeOutcome,
     EpisodeTracker,
     ExecutorExposure,
+    ExposureSnapshot,
     build_exit_plan,
     calculate_exposure,
     update_loss_streak,
@@ -39,29 +39,110 @@ class RSIv5HyperliquidControllerConfig(RSIv5ControllerConfig):
     controller_name: str = "rsi_v5_hyperliquid"
     connector_name: str = Field(
         default="hyperliquid_perpetual",
-        client_data=ClientFieldData(prompt=lambda mi: "Connector:", prompt_on_new=True, is_updatable=False),
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Connector:",
+            prompt_on_new=True,
+            is_updatable=False,
+        ),
     )
     trading_pair: str = Field(
         default="BTC-USD",
-        client_data=ClientFieldData(prompt=lambda mi: "Trading pair:", prompt_on_new=True, is_updatable=False),
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Trading pair:",
+            prompt_on_new=True,
+            is_updatable=False,
+        ),
     )
-    leverage: int = Field(default=1, ge=1, client_data=ClientFieldData(prompt=lambda mi: "Leverage:", prompt_on_new=True, is_updatable=False))
+    leverage: int = Field(
+        default=1,
+        ge=1,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Leverage:",
+            prompt_on_new=True,
+            is_updatable=False,
+        ),
+    )
     position_mode: PositionMode = PositionMode.ONEWAY
 
-    collateral_asset: str = Field(default="USDC", client_data=ClientFieldData(prompt=lambda mi: "Collateral asset:", prompt_on_new=False, is_updatable=False))
-    perpetual_max_leverage: int = Field(default=2, ge=1, client_data=ClientFieldData(prompt=lambda mi: "Maximum permitted leverage:", prompt_on_new=False, is_updatable=False))
-    perpetual_hard_stop_loss_pct: Decimal = Field(default=Decimal("0.08"), gt=Decimal("0"), le=Decimal("0.25"), client_data=ClientFieldData(prompt=lambda mi: "Hard stop loss pct:", prompt_on_new=False, is_updatable=True))
-    perpetual_allow_position_hold: bool = Field(default=False, client_data=ClientFieldData(prompt=lambda mi: "Allow POSITION_HOLD on perpetuals?:", prompt_on_new=False, is_updatable=False))
-    executor_exit_retry_seconds: int = Field(default=5, ge=1, le=60, client_data=ClientFieldData(prompt=lambda mi: "Executor exit retry seconds:", prompt_on_new=False, is_updatable=True))
+    collateral_asset: str = Field(
+        default="USDC",
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Collateral asset:",
+            prompt_on_new=False,
+            is_updatable=False,
+        ),
+    )
+    perpetual_max_leverage: int = Field(
+        default=2,
+        ge=1,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Maximum permitted leverage:",
+            prompt_on_new=False,
+            is_updatable=False,
+        ),
+    )
+    perpetual_hard_stop_loss_pct: Decimal = Field(
+        default=Decimal("0.08"),
+        gt=Decimal("0"),
+        le=Decimal("0.25"),
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Hard stop loss pct:",
+            prompt_on_new=False,
+            is_updatable=True,
+        ),
+    )
+    perpetual_allow_position_hold: bool = Field(
+        default=False,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Allow POSITION_HOLD on perpetuals?:",
+            prompt_on_new=False,
+            is_updatable=False,
+        ),
+    )
+    executor_exit_retry_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=60,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Executor exit retry seconds:",
+            prompt_on_new=False,
+            is_updatable=True,
+        ),
+    )
 
-    use_bag_freeze: bool = Field(default=False, client_data=ClientFieldData(prompt=lambda mi: "Enable perpetual bag freeze?:", prompt_on_new=False, is_updatable=False))
-    early_stop_keep_position: bool = Field(default=False, client_data=ClientFieldData(prompt=lambda mi: "Keep perpetual position after early stop?:", prompt_on_new=False, is_updatable=False))
-    early_stop_drawdown_pct: float = Field(default=0.08, ge=0.0, le=0.25, client_data=ClientFieldData(prompt=lambda mi: "Controller emergency drawdown stop:", prompt_on_new=False, is_updatable=True))
+    use_bag_freeze: bool = Field(
+        default=False,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Enable perpetual bag freeze?:",
+            prompt_on_new=False,
+            is_updatable=False,
+        ),
+    )
+    early_stop_keep_position: bool = Field(
+        default=False,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Keep perpetual position after early stop?:",
+            prompt_on_new=False,
+            is_updatable=False,
+        ),
+    )
+    early_stop_drawdown_pct: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=0.25,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Controller emergency drawdown stop:",
+            prompt_on_new=False,
+            is_updatable=True,
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_hyperliquid_perpetual_safety(self):
         if self.connector_name != "hyperliquid_perpetual":
-            raise ValueError("rsi_v5_hyperliquid requires connector_name=hyperliquid_perpetual")
+            raise ValueError(
+                "rsi_v5_hyperliquid requires connector_name=hyperliquid_perpetual"
+            )
         if self.position_mode != PositionMode.ONEWAY:
             raise ValueError("rsi_v5_hyperliquid requires ONEWAY position mode")
         if self.leverage > self.perpetual_max_leverage:
@@ -70,9 +151,13 @@ class RSIv5HyperliquidControllerConfig(RSIv5ControllerConfig):
             raise ValueError("collateral_asset must not be empty")
         if not self.perpetual_allow_position_hold:
             if self.use_bag_freeze:
-                raise ValueError("use_bag_freeze requires perpetual_allow_position_hold=true")
+                raise ValueError(
+                    "use_bag_freeze requires perpetual_allow_position_hold=true"
+                )
             if self.early_stop_keep_position:
-                raise ValueError("early_stop_keep_position requires perpetual_allow_position_hold=true")
+                raise ValueError(
+                    "early_stop_keep_position requires perpetual_allow_position_hold=true"
+                )
         return self
 
 
@@ -122,21 +207,30 @@ class RSIv5HyperliquidController(RSIv5Controller):
     def _executor_exposure(self, executor: object) -> ExecutorExposure:
         custom_info = getattr(executor, "custom_info", None) or {}
         executor_config = getattr(executor, "config", None)
-        configured_base = self._decimal(getattr(executor_config, "amount", _ZERO))
-        filled_base = self._decimal(custom_info.get("open_order_filled_amount_base", _ZERO))
-        filled_quote = self._decimal(custom_info.get("open_order_filled_amount_quote", _ZERO))
-        if filled_quote <= _ZERO and filled_base > _ZERO:
-            reference = self._decimal(
-                custom_info.get("entry_price")
-                or getattr(executor_config, "entry_price", None)
-                or self._get_mid_price()
-            )
-            filled_quote = filled_base * max(reference, _ZERO)
+        configured_base = self._decimal(
+            getattr(executor_config, "amount", _ZERO)
+        )
         reference_price = self._decimal(
-            custom_info.get("entry_price")
+            custom_info.get("current_position_average_price")
+            or custom_info.get("entry_price")
             or getattr(executor_config, "entry_price", None)
             or self._get_mid_price()
         )
+        filled_base = self._decimal(
+            custom_info.get("open_order_filled_amount_base", _ZERO)
+        )
+        filled_quote = self._decimal(
+            custom_info.get("open_order_filled_amount_quote", _ZERO)
+        )
+        if filled_quote <= _ZERO:
+            filled_quote = self._decimal(
+                getattr(executor, "filled_amount_quote", _ZERO)
+            )
+        if filled_base <= _ZERO and filled_quote > _ZERO and reference_price > _ZERO:
+            filled_base = filled_quote / reference_price
+        if filled_quote <= _ZERO and filled_base > _ZERO:
+            filled_quote = filled_base * max(reference_price, _ZERO)
+
         return ExecutorExposure(
             executor_id=str(getattr(executor, "id", "")),
             side=self._side_name(getattr(executor, "side", None)),
@@ -146,15 +240,23 @@ class RSIv5HyperliquidController(RSIv5Controller):
             filled_base=max(filled_base, _ZERO),
             filled_quote=max(filled_quote, _ZERO),
             reference_price=max(reference_price, _ZERO),
-            net_pnl_quote=self._decimal(getattr(executor, "net_pnl_quote", _ZERO)),
+            net_pnl_quote=self._decimal(
+                getattr(executor, "net_pnl_quote", _ZERO)
+            ),
             done=not bool(getattr(executor, "is_active", False)),
         )
 
     def _active_executor_exposures(self) -> Tuple[ExecutorExposure, ...]:
-        return tuple(self._executor_exposure(executor) for executor in self._active_buy_position_executors())
+        return tuple(
+            self._executor_exposure(executor)
+            for executor in self._active_buy_position_executors()
+        )
 
     def _active_buy_filled_amount(self) -> Decimal:
-        return sum((exposure.filled_base for exposure in self._active_executor_exposures()), _ZERO)
+        return sum(
+            (exposure.filled_base for exposure in self._active_executor_exposures()),
+            _ZERO,
+        )
 
     def _base_quote_assets(self) -> Tuple[Optional[str], Optional[str]]:
         parts = self.config.trading_pair.split("-")
@@ -167,7 +269,10 @@ class RSIv5HyperliquidController(RSIv5Controller):
         return self._position_amount(TradeType.BUY)
 
     def _has_buy_inventory(self) -> bool:
-        return self._active_buy_filled_amount() > _ZERO or super()._has_buy_inventory()
+        return (
+            self._active_buy_filled_amount() > _ZERO
+            or super()._has_buy_inventory()
+        )
 
     def _get_position_cost_basis(self) -> Optional[Decimal]:
         held = self._aggregate_held_inventory(TradeType.BUY)
@@ -191,18 +296,27 @@ class RSIv5HyperliquidController(RSIv5Controller):
     def _get_active_buy_executor_position_value_usd(self) -> Decimal:
         mark_price = self._get_mid_price() or _ZERO
         return sum(
-            (exposure.filled_notional(mark_price) for exposure in self._active_executor_exposures()),
+            (
+                exposure.filled_notional(mark_price)
+                for exposure in self._active_executor_exposures()
+            ),
             _ZERO,
         )
 
     def _get_pending_buy_executor_notional_usd(self) -> Decimal:
         mark_price = self._get_mid_price() or _ZERO
         return sum(
-            (exposure.pending_notional(mark_price) for exposure in self._active_executor_exposures()),
+            (
+                exposure.pending_notional(mark_price)
+                for exposure in self._active_executor_exposures()
+            ),
             _ZERO,
         )
 
-    def _exposure_snapshot(self, proposed_notional: Decimal = _ZERO):
+    def _exposure_snapshot(
+        self,
+        proposed_notional: Decimal = _ZERO,
+    ) -> ExposureSnapshot:
         mark_price = self._get_mid_price() or _ZERO
         held_notional = self._position_amount(TradeType.BUY) * mark_price
         return calculate_exposure(
@@ -215,7 +329,10 @@ class RSIv5HyperliquidController(RSIv5Controller):
     def _get_total_position_value_usd(self) -> Decimal:
         return self._exposure_snapshot().total_notional
 
-    def _inventory_net_pnl_pct(self, current_price: Optional[Decimal]) -> Optional[Decimal]:
+    def _inventory_net_pnl_pct(
+        self,
+        current_price: Optional[Decimal],
+    ) -> Optional[Decimal]:
         if current_price is None or current_price <= _ZERO:
             return None
         cost_basis = self._get_position_cost_basis()
@@ -226,11 +343,16 @@ class RSIv5HyperliquidController(RSIv5Controller):
         if total_amount <= _ZERO:
             return None
         fees = held.cum_fees_quote + sum(
-            (self._decimal(getattr(executor, "cum_fees_quote", _ZERO)) for executor in self._active_buy_position_executors()),
+            (
+                self._decimal(getattr(executor, "cum_fees_quote", _ZERO))
+                for executor in self._active_buy_position_executors()
+            ),
             _ZERO,
         )
         cost_quote = total_amount * cost_basis
-        return (((current_price - cost_basis) * total_amount) - fees) / cost_quote if cost_quote > _ZERO else None
+        if cost_quote <= _ZERO:
+            return None
+        return (((current_price - cost_basis) * total_amount) - fees) / cost_quote
 
     def _sync_episode_tracker(self) -> None:
         active_executors = self._active_buy_position_executors()
@@ -239,19 +361,51 @@ class RSIv5HyperliquidController(RSIv5Controller):
             return
 
         if not self._episode_tracker.is_open:
-            timestamps = [float(getattr(executor, "timestamp", self.market_data_provider.time())) for executor in active_executors]
-            self._episode_tracker.open(timestamp=min(timestamps, default=self.market_data_provider.time()))
+            timestamps = [
+                float(
+                    getattr(
+                        executor,
+                        "timestamp",
+                        self.market_data_provider.time(),
+                    )
+                )
+                for executor in active_executors
+            ]
+            self._episode_tracker.open(
+                timestamp=min(
+                    timestamps,
+                    default=self.market_data_provider.time(),
+                )
+            )
 
         for executor in active_executors:
             exposure = self._executor_exposure(executor)
-            planned_notional = exposure.configured_base * max(exposure.reference_price, _ZERO)
-            self._episode_tracker.register_executor(exposure.executor_id, planned_notional)
+            planned_notional = (
+                exposure.configured_base * max(exposure.reference_price, _ZERO)
+            )
+            self._episode_tracker.register_executor(
+                exposure.executor_id,
+                planned_notional,
+            )
 
-    def _register_created_executor(self, config: PositionExecutorConfig) -> None:
+    def _register_created_executor(
+        self,
+        config: PositionExecutorConfig,
+    ) -> None:
         if not self._episode_tracker.is_open:
-            self._episode_tracker.open(timestamp=float(config.timestamp or self.market_data_provider.time()))
-        planned_notional = max(config.amount, _ZERO) * max(config.entry_price or _ZERO, _ZERO)
-        self._episode_tracker.register_executor(config.id, planned_notional)
+            self._episode_tracker.open(
+                timestamp=float(
+                    config.timestamp or self.market_data_provider.time()
+                )
+            )
+        planned_notional = (
+            max(config.amount, _ZERO)
+            * max(config.entry_price or _ZERO, _ZERO)
+        )
+        self._episode_tracker.register_executor(
+            config.id,
+            planned_notional,
+        )
 
     def _track_executor_result(self, executor) -> None:
         executor_id = getattr(executor, "id", None)
@@ -262,10 +416,23 @@ class RSIv5HyperliquidController(RSIv5Controller):
             self._decimal(getattr(executor, "net_pnl_quote", _ZERO)),
         )
 
-    def _finalize_episode_if_flat(self, timestamp: Optional[float] = None) -> Optional[EpisodeOutcome]:
-        now = float(timestamp if timestamp is not None else self.market_data_provider.time())
-        is_flat = not self._active_buy_position_executors() and self._position_amount(TradeType.BUY) <= _ZERO
-        outcome = self._episode_tracker.close_if_flat(is_flat=is_flat, timestamp=now)
+    def _finalize_episode_if_flat(
+        self,
+        timestamp: Optional[float] = None,
+    ) -> Optional[EpisodeOutcome]:
+        now = float(
+            timestamp
+            if timestamp is not None
+            else self.market_data_provider.time()
+        )
+        is_flat = (
+            not self._active_buy_position_executors()
+            and self._position_amount(TradeType.BUY) <= _ZERO
+        )
+        outcome = self._episode_tracker.close_if_flat(
+            is_flat=is_flat,
+            timestamp=now,
+        )
         if outcome is None:
             return None
 
@@ -279,35 +446,60 @@ class RSIv5HyperliquidController(RSIv5Controller):
             self._last_loss_timestamp = None
         self._last_episode_outcome = outcome
         self.logger().info(
-            f"Episode closed | {self._controller_pair_log_prefix()} episode={outcome.episode_id} "
-            f"executors={len(outcome.executor_ids)} pnl={outcome.net_pnl_quote} "
+            f"Episode closed | {self._controller_pair_log_prefix()} "
+            f"episode={outcome.episode_id} "
+            f"executors={len(outcome.executor_ids)} "
+            f"pnl={outcome.net_pnl_quote} "
             f"loss_streak={self._consecutive_losses}"
         )
         return outcome
 
     def can_create_executor(self, signal: int) -> bool:
         if signal < 0:
-            self._record_gate_reason(TradeType.SELL, "executor_owned_exit")
+            self._record_gate_reason(
+                TradeType.SELL,
+                "executor_owned_exit",
+            )
             return False
-        if signal > 0 and not self.config.perpetual_allow_position_hold and self._position_amount(TradeType.BUY) > _ZERO:
-            self._record_gate_reason(TradeType.BUY, "unexpected_held_position")
+        if (
+            signal > 0
+            and not self.config.perpetual_allow_position_hold
+            and self._position_amount(TradeType.BUY) > _ZERO
+        ):
+            self._record_gate_reason(
+                TradeType.BUY,
+                "unexpected_held_position",
+            )
             return False
         return super().can_create_executor(signal)
 
-    def get_executor_config(self, trade_type: TradeType, price: Decimal, amount: Decimal):
+    def get_executor_config(
+        self,
+        trade_type: TradeType,
+        price: Decimal,
+        amount: Decimal,
+    ):
         if trade_type == TradeType.SELL:
             raise RuntimeError(
                 "Hyperliquid RSI exits must stop the owning PositionExecutor; "
                 "controller-created SELL executors are forbidden"
             )
 
-        executor_config = super().get_executor_config(trade_type, price, amount)
+        executor_config = super().get_executor_config(
+            trade_type,
+            price,
+            amount,
+        )
         if not isinstance(executor_config, PositionExecutorConfig):
-            raise TypeError("rsi_v5_hyperliquid BUY entries require PositionExecutorConfig")
+            raise TypeError(
+                "rsi_v5_hyperliquid BUY entries require PositionExecutorConfig"
+            )
 
         triple_barrier = executor_config.triple_barrier_config.model_copy(
             update={
-                "stop_loss": Decimal(str(self.config.perpetual_hard_stop_loss_pct)),
+                "stop_loss": Decimal(
+                    str(self.config.perpetual_hard_stop_loss_pct)
+                ),
                 "stop_loss_order_type": OrderType.MARKET,
             }
         )
@@ -320,10 +512,17 @@ class RSIv5HyperliquidController(RSIv5Controller):
         self._register_created_executor(executor_config)
         return executor_config
 
-    def _check_bag_freeze_trigger(self, current_price: Decimal, now_ts: float) -> List[ExecutorAction]:
+    def _check_bag_freeze_trigger(
+        self,
+        current_price: Decimal,
+        now_ts: float,
+    ) -> List[ExecutorAction]:
         if not self.config.perpetual_allow_position_hold:
             return []
-        return super()._check_bag_freeze_trigger(current_price, now_ts)
+        return super()._check_bag_freeze_trigger(
+            current_price,
+            now_ts,
+        )
 
     def _executor_owned_exit_actions(
         self,
@@ -333,14 +532,20 @@ class RSIv5HyperliquidController(RSIv5Controller):
         reason: str,
     ) -> List[StopExecutorAction]:
         active_executors = self._active_buy_position_executors()
-        active_ids = {str(getattr(executor, "id", "")) for executor in active_executors}
+        active_ids = {
+            str(getattr(executor, "id", ""))
+            for executor in active_executors
+        }
         self._exit_request_timestamps = {
             executor_id: timestamp
             for executor_id, timestamp in self._exit_request_timestamps.items()
             if executor_id in active_ids
         }
         plan = build_exit_plan(
-            (self._executor_exposure(executor) for executor in active_executors),
+            (
+                self._executor_exposure(executor)
+                for executor in active_executors
+            ),
             reason=reason,
         )
         actions: List[StopExecutorAction] = []
@@ -349,7 +554,10 @@ class RSIv5HyperliquidController(RSIv5Controller):
             if executor_id in existing_stop_ids:
                 continue
             previous_request = self._exit_request_timestamps.get(executor_id)
-            if previous_request is not None and (now - previous_request) < retry_seconds:
+            if (
+                previous_request is not None
+                and (now - previous_request) < retry_seconds
+            ):
                 continue
             self._exit_request_timestamps[executor_id] = now
             actions.append(
@@ -362,7 +570,8 @@ class RSIv5HyperliquidController(RSIv5Controller):
         if actions:
             self.logger().info(
                 f"Executor-owned exit | {self._controller_pair_log_prefix()} "
-                f"reason={reason} executors={[action.executor_id for action in actions]}"
+                f"reason={reason} "
+                f"executors={[action.executor_id for action in actions]}"
             )
         return actions
 
@@ -394,7 +603,9 @@ class RSIv5HyperliquidController(RSIv5Controller):
         exposure = self._exposure_snapshot()
         info.update(
             {
-                "runtime_profile": "hyperliquid-perpetual-executor-owned-v1",
+                "runtime_profile": (
+                    "hyperliquid-perpetual-executor-owned-v1"
+                ),
                 "episode_id": self._episode_tracker.episode_id,
                 "exposure": {
                     "held_notional": float(exposure.held_notional),
@@ -405,8 +616,12 @@ class RSIv5HyperliquidController(RSIv5Controller):
                 "last_episode": (
                     {
                         "episode_id": self._last_episode_outcome.episode_id,
-                        "net_pnl_quote": float(self._last_episode_outcome.net_pnl_quote),
-                        "executor_count": len(self._last_episode_outcome.executor_ids),
+                        "net_pnl_quote": float(
+                            self._last_episode_outcome.net_pnl_quote
+                        ),
+                        "executor_count": len(
+                            self._last_episode_outcome.executor_ids
+                        ),
                     }
                     if self._last_episode_outcome is not None
                     else None

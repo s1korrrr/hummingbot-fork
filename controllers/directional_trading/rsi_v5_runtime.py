@@ -6,6 +6,7 @@ from typing import Iterable, Optional
 from uuid import uuid4
 
 _ZERO = Decimal("0")
+_POSITION_EXECUTOR_TYPES = {"position_executor", "rsi_position_executor"}
 
 
 def _non_negative(value: Decimal) -> Decimal:
@@ -30,14 +31,22 @@ class ExecutorExposure:
         return _non_negative(self.configured_base - self.filled_base)
 
     def filled_notional(self, mark_price: Decimal) -> Decimal:
-        if not self.active or self.side != "BUY" or self.executor_type != "position_executor":
+        if (
+            not self.active
+            or self.side != "BUY"
+            or self.executor_type not in _POSITION_EXECUTOR_TYPES
+        ):
             return _ZERO
         if self.filled_base > _ZERO and mark_price > _ZERO:
             return self.filled_base * mark_price
         return _non_negative(self.filled_quote)
 
     def pending_notional(self, mark_price: Decimal) -> Decimal:
-        if not self.active or self.side != "BUY" or self.executor_type != "position_executor":
+        if (
+            not self.active
+            or self.side != "BUY"
+            or self.executor_type not in _POSITION_EXECUTOR_TYPES
+        ):
             return _ZERO
         conservative_price = max(
             _non_negative(mark_price),
@@ -178,7 +187,7 @@ def build_exit_plan(
         for executor in executors
         if executor.active
         and executor.side == "BUY"
-        and executor.executor_type == "position_executor"
+        and executor.executor_type in _POSITION_EXECUTOR_TYPES
     )
     return ExitPlan(
         executor_ids=executor_ids,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
@@ -55,6 +56,7 @@ class AbsoluteBarrierConfig(TripleBarrierConfig):
 class AbsoluteBarrierPositionExecutorConfig(PositionExecutorConfig):
     type: Literal["absolute_barrier_position_executor"] = "absolute_barrier_position_executor"
     entry_price: Decimal
+    entry_deadline: datetime
     triple_barrier_config: AbsoluteBarrierConfig
     leverage: Literal[1] = 1
     activation_bounds: None = None
@@ -68,6 +70,15 @@ class AbsoluteBarrierPositionExecutorConfig(PositionExecutorConfig):
             raise ValueError("entry price and amount must be finite and positive")
         return parsed
 
+    @field_validator("entry_deadline")
+    @classmethod
+    def validate_entry_deadline_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("entry deadline must be timezone-aware")
+        if value.utcoffset() != timedelta(0):
+            raise ValueError("entry deadline must be UTC")
+        return value
+
     @model_validator(mode="after")
     def validate_absolute_barrier_geometry(self) -> "AbsoluteBarrierPositionExecutorConfig":
         stop = self.triple_barrier_config.stop_loss_price
@@ -78,4 +89,11 @@ class AbsoluteBarrierPositionExecutorConfig(PositionExecutorConfig):
             valid = stop > self.entry_price > take_profit
         if not valid:
             raise ValueError("absolute stop/entry/take-profit geometry is invalid for the configured side")
+        if self.timestamp is None:
+            raise ValueError("absolute barrier executor requires a creation timestamp")
+        deadline_delay = self.entry_deadline.timestamp() - float(self.timestamp)
+        if deadline_delay <= 0:
+            raise ValueError("entry deadline must be after executor creation")
+        if deadline_delay > 300:
+            raise ValueError("entry deadline must be within 300 seconds of executor creation")
         return self

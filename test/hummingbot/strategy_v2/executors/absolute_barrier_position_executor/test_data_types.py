@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest import TestCase
 
@@ -17,6 +18,7 @@ class TestAbsoluteBarrierPositionExecutorConfig(TestCase):
         entry: str = "100",
         stop: str = "102",
         take_profit: str = "96",
+        entry_deadline: datetime | None = None,
         **barrier_overrides,
     ) -> AbsoluteBarrierPositionExecutorConfig:
         barrier = {
@@ -34,6 +36,7 @@ class TestAbsoluteBarrierPositionExecutorConfig(TestCase):
             trading_pair="BTC-USD",
             side=side,
             entry_price=Decimal(entry),
+            entry_deadline=entry_deadline or datetime.fromtimestamp(61, tz=UTC),
             amount=Decimal("1"),
             triple_barrier_config=AbsoluteBarrierConfig(**barrier),
         )
@@ -45,6 +48,7 @@ class TestAbsoluteBarrierPositionExecutorConfig(TestCase):
         self.assertEqual(1, short.leverage)
         self.assertEqual(Decimal("102"), short.triple_barrier_config.stop_loss_price)
         self.assertEqual(Decimal("104"), long.triple_barrier_config.take_profit_price)
+        self.assertEqual(datetime.fromtimestamp(61, tz=UTC), short.entry_deadline)
 
     def test_invalid_short_geometry_fails_closed(self):
         with self.assertRaisesRegex(ValidationError, "geometry"):
@@ -74,13 +78,17 @@ class TestAbsoluteBarrierPositionExecutorConfig(TestCase):
         with self.assertRaises(ValidationError):
             self.make_config(time_limit_order_type=OrderType.LIMIT)
 
-    def test_time_and_entry_age_are_bounded(self):
+    def test_time_entry_age_and_absolute_deadline_are_bounded(self):
         with self.assertRaises(ValidationError):
             self.make_config(time_limit=None)
         with self.assertRaises(ValidationError):
             self.make_config(open_order_limit_max_age_seconds=0)
         with self.assertRaises(ValidationError):
             self.make_config(open_order_limit_max_age_seconds=301)
+        with self.assertRaises(ValidationError):
+            self.make_config(entry_deadline=datetime.fromtimestamp(1, tz=UTC))
+        with self.assertRaises(ValidationError):
+            self.make_config(entry_deadline=datetime.fromtimestamp(302, tz=UTC))
 
     def test_activation_bounds_are_forbidden(self):
         payload = self.make_config().model_dump()
@@ -94,7 +102,7 @@ class TestAbsoluteBarrierPositionExecutorConfig(TestCase):
         self.assertEqual(barrier, adjusted)
         self.assertIsNot(barrier, adjusted)
 
-    def test_round_trip_preserves_absolute_prices(self):
+    def test_round_trip_preserves_absolute_prices_and_deadline(self):
         config = self.make_config()
         restored = AbsoluteBarrierPositionExecutorConfig.model_validate(config.model_dump())
         self.assertEqual(config, restored)

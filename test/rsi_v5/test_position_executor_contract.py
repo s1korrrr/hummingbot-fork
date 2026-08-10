@@ -10,15 +10,9 @@ from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
-from hummingbot.strategy_v2.executors.position_executor.data_types import (
-    PositionExecutorConfig,
-    TripleBarrierConfig,
-)
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
-from hummingbot.strategy_v2.executors.rsi_position_executor import (
-    RSIPositionExecutor,
-    register_rsi_position_executor,
-)
+from hummingbot.strategy_v2.executors.rsi_position_executor import RSIPositionExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
@@ -30,7 +24,6 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
 
     def setUp(self) -> None:
         super().setUp()
-        register_rsi_position_executor()
         connector = MagicMock(spec=ExchangePyBase)
         connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
         connector._update_orders_with_error_handler = AsyncMock()
@@ -84,8 +77,7 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
         amount: Decimal = Decimal("1"),
         max_retries: int = 3,
     ) -> PositionExecutor:
-        executor_class = ExecutorOrchestrator._executor_mapping["position_executor"]
-        self.assertIs(executor_class, RSIPositionExecutor)
+        executor_class = RSIPositionExecutor
         with patch.object(
             executor_class,
             "get_trading_rules",
@@ -153,7 +145,7 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
         self.assertEqual(config.type, "position_executor")
         self.assertIs(
             ExecutorOrchestrator._executor_mapping["position_executor"],
-            RSIPositionExecutor,
+            PositionExecutor,
         )
 
     def test_standard_executor_config_round_trips_through_executor_info(self):

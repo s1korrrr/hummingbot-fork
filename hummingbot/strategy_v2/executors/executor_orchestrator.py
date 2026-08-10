@@ -1145,7 +1145,7 @@ class ExecutorOrchestrator:
         # compa
         executor_config.controller_id = controller_id
 
-        executor_class = self._executor_mapping.get(executor_config.type)
+        executor_class = self._resolve_executor_class(controller_id, executor_config)
         if executor_class is not None:
             executor = executor_class(
                 strategy=self.strategy,
@@ -1160,6 +1160,14 @@ class ExecutorOrchestrator:
         self.active_executors[controller_id].append(executor)
         # MarketsRecorder.get_instance().store_or_update_executor(executor)
         self.logger().debug(f"Created {type(executor).__name__} for controller {controller_id}")
+
+    def _resolve_executor_class(self, controller_id: str, executor_config):
+        controller = self.strategy.controllers.get(controller_id)
+        if controller is not None:
+            override = controller.get_executor_class_for_config(executor_config)
+            if override is not None:
+                return override
+        return self._executor_mapping.get(executor_config.type)
 
     def stop_executor(self, action: StopExecutorAction):
         """

@@ -5,11 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 from pydantic import model_validator
 
-from controllers.directional_trading.rsi_v5 import (
-    Field,
-    RSIv5Controller,
-    RSIv5ControllerConfig,
-)
+from controllers.directional_trading.rsi_v5 import Field, RSIv5Controller, RSIv5ControllerConfig
 from controllers.directional_trading.rsi_v5_runtime import (
     EpisodeOutcome,
     EpisodeTracker,
@@ -22,17 +18,12 @@ from controllers.directional_trading.rsi_v5_runtime import (
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
-from hummingbot.strategy_v2.executors.rsi_position_executor import (
-    RSIPositionExecutorConfig,
-    register_rsi_position_executor,
-)
+from hummingbot.strategy_v2.executors.rsi_position_executor import RSIPositionExecutor, RSIPositionExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
 
 _ZERO = Decimal("0")
 _POSITION_EXECUTOR_TYPES = {"position_executor"}
-
-register_rsi_position_executor()
 
 
 class RSIv5HyperliquidControllerConfig(RSIv5ControllerConfig):
@@ -184,6 +175,11 @@ class RSIv5HyperliquidController(RSIv5Controller):
     @config.setter
     def config(self, value: RSIv5HyperliquidControllerConfig) -> None:
         self._config = value
+
+    def get_executor_class_for_config(self, config):
+        if isinstance(config, RSIPositionExecutorConfig):
+            return RSIPositionExecutor
+        return super().get_executor_class_for_config(config)
 
     @staticmethod
     def _decimal(value: object, default: Decimal = _ZERO) -> Decimal:

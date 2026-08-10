@@ -118,9 +118,7 @@ class TestRSIv5HyperliquidController:
         return controller
 
     def test_defaults_are_hyperliquid_oneway_and_no_position_hold(self):
-        from controllers.directional_trading.rsi_v5_hyperliquid import (
-            RSIv5HyperliquidControllerConfig,
-        )
+        from controllers.directional_trading.rsi_v5_hyperliquid import RSIv5HyperliquidControllerConfig
 
         config = RSIv5HyperliquidControllerConfig(id="defaults")
 
@@ -143,9 +141,7 @@ class TestRSIv5HyperliquidController:
         ],
     )
     def test_unsafe_perpetual_configuration_is_rejected(self, overrides):
-        from controllers.directional_trading.rsi_v5_hyperliquid import (
-            RSIv5HyperliquidControllerConfig,
-        )
+        from controllers.directional_trading.rsi_v5_hyperliquid import RSIv5HyperliquidControllerConfig
 
         with pytest.raises(Exception):
             RSIv5HyperliquidControllerConfig(id="invalid", **overrides)
@@ -306,15 +302,10 @@ class TestRSIv5HyperliquidController:
         ] == ["filled"]
 
     def test_buy_executor_uses_canonical_type_partial_fill_safe_runtime_and_hard_stop(self):
-        from hummingbot.strategy_v2.executors.executor_orchestrator import (
-            ExecutorOrchestrator,
-        )
-        from hummingbot.strategy_v2.executors.position_executor.data_types import (
-            PositionExecutorConfig,
-        )
-        from hummingbot.strategy_v2.executors.rsi_position_executor import (
-            RSIPositionExecutor,
-        )
+        from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+        from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+        from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+        from hummingbot.strategy_v2.executors.rsi_position_executor import RSIPositionExecutor
 
         controller = self.build_controller(
             perpetual_hard_stop_loss_pct=Decimal("0.08")
@@ -330,10 +321,8 @@ class TestRSIv5HyperliquidController:
         assert config.connector_name == "hyperliquid_perpetual"
         assert config.leverage == 1
         assert config.triple_barrier_config.stop_loss == Decimal("0.08")
-        assert (
-            ExecutorOrchestrator._executor_mapping["position_executor"]
-            is RSIPositionExecutor
-        )
+        assert ExecutorOrchestrator._executor_mapping["position_executor"] is PositionExecutor
+        assert controller.get_executor_class_for_config(config) is RSIPositionExecutor
         assert "rsi_position_executor" not in ExecutorOrchestrator._executor_mapping
 
     def test_perpetual_held_position_uses_position_amount_not_spot_wallet_balance(self):

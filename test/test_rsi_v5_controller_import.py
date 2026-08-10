@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
+from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
@@ -37,6 +39,17 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertIsNotNone(RSIv5Controller)
         self.assertIsNotNone(RSIv5ControllerConfig)
+
+    def test_rsi_hyperliquid_import_does_not_mutate_default_position_executor(self):
+        ExecutorOrchestrator._executor_mapping["position_executor"] = PositionExecutor
+
+        from controllers.directional_trading.rsi_v5_hyperliquid import RSIv5HyperliquidController
+
+        self.assertIsNotNone(RSIv5HyperliquidController)
+        self.assertIs(
+            ExecutorOrchestrator._executor_mapping["position_executor"],
+            PositionExecutor,
+        )
 
     def test_rsi_v5_default_sell_threshold_harmonization_preserves_overbought_default(self):
         from controllers.directional_trading.rsi_v5 import RSIv5ControllerConfig

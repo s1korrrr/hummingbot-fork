@@ -276,6 +276,16 @@ class EpisodeTracker:
         self,
         settlement: ExecutorSettlement,
     ) -> SettlementMutation:
+        mutation = self.preview_executor_settlement(settlement)
+        if mutation is not SettlementMutation.IDEMPOTENT:
+            self._episode.settlements_by_executor[settlement.executor_id] = settlement
+        return mutation
+
+    def preview_executor_settlement(
+        self,
+        settlement: ExecutorSettlement,
+    ) -> SettlementMutation:
+        """Validate a settlement without mutating episode truth."""
         episode = self._episode
         if episode is None:
             raise UnknownExecutorSettlement("cannot settle without an open episode")
@@ -286,7 +296,6 @@ class EpisodeTracker:
 
         existing = episode.settlements_by_executor.get(settlement.executor_id)
         if existing is None:
-            episode.settlements_by_executor[settlement.executor_id] = settlement
             return SettlementMutation.INSERTED
         if existing == settlement:
             return SettlementMutation.IDEMPOTENT
@@ -305,7 +314,6 @@ class EpisodeTracker:
                 f"{settlement.revision} did not advance beyond {existing.revision}"
             )
 
-        episode.settlements_by_executor[settlement.executor_id] = settlement
         return SettlementMutation.REPLACED
 
     def close_if_flat(

@@ -533,7 +533,10 @@ class TestRSIv5HyperliquidController:
         assert controller._get_sellable_inventory_amount() == Decimal("0.25")
 
     def test_unexpected_short_position_blocks_new_entries(self):
-        controller = self.build_controller()
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+
+        store = RSIV5RuntimeStore.in_memory()
+        controller = self.build_controller(runtime_store=store)
         controller.positions_held = [
             SimpleNamespace(
                 connector_name="hyperliquid_perpetual",
@@ -547,6 +550,16 @@ class TestRSIv5HyperliquidController:
 
         assert controller.can_create_executor(1) is False
         assert "unexpected_short" in controller.get_custom_info()["runtime_hold"]["reasons"]
+        assert [event.event_type for event in store.load(controller.config.id)] == [
+            "RECONCILIATION_HOLD"
+        ]
+        assert controller.can_create_executor(1) is False
+        assert len(store.load(controller.config.id)) == 1
+
+        restarted = self.build_controller(runtime_store=store)
+        assert "unexpected_short" in restarted.get_custom_info()["runtime_hold"]["reasons"]
+        restarted._sync_episode_tracker()
+        assert "unexpected_short" not in restarted.get_custom_info()["runtime_hold"]["reasons"]
 
     def test_unowned_held_long_sets_orphan_hold_without_opening_empty_episode(self):
         controller = self.build_controller()
@@ -598,9 +611,15 @@ class TestRSIv5HyperliquidController:
         assert outcome.net_pnl_quote == Decimal("999")
 
     def test_changed_final_settlement_sets_fail_closed_runtime_hold(self):
-        controller = self.build_controller()
-        controller._episode_tracker.open(timestamp=100)
-        controller._episode_tracker.register_executor("entry", Decimal("100"))
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+
+        store = RSIV5RuntimeStore.in_memory()
+        controller = self.build_controller(runtime_store=store)
+        assert controller._persist_and_register_executor(
+            timestamp=100,
+            executor_id="entry",
+            planned_notional=Decimal("100"),
+        )
         terminal = buy_executor(
             "entry",
             filled_base="1",
@@ -613,9 +632,18 @@ class TestRSIv5HyperliquidController:
         terminal.net_pnl_quote = Decimal("2")
 
         controller._track_executor_result(terminal)
+        controller.executors_info = [terminal]
 
         assert controller.can_create_executor(1) is False
         assert "settlement_conflict" in controller.get_custom_info()["runtime_hold"]["reasons"]
+        assert [event.event_type for event in store.load(controller.config.id)] == [
+            "EPISODE_OPENED",
+            "EXECUTOR_REGISTERED",
+            "EXECUTOR_SETTLED",
+            "RECONCILIATION_HOLD",
+        ]
+        replay = store.replay(controller.config.id)
+        assert "settlement_conflict" in {reason.value for reason in replay.runtime_holds}
 
     def test_loss_streak_changes_once_for_aggregate_episode(self):
         controller = self.build_controller()

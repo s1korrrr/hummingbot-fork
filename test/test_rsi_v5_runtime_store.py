@@ -190,6 +190,25 @@ def test_replay_restores_closed_episode_loss_streak():
     assert replay.historical_final_results == {"executor-1": Decimal("-5")}
 
 
+def test_replay_restores_durable_reconciliation_hold():
+    Event, _, Store = runtime_store_types()
+    store = Store.in_memory()
+    store.append(
+        Event(
+            "controller-1",
+            "hold-unexpected-short",
+            "runtime:controller-1",
+            "RECONCILIATION_HOLD",
+            {"reason": "unexpected_short"},
+            2.0,
+        )
+    )
+
+    replay = store.replay("controller-1")
+
+    assert {reason.value for reason in replay.runtime_holds} == {"unexpected_short"}
+
+
 def test_replay_rejects_sequence_gaps_and_corrupt_payloads():
     Event, ReplayError, Store = runtime_store_types()
     store = Store.in_memory()

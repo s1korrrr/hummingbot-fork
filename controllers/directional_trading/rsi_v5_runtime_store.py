@@ -296,7 +296,7 @@ class RSIV5RuntimeStore:
                     replay.historical_final_results[executor_id] = settlement.net_pnl_quote
             replay.exit_request_timestamps.clear()
             return
-        if event.event_type == "RUNTIME_HOLD":
+        if event.event_type in {"RECONCILIATION_HOLD", "RUNTIME_HOLD"}:
             replay.runtime_holds.add(RuntimeHoldReason(str(payload["reason"])))
             return
         raise RSIV5RuntimeReplayError(f"unknown runtime event type {event.event_type!r}")

@@ -217,6 +217,24 @@ class RSIv5HyperliquidController(RSIv5Controller):
             )
             return False
 
+    def _enter_runtime_hold(self, reason: RuntimeHoldReason) -> None:
+        """Persist a reconciliation hold before exposing it as controller state."""
+        if reason in self._runtime_holds:
+            return
+        now = float(self.market_data_provider.time())
+        episode_id = self._episode_tracker.episode_id or f"runtime:{self.config.id}"
+        event = self._runtime_event(
+            event_id=(
+                f"reconciliation-hold:{self.config.id}:{episode_id}:{reason.value}"
+            ),
+            episode_id=episode_id,
+            event_type="RECONCILIATION_HOLD",
+            payload={"reason": reason.value},
+            created_at=now,
+        )
+        self._append_runtime_events([event])
+        self._runtime_holds.add(reason)
+
     def _runtime_event(
         self,
         *,
@@ -441,12 +459,14 @@ class RSIv5HyperliquidController(RSIv5Controller):
         )
 
     def _sync_exposure_holds(self, exposure: SignedExposureSnapshot) -> None:
-        self._runtime_holds.discard(RuntimeHoldReason.ORPHAN_EXPOSURE)
-        self._runtime_holds.discard(RuntimeHoldReason.UNEXPECTED_SHORT)
+        if not exposure.has_orphan_long:
+            self._runtime_holds.discard(RuntimeHoldReason.ORPHAN_EXPOSURE)
+        if not exposure.has_unexpected_short:
+            self._runtime_holds.discard(RuntimeHoldReason.UNEXPECTED_SHORT)
         if exposure.has_unexpected_short:
-            self._runtime_holds.add(RuntimeHoldReason.UNEXPECTED_SHORT)
+            self._enter_runtime_hold(RuntimeHoldReason.UNEXPECTED_SHORT)
         if exposure.has_orphan_long:
-            self._runtime_holds.add(RuntimeHoldReason.ORPHAN_EXPOSURE)
+            self._enter_runtime_hold(RuntimeHoldReason.ORPHAN_EXPOSURE)
 
     def _get_total_position_value_usd(self) -> Decimal:
         return self._exposure_snapshot().total_notional
@@ -490,7 +510,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
         )
         self._runtime_holds.discard(RuntimeHoldReason.MISSING_EXECUTOR)
         if missing_executor_ids:
-            self._runtime_holds.add(RuntimeHoldReason.MISSING_EXECUTOR)
+            self._enter_runtime_hold(RuntimeHoldReason.MISSING_EXECUTOR)
             return
         if signed_exposure.has_unexpected_short or signed_exposure.has_orphan_long:
             return
@@ -581,7 +601,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
     def _track_executor_result(self, executor) -> None:
         executor_id = getattr(executor, "id", None)
         if executor_id is None:
-            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            self._enter_runtime_hold(RuntimeHoldReason.UNOWNED_SETTLEMENT)
             return
         executor_id = str(executor_id)
         if not self._episode_tracker.owns_executor(executor_id):
@@ -589,9 +609,9 @@ class RSIv5HyperliquidController(RSIv5Controller):
             observed_result = self._decimal(getattr(executor, "net_pnl_quote", _ZERO))
             if historical_result is not None and self._executor_is_done(executor):
                 if historical_result != observed_result:
-                    self._runtime_holds.add(RuntimeHoldReason.SETTLEMENT_CONFLICT)
+                    self._enter_runtime_hold(RuntimeHoldReason.SETTLEMENT_CONFLICT)
                 return
-            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            self._enter_runtime_hold(RuntimeHoldReason.UNOWNED_SETTLEMENT)
             return
         status = (
             SettlementStatus.FINAL
@@ -618,7 +638,21 @@ class RSIv5HyperliquidController(RSIv5Controller):
         )
         episode_id = self._episode_tracker.episode_id
         if episode_id is None:
-            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            self._enter_runtime_hold(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            return
+        try:
+            self._episode_tracker.preview_executor_settlement(settlement)
+        except SettlementConflict as exc:
+            reason = (
+                RuntimeHoldReason.UNOWNED_SETTLEMENT
+                if existing is None
+                else RuntimeHoldReason.SETTLEMENT_CONFLICT
+            )
+            self._enter_runtime_hold(reason)
+            self.logger().error(
+                f"RSI settlement hold | {self._controller_pair_log_prefix()} "
+                f"executor={executor_id} reason={reason.value} error={exc}"
+            )
             return
         event = self._runtime_event(
             event_id=(
@@ -637,19 +671,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
         )
         if not self._append_runtime_events([event]):
             return
-        try:
-            self._episode_tracker.record_executor_settlement(settlement)
-        except SettlementConflict as exc:
-            reason = (
-                RuntimeHoldReason.UNOWNED_SETTLEMENT
-                if existing is None
-                else RuntimeHoldReason.SETTLEMENT_CONFLICT
-            )
-            self._runtime_holds.add(reason)
-            self.logger().error(
-                f"RSI settlement hold | {self._controller_pair_log_prefix()} "
-                f"executor={executor_id} reason={reason.value} error={exc}"
-            )
+        self._episode_tracker.record_executor_settlement(settlement)
 
     def _finalize_episode_if_flat(
         self,
@@ -693,7 +715,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
             timestamp=now,
         )
         if outcome is None:
-            self._runtime_holds.add(RuntimeHoldReason.REPLAY_INCONSISTENCY)
+            self._enter_runtime_hold(RuntimeHoldReason.REPLAY_INCONSISTENCY)
             return None
 
         self._consecutive_losses = update_loss_streak(
@@ -867,7 +889,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
         executor_id = str(action.executor_id)
         episode_id = self._episode_tracker.episode_id
         if episode_id is None or not self._episode_tracker.owns_executor(executor_id):
-            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            self._enter_runtime_hold(RuntimeHoldReason.UNOWNED_SETTLEMENT)
             return False
         event = self._runtime_event(
             event_id=f"exit-requested:{self.config.id}:{episode_id}:{executor_id}:{uuid4()}",

@@ -7,7 +7,12 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
-from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent,
+    MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    OrderFilledEvent,
+)
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
@@ -93,6 +98,20 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
                 max_retries=max_retries,
             )
         executor._status = RunnableStatus.RUNNING
+        executor.get_in_flight_order = MagicMock(
+            side_effect=lambda _, order_id: next(
+                (
+                    tracked.order
+                    for tracked in (
+                        executor._open_order,
+                        executor._close_order,
+                        executor._take_profit_limit_order,
+                    )
+                    if tracked is not None and tracked.order_id == order_id
+                ),
+                None,
+            )
+        )
         return executor
 
     @staticmethod
@@ -139,6 +158,29 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
             )
         executor._open_order = tracked
 
+    def _fill_event(
+        self,
+        *,
+        order_id: str,
+        trade_id: str,
+        amount: Decimal,
+        trade_type: TradeType = TradeType.BUY,
+    ) -> OrderFilledEvent:
+        return OrderFilledEvent(
+            timestamp=1_700_000_001.0,
+            order_id=order_id,
+            trading_pair=self.trading_pair,
+            trade_type=trade_type,
+            order_type=OrderType.LIMIT_MAKER,
+            price=Decimal("100"),
+            amount=amount,
+            trade_fee=AddedToCostTradeFee(
+                flat_fees=[TokenAmount(token="USD", amount=Decimal("0.01"))]
+            ),
+            exchange_trade_id=trade_id,
+            exchange_order_id=f"EX-{order_id}",
+        )
+
     def test_runtime_mapping_preserves_standard_executor_discriminator(self):
         config = self._config("typed")
 
@@ -171,6 +213,257 @@ class TestRSIv5HyperliquidPositionExecutorContract(IsolatedAsyncioWrapperTestCas
         self.assertEqual(restored.type, "position_executor")
         self.assertEqual(restored.config.type, "position_executor")
         self.assertEqual(restored.config.id, "round-trip")
+
+    def test_duplicate_entry_completion_is_a_callback_noop(self):
+        executor = self._executor("duplicate-completion")
+        self._open_order(
+            executor,
+            order_id="OPEN-DUPLICATE",
+            configured_amount=Decimal("0.4"),
+            fill_amount=Decimal("0.4"),
+            state=OrderState.FILLED,
+        )
+        event = BuyOrderCompletedEvent(
+            timestamp=1_700_000_002.0,
+            order_id="OPEN-DUPLICATE",
+            base_asset="BTC",
+            quote_asset="USD",
+            base_asset_amount=Decimal("0.4"),
+            quote_asset_amount=Decimal("40"),
+            order_type=OrderType.LIMIT_MAKER,
+            exchange_order_id="EX-OPEN-DUPLICATE",
+        )
+
+        executor.process_order_completed_event(0, self.strategy.connectors[self.connector_name], event)
+        executor.process_order_completed_event(0, self.strategy.connectors[self.connector_name], event)
+
+        self.assertEqual(executor._total_executed_amount_backup, Decimal("0.4"))
+        self.assertEqual(len(executor.lifecycle_state.events), 1)
+
+    def test_cancel_then_late_fill_preserves_reducer_owned_exposure(self):
+        executor = self._executor("cancel-late-fill")
+        self._open_order(
+            executor,
+            order_id="OPEN-LATE",
+            configured_amount=Decimal("1"),
+            fill_amount=Decimal("0"),
+            state=OrderState.OPEN,
+        )
+
+        executor.process_order_canceled_event(
+            0,
+            self.strategy.connectors[self.connector_name],
+            OrderCancelledEvent(
+                timestamp=1_700_000_002.0,
+                order_id="OPEN-LATE",
+                exchange_order_id="EX-OPEN-LATE",
+            ),
+        )
+        executor.process_order_filled_event(
+            0,
+            self.strategy.connectors[self.connector_name],
+            self._fill_event(
+                order_id="OPEN-LATE",
+                trade_id="TRADE-LATE",
+                amount=Decimal("0.4"),
+            ),
+        )
+
+        self.assertEqual(executor.lifecycle_state.filled_base, Decimal("0.4"))
+        self.assertEqual(executor.lifecycle_state.filled_quote, Decimal("40"))
+        self.assertTrue(executor.lifecycle_state.entry_cancelled)
+        self.assertEqual(executor.open_filled_amount, Decimal("0.4"))
+        self.assertEqual(executor.amount_to_close, Decimal("0.4"))
+
+    def test_entry_fill_and_cancel_callback_order_converges(self):
+        states = []
+        for cancel_first in (False, True):
+            executor = self._executor("entry-cancel-order")
+            self._open_order(
+                executor,
+                order_id="OPEN-ENTRY-CANCEL",
+                configured_amount=Decimal("1"),
+                fill_amount=Decimal("0"),
+                state=OrderState.OPEN,
+            )
+            fill = self._fill_event(
+                order_id="OPEN-ENTRY-CANCEL",
+                trade_id="TRADE-ENTRY-CANCEL",
+                amount=Decimal("0.4"),
+            )
+            cancel = OrderCancelledEvent(
+                timestamp=1_700_000_002.0,
+                order_id="OPEN-ENTRY-CANCEL",
+                exchange_order_id="EX-OPEN-ENTRY-CANCEL",
+            )
+            callbacks = (
+                (executor.process_order_canceled_event, cancel),
+                (executor.process_order_filled_event, fill),
+            ) if cancel_first else (
+                (executor.process_order_filled_event, fill),
+                (executor.process_order_canceled_event, cancel),
+            )
+
+            for callback, event in callbacks:
+                callback(0, self.strategy.connectors[self.connector_name], event)
+            states.append(executor.lifecycle_state)
+
+        self.assertEqual(states[0], states[1])
+        self.assertEqual(states[0].filled_base, Decimal("0.4"))
+        self.assertTrue(states[0].entry_cancelled)
+        self.assertFalse(states[0].reconciliation_required)
+
+    def test_conflicting_fill_callback_enters_position_hold_without_overwrite(self):
+        executor = self._executor("conflicting-fill")
+        self._open_order(
+            executor,
+            order_id="OPEN-CONFLICT",
+            configured_amount=Decimal("1"),
+            fill_amount=Decimal("0"),
+            state=OrderState.OPEN,
+        )
+        first = self._fill_event(
+            order_id="OPEN-CONFLICT",
+            trade_id="TRADE-CONFLICT",
+            amount=Decimal("0.4"),
+        )
+        conflicting = first._replace(amount=Decimal("0.6"))
+
+        executor.process_order_filled_event(0, self.strategy.connectors[self.connector_name], first)
+        executor.process_order_filled_event(0, self.strategy.connectors[self.connector_name], conflicting)
+
+        self.assertTrue(executor.lifecycle_state.reconciliation_required)
+        self.assertEqual(executor.lifecycle_state.filled_base, Decimal("0.4"))
+        self.assertEqual(executor.status, RunnableStatus.SHUTTING_DOWN)
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+
+    async def test_reconciliation_hold_accepts_cancel_bookkeeping_but_keeps_unowned_residual(self):
+        executor = self._executor("conflict-cancel")
+        self._open_order(
+            executor,
+            order_id="OPEN-CONFLICT-CANCEL",
+            configured_amount=Decimal("1"),
+            fill_amount=Decimal("0"),
+            state=OrderState.OPEN,
+        )
+        first = self._fill_event(
+            order_id="OPEN-CONFLICT-CANCEL",
+            trade_id="TRADE-CONFLICT-CANCEL",
+            amount=Decimal("0.4"),
+        )
+        conflicting = first._replace(amount=Decimal("0.6"))
+        executor.process_order_filled_event(0, self.strategy.connectors[self.connector_name], first)
+        executor.process_order_filled_event(0, self.strategy.connectors[self.connector_name], conflicting)
+
+        executor.process_order_canceled_event(
+            0,
+            self.strategy.connectors[self.connector_name],
+            OrderCancelledEvent(
+                timestamp=1_700_000_003.0,
+                order_id="OPEN-CONFLICT-CANCEL",
+                exchange_order_id="EX-OPEN-CONFLICT-CANCEL",
+            ),
+        )
+        with patch.object(executor, "_sleep", new=AsyncMock()):
+            await executor.control_task()
+
+        self.assertIsNone(executor._open_order)
+        self.assertEqual(executor.status, RunnableStatus.SHUTTING_DOWN)
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+        self.assertEqual(executor.open_filled_amount, Decimal("0.4"))
+        self.strategy.sell.assert_not_called()
+
+    def test_duplicate_fill_and_fee_callback_is_idempotent(self):
+        executor = self._executor("duplicate-fill")
+        self._open_order(
+            executor,
+            order_id="OPEN-FILL-DUPLICATE",
+            configured_amount=Decimal("1"),
+            fill_amount=Decimal("0"),
+            state=OrderState.OPEN,
+        )
+        event = self._fill_event(
+            order_id="OPEN-FILL-DUPLICATE",
+            trade_id="TRADE-FILL-DUPLICATE",
+            amount=Decimal("0.4"),
+        )
+
+        executor.process_order_filled_event(0, self.strategy.connectors[self.connector_name], event)
+        executor.process_order_filled_event(0, self.strategy.connectors[self.connector_name], event)
+
+        self.assertEqual(executor.lifecycle_state.filled_base, Decimal("0.4"))
+        self.assertEqual(executor.lifecycle_state.fee_adjustment_quote, Decimal("0.01"))
+        self.assertEqual(len(executor.lifecycle_state.events), 2)
+        self.assertFalse(executor.lifecycle_state.reconciliation_required)
+
+    def test_entry_and_close_fill_callback_order_converges(self):
+        states = []
+        for close_first in (False, True):
+            executor = self._executor("fill-order")
+            self._open_order(
+                executor,
+                order_id="OPEN-ORDERED",
+                configured_amount=Decimal("0.4"),
+                fill_amount=Decimal("0"),
+                state=OrderState.OPEN,
+            )
+            open_order = executor._open_order
+            self._open_order(
+                executor,
+                order_id="CLOSE-ORDERED",
+                configured_amount=Decimal("0.4"),
+                fill_amount=Decimal("0"),
+                state=OrderState.OPEN,
+            )
+            executor._close_order = executor._open_order
+            executor._open_order = open_order
+            entry_fill = self._fill_event(
+                order_id="OPEN-ORDERED",
+                trade_id="ENTRY-TRADE",
+                amount=Decimal("0.4"),
+            )
+            close_fill = self._fill_event(
+                order_id="CLOSE-ORDERED",
+                trade_id="CLOSE-TRADE",
+                amount=Decimal("0.4"),
+                trade_type=TradeType.SELL,
+            )
+            callbacks = (close_fill, entry_fill) if close_first else (entry_fill, close_fill)
+
+            for callback in callbacks:
+                executor.process_order_filled_event(
+                    0,
+                    self.strategy.connectors[self.connector_name],
+                    callback,
+                )
+            states.append(executor.lifecycle_state)
+
+        self.assertEqual(states[0], states[1])
+        self.assertEqual(states[0].filled_base, Decimal("0.4"))
+        self.assertEqual(states[0].close_filled_base, Decimal("0.4"))
+        self.assertFalse(states[0].reconciliation_required)
+
+    def test_fill_without_exchange_trade_id_preserves_amount_and_holds(self):
+        executor = self._executor("missing-trade-id")
+        self._open_order(
+            executor,
+            order_id="OPEN-MISSING-TRADE-ID",
+            configured_amount=Decimal("1"),
+            fill_amount=Decimal("0"),
+            state=OrderState.OPEN,
+        )
+        event = self._fill_event(
+            order_id="OPEN-MISSING-TRADE-ID",
+            trade_id="",
+            amount=Decimal("0.4"),
+        )
+
+        executor.process_order_filled_event(0, self.strategy.connectors[self.connector_name], event)
+
+        self.assertEqual(executor.lifecycle_state.filled_base, Decimal("0.4"))
+        self.assertTrue(executor.lifecycle_state.reconciliation_required)
+        self.assertEqual(executor.status, RunnableStatus.SHUTTING_DOWN)
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
 
     async def test_early_stop_unfilled_entry_cancels_without_close_order(self):
         executor = self._executor("unfilled")

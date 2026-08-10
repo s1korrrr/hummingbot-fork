@@ -1,10 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Iterable, Optional
 from uuid import uuid4
+
+from hummingbot.strategy_v2.executors.rsi_position_executor.lifecycle import (
+    LifecycleEvent as _LifecycleEvent,
+    LifecycleState as _LifecycleState,
+    reduce_lifecycle_event as _reduce_lifecycle_event,
+)
+
+# Preserve the controller-runtime import surface while the executor package owns
+# the reducer used by connector callbacks.
+LifecycleEvent = _LifecycleEvent
+LifecycleState = _LifecycleState
+reduce_lifecycle_event = _reduce_lifecycle_event
 
 _ZERO = Decimal("0")
 _POSITION_EXECUTOR_TYPES = {"position_executor", "rsi_position_executor"}
@@ -365,102 +377,6 @@ class EpisodeTracker:
         outcome = self.close_if_flat(is_flat=is_flat, timestamp=timestamp)
         self._episode = episode
         return outcome
-
-
-@dataclass(frozen=True)
-class LifecycleEvent:
-    event_id: str
-    kind: str
-    amount: Decimal = _ZERO
-
-    def __post_init__(self) -> None:
-        amount = Decimal(str(self.amount))
-        if not amount.is_finite():
-            raise ValueError("lifecycle event amount must be finite")
-        object.__setattr__(self, "event_id", str(self.event_id))
-        object.__setattr__(self, "kind", str(self.kind).upper())
-        object.__setattr__(self, "amount", amount)
-
-
-@dataclass(frozen=True)
-class LifecycleState:
-    executor_id: str
-    events: tuple[LifecycleEvent, ...] = ()
-    filled_base: Decimal = _ZERO
-    close_filled_base: Decimal = _ZERO
-    fee_adjustment_quote: Decimal = _ZERO
-    entry_cancelled: bool = False
-    terminal: bool = False
-    reconciliation_required: bool = False
-    conflicting_event_ids: tuple[str, ...] = ()
-
-    @classmethod
-    def initial(cls, executor_id: str) -> LifecycleState:
-        return cls(executor_id=str(executor_id))
-
-
-_LIFECYCLE_EVENT_KINDS = {
-    "ENTRY_FILL",
-    "CANCEL_ACK",
-    "CLOSE_FILL",
-    "FEE_ADJUSTMENT",
-    "TIMEOUT",
-    "FAILURE",
-    "TERMINAL_CONFIRMATION",
-}
-
-
-def reduce_lifecycle_event(
-    state: LifecycleState,
-    event: LifecycleEvent,
-) -> LifecycleState:
-    """Reduce a callback into an order-independent executor lifecycle state."""
-    existing_by_id = {existing.event_id: existing for existing in state.events}
-    existing = existing_by_id.get(event.event_id)
-    if existing == event:
-        return state
-    if existing is not None:
-        conflicts = tuple(sorted(set(state.conflicting_event_ids) | {event.event_id}))
-        return replace(
-            state,
-            reconciliation_required=True,
-            conflicting_event_ids=conflicts,
-        )
-
-    existing_by_id[event.event_id] = event
-    events = tuple(sorted(existing_by_id.values(), key=lambda item: item.event_id))
-    filled_base = sum(
-        (item.amount for item in events if item.kind == "ENTRY_FILL"),
-        _ZERO,
-    )
-    close_filled_base = sum(
-        (item.amount for item in events if item.kind == "CLOSE_FILL"),
-        _ZERO,
-    )
-    fee_adjustment_quote = sum(
-        (item.amount for item in events if item.kind == "FEE_ADJUSTMENT"),
-        _ZERO,
-    )
-    reconciliation_required = bool(state.conflicting_event_ids) or any(
-        item.kind not in _LIFECYCLE_EVENT_KINDS
-        or item.kind in {"TIMEOUT", "FAILURE"}
-        or (item.kind in {"ENTRY_FILL", "CLOSE_FILL"} and item.amount < _ZERO)
-        for item in events
-    )
-    if close_filled_base > filled_base:
-        reconciliation_required = True
-
-    return LifecycleState(
-        executor_id=state.executor_id,
-        events=events,
-        filled_base=filled_base,
-        close_filled_base=close_filled_base,
-        fee_adjustment_quote=fee_adjustment_quote,
-        entry_cancelled=any(item.kind == "CANCEL_ACK" for item in events),
-        terminal=any(item.kind == "TERMINAL_CONFIRMATION" for item in events),
-        reconciliation_required=reconciliation_required,
-        conflicting_event_ids=state.conflicting_event_ids,
-    )
 
 
 def build_exit_plan(

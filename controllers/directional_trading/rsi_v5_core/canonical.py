@@ -10,31 +10,52 @@ from typing import Any
 
 from pydantic import BaseModel
 
+LEGACY_DECIMAL_SCHEMA_VERSIONS = frozenset({"1.0"})
 
-def _canonical_value(value: Any) -> Any:
+
+def canonical_decimal_string(value: Decimal) -> str:
+    if not value.is_finite():
+        raise ValueError("non-finite Decimal is not canonicalizable")
+    if value.is_zero():
+        return "0"
+    fixed = format(value, "f")
+    if "." in fixed:
+        fixed = fixed.rstrip("0").rstrip(".")
+    return fixed
+
+
+def canonical_value(value: Any, *, schema_version: str | None = None) -> Any:
     if isinstance(value, BaseModel):
-        return _canonical_value(value.model_dump(mode="python", exclude_none=False))
+        return canonical_value(
+            value.model_dump(mode="python", exclude_none=False),
+            schema_version=schema_version,
+        )
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise ValueError("non-finite Decimal is not canonicalizable")
-        return str(value)
+        if schema_version is None or schema_version in LEGACY_DECIMAL_SCHEMA_VERSIONS:
+            return str(value)
+        return canonical_decimal_string(value)
     if isinstance(value, datetime):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("canonical datetimes must be timezone-aware")
         return value.astimezone(timezone.utc).isoformat(timespec="auto").replace("+00:00", "Z")
     if isinstance(value, Enum):
-        return _canonical_value(value.value)
+        return canonical_value(value.value, schema_version=schema_version)
     if isinstance(value, dict):
+        nested_schema_version = value.get("schema_version", schema_version)
+        if nested_schema_version is not None:
+            nested_schema_version = str(nested_schema_version)
         normalized = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError("canonical JSON object keys must be strings")
-            normalized[key] = _canonical_value(item)
+            normalized[key] = canonical_value(item, schema_version=nested_schema_version)
         return normalized
     if isinstance(value, (list, tuple)):
-        return [_canonical_value(item) for item in value]
+        return [canonical_value(item, schema_version=schema_version) for item in value]
     if isinstance(value, (set, frozenset)):
-        items = [_canonical_value(item) for item in value]
+        items = [canonical_value(item, schema_version=schema_version) for item in value]
         return sorted(items, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -47,7 +68,7 @@ def _canonical_value(value: Any) -> Any:
 
 def canonical_json(value: Any) -> str:
     return json.dumps(
-        _canonical_value(value),
+        canonical_value(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

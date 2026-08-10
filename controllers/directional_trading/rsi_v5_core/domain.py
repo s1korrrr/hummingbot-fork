@@ -1,14 +1,53 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
-from controllers.directional_trading.rsi_v5_core.canonical import stable_hash
+from controllers.directional_trading.rsi_v5_core.canonical import canonical_value, stable_hash
 
 _ZERO = Decimal("0")
+_HASH_PATTERN = r"^[0-9a-f]{64}$"
+_VERSION_PATTERN = r"^sha256:[0-9a-f]{64}$"
+
+
+def _positive_decimal_string(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = Decimal(value)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("invalid decimal string") from exc
+    else:
+        raise ValueError("value must be encoded as a decimal string")
+    if not parsed.is_finite() or parsed <= _ZERO:
+        raise ValueError("decimal string must be finite and positive")
+    return parsed
+
+
+def _utc_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("invalid ISO-8601 timestamp") from exc
+    else:
+        raise ValueError("timestamp must be a datetime or ISO-8601 string")
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware UTC")
+    if parsed.utcoffset() != timedelta(0):
+        raise ValueError("timestamp must use UTC")
+    return parsed
+
+
+def _identity_payload(payload: dict[str, Any], identity_field: str) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key != identity_field}
 
 
 class StableModel(BaseModel):
@@ -228,6 +267,80 @@ class EntryIntent(StableModel):
     reference_price: Decimal = Field(gt=_ZERO)
     amount_base: Decimal = Field(gt=_ZERO)
     leverage: int = Field(ge=1)
+
+
+class RSIEntryIntent(StableModel):
+    """Versioned external EntryIntent contract; publication is disabled by default."""
+
+    schema_version: str = Field(pattern=r"^1\.(?:0|1)$")
+    intent_id: str = Field(pattern=_HASH_PATTERN)
+    episode_id: str = Field(min_length=1, max_length=128)
+    controller_id: str = Field(min_length=1, max_length=256)
+    event_sequence: int = Field(ge=1)
+    strategy_version: str = Field(pattern=_VERSION_PATTERN)
+    runtime_version: str = Field(pattern=_VERSION_PATTERN)
+    config_hash: str = Field(pattern=_HASH_PATTERN)
+    snapshot_hash: str = Field(pattern=_HASH_PATTERN)
+    regime_model_id: str = Field(pattern=_HASH_PATTERN)
+    market_event_time: datetime
+    signal_candle_time: datetime
+    side: Side = Side.BUY
+    entry_role: EntryRole
+    planned_notional: Decimal
+    planned_price: Decimal
+    amount_base: Decimal
+    dca_level: int = Field(ge=0, le=64)
+    deterministic_max_additional_layers: int = Field(ge=0, le=64)
+    leverage: int = Field(ge=1, le=10)
+    issued_at: datetime
+    expires_at: datetime
+    nonce: str = Field(min_length=8, max_length=256)
+
+    @field_validator("planned_notional", "planned_price", "amount_base", mode="before")
+    @classmethod
+    def validate_positive_decimal(cls, value: Any) -> Decimal:
+        return _positive_decimal_string(value)
+
+    @field_validator("market_event_time", "signal_candle_time", "issued_at", "expires_at", mode="before")
+    @classmethod
+    def validate_timestamp(cls, value: Any) -> datetime:
+        return _utc_timestamp(value)
+
+    @model_validator(mode="after")
+    def validate_contract(self, info: ValidationInfo) -> "RSIEntryIntent":
+        if self.side != Side.BUY:
+            raise ValueError("side must be BUY")
+        if self.signal_candle_time > self.market_event_time:
+            raise ValueError("signal_candle_time must not exceed market_event_time")
+        if self.issued_at < self.market_event_time:
+            raise ValueError("issued_at must not precede market_event_time")
+        if self.expires_at <= self.issued_at:
+            raise ValueError("expires_at must be after issued_at")
+        if self.planned_price * self.amount_base != self.planned_notional:
+            raise ValueError("planned_notional must equal planned_price multiplied by amount_base")
+        if not (info.context or {}).get("skip_identity_validation"):
+            expected_id = stable_hash(_identity_payload(self.model_dump(mode="python"), "intent_id"))
+            if self.intent_id != expected_id:
+                raise ValueError("intent_id does not match canonical payload")
+        return self
+
+    @classmethod
+    def build(cls, **payload: Any) -> "RSIEntryIntent":
+        unsigned = dict(payload)
+        unsigned.pop("intent_id", None)
+        normalized = cls.model_validate(
+            {"intent_id": "0" * 64, **unsigned},
+            context={"skip_identity_validation": True},
+        )
+        normalized_payload = _identity_payload(
+            normalized.model_dump(mode="python"),
+            "intent_id",
+        )
+        intent_id = stable_hash(normalized_payload)
+        return cls.model_validate({"intent_id": intent_id, **normalized_payload})
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return canonical_value(self.model_dump(mode="python"))
 
 
 class ExitIntent(StableModel):

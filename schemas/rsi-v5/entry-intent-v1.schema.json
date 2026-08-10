@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rsitech.ai/schemas/rsi-v5/entry-intent-v1.schema.json",
+  "title": "RSI v5 EntryIntent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "intent_id", "episode_id", "controller_id", "event_sequence",
+    "strategy_version", "runtime_version", "config_hash", "snapshot_hash",
+    "regime_model_id", "market_event_time", "signal_candle_time", "side",
+    "entry_role", "planned_notional", "planned_price", "amount_base", "dca_level",
+    "deterministic_max_additional_layers", "leverage", "issued_at", "expires_at", "nonce"
+  ],
+  "properties": {
+    "schema_version": {"enum": ["1.0", "1.1"]},
+    "intent_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "episode_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "controller_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "event_sequence": {"type": "integer", "minimum": 1},
+    "strategy_version": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "runtime_version": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "config_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "snapshot_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "regime_model_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "market_event_time": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "signal_candle_time": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "side": {"const": "BUY"},
+    "entry_role": {"enum": ["FULL", "SCOUT", "RUNNER"]},
+    "planned_notional": {"$ref": "#/$defs/positiveDecimalString"},
+    "planned_price": {"$ref": "#/$defs/positiveDecimalString"},
+    "amount_base": {"$ref": "#/$defs/positiveDecimalString"},
+    "dca_level": {"type": "integer", "minimum": 0, "maximum": 64},
+    "deterministic_max_additional_layers": {"type": "integer", "minimum": 0, "maximum": 64},
+    "leverage": {"type": "integer", "minimum": 1, "maximum": 10},
+    "issued_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "expires_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "nonce": {"type": "string", "minLength": 8, "maxLength": 256}
+  },
+  "$defs": {
+    "positiveDecimalString": {
+      "type": "string",
+      "pattern": "^(?:0*[1-9]\\d*(?:\\.\\d+)?|0*\\.0*[1-9]\\d*)$"
+    }
+  }
+}

@@ -62,6 +62,8 @@ class TestAbsoluteBarrierPositionExecutor(TestCase):
         executor._open_order = MagicMock()
         executor._entry_remainder_cancel_pending = False
         executor._entry_remainder_cancelled = False
+        executor._entry_remainder_cancel_requested_at = None
+        executor._entry_cancel_retry_seconds = 2.0
         return executor
 
     def test_constructor_keeps_absolute_config_type(self):
@@ -73,6 +75,8 @@ class TestAbsoluteBarrierPositionExecutor(TestCase):
         self.assertIs(config, executor.config)
         self.assertFalse(executor._entry_remainder_cancel_pending)
         self.assertFalse(executor._entry_remainder_cancelled)
+        self.assertIsNone(executor._entry_remainder_cancel_requested_at)
+        self.assertEqual(2.0, executor._entry_cancel_retry_seconds)
         validate.assert_called_once_with()
 
     def test_tick_alignment_fails_closed(self):

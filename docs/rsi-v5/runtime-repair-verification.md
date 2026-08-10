@@ -2,8 +2,8 @@
 
 Date: 2026-08-10
 Component: `s1korrrr/hummingbot`
-Branch: `feat/andrzej_rsi_runtime_repair`
-Verified code SHA: `bc5b028276c3f5c6ccb09d749b71b07d73741fd1`
+Branch: `feat/andrzej_rsi_callback_reducer_integration`
+Verified code SHA: `b4590bdca3f4893258047400e7fe1818bf14aea7`
 Audited baseline: `1823dea50bef69aaebeff045fc4677a725420985`
 
 ## Readiness
@@ -16,6 +16,7 @@ This branch is locally `repo-ready` for review. It is not runtime-proven, paper-
 - RSI executor-class selection is scoped to the owning controller; importing the RSI controller does not mutate the process-wide executor map.
 - A `SHUTTING_DOWN` executor contributes provisional settlement only. Episode PnL and loss streak change only after every member has an authoritative terminal settlement.
 - Identical duplicate facts are idempotent. A changed final result, unknown owner, missing restored executor, corrupt replay, or persistence failure blocks new entries.
+- RSI connector callbacks are reduced before executor mutation. Duplicate completions do not double-count, fill/cancel and entry/close callback order converges, contradictory facts or missing exchange trade IDs enter `POSITION_HOLD`, and safe cancellation bookkeeping continues while the hold prevents a blind close.
 - Reconciliation holds are append-only runtime events. A conflicting final settlement is rejected before it can corrupt the settlement ledger, and the hold replays after restart.
 - Held short exposure and held long exposure without a reconstructable owner block new entries.
 - The first executor atomically opens and joins an episode; an empty episode is not created.
@@ -31,6 +32,7 @@ This branch is locally `repo-ready` for review. It is not runtime-proven, paper-
 - `93c1bb50204432e5bdf4f44f9c7ad0c821201617` — append-only runtime persistence and replay.
 - `7a32222da304a392461f78493a94c9f71313ddb8` — complete the Absolute Barrier test fixture state exposed by the broad Strategy V2 gate.
 - `bc5b028276c3f5c6ccb09d749b71b07d73741fd1` — persist reconciliation holds and validate conflicting settlements before append.
+- `b4590bdca3f4893258047400e7fe1818bf14aea7` — make lifecycle-reducer decisions authoritative for RSI connector callbacks.
 
 ## Verification evidence
 
@@ -41,6 +43,8 @@ conda run -n hummingbot pre-commit run --files \
   hummingbot/strategy_v2/controllers/controller_base.py \
   hummingbot/strategy_v2/executors/executor_orchestrator.py \
   hummingbot/strategy_v2/executors/rsi_position_executor/__init__.py \
+  hummingbot/strategy_v2/executors/rsi_position_executor/lifecycle.py \
+  hummingbot/strategy_v2/executors/rsi_position_executor/rsi_position_executor.py \
   hummingbot/model/rsi_v5_runtime_event.py \
   hummingbot/model/__init__.py \
   hummingbot/connector/markets_recorder.py \
@@ -75,7 +79,7 @@ conda run -n hummingbot python -m pytest \
   test/rsi_v5/test_position_executor_contract.py -q
 ```
 
-Result: `195 passed, 1 skipped, 8 warnings in 7.41s`.
+Result after callback integration: `203 passed, 1 skipped, 8 warnings in 38.92s`.
 
 The skip is intentional in the existing suite. Warnings are existing Pydantic, pandas-ta, and event-loop deprecations; no new warning category was introduced by this branch.
 
@@ -94,7 +98,7 @@ conda run -n hummingbot python -m pytest --import-mode=importlib \
   test/test_rsi_v5_universe_shadow.py -q
 ```
 
-Result after the durable-hold hardening pass: `545 passed, 1 skipped, 8 warnings in 9.03s`.
+Result after callback integration: `553 passed, 1 skipped, 8 warnings in 41.40s`.
 
 The first generated-file-list attempt was invalid because it duplicated paths and collected multiple modules named `test_data_types.py` with pytest's default import mode. The command above is the retained reproducible gate; the invalid collection attempt is not counted as a project test result.
 
@@ -129,5 +133,5 @@ While the feature remains disabled, revert the branch commits in reverse order. 
 - SQLite sequence collisions fail closed. Multi-process writer behavior has not been promoted beyond that failure mode.
 - The append-only table has no archival/retention job yet; operational growth must be measured during an approved soak.
 - No connector-backed crash injection, paper/testnet soak, fee/funding reconciliation, or kill-switch exercise has run.
-- The pure callback lifecycle reducer is unit-verified, but connector callbacks are still represented through executor aggregate state; a connector-backed lifecycle smoke remains required before calling that boundary runtime-proven.
+- Connector callbacks now consume the reducer before executor mutation, but the evidence is synthetic/local. A connector-backed lifecycle smoke remains required before calling the boundary runtime-proven.
 - Root integration must pin only a later Hummingbot commit that is merged to `master`; this local branch SHA is not eligible for a root gitlink update.

@@ -132,6 +132,9 @@ class RuntimeHoldReason(str, Enum):
     UNEXPECTED_SHORT = "unexpected_short"
     SETTLEMENT_CONFLICT = "settlement_conflict"
     UNOWNED_SETTLEMENT = "unowned_settlement"
+    PERSISTENCE_FAILURE = "persistence_failure"
+    REPLAY_INCONSISTENCY = "replay_inconsistency"
+    MISSING_EXECUTOR = "missing_executor"
 
 
 class SettlementConflict(RuntimeError):
@@ -236,6 +239,18 @@ class EpisodeTracker:
             return None
         return self._episode.settlements_by_executor.get(str(executor_id))
 
+    def owns_executor(self, executor_id: str) -> bool:
+        return bool(
+            self._episode is not None
+            and str(executor_id) in self._episode.planned_notional_by_executor
+        )
+
+    @property
+    def registered_executor_ids(self) -> tuple[str, ...]:
+        if self._episode is None:
+            return ()
+        return tuple(sorted(self._episode.planned_notional_by_executor))
+
     def record_executor_result(
         self,
         executor_id: str,
@@ -330,6 +345,17 @@ class EpisodeTracker:
             ),
         )
         self._episode = None
+        return outcome
+
+    def preview_close_if_flat(
+        self,
+        *,
+        is_flat: bool,
+        timestamp: float,
+    ) -> Optional[EpisodeOutcome]:
+        episode = self._episode
+        outcome = self.close_if_flat(is_flat=is_flat, timestamp=timestamp)
+        self._episode = episode
         return outcome
 
 

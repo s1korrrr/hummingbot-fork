@@ -10,6 +10,7 @@ from shutil import move
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
+from sqlalchemy import func
 from sqlalchemy.orm import Query, Session
 
 from hummingbot import data_path
@@ -45,6 +46,7 @@ from hummingbot.model.order_status import OrderStatus
 from hummingbot.model.position import Position
 from hummingbot.model.position_hold_ledger import PositionHoldLedger
 from hummingbot.model.range_position_update import RangePositionUpdate
+from hummingbot.model.rsi_v5_runtime_event import RSIV5RuntimeEvent
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
@@ -69,6 +71,11 @@ class MarketsRecorder:
     def get_instance(cls, *args, **kwargs) -> "MarketsRecorder":
         if cls._shared_instance is None:
             cls._shared_instance = MarketsRecorder(*args, **kwargs)
+        return cls._shared_instance
+
+    @classmethod
+    def get_existing_instance(cls) -> Optional["MarketsRecorder"]:
+        """Return the initialized recorder without implicitly constructing one."""
         return cls._shared_instance
 
     def __init__(self,
@@ -231,6 +238,87 @@ class MarketsRecorder:
                 new_executor = Executors(**executor_dict)
                 session.add(new_executor)
             session.commit()
+
+    @staticmethod
+    def _same_rsi_v5_runtime_fact(row: RSIV5RuntimeEvent, event: Dict[str, Any]) -> bool:
+        return bool(
+            row.controller_id == event["controller_id"]
+            and row.event_id == event["event_id"]
+            and row.episode_id == event["episode_id"]
+            and row.event_type == event["event_type"]
+            and row.payload_json == event["payload_json"]
+        )
+
+    def append_rsi_v5_runtime_events(
+        self,
+        events: List[Dict[str, Any]],
+    ) -> List[RSIV5RuntimeEvent]:
+        """Append one controller-local batch atomically; existing facts are immutable."""
+        if not events:
+            return []
+        controller_ids = {str(event["controller_id"]) for event in events}
+        if len(controller_ids) != 1:
+            raise ValueError("one RSI runtime append batch cannot span controllers")
+        controller_id = next(iter(controller_ids))
+        persisted: List[RSIV5RuntimeEvent] = []
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                next_sequence = (
+                    session.query(func.max(RSIV5RuntimeEvent.sequence))
+                    .filter(RSIV5RuntimeEvent.controller_id == controller_id)
+                    .scalar()
+                    or 0
+                ) + 1
+                for event in events:
+                    existing = (
+                        session.query(RSIV5RuntimeEvent)
+                        .filter(RSIV5RuntimeEvent.event_id == event["event_id"])
+                        .one_or_none()
+                    )
+                    if existing is not None:
+                        if not self._same_rsi_v5_runtime_fact(existing, event):
+                            raise RuntimeError(
+                                f"event_id {event['event_id']!r} already records a different fact"
+                            )
+                        persisted.append(existing)
+                        continue
+                    requested_sequence = event.get("sequence")
+                    if requested_sequence is not None and int(requested_sequence) != next_sequence:
+                        raise RuntimeError(
+                            f"sequence {requested_sequence} conflicts with next sequence {next_sequence}"
+                        )
+                    row = RSIV5RuntimeEvent(
+                        controller_id=controller_id,
+                        sequence=next_sequence,
+                        event_id=str(event["event_id"]),
+                        episode_id=str(event["episode_id"]),
+                        event_type=str(event["event_type"]),
+                        payload_json=str(event["payload_json"]),
+                        created_at=float(event["created_at"]),
+                    )
+                    session.add(row)
+                    session.flush()
+                    persisted.append(row)
+                    next_sequence += 1
+                for row in persisted:
+                    if row in session:
+                        session.expunge(row)
+        return persisted
+
+    def get_rsi_v5_runtime_events(
+        self,
+        controller_id: str,
+    ) -> List[RSIV5RuntimeEvent]:
+        with self._sql_manager.get_new_session() as session:
+            rows = (
+                session.query(RSIV5RuntimeEvent)
+                .filter(RSIV5RuntimeEvent.controller_id == str(controller_id))
+                .order_by(RSIV5RuntimeEvent.sequence.asc())
+                .all()
+            )
+            for row in rows:
+                session.expunge(row)
+        return rows
 
     def store_or_update_chart_snapshot(self, snapshot: Dict[str, Any]):
         identity = {

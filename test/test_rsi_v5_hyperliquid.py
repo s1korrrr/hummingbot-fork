@@ -97,6 +97,9 @@ class TestRSIv5HyperliquidController:
             RSIv5HyperliquidController,
             RSIv5HyperliquidControllerConfig,
         )
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+
+        runtime_store = overrides.pop("runtime_store", None) or RSIV5RuntimeStore.in_memory()
 
         controller = RSIv5HyperliquidController(
             config=RSIv5HyperliquidControllerConfig(
@@ -105,6 +108,7 @@ class TestRSIv5HyperliquidController:
             ),
             market_data_provider=provider or make_provider(),
             actions_queue=asyncio.Queue(),
+            runtime_store=runtime_store,
         )
         controller.positions_held = []
         controller.executors_info = []
@@ -116,6 +120,171 @@ class TestRSIv5HyperliquidController:
             },
         }
         return controller
+
+    def test_runtime_store_replay_restores_pending_exit_and_suppresses_early_retry(self):
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeEvent, RSIV5RuntimeStore
+
+        store = RSIV5RuntimeStore.in_memory()
+        store.append_many(
+            [
+                RSIV5RuntimeEvent(
+                    "btc-rsi-v5-hyperliquid", "open", "episode-1", "EPISODE_OPENED", {"started_at": 1.0}, 1.0
+                ),
+                RSIV5RuntimeEvent(
+                    "btc-rsi-v5-hyperliquid",
+                    "register",
+                    "episode-1",
+                    "EXECUTOR_REGISTERED",
+                    {"executor_id": "filled", "planned_notional": "100"},
+                    1.0,
+                ),
+                RSIV5RuntimeEvent(
+                    "btc-rsi-v5-hyperliquid",
+                    "exit",
+                    "episode-1",
+                    "EXIT_REQUESTED",
+                    {"executor_id": "filled", "requested_at": 2.0, "reason": "signal"},
+                    2.0,
+                ),
+            ]
+        )
+        provider = make_provider()
+        provider.time.return_value = 4.0
+        controller = self.build_controller(
+            provider=provider,
+            runtime_store=store,
+            executor_exit_retry_seconds=5,
+        )
+        controller.executors_info = [buy_executor("filled", filled_base="1", filled_quote="100")]
+        controller.processed_data["signal"] = -1
+
+        assert controller.stop_actions_proposal() == []
+        assert controller._episode_tracker.episode_id == "episode-1"
+
+    def test_restart_with_registered_but_unobserved_executor_blocks_new_entry(self):
+        from controllers.directional_trading.rsi_v5_runtime import RuntimeHoldReason
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeEvent, RSIV5RuntimeStore
+
+        store = RSIV5RuntimeStore.in_memory()
+        store.append_many(
+            [
+                RSIV5RuntimeEvent(
+                    "btc-rsi-v5-hyperliquid", "open", "episode-1", "EPISODE_OPENED", {"started_at": 1.0}, 1.0
+                ),
+                RSIV5RuntimeEvent(
+                    "btc-rsi-v5-hyperliquid",
+                    "register",
+                    "episode-1",
+                    "EXECUTOR_REGISTERED",
+                    {"executor_id": "not-restored", "planned_notional": "100"},
+                    1.0,
+                ),
+            ]
+        )
+        controller = self.build_controller(runtime_store=store)
+
+        assert controller.can_create_executor(1) is False
+        assert RuntimeHoldReason.MISSING_EXECUTOR in controller._runtime_holds
+
+    def test_executor_creation_persists_episode_membership_before_returning_config(self):
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+
+        store = RSIV5RuntimeStore.in_memory()
+        controller = self.build_controller(runtime_store=store)
+
+        config = controller.get_executor_config(TradeType.BUY, Decimal("100"), Decimal("1"))
+
+        events = store.load(controller.config.id)
+        assert [event.event_type for event in events] == ["EPISODE_OPENED", "EXECUTOR_REGISTERED"]
+        assert events[1].payload["executor_id"] == config.id
+
+    def test_closed_episode_replays_loss_streak_after_restart(self):
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+
+        store = RSIV5RuntimeStore.in_memory()
+        controller = self.build_controller(runtime_store=store)
+        config = controller.get_executor_config(TradeType.BUY, Decimal("100"), Decimal("1"))
+        terminal = buy_executor(
+            config.id,
+            configured_base="1",
+            filled_base="1",
+            filled_quote="100",
+            is_active=False,
+            status=RunnableStatus.TERMINATED,
+        )
+        terminal.net_pnl_quote = Decimal("-5")
+        controller._track_executor_result(terminal)
+        controller.executors_info = []
+        controller.positions_held = []
+        controller._finalize_episode_if_flat(timestamp=1_700_000_010.0)
+
+        restarted = self.build_controller(runtime_store=store)
+
+        assert restarted._episode_tracker.is_open is False
+        assert restarted._consecutive_losses == 1
+        assert restarted._last_loss_timestamp == 1_700_000_010.0
+        assert restarted._last_episode_outcome.net_pnl_quote == Decimal("-5")
+        restarted.executors_info = [terminal]
+        assert restarted.stop_actions_proposal() == []
+        assert restarted._runtime_holds == set()
+
+    def test_duplicate_final_settlement_remains_idempotent_when_clock_advances(self):
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+
+        provider = make_provider()
+        store = RSIV5RuntimeStore.in_memory()
+        controller = self.build_controller(provider=provider, runtime_store=store)
+        config = controller.get_executor_config(TradeType.BUY, Decimal("100"), Decimal("1"))
+        terminal = buy_executor(
+            config.id,
+            filled_base="1",
+            filled_quote="100",
+            is_active=False,
+            status=RunnableStatus.TERMINATED,
+        )
+        terminal.net_pnl_quote = Decimal("2")
+        controller._track_executor_result(terminal)
+        provider.time.return_value += 10
+
+        controller._track_executor_result(terminal)
+
+        settlement_events = [
+            event for event in store.load(controller.config.id) if event.event_type == "EXECUTOR_SETTLED"
+        ]
+        assert len(settlement_events) == 1
+        assert controller._runtime_holds == set()
+
+    def test_persistence_failure_blocks_exit_action(self):
+        from controllers.directional_trading.rsi_v5_runtime import RuntimeHoldReason
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+
+        class FailingStore(RSIV5RuntimeStore):
+            def append_many(self, events):
+                raise OSError("database unavailable")
+
+        controller = self.build_controller(runtime_store=FailingStore.in_memory())
+        controller.executors_info = [buy_executor("filled", filled_base="1", filled_quote="100")]
+        controller.processed_data["signal"] = -1
+
+        assert controller.stop_actions_proposal() == []
+        assert RuntimeHoldReason.PERSISTENCE_FAILURE in controller._runtime_holds
+
+    def test_corrupt_replay_blocks_new_entries(self):
+        from controllers.directional_trading.rsi_v5_runtime import RuntimeHoldReason
+        from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeEvent, RSIV5RuntimeStore
+
+        store = RSIV5RuntimeStore.in_memory()
+        stored = store.append(
+            RSIV5RuntimeEvent(
+                "btc-rsi-v5-hyperliquid", "open", "episode-1", "EPISODE_OPENED", {"started_at": 1.0}, 1.0
+            )
+        )
+        store._memory_events[0] = stored.model_copy(update={"sequence": 2})
+
+        controller = self.build_controller(runtime_store=store)
+
+        assert RuntimeHoldReason.REPLAY_INCONSISTENCY in controller._runtime_holds
+        assert controller.can_create_executor(1) is False
 
     def test_defaults_are_hyperliquid_oneway_and_no_position_hold(self):
         from controllers.directional_trading.rsi_v5_hyperliquid import RSIv5HyperliquidControllerConfig
@@ -130,6 +299,22 @@ class TestRSIv5HyperliquidController:
         assert config.perpetual_allow_position_hold is False
         assert config.use_bag_freeze is False
         assert config.early_stop_keep_position is False
+
+    def test_controller_requires_initialized_recorder_when_store_is_not_injected(self, monkeypatch):
+        from controllers.directional_trading.rsi_v5_hyperliquid import (
+            RSIv5HyperliquidController,
+            RSIv5HyperliquidControllerConfig,
+        )
+        from hummingbot.connector.markets_recorder import MarketsRecorder
+
+        monkeypatch.setattr(MarketsRecorder, "_shared_instance", None)
+
+        with pytest.raises(RuntimeError, match="initialized MarketsRecorder"):
+            RSIv5HyperliquidController(
+                config=RSIv5HyperliquidControllerConfig(id="persistence-required"),
+                market_data_provider=make_provider(),
+                actions_queue=asyncio.Queue(),
+            )
 
     @pytest.mark.parametrize(
         "overrides",

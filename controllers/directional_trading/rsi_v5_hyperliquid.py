@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from pydantic import model_validator
 
@@ -20,6 +21,7 @@ from controllers.directional_trading.rsi_v5_runtime import (
     calculate_exposure,
     update_loss_streak,
 )
+from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeEvent, RSIV5RuntimeStore
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
@@ -168,11 +170,70 @@ class RSIv5HyperliquidController(RSIv5Controller):
     """RSI v5 adapter with executor-owned perpetual exits and episode accounting."""
 
     def __init__(self, config: RSIv5HyperliquidControllerConfig, *args, **kwargs):
+        runtime_store = kwargs.pop("runtime_store", None)
+        if runtime_store is None:
+            from hummingbot.connector.markets_recorder import MarketsRecorder
+
+            recorder = MarketsRecorder.get_existing_instance()
+            if recorder is None:
+                raise RuntimeError(
+                    "RSI Hyperliquid runtime persistence requires an initialized MarketsRecorder"
+                )
+            runtime_store = RSIV5RuntimeStore(recorder)
+        self._runtime_store: RSIV5RuntimeStore = runtime_store
         self._episode_tracker = EpisodeTracker()
         self._last_episode_outcome: Optional[EpisodeOutcome] = None
         self._exit_request_timestamps: Dict[str, float] = {}
+        self._historical_final_results: Dict[str, Decimal] = {}
         self._runtime_holds: set[RuntimeHoldReason] = set()
         super().__init__(config, *args, **kwargs)
+        self._replay_runtime_state()
+
+    def _replay_runtime_state(self) -> None:
+        try:
+            replay = self._runtime_store.replay(self.config.id)
+        except Exception as exc:
+            self._runtime_holds.add(RuntimeHoldReason.REPLAY_INCONSISTENCY)
+            self.logger().error(
+                f"RSI runtime replay hold | {self._controller_pair_log_prefix()} error={exc}"
+            )
+            return
+        self._episode_tracker = replay.episode_tracker
+        self._exit_request_timestamps = replay.exit_request_timestamps
+        self._last_episode_outcome = replay.last_episode_outcome
+        self._consecutive_losses = replay.consecutive_losses
+        self._last_loss_timestamp = replay.last_loss_timestamp
+        self._historical_final_results = replay.historical_final_results
+        self._runtime_holds.update(replay.runtime_holds)
+
+    def _append_runtime_events(self, events: List[RSIV5RuntimeEvent]) -> bool:
+        try:
+            self._runtime_store.append_many(events)
+            return True
+        except Exception as exc:
+            self._runtime_holds.add(RuntimeHoldReason.PERSISTENCE_FAILURE)
+            self.logger().error(
+                f"RSI runtime persistence hold | {self._controller_pair_log_prefix()} error={exc}"
+            )
+            return False
+
+    def _runtime_event(
+        self,
+        *,
+        event_id: str,
+        episode_id: str,
+        event_type: str,
+        payload: dict,
+        created_at: float,
+    ) -> RSIV5RuntimeEvent:
+        return RSIV5RuntimeEvent(
+            controller_id=self.config.id,
+            event_id=event_id,
+            episode_id=episode_id,
+            event_type=event_type,
+            payload=payload,
+            created_at=created_at,
+        )
 
     @property
     def config(self) -> RSIv5HyperliquidControllerConfig:
@@ -419,6 +480,18 @@ class RSIv5HyperliquidController(RSIv5Controller):
         owned_executors = self._owned_buy_position_executors()
         signed_exposure = self._signed_exposure_snapshot()
         self._sync_exposure_holds(signed_exposure)
+        observed_executor_ids = {
+            str(getattr(executor, "id", ""))
+            for executor in self.executors_info
+        }
+        missing_executor_ids = (
+            set(self._episode_tracker.registered_executor_ids)
+            - observed_executor_ids
+        )
+        self._runtime_holds.discard(RuntimeHoldReason.MISSING_EXECUTOR)
+        if missing_executor_ids:
+            self._runtime_holds.add(RuntimeHoldReason.MISSING_EXECUTOR)
+            return
         if signed_exposure.has_unexpected_short or signed_exposure.has_orphan_long:
             return
         if not owned_executors:
@@ -439,11 +512,55 @@ class RSIv5HyperliquidController(RSIv5Controller):
             planned_notional = (
                 exposure.configured_base * max(exposure.reference_price, _ZERO)
             )
-            self._episode_tracker.open_and_register_executor(
+            self._persist_and_register_executor(
                 timestamp=episode_timestamp,
                 executor_id=exposure.executor_id,
                 planned_notional=planned_notional,
             )
+
+    def _persist_and_register_executor(
+        self,
+        *,
+        timestamp: float,
+        executor_id: str,
+        planned_notional: Decimal,
+    ) -> bool:
+        executor_id = str(executor_id)
+        if self._episode_tracker.owns_executor(executor_id):
+            return True
+        episode_id = self._episode_tracker.episode_id or str(uuid4())
+        events: List[RSIV5RuntimeEvent] = []
+        if not self._episode_tracker.is_open:
+            events.append(
+                self._runtime_event(
+                    event_id=f"episode-opened:{episode_id}",
+                    episode_id=episode_id,
+                    event_type="EPISODE_OPENED",
+                    payload={"started_at": float(timestamp)},
+                    created_at=float(timestamp),
+                )
+            )
+        events.append(
+            self._runtime_event(
+                event_id=f"executor-registered:{self.config.id}:{executor_id}",
+                episode_id=episode_id,
+                event_type="EXECUTOR_REGISTERED",
+                payload={
+                    "executor_id": executor_id,
+                    "planned_notional": str(max(planned_notional, _ZERO)),
+                },
+                created_at=float(timestamp),
+            )
+        )
+        if not self._append_runtime_events(events):
+            return False
+        self._episode_tracker.open_and_register_executor(
+            timestamp=float(timestamp),
+            executor_id=executor_id,
+            planned_notional=planned_notional,
+            episode_id=episode_id,
+        )
+        return True
 
     def _register_created_executor(
         self,
@@ -453,11 +570,13 @@ class RSIv5HyperliquidController(RSIv5Controller):
             max(config.amount, _ZERO)
             * max(config.entry_price or _ZERO, _ZERO)
         )
-        self._episode_tracker.open_and_register_executor(
+        registered = self._persist_and_register_executor(
             timestamp=float(config.timestamp or self.market_data_provider.time()),
             executor_id=config.id,
             planned_notional=planned_notional,
         )
+        if not registered:
+            raise RuntimeError("RSI executor creation blocked by runtime persistence failure")
 
     def _track_executor_result(self, executor) -> None:
         executor_id = getattr(executor, "id", None)
@@ -465,6 +584,15 @@ class RSIv5HyperliquidController(RSIv5Controller):
             self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
             return
         executor_id = str(executor_id)
+        if not self._episode_tracker.owns_executor(executor_id):
+            historical_result = self._historical_final_results.get(executor_id)
+            observed_result = self._decimal(getattr(executor, "net_pnl_quote", _ZERO))
+            if historical_result is not None and self._executor_is_done(executor):
+                if historical_result != observed_result:
+                    self._runtime_holds.add(RuntimeHoldReason.SETTLEMENT_CONFLICT)
+                return
+            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            return
         status = (
             SettlementStatus.FINAL
             if self._executor_is_done(executor)
@@ -482,15 +610,35 @@ class RSIv5HyperliquidController(RSIv5Controller):
             revision = existing.revision
         else:
             revision = (existing.revision + 1) if existing else 1
+        settlement = ExecutorSettlement(
+            executor_id=executor_id,
+            status=status,
+            net_pnl_quote=net_pnl_quote,
+            revision=revision,
+        )
+        episode_id = self._episode_tracker.episode_id
+        if episode_id is None:
+            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            return
+        event = self._runtime_event(
+            event_id=(
+                f"executor-settled:{self.config.id}:{episode_id}:{executor_id}:"
+                f"{status.value}:{revision}"
+            ),
+            episode_id=episode_id,
+            event_type="EXECUTOR_SETTLED",
+            payload={
+                "executor_id": executor_id,
+                "status": status.value,
+                "net_pnl_quote": str(net_pnl_quote),
+                "revision": revision,
+            },
+            created_at=float(self.market_data_provider.time()),
+        )
+        if not self._append_runtime_events([event]):
+            return
         try:
-            self._episode_tracker.record_executor_settlement(
-                ExecutorSettlement(
-                    executor_id=executor_id,
-                    status=status,
-                    net_pnl_quote=net_pnl_quote,
-                    revision=revision,
-                )
-            )
+            self._episode_tracker.record_executor_settlement(settlement)
         except SettlementConflict as exc:
             reason = (
                 RuntimeHoldReason.UNOWNED_SETTLEMENT
@@ -515,11 +663,37 @@ class RSIv5HyperliquidController(RSIv5Controller):
         signed_exposure = self._signed_exposure_snapshot()
         self._sync_exposure_holds(signed_exposure)
         is_flat = not self._owned_buy_position_executors() and signed_exposure.is_flat
+        outcome = self._episode_tracker.preview_close_if_flat(
+            is_flat=is_flat,
+            timestamp=now,
+        )
+        if outcome is None:
+            return None
+        final_results = {
+            executor_id: self._episode_tracker.settlement_for_executor(executor_id)
+            for executor_id in outcome.executor_ids
+        }
+
+        close_event = self._runtime_event(
+            event_id=f"episode-closed:{self.config.id}:{outcome.episode_id}",
+            episode_id=outcome.episode_id,
+            event_type="EPISODE_CLOSED",
+            payload={
+                "ended_at": outcome.ended_at,
+                "executor_ids": list(outcome.executor_ids),
+                "net_pnl_quote": str(outcome.net_pnl_quote),
+                "total_planned_notional": str(outcome.total_planned_notional),
+            },
+            created_at=now,
+        )
+        if not self._append_runtime_events([close_event]):
+            return None
         outcome = self._episode_tracker.close_if_flat(
             is_flat=is_flat,
             timestamp=now,
         )
         if outcome is None:
+            self._runtime_holds.add(RuntimeHoldReason.REPLAY_INCONSISTENCY)
             return None
 
         self._consecutive_losses = update_loss_streak(
@@ -531,6 +705,11 @@ class RSIv5HyperliquidController(RSIv5Controller):
         elif outcome.net_pnl_quote > _ZERO:
             self._last_loss_timestamp = None
         self._last_episode_outcome = outcome
+        for executor_id in outcome.executor_ids:
+            settlement = final_results.get(executor_id)
+            if settlement is not None:
+                self._historical_final_results[executor_id] = settlement.net_pnl_quote
+        self._exit_request_timestamps.clear()
         self.logger().info(
             f"Episode closed | {self._controller_pair_log_prefix()} "
             f"episode={outcome.episode_id} "
@@ -662,14 +841,14 @@ class RSIv5HyperliquidController(RSIv5Controller):
                 and (now - previous_request) < retry_seconds
             ):
                 continue
-            self._exit_request_timestamps[executor_id] = now
-            actions.append(
-                StopExecutorAction(
-                    executor_id=executor_id,
-                    controller_id=self.config.id,
-                    keep_position=False,
-                )
+            action = StopExecutorAction(
+                executor_id=executor_id,
+                controller_id=self.config.id,
+                keep_position=False,
             )
+            if not self._persist_stop_action_intent(action=action, now=now, reason=reason):
+                continue
+            actions.append(action)
         if actions:
             self.logger().info(
                 f"Executor-owned exit | {self._controller_pair_log_prefix()} "
@@ -678,10 +857,49 @@ class RSIv5HyperliquidController(RSIv5Controller):
             )
         return actions
 
+    def _persist_stop_action_intent(
+        self,
+        *,
+        action: StopExecutorAction,
+        now: float,
+        reason: str,
+    ) -> bool:
+        executor_id = str(action.executor_id)
+        episode_id = self._episode_tracker.episode_id
+        if episode_id is None or not self._episode_tracker.owns_executor(executor_id):
+            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
+            return False
+        event = self._runtime_event(
+            event_id=f"exit-requested:{self.config.id}:{episode_id}:{executor_id}:{uuid4()}",
+            episode_id=episode_id,
+            event_type="EXIT_REQUESTED",
+            payload={
+                "executor_id": executor_id,
+                "requested_at": now,
+                "reason": reason,
+                "keep_position": bool(action.keep_position),
+            },
+            created_at=now,
+        )
+        if not self._append_runtime_events([event]):
+            return False
+        if not action.keep_position:
+            self._exit_request_timestamps[executor_id] = now
+        return True
+
     def stop_actions_proposal(self) -> List[ExecutorAction]:
         self._sync_episode_tracker()
         actions = super().stop_actions_proposal()
         now = float(self.market_data_provider.time())
+        persisted_actions: List[ExecutorAction] = []
+        for action in actions:
+            if not isinstance(action, StopExecutorAction) or self._persist_stop_action_intent(
+                action=action,
+                now=now,
+                reason="controller_stop",
+            ):
+                persisted_actions.append(action)
+        actions = persisted_actions
         signal = int((self.processed_data or {}).get("signal", 0) or 0)
         if signal < 0:
             state = (self.processed_data or {}).get("signal_state", {})

@@ -347,6 +347,91 @@ class TestRSIv5HyperliquidController:
         assert controller._get_base_balance() == Decimal("0.25")
         assert controller._get_sellable_inventory_amount() == Decimal("0.25")
 
+    def test_unexpected_short_position_blocks_new_entries(self):
+        controller = self.build_controller()
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="hyperliquid_perpetual",
+                trading_pair="BTC-USD",
+                side=TradeType.SELL,
+                amount=Decimal("0.25"),
+                breakeven_price=Decimal("100"),
+                cum_fees_quote=Decimal("0"),
+            )
+        ]
+
+        assert controller.can_create_executor(1) is False
+        assert "unexpected_short" in controller.get_custom_info()["runtime_hold"]["reasons"]
+
+    def test_unowned_held_long_sets_orphan_hold_without_opening_empty_episode(self):
+        controller = self.build_controller()
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="hyperliquid_perpetual",
+                trading_pair="BTC-USD",
+                side=TradeType.BUY,
+                amount=Decimal("0.25"),
+                breakeven_price=Decimal("100"),
+                cum_fees_quote=Decimal("0"),
+            )
+        ]
+
+        controller._sync_episode_tracker()
+
+        assert controller._episode_tracker.is_open is False
+        assert controller.can_create_executor(1) is False
+        assert "orphan_exposure" in controller.get_custom_info()["runtime_hold"]["reasons"]
+
+    def test_shutting_down_pnl_is_provisional_until_terminal_settlement(self):
+        controller = self.build_controller()
+        controller._episode_tracker.open(timestamp=100)
+        controller._episode_tracker.register_executor("entry", Decimal("100"))
+        shutting_down = buy_executor(
+            "entry",
+            filled_base="1",
+            filled_quote="100",
+            is_active=False,
+            status=RunnableStatus.SHUTTING_DOWN,
+        )
+        shutting_down.net_pnl_quote = Decimal("-2")
+
+        controller._track_executor_result(shutting_down)
+        assert controller._episode_tracker.close_if_flat(is_flat=True, timestamp=110) is None
+
+        terminal = buy_executor(
+            "entry",
+            filled_base="1",
+            filled_quote="100",
+            is_active=False,
+            status=RunnableStatus.TERMINATED,
+        )
+        terminal.net_pnl_quote = Decimal("999")
+        controller._track_executor_result(terminal)
+
+        outcome = controller._episode_tracker.close_if_flat(is_flat=True, timestamp=120)
+        assert outcome is not None
+        assert outcome.net_pnl_quote == Decimal("999")
+
+    def test_changed_final_settlement_sets_fail_closed_runtime_hold(self):
+        controller = self.build_controller()
+        controller._episode_tracker.open(timestamp=100)
+        controller._episode_tracker.register_executor("entry", Decimal("100"))
+        terminal = buy_executor(
+            "entry",
+            filled_base="1",
+            filled_quote="100",
+            is_active=False,
+            status=RunnableStatus.TERMINATED,
+        )
+        terminal.net_pnl_quote = Decimal("1")
+        controller._track_executor_result(terminal)
+        terminal.net_pnl_quote = Decimal("2")
+
+        controller._track_executor_result(terminal)
+
+        assert controller.can_create_executor(1) is False
+        assert "settlement_conflict" in controller.get_custom_info()["runtime_hold"]["reasons"]
+
     def test_loss_streak_changes_once_for_aggregate_episode(self):
         controller = self.build_controller()
         controller._episode_tracker.open(timestamp=100)
@@ -361,10 +446,20 @@ class TestRSIv5HyperliquidController:
         controller._consecutive_losses = 2
 
         controller._track_executor_result(
-            SimpleNamespace(id="scout", net_pnl_quote=Decimal("2"))
+            SimpleNamespace(
+                id="scout",
+                is_done=True,
+                status=RunnableStatus.TERMINATED,
+                net_pnl_quote=Decimal("2"),
+            )
         )
         controller._track_executor_result(
-            SimpleNamespace(id="runner", net_pnl_quote=Decimal("-5"))
+            SimpleNamespace(
+                id="runner",
+                is_done=True,
+                status=RunnableStatus.TERMINATED,
+                net_pnl_quote=Decimal("-5"),
+            )
         )
         controller.executors_info = []
         controller.positions_held = []

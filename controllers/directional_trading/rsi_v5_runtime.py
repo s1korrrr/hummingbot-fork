@@ -80,6 +80,33 @@ class ExposureSnapshot:
 
 
 @dataclass(frozen=True)
+class SignedExposureSnapshot:
+    held_long_base: Decimal
+    held_short_base: Decimal
+    owned_long_base: Decimal
+
+    @property
+    def net_base(self) -> Decimal:
+        return self.held_long_base + self.owned_long_base - self.held_short_base
+
+    @property
+    def is_flat(self) -> bool:
+        return (
+            self.held_long_base <= _ZERO
+            and self.held_short_base <= _ZERO
+            and self.owned_long_base <= _ZERO
+        )
+
+    @property
+    def has_unexpected_short(self) -> bool:
+        return self.held_short_base > _ZERO
+
+    @property
+    def has_orphan_long(self) -> bool:
+        return self.held_long_base > _ZERO and self.owned_long_base <= _ZERO
+
+
+@dataclass(frozen=True)
 class EpisodeOutcome:
     episode_id: str
     started_at: float
@@ -98,6 +125,13 @@ class SettlementMutation(str, Enum):
     INSERTED = "INSERTED"
     REPLACED = "REPLACED"
     IDEMPOTENT = "IDEMPOTENT"
+
+
+class RuntimeHoldReason(str, Enum):
+    ORPHAN_EXPOSURE = "orphan_exposure"
+    UNEXPECTED_SHORT = "unexpected_short"
+    SETTLEMENT_CONFLICT = "settlement_conflict"
+    UNOWNED_SETTLEMENT = "unowned_settlement"
 
 
 class SettlementConflict(RuntimeError):
@@ -173,6 +207,34 @@ class EpisodeTracker:
             str(executor_id),
             _non_negative(Decimal(str(planned_notional))),
         )
+
+    def open_and_register_executor(
+        self,
+        *,
+        timestamp: float,
+        executor_id: str,
+        planned_notional: Decimal,
+        episode_id: Optional[str] = None,
+    ) -> str:
+        executor_id = str(executor_id)
+        planned_notional = _non_negative(Decimal(str(planned_notional)))
+        if self._episode is None:
+            self._episode = _OpenEpisode(
+                episode_id=episode_id or str(uuid4()),
+                started_at=float(timestamp),
+                planned_notional_by_executor={executor_id: planned_notional},
+            )
+        else:
+            self.register_executor(executor_id, planned_notional)
+        return self._episode.episode_id
+
+    def settlement_for_executor(
+        self,
+        executor_id: str,
+    ) -> Optional[ExecutorSettlement]:
+        if self._episode is None:
+            return None
+        return self._episode.settlements_by_executor.get(str(executor_id))
 
     def record_executor_result(
         self,

@@ -54,6 +54,7 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
     TrailingStop,
     TripleBarrierConfig,
 )
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.utils.common import parse_enum_value
@@ -482,7 +483,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         self._cost_basis_cache_ts: Optional[float] = None
         self._consecutive_losses: int = 0
         self._last_loss_timestamp: Optional[float] = None
-        self._tracked_executor_result_ids: set = set()
+        self._final_executor_results: Dict[str, Decimal] = {}
+        self._executor_result_conflict_ids: set[str] = set()
         self._operator_entry_paused: bool = False
         self._operator_pause_reason: Optional[str] = None
         self._operator_pause_scope: Optional[str] = None
@@ -2277,12 +2279,34 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return False
 
     def _track_executor_result(self, executor) -> None:
+        is_done = getattr(executor, "is_done", None)
+        is_final = (
+            is_done
+            if isinstance(is_done, bool)
+            else getattr(executor, "status", None) == RunnableStatus.TERMINATED
+        )
+        if not is_final:
+            return
+        executor_id = getattr(executor, "id", None)
+        if executor_id is None:
+            return
         if not hasattr(executor, "net_pnl_quote") or executor.net_pnl_quote is None:
             return
         try:
             net_pnl_quote = Decimal(str(executor.net_pnl_quote))
         except (InvalidOperation, TypeError, ValueError):
             return
+        executor_id = str(executor_id)
+        if executor_id in self._final_executor_results:
+            if self._final_executor_results[executor_id] != net_pnl_quote:
+                self._executor_result_conflict_ids.add(executor_id)
+                self.logger().error(
+                    f"Conflicting final executor result | {self._controller_pair_log_prefix()} "
+                    f"executor={executor_id} previous={self._final_executor_results[executor_id]} "
+                    f"current={net_pnl_quote}"
+                )
+            return
+        self._final_executor_results[executor_id] = net_pnl_quote
         if net_pnl_quote < Decimal("0"):
             self._consecutive_losses += 1
             self._last_loss_timestamp = self.market_data_provider.time()
@@ -3997,6 +4021,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         buy_entry_role = str(state.get("buy_entry_role", "none") or "none")
         runner_entry = signal > 0 and buy_entry_role == "runner"
 
+        if self._executor_result_conflict_ids:
+            self._record_gate_reason(target_side, "executor_result_conflict")
+            return False
+
         if getattr(self.config, "manual_kill_switch", False):
             self._record_gate_reason(target_side, "manual_kill_switch")
             return False
@@ -4281,20 +4309,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             )
             actions.extend(recovery_actions)
 
-        # --- Track closed executors for consecutive loss counting ---
+        # --- Track only authoritative terminal executor results ---
         for ex in self.executors_info:
             if not ex.is_active:
-                executor_id = getattr(ex, "id", None)
-                if executor_id is not None:
-                    if executor_id in self._tracked_executor_result_ids:
-                        continue
-                    self._track_executor_result(ex)
-                    self._tracked_executor_result_ids.add(executor_id)
-                    continue
-                if hasattr(ex, "_v5_tracked"):
-                    continue
                 self._track_executor_result(ex)
-                ex._v5_tracked = True  # type: ignore[attr-defined]
 
         # --- Early stop on active executor deep drawdown ---
         existing_stop_ids = {

@@ -10,7 +10,12 @@ from controllers.directional_trading.rsi_v5_runtime import (
     EpisodeOutcome,
     EpisodeTracker,
     ExecutorExposure,
+    ExecutorSettlement,
     ExposureSnapshot,
+    RuntimeHoldReason,
+    SettlementConflict,
+    SettlementStatus,
+    SignedExposureSnapshot,
     build_exit_plan,
     calculate_exposure,
     update_loss_streak,
@@ -166,6 +171,7 @@ class RSIv5HyperliquidController(RSIv5Controller):
         self._episode_tracker = EpisodeTracker()
         self._last_episode_outcome: Optional[EpisodeOutcome] = None
         self._exit_request_timestamps: Dict[str, float] = {}
+        self._runtime_holds: set[RuntimeHoldReason] = set()
         super().__init__(config, *args, **kwargs)
 
     @property
@@ -366,6 +372,21 @@ class RSIv5HyperliquidController(RSIv5Controller):
             proposed_notional=proposed_notional,
         )
 
+    def _signed_exposure_snapshot(self) -> SignedExposureSnapshot:
+        return SignedExposureSnapshot(
+            held_long_base=self._position_amount(TradeType.BUY),
+            held_short_base=self._position_amount(TradeType.SELL),
+            owned_long_base=self._active_buy_filled_amount(),
+        )
+
+    def _sync_exposure_holds(self, exposure: SignedExposureSnapshot) -> None:
+        self._runtime_holds.discard(RuntimeHoldReason.ORPHAN_EXPOSURE)
+        self._runtime_holds.discard(RuntimeHoldReason.UNEXPECTED_SHORT)
+        if exposure.has_unexpected_short:
+            self._runtime_holds.add(RuntimeHoldReason.UNEXPECTED_SHORT)
+        if exposure.has_orphan_long:
+            self._runtime_holds.add(RuntimeHoldReason.ORPHAN_EXPOSURE)
+
     def _get_total_position_value_usd(self) -> Decimal:
         return self._exposure_snapshot().total_notional
 
@@ -396,65 +417,91 @@ class RSIv5HyperliquidController(RSIv5Controller):
 
     def _sync_episode_tracker(self) -> None:
         owned_executors = self._owned_buy_position_executors()
-        held_amount = self._position_amount(TradeType.BUY)
-        if not owned_executors and held_amount <= _ZERO:
+        signed_exposure = self._signed_exposure_snapshot()
+        self._sync_exposure_holds(signed_exposure)
+        if signed_exposure.has_unexpected_short or signed_exposure.has_orphan_long:
+            return
+        if not owned_executors:
             return
 
-        if not self._episode_tracker.is_open:
-            timestamps = [
+        episode_timestamp = min(
+            (
                 float(
-                    getattr(
-                        executor,
-                        "timestamp",
-                        self.market_data_provider.time(),
-                    )
+                    getattr(executor, "timestamp", self.market_data_provider.time())
                 )
                 for executor in owned_executors
-            ]
-            self._episode_tracker.open(
-                timestamp=min(
-                    timestamps,
-                    default=self.market_data_provider.time(),
-                )
-            )
+            ),
+            default=self.market_data_provider.time(),
+        )
 
         for executor in owned_executors:
             exposure = self._executor_exposure(executor)
             planned_notional = (
                 exposure.configured_base * max(exposure.reference_price, _ZERO)
             )
-            self._episode_tracker.register_executor(
-                exposure.executor_id,
-                planned_notional,
+            self._episode_tracker.open_and_register_executor(
+                timestamp=episode_timestamp,
+                executor_id=exposure.executor_id,
+                planned_notional=planned_notional,
             )
 
     def _register_created_executor(
         self,
         config: PositionExecutorConfig,
     ) -> None:
-        if not self._episode_tracker.is_open:
-            self._episode_tracker.open(
-                timestamp=float(
-                    config.timestamp or self.market_data_provider.time()
-                )
-            )
         planned_notional = (
             max(config.amount, _ZERO)
             * max(config.entry_price or _ZERO, _ZERO)
         )
-        self._episode_tracker.register_executor(
-            config.id,
-            planned_notional,
+        self._episode_tracker.open_and_register_executor(
+            timestamp=float(config.timestamp or self.market_data_provider.time()),
+            executor_id=config.id,
+            planned_notional=planned_notional,
         )
 
     def _track_executor_result(self, executor) -> None:
         executor_id = getattr(executor, "id", None)
         if executor_id is None:
+            self._runtime_holds.add(RuntimeHoldReason.UNOWNED_SETTLEMENT)
             return
-        self._episode_tracker.record_executor_result(
-            str(executor_id),
-            self._decimal(getattr(executor, "net_pnl_quote", _ZERO)),
+        executor_id = str(executor_id)
+        status = (
+            SettlementStatus.FINAL
+            if self._executor_is_done(executor)
+            else SettlementStatus.PROVISIONAL
         )
+        net_pnl_quote = self._decimal(
+            getattr(executor, "net_pnl_quote", _ZERO)
+        )
+        existing = self._episode_tracker.settlement_for_executor(executor_id)
+        if (
+            existing is not None
+            and existing.status is status
+            and existing.net_pnl_quote == net_pnl_quote
+        ):
+            revision = existing.revision
+        else:
+            revision = (existing.revision + 1) if existing else 1
+        try:
+            self._episode_tracker.record_executor_settlement(
+                ExecutorSettlement(
+                    executor_id=executor_id,
+                    status=status,
+                    net_pnl_quote=net_pnl_quote,
+                    revision=revision,
+                )
+            )
+        except SettlementConflict as exc:
+            reason = (
+                RuntimeHoldReason.UNOWNED_SETTLEMENT
+                if existing is None
+                else RuntimeHoldReason.SETTLEMENT_CONFLICT
+            )
+            self._runtime_holds.add(reason)
+            self.logger().error(
+                f"RSI settlement hold | {self._controller_pair_log_prefix()} "
+                f"executor={executor_id} reason={reason.value} error={exc}"
+            )
 
     def _finalize_episode_if_flat(
         self,
@@ -465,10 +512,9 @@ class RSIv5HyperliquidController(RSIv5Controller):
             if timestamp is not None
             else self.market_data_provider.time()
         )
-        is_flat = (
-            not self._owned_buy_position_executors()
-            and self._position_amount(TradeType.BUY) <= _ZERO
-        )
+        signed_exposure = self._signed_exposure_snapshot()
+        self._sync_exposure_holds(signed_exposure)
+        is_flat = not self._owned_buy_position_executors() and signed_exposure.is_flat
         outcome = self._episode_tracker.close_if_flat(
             is_flat=is_flat,
             timestamp=now,
@@ -495,6 +541,14 @@ class RSIv5HyperliquidController(RSIv5Controller):
         return outcome
 
     def can_create_executor(self, signal: int) -> bool:
+        self._sync_episode_tracker()
+        if self._runtime_holds:
+            reason = sorted(hold.value for hold in self._runtime_holds)[0]
+            self._record_gate_reason(
+                TradeType.BUY if signal >= 0 else TradeType.SELL,
+                f"runtime_hold:{reason}",
+            )
+            return False
         if signal < 0:
             self._record_gate_reason(
                 TradeType.SELL,
@@ -675,6 +729,10 @@ class RSIv5HyperliquidController(RSIv5Controller):
                     if self._last_episode_outcome is not None
                     else None
                 ),
+                "runtime_hold": {
+                    "active": bool(self._runtime_holds),
+                    "reasons": sorted(hold.value for hold in self._runtime_holds),
+                },
             }
         )
         return info

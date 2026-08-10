@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
@@ -285,6 +286,44 @@ class RSIv5AuditEdgeCaseTest(unittest.TestCase):
 
         self.assertEqual(controller._consecutive_losses, 2)
         self.assertEqual(controller._last_loss_timestamp, 1000000.0)
+
+    def test_executor_result_is_counted_only_once_after_terminal_settlement(self):
+        controller = self._build_controller()
+        shutting_down = SimpleNamespace(
+            id="entry",
+            is_done=False,
+            status=RunnableStatus.SHUTTING_DOWN,
+            net_pnl_quote=Decimal("-1"),
+        )
+        terminal = SimpleNamespace(
+            id="entry",
+            is_done=True,
+            status=RunnableStatus.TERMINATED,
+            net_pnl_quote=Decimal("-2"),
+        )
+
+        controller._track_executor_result(shutting_down)
+        self.assertEqual(controller._consecutive_losses, 0)
+        controller._track_executor_result(terminal)
+        controller._track_executor_result(terminal)
+
+        self.assertEqual(controller._consecutive_losses, 1)
+
+    def test_changed_terminal_result_blocks_future_entries(self):
+        controller = self._build_controller()
+        terminal = SimpleNamespace(
+            id="entry",
+            is_done=True,
+            status=RunnableStatus.TERMINATED,
+            net_pnl_quote=Decimal("1"),
+        )
+        controller._track_executor_result(terminal)
+        terminal.net_pnl_quote = Decimal("2")
+
+        controller._track_executor_result(terminal)
+
+        self.assertIn("entry", controller._executor_result_conflict_ids)
+        self.assertFalse(controller.can_create_executor(1))
 
     # ------------------------------------------------------------------
     # Flash-crash drop boundary

@@ -13,6 +13,7 @@ from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
@@ -1970,12 +1971,24 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         )
         controller.processed_data = {"signal": 0, "signal_state": {}}
         controller.executors_info = [
-            SimpleNamespace(id="loss-1", is_active=False, net_pnl_quote=Decimal("-1"))
+            SimpleNamespace(
+                id="loss-1",
+                is_active=False,
+                is_done=True,
+                status=RunnableStatus.TERMINATED,
+                net_pnl_quote=Decimal("-1"),
+            )
         ]
         controller.stop_actions_proposal()
 
         controller.executors_info = [
-            SimpleNamespace(id="loss-1", is_active=False, net_pnl_quote=Decimal("-1"))
+            SimpleNamespace(
+                id="loss-1",
+                is_active=False,
+                is_done=True,
+                status=RunnableStatus.TERMINATED,
+                net_pnl_quote=Decimal("-1"),
+            )
         ]
         controller.stop_actions_proposal()
 

@@ -17,6 +17,7 @@ Key Features:
 - No time limit on executors - hold until trailing stop or bag freeze
 """
 import logging
+import re
 import time as _time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -70,6 +71,7 @@ from hummingbot.strategy_v2.utils.market_analysis import (
 # Pydantic Field helper (same as rsi_v1 for prompt/client_data compat)
 # ---------------------------------------------------------------------------
 _CLIENT_FIELD_SCHEMA_KEYS = ("prompt", "prompt_on_new", "is_secure", "is_connect_key", "is_updatable")
+_PANDAS_TA_NUMERIC_SUFFIX = re.compile(r"\d+(?:\.\d+)?(?:_\d+(?:\.\d+)?)*\Z")
 
 
 def _extract_client_field_value(client_data: Optional[ClientFieldData], key: str):
@@ -2967,6 +2969,33 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             return False
         return bool(numeric.map(lambda value: float("-inf") < float(value) < float("inf")).all())
 
+    @staticmethod
+    def _column_has_finite_latest_value(df: pd.DataFrame, column: str) -> bool:
+        series = df[column]
+        if not isinstance(series, pd.Series) or series.empty:
+            return False
+        numeric = pd.to_numeric(pd.Series([series.iloc[-1]]), errors="coerce").iloc[0]
+        return bool(pd.notna(numeric) and float("-inf") < float(numeric) < float("inf"))
+
+    def _resolve_bollinger_column(self, df: pd.DataFrame, band: str) -> Optional[str]:
+        historical_name = f"{band}_{self.config.bb_length}_{self.config.bb_std}"
+        exact_count = sum(column == historical_name for column in df.columns)
+        if exact_count > 1:
+            return None
+        if exact_count == 1 and self._column_has_finite_latest_value(df, historical_name):
+            return historical_name
+
+        logical_prefix = f"{historical_name}_"
+        candidates = [
+            column
+            for column in df.columns
+            if isinstance(column, str)
+            and column.startswith(logical_prefix)
+            and _PANDAS_TA_NUMERIC_SUFFIX.fullmatch(column[len(logical_prefix):]) is not None
+            and self._column_has_finite_latest_value(df, column)
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
     def _build_data_health(self, df: pd.DataFrame, now_ts: float) -> Dict[str, object]:
         health: Dict[str, object] = {
             "ready": False,
@@ -3143,14 +3172,14 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         # --- Bollinger Bands ---
         try:
             df.ta.bbands(length=self.config.bb_length, std=self.config.bb_std, append=True)
-            bbl_col = f"BBL_{self.config.bb_length}_{self.config.bb_std}"
-            bbu_col = f"BBU_{self.config.bb_length}_{self.config.bb_std}"
-            bbm_col = f"BBM_{self.config.bb_length}_{self.config.bb_std}"
-            if bbl_col in df.columns and pd.notna(df[bbl_col].iloc[-1]):
+            bbl_col = self._resolve_bollinger_column(df, "BBL")
+            bbu_col = self._resolve_bollinger_column(df, "BBU")
+            bbm_col = self._resolve_bollinger_column(df, "BBM")
+            if bbl_col is not None:
                 bb_lower = float(df[bbl_col].iloc[-1])
-            if bbu_col in df.columns and pd.notna(df[bbu_col].iloc[-1]):
+            if bbu_col is not None:
                 bb_upper = float(df[bbu_col].iloc[-1])
-            if bbm_col in df.columns and pd.notna(df[bbm_col].iloc[-1]):
+            if bbm_col is not None:
                 bb_mid = float(df[bbm_col].iloc[-1])
         except Exception:
             pass
@@ -3581,8 +3610,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         rsi_oversold_now = rsi <= buy_thr
         score = score + rsi_oversold_now.astype(int)
 
-        bbl_col = f"BBL_{self.config.bb_length}_{self.config.bb_std}"
-        if bbl_col in df.columns:
+        bbl_col = self._resolve_bollinger_column(df, "BBL")
+        if bbl_col is not None:
             bbl = pd.to_numeric(df[bbl_col], errors="coerce")
             score = score + (rsi_oversold_now & (close <= bbl)).astype(int)
 
@@ -4505,7 +4534,12 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             sell_price = current_price if recovery_execution_strategy == ExecutionStrategy.MARKET else ref_price
             target_amount = Decimal(str(pos.amount))
             partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
-            if Decimal("0") < partial_fraction < Decimal("1"):
+            signal_slice_multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
+            if current_signal < 0 and signal_slice_multiplier > 0 and sell_price > 0:
+                target_quote = self.config.usd_per_entry * signal_slice_multiplier
+                target_amount = min(target_amount, target_quote / sell_price)
+                reversal_reason = f"slice-{reversal_reason}"
+            elif current_signal >= 0 and Decimal("0") < partial_fraction < Decimal("1"):
                 target_amount = target_amount * partial_fraction
                 reversal_reason = f"partial-{reversal_reason}"
             sell_amount = self._resolve_recovery_sell_amount(

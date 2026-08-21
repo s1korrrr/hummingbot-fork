@@ -18,7 +18,9 @@
       "inputs": {
         "candle_time": 1000,
         "rsi": "30",
+        "buy_threshold": "31",
         "score": 3,
+        "minimum_score": 2,
         "raw_reversal": true
       },
       "result": {
@@ -36,7 +38,8 @@
         "time": 1000,
         "mark": "98",
         "held_base": "0.25",
-        "basis": "100"
+        "basis": "100",
+        "minimum_gap_fraction": "0.01"
       },
       "result": {
         "allowed": true,
@@ -70,6 +73,8 @@
         "basis": "100",
         "peak": "102",
         "pullback_mark": "101.60",
+        "pullback_threshold_fraction": "0.0035",
+        "partial_fraction": "0.5",
         "held_base": "1"
       },
       "result": {
@@ -90,6 +95,8 @@
         "time": 1000,
         "scout_time": 990,
         "scout_quote": "10",
+        "usd_per_entry": "25",
+        "reference_price": "100",
         "fraction": "0.6"
       },
       "result": {
@@ -125,6 +132,12 @@
       "inputs": {
         "candle_time": 1120,
         "rsi": "75.2",
+        "rsi_previous": "76.1",
+        "sell_threshold": "74",
+        "ema_fast": "101",
+        "close": "100.80",
+        "macd_hist": "0.4",
+        "macd_hist_previous": "0.7",
         "held_base": "0.5",
         "basis": "100"
       },
@@ -137,5 +150,5 @@
       ]
     }
   ],
-  "trace_hash": "739f2a6c920b8f70d08b5d599cce97dc9ccc8f754cbb82b78ab04514cde0919c"
+  "trace_hash": "56d0ce3dcf562f6e6f4f7809d80073418753a2db7d605440216382aa2a4e4126"
 }

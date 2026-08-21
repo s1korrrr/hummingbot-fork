@@ -109,7 +109,14 @@ def capture_q2_lifecycle_trace() -> dict:
         _event(
             1,
             "entry",
-            {"candle_time": 1000, "rsi": "30", "score": 3, "raw_reversal": True},
+            {
+                "candle_time": 1000,
+                "rsi": "30",
+                "buy_threshold": "31",
+                "score": 3,
+                "minimum_score": 2,
+                "raw_reversal": True,
+            },
             {"signal": entry_signal, "role": entry._last_buy_signal_role},
             ["RSIv5Controller._determine_signal"],
         )
@@ -140,7 +147,13 @@ def capture_q2_lifecycle_trace() -> dict:
         _event(
             2,
             "dca",
-            {"time": 1000, "mark": "98", "held_base": "0.25", "basis": "100"},
+            {
+                "time": 1000,
+                "mark": "98",
+                "held_base": "0.25",
+                "basis": "100",
+                "minimum_gap_fraction": "0.01",
+            },
             {"allowed": dca_allowed, "gate_reason": dca._last_gate_reason[TradeType.BUY]},
             ["RSIv5Controller.can_create_executor"],
         )
@@ -216,7 +229,14 @@ def capture_q2_lifecycle_trace() -> dict:
         _event(
             4,
             "partial_harvest",
-            {"basis": "100", "peak": "102", "pullback_mark": "101.60", "held_base": "1"},
+            {
+                "basis": "100",
+                "peak": "102",
+                "pullback_mark": "101.60",
+                "pullback_threshold_fraction": "0.0035",
+                "partial_fraction": "0.5",
+                "held_base": "1",
+            },
             {
                 "actions": len(harvest_actions),
                 "side": harvest_config.side.name,
@@ -265,7 +285,14 @@ def capture_q2_lifecycle_trace() -> dict:
         _event(
             5,
             "runner",
-            {"time": 1000, "scout_time": 990, "scout_quote": "10", "fraction": "0.6"},
+            {
+                "time": 1000,
+                "scout_time": 990,
+                "scout_quote": "10",
+                "usd_per_entry": "25",
+                "reference_price": "100",
+                "fraction": "0.6",
+            },
             {
                 "allowed": runner_allowed,
                 "gate_reason": runner._last_gate_reason[TradeType.BUY],
@@ -334,7 +361,18 @@ def capture_q2_lifecycle_trace() -> dict:
         _event(
             7,
             "exit",
-            {"candle_time": 1120, "rsi": "75.2", "held_base": "0.5", "basis": "100"},
+            {
+                "candle_time": 1120,
+                "rsi": "75.2",
+                "rsi_previous": "76.1",
+                "sell_threshold": "74",
+                "ema_fast": "101",
+                "close": "100.80",
+                "macd_hist": "0.4",
+                "macd_hist_previous": "0.7",
+                "held_base": "0.5",
+                "basis": "100",
+            },
             {"signal": exit_signal, "ownership": "direct_signal_exit"},
             ["RSIv5Controller._determine_signal"],
         )

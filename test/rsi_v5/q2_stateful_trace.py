@@ -79,7 +79,7 @@ def observe_q2_scenarios(
     request_value = _load_request(request)
     _validate_request_shape(request_value)
     normalized_admissions = {
-        action: _admission_outcome(admission_outcomes, action)
+        action: _admission_outcome(admission_outcomes, action, request_value)
         for action in ("dca", "runner")
     }
 
@@ -130,21 +130,50 @@ def _validate_request_shape(request: Mapping[str, Any]) -> None:
         raise ValueError(f"Q2 request must contain the ordered seven scenarios: {expected}")
 
 
-def _admission_outcome(admissions: Mapping[str, Any], action: str) -> dict[str, Any]:
+def _admission_outcome(
+    admissions: Mapping[str, Any], action: str, request: Mapping[str, Any]
+) -> dict[str, Any]:
     if action not in admissions:
-        raise ValueError(f"missing evaluated admission outcome for {action}")
+        return {
+            "allowed": False,
+            "rejection_code": "MISSING_ADMISSION_OUTCOME",
+            "role": None,
+            "fraction": None,
+        }
     outcome = admissions[action]
     if isinstance(outcome, Mapping):
         allowed = outcome.get("allowed")
         rejection_code = outcome.get("rejection_code")
+        role = outcome.get("role")
+        fraction = outcome.get("fraction")
     else:
         allowed = getattr(outcome, "allowed", None)
         rejection_code = getattr(outcome, "rejection_code", None)
+        role = getattr(outcome, "role", None)
+        fraction = getattr(outcome, "fraction", None)
     if not isinstance(allowed, bool):
         raise ValueError(f"evaluated admission outcome for {action} must contain boolean allowed")
     if rejection_code is not None and not isinstance(rejection_code, str):
         raise ValueError(f"evaluated admission rejection_code for {action} must be a string or null")
-    return {"allowed": allowed, "rejection_code": rejection_code}
+    if allowed and rejection_code is not None:
+        raise ValueError(f"allowed admission outcome for {action} must not contain rejection_code")
+    if not allowed and not rejection_code:
+        raise ValueError(f"blocked admission outcome for {action} must contain rejection_code")
+    if action == "dca":
+        if allowed:
+            expected_fraction = request["program_binding"]["parameters"]["dca_fraction"]
+            if role != "dca" or fraction != expected_fraction:
+                raise ValueError(
+                    "allowed DCA admission outcome must contain the request-bound dca role and fraction"
+                )
+        elif role is not None or fraction is not None:
+            raise ValueError("blocked DCA admission outcome must not contain a role or fraction")
+    return {
+        "allowed": allowed,
+        "rejection_code": rejection_code,
+        "role": role,
+        "fraction": fraction,
+    }
 
 
 def _build_controller(
@@ -196,7 +225,7 @@ def _build_controller(
         trailing_stop_order_type=profile["trailing_order_type"],
         early_stop_drawdown_pct=float(profile["hard_stop_fraction"]),
         early_stop_keep_position=profile["hard_stop_keep_position"],
-        trend_confirmation_enabled=False,
+        trend_confirmation_enabled=profile["trend_confirmation_enabled"],
     )
     config.manual_kill_switch = bool(initial_state["controller_state"]["manual_kill_switch"])
     provider = ScenarioMarketDataProvider(initial_state)
@@ -338,15 +367,29 @@ def _observe_dca(
     admission: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     admission_step, gate_step, config_step = scenario["steps"]
+    _require_neutral_dca_state(controller)
     result = [_admission_step(admission_step, admission, controller, provider)]
     if not admission["allowed"]:
         result.extend(_externally_blocked_steps((gate_step, config_step), admission, controller, provider))
         return result
+    _apply_dca_adapter_state(controller, admission)
     allowed = _apply_gate(controller, provider, gate_step)
     result.append(_gate_step(gate_step, allowed, controller, provider))
     config = _apply_config(controller, provider, config_step)
     result.append(_observed_step(config_step, {"kind": "EXECUTOR_CONFIG"}, [_config_action(config, controller)], controller, provider))
     return result
+
+
+def _require_neutral_dca_state(controller: RSIv5Controller) -> None:
+    state = controller.processed_data["signal_state"]
+    if state.get("buy_entry_role") != "none" or Decimal(str(state.get("buy_entry_fraction"))) != Decimal("0"):
+        raise ValueError("DCA scenario must start with neutral buy entry role and fraction")
+
+
+def _apply_dca_adapter_state(controller: RSIv5Controller, admission: Mapping[str, Any]) -> None:
+    state = controller.processed_data["signal_state"]
+    state["buy_entry_role"] = admission["role"]
+    state["buy_entry_fraction"] = float(admission["fraction"])
 
 
 def _observe_cooldown(

@@ -21,7 +21,12 @@ STEP_IDS = {
     "exit": ["hard_stop_before", "hard_stop_at", "signal", "owned_exit"],
 }
 ADMISSIONS = {
-    "dca": {"allowed": True, "rejection_code": None},
+    "dca": {
+        "allowed": True,
+        "rejection_code": None,
+        "role": "dca",
+        "fraction": "0.25",
+    },
     "runner": {"allowed": True, "rejection_code": None},
 }
 
@@ -105,7 +110,12 @@ def test_q2_entry_and_runner_derive_roles_from_confirmation_state() -> None:
     assert runner_config["actions"][0]["amount_base"] == "0.15931373"
 
 
-def test_q2_external_admission_is_recorded_and_missing_admission_fails_closed() -> None:
+def test_q2_external_admission_applies_dca_adapter_only_after_allow() -> None:
+    request = json.loads(REQUEST.read_text(encoding="utf-8"))
+    initial = next(item for item in request["scenarios"] if item["action"] == "dca")["initial_state"]
+    assert initial["processed_signal_state"]["buy_entry_role"] == "none"
+    assert initial["processed_signal_state"]["buy_entry_fraction"] == "0"
+
     scenarios = _by_action(observe_q2_scenarios(REQUEST, admission_outcomes=ADMISSIONS))
 
     for action in ("dca", "runner"):
@@ -116,27 +126,104 @@ def test_q2_external_admission_is_recorded_and_missing_admission_fails_closed() 
             "rejection_code": None,
             "enforced_by": "root",
         }
+    dca_admission = _step(scenarios["dca"], "admission")
+    assert dca_admission["post_state"]["signal_state"]["buy_entry_role"] == "none"
+    assert dca_admission["post_state"]["signal_state"]["buy_entry_fraction"] == "0"
+    dca_gate = _step(scenarios["dca"], "gate")
+    assert dca_gate["post_state"]["signal_state"]["buy_entry_role"] == "dca"
+    assert dca_gate["post_state"]["signal_state"]["buy_entry_fraction"] == "0.25"
 
-    with pytest.raises(ValueError, match="missing evaluated admission outcome for dca"):
-        observe_q2_scenarios(REQUEST, admission_outcomes={"runner": ADMISSIONS["runner"]})
 
+@pytest.mark.parametrize("action", ["dca", "runner"])
+@pytest.mark.parametrize("rejection_code", ["DECISION_HOLD", "DECISION_DENY"])
+def test_q2_attr_admission_rejection_blocks_gate_and_config_without_controller_calls(
+    action: str,
+    rejection_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"gate": 0, "config": 0}
+    original_gate = RSIv5Controller.can_create_executor
+    original_config = RSIv5Controller.get_executor_config
 
-def test_q2_attr_admission_rejection_blocks_dca_gate_and_config() -> None:
-    rejected = {
-        "dca": SimpleNamespace(allowed=False, rejection_code="RISK_HOLD"),
-        "runner": SimpleNamespace(allowed=True, rejection_code=None),
-    }
+    def tracking_gate(self, *args, **kwargs):
+        calls["gate"] += 1
+        return original_gate(self, *args, **kwargs)
+
+    def tracking_config(self, *args, **kwargs):
+        calls["config"] += 1
+        return original_config(self, *args, **kwargs)
+
+    monkeypatch.setattr(RSIv5Controller, "can_create_executor", tracking_gate)
+    monkeypatch.setattr(RSIv5Controller, "get_executor_config", tracking_config)
+    rejected = copy.deepcopy(ADMISSIONS)
+    rejected[action] = SimpleNamespace(
+        allowed=False,
+        rejection_code=rejection_code,
+        role=None,
+        fraction=None,
+    )
 
     scenarios = _by_action(observe_q2_scenarios(REQUEST, admission_outcomes=rejected))
-    dca = scenarios["dca"]
+    blocked = scenarios[action]
 
-    assert _step(dca, "admission")["decision"]["rejection_code"] == "RISK_HOLD"
-    assert _step(dca, "gate")["decision"] == {
+    assert _step(blocked, "admission")["decision"]["rejection_code"] == rejection_code
+    if action == "dca":
+        assert _step(blocked, "admission")["post_state"]["signal_state"]["buy_entry_role"] == "none"
+        assert _step(blocked, "admission")["post_state"]["signal_state"]["buy_entry_fraction"] == "0"
+    assert _step(blocked, "gate")["decision"] == {
         "kind": "EXTERNAL_ADMISSION_BLOCKED",
         "allowed": False,
-        "rejection_code": "RISK_HOLD",
+        "rejection_code": rejection_code,
     }
-    assert _step(dca, "executor_config")["actions"] == []
+    assert _step(blocked, "executor_config")["actions"] == []
+    assert calls == {"gate": 5, "config": 3}
+
+
+@pytest.mark.parametrize("action", ["dca", "runner"])
+def test_q2_missing_outcome_blocks_without_calling_gate_or_config(
+    action: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"gate": 0, "config": 0}
+    original_gate = RSIv5Controller.can_create_executor
+    original_config = RSIv5Controller.get_executor_config
+
+    def tracking_gate(self, *args, **kwargs):
+        calls["gate"] += 1
+        return original_gate(self, *args, **kwargs)
+
+    def tracking_config(self, *args, **kwargs):
+        calls["config"] += 1
+        return original_config(self, *args, **kwargs)
+
+    monkeypatch.setattr(RSIv5Controller, "can_create_executor", tracking_gate)
+    monkeypatch.setattr(RSIv5Controller, "get_executor_config", tracking_config)
+
+    supplied = {key: value for key, value in ADMISSIONS.items() if key != action}
+    scenarios = _by_action(observe_q2_scenarios(REQUEST, admission_outcomes=supplied))
+
+    blocked = scenarios[action]
+    assert _step(blocked, "admission")["decision"]["rejection_code"] == "MISSING_ADMISSION_OUTCOME"
+    assert _step(blocked, "gate")["decision"]["kind"] == "EXTERNAL_ADMISSION_BLOCKED"
+    assert _step(blocked, "executor_config")["decision"]["kind"] == "EXTERNAL_ADMISSION_BLOCKED"
+    assert calls == {"gate": 5, "config": 3}
+
+
+def test_q2_producer_consumes_bound_trend_confirmation_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    request = json.loads(REQUEST.read_text(encoding="utf-8"))
+    request["controller_profile"]["config"]["trend_confirmation_enabled"] = True
+    observed_flags = []
+    original_init = RSIv5Controller.__init__
+
+    def tracking_init(self, config, *args, **kwargs):
+        observed_flags.append(config.trend_confirmation_enabled)
+        original_init(self, config, *args, **kwargs)
+
+    monkeypatch.setattr(RSIv5Controller, "__init__", tracking_init)
+
+    observe_q2_scenarios(request, admission_outcomes=ADMISSIONS)
+
+    assert observed_flags == [True] * 7
 
 
 def test_q2_dca_and_cooldown_cover_score_and_exact_time_boundaries_without_gap_patch() -> None:

@@ -1,0 +1,141 @@
+{
+  "schema_version": "rsi-v5-q2-lifecycle-trace/1.0",
+  "authority": {
+    "paper_shadow_only": true,
+    "live_orders_allowed": false,
+    "execution_authority": false
+  },
+  "controller": {
+    "connector": "hyperliquid_perpetual",
+    "trading_pair": "BNB-USDC",
+    "interval": "1m",
+    "controller_id": "rsi-v5-q2-oracle"
+  },
+  "events": [
+    {
+      "sequence": 1,
+      "action": "entry",
+      "inputs": {
+        "candle_time": 1000,
+        "rsi": "30",
+        "score": 3,
+        "raw_reversal": true
+      },
+      "result": {
+        "signal": 1,
+        "role": "scout"
+      },
+      "source_methods": [
+        "RSIv5Controller._determine_signal"
+      ]
+    },
+    {
+      "sequence": 2,
+      "action": "dca",
+      "inputs": {
+        "time": 1000,
+        "mark": "98",
+        "held_base": "0.25",
+        "basis": "100"
+      },
+      "result": {
+        "allowed": true,
+        "gate_reason": "ready"
+      },
+      "source_methods": [
+        "RSIv5Controller.can_create_executor"
+      ]
+    },
+    {
+      "sequence": 3,
+      "action": "cooldown",
+      "inputs": {
+        "time": 1000,
+        "last_entry_time": 990,
+        "cooldown_seconds": 90
+      },
+      "result": {
+        "allowed": false,
+        "gate_reason": "cooldown"
+      },
+      "source_methods": [
+        "RSIv5Controller.can_create_executor",
+        "RSIv5Controller._effective_cooldown_time"
+      ]
+    },
+    {
+      "sequence": 4,
+      "action": "partial_harvest",
+      "inputs": {
+        "basis": "100",
+        "peak": "102",
+        "pullback_mark": "101.60",
+        "held_base": "1"
+      },
+      "result": {
+        "actions": 1,
+        "side": "SELL",
+        "amount_base": "0.50000000",
+        "execution_strategy": "LIMIT_CHASER"
+      },
+      "source_methods": [
+        "RSIv5Controller.stop_actions_proposal",
+        "RSIv5Controller._check_held_bag_recovery"
+      ]
+    },
+    {
+      "sequence": 5,
+      "action": "runner",
+      "inputs": {
+        "time": 1000,
+        "scout_time": 990,
+        "scout_quote": "10",
+        "fraction": "0.6"
+      },
+      "result": {
+        "allowed": true,
+        "gate_reason": "ready",
+        "level_id": "runner",
+        "amount_base": "0.15000000"
+      },
+      "source_methods": [
+        "RSIv5Controller.can_create_executor",
+        "RSIv5Controller.get_executor_config"
+      ]
+    },
+    {
+      "sequence": 6,
+      "action": "trailing",
+      "inputs": {
+        "entry_role": "runner",
+        "reference_price": "100"
+      },
+      "result": {
+        "activation_fraction": "0.047",
+        "distance_fraction": "0.034",
+        "order_type": "LIMIT"
+      },
+      "source_methods": [
+        "RSIv5Controller.get_executor_config"
+      ]
+    },
+    {
+      "sequence": 7,
+      "action": "exit",
+      "inputs": {
+        "candle_time": 1120,
+        "rsi": "75.2",
+        "held_base": "0.5",
+        "basis": "100"
+      },
+      "result": {
+        "signal": -1,
+        "ownership": "direct_signal_exit"
+      },
+      "source_methods": [
+        "RSIv5Controller._determine_signal"
+      ]
+    }
+  ],
+  "trace_hash": "739f2a6c920b8f70d08b5d599cce97dc9ccc8f754cbb82b78ab04514cde0919c"
+}

@@ -4534,7 +4534,12 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             sell_price = current_price if recovery_execution_strategy == ExecutionStrategy.MARKET else ref_price
             target_amount = Decimal(str(pos.amount))
             partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
-            if Decimal("0") < partial_fraction < Decimal("1"):
+            signal_slice_multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
+            if current_signal < 0 and signal_slice_multiplier > 0 and sell_price > 0:
+                target_quote = self.config.usd_per_entry * signal_slice_multiplier
+                target_amount = min(target_amount, target_quote / sell_price)
+                reversal_reason = f"slice-{reversal_reason}"
+            elif current_signal >= 0 and Decimal("0") < partial_fraction < Decimal("1"):
                 target_amount = target_amount * partial_fraction
                 reversal_reason = f"partial-{reversal_reason}"
             sell_amount = self._resolve_recovery_sell_amount(

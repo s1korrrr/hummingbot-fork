@@ -286,7 +286,7 @@ def test_q2_trailing_is_config_only_and_exit_stops_without_fictional_fill() -> N
         {
             "action_type": "STOP_EXECUTOR",
             "executor_id": "exit-existing-buy",
-            "keep_position": True,
+            "keep_position": False,
         }
     ]
     assert at["post_state"]["inventory"][0]["amount_base"] == "1"

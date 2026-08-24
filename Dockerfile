@@ -1,5 +1,18 @@
-# Set the base image
-FROM continuumio/miniconda3:latest AS builder
+# Pinned from docker.io/continuumio/miniconda3:latest on 2026-08-25.
+FROM continuumio/miniconda3@sha256:1808b31ef43e9c521cde5884ba4df9ec26d8d503a314cea787590f8550358a63 AS identity-check
+
+ARG SOURCE_COMMIT
+ARG COMMIT
+
+# Image identity is a source boundary: accept only the exact lowercase Git SHA
+# and keep the legacy commit value unable to diverge from the OCI revision.
+RUN test -n "${SOURCE_COMMIT}" && \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' && \
+    test "${COMMIT}" = "${SOURCE_COMMIT}"
+
+# Build from the checked identity stage so all normal builds fail before doing
+# expensive dependency installation when the required source identity is absent.
+FROM identity-check AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -39,18 +52,21 @@ RUN python3 setup.py build_ext --inplace -j 8 && \
 
 
 # Build final image using artifacts from builder
-FROM continuumio/miniconda3:latest AS release
+# Pinned from docker.io/continuumio/miniconda3:latest on 2026-08-25.
+FROM continuumio/miniconda3@sha256:1808b31ef43e9c521cde5884ba4df9ec26d8d503a314cea787590f8550358a63 AS release
 
 # Dockerfile author / maintainer
 LABEL maintainer="Fede Cardoso @dardonacci <federico@hummingbot.org>"
 
 # Build arguments
-ARG BRANCH=""
-ARG COMMIT=""
-ARG BUILD_DATE=""
+ARG BRANCH
+ARG COMMIT
+ARG SOURCE_COMMIT
+ARG BUILD_DATE
 LABEL branch=${BRANCH}
 LABEL commit=${COMMIT}
 LABEL date=${BUILD_DATE}
+LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}"
 
 # Set ENV variables
 ENV COMMIT_SHA=${COMMIT}

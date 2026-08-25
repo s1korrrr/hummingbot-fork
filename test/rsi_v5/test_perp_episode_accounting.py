@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -154,7 +154,9 @@ def test_reward_reconciles_nav_and_external_cashflow_exactly() -> None:
     )
     result = liquidatable_nav_reward(before, after, attribution)
     assert result.performance_nav_after == D("101")
-    assert result.log_return == D("1.01").ln()
+    with localcontext() as context:
+        context.prec = 50
+        assert result.log_return == D("1.01").ln()
     assert result.reconciliation_error == D("0")
 
 

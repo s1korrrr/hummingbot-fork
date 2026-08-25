@@ -45,6 +45,12 @@ class ParityStatus(StrEnum):
     MISMATCH = "MISMATCH"
 
 
+class TerminalOutcome(StrEnum):
+    SOLVENT = "SOLVENT"
+    LIQUIDATED = "LIQUIDATED"
+    INSOLVENT = "INSOLVENT"
+
+
 def _text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise EpisodeAccountingError(f"{label} must be non-empty text")
@@ -219,6 +225,7 @@ class LiquidatableNavBreakdown:
     close_impact_cost: Decimal
     nav: Decimal
     position_count: int
+    terminal_outcome: TerminalOutcome = TerminalOutcome.SOLVENT
     breakdown_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -435,7 +442,7 @@ class QuantsLabParityResult:
         }
 
 
-def liquidatable_nav(snapshot: EpisodeAccountSnapshot) -> LiquidatableNavBreakdown:
+def terminal_nav_evidence(snapshot: EpisodeAccountSnapshot) -> LiquidatableNavBreakdown:
     if not isinstance(snapshot, EpisodeAccountSnapshot):
         raise TypeError("snapshot must be EpisodeAccountSnapshot")
     with localcontext() as context:
@@ -463,8 +470,12 @@ def liquidatable_nav(snapshot: EpisodeAccountSnapshot) -> LiquidatableNavBreakdo
             - close_fee
             - close_impact
         )
-    if nav <= 0:
-        raise EpisodeAccountingError("liquidatable NAV must be positive")
+    if nav > 0:
+        terminal_outcome = TerminalOutcome.SOLVENT
+    elif nav == 0:
+        terminal_outcome = TerminalOutcome.LIQUIDATED
+    else:
+        terminal_outcome = TerminalOutcome.INSOLVENT
     return LiquidatableNavBreakdown(
         collateral_cash=snapshot.collateral_cash,
         accrued_funding_cashflow=snapshot.accrued_funding_cashflow,
@@ -474,7 +485,15 @@ def liquidatable_nav(snapshot: EpisodeAccountSnapshot) -> LiquidatableNavBreakdo
         close_impact_cost=close_impact,
         nav=nav,
         position_count=len(snapshot.positions),
+        terminal_outcome=terminal_outcome,
     )
+
+
+def liquidatable_nav(snapshot: EpisodeAccountSnapshot) -> LiquidatableNavBreakdown:
+    breakdown = terminal_nav_evidence(snapshot)
+    if breakdown.nav <= 0:
+        raise EpisodeAccountingError("liquidatable NAV must be positive")
+    return breakdown
 
 
 def settle_terminal(

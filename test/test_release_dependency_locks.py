@@ -104,6 +104,14 @@ def test_conda_alias_versions_fail_closed_when_divergent():
         lock_validator._conda_package_versions(entries)
 
 
+def test_conda_source_constraint_rejects_locked_urllib3_above_upper_bound(tmp_path: Path):
+    environment = tmp_path / "environment.yml"
+    environment.write_text("dependencies:\n  - urllib3>=1.26.15,<2\n")
+    entry = "https://conda.anaconda.org/conda-forge/linux-64/urllib3-2.7.0-py_0.conda#" + "a" * 64
+    with pytest.raises(lock_validator.LockValidationError, match="source constraint"):
+        lock_validator._validate_conda_source_coverage(environment, {"linux-64": (entry,)})
+
+
 def test_resolver_environment_strips_hostile_pip_and_uv_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     for key in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_CONFIG_FILE", "UV_INDEX", "UV_CONFIG_FILE", "UV_FIND_LINKS"):
         monkeypatch.setenv(key, "https://hostile.invalid")

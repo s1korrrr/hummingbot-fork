@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import yaml
+from conda.models.version import VersionSpec
 
 TARGETS = ("linux-64", "linux-aarch64")
 PYTHON_VERSION = "3.13.15"
@@ -95,6 +96,13 @@ def _conda_spec_name(spec: str) -> str:
     return _canonical_package_name(re.split(r"[<>=!~ ]", spec, maxsplit=1)[0])
 
 
+def _conda_spec_parts(spec: str) -> tuple[str, str]:
+    match = re.fullmatch(r"\s*([A-Za-z0-9_.-]+)\s*(.*)", spec)
+    if match is None:
+        raise LockValidationError(f"invalid Conda source spec {spec!r}")
+    return _canonical_package_name(match.group(1)), match.group(2).strip()
+
+
 def _explicit_package_names(entries: tuple[str, ...]) -> set[str]:
     names = set()
     for entry in entries:
@@ -127,11 +135,16 @@ def _validate_conda_source_coverage(environment_path: Path, target_entries: dict
     dependencies = environment.get("dependencies")
     if not isinstance(dependencies, list):
         raise LockValidationError(f"{environment_path}: dependencies must be a YAML list")
-    source_names = {_conda_spec_name(item) for item in dependencies if isinstance(item, str) and item.strip()}
+    source_specs = [_conda_spec_parts(item) for item in dependencies if isinstance(item, str) and item.strip()]
+    source_names = {name for name, _ in source_specs}
     for target, entries in target_entries.items():
-        missing = sorted(source_names - _explicit_package_names(entries))
+        versions = _conda_package_versions(entries)
+        missing = sorted(source_names - set(versions))
         if missing:
             raise LockValidationError(f"{target}: explicit lock misses canonical Conda requirements: {', '.join(missing)}")
+        for name, constraint in source_specs:
+            if constraint and not VersionSpec(constraint).match(versions[name]):
+                raise LockValidationError(f"{target}: source constraint mismatch for {name}: {constraint} does not match {versions[name]}")
 
 
 def _explicit_entries(lock_path: Path, target: str) -> tuple[str, ...]:

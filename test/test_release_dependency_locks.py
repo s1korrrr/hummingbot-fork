@@ -303,3 +303,31 @@ def test_validator_rejects_missing_injective_direct_input_before_fingerprint_che
 
     with pytest.raises(lock_validator.LockValidationError, match="coverage"):
         lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)
+
+
+def test_validator_rejects_transitive_version_drift_after_fingerprint_refresh(tmp_path: Path):
+    lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
+    lock_path = lock_dir / "pip-injective-linux-64.lock.txt"
+    lock_path.write_text(lock_path.read_text().replace("aiohappyeyeballs==2.7.1", "aiohappyeyeballs==2.7.2", 1))
+    _refresh_artifact_fingerprint(lock_dir, lock_path.name)
+    with pytest.raises(lock_validator.LockValidationError, match="overlap"):
+        lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)
+
+
+def test_validator_rejects_non_overlapping_transitive_drift_at_closure_manifest(tmp_path: Path):
+    lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
+    lock_path = lock_dir / "pip-injective-linux-64.lock.txt"
+    lock_path.write_text(lock_path.read_text().replace("bech32==1.2.0", "bech32==1.2.1", 1))
+    _refresh_artifact_fingerprint(lock_dir, lock_path.name)
+    with pytest.raises(lock_validator.LockValidationError, match="closure manifest"):
+        lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)
+
+
+def test_validator_rejects_origin_policy_drift(tmp_path: Path):
+    lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
+    provenance_path = lock_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    provenance["origin_policy"]["pypi_index"] = "https://hostile.invalid/simple"
+    provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+    with pytest.raises(lock_validator.LockValidationError, match="origin policy"):
+        lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)

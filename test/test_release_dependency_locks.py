@@ -7,6 +7,7 @@ import pytest
 
 from scripts import validate_release_dependency_locks as lock_validator
 from scripts.generate_release_dependency_locks import _solve_target, conda_specs_from_environment
+from scripts import generate_release_dependency_locks as lock_generator
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCKS = ROOT / "setup/locks"
@@ -101,6 +102,14 @@ def test_conda_alias_versions_fail_closed_when_divergent():
     )
     with pytest.raises(lock_validator.LockValidationError, match="divergent"):
         lock_validator._conda_package_versions(entries)
+
+
+def test_resolver_environment_strips_hostile_pip_and_uv_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    for key in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_CONFIG_FILE", "UV_INDEX", "UV_CONFIG_FILE", "UV_FIND_LINKS"):
+        monkeypatch.setenv(key, "https://hostile.invalid")
+    environment = lock_generator._resolver_environment(tmp_path)
+    assert {key for key in environment if key.startswith(("PIP_", "UV_"))} == {"UV_CACHE_DIR"}
+    assert environment["UV_CACHE_DIR"] == str(tmp_path / "uv-cache")
 
 
 def test_solve_target_rejects_cache_dependent_fetch_omissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

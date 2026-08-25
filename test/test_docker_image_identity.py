@@ -21,6 +21,10 @@ PINNED_ACTIONS = {
     "docker/login-action": "5e57cd118135c172c3672efd75eb46360885c0ef",  # noqa: mock
     "docker/build-push-action": "263435318d21b8e681c14492fe198d362a7d2c83",  # noqa: mock
 }
+PINNED_RUNNER = "ubuntu-24.04"
+PINNED_QEMU_IMAGE = "docker.io/tonistiigi/binfmt:qemu-v10.0.4@sha256:8f58e6214f4cc9dc83ce8f5acad1ece508eb6b20e696a8c1e9f274481982c541"  # noqa: mock
+PINNED_BUILDX_VERSION = "v0.17.1"
+PINNED_BUILDKIT_IMAGE = "moby/buildkit:v0.17.3@sha256:b2498ea62630c147e98f96145c2988a74720700b250e4cf7a4328e14f5b99fc3"  # noqa: mock
 
 
 def _dockerfile() -> str:
@@ -43,6 +47,11 @@ def _release_validation_script() -> str:
 def _workflow_step(job_name: str, step_id: str) -> dict:
     steps = _workflow_document()["jobs"][job_name]["steps"]
     return next(step for step in steps if step.get("id") == step_id)
+
+
+def _workflow_step_by_action(job_name: str, action: str) -> dict:
+    steps = _workflow_document()["jobs"][job_name]["steps"]
+    return next(step for step in steps if step.get("uses", "").startswith(f"{action}@"))
 
 
 def _make_context(tmp_path: Path, name: str) -> Path:
@@ -223,6 +232,23 @@ def test_workflow_publish_job_requires_protected_release_environment():
     assert publish_job["environment"]["name"] == "hummingbot-image-release"
 
 
+def test_workflow_pins_runner_qemu_buildx_and_buildkit_in_every_image_job():
+    document = _workflow_document()
+    for job_name in ("verify_pr", "publish_release"):
+        job = document["jobs"][job_name]
+        qemu = _workflow_step_by_action(job_name, "docker/setup-qemu-action")
+        buildx = _workflow_step_by_action(job_name, "docker/setup-buildx-action")
+
+        assert job["runs-on"] == PINNED_RUNNER
+        assert qemu["with"]["image"] == PINNED_QEMU_IMAGE
+        assert ":latest" not in qemu["with"]["image"]
+        assert re.fullmatch(r".+:[^@]+@sha256:[0-9a-f]{64}", qemu["with"]["image"])
+        assert buildx["with"]["version"] == PINNED_BUILDX_VERSION
+        assert buildx["with"]["driver-opts"] == f"image={PINNED_BUILDKIT_IMAGE}"
+        assert ":latest" not in buildx["with"]["driver-opts"]
+        assert re.fullmatch(r"image=.+:[^@]+@sha256:[0-9a-f]{64}", buildx["with"]["driver-opts"])
+
+
 def test_workflow_uses_checked_out_commit_timestamps_not_event_timestamps(tmp_path: Path):
     workflow = _workflow()
     assert "github.event.pull_request.updated_at" not in workflow
@@ -254,14 +280,47 @@ def test_workflow_uses_checked_out_commit_timestamps_not_event_timestamps(tmp_pa
 def test_workflow_publish_is_digest_only_without_a_semantic_tag():
     publish_job = _workflow_document()["jobs"]["publish_release"]
     image_step = _workflow_step("publish_release", "image")
+    digest_step = _workflow_step("publish_release", "validate_digest")
 
     assert "tags" not in image_step["with"]
     assert image_step["with"]["push"] == "true"
     assert "name=hummingbot/hummingbot" in image_step["with"]["outputs"]
     assert "push-by-digest=true" in image_step["with"]["outputs"]
     assert "name-canonical=true" in image_step["with"]["outputs"]
-    assert publish_job["outputs"]["image_digest"] == "${{ steps.image.outputs.digest }}"
-    assert "steps.image.outputs.digest" in _workflow_step("publish_release", "record_digest")["run"]
+    assert publish_job["outputs"]["image_digest"] == "${{ steps.validate_digest.outputs.image_digest }}"
+    assert digest_step["env"]["IMAGE_DIGEST"] == "${{ steps.image.outputs.digest }}"
+    assert "steps.image.outputs.digest" not in digest_step["run"]
+
+
+@pytest.mark.parametrize(
+    ("name", "digest", "expected_success"),
+    [
+        ("valid", f"sha256:{'a' * 64}", True),
+        ("malformed", "sha256:not-a-digest", False),
+        ("empty", "", False),
+        ("shell_metacharacters", "sha256:$(touch should-not-run)", False),
+    ],
+)
+def test_workflow_digest_validation_is_env_only_and_fail_closed(
+    tmp_path: Path, name: str, digest: str, expected_success: bool
+):
+    step = _workflow_step("publish_release", "validate_digest")
+    marker = tmp_path / "should-not-run"
+    output = tmp_path / f"{name}-output"
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", step["run"]],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "IMAGE_DIGEST": digest, "GITHUB_OUTPUT": str(output), "GITHUB_STEP_SUMMARY": str(tmp_path / "summary")},
+    )
+
+    assert result.returncode == (0 if expected_success else 1), name
+    assert not marker.exists()
+    if expected_success:
+        assert output.read_text().splitlines() == [f"image_digest={digest}"]
+    else:
+        assert "must be an exact sha256 digest" in result.stderr
 
 
 def test_workflow_validation_rejects_the_old_unhardened_6a8_source_commit(tmp_path: Path):
@@ -402,6 +461,58 @@ def test_make_build_streams_a_canonical_git_archive_without_ignored_artifacts(tm
     assert "Dockerfile" in names
     assert "ignored-native.so" not in names
     assert arguments.read_text().splitlines()[-1] == "-"
+
+
+def test_make_build_archives_the_resolved_source_commit_not_a_racing_head(tmp_path: Path):
+    repo = _make_context(tmp_path, "archive-race")
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    source_date = subprocess.run(
+        ["git", "show", "-s", "--format=%cI", source_commit],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "tracked.txt").write_text("later head bytes\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "advance head"], cwd=repo, check=True)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    context = tmp_path / "docker-context.tar"
+    arguments = tmp_path / "docker-arguments.txt"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_DOCKER_ARGUMENTS\"\n"
+        "cat > \"$FAKE_DOCKER_CONTEXT\"\n"
+    )
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["make", "build", f"SOURCE_COMMIT={source_commit}"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_DOCKER_CONTEXT": str(context),
+            "FAKE_DOCKER_ARGUMENTS": str(arguments),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    with tarfile.open(context) as archive:
+        tracked = archive.extractfile("tracked.txt")
+        assert tracked is not None
+        assert tracked.read().decode() == "clean\n"
+    arguments_text = arguments.read_text()
+    assert f"SOURCE_COMMIT={source_commit}" in arguments_text
+    assert f"COMMIT={source_commit}" in arguments_text
+    assert f"BUILD_DATE={source_date}" in arguments_text
 
 
 def test_workflow_actions_are_pinned_to_immutable_commits():

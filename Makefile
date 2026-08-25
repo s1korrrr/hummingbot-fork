@@ -3,9 +3,9 @@
 
 DYDX ?= 0
 ENV_FILE := setup/environment.yml
-SOURCE_COMMIT := $(shell git rev-parse HEAD)
+SOURCE_COMMIT ?= $(shell git rev-parse HEAD)
 SOURCE_BRANCH := $(shell git branch --show-current)
-BUILD_DATE := $(shell git show -s --format=%cI HEAD)
+BUILD_DATE ?= $(shell git show -s --format=%cI $(SOURCE_COMMIT))
 ifeq ($(DYDX),1)
   ENV_FILE := setup/environment_dydx.yml
 endif
@@ -39,7 +39,7 @@ verify-image-context:
 	fi
 
 build: verify-image-context
-	git archive --format=tar HEAD | docker build -t hummingbot/hummingbot${TAG} -f Dockerfile \
+	git archive --format=tar $(SOURCE_COMMIT) | docker build -t hummingbot/hummingbot${TAG} -f Dockerfile \
 		--build-arg SOURCE_COMMIT=$(SOURCE_COMMIT) \
 		--build-arg COMMIT=$(SOURCE_COMMIT) \
 		--build-arg BRANCH=$(SOURCE_BRANCH) \

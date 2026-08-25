@@ -1,9 +1,11 @@
+import importlib.util
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -666,6 +668,32 @@ def test_dockerfile_runs_pip_and_native_build_inside_the_hummingbot_environment(
     assert "RUN python3 setup.py build_ext" not in dockerfile
 
 
+def test_lock_validation_ancestry_fails_before_builder_bootstrap_installation():
+    dockerfile = _dockerfile()
+
+    validation_from = "FROM identity-check AS lock-validation"
+    bootstrap_from = "FROM lock-validation AS builder-bootstrap"
+    environment_from = "FROM builder-bootstrap AS builder-environment"
+    assert validation_from in dockerfile
+    assert bootstrap_from in dockerfile
+    assert environment_from in dockerfile
+    assert dockerfile.index(validation_from) < dockerfile.index(bootstrap_from) < dockerfile.index(environment_from)
+
+    validation = _dockerfile_stage("lock-validation")
+    bootstrap = _dockerfile_stage("builder-bootstrap")
+    for source in (
+        "COPY setup/environment.yml /tmp/release-sources/setup/environment.yml",
+        "COPY setup/pip_packages.txt /tmp/release-sources/setup/pip_packages.txt",
+        "COPY setup/locks/ /tmp/release-locks/",
+        "COPY scripts/validate_release_dependency_locks.py /tmp/validate_release_dependency_locks.py",
+    ):
+        assert source in validation
+    assert 'case "${TARGETPLATFORM}" in' in validation
+    assert "/tmp/validate_release_dependency_locks.py" in validation
+    assert "apt-get" not in validation
+    assert "apt-get update" in bootstrap
+
+
 def test_builder_environment_maps_each_supported_platform_to_its_exact_lock_pair_and_fails_closed():
     stage = _dockerfile_stage("builder-environment")
 
@@ -680,8 +708,9 @@ def test_builder_environment_maps_each_supported_platform_to_its_exact_lock_pair
     assert re.search(r"\*\)\s+.*exit\s+(?:1|64);;", stage, flags=re.DOTALL)
 
 
-def test_builder_environment_validates_canonical_sources_and_all_locks_before_exact_conda_create():
-    stage = _dockerfile_stage("builder-environment")
+def test_lock_validation_checks_canonical_sources_before_builder_environment_exact_conda_create():
+    validation = _dockerfile_stage("lock-validation")
+    environment = _dockerfile_stage("builder-environment")
 
     expected_copies = (
         "COPY setup/environment.yml /tmp/release-sources/setup/environment.yml",
@@ -690,7 +719,7 @@ def test_builder_environment_validates_canonical_sources_and_all_locks_before_ex
         "COPY scripts/validate_release_dependency_locks.py /tmp/validate_release_dependency_locks.py",
     )
     for instruction in expected_copies:
-        assert instruction in stage
+        assert instruction in validation
 
     bootstrap_setup = "from ruamel.yaml import YAML"
     bootstrap_probe = (
@@ -702,18 +731,19 @@ def test_builder_environment_validates_canonical_sources_and_all_locks_before_ex
         "/opt/conda/bin/python /tmp/validate_release_dependency_locks.py"
     )
     exact_create = 'conda create --prefix /opt/conda/envs/hummingbot --file "${CONDA_LOCK}" --yes'
-    assert bootstrap_setup in stage
-    assert "from ruamel.yaml.error import YAMLError" in stage
-    assert "def safe_load(stream):" in stage
-    assert bootstrap_probe in stage
-    assert validator in stage
-    assert "--lock-dir /tmp/release-locks" in stage
-    assert "--environment /tmp/release-sources/setup/environment.yml" in stage
-    assert "--pip-packages /tmp/release-sources/setup/pip_packages.txt" in stage
-    assert exact_create in stage
-    assert stage.index(bootstrap_setup) < stage.index(bootstrap_probe) < stage.index(validator) < stage.index(exact_create)
+    assert bootstrap_setup in validation
+    assert "from ruamel.yaml.error import YAMLError" in validation
+    assert "def safe_load(stream):" in validation
+    assert bootstrap_probe in validation
+    assert validator in validation
+    assert "--lock-dir /tmp/release-locks" in validation
+    assert "--environment /tmp/release-sources/setup/environment.yml" in validation
+    assert "--pip-packages /tmp/release-sources/setup/pip_packages.txt" in validation
+    assert validation.index(bootstrap_setup) < validation.index(bootstrap_probe) < validation.index(validator)
+    assert exact_create in environment
     for forbidden in ("conda env create", "conda env update", "conda install", "conda update"):
-        assert forbidden not in stage
+        assert forbidden not in validation
+        assert forbidden not in environment
 
 
 def test_builder_environment_installs_both_pip_locks_with_fail_closed_flags_and_distinct_reports():
@@ -780,9 +810,64 @@ def test_builder_environment_runs_a_deterministic_eip712_runtime_reversal_gate_a
     assert "chainId=1" in smoke
     assert 'verifyingContract="0x0000000000000000000000000000000000000001"' in smoke  # noqa: mock
     assert "signable_bytes" in smoke
-    assert "len(signable) == 66" in smoke
-    assert 'signable[:2] == b"\\x19\\x01"' in smoke
+    assert "1901de57171073f97873bc93388ae5e87afd47d803e4b4a59a7a402a0eb71b7aa2e6" in smoke  # noqa: mock
+    assert "64e15bdc268f69b1f35c21c9559e329a2f3587fe22a9800badf545aec280d842" in smoke  # noqa: mock
+    assert "358eb3432f7a6fdfb6bbec6fcc85bf845d3feea114fb95722bbbf854a934453e" in smoke  # noqa: mock
     assert "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470" in smoke  # noqa: mock
+
+
+def test_runtime_dependency_smoke_rejects_wrong_vector_under_optimized_python(tmp_path: Path):
+    smoke = RELEASE_RUNTIME_DEPENDENCY_SMOKE.read_text()
+    wrong_smoke = smoke.replace(
+        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",  # noqa: mock
+        "0" * 64,
+    )
+    assert wrong_smoke != smoke
+    candidate = tmp_path / RELEASE_RUNTIME_DEPENDENCY_SMOKE.name
+    candidate.write_text(wrong_smoke)
+
+    result = subprocess.run(
+        [sys.executable, "-O", str(candidate)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+
+
+def _load_runtime_dependency_smoke():
+    spec = importlib.util.spec_from_file_location(
+        "release_runtime_dependency_smoke_under_test",
+        RELEASE_RUNTIME_DEPENDENCY_SMOKE,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_runtime_dependency_smoke_rejects_wrong_signable_body_prefix_and_length():
+    smoke = _load_runtime_dependency_smoke()
+    accepted = bytes.fromhex(smoke.EXPECTED_SIGNABLE_HEX)
+    wrong_values = (
+        accepted[:-1] + bytes([accepted[-1] ^ 1]),
+        b"\x18" + accepted[1:],
+        accepted[:-1],
+    )
+
+    for wrong in wrong_values:
+        with pytest.raises(RuntimeError, match="unexpected EIP-712 signable bytes"):
+            smoke.verify_signable(wrong)
+
+
+def test_runtime_dependency_smoke_rejects_wrong_expected_signable_keccak(monkeypatch):
+    smoke = _load_runtime_dependency_smoke()
+    accepted = bytes.fromhex(smoke.EXPECTED_SIGNABLE_HEX)
+    monkeypatch.setattr(smoke, "EXPECTED_SIGNABLE_KECCAK", "0" * 64)
+
+    with pytest.raises(RuntimeError, match="unexpected EIP-712 signable Keccak-256"):
+        smoke.verify_signable(accepted)
 
 
 def test_release_preserves_license_texts_and_generates_solved_package_inventory():

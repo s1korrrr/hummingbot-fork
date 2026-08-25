@@ -14,6 +14,42 @@ RUN test -n "${SOURCE_COMMIT}" && \
     printf '%s\n' "${SOURCE_COMMIT}" | grep -Eq '^[0-9a-f]{40}$' && \
     test "${COMMIT}" = "${SOURCE_COMMIT}"
 
+# Validate the complete dependency lock inventory before any apt, Conda, or pip
+# installation. Unsupported and empty target platforms fail in this stage.
+FROM identity-check AS lock-validation
+
+ARG TARGETPLATFORM
+
+COPY setup/environment.yml /tmp/release-sources/setup/environment.yml
+COPY setup/pip_packages.txt /tmp/release-sources/setup/pip_packages.txt
+COPY setup/locks/ /tmp/release-locks/
+COPY scripts/validate_release_dependency_locks.py /tmp/validate_release_dependency_locks.py
+
+# Miniforge's base environment ships ruamel.yaml rather than PyYAML. Expose the
+# validator's two required PyYAML-compatible names without installing or
+# solving any bootstrap package.
+RUN install -d /tmp/validator-bootstrap && \
+    printf '%s\n' \
+        'from ruamel.yaml import YAML' \
+        'from ruamel.yaml.error import YAMLError' \
+        '' \
+        'def safe_load(stream):' \
+        '    return YAML(typ="safe").load(stream)' \
+        > /tmp/validator-bootstrap/yaml.py
+
+RUN set -eu; \
+    case "${TARGETPLATFORM}" in \
+        linux/amd64|linux/arm64) ;; \
+        *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM:-<empty>}" >&2; exit 64;; \
+    esac; \
+    PYTHONPATH=/tmp/validator-bootstrap /opt/conda/bin/python \
+        -c 'import yaml; from conda.models.version import VersionSpec' && \
+    PYTHONPATH=/tmp/validator-bootstrap /opt/conda/bin/python \
+        /tmp/validate_release_dependency_locks.py \
+        --lock-dir /tmp/release-locks \
+        --environment /tmp/release-sources/setup/environment.yml \
+        --pip-packages /tmp/release-sources/setup/pip_packages.txt
+
 # This target is deliberately lightweight: it inherits the exact identity gate
 # and declares the metadata inherited by the final runtime image.
 FROM identity-check AS image-metadata
@@ -44,8 +80,8 @@ ENV COMMIT_BRANCH=${BRANCH}
 ENV BUILD_DATE=${BUILD_DATE}
 ENV INSTALLATION_TYPE=docker
 
-# Keep build-tool assumptions explicit and testable on the pinned base.
-FROM identity-check AS builder-bootstrap
+# Keep build-tool assumptions explicit and testable after lock validation.
+FROM lock-validation AS builder-bootstrap
 
 # Install system dependencies
 RUN apt-get update && \
@@ -61,25 +97,8 @@ ARG TARGETPLATFORM
 
 WORKDIR /home/hummingbot
 
-# Copy the canonical recipes, the complete lock/provenance inventory, and the
-# offline validator into one stage so source binding is checked before install.
-COPY setup/environment.yml /tmp/release-sources/setup/environment.yml
-COPY setup/pip_packages.txt /tmp/release-sources/setup/pip_packages.txt
-COPY setup/locks/ /tmp/release-locks/
-COPY scripts/validate_release_dependency_locks.py /tmp/validate_release_dependency_locks.py
+# The validated sources and lock inventory are inherited from lock-validation.
 COPY scripts/verify_release_eip712_runtime.py /tmp/verify_release_eip712_runtime.py
-
-# Miniforge's base environment ships ruamel.yaml rather than PyYAML. Expose the
-# validator's two required PyYAML-compatible names without installing or
-# solving any bootstrap package.
-RUN install -d /tmp/validator-bootstrap && \
-    printf '%s\n' \
-        'from ruamel.yaml import YAML' \
-        'from ruamel.yaml.error import YAMLError' \
-        '' \
-        'def safe_load(stream):' \
-        '    return YAML(typ="safe").load(stream)' \
-        > /tmp/validator-bootstrap/yaml.py
 
 RUN set -eu; \
     case "${TARGETPLATFORM}" in \
@@ -91,13 +110,6 @@ RUN set -eu; \
             INJECTIVE_PIP_LOCK=/tmp/release-locks/pip-injective-linux-aarch64.lock.txt;; \
         *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM:-<empty>}" >&2; exit 64;; \
     esac; \
-    PYTHONPATH=/tmp/validator-bootstrap /opt/conda/bin/python \
-        -c 'import yaml; from conda.models.version import VersionSpec' && \
-    PYTHONPATH=/tmp/validator-bootstrap /opt/conda/bin/python \
-        /tmp/validate_release_dependency_locks.py \
-        --lock-dir /tmp/release-locks \
-        --environment /tmp/release-sources/setup/environment.yml \
-        --pip-packages /tmp/release-sources/setup/pip_packages.txt && \
     install -d /opt/conda/image-evidence && \
     conda list --json > /opt/conda/image-evidence/base-final-conda-list.json && \
     conda create --prefix /opt/conda/envs/hummingbot --file "${CONDA_LOCK}" --yes && \

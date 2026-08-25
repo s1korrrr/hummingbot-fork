@@ -372,24 +372,17 @@ def test_workflow_validation_accepts_only_the_checked_out_producer_commit(tmp_pa
 
 
 def test_make_build_command_binds_one_exact_head_sha_to_both_metadata_arguments():
-    result = subprocess.run(
-        ["make", "-n", "build"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
-    ).stdout.strip()
-    build_date = subprocess.run(
-        ["git", "show", "-s", "--format=%cI", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    makefile = (ROOT / "Makefile").read_text()
 
-    assert f"SOURCE_COMMIT={head}" in result.stdout
-    assert f"COMMIT={head}" in result.stdout
-    assert f"BUILD_DATE={build_date}" in result.stdout
-    assert "git clean" not in result.stdout
+    assert "source_commit=\"$$(git rev-parse --verify HEAD)\"" in makefile
+    assert "git archive --format=tar \"$$source_commit\"" in makefile
+    assert "--build-arg \"SOURCE_COMMIT=$$source_commit\"" in makefile
+    assert "--build-arg \"COMMIT=$$source_commit\"" in makefile
+    assert "--build-arg \"BUILD_DATE=$$build_date\"" in makefile
+    assert "SOURCE_COMMIT ?=" not in makefile
+    assert "BUILD_DATE ?=" not in makefile
+    assert "unexport SOURCE_COMMIT BUILD_DATE" in makefile
+    assert "git clean" not in makefile
 
 
 def test_make_build_requires_a_clean_context_before_labeling_head():
@@ -478,6 +471,10 @@ def test_make_build_archives_the_resolved_source_commit_not_a_racing_head(tmp_pa
     (repo / "tracked.txt").write_text("later head bytes\n")
     subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "--quiet", "-m", "advance head"], cwd=repo, check=True)
+    advanced_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "checkout", "--quiet", "--detach", source_commit], cwd=repo, check=True)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     context = tmp_path / "docker-context.tar"
@@ -489,9 +486,78 @@ def test_make_build_archives_the_resolved_source_commit_not_a_racing_head(tmp_pa
         "cat > \"$FAKE_DOCKER_CONTEXT\"\n"
     )
     fake_docker.chmod(0o755)
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = rev-parse ] && [ \"$2\" = --verify ] && [ \"$3\" = HEAD ]; then\n"
+        "  \"$REAL_GIT\" rev-parse --verify HEAD\n"
+        "  \"$REAL_GIT\" checkout --quiet --detach \"$RACE_ADVANCED_HEAD\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exec \"$REAL_GIT\" \"$@\"\n"
+    )
+    fake_git.chmod(0o755)
 
     result = subprocess.run(
-        ["make", "build", f"SOURCE_COMMIT={source_commit}"],
+        ["make", "build"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_DOCKER_CONTEXT": str(context),
+            "FAKE_DOCKER_ARGUMENTS": str(arguments),
+            "REAL_GIT": shutil.which("git") or "git",
+            "RACE_ADVANCED_HEAD": advanced_head,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    with tarfile.open(context) as archive:
+        tracked = archive.extractfile("tracked.txt")
+        assert tracked is not None
+        assert tracked.read().decode() == "clean\n"
+    arguments_text = arguments.read_text()
+    assert f"SOURCE_COMMIT={source_commit}" in arguments_text
+    assert f"COMMIT={source_commit}" in arguments_text
+    assert f"BUILD_DATE={source_date}" in arguments_text
+
+
+def test_make_ignores_recursive_and_shell_metacharacter_identity_overrides(tmp_path: Path):
+    repo = _make_context(tmp_path, "override-injection")
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    source_date = subprocess.run(
+        ["git", "show", "-s", "--format=%cI", source_commit],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    context = tmp_path / "docker-context.tar"
+    arguments = tmp_path / "docker-arguments.txt"
+    marker = tmp_path / "override-executed"
+    shell_metacharacter_marker = tmp_path / "shell-metacharacter-executed"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_DOCKER_ARGUMENTS\"\n"
+        "cat > \"$FAKE_DOCKER_CONTEXT\"\n"
+    )
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            "make",
+            "build",
+            f"SOURCE_COMMIT=$(shell touch {marker})",
+            f"BUILD_DATE=2026-08-25T00:00:00Z;touch {shell_metacharacter_marker}",
+        ],
         cwd=repo,
         check=False,
         capture_output=True,
@@ -505,10 +571,10 @@ def test_make_build_archives_the_resolved_source_commit_not_a_racing_head(tmp_pa
     )
 
     assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+    assert not shell_metacharacter_marker.exists()
     with tarfile.open(context) as archive:
-        tracked = archive.extractfile("tracked.txt")
-        assert tracked is not None
-        assert tracked.read().decode() == "clean\n"
+        assert "Dockerfile" in archive.getnames()
     arguments_text = arguments.read_text()
     assert f"SOURCE_COMMIT={source_commit}" in arguments_text
     assert f"COMMIT={source_commit}" in arguments_text

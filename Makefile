@@ -3,9 +3,8 @@
 
 DYDX ?= 0
 ENV_FILE := setup/environment.yml
-SOURCE_COMMIT ?= $(shell git rev-parse HEAD)
-SOURCE_BRANCH := $(shell git branch --show-current)
-BUILD_DATE ?= $(shell git show -s --format=%cI $(SOURCE_COMMIT))
+# Identity is captured inside the build shell; never expand or export caller-provided values.
+unexport SOURCE_COMMIT BUILD_DATE
 ifeq ($(DYDX),1)
   ENV_FILE := setup/environment_dydx.yml
 endif
@@ -39,11 +38,18 @@ verify-image-context:
 	fi
 
 build: verify-image-context
-	git archive --format=tar $(SOURCE_COMMIT) | docker build -t hummingbot/hummingbot${TAG} -f Dockerfile \
-		--build-arg SOURCE_COMMIT=$(SOURCE_COMMIT) \
-		--build-arg COMMIT=$(SOURCE_COMMIT) \
-		--build-arg BRANCH=$(SOURCE_BRANCH) \
-		--build-arg BUILD_DATE=$(BUILD_DATE) -
+	@source_commit="$$(git rev-parse --verify HEAD)"; \
+	if ! printf '%s\n' "$$source_commit" | grep -Eq '^[0-9a-f]{40}$$'; then \
+		echo "Image build requires an exact lowercase Git SHA." >&2; \
+		exit 1; \
+	fi; \
+	build_date="$$(git show -s --format=%cI "$$source_commit")"; \
+	branch="$$(git branch --show-current | LC_ALL=C tr -cd '[:alnum:]./_-')"; \
+	git archive --format=tar "$$source_commit" | docker build -t "hummingbot/hummingbot$${TAG}" -f Dockerfile \
+		--build-arg "SOURCE_COMMIT=$$source_commit" \
+		--build-arg "COMMIT=$$source_commit" \
+		--build-arg "BRANCH=$$branch" \
+		--build-arg "BUILD_DATE=$$build_date" -
 
 
 uninstall:

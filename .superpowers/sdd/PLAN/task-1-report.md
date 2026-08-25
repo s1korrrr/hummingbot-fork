@@ -2,7 +2,8 @@
 
 ## Status
 
-Complete as corrected source-lock evidence, pending fresh independent re-review.
+Independently accepted `READY_WITH_RISK` as corrected `repo-ready` source-lock
+evidence at `7fe315f6d8cdf32ef634eb58ab9f4d5814dc4ad9`.
 Publication remains `HOLD_FOR_EVIDENCE`; no Dockerfile, image, deployment, or push changed.
 
 ## Final implementation
@@ -33,8 +34,8 @@ Artifacts are two explicit locks, two Injective closures,
 
 ## Residual risk and Task 2 handoff
 
-Task 2 may proceed only after fresh independent re-review. It must consume
-locks without solves and prove target runtime imports/EIP-712 behavior.
+Task 2 may proceed. It must consume locks without solves and prove target
+runtime imports/EIP-712 behavior on both architectures.
 Generic `pip check` remains intentionally non-clean for the approved pysha3
 metadata substitution.
 

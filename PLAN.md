@@ -154,8 +154,9 @@
 
 ### Authoritative current result
 
-- Task 1 completed on 2026-08-25 as source-lock evidence pending a fresh
-  independent re-review. It does not establish target-image runtime evidence.
+- Task 1 was independently accepted `READY_WITH_RISK` on 2026-08-25 as
+  `repo-ready` source-lock evidence. It does not establish target-image runtime
+  evidence.
 - The six-artifact inventory contains two 367-record explicit Conda locks, two
   target-specific 59-package Injective pip closures, one direct EIP-712 lock,
   and provenance. Each target has 49 equal normalized Conda/pip overlaps and
@@ -177,5 +178,5 @@
   representative EIP-712 behavior inside both target images.
 - No image, registry, runtime, deployment, credential, or trading state was
   changed. Publication remains `HOLD_FOR_EVIDENCE`.
-- Rollback: revert the Task 1 commits. Task 2 may proceed only after the fresh
-  review accepts this corrected source-lock range.
+- Rollback: revert the Task 1 commits. Task 2 now owns resolver-free Docker
+  consumption and both-target runtime proof.

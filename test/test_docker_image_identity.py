@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
 WORKFLOW = ROOT / ".github/workflows/docker_buildx_workflow.yml"
 SOURCE_SHA = "6a8b5c37ea5bdfbdfc11127e3fa0a05a35e386ca"  # noqa: mock
-PINNED_MINICONDA = "anaconda/miniconda@sha256:d722abd5acde70c181c16cd4129696e08501cd7e0a1316705953b162d9054cfb"  # noqa: mock
+PINNED_MINIFORGE = "docker.io/condaforge/miniforge3:26.5.3-0@sha256:b230e51ddd0ebc4b08bb44d7442c20f9443973e3ddd09cf7f621b04fe449ca66"  # noqa: mock
+ENVIRONMENT_FILES = (ROOT / "setup/environment.yml", ROOT / "setup/environment_dydx.yml")
 PINNED_ACTIONS = {
     "actions/checkout": "11bd71901bbe5b1630ceea73d27597364c9af683",  # noqa: mock
     "docker/setup-qemu-action": "29109295f81e9208d7d86ff1c6c12d2833863392",  # noqa: mock
@@ -82,7 +83,8 @@ def _make_context(tmp_path: Path, name: str) -> Path:
 
 
 METADATA_IMAGE = "hummingbot:qte-image-identity-metadata-test"
-BOOTSTRAP_IMAGE = "hummingbot:qte-miniconda-bootstrap-test"
+BOOTSTRAP_IMAGE = "hummingbot:qte-miniforge-bootstrap-test"
+ENVIRONMENT_IMAGE = "hummingbot:qte-condaforge-environment-test"
 
 
 def _build_metadata(*build_args: str) -> subprocess.CompletedProcess[str]:
@@ -122,6 +124,32 @@ def _build_bootstrap(target: str) -> subprocess.CompletedProcess[str]:
             "--load",
             "--tag",
             BOOTSTRAP_IMAGE,
+            "--build-arg",
+            f"SOURCE_COMMIT={SOURCE_SHA}",
+            "--build-arg",
+            f"COMMIT={SOURCE_SHA}",
+            str(ROOT),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _build_environment() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "docker",
+            "buildx",
+            "build",
+            "--progress=plain",
+            "--file",
+            str(DOCKERFILE),
+            "--target",
+            "builder-environment",
+            "--load",
+            "--tag",
+            ENVIRONMENT_IMAGE,
             "--build-arg",
             f"SOURCE_COMMIT={SOURCE_SHA}",
             "--build-arg",
@@ -223,25 +251,52 @@ def test_dockerfile_emits_oci_revision_and_retains_matching_legacy_commit_metada
     assert "LABEL commit=${SOURCE_COMMIT}" not in dockerfile
 
 
-def test_dockerfile_pins_every_miniconda_base_image_to_the_recorded_digest():
+def test_dockerfile_pins_every_miniforge_base_image_to_the_recorded_digest():
     dockerfile = _dockerfile()
 
     from_images = re.findall(r"^FROM\s+([^\s]+)", dockerfile, flags=re.MULTILINE)
-    assert [image for image in from_images if image.startswith("anaconda/")] == [PINNED_MINICONDA]
+    assert [image for image in from_images if image.startswith("docker.io/condaforge/")] == [PINNED_MINIFORGE]
+    assert not any(image.startswith("anaconda/") for image in from_images)
     assert not any(image.startswith("continuumio/") for image in from_images)
     assert not re.search(r"^FROM\s+[^\s]*:latest", dockerfile, flags=re.MULTILINE)
 
 
-def test_dockerfile_copies_the_official_miniconda_prefix_into_the_release_image():
+def test_canonical_environment_files_are_conda_forge_only():
+    for path in ENVIRONMENT_FILES:
+        document = yaml.safe_load(path.read_text())
+
+        assert document["channels"] == ["conda-forge", "nodefaults"], path
+
+
+def test_dockerfile_copies_the_miniforge_prefix_into_the_release_image():
     dockerfile = _dockerfile()
 
-    assert "COPY --from=builder /opt/miniconda3/ /opt/miniconda3/" in dockerfile
-    assert "/opt/conda/" not in dockerfile
+    assert "COPY --from=builder /opt/conda/ /opt/conda/" in dockerfile
+    assert "/opt/miniconda3/" not in dockerfile
+
+
+def test_dockerfile_runs_pip_and_native_build_inside_the_hummingbot_environment():
+    dockerfile = _dockerfile()
+
+    assert "conda run -n hummingbot python -m pip install" in dockerfile
+    assert "conda run -n hummingbot --no-capture-output python setup.py build_ext" in dockerfile
+    assert "RUN python3 -m pip install" not in dockerfile
+    assert "RUN python3 setup.py build_ext" not in dockerfile
+
+
+def test_release_explicitly_preserves_tini_and_execs_the_hummingbot_python():
+    dockerfile = _dockerfile()
+
+    assert 'ENTRYPOINT ["/usr/bin/tini", "--"]' in dockerfile
+    assert (
+        'CMD ["/bin/bash", "-lc", "exec /opt/conda/envs/hummingbot/bin/python '
+        './bin/hummingbot_quickstart.py 2>> ./logs/errors.log"]' in dockerfile
+    )
 
 
 @pytest.mark.parametrize("target", ("builder-bootstrap", "runtime-bootstrap"))
-def test_miniconda_bootstrap_targets_preserve_the_required_tool_contract(target: str):
-    assert shutil.which("docker"), "BuildKit is required for Miniconda bootstrap verification"
+def test_miniforge_bootstrap_targets_preserve_the_required_tool_contract(target: str):
+    assert shutil.which("docker"), "BuildKit is required for Miniforge bootstrap verification"
 
     result = _build_bootstrap(target)
 
@@ -254,16 +309,54 @@ def test_miniconda_bootstrap_targets_preserve_the_required_tool_contract(target:
             BOOTSTRAP_IMAGE,
             "/bin/bash",
             "-lc",
-            "test \"${CONDA_PREFIX:-/opt/miniconda3}\" = /opt/miniconda3 "
-            "&& test \"$(type -P conda)\" = /opt/miniconda3/bin/conda "
+            "test \"${CONDA_DIR}\" = /opt/conda "
+            "&& test \"$(type -P conda)\" = /opt/conda/bin/conda "
             "&& command -v git "
-            "&& command -v wget",
+            "&& command -v wget "
+            "&& test \"$(ps -o comm= -p 1 | tr -d ' ')\" = tini",
         ],
         check=False,
         capture_output=True,
         text=True,
     )
     assert probe.returncode == 0, probe.stderr
+
+
+def test_conda_environment_records_conda_forge_package_urls_and_selected_python():
+    assert shutil.which("docker"), "BuildKit is required for dependency provenance verification"
+
+    result = _build_environment()
+
+    assert result.returncode == 0, result.stderr
+    probe = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/bin/bash",
+            ENVIRONMENT_IMAGE,
+            "-lc",
+            "set -euo pipefail; "
+            "provenance=/opt/conda/conda-meta/hummingbot-package-urls.txt; "
+            "python_record=/opt/conda/conda-meta/hummingbot-python-version.txt; "
+            "test -s \"${provenance}\"; "
+            "test -s \"${python_record}\"; "
+            "! grep -Fq repo.anaconda.com \"${provenance}\"; "
+            "grep -Eq '^https://conda.anaconda.org/conda-forge/' \"${provenance}\"; "
+            "bad_urls=$(grep -E '^https?://' \"${provenance}\" | "
+            "grep -Ev '^https://conda\\.anaconda\\.org/conda-forge/' || true); "
+            "test -z \"${bad_urls}\"; "
+            "test \"$(cat \"${python_record}\")\" = \"$(conda run -n hummingbot python -c "
+            "'import platform; print(platform.python_version())')\"; "
+            "cat \"${python_record}\"",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert re.fullmatch(r"3\.1[0-9]\.[0-9]+\n", probe.stdout)
 
 
 def test_workflow_pr_verification_is_non_pushing_and_binds_pr_head_sha():

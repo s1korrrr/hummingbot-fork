@@ -8,7 +8,8 @@
   DoD: cache-isolated solves lock all LINK records; source pip YAML and exact
   lock inventory fail closed; exact `uv 0.11.29` generates complete hashed
   Injective closures for both Python 3.13 manylinux targets; provenance binds
-  the single named pysha3 substitution; all artifacts are re-reviewed.
+  the single named pysha3 substitution; artifacts await fresh independent
+  re-review before Task 2 begins.
 - [ ] Task 2: consume locks in the release image.
   DoD: Docker uses only the selected validated locks; both target environment
   builds or exact blockers are recorded; docs and tests match runtime flow.

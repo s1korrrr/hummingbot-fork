@@ -4,7 +4,12 @@ import re
 import shutil
 import subprocess
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
+from uuid import uuid4
 
 import pytest
 import yaml
@@ -81,11 +86,19 @@ def _make_context(tmp_path: Path, name: str) -> Path:
     return repo
 
 
-METADATA_IMAGE = "hummingbot:qte-image-identity-metadata-test"
+@dataclass(frozen=True)
+class _MetadataImage:
+    result: subprocess.CompletedProcess[str]
+    image_id: str | None
+    image_tag: str
 
 
-def _build_metadata(*build_args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+@contextmanager
+def _build_metadata(artifact_dir: Path, *build_args: str) -> Iterator[_MetadataImage]:
+    invocation = uuid4().hex
+    image_tag = f"hummingbot:qte-image-identity-metadata-test-{invocation}"
+    image_id_file = artifact_dir / f"metadata-image-{invocation}.iid"
+    result = subprocess.run(
         [
             "docker",
             "buildx",
@@ -96,8 +109,10 @@ def _build_metadata(*build_args: str) -> subprocess.CompletedProcess[str]:
             "--target",
             "image-metadata",
             "--load",
+            "--iidfile",
+            str(image_id_file),
             "--tag",
-            METADATA_IMAGE,
+            image_tag,
             *build_args,
             str(ROOT),
         ],
@@ -105,16 +120,69 @@ def _build_metadata(*build_args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
     )
+    image_id = image_id_file.read_text().strip() if image_id_file.exists() else None
+    try:
+        yield _MetadataImage(result=result, image_id=image_id, image_tag=image_tag)
+    finally:
+        if image_id is not None:
+            subprocess.run(
+                ["docker", "image", "rm", image_tag],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
 
 
-def _image_labels() -> dict[str, str]:
+def _image_labels(image_id: str | None) -> dict[str, str]:
+    assert image_id is not None
     result = subprocess.run(
-        ["docker", "image", "inspect", METADATA_IMAGE, "--format", "{{json .Config.Labels}}"],
+        ["docker", "image", "inspect", image_id, "--format", "{{json .Config.Labels}}"],
         check=True,
         capture_output=True,
         text=True,
     )
     return json.loads(result.stdout)
+
+
+def test_concurrent_metadata_builds_keep_labels_bound_to_their_immutable_image_ids(tmp_path: Path):
+    assert shutil.which("docker"), "BuildKit is required for image identity verification"
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    def build_and_inspect(branch: str) -> tuple[str, str, dict[str, str]]:
+        with _build_metadata(
+            tmp_path,
+            "--build-arg",
+            f"SOURCE_COMMIT={source_commit}",
+            "--build-arg",
+            f"COMMIT={source_commit}",
+            "--build-arg",
+            f"BRANCH={branch}",
+            "--build-arg",
+            "BUILD_DATE=2026-08-25T00:00:00Z",
+        ) as image:
+            assert image.result.returncode == 0, image.result.stderr
+            return image.image_id, image.image_tag, _image_labels(image.image_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(build_and_inspect, "isolation-first")
+        second = executor.submit(build_and_inspect, "isolation-second")
+        first_image_id, first_image_tag, first_labels = first.result()
+        second_image_id, second_image_tag, second_labels = second.result()
+
+    assert first_image_id != second_image_id
+    assert first_image_tag != second_image_tag
+    assert first_labels["branch"] == "isolation-first"
+    assert second_labels["branch"] == "isolation-second"
+    for image_tag in (first_image_tag, second_image_tag):
+        cleanup_check = subprocess.run(
+            ["docker", "image", "inspect", image_tag],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert cleanup_check.returncode != 0
 
 
 @pytest.mark.parametrize(
@@ -137,22 +205,26 @@ def _image_labels() -> dict[str, str]:
         ),
     ],
 )
-def test_buildkit_metadata_target_rejects_invalid_source_identity(name: str, build_args: tuple[str, ...]):
+def test_buildkit_metadata_target_rejects_invalid_source_identity(
+    tmp_path: Path, name: str, build_args: tuple[str, ...]
+):
     assert shutil.which("docker"), "BuildKit is required for image identity verification"
 
-    result = _build_metadata(*build_args)
+    with _build_metadata(tmp_path, *build_args) as image:
+        result = image.result
 
     assert result.returncode != 0, name
     assert 'process "/bin/sh -c test -n' in f"{result.stdout}\n{result.stderr}"
 
 
-def test_buildkit_metadata_target_replaces_base_identity_with_exact_hummingbot_build_identity():
+def test_buildkit_metadata_target_replaces_base_identity_with_exact_hummingbot_build_identity(tmp_path: Path):
     assert shutil.which("docker"), "BuildKit is required for image identity verification"
     source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
     ).stdout.strip()
 
-    result = _build_metadata(
+    with _build_metadata(
+        tmp_path,
         "--build-arg",
         f"SOURCE_COMMIT={source_commit}",
         "--build-arg",
@@ -161,10 +233,10 @@ def test_buildkit_metadata_target_replaces_base_identity_with_exact_hummingbot_b
         "BRANCH=metadata-test",
         "--build-arg",
         "BUILD_DATE=2026-08-25T00:00:00Z",
-    )
+    ) as image:
+        assert image.result.returncode == 0, image.result.stderr
+        labels = _image_labels(image.image_id)
 
-    assert result.returncode == 0, result.stderr
-    labels = _image_labels()
     assert labels["org.opencontainers.image.revision"] == source_commit
     assert labels["commit"] == source_commit
     assert labels["branch"] == "metadata-test"

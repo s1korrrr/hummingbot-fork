@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
 WORKFLOW = ROOT / ".github/workflows/docker_buildx_workflow.yml"
 SOURCE_SHA = "6a8b5c37ea5bdfbdfc11127e3fa0a05a35e386ca"  # noqa: mock
-PINNED_MINICONDA = "continuumio/miniconda3@sha256:1808b31ef43e9c521cde5884ba4df9ec26d8d503a314cea787590f8550358a63"  # noqa: mock
+PINNED_MINICONDA = "anaconda/miniconda@sha256:d722abd5acde70c181c16cd4129696e08501cd7e0a1316705953b162d9054cfb"  # noqa: mock
 PINNED_ACTIONS = {
     "actions/checkout": "11bd71901bbe5b1630ceea73d27597364c9af683",  # noqa: mock
     "docker/setup-qemu-action": "29109295f81e9208d7d86ff1c6c12d2833863392",  # noqa: mock
@@ -82,6 +82,7 @@ def _make_context(tmp_path: Path, name: str) -> Path:
 
 
 METADATA_IMAGE = "hummingbot:qte-image-identity-metadata-test"
+BOOTSTRAP_IMAGE = "hummingbot:qte-miniconda-bootstrap-test"
 
 
 def _build_metadata(*build_args: str) -> subprocess.CompletedProcess[str]:
@@ -99,6 +100,32 @@ def _build_metadata(*build_args: str) -> subprocess.CompletedProcess[str]:
             "--tag",
             METADATA_IMAGE,
             *build_args,
+            str(ROOT),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _build_bootstrap(target: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "docker",
+            "buildx",
+            "build",
+            "--progress=quiet",
+            "--file",
+            str(DOCKERFILE),
+            "--target",
+            target,
+            "--load",
+            "--tag",
+            BOOTSTRAP_IMAGE,
+            "--build-arg",
+            f"SOURCE_COMMIT={SOURCE_SHA}",
+            "--build-arg",
+            f"COMMIT={SOURCE_SHA}",
             str(ROOT),
         ],
         check=False,
@@ -179,7 +206,8 @@ def test_dockerfile_declares_a_shared_metadata_target_and_identity_guard():
     dockerfile = _dockerfile()
 
     assert "FROM identity-check AS image-metadata" in dockerfile
-    assert "FROM image-metadata AS release" in dockerfile
+    assert "FROM image-metadata AS runtime-bootstrap" in dockerfile
+    assert "FROM runtime-bootstrap AS release" in dockerfile
     assert "ARG SOURCE_COMMIT" in dockerfile
     assert 'test -n "${SOURCE_COMMIT}"' in dockerfile
     assert "^[0-9a-f]{40}$" in dockerfile
@@ -199,8 +227,43 @@ def test_dockerfile_pins_every_miniconda_base_image_to_the_recorded_digest():
     dockerfile = _dockerfile()
 
     from_images = re.findall(r"^FROM\s+([^\s]+)", dockerfile, flags=re.MULTILINE)
-    assert [image for image in from_images if image.startswith("continuumio/")] == [PINNED_MINICONDA]
+    assert [image for image in from_images if image.startswith("anaconda/")] == [PINNED_MINICONDA]
+    assert not any(image.startswith("continuumio/") for image in from_images)
     assert not re.search(r"^FROM\s+[^\s]*:latest", dockerfile, flags=re.MULTILINE)
+
+
+def test_dockerfile_copies_the_official_miniconda_prefix_into_the_release_image():
+    dockerfile = _dockerfile()
+
+    assert "COPY --from=builder /opt/miniconda3/ /opt/miniconda3/" in dockerfile
+    assert "/opt/conda/" not in dockerfile
+
+
+@pytest.mark.parametrize("target", ("builder-bootstrap", "runtime-bootstrap"))
+def test_miniconda_bootstrap_targets_preserve_the_required_tool_contract(target: str):
+    assert shutil.which("docker"), "BuildKit is required for Miniconda bootstrap verification"
+
+    result = _build_bootstrap(target)
+
+    assert result.returncode == 0, result.stderr
+    probe = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            BOOTSTRAP_IMAGE,
+            "/bin/bash",
+            "-lc",
+            "test \"${CONDA_PREFIX:-/opt/miniconda3}\" = /opt/miniconda3 "
+            "&& test \"$(type -P conda)\" = /opt/miniconda3/bin/conda "
+            "&& command -v git "
+            "&& command -v wget",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
 
 
 def test_workflow_pr_verification_is_non_pushing_and_binds_pr_head_sha():

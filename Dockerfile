@@ -1,5 +1,5 @@
-# Pinned from docker.io/continuumio/miniconda3:latest on 2026-08-25.
-FROM continuumio/miniconda3@sha256:1808b31ef43e9c521cde5884ba4df9ec26d8d503a314cea787590f8550358a63 AS identity-check
+# Pinned from the docker.io/anaconda/miniconda:26.5.3 OCI index on 2026-08-25.
+FROM anaconda/miniconda@sha256:d722abd5acde70c181c16cd4129696e08501cd7e0a1316705953b162d9054cfb AS identity-check
 
 ARG SOURCE_COMMIT
 ARG COMMIT
@@ -40,14 +40,18 @@ ENV COMMIT_BRANCH=${BRANCH}
 ENV BUILD_DATE=${BUILD_DATE}
 ENV INSTALLATION_TYPE=docker
 
-# Build from the checked identity stage so all normal builds fail before doing
-# expensive dependency installation when the required source identity is absent.
-FROM identity-check AS builder
+# The official image does not inherit git or wget like the retired
+# continuumio image did. Keep those build assumptions explicit and testable.
+FROM identity-check AS builder-bootstrap
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y sudo libusb-1.0 gcc g++ python3-dev && \
+    apt-get install -y sudo libusb-1.0 gcc g++ python3-dev git wget && \
     rm -rf /var/lib/apt/lists/*
+
+# Build from the checked bootstrap stage so all normal builds fail before doing
+# expensive dependency installation when the required source identity is absent.
+FROM builder-bootstrap AS builder
 
 WORKDIR /home/hummingbot
 
@@ -81,13 +85,16 @@ RUN python3 setup.py build_ext --inplace -j 8 && \
     find . -type f -name "*.cpp" -delete
 
 
-# Build final image using artifacts from builder and identity-bound metadata.
-FROM image-metadata AS release
+# Keep the legacy runtime tool contract explicit on the official base image.
+FROM image-metadata AS runtime-bootstrap
 
 # Install system dependencies
 RUN apt-get update && \
-    apt-get install -y sudo libusb-1.0 && \
+    apt-get install -y sudo libusb-1.0 git wget && \
     rm -rf /var/lib/apt/lists/*
+
+# Build final image using artifacts from builder and identity-bound metadata.
+FROM runtime-bootstrap AS release
 
 # Create mount points
 RUN mkdir -p /home/hummingbot/conf /home/hummingbot/conf/connectors /home/hummingbot/conf/strategies /home/hummingbot/conf/controllers /home/hummingbot/conf/scripts /home/hummingbot/logs /home/hummingbot/data /home/hummingbot/certs /home/hummingbot/scripts /home/hummingbot/controllers
@@ -95,7 +102,7 @@ RUN mkdir -p /home/hummingbot/conf /home/hummingbot/conf/connectors /home/hummin
 WORKDIR /home/hummingbot
 
 # Copy all build artifacts from builder image
-COPY --from=builder /opt/conda/ /opt/conda/
+COPY --from=builder /opt/miniconda3/ /opt/miniconda3/
 COPY --from=builder /home/ /home/
 
 # Setting bash as default shell because we have .bashrc with customized PATH (setting SHELL affects RUN, CMD and ENTRYPOINT, but not manual commands e.g. `docker run image COMMAND`!)

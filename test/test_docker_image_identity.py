@@ -25,6 +25,15 @@ PINNED_RUNNER = "ubuntu-24.04"
 PINNED_QEMU_IMAGE = "docker.io/tonistiigi/binfmt:qemu-v10.0.4@sha256:8f58e6214f4cc9dc83ce8f5acad1ece508eb6b20e696a8c1e9f274481982c541"  # noqa: mock
 PINNED_BUILDX_VERSION = "v0.17.1"
 PINNED_BUILDKIT_IMAGE = "moby/buildkit:v0.17.3@sha256:b2498ea62630c147e98f96145c2988a74720700b250e4cf7a4328e14f5b99fc3"  # noqa: mock
+HUMMINGBOT_OCI_LABELS = {
+    "org.opencontainers.image.title": "Hummingbot",
+    "org.opencontainers.image.description": (
+        "Open-source framework for designing and deploying automated trading strategies."
+    ),
+    "org.opencontainers.image.url": "https://hummingbot.org",
+    "org.opencontainers.image.source": "https://github.com/hummingbot/hummingbot",
+    "org.opencontainers.image.licenses": "Apache-2.0",
+}
 
 
 def _dockerfile() -> str:
@@ -137,7 +146,7 @@ def test_buildkit_metadata_target_rejects_invalid_source_identity(name: str, bui
     assert 'process "/bin/sh -c test -n' in f"{result.stdout}\n{result.stderr}"
 
 
-def test_buildkit_metadata_target_emits_matching_oci_and_legacy_labels():
+def test_buildkit_metadata_target_replaces_base_identity_with_exact_hummingbot_build_identity():
     assert shutil.which("docker"), "BuildKit is required for image identity verification"
     source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
@@ -160,6 +169,10 @@ def test_buildkit_metadata_target_emits_matching_oci_and_legacy_labels():
     assert labels["commit"] == source_commit
     assert labels["branch"] == "metadata-test"
     assert labels["date"] == "2026-08-25T00:00:00Z"
+    assert labels["org.opencontainers.image.created"] == "2026-08-25T00:00:00Z"
+    assert labels["org.opencontainers.image.version"] == source_commit
+    for name, value in HUMMINGBOT_OCI_LABELS.items():
+        assert labels[name] == value
 
 
 def test_dockerfile_declares_a_shared_metadata_target_and_identity_guard():

@@ -25,6 +25,13 @@ ARG BUILD_DATE
 LABEL branch=${BRANCH}
 LABEL commit=${COMMIT}
 LABEL date=${BUILD_DATE}
+LABEL org.opencontainers.image.title="Hummingbot"
+LABEL org.opencontainers.image.description="Open-source framework for designing and deploying automated trading strategies."
+LABEL org.opencontainers.image.url="https://hummingbot.org"
+LABEL org.opencontainers.image.source="https://github.com/hummingbot/hummingbot"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.version="${SOURCE_COMMIT}"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
 LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}"
 
 # Set ENV variables

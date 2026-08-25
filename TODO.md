@@ -2,9 +2,8 @@
 
 - [x] Task 1: generate and validate complete target locks.
   DoD: both explicit Conda locks, exact pip hash lock, source binding, validator,
-  generator, and adversarial tests are complete and self-reviewed. The initial
-  locks remain invalid pending cache-isolated Conda regeneration plus both
-  target-specific hashed Injective closures. Docker consumption is deferred.
+  generator, and adversarial tests are corrected source-lock evidence pending
+  fresh independent re-review. Docker consumption is deferred to Task 2.
 - [x] Task 1 review correction: complete lock coverage and pip closure.
   DoD: cache-isolated solves lock all LINK records; source pip YAML and exact
   lock inventory fail closed; exact `uv 0.11.29` generates complete hashed

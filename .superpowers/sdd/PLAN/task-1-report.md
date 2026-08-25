@@ -9,6 +9,15 @@ No Dockerfile, image, service, deployment, publication, or push was changed.
 
 ## Implemented source-lock baseline
 
+Final state at `815d86f`, `43da388`, and `e2889d2`: the canonical Conda
+constraints are `eth-utils>=5,<6`, `eth-typing>=5,<6`, and `hexbytes>=1,<2`.
+Both targets contain 367 Conda records, 59 pip packages, and 49 equal
+normalized overlaps with zero conflicts. LINK identity is projected safely to
+FETCH URL/hash metadata; provenance binds exact closure/overlap maps and the
+isolated explicit-PyPI origin policy. The focused adversarial suite has 31
+passing tests and the offline validator is green. Runtime target-image proof
+remains Task 2; no Dockerfile or push occurred.
+
 - `scripts/generate_release_dependency_locks.py` generates cache-isolated
   target Conda locks from complete LINK plans and target-specific, hash-pinned
   Injective closures with `uv 0.11.29`.
@@ -23,6 +32,9 @@ No Dockerfile, image, service, deployment, publication, or push was changed.
   that pip and Conda can coexist in one environment.
 
 ## Combined-environment feasibility evidence
+
+The failure narrative below is historical and superseded by the final canonical
+constraints and compatible combined resolutions above.
 
 The required bounded check built an exact constraint file from every normalized
 package name shared by the `linux-64` Conda explicit lock and the current

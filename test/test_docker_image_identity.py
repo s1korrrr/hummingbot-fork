@@ -1,11 +1,13 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
+import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Barrier, Event
@@ -19,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
 WORKFLOW = ROOT / ".github/workflows/docker_buildx_workflow.yml"
 SOURCE_SHA = "6a8b5c37ea5bdfbdfc11127e3fa0a05a35e386ca"  # noqa: mock
-PINNED_MINICONDA = "continuumio/miniconda3@sha256:1808b31ef43e9c521cde5884ba4df9ec26d8d503a314cea787590f8550358a63"  # noqa: mock
+PINNED_MINIFORGE = "docker.io/condaforge/miniforge3:26.5.3-0@sha256:b230e51ddd0ebc4b08bb44d7442c20f9443973e3ddd09cf7f621b04fe449ca66"  # noqa: mock
+ENVIRONMENT_FILES = (ROOT / "setup/environment.yml", ROOT / "setup/environment_dydx.yml")
 PINNED_ACTIONS = {
     "actions/checkout": "11bd71901bbe5b1630ceea73d27597364c9af683",  # noqa: mock
     "docker/setup-qemu-action": "29109295f81e9208d7d86ff1c6c12d2833863392",  # noqa: mock
@@ -88,17 +91,24 @@ def _make_context(tmp_path: Path, name: str) -> Path:
 
 
 @dataclass(frozen=True)
-class _MetadataImage:
+class _BuiltImage:
     result: subprocess.CompletedProcess[str]
     image_id: str | None
     image_tag: str
 
 
 @contextmanager
-def _build_metadata(artifact_dir: Path, *build_args: str) -> Iterator[_MetadataImage]:
+def _build_image(
+    artifact_dir: Path,
+    *,
+    role: str,
+    target: str,
+    progress: str,
+    build_args: tuple[str, ...],
+) -> Iterator[_BuiltImage]:
     invocation = uuid4().hex
-    image_tag = f"hummingbot:qte-image-identity-metadata-test-{invocation}"
-    image_id_file = artifact_dir / f"metadata-image-{invocation}.iid"
+    image_tag = f"hummingbot:qte-{role}-test-{invocation}"
+    image_id_file = artifact_dir / f"{role}-{invocation}.iid"
     result: subprocess.CompletedProcess[str] | None = None
     try:
         result = subprocess.run(
@@ -106,11 +116,11 @@ def _build_metadata(artifact_dir: Path, *build_args: str) -> Iterator[_MetadataI
                 "docker",
                 "buildx",
                 "build",
-                "--progress=quiet",
+                f"--progress={progress}",
                 "--file",
                 str(DOCKERFILE),
                 "--target",
-                "image-metadata",
+                target,
                 "--load",
                 "--iidfile",
                 str(image_id_file),
@@ -128,33 +138,68 @@ def _build_metadata(artifact_dir: Path, *build_args: str) -> Iterator[_MetadataI
             raise ValueError(f"BuildKit iidfile must contain an exact sha256 image ID; got {image_id!r}")
         if result.returncode == 0 and image_id is None:
             raise ValueError("BuildKit did not produce an exact sha256 image ID")
-        yield _MetadataImage(result=result, image_id=image_id, image_tag=image_tag)
+        yield _BuiltImage(result=result, image_id=image_id, image_tag=image_tag)
     finally:
         try:
-            if result is not None:
-                cleanup = subprocess.run(
-                    ["docker", "image", "rm", "--force", image_tag],
-                    check=False,
-                    capture_output=True,
-                    text=True,
+            cleanup = subprocess.run(
+                ["docker", "image", "rm", "--force", image_tag],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            remaining_tag = subprocess.run(
+                ["docker", "image", "inspect", image_tag],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if remaining_tag.returncode == 0:
+                raise RuntimeError(
+                    f"Isolated Docker test tag {image_tag} still exists after exact cleanup "
+                    f"(remove exit {cleanup.returncode}): {cleanup.stderr}"
                 )
-                cleanup_check = subprocess.run(
-                    ["docker", "image", "inspect", image_tag],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                if cleanup_check.returncode == 0:
-                    raise RuntimeError(
-                        f"Docker test build exited {result.returncode}; docker image rm --force exited "
-                        f"{cleanup.returncode}; exact Docker test tag remains: {image_tag}"
-                    )
-                if "No such image" not in cleanup_check.stderr and "No such object" not in cleanup_check.stderr:
-                    raise RuntimeError(
-                        f"Could not verify exact Docker test tag cleanup for {image_tag}: {cleanup_check.stderr}"
-                    )
         finally:
             image_id_file.unlink(missing_ok=True)
+
+
+def _build_metadata(artifact_dir: Path, *build_args: str) -> AbstractContextManager[_BuiltImage]:
+    return _build_image(
+        artifact_dir,
+        role="image-identity-metadata",
+        target="image-metadata",
+        progress="quiet",
+        build_args=build_args,
+    )
+
+
+def _build_bootstrap(artifact_dir: Path, target: str) -> AbstractContextManager[_BuiltImage]:
+    return _build_image(
+        artifact_dir,
+        role=f"miniforge-{target}",
+        target=target,
+        progress="quiet",
+        build_args=(
+            "--build-arg",
+            f"SOURCE_COMMIT={SOURCE_SHA}",
+            "--build-arg",
+            f"COMMIT={SOURCE_SHA}",
+        ),
+    )
+
+
+def _build_environment(artifact_dir: Path) -> AbstractContextManager[_BuiltImage]:
+    return _build_image(
+        artifact_dir,
+        role="condaforge-environment",
+        target="builder-environment",
+        progress="plain",
+        build_args=(
+            "--build-arg",
+            f"SOURCE_COMMIT={SOURCE_SHA}",
+            "--build-arg",
+            f"COMMIT={SOURCE_SHA}",
+        ),
+    )
 
 
 def _image_labels(image_id: str | None) -> dict[str, str]:
@@ -183,10 +228,11 @@ def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path, Path]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     removed_tags = tmp_path / "removed-tags"
-    inspected_tags = tmp_path / "inspected-tags"
+    docker_calls = tmp_path / "docker-calls"
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_DOCKER_CALLS\"\n"
         "if [ \"$1\" = buildx ]; then\n"
         "  shift\n"
         "  while [ \"$#\" -gt 0 ]; do\n"
@@ -200,21 +246,53 @@ def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path, Path]:
         "  exit \"$FAKE_DOCKER_BUILD_EXIT\"\n"
         "fi\n"
         "if [ \"$1\" = image ] && [ \"$2\" = rm ]; then\n"
-        "  printf '%s\\n' \"$*\" >> \"$FAKE_DOCKER_REMOVED_TAGS\"\n"
-        "  exit \"${FAKE_DOCKER_RM_EXIT:-0}\"\n"
+        "  target=$3\n"
+        "  if [ \"$target\" = --force ]; then target=$4; fi\n"
+        "  printf '%s\\n' \"$target\" >> \"$FAKE_DOCKER_REMOVED_TAGS\"\n"
+        "  exit \"${FAKE_DOCKER_REMOVE_EXIT:-0}\"\n"
         "fi\n"
         "if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n"
-        "  printf '%s\\n' \"$3\" >> \"$FAKE_DOCKER_INSPECTED_TAGS\"\n"
-        "  inspect_exit=\"${FAKE_DOCKER_INSPECT_EXIT:-1}\"\n"
-        "  if [ \"$inspect_exit\" -ne 0 ]; then\n"
-        "    printf 'Error: No such image: %s\\n' \"$3\" >&2\n"
-        "  fi\n"
-        "  exit \"$inspect_exit\"\n"
+        "  exit \"${FAKE_DOCKER_INSPECT_EXIT:-1}\"\n"
         "fi\n"
         "exit 99\n"
     )
     fake_docker.chmod(0o755)
-    return fake_bin, removed_tags, inspected_tags
+    return fake_bin, removed_tags, docker_calls
+
+
+@pytest.mark.parametrize(
+    ("helper_name", "target"),
+    [
+        ("metadata", None),
+        ("bootstrap", "builder-bootstrap"),
+        ("environment", None),
+    ],
+)
+def test_every_docker_build_helper_cleans_its_exact_tag_and_iidfile_after_failure(
+    tmp_path: Path, monkeypatch, helper_name: str, target: str | None
+):
+    fake_bin, removed_tags, docker_calls = _make_fake_docker(tmp_path)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_IID", f"sha256:{'a' * 64}")
+    monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "7")
+    monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
+    monkeypatch.setenv("FAKE_DOCKER_CALLS", str(docker_calls))
+
+    if helper_name == "metadata":
+        invocation = _build_metadata(tmp_path)
+    elif helper_name == "bootstrap":
+        assert target is not None
+        invocation = _build_bootstrap(tmp_path, target)
+    else:
+        invocation = _build_environment(tmp_path)
+
+    with invocation as image:
+        assert image.result.returncode == 7
+
+    assert list(tmp_path.glob("*.iid")) == []
+    cleaned_tags = removed_tags.read_text().splitlines()
+    assert len(cleaned_tags) == 1
+    assert cleaned_tags[0] == image.image_tag
 
 
 @pytest.mark.parametrize(
@@ -228,15 +306,15 @@ def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path, Path]:
         f"sha256:{'a' * 64}extra",
     ],
 )
-def test_metadata_build_rejects_malformed_iid_and_cleans_exact_artifacts(
+def test_docker_build_rejects_malformed_iid_and_cleans_exact_artifacts(
     tmp_path: Path, monkeypatch, malformed_iid: str
 ):
-    fake_bin, removed_tags, inspected_tags = _make_fake_docker(tmp_path)
+    fake_bin, removed_tags, docker_calls = _make_fake_docker(tmp_path)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_DOCKER_IID", malformed_iid)
     monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "0")
     monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
-    monkeypatch.setenv("FAKE_DOCKER_INSPECTED_TAGS", str(inspected_tags))
+    monkeypatch.setenv("FAKE_DOCKER_CALLS", str(docker_calls))
 
     with pytest.raises(ValueError, match="exact sha256 image ID"):
         with _build_metadata(tmp_path):
@@ -245,50 +323,54 @@ def test_metadata_build_rejects_malformed_iid_and_cleans_exact_artifacts(
     assert list(tmp_path.glob("*.iid")) == []
     cleaned_tags = removed_tags.read_text().splitlines()
     assert len(cleaned_tags) == 1
-    assert cleaned_tags[0].startswith("image rm --force hummingbot:qte-image-identity-metadata-test-")
-    assert inspected_tags.read_text().splitlines() == [cleaned_tags[0].removeprefix("image rm --force ")]
+    assert cleaned_tags[0].startswith("hummingbot:qte-image-identity-metadata-test-")
 
 
-def test_failed_metadata_build_always_removes_unique_iidfile_and_tag(tmp_path: Path, monkeypatch):
-    fake_bin, removed_tags, inspected_tags = _make_fake_docker(tmp_path)
-    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("FAKE_DOCKER_IID", f"sha256:{'a' * 64}")
-    monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "7")
-    monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
-    monkeypatch.setenv("FAKE_DOCKER_INSPECTED_TAGS", str(inspected_tags))
-
-    with _build_metadata(tmp_path) as image:
-        assert image.result.returncode == 7
-
-    assert list(tmp_path.glob("*.iid")) == []
-    cleaned_tags = removed_tags.read_text().splitlines()
-    assert len(cleaned_tags) == 1
-    assert cleaned_tags[0].startswith("image rm --force hummingbot:qte-image-identity-metadata-test-")
-    assert inspected_tags.read_text().splitlines() == [cleaned_tags[0].removeprefix("image rm --force ")]
-
-
-def test_failed_build_raises_when_forced_cleanup_leaves_exact_tag_present(tmp_path: Path, monkeypatch):
-    fake_bin, removed_tags, inspected_tags = _make_fake_docker(tmp_path)
+def test_docker_build_helpers_use_collision_proof_tags_and_leave_zero_iidfiles(tmp_path: Path, monkeypatch):
+    fake_bin, removed_tags, docker_calls = _make_fake_docker(tmp_path)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_DOCKER_IID", f"sha256:{'b' * 64}")
+    monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "0")
+    monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
+    monkeypatch.setenv("FAKE_DOCKER_CALLS", str(docker_calls))
+
+    observed_tags = []
+    for invocation in (
+        _build_metadata(tmp_path),
+        _build_bootstrap(tmp_path, "runtime-bootstrap"),
+        _build_environment(tmp_path),
+    ):
+        with invocation as image:
+            assert image.image_id == f"sha256:{'b' * 64}"
+            observed_tags.append(image.image_tag)
+
+    assert len(set(observed_tags)) == 3
+    assert removed_tags.read_text().splitlines() == observed_tags
+    assert list(tmp_path.glob("*.iid")) == []
+
+
+def test_failed_build_raises_when_exact_tag_remains_after_forced_cleanup(tmp_path: Path, monkeypatch):
+    fake_bin, removed_tags, docker_calls = _make_fake_docker(tmp_path)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_IID", f"sha256:{'c' * 64}")
     monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "7")
-    monkeypatch.setenv("FAKE_DOCKER_RM_EXIT", "9")
+    monkeypatch.setenv("FAKE_DOCKER_REMOVE_EXIT", "9")
     monkeypatch.setenv("FAKE_DOCKER_INSPECT_EXIT", "0")
     monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
-    monkeypatch.setenv("FAKE_DOCKER_INSPECTED_TAGS", str(inspected_tags))
+    monkeypatch.setenv("FAKE_DOCKER_CALLS", str(docker_calls))
 
-    with pytest.raises(RuntimeError, match="build exited 7.*exact Docker test tag remains"):
-        with _build_metadata(tmp_path) as image:
+    with pytest.raises(RuntimeError, match="still exists after exact cleanup"):
+        with _build_environment(tmp_path) as image:
             assert image.result.returncode == 7
 
     assert list(tmp_path.glob("*.iid")) == []
-    cleaned_tags = removed_tags.read_text().splitlines()
-    assert len(cleaned_tags) == 1
-    assert cleaned_tags[0].startswith("image rm --force hummingbot:qte-image-identity-metadata-test-")
-    assert inspected_tags.read_text().splitlines() == [cleaned_tags[0].removeprefix("image rm --force ")]
+    cleaned_tag = removed_tags.read_text().strip()
+    assert cleaned_tag.startswith("hummingbot:qte-condaforge-environment-test-")
+    assert f"image rm --force {cleaned_tag}" in docker_calls.read_text().splitlines()
+    assert f"image inspect {cleaned_tag}" in docker_calls.read_text().splitlines()
 
 
-def test_concurrent_metadata_builds_keep_labels_bound_to_their_immutable_image_ids(tmp_path: Path):
+def test_concurrent_metadata_builds_keep_distinct_labels_bound_to_immutable_ids(tmp_path: Path):
     assert shutil.which("docker"), "BuildKit is required for image identity verification"
     first_source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
@@ -310,6 +392,7 @@ def test_concurrent_metadata_builds_keep_labels_bound_to_their_immutable_image_i
             "BUILD_DATE=2026-08-25T00:00:00Z",
         ) as image:
             assert image.result.returncode == 0, image.result.stderr
+            assert image.image_id is not None
             both_builds_finished.wait(timeout=30)
             return image.image_id, image.image_tag, _image_labels(image.image_id), _image_environment(image.image_id)
 
@@ -337,63 +420,60 @@ def test_concurrent_metadata_builds_keep_labels_bound_to_their_immutable_image_i
             text=True,
         )
         assert cleanup_check.returncode != 0
+    assert list(tmp_path.glob("*.iid")) == []
 
 
-def test_same_content_build_cleanup_preserves_shared_immutable_id_until_every_unique_tag_exits(tmp_path: Path):
-    assert shutil.which("docker"), "BuildKit is required for image identity verification"
+def test_concurrent_same_content_builds_clean_only_their_exact_tag_from_shared_image_id(tmp_path: Path):
+    assert shutil.which("docker"), "BuildKit is required for shared image identity verification"
     source_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
     ).stdout.strip()
-    both_builds_finished = Barrier(2)
-    first_cleanup_finished = Event()
-    common_args = (
+    build_args = (
         "--build-arg",
         f"SOURCE_COMMIT={source_commit}",
         "--build-arg",
         f"COMMIT={source_commit}",
         "--build-arg",
-        "BRANCH=shared-id-isolation",
+        "BRANCH=shared-identity",
         "--build-arg",
         "BUILD_DATE=2026-08-25T00:00:00Z",
     )
+    both_builds_finished = Barrier(2)
+    first_tag_cleaned = Event()
 
-    def first_build() -> tuple[str, str]:
+    def clean_first() -> tuple[str, str]:
         try:
-            with _build_metadata(tmp_path, *common_args) as image:
+            with _build_metadata(tmp_path, *build_args) as image:
                 assert image.result.returncode == 0, image.result.stderr
-                both_builds_finished.wait(timeout=30)
                 assert image.image_id is not None
+                both_builds_finished.wait(timeout=30)
                 return image.image_id, image.image_tag
         finally:
-            first_cleanup_finished.set()
+            first_tag_cleaned.set()
 
-    def second_build() -> tuple[str, str, dict[str, str], list[str]]:
-        with _build_metadata(tmp_path, *common_args) as image:
+    def preserve_second() -> tuple[str, str]:
+        with _build_metadata(tmp_path, *build_args) as image:
             assert image.result.returncode == 0, image.result.stderr
+            assert image.image_id is not None
             both_builds_finished.wait(timeout=30)
-            assert first_cleanup_finished.wait(timeout=30)
-            tag_check = subprocess.run(
+            assert first_tag_cleaned.wait(timeout=30)
+            own_tag = subprocess.run(
                 ["docker", "image", "inspect", image.image_tag],
                 check=False,
                 capture_output=True,
                 text=True,
             )
-            assert tag_check.returncode == 0, tag_check.stderr
-            assert image.image_id is not None
-            return image.image_id, image.image_tag, _image_labels(image.image_id), _image_environment(image.image_id)
+            assert own_tag.returncode == 0, own_tag.stderr
+            return image.image_id, image.image_tag
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(first_build)
-        second = executor.submit(second_build)
+        first = executor.submit(clean_first)
+        second = executor.submit(preserve_second)
         first_image_id, first_image_tag = first.result()
-        second_image_id, second_image_tag, second_labels, second_environment = second.result()
+        second_image_id, second_image_tag = second.result()
 
     assert first_image_id == second_image_id
     assert first_image_tag != second_image_tag
-    assert second_labels["commit"] == source_commit
-    assert second_labels["org.opencontainers.image.revision"] == source_commit
-    assert second_labels["branch"] == "shared-id-isolation"
-    assert f"COMMIT_SHA={source_commit}" in second_environment
     for image_tag in (first_image_tag, second_image_tag):
         cleanup_check = subprocess.run(
             ["docker", "image", "inspect", image_tag],
@@ -402,6 +482,7 @@ def test_same_content_build_cleanup_preserves_shared_immutable_id_until_every_un
             text=True,
         )
         assert cleanup_check.returncode != 0
+    assert list(tmp_path.glob("*.iid")) == []
 
 
 @pytest.mark.parametrize(
@@ -455,7 +536,6 @@ def test_buildkit_metadata_target_replaces_base_identity_with_exact_hummingbot_b
     ) as image:
         assert image.result.returncode == 0, image.result.stderr
         labels = _image_labels(image.image_id)
-
     assert labels["org.opencontainers.image.revision"] == source_commit
     assert labels["commit"] == source_commit
     assert labels["branch"] == "metadata-test"
@@ -470,7 +550,8 @@ def test_dockerfile_declares_a_shared_metadata_target_and_identity_guard():
     dockerfile = _dockerfile()
 
     assert "FROM identity-check AS image-metadata" in dockerfile
-    assert "FROM image-metadata AS release" in dockerfile
+    assert "FROM image-metadata AS runtime-bootstrap" in dockerfile
+    assert "FROM runtime-bootstrap AS release" in dockerfile
     assert "ARG SOURCE_COMMIT" in dockerfile
     assert 'test -n "${SOURCE_COMMIT}"' in dockerfile
     assert "^[0-9a-f]{40}$" in dockerfile
@@ -486,12 +567,187 @@ def test_dockerfile_emits_oci_revision_and_retains_matching_legacy_commit_metada
     assert "LABEL commit=${SOURCE_COMMIT}" not in dockerfile
 
 
-def test_dockerfile_pins_every_miniconda_base_image_to_the_recorded_digest():
+def test_dockerfile_pins_every_miniforge_base_image_to_the_recorded_digest():
     dockerfile = _dockerfile()
 
     from_images = re.findall(r"^FROM\s+([^\s]+)", dockerfile, flags=re.MULTILINE)
-    assert [image for image in from_images if image.startswith("continuumio/")] == [PINNED_MINICONDA]
+    assert [image for image in from_images if image.startswith("docker.io/condaforge/")] == [PINNED_MINIFORGE]
+    assert not any(image.startswith("anaconda/") for image in from_images)
+    assert not any(image.startswith("continuumio/") for image in from_images)
     assert not re.search(r"^FROM\s+[^\s]*:latest", dockerfile, flags=re.MULTILINE)
+
+
+def test_canonical_environment_files_are_conda_forge_only():
+    for path in ENVIRONMENT_FILES:
+        document = yaml.safe_load(path.read_text())
+
+        assert document["channels"] == ["conda-forge", "nodefaults"], path
+
+
+def test_dockerfile_copies_the_miniforge_prefix_into_the_release_image():
+    dockerfile = _dockerfile()
+
+    assert "COPY --from=builder /opt/conda/ /opt/conda/" in dockerfile
+    assert "/opt/miniconda3/" not in dockerfile
+
+
+def test_dockerfile_runs_pip_and_native_build_inside_the_hummingbot_environment():
+    dockerfile = _dockerfile()
+
+    assert "conda run -n hummingbot python -m pip install" in dockerfile
+    assert "conda run -n hummingbot --no-capture-output python setup.py build_ext" in dockerfile
+    assert "RUN python3 -m pip install" not in dockerfile
+    assert "RUN python3 setup.py build_ext" not in dockerfile
+
+
+def test_release_explicitly_preserves_tini_and_execs_the_hummingbot_python():
+    dockerfile = _dockerfile()
+
+    assert 'ENTRYPOINT ["/usr/bin/tini", "--"]' in dockerfile
+    assert (
+        'CMD ["/bin/bash", "-lc", "source /opt/conda/etc/profile.d/conda.sh && '
+        'conda activate hummingbot && exec python '
+        './bin/hummingbot_quickstart.py 2>> ./logs/errors.log"]' in dockerfile
+    )
+
+
+@pytest.mark.parametrize("target", ("builder-bootstrap", "runtime-bootstrap"))
+def test_miniforge_bootstrap_targets_preserve_the_required_tool_contract(tmp_path: Path, target: str):
+    assert shutil.which("docker"), "BuildKit is required for Miniforge bootstrap verification"
+
+    with _build_bootstrap(tmp_path, target) as image:
+        assert image.result.returncode == 0, image.result.stderr
+        probe = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                image.image_id,
+                "/bin/bash",
+                "-lc",
+                "test \"${CONDA_DIR}\" = /opt/conda "
+                "&& test \"$(type -P conda)\" = /opt/conda/bin/conda "
+                "&& command -v git "
+                "&& command -v wget "
+                "&& test \"$(ps -o comm= -p 1 | tr -d ' ')\" = tini",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    assert probe.returncode == 0, probe.stderr
+
+
+def test_conda_environment_records_conda_forge_package_urls_and_selected_python(tmp_path: Path):
+    assert shutil.which("docker"), "BuildKit is required for dependency provenance verification"
+
+    with _build_environment(tmp_path) as image:
+        assert image.result.returncode == 0, image.result.stderr
+        probe = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/bash",
+                image.image_id,
+                "-lc",
+                "set -euo pipefail; "
+                "provenance=/opt/conda/conda-meta/hummingbot-package-urls.txt; "
+                "python_record=/opt/conda/conda-meta/hummingbot-python-version.txt; "
+                "test -s \"${provenance}\"; "
+                "test -s \"${python_record}\"; "
+                "! grep -Fq repo.anaconda.com \"${provenance}\"; "
+                "grep -Eq '^https://conda.anaconda.org/conda-forge/' \"${provenance}\"; "
+                "bad_urls=$(grep -E '^https?://' \"${provenance}\" | "
+                "grep -Ev '^https://conda\\.anaconda\\.org/conda-forge/' || true); "
+                "test -z \"${bad_urls}\"; "
+                "test \"$(cat \"${python_record}\")\" = \"$(conda run -n hummingbot python -c "
+                "'import platform; print(platform.python_version())')\"; "
+                "cat \"${python_record}\"",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    assert probe.returncode == 0, probe.stderr
+    assert re.fullmatch(r"3\.1[0-9]\.[0-9]+\n", probe.stdout)
+
+
+def test_runtime_command_activates_the_environment_and_preserves_tini_signal_forwarding(tmp_path: Path):
+    assert shutil.which("docker"), "Docker is required for runtime environment verification"
+    with _build_environment(tmp_path) as image:
+        assert image.result.returncode == 0, image.result.stderr
+
+        cmd_match = re.search(r"^CMD (\[.*\])$", _dockerfile(), flags=re.MULTILINE)
+        assert cmd_match is not None
+        cmd = json.loads(cmd_match.group(1))
+        assert cmd[:2] == ["/bin/bash", "-lc"]
+        shell_command = cmd[2]
+        runtime_tail = "exec python ./bin/hummingbot_quickstart.py 2>> ./logs/errors.log"
+        assert shell_command.endswith(runtime_tail)
+
+        probe_program = (
+            "import json, os, shutil, sys; "
+            "print(json.dumps({'sys_executable': sys.executable, "
+            "'which_python': shutil.which('python'), "
+            "'conda_prefix': os.environ.get('CONDA_PREFIX'), "
+            "'path_head': os.environ['PATH'].split(':', 1)[0]}))"
+        )
+        probe_command = shell_command.removesuffix(runtime_tail) + f"exec python -c {shlex.quote(probe_program)}"
+        probe = subprocess.run(
+            ["docker", "run", "--rm", image.image_id, "/bin/bash", "-lc", probe_command],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert json.loads(probe.stdout) == {
+            "sys_executable": "/opt/conda/envs/hummingbot/bin/python",
+            "which_python": "/opt/conda/envs/hummingbot/bin/python",
+            "conda_prefix": "/opt/conda/envs/hummingbot",
+            "path_head": "/opt/conda/envs/hummingbot/bin",
+        }
+
+        signal_program = "import time; time.sleep(300)"
+        signal_command = shell_command.removesuffix(runtime_tail) + f"exec python -c {shlex.quote(signal_program)}"
+        container = subprocess.run(
+            ["docker", "run", "--detach", image.image_id, "/bin/bash", "-lc", signal_command],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        try:
+            deadline = time.monotonic() + 5
+            processes = []
+            while time.monotonic() < deadline:
+                process_table = subprocess.run(
+                    ["docker", "top", container, "-eo", "pid,ppid,comm,args"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+                processes = [line.split(maxsplit=3) for line in process_table[1:]]
+                if any(process[2].startswith("python") for process in processes):
+                    break
+                time.sleep(0.1)
+            tini = next(process for process in processes if process[2] == "tini")
+            python = next(process for process in processes if process[2].startswith("python"))
+            assert python[1] == tini[0]
+
+            subprocess.run(["docker", "stop", "--time", "3", container], check=True, capture_output=True, text=True)
+            state = subprocess.run(
+                ["docker", "inspect", container, "--format", "{{json .State}}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            state_document = json.loads(state.stdout)
+            assert state_document["Status"] == "exited"
+            assert state_document["ExitCode"] == 143
+            assert state_document["OOMKilled"] is False
+        finally:
+            subprocess.run(["docker", "rm", "--force", container], check=False, capture_output=True, text=True)
 
 
 def test_workflow_pr_verification_is_non_pushing_and_binds_pr_head_sha():

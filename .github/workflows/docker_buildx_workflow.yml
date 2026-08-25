@@ -30,6 +30,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
+      - name: Derive exact source metadata
+        id: source_metadata
+        shell: bash
+        run: echo "build_date=$(git show -s --format=%cI HEAD)" >> "${GITHUB_OUTPUT}"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
@@ -47,7 +52,7 @@ jobs:
             SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
             COMMIT=${{ github.event.pull_request.head.sha }}
             BRANCH=${{ github.head_ref }}
-            BUILD_DATE=${{ github.event.pull_request.updated_at }}
+            BUILD_DATE=${{ steps.source_metadata.outputs.build_date }}
 
   validate_release:
     if: github.event_name == 'workflow_dispatch'
@@ -89,11 +94,18 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: hummingbot-image-release
+    outputs:
+      image_digest: ${{ steps.image.outputs.digest }}
     steps:
       - name: Checkout exact confirmed source commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.validate_release.outputs.source_commit }}
+
+      - name: Derive exact source metadata
+        id: source_metadata
+        shell: bash
+        run: echo "build_date=$(git show -s --format=%cI HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
@@ -108,15 +120,23 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and publish immutable source-bound image
+        id: image
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: hummingbot/hummingbot:sha-${{ needs.validate_release.outputs.source_commit }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           build-args: |
             SOURCE_COMMIT=${{ needs.validate_release.outputs.source_commit }}
             COMMIT=${{ needs.validate_release.outputs.source_commit }}
             BRANCH=manual-release
-            BUILD_DATE=${{ github.event.repository.updated_at }}
+            BUILD_DATE=${{ steps.source_metadata.outputs.build_date }}
+
+      - name: Record canonical image digest
+        id: record_digest
+        shell: bash
+        run: |
+          test -n "${{ steps.image.outputs.digest }}"
+          echo "Published canonical digest: ${{ steps.image.outputs.digest }}" >> "${GITHUB_STEP_SUMMARY}"

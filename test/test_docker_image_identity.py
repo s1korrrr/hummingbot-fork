@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -39,16 +40,23 @@ def _release_validation_script() -> str:
     return workflow["jobs"]["validate_release"]["steps"][0]["run"]
 
 
+def _workflow_step(job_name: str, step_id: str) -> dict:
+    steps = _workflow_document()["jobs"][job_name]["steps"]
+    return next(step for step in steps if step.get("id") == step_id)
+
+
 def _make_context(tmp_path: Path, name: str) -> Path:
     repo = tmp_path / name
     repo.mkdir()
     (repo / "Makefile").write_text((ROOT / "Makefile").read_text())
+    (repo / "Dockerfile").write_text("FROM scratch\n")
+    (repo / ".gitignore").write_text("*.so\n")
     (repo / "tracked.txt").write_text("clean\n")
     for command in (
         ["git", "init", "--quiet"],
         ["git", "config", "user.name", "Image identity test"],
         ["git", "config", "user.email", "image-identity-test@example.invalid"],
-        ["git", "add", "Makefile", "tracked.txt"],
+        ["git", "add", "Makefile", "Dockerfile", ".gitignore", "tracked.txt"],
         ["git", "commit", "--quiet", "-m", "initial context"],
     ):
         subprocess.run(command, cwd=repo, check=True)
@@ -206,7 +214,6 @@ def test_workflow_release_publication_is_manual_confirmed_and_uses_immutable_sou
     assert "ref: ${{ needs.validate_release.outputs.source_commit }}" in workflow
     assert "SOURCE_COMMIT=${{ needs.validate_release.outputs.source_commit }}" in workflow
     assert "COMMIT=${{ needs.validate_release.outputs.source_commit }}" in workflow
-    assert "tags: hummingbot/hummingbot:sha-${{ needs.validate_release.outputs.source_commit }}" in workflow
 
 
 def test_workflow_publish_job_requires_protected_release_environment():
@@ -214,6 +221,46 @@ def test_workflow_publish_job_requires_protected_release_environment():
 
     publish_job = document["jobs"]["publish_release"]
     assert publish_job["environment"]["name"] == "hummingbot-image-release"
+
+
+def test_workflow_uses_checked_out_commit_timestamps_not_event_timestamps(tmp_path: Path):
+    workflow = _workflow()
+    assert "github.event.pull_request.updated_at" not in workflow
+    assert "github.event.repository.updated_at" not in workflow
+
+    metadata_script = _workflow_step("verify_pr", "source_metadata")["run"]
+    repo = _make_context(tmp_path, "timestamp")
+    expected = subprocess.run(
+        ["git", "show", "-s", "--format=%cI", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    first_output = tmp_path / "first-output"
+    second_output = tmp_path / "second-output"
+
+    for output in (first_output, second_output):
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", metadata_script],
+            cwd=repo,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GITHUB_OUTPUT": str(output)},
+        )
+        assert result.returncode == 0, result.stderr
+
+    assert first_output.read_text().strip() == f"build_date={expected}"
+    assert second_output.read_text() == first_output.read_text()
+
+
+def test_workflow_publish_is_digest_only_without_a_semantic_tag():
+    publish_job = _workflow_document()["jobs"]["publish_release"]
+    image_step = _workflow_step("publish_release", "image")
+
+    assert "tags" not in image_step["with"]
+    assert image_step["with"]["push"] == "true"
+    assert "push-by-digest=true" in image_step["with"]["outputs"]
+    assert "name-canonical=true" in image_step["with"]["outputs"]
+    assert publish_job["outputs"]["image_digest"] == "${{ steps.image.outputs.digest }}"
+    assert "steps.image.outputs.digest" in _workflow_step("publish_release", "record_digest")["run"]
 
 
 def test_workflow_validation_rejects_the_old_unhardened_6a8_source_commit(tmp_path: Path):
@@ -317,6 +364,43 @@ def test_make_context_gate_accepts_clean_git_state(tmp_path: Path):
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_make_build_streams_a_canonical_git_archive_without_ignored_artifacts(tmp_path: Path):
+    repo = _make_context(tmp_path, "archive")
+    (repo / "ignored-native.so").write_bytes(b"ignored native artifact")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    context = tmp_path / "docker-context.tar"
+    arguments = tmp_path / "docker-arguments.txt"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > \"$FAKE_DOCKER_ARGUMENTS\"\n"
+        "cat > \"$FAKE_DOCKER_CONTEXT\"\n"
+    )
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["make", "build"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_DOCKER_CONTEXT": str(context),
+            "FAKE_DOCKER_ARGUMENTS": str(arguments),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    with tarfile.open(context) as archive:
+        names = archive.getnames()
+    assert "Dockerfile" in names
+    assert "ignored-native.so" not in names
+    assert arguments.read_text().splitlines()[-1] == "-"
 
 
 def test_workflow_actions_are_pinned_to_immutable_commits():

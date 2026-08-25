@@ -39,11 +39,11 @@ verify-image-context:
 	fi
 
 build: verify-image-context
-	docker build -t hummingbot/hummingbot${TAG} -f Dockerfile \
+	git archive --format=tar HEAD | docker build -t hummingbot/hummingbot${TAG} -f Dockerfile \
 		--build-arg SOURCE_COMMIT=$(SOURCE_COMMIT) \
 		--build-arg COMMIT=$(SOURCE_COMMIT) \
 		--build-arg BRANCH=$(SOURCE_BRANCH) \
-		--build-arg BUILD_DATE=$(BUILD_DATE) .
+		--build-arg BUILD_DATE=$(BUILD_DATE) -
 
 
 uninstall:

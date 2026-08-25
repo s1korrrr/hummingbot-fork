@@ -16,6 +16,11 @@ try:
         CONDA_FORGE_PATH,
         EIP712_DIRECT_REQUIREMENTS,
         INJECTIVE_DIRECT_REQUIREMENTS,
+        PYPI_INDEX,
+        ORIGIN_POLICY,
+        _validate_pip_lock,
+        _conda_package_versions,
+        _explicit_entries,
         PYTHON_VERSION,
         RUNTIME_SUBSTITUTION,
         SHA256_RE,
@@ -29,6 +34,11 @@ except ModuleNotFoundError:  # Direct execution adds scripts/ rather than the re
         CONDA_FORGE_PATH,
         EIP712_DIRECT_REQUIREMENTS,
         INJECTIVE_DIRECT_REQUIREMENTS,
+        PYPI_INDEX,
+        ORIGIN_POLICY,
+        _validate_pip_lock,
+        _conda_package_versions,
+        _explicit_entries,
         PYTHON_VERSION,
         RUNTIME_SUBSTITUTION,
         SHA256_RE,
@@ -88,6 +98,19 @@ def conda_specs_from_environment(environment: Path) -> list[str]:
     return package_specs
 
 
+def _solver_record_identity(record: dict[str, object]) -> tuple[object, ...]:
+    try:
+        name = record["name"]
+        version = record["version"]
+    except KeyError as error:
+        raise LockValidationError(f"solver record missing identity field {error.args[0]}") from error
+    if not isinstance(name, str) or not isinstance(version, str):
+        raise LockValidationError("solver record identity name and version must be strings")
+    build = record.get("build", record.get("build_string"))
+    subdir = record.get("subdir", record.get("platform"))
+    return name, version, build, record.get("build_number"), subdir
+
+
 def _solve_target(conda: str, environment: Path, temp_root: Path, target: str) -> list[dict[str, object]]:
     prefix = temp_root / f"hummingbot-{target}"
     environment_variables = os.environ.copy()
@@ -126,11 +149,12 @@ def _solve_target(conda: str, environment: Path, temp_root: Path, target: str) -
         raise LockValidationError(f"{target}: Conda dry-run did not return complete FETCH records") from error
     if not isinstance(fetch_records, list) or not isinstance(link_records, list) or not link_records:
         raise LockValidationError(f"{target}: Conda dry-run returned no package records")
-    fetch = {(record["name"], record["version"]): record for record in fetch_records}
-    linked = {(record["name"], record["version"]): record for record in link_records}
-    if set(fetch) != set(linked) or len(linked) != len(link_records):
+    fetch = {_solver_record_identity(record): record for record in fetch_records}
+    linked_identities = [_solver_record_identity(record) for record in link_records]
+    linked = set(linked_identities)
+    if len(fetch) != len(fetch_records) or len(linked) != len(link_records) or set(fetch) != linked:
         raise LockValidationError(f"{target}: isolated package cache did not produce a complete link plan")
-    return [linked[identity] for identity in sorted(linked)]
+    return [fetch[identity] for identity in linked_identities]
 
 
 def _pip_lock_from_downloads(python: str, temp_root: Path) -> str:
@@ -138,7 +162,7 @@ def _pip_lock_from_downloads(python: str, temp_root: Path) -> str:
     download_dir.mkdir()
     requirements = [f"{name}=={version}" for name, version in EIP712_DIRECT_REQUIREMENTS.items()]
     result = subprocess.run(
-        [python, "-m", "pip", "download", "--no-deps", "--dest", str(download_dir), *requirements],
+        [python, "-m", "pip", "download", "--isolated", "--index-url", PYPI_INDEX, "--no-deps", "--dest", str(download_dir), *requirements],
         check=False,
         capture_output=True,
         text=True,
@@ -159,13 +183,19 @@ def _pip_lock_from_downloads(python: str, temp_root: Path) -> str:
     return "\n".join(rendered) + "\n"
 
 
-def _injective_lock_from_uv(uv: str, temp_root: Path, target: str) -> str:
+def _resolver_environment(temp_root: Path) -> dict[str, str]:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith(("UV_", "PIP_"))}
+    environment["UV_CACHE_DIR"] = str(temp_root / "uv-cache")
+    return environment
+
+
+def _injective_lock_from_uv(uv: str, temp_root: Path, target: str, constraints: Path) -> str:
     input_path = temp_root / f"injective-{target}.in"
     output_path = temp_root / f"injective-{target}.lock"
     input_path.write_text("".join(f"{name}=={version}\n" for name, version in INJECTIVE_DIRECT_REQUIREMENTS.items()))
     result = subprocess.run(
-        [uv, "pip", "compile", str(input_path), "--python-version", "3.13", "--python-platform", PIP_TARGETS[target], "--generate-hashes", "--no-annotate", "--no-header", "--output-file", str(output_path)],
-        check=False, capture_output=True, text=True, env={**os.environ, "UV_CACHE_DIR": str(temp_root / "uv-cache")},
+        [uv, "pip", "compile", str(input_path), "--constraint", str(constraints), "--python-version", "3.13", "--python-platform", PIP_TARGETS[target], "--generate-hashes", "--no-annotate", "--no-header", "--no-config", "--default-index", PYPI_INDEX, "--output-file", str(output_path)],
+        check=False, capture_output=True, text=True, env=_resolver_environment(temp_root),
     )
     if result.returncode != 0:
         raise LockValidationError(f"{target}: uv closure generation failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -181,10 +211,18 @@ def _validate_uv_version(uv: str) -> None:
 
 def _provenance(lock_dir: Path, environment: Path, pip_packages: Path) -> str:
     artifact_names = [f"{target}.explicit.txt" for target in TARGETS] + [f"pip-injective-{target}.lock.txt" for target in TARGETS] + ["pip-eip712-direct.lock.txt"]
+    closures = {target: _validate_pip_lock(lock_dir / f"pip-injective-{target}.lock.txt", INJECTIVE_DIRECT_REQUIREMENTS, closure=True) for target in TARGETS}
+    overlaps = {}
+    for target in TARGETS:
+        conda_versions = _conda_package_versions(_explicit_entries(lock_dir / f"{target}.explicit.txt", target))
+        overlaps[target] = {name: closures[target][name] for name in sorted(set(conda_versions) & set(closures[target]))}
     payload = {
         "artifacts": {name: hashlib.sha256((lock_dir / name).read_bytes()).hexdigest() for name in artifact_names},
         "format": 1,
         "injective_direct_requirements": INJECTIVE_DIRECT_REQUIREMENTS,
+        "origin_policy": ORIGIN_POLICY,
+        "pip_closures": closures,
+        "conda_pip_overlaps": overlaps,
         "pip_targets": PIP_TARGETS,
         "python_version": PYTHON_VERSION,
         "runtime_substitution": RUNTIME_SUBSTITUTION,
@@ -210,7 +248,10 @@ def generate_locks(lock_dir: Path, environment: Path, pip_packages: Path, conda:
         for target in TARGETS:
             _write_explicit_lock(staged_locks / f"{target}.explicit.txt", _solve_target(conda, environment, temporary_root, target), target)
         for target in TARGETS:
-            (staged_locks / f"pip-injective-{target}.lock.txt").write_text(_injective_lock_from_uv(uv, temporary_root, target))
+            conda_versions = _conda_package_versions(_explicit_entries(staged_locks / f"{target}.explicit.txt", target))
+            constraints = temporary_root / f"{target}.constraints.txt"
+            constraints.write_text("".join(f"{name}=={version}\n" for name, version in sorted(conda_versions.items()) if name[0].isalnum()))
+            (staged_locks / f"pip-injective-{target}.lock.txt").write_text(_injective_lock_from_uv(uv, temporary_root, target, constraints))
         (staged_locks / "pip-eip712-direct.lock.txt").write_text(_pip_lock_from_downloads(python, temporary_root))
         (staged_locks / "provenance.json").write_text(_provenance(staged_locks, environment, pip_packages))
         validate_lock_directory(staged_locks, environment, pip_packages)

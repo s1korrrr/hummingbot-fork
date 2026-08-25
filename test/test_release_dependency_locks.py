@@ -49,6 +49,12 @@ def test_conda_specs_from_environment_excludes_channels_before_dependencies(tmp_
     assert conda_specs_from_environment(environment) == ["python==3.13.15"]
 
 
+def test_source_recipe_constrains_eth_utils_for_the_combined_lock():
+    assert "eth-utils>=5,<6" in conda_specs_from_environment(ENVIRONMENT)
+    assert "eth-typing>=5,<6" in conda_specs_from_environment(ENVIRONMENT)
+    assert "hexbytes>=1,<2" in conda_specs_from_environment(ENVIRONMENT)
+
+
 def test_source_recipe_direct_pip_requirements_are_exactly_pinned():
     lock_validator._validate_source_pins(ENVIRONMENT, PIP_PACKAGES)
 
@@ -104,18 +110,50 @@ def test_solve_target_rejects_cache_dependent_fetch_omissions(tmp_path: Path, mo
     assert observed_environment["CONDA_PKGS_DIRS"] == str(tmp_path / "conda-pkgs")
 
 
-def test_solve_target_returns_complete_link_plan_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_solve_target_projects_link_identity_to_fetch_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     environment = tmp_path / "environment.yml"
     environment.write_text("dependencies:\n  - python==3.13.15\n")
-    fetch_record = {"name": "python", "version": "3.13.15", "url": "https://fetch.example/python"}
-    link_record = {"name": "python", "version": "3.13.15", "url": "https://link.example/python"}
+    fetch_record = {
+        "name": "python",
+        "version": "3.13.15",
+        "build": "h123_0",
+        "build_number": 0,
+        "subdir": "linux-64",
+        "url": "https://fetch.example/python",
+        "sha256": "a" * 64,
+    }
+    link_record = {
+        "name": "python",
+        "version": "3.13.15",
+        "build_string": "h123_0",
+        "build_number": 0,
+        "platform": "linux-64",
+    }
     payload = {"actions": {"FETCH": [fetch_record], "LINK": [link_record]}}
     monkeypatch.setattr(
         "scripts.generate_release_dependency_locks.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""),
     )
 
-    assert _solve_target("conda", environment, tmp_path, "linux-64") == [link_record]
+    assert _solve_target("conda", environment, tmp_path, "linux-64") == [fetch_record]
+
+
+def test_solve_target_rejects_same_name_version_with_mismatched_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    environment = tmp_path / "environment.yml"
+    environment.write_text("dependencies:\n  - python==3.13.15\n")
+    payload = {
+        "actions": {
+            "FETCH": [{"name": "python", "version": "3.13.15", "build": "h123_0", "build_number": 0}],
+            "LINK": [{"name": "python", "version": "3.13.15", "build_string": "h456_0", "build_number": 0}],
+        }
+    }
+    monkeypatch.setattr(
+        "scripts.generate_release_dependency_locks.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""),
+    )
+
+    with pytest.raises(lock_validator.LockValidationError, match="complete link plan"):
+        _solve_target("conda", environment, tmp_path, "linux-64")
 
 
 def test_committed_locks_validate_offline_for_both_release_targets():

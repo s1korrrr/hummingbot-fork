@@ -21,6 +21,8 @@ PIP_TARGETS = {
     "linux-aarch64": "aarch64-manylinux_2_17",
 }
 UV_VERSION = "0.11.29"
+PYPI_INDEX = "https://pypi.org/simple"
+ORIGIN_POLICY = {"pip_isolated": True, "pypi_index": PYPI_INDEX, "uv_no_config": True}
 INJECTIVE_DIRECT_REQUIREMENTS = {"injective-py": "1.13.0", "safe-pysha3": "1.0.4"}
 EIP712_DIRECT_REQUIREMENTS = {"eip712-structs": "1.1.0"}
 RUNTIME_SUBSTITUTION = {"requirement": "pysha3>=1.0.2", "replacement": "safe-pysha3==1.0.4"}
@@ -104,6 +106,16 @@ def _explicit_package_names(entries: tuple[str, ...]) -> set[str]:
     return names
 
 
+def _conda_package_versions(entries: tuple[str, ...]) -> dict[str, str]:
+    versions = {}
+    for entry in entries:
+        match = re.fullmatch(r"(.+)-([0-9][^-]*)-[^-]+\.(?:conda|tar\.bz2)", Path(urlsplit(entry).path).name)
+        if match is None:
+            raise LockValidationError("cannot identify Conda package version")
+        versions[_canonical_package_name(match.group(1))] = match.group(2)
+    return versions
+
+
 def _validate_conda_source_coverage(environment_path: Path, target_entries: dict[str, tuple[str, ...]]) -> None:
     try:
         environment = _required_mapping(yaml.safe_load(environment_path.read_text()), str(environment_path))
@@ -178,6 +190,7 @@ def _validate_pip_lock(path: Path, expected_requirements: dict[str, str], *, clo
     for name, expected_version in expected_requirements.items():
         if found[name][0] != expected_version:
             raise LockValidationError(f"{path}: pinned requirement {name} must be {expected_version}")
+    return {_canonical_package_name(name): version for name, (version, _) in found.items()}
 
 
 def _validate_artifact_fingerprints(provenance: dict[str, object], lock_dir: Path) -> None:
@@ -232,8 +245,22 @@ def validate_lock_directory(lock_dir: Path, environment_path: Path, pip_packages
         python_entry = next(entry for entry in entries if "/python-" in entry)
         python_versions[target] = re.search(r"/python-([0-9][^-]*)-", python_entry).group(1)
     _validate_conda_source_coverage(environment_path, target_entries)
+    closure_maps = {}
+    overlap_maps = {}
     for target in TARGETS:
-        _validate_pip_lock(lock_dir / f"pip-injective-{target}.lock.txt", INJECTIVE_DIRECT_REQUIREMENTS, closure=True)
+        closure = _validate_pip_lock(lock_dir / f"pip-injective-{target}.lock.txt", INJECTIVE_DIRECT_REQUIREMENTS, closure=True)
+        closure_maps[target] = closure
+        conda_versions = _conda_package_versions(target_entries[target])
+        conflicts = {name: (conda_versions[name], closure[name]) for name in set(conda_versions) & set(closure) if conda_versions[name] != closure[name]}
+        if conflicts:
+            raise LockValidationError(f"{target}: incompatible Conda/pip overlap")
+        overlap_maps[target] = {name: closure[name] for name in sorted(set(conda_versions) & set(closure))}
+    if provenance.get("origin_policy") != ORIGIN_POLICY:
+        raise LockValidationError("resolver origin policy mismatch")
+    if provenance.get("pip_closures") != closure_maps:
+        raise LockValidationError("pip closure manifest mismatch")
+    if provenance.get("conda_pip_overlaps") != overlap_maps:
+        raise LockValidationError("Conda/pip overlap manifest mismatch")
     _validate_pip_lock(lock_dir / "pip-eip712-direct.lock.txt", EIP712_DIRECT_REQUIREMENTS)
     _validate_artifact_fingerprints(provenance, lock_dir)
     return ValidationResult(targets=TARGETS, python_versions=python_versions)

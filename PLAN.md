@@ -325,6 +325,19 @@
   expected signable Keccak, and an optimized subprocess with a deliberately
   wrong expected empty-input digest. The broad image-identity suite passed
   `94 passed` in 188.05 seconds.
+- Fresh independent correction re-review accepted the complete Task 2 range
+  `068d0f1fa8727e8c9b351cee92f6686b9f1ee611..558b8810df7b12a68320153d77c41629313fa5e5`
+  as `READY_WITH_RISK` with high confidence and no remaining blocker finding.
+- Task 3 reran the exact final implementation tree locally: image-identity
+  `94 passed` in 57.12 seconds, lock tests `37 passed`, license tests `17
+  passed`, both-target offline validation, helper execution under normal and
+  optimized Python, actionlint, all changed-file hooks, and diff hygiene.
+- The non-force remote guard found H28 still at expected prior head
+  `8f507cef03e1dba21316cfc765f6c67f5d763938`; the reviewed implementation was
+  pushed and read back at
+  `558b8810df7b12a68320153d77c41629313fa5e5` on draft PR #28. The PR remains
+  draft; no merge, ready-state change, image publication, or deployment was
+  performed.
 - No registry, final application image, deployment, service, credential,
   publication, legal, or trading state was changed. Publication remains
   `HOLD_FOR_EVIDENCE` and final-image evidence remains a later gate.

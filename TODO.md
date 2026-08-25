@@ -41,6 +41,7 @@
   digests; lock validation precedes inherited apt installation; both targets
   rebuild and are inspected/cleaned; focused validation passes and the
   correction is committed without a push or target-image readiness overclaim.
-- [ ] Task 3: audit, close out, and push.
+- [x] Task 3: audit, close out, and push.
   DoD: all relevant local checks and reviews are recorded, durable memory is
-  updated, and only reviewed commits are non-force pushed.
+  updated, and the reviewed implementation was non-force pushed with exact
+  remote SHA readback. This closeout receipt is documentation-only.

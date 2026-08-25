@@ -45,6 +45,9 @@ HUMMINGBOT_OCI_LABELS = {
     "org.opencontainers.image.source": "https://github.com/hummingbot/hummingbot",
     "org.opencontainers.image.licenses": "Apache-2.0",
 }
+IMMUTABLE_REGISTRY_IMAGE = f"hummingbot/hummingbot@sha256:{'a' * 64}"
+IMMUTABLE_LOCAL_IMAGE_ID = f"sha256:{'b' * 64}"
+SHUTDOWN_PARSE_IMAGE_ID = f"sha256:{'0' * 64}"
 
 
 def _dockerfile() -> str:
@@ -1122,6 +1125,307 @@ def test_make_build_command_binds_one_exact_head_sha_to_both_metadata_arguments(
 def test_make_build_requires_a_clean_context_before_labeling_head():
     makefile = (ROOT / "Makefile").read_text()
     assert "build: verify-image-context" in makefile
+
+
+def test_compose_requires_an_image_and_preserves_make_validated_identity():
+    missing_environment = {key: value for key, value in os.environ.items() if key != "HUMMINGBOT_IMAGE"}
+    missing = subprocess.run(
+        ["docker", "compose", "-f", str(ROOT / "docker-compose.yml"), "config"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=missing_environment,
+    )
+    assert missing.returncode != 0
+    assert "HUMMINGBOT_IMAGE" in missing.stderr
+
+    for immutable_image in (IMMUTABLE_REGISTRY_IMAGE, IMMUTABLE_LOCAL_IMAGE_ID):
+        configured = subprocess.run(
+            ["docker", "compose", "-f", str(ROOT / "docker-compose.yml"), "config"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**missing_environment, "HUMMINGBOT_IMAGE": immutable_image},
+        )
+        assert configured.returncode == 0, configured.stderr
+        document = yaml.safe_load(configured.stdout)
+        assert document["services"]["hummingbot"]["image"] == immutable_image
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        None,
+        "",
+        "hummingbot/hummingbot:latest",
+        "hummingbot/hummingbot:development",
+        "hummingbot/hummingbot@sha256:not-a-digest",
+        f"sha256:{'a' * 63}",
+        "sha256:$(touch should-not-run)",
+        f"hummingbot/hummingbot:latest\n{IMMUTABLE_LOCAL_IMAGE_ID}",
+        f"/@sha256:{'a' * 64}",
+        f"localhost:5000/hummingbot/hummingbot@sha256:{'a' * 64}",
+    ],
+)
+def test_make_deploy_rejects_non_immutable_image_before_compose(tmp_path: Path, image: str | None):
+    repo = _make_context(tmp_path, "deploy-reject")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "docker-invoked"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\ntouch \"$FAKE_DOCKER_MARKER\"\nexit 0\n")
+    fake_docker.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_DOCKER_MARKER": str(marker),
+    }
+    environment.pop("HUMMINGBOT_IMAGE", None)
+    if image is not None:
+        environment["HUMMINGBOT_IMAGE"] = image
+
+    result = subprocess.run(
+        ["make", "deploy"], cwd=repo, check=False, capture_output=True, text=True, env=environment
+    )
+
+    assert result.returncode != 0
+    assert "immutable registry digest or local image ID" in result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("image", [IMMUTABLE_REGISTRY_IMAGE, IMMUTABLE_LOCAL_IMAGE_ID])
+def test_make_deploy_passes_only_validated_immutable_image_to_compose(tmp_path: Path, image: str):
+    repo = _make_context(tmp_path, "deploy-accept")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocation = tmp_path / "docker-invocation"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$HUMMINGBOT_IMAGE\" > \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+    )
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["make", "deploy"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_DOCKER_INVOCATION": str(invocation),
+            "HUMMINGBOT_IMAGE": image,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocation.read_text().splitlines() == [
+        image,
+        "compose --project-name hummingbot -f ./docker-compose.yml up -d",
+    ]
+
+
+@pytest.mark.parametrize(
+    "compose_environment",
+    [
+        'HUMMINGBOT_IMAGE=sha256:$(touch "$SHELL_MARKER"; printf "%064d" 0)\n',
+        'COMPOSE_FILE=$(touch "$SHELL_MARKER"; printf "alternate.yml")\n',
+        'COMPOSE_PROFILES=gateway\nCOMPOSE_FILE=$(touch "$SHELL_MARKER"; printf "alternate.yml")\n',
+        "COMPOSE_PROFILES=gateway\nCOMPOSE_FILE=alternate.yml",
+        "COMPOSE_PROFILES=gate\x00way\n",
+    ],
+)
+def test_make_deploy_treats_compose_environment_as_allowlisted_data(
+    tmp_path: Path, compose_environment: str
+):
+    repo = _make_context(tmp_path, "deploy-compose-environment")
+    shell_marker = tmp_path / "shell-executed"
+    (repo / ".compose.env").write_text(compose_environment)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "docker-invoked"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\ntouch \"$FAKE_DOCKER_MARKER\"\nexit 0\n")
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["make", "deploy"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_DOCKER_MARKER": str(marker),
+            "SHELL_MARKER": str(shell_marker),
+            "HUMMINGBOT_IMAGE": IMMUTABLE_REGISTRY_IMAGE,
+        },
+    )
+
+    assert result.returncode != 0
+    assert ".compose.env must contain exactly one COMPOSE_PROFILES entry" in result.stderr
+    assert not shell_marker.exists()
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("compose_profiles", "expected_arguments"),
+    [
+        ("", "compose --project-name hummingbot -f ./docker-compose.yml up -d"),
+        (
+            "gateway",
+            "compose --project-name hummingbot -f ./docker-compose.yml --profile gateway up -d",
+        ),
+    ],
+)
+def test_make_deploy_passes_allowlisted_compose_environment_as_data(
+    tmp_path: Path, compose_profiles: str, expected_arguments: str
+):
+    repo = _make_context(tmp_path, "deploy-compose-environment-accepted")
+    (repo / ".compose.env").write_text(f"COMPOSE_PROFILES={compose_profiles}\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocation = tmp_path / "docker-invocation"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$FAKE_DOCKER_INVOCATION\"\n")
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["make", "deploy"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_DOCKER_INVOCATION": str(invocation),
+            "HUMMINGBOT_IMAGE": IMMUTABLE_REGISTRY_IMAGE,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocation.read_text().strip() == expected_arguments
+
+
+def test_make_deploy_ignores_ambient_compose_routing_controls(tmp_path: Path):
+    repo = _make_context(tmp_path, "deploy-ambient-compose-controls")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocation = tmp_path / "docker-invocation"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "printf 'COMPOSE_FILE=%s\\n' \"${COMPOSE_FILE-unset}\" > \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf 'COMPOSE_PROFILES=%s\\n' \"${COMPOSE_PROFILES-unset}\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf 'COMPOSE_ENV_FILES=%s\\n' \"${COMPOSE_ENV_FILES-unset}\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf 'COMPOSE_DISABLE_ENV_FILE=%s\\n' \"${COMPOSE_DISABLE_ENV_FILE-unset}\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf 'COMPOSE_PROJECT_NAME=%s\\n' \"${COMPOSE_PROJECT_NAME-unset}\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+    )
+    fake_docker.chmod(0o755)
+
+    result = subprocess.run(
+        ["make", "deploy"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_DOCKER_INVOCATION": str(invocation),
+            "HUMMINGBOT_IMAGE": IMMUTABLE_REGISTRY_IMAGE,
+            "COMPOSE_FILE": "alternate.yml",
+            "COMPOSE_PROFILES": "unapproved",
+            "COMPOSE_ENV_FILES": "alternate.env",
+            "COMPOSE_DISABLE_ENV_FILE": "0",
+            "COMPOSE_PROJECT_NAME": "alternate",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocation.read_text().splitlines() == [
+        "COMPOSE_FILE=unset",
+        "COMPOSE_PROFILES=unset",
+        "COMPOSE_ENV_FILES=unset",
+        "COMPOSE_DISABLE_ENV_FILE=1",
+        "COMPOSE_PROJECT_NAME=unset",
+        "compose --project-name hummingbot -f ./docker-compose.yml up -d",
+    ]
+
+
+def test_compose_disable_env_file_prevents_untracked_gateway_profile(tmp_path: Path):
+    shutil.copy(ROOT / "docker-compose.yml", tmp_path / "docker-compose.yml")
+    (tmp_path / ".env").write_text("COMPOSE_PROFILES=gateway\n")
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"COMPOSE_FILE", "COMPOSE_PROFILES", "COMPOSE_ENV_FILES"}
+    }
+    environment.update(
+        {
+            "COMPOSE_DISABLE_ENV_FILE": "1",
+            "HUMMINGBOT_IMAGE": IMMUTABLE_REGISTRY_IMAGE,
+        }
+    )
+
+    result = subprocess.run(
+        ["docker", "compose", "-f", "./docker-compose.yml", "config", "--services"],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["hummingbot"]
+
+
+def test_make_down_does_not_require_a_runtime_image_identity(tmp_path: Path):
+    repo = _make_context(tmp_path, "down-without-runtime-image")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    invocation = tmp_path / "docker-invocation"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$HUMMINGBOT_IMAGE\" > \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf 'COMPOSE_ENV_FILES=%s\\n' \"${COMPOSE_ENV_FILES-unset}\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf 'COMPOSE_DISABLE_ENV_FILE=%s\\n' \"${COMPOSE_DISABLE_ENV_FILE-unset}\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf 'COMPOSE_PROJECT_NAME=%s\\n' \"${COMPOSE_PROJECT_NAME-unset}\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+        "printf '%s\\n' \"$*\" >> \"$FAKE_DOCKER_INVOCATION\"\n"
+    )
+    fake_docker.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_DOCKER_INVOCATION": str(invocation),
+        "COMPOSE_FILE": "alternate.yml",
+        "COMPOSE_PROFILES": "unapproved",
+        "COMPOSE_ENV_FILES": "alternate.env",
+        "COMPOSE_DISABLE_ENV_FILE": "0",
+        "COMPOSE_PROJECT_NAME": "alternate",
+    }
+    environment.pop("HUMMINGBOT_IMAGE", None)
+
+    result = subprocess.run(
+        ["make", "down"], cwd=repo, check=False, capture_output=True, text=True, env=environment
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert invocation.read_text().splitlines() == [
+        SHUTDOWN_PARSE_IMAGE_ID,
+        "COMPOSE_ENV_FILES=unset",
+        "COMPOSE_DISABLE_ENV_FILE=1",
+        "COMPOSE_PROJECT_NAME=unset",
+        "compose --project-name hummingbot -f ./docker-compose.yml --profile gateway down",
+    ]
 
 
 @pytest.mark.parametrize("state", ["staged", "unstaged", "untracked"])

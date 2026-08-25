@@ -1,5 +1,5 @@
 .ONESHELL:
-.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build verify-image-context install setup deploy down
+.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build verify-image-context install setup verify-deploy-image deploy down
 
 DYDX ?= 0
 ENV_FILE := setup/environment.yml
@@ -94,9 +94,33 @@ setup:
 		echo "Gateway will NOT be included."; \
 	fi
 
+verify-deploy-image:
+	@image="$$HUMMINGBOT_IMAGE"; \
+	line_count="$$(printf '%sX\n' "$$image" | wc -l | tr -d '[:space:]')"; \
+	if [ "$$line_count" != 1 ] || ! printf '%s\n' "$$image" | grep -Eq '^(sha256:[0-9a-f]{64}|hummingbot/hummingbot@sha256:[0-9a-f]{64})$$'; then \
+		echo "HUMMINGBOT_IMAGE must be an immutable registry digest or local image ID (published repository: hummingbot/hummingbot)." >&2; \
+		exit 1; \
+	fi
+
 deploy:
-	@set -a; . ./.compose.env 2>/dev/null || true; set +a; \
-	docker compose up -d
+	@set -e; compose_profile_args=""; \
+	if [ -f ./.compose.env ]; then \
+		if printf 'COMPOSE_PROFILES=\n' | cmp -s - ./.compose.env; then \
+			:; \
+		elif printf 'COMPOSE_PROFILES=gateway\n' | cmp -s - ./.compose.env; then \
+			compose_profile_args="--profile gateway"; \
+		else \
+			echo ".compose.env must contain exactly one COMPOSE_PROFILES entry (empty or gateway); HUMMINGBOT_IMAGE must be supplied through the process environment." >&2; \
+			exit 1; \
+		fi; \
+	fi; \
+	unset COMPOSE_FILE COMPOSE_PROFILES COMPOSE_ENV_FILES COMPOSE_PROJECT_NAME; \
+	export COMPOSE_DISABLE_ENV_FILE=1; \
+	$(MAKE) --no-print-directory verify-deploy-image; \
+	docker compose --project-name hummingbot -f ./docker-compose.yml $$compose_profile_args up -d
 
 down:
-	docker compose --profile gateway down
+	@unset COMPOSE_FILE COMPOSE_PROFILES COMPOSE_ENV_FILES COMPOSE_PROJECT_NAME; \
+	export COMPOSE_DISABLE_ENV_FILE=1; \
+	HUMMINGBOT_IMAGE="sha256:0000000000000000000000000000000000000000000000000000000000000000" \
+		docker compose --project-name hummingbot -f ./docker-compose.yml --profile gateway down

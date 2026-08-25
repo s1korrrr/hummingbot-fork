@@ -112,7 +112,10 @@ def _conda_package_versions(entries: tuple[str, ...]) -> dict[str, str]:
         match = re.fullmatch(r"(.+)-([0-9][^-]*)-[^-]+\.(?:conda|tar\.bz2)", Path(urlsplit(entry).path).name)
         if match is None:
             raise LockValidationError("cannot identify Conda package version")
-        versions[_canonical_package_name(match.group(1))] = match.group(2)
+        name, version = _canonical_package_name(match.group(1)), match.group(2)
+        if name in versions and versions[name] != version:
+            raise LockValidationError(f"divergent normalized Conda alias {name}")
+        versions[name] = version
     return versions
 
 

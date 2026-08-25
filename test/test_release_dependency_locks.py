@@ -94,6 +94,15 @@ def test_pip_lock_rejects_duplicate_pep503_aliases(tmp_path: Path):
         lock_validator._validate_pip_lock(lock, {"foo-bar": "1"})
 
 
+def test_conda_alias_versions_fail_closed_when_divergent():
+    entries = (
+        "https://conda.anaconda.org/conda-forge/noarch/foo_bar-1.0-0.conda#" + "a" * 64,
+        "https://conda.anaconda.org/conda-forge/noarch/foo-bar-2.0-0.conda#" + "b" * 64,
+    )
+    with pytest.raises(lock_validator.LockValidationError, match="divergent"):
+        lock_validator._conda_package_versions(entries)
+
+
 def test_solve_target_rejects_cache_dependent_fetch_omissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     environment = tmp_path / "environment.yml"
     environment.write_text("dependencies:\n  - python==3.13.15\n  - requests\n")

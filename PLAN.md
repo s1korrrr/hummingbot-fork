@@ -152,6 +152,13 @@
 
 ## Final notes
 
+### Authoritative current result
+
+- Task 1 source-lock evidence consists of two 367-entry Conda locks, two
+  59-package Injective closures, and 49 equal Conda/pip overlaps per target.
+- Resolver inputs are isolated and pinned to PyPI; exact Python 3.13.15 is
+  passed to UV. Runtime image proof remains Task 2 and publication is held.
+
 - Review correction in progress on 2026-08-25. The original generator used
   `actions.FETCH`, which can omit already cached packages; a new lock must be
   built from complete `actions.LINK` records with `CONDA_PKGS_DIRS` confined to

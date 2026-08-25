@@ -26,7 +26,8 @@ Publication remains `HOLD_FOR_EVIDENCE`; no Dockerfile, image, deployment, or pu
 
 Commits: `7aef9e139`, `743841513`, `815d86f6f`, `43da388cb`,
 `e2889d299`, `b2d4a60b7`, `4c4dca783`, `2e555bd61`, `f0a847c60`, and
-`ca031427b`; this closeout docs commit follows them.
+`ca031427b`, `69e5dc3da`, `12f020ade`, and `ef15e4819`; this closeout docs
+commit follows them.
 Artifacts are two explicit locks, two Injective closures,
 `pip-eip712-direct.lock.txt`, and provenance.
 

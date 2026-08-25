@@ -52,28 +52,99 @@ RUN apt-get update && \
     apt-get install -y sudo libusb-1.0 gcc g++ python3-dev git wget && \
     rm -rf /var/lib/apt/lists/*
 
-# Solve the canonical environment in its own inspectable stage. The explicit
-# package list is retained in the final prefix as dependency provenance, and
-# any defaults-channel package fails the build.
+# Create the canonical environment from independently validated, target-specific
+# explicit locks. This stage contains the dependency runtime reversal gate and
+# never solves the broad source recipes.
 FROM builder-bootstrap AS builder-environment
+
+ARG TARGETPLATFORM
 
 WORKDIR /home/hummingbot
 
-# Create conda environment
-COPY setup/environment.yml /tmp/environment.yml
-RUN install -d /opt/conda/image-evidence && \
-    PIP_REPORT=/opt/conda/image-evidence/hummingbot-environment-pip-install-report.json \
-        conda env create -f /tmp/environment.yml && \
-    conda list -n hummingbot --explicit > /opt/conda/conda-meta/hummingbot-package-urls.txt && \
+# Copy the canonical recipes, the complete lock/provenance inventory, and the
+# offline validator into one stage so source binding is checked before install.
+COPY setup/environment.yml /tmp/release-sources/setup/environment.yml
+COPY setup/pip_packages.txt /tmp/release-sources/setup/pip_packages.txt
+COPY setup/locks/ /tmp/release-locks/
+COPY scripts/validate_release_dependency_locks.py /tmp/validate_release_dependency_locks.py
+COPY scripts/verify_release_eip712_runtime.py /tmp/verify_release_eip712_runtime.py
+
+# Miniforge's base environment ships ruamel.yaml rather than PyYAML. Expose the
+# validator's two required PyYAML-compatible names without installing or
+# solving any bootstrap package.
+RUN install -d /tmp/validator-bootstrap && \
+    printf '%s\n' \
+        'from ruamel.yaml import YAML' \
+        'from ruamel.yaml.error import YAMLError' \
+        '' \
+        'def safe_load(stream):' \
+        '    return YAML(typ="safe").load(stream)' \
+        > /tmp/validator-bootstrap/yaml.py
+
+RUN set -eu; \
+    case "${TARGETPLATFORM}" in \
+        linux/amd64) \
+            CONDA_LOCK=/tmp/release-locks/linux-64.explicit.txt; \
+            INJECTIVE_PIP_LOCK=/tmp/release-locks/pip-injective-linux-64.lock.txt;; \
+        linux/arm64) \
+            CONDA_LOCK=/tmp/release-locks/linux-aarch64.explicit.txt; \
+            INJECTIVE_PIP_LOCK=/tmp/release-locks/pip-injective-linux-aarch64.lock.txt;; \
+        *) echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM:-<empty>}" >&2; exit 64;; \
+    esac; \
+    PYTHONPATH=/tmp/validator-bootstrap /opt/conda/bin/python \
+        -c 'import yaml; from conda.models.version import VersionSpec' && \
+    PYTHONPATH=/tmp/validator-bootstrap /opt/conda/bin/python \
+        /tmp/validate_release_dependency_locks.py \
+        --lock-dir /tmp/release-locks \
+        --environment /tmp/release-sources/setup/environment.yml \
+        --pip-packages /tmp/release-sources/setup/pip_packages.txt && \
+    install -d /opt/conda/image-evidence && \
     conda list --json > /opt/conda/image-evidence/base-final-conda-list.json && \
+    conda create --prefix /opt/conda/envs/hummingbot --file "${CONDA_LOCK}" --yes && \
+    /opt/conda/envs/hummingbot/bin/python -m pip install \
+        --isolated \
+        --no-cache-dir \
+        --no-build-isolation \
+        --require-hashes \
+        --no-deps \
+        --index-url https://pypi.org/simple \
+        --report /opt/conda/image-evidence/hummingbot-environment-pip-install-report.json \
+        -r "${INJECTIVE_PIP_LOCK}" && \
+    /opt/conda/envs/hummingbot/bin/python -m pip install \
+        --isolated \
+        --no-cache-dir \
+        --no-build-isolation \
+        --require-hashes \
+        --no-deps \
+        --index-url https://pypi.org/simple \
+        --report /opt/conda/image-evidence/hummingbot-pip-install-report.json \
+        -r /tmp/release-locks/pip-eip712-direct.lock.txt && \
+    /opt/conda/envs/hummingbot/bin/python /tmp/verify_release_eip712_runtime.py && \
+    conda list -n hummingbot --explicit > /opt/conda/conda-meta/hummingbot-package-urls.txt && \
+    conda list -n hummingbot --json \
+        > /opt/conda/image-evidence/hummingbot-final-conda-list.json && \
     if grep -Fq 'repo.anaconda.com' /opt/conda/conda-meta/hummingbot-package-urls.txt; then \
         echo "The hummingbot environment must not contain defaults-channel packages." >&2; \
         exit 1; \
     fi && \
-    conda run -n hummingbot python -c 'import platform; print(platform.python_version())' \
+    /opt/conda/envs/hummingbot/bin/python -c 'import platform; print(platform.python_version())' \
         > /opt/conda/conda-meta/hummingbot-python-version.txt && \
-    conda clean -afy && \
-    rm /tmp/environment.yml
+    install -m 0644 /tmp/release-sources/setup/environment.yml \
+        /opt/conda/image-evidence/hummingbot-environment-source.yml && \
+    install -m 0644 /tmp/release-sources/setup/pip_packages.txt \
+        /opt/conda/image-evidence/hummingbot-pip-source-requirements.txt && \
+    install -m 0644 "${CONDA_LOCK}" \
+        /opt/conda/image-evidence/hummingbot-selected-conda-lock.txt && \
+    install -m 0644 "${INJECTIVE_PIP_LOCK}" \
+        /opt/conda/image-evidence/hummingbot-environment-pip-requirements.txt && \
+    install -m 0644 /tmp/release-locks/pip-eip712-direct.lock.txt \
+        /opt/conda/image-evidence/hummingbot-pip-requirements.txt && \
+    install -m 0644 /tmp/release-locks/provenance.json \
+        /opt/conda/image-evidence/release-lock-provenance.json && \
+    printf 'target_platform=%s\nconda_lock=%s\ninjective_pip_lock=%s\n' \
+        "${TARGETPLATFORM}" "${CONDA_LOCK##*/}" "${INJECTIVE_PIP_LOCK##*/}" \
+        > /opt/conda/image-evidence/release-lock-target.txt && \
+    conda clean -afy
 
 # Build from the checked environment stage so all normal builds fail before
 # source compilation when identity or dependency provenance is invalid.
@@ -89,17 +160,6 @@ COPY setup.py .
 COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY licenses/miniforge-images-BSD-3-Clause.txt licenses/miniforge-images-BSD-3-Clause.txt
 COPY README.md .
-
-COPY setup/pip_packages.txt /tmp/pip_packages.txt
-RUN conda run -n hummingbot python -m pip install --no-deps \
-        --report /opt/conda/image-evidence/hummingbot-pip-install-report.json \
-        -r /tmp/pip_packages.txt && \
-    install -m 0644 /tmp/pip_packages.txt \
-        /opt/conda/image-evidence/hummingbot-pip-requirements.txt && \
-    conda list -n hummingbot --json \
-        > /opt/conda/image-evidence/hummingbot-final-conda-list.json && \
-    rm /tmp/pip_packages.txt
-
 
 RUN conda run -n hummingbot --no-capture-output python setup.py build_ext --inplace -j 8 && \
     rm -rf build/ && \

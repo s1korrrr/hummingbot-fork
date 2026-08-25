@@ -25,6 +25,7 @@ PINNED_MINIFORGE = "docker.io/condaforge/miniforge3:26.5.3-0@sha256:b230e51ddd0e
 ENVIRONMENT_FILES = (ROOT / "setup/environment.yml", ROOT / "setup/environment_dydx.yml")
 THIRD_PARTY_NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
 IMAGE_LICENSE_GATE_DOC = ROOT / "docs/release/image-license-gate.md"
+RELEASE_RUNTIME_DEPENDENCY_SMOKE = ROOT / "scripts/verify_release_eip712_runtime.py"
 PINNED_ACTIONS = {
     "actions/checkout": "11bd71901bbe5b1630ceea73d27597364c9af683",  # noqa: mock
     "docker/setup-qemu-action": "29109295f81e9208d7d86ff1c6c12d2833863392",  # noqa: mock
@@ -52,6 +53,17 @@ SHUTDOWN_PARSE_IMAGE_ID = f"sha256:{'0' * 64}"
 
 def _dockerfile() -> str:
     return DOCKERFILE.read_text()
+
+
+def _dockerfile_stage(name: str) -> str:
+    match = re.search(
+        rf"^FROM\s+[^\n]+\s+AS\s+{re.escape(name)}\s*$\n(.*?)(?=^FROM\s|\Z)",
+        _dockerfile(),
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, f"missing Dockerfile stage {name}"
+    stage = re.sub(r"\\\s*\n\s*", " ", match.group(1))
+    return re.sub(r"\s+", " ", stage).strip()
 
 
 def _workflow() -> str:
@@ -648,10 +660,129 @@ def test_dockerfile_copies_the_miniforge_prefix_into_the_release_image():
 def test_dockerfile_runs_pip_and_native_build_inside_the_hummingbot_environment():
     dockerfile = _dockerfile()
 
-    assert "conda run -n hummingbot python -m pip install" in dockerfile
+    assert "/opt/conda/envs/hummingbot/bin/python -m pip install" in dockerfile
     assert "conda run -n hummingbot --no-capture-output python setup.py build_ext" in dockerfile
     assert "RUN python3 -m pip install" not in dockerfile
     assert "RUN python3 setup.py build_ext" not in dockerfile
+
+
+def test_builder_environment_maps_each_supported_platform_to_its_exact_lock_pair_and_fails_closed():
+    stage = _dockerfile_stage("builder-environment")
+
+    assert 'case "${TARGETPLATFORM}" in' in stage
+    assert 'linux/amd64)' in stage
+    assert 'CONDA_LOCK=/tmp/release-locks/linux-64.explicit.txt' in stage
+    assert 'INJECTIVE_PIP_LOCK=/tmp/release-locks/pip-injective-linux-64.lock.txt' in stage
+    assert 'linux/arm64)' in stage
+    assert 'CONDA_LOCK=/tmp/release-locks/linux-aarch64.explicit.txt' in stage
+    assert 'INJECTIVE_PIP_LOCK=/tmp/release-locks/pip-injective-linux-aarch64.lock.txt' in stage
+    assert 'Unsupported TARGETPLATFORM: ${TARGETPLATFORM:-<empty>}' in stage
+    assert re.search(r"\*\)\s+.*exit\s+(?:1|64);;", stage, flags=re.DOTALL)
+
+
+def test_builder_environment_validates_canonical_sources_and_all_locks_before_exact_conda_create():
+    stage = _dockerfile_stage("builder-environment")
+
+    expected_copies = (
+        "COPY setup/environment.yml /tmp/release-sources/setup/environment.yml",
+        "COPY setup/pip_packages.txt /tmp/release-sources/setup/pip_packages.txt",
+        "COPY setup/locks/ /tmp/release-locks/",
+        "COPY scripts/validate_release_dependency_locks.py /tmp/validate_release_dependency_locks.py",
+    )
+    for instruction in expected_copies:
+        assert instruction in stage
+
+    bootstrap_setup = "from ruamel.yaml import YAML"
+    bootstrap_probe = (
+        "PYTHONPATH=/tmp/validator-bootstrap "
+        "/opt/conda/bin/python -c 'import yaml; from conda.models.version import VersionSpec'"
+    )
+    validator = (
+        "PYTHONPATH=/tmp/validator-bootstrap "
+        "/opt/conda/bin/python /tmp/validate_release_dependency_locks.py"
+    )
+    exact_create = 'conda create --prefix /opt/conda/envs/hummingbot --file "${CONDA_LOCK}" --yes'
+    assert bootstrap_setup in stage
+    assert "from ruamel.yaml.error import YAMLError" in stage
+    assert "def safe_load(stream):" in stage
+    assert bootstrap_probe in stage
+    assert validator in stage
+    assert "--lock-dir /tmp/release-locks" in stage
+    assert "--environment /tmp/release-sources/setup/environment.yml" in stage
+    assert "--pip-packages /tmp/release-sources/setup/pip_packages.txt" in stage
+    assert exact_create in stage
+    assert stage.index(bootstrap_setup) < stage.index(bootstrap_probe) < stage.index(validator) < stage.index(exact_create)
+    for forbidden in ("conda env create", "conda env update", "conda install", "conda update"):
+        assert forbidden not in stage
+
+
+def test_builder_environment_installs_both_pip_locks_with_fail_closed_flags_and_distinct_reports():
+    stage = _dockerfile_stage("builder-environment")
+
+    pip_commands = re.findall(
+        r"/opt/conda/envs/hummingbot/bin/python -m pip install .*?(?=\s+&&)",
+        stage,
+        flags=re.DOTALL,
+    )
+    assert len(pip_commands) == 2
+    for command in pip_commands:
+        for flag in (
+            "--isolated",
+            "--no-cache-dir",
+            "--no-build-isolation",
+            "--require-hashes",
+            "--no-deps",
+            "--index-url https://pypi.org/simple",
+        ):
+            assert flag in command
+    assert "--report /opt/conda/image-evidence/hummingbot-environment-pip-install-report.json" in pip_commands[0]
+    assert '-r "${INJECTIVE_PIP_LOCK}"' in pip_commands[0]
+    assert "--report /opt/conda/image-evidence/hummingbot-pip-install-report.json" in pip_commands[1]
+    assert "-r /tmp/release-locks/pip-eip712-direct.lock.txt" in pip_commands[1]
+    assert "pip check" not in stage
+
+
+def test_builder_environment_preserves_selected_lock_and_inventory_evidence():
+    stage = _dockerfile_stage("builder-environment")
+
+    for evidence_path in (
+        "/opt/conda/conda-meta/hummingbot-package-urls.txt",
+        "/opt/conda/conda-meta/hummingbot-python-version.txt",
+        "/opt/conda/image-evidence/base-final-conda-list.json",
+        "/opt/conda/image-evidence/hummingbot-final-conda-list.json",
+        "/opt/conda/image-evidence/hummingbot-environment-source.yml",
+        "/opt/conda/image-evidence/hummingbot-pip-source-requirements.txt",
+        "/opt/conda/image-evidence/hummingbot-selected-conda-lock.txt",
+        "/opt/conda/image-evidence/hummingbot-environment-pip-requirements.txt",
+        "/opt/conda/image-evidence/hummingbot-pip-requirements.txt",
+        "/opt/conda/image-evidence/release-lock-provenance.json",
+        "/opt/conda/image-evidence/release-lock-target.txt",
+    ):
+        assert evidence_path in stage
+
+
+def test_builder_environment_runs_a_deterministic_eip712_runtime_reversal_gate_after_install():
+    stage = _dockerfile_stage("builder-environment")
+
+    assert "COPY scripts/verify_release_eip712_runtime.py /tmp/verify_release_eip712_runtime.py" in stage
+    smoke_command = "/opt/conda/envs/hummingbot/bin/python /tmp/verify_release_eip712_runtime.py"
+    eip_report = "/opt/conda/image-evidence/hummingbot-pip-install-report.json"
+    assert smoke_command in stage
+    assert stage.index(eip_report) < stage.index(smoke_command)
+    assert RELEASE_RUNTIME_DEPENDENCY_SMOKE.is_file()
+    smoke = RELEASE_RUNTIME_DEPENDENCY_SMOKE.read_text()
+    assert "import sha3" in smoke
+    assert "from eip712_structs import EIP712Struct, String, make_domain" in smoke
+    assert "class HummingbotRuntimeProbe(EIP712Struct):" in smoke
+    assert "message = String()" in smoke
+    assert "name=\"Hummingbot\"" in smoke
+    assert "version=\"1\"" in smoke
+    assert "chainId=1" in smoke
+    assert 'verifyingContract="0x0000000000000000000000000000000000000001"' in smoke  # noqa: mock
+    assert "signable_bytes" in smoke
+    assert "len(signable) == 66" in smoke
+    assert 'signable[:2] == b"\\x19\\x01"' in smoke
+    assert "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470" in smoke  # noqa: mock
 
 
 def test_release_preserves_license_texts_and_generates_solved_package_inventory():
@@ -673,7 +804,7 @@ def test_release_preserves_license_texts_and_generates_solved_package_inventory(
     assert "scripts/generate_third_party_license_inventory.py" in dockerfile
     assert "--conda-prefix /opt/conda" in dockerfile
     assert "--conda-prefix /opt/conda/envs/hummingbot" in dockerfile
-    assert "PIP_REPORT=/opt/conda/image-evidence/hummingbot-environment-pip-install-report.json" in dockerfile
+    assert "--report /opt/conda/image-evidence/hummingbot-environment-pip-install-report.json" in dockerfile
     assert "--pip-report /opt/conda/image-evidence/hummingbot-environment-pip-install-report.json" in dockerfile
     assert "--pip-report /opt/conda/image-evidence/hummingbot-pip-install-report.json" in dockerfile
     assert "--conda-list /opt/conda/image-evidence/base-final-conda-list.json" in dockerfile

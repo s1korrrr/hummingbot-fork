@@ -661,6 +661,11 @@ def test_release_preserves_license_texts_and_generates_solved_package_inventory(
     assert "/usr/share/licenses/hummingbot/third-party-license-inventory.json" in notices
     assert "does not establish legal clearance" in notices
     assert "COPY LICENSE THIRD_PARTY_NOTICES.md ./" in dockerfile
+    assert (
+        "COPY licenses/miniforge-images-BSD-3-Clause.txt "
+        "licenses/miniforge-images-BSD-3-Clause.txt"
+    ) in dockerfile
+    assert "COPY licenses/ licenses/" not in dockerfile
     assert "--report /opt/conda/image-evidence/hummingbot-pip-install-report.json" in dockerfile
     assert "scripts/generate_third_party_license_inventory.py" in dockerfile
     assert "--conda-prefix /opt/conda" in dockerfile

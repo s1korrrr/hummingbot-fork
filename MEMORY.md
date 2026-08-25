@@ -40,11 +40,13 @@
   Both targets have 367 Conda entries and 49 version-equal Conda/pip overlaps.
   Generation strips ambient `UV_*`/`PIP_*`, uses UV `--no-config` and pip
   `--isolated`, and pins `https://pypi.org/simple`.
-- `builder-environment` maps `linux/amd64` to the `linux-64` Conda/Injective
-  locks and `linux/arm64` to the `linux-aarch64` locks; any other or empty
-  target fails closed. It validates all locks before exact `conda create
-  --prefix ... --file ... --yes`, then uses hash-required, no-deps,
-  no-build-isolation pip installs for the two distinct reports.
+- `lock-validation` inherits directly from `identity-check`, copies and checks
+  every canonical source/lock/provenance artifact, and rejects unsupported or
+  empty targets before its `builder-bootstrap` descendant runs apt.
+  `builder-environment` then maps `linux/amd64` to the `linux-64`
+  Conda/Injective locks and `linux/arm64` to the `linux-aarch64` locks before
+  exact `conda create --prefix ... --file ... --yes` and hash-required,
+  no-deps, no-build-isolation pip installs for the two distinct reports.
 - The builder keeps selection and installed-set evidence in
   `/opt/conda/image-evidence`, explicit package URLs and Python version in
   `/opt/conda/conda-meta`, and runs
@@ -52,6 +54,10 @@
   Generic `pip check` is intentionally non-green because upstream metadata
   still names `pysha3`; the deterministic EIP-712/Keccak smoke is the named
   `safe-pysha3` substitution gate.
+- Release smoke checks must use explicit failures rather than Python `assert`,
+  which disappears under `python -O`. The EIP-712 gate binds the complete
+  signable vector, its Keccak digest, and empty-input Keccak; validate the helper
+  in both normal and optimized modes.
 
 ## Known pitfalls
 

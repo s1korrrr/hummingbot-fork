@@ -35,6 +35,12 @@
   DoD: coherent Conventional Commits leave a clean tracked worktree and the
   final report names commits, red evidence, validations, residual risks, and
   review readiness without pushing.
+- [x] Task 2.8: make the runtime reversal gate optimization-safe and exact.
+  DoD: an execution-level regression fails the old assert-only helper under
+  `python -O`; explicit failures bind the complete signable vector and Keccak
+  digests; lock validation precedes inherited apt installation; both targets
+  rebuild and are inspected/cleaned; focused validation passes and the
+  correction is committed without a push or target-image readiness overclaim.
 - [ ] Task 3: audit, close out, and push.
   DoD: all relevant local checks and reviews are recorded, durable memory is
   updated, and only reviewed commits are non-force pushed.

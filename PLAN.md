@@ -66,6 +66,42 @@
 - No placeholder hashes, partial target locks, defaults-channel artifacts,
   hidden fallback solve, automatic lock refresh, or hosted-CI claim.
 
+## Task 2 review correction: optimized runtime gate
+
+- Finding: the initial smoke used Python `assert`, so `python -O` removed every
+  semantic check; it also checked only signable length/prefix rather than the
+  deterministic EIP-712 vector.
+- Finding: `builder-bootstrap` installed apt packages before its descendant
+  validated dependency locks, contradicting the documented fail-before-install
+  boundary and escaping tests scoped only to `builder-environment` text.
+- Options considered:
+  1. Keep assertions and rely on the Docker invocation omitting `-O`.
+     Rejected because ambient optimization must not silently disable a release
+     reversal gate.
+  2. Use explicit comparisons that raise `RuntimeError` and bind the complete
+     signable vector plus its Keccak digest. Chosen because failure behavior is
+     optimization-independent and the vector detects semantic encoding drift.
+  3. Add a `lock-validation` stage directly from `identity-check`, then make
+     `builder-bootstrap` inherit it. Chosen so unsupported targets and invalid
+     locks stop before apt or environment installation while validated
+     artifacts remain available to descendants.
+- TDD boundary: execute a temporary helper copy under `python -O` after
+  replacing the accepted empty-input digest with a wrong value. The old helper
+  must incorrectly exit zero (RED); the corrected helper must exit nonzero.
+- Cross-stage TDD boundary: assert the exact ancestry
+  `identity-check -> lock-validation -> builder-bootstrap -> builder-environment`
+  and prove the validator is in the ancestor while apt is absent from it. The
+  current Dockerfile must fail before stage refactoring.
+- Scope: `Dockerfile`, `scripts/verify_release_eip712_runtime.py`, behavioral
+  and cross-stage regressions in `test/test_docker_image_identity.py`, and Task
+  2 truth artifacts only.
+- Validation: behavioral regression, helper under normal and optimized Python,
+  focused Docker contract, lock/license suites as relevant, Python compilation,
+  changed-file pre-commit, and diff hygiene.
+- Image rebuild decision: the Docker stage graph changes, so both target
+  dependency images must be rebuilt, inspected, and cleaned even though the
+  dependency sets and selected locks remain unchanged.
+
 ## Options considered
 
 1. Keep broad solves and rely only on the generated license inventory.
@@ -269,6 +305,26 @@
   Python 3.13.15; license policy/generated inventory/third-party inventory
   suite `17 passed`; Python compilation, all changed-file pre-commit hooks, and
   `git diff --check` passed.
+- Independent Task 2 audit correction moved complete offline validation into a
+  `lock-validation` stage directly descended from `identity-check`; both fresh
+  build logs show validation completing before the first apt step. The runtime
+  helper now uses explicit `RuntimeError` comparisons that remain active under
+  `python -O` and binds the independently recomputed signable vector
+  `1901de57171073f97873bc93388ae5e87afd47d803e4b4a59a7a402a0eb71b7aa2e664e15bdc268f69b1f35c21c9559e329a2f3587fe22a9800badf545aec280d842`
+  and Keccak
+  `358eb3432f7a6fdfb6bbec6fcc85bf845d3feea114fb95722bbbf854a934453e`.
+- Corrected implementation commit `5553e63b6ebd8bcfcdd4e7c54459a32e52f9858c`
+  built and inspected on `linux/arm64`
+  (`sha256:6994c7f29e0a8f4795ebedf4787f0e65b6bb0e62f19cc35d3f3a1f362be48978`)
+  and `linux/amd64`
+  (`sha256:db5faec279e86983c0618b294d6fcb19fec3d1b2b250dc1957070cd3393da75e`).
+  Both passed the helper under normal and optimized Python, exact lock/evidence
+  inspection, and the expected non-green generic pip diagnostic; exact tags
+  were deleted and confirmed absent.
+- Audit-correction behavioral tests cover wrong signable body, prefix, length,
+  expected signable Keccak, and an optimized subprocess with a deliberately
+  wrong expected empty-input digest. The broad image-identity suite passed
+  `94 passed` in 188.05 seconds.
 - No registry, final application image, deployment, service, credential,
   publication, legal, or trading state was changed. Publication remains
   `HOLD_FOR_EVIDENCE` and final-image evidence remains a later gate.

@@ -58,9 +58,10 @@ inputs remain mutable or an inventory contains unresolved artifact sources.
 
 ## Locked builder-environment evidence
 
-The release Docker build validates all committed dependency locks offline
-before it installs anything. `TARGETPLATFORM` then selects exactly one reviewed
-pair: `linux/amd64` uses `linux-64.explicit.txt` and
+The release Docker build's `lock-validation` stage validates all committed
+dependency locks offline before its descendant `builder-bootstrap` runs apt or
+installs anything else. `TARGETPLATFORM` then selects exactly one reviewed pair:
+`linux/amd64` uses `linux-64.explicit.txt` and
 `pip-injective-linux-64.lock.txt`; `linux/arm64` uses
 `linux-aarch64.explicit.txt` and
 `pip-injective-linux-aarch64.lock.txt`. Empty and unsupported target values fail
@@ -74,12 +75,14 @@ provenance, target mapping, final Conda lists, explicit package URLs, Python
 version, and installed-requirement evidence under `/opt/conda/image-evidence`
 and `/opt/conda/conda-meta`.
 
-After the direct EIP-712 install, the image executes a deterministic EIP-712
-signable-bytes operation and checks the canonical empty-input Keccak-256 digest.
-That runtime reversal gate proves the reviewed `safe-pysha3` substitution works
-for the named operation. Generic `pip check` remains intentionally non-green
-because `eip712-structs` metadata still requests `pysha3`; it is diagnostic,
-not a claimed green gate.
+After the direct EIP-712 install, the image binds the complete deterministic
+EIP-712 signable byte vector, its Keccak-256 digest, and the canonical
+empty-input Keccak-256 digest. Explicit failures remain active under
+`python -O`; the reversal gate does not depend on removable assertions. That
+gate proves the reviewed `safe-pysha3` substitution works for the named
+operation. Generic `pip check` remains intentionally non-green because
+`eip712-structs` metadata still requests `pysha3`; it is diagnostic, not a
+claimed green gate.
 
 This is local target-image dependency/runtime evidence only. It is not proof of
 the compiled application, final-image license disposition, legal clearance,

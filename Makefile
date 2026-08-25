@@ -1,8 +1,11 @@
 .ONESHELL:
-.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build install setup deploy down
+.PHONY: test run run_coverage report_coverage development-diff-cover uninstall build verify-image-context install setup deploy down
 
 DYDX ?= 0
 ENV_FILE := setup/environment.yml
+SOURCE_COMMIT := $(shell git rev-parse HEAD)
+SOURCE_BRANCH := $(shell git branch --show-current)
+BUILD_DATE := $(shell git show -s --format=%cI HEAD)
 ifeq ($(DYDX),1)
   ENV_FILE := setup/environment_dydx.yml
 endif
@@ -29,8 +32,18 @@ development-diff-cover:
 	coverage xml
 	diff-cover --compare-branch=origin/development coverage.xml
 
-build:
-	git clean -xdf && make clean && docker build -t hummingbot/hummingbot${TAG} -f Dockerfile .
+verify-image-context:
+	@if ! git diff --quiet -- || ! git diff --cached --quiet || [ -n "$$(git ls-files --others --exclude-standard)" ]; then \
+		echo "Image build requires a clean Git worktree." >&2; \
+		exit 1; \
+	fi
+
+build: verify-image-context
+	docker build -t hummingbot/hummingbot${TAG} -f Dockerfile \
+		--build-arg SOURCE_COMMIT=$(SOURCE_COMMIT) \
+		--build-arg COMMIT=$(SOURCE_COMMIT) \
+		--build-arg BRANCH=$(SOURCE_BRANCH) \
+		--build-arg BUILD_DATE=$(BUILD_DATE) .
 
 
 uninstall:

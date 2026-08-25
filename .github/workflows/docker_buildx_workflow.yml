@@ -13,7 +13,7 @@ on:
         type: boolean
         default: false
       source_commit:
-        description: Exact lowercase 40-hex Hummingbot source commit to publish.
+        description: Exact lowercase 40-hex workflow commit to publish; must equal github.sha.
         required: true
         type: string
 
@@ -60,24 +60,35 @@ jobs:
         id: confirm
         env:
           CONFIRM_RELEASE: ${{ inputs.confirm_release }}
-          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
         shell: bash
         run: |
           if [[ "${CONFIRM_RELEASE}" != "true" ]]; then
             echo "Release publication was not confirmed." >&2
             exit 1
           fi
-          if [[ ! "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+          if [[ ! "${WORKFLOW_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "github.sha must be an exact lowercase 40-hex Git SHA." >&2
+            exit 1
+          fi
+          if [[ ! "${REQUESTED_SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "source_commit must be an exact lowercase 40-hex Git SHA." >&2
             exit 1
           fi
+          if [[ "${REQUESTED_SOURCE_COMMIT}" != "${WORKFLOW_COMMIT}" ]]; then
+            echo "source_commit must equal the checked-out hardened workflow commit." >&2
+            exit 1
+          fi
           echo "confirmed=true" >> "${GITHUB_OUTPUT}"
-          echo "source_commit=${SOURCE_COMMIT}" >> "${GITHUB_OUTPUT}"
+          echo "source_commit=${WORKFLOW_COMMIT}" >> "${GITHUB_OUTPUT}"
 
   publish_release:
     needs: validate_release
     if: github.event_name == 'workflow_dispatch' && needs.validate_release.outputs.confirmed == 'true'
     runs-on: ubuntu-latest
+    environment:
+      name: hummingbot-image-release
     steps:
       - name: Checkout exact confirmed source commit
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

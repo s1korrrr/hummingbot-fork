@@ -257,6 +257,7 @@ def test_workflow_publish_is_digest_only_without_a_semantic_tag():
 
     assert "tags" not in image_step["with"]
     assert image_step["with"]["push"] == "true"
+    assert "name=hummingbot/hummingbot" in image_step["with"]["outputs"]
     assert "push-by-digest=true" in image_step["with"]["outputs"]
     assert "name-canonical=true" in image_step["with"]["outputs"]
     assert publish_job["outputs"]["image_digest"] == "${{ steps.image.outputs.digest }}"

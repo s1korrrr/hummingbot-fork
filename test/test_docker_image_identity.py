@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Iterator
 from uuid import uuid4
 
@@ -133,13 +133,26 @@ def _build_metadata(artifact_dir: Path, *build_args: str) -> Iterator[_MetadataI
         try:
             if result is not None:
                 cleanup = subprocess.run(
-                    ["docker", "image", "rm", image_tag],
+                    ["docker", "image", "rm", "--force", image_tag],
                     check=False,
                     capture_output=True,
                     text=True,
                 )
-                if result.returncode == 0 and cleanup.returncode != 0:
-                    raise RuntimeError(f"Failed to remove isolated Docker test tag {image_tag}: {cleanup.stderr}")
+                cleanup_check = subprocess.run(
+                    ["docker", "image", "inspect", image_tag],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if cleanup_check.returncode == 0:
+                    raise RuntimeError(
+                        f"Docker test build exited {result.returncode}; docker image rm --force exited "
+                        f"{cleanup.returncode}; exact Docker test tag remains: {image_tag}"
+                    )
+                if "No such image" not in cleanup_check.stderr and "No such object" not in cleanup_check.stderr:
+                    raise RuntimeError(
+                        f"Could not verify exact Docker test tag cleanup for {image_tag}: {cleanup_check.stderr}"
+                    )
         finally:
             image_id_file.unlink(missing_ok=True)
 
@@ -166,10 +179,11 @@ def _image_environment(image_id: str | None) -> list[str]:
     return json.loads(result.stdout)
 
 
-def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path]:
+def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path, Path]:
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     removed_tags = tmp_path / "removed-tags"
+    inspected_tags = tmp_path / "inspected-tags"
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         "#!/bin/sh\n"
@@ -186,13 +200,21 @@ def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path]:
         "  exit \"$FAKE_DOCKER_BUILD_EXIT\"\n"
         "fi\n"
         "if [ \"$1\" = image ] && [ \"$2\" = rm ]; then\n"
-        "  printf '%s\\n' \"$3\" >> \"$FAKE_DOCKER_REMOVED_TAGS\"\n"
-        "  exit 0\n"
+        "  printf '%s\\n' \"$*\" >> \"$FAKE_DOCKER_REMOVED_TAGS\"\n"
+        "  exit \"${FAKE_DOCKER_RM_EXIT:-0}\"\n"
+        "fi\n"
+        "if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n"
+        "  printf '%s\\n' \"$3\" >> \"$FAKE_DOCKER_INSPECTED_TAGS\"\n"
+        "  inspect_exit=\"${FAKE_DOCKER_INSPECT_EXIT:-1}\"\n"
+        "  if [ \"$inspect_exit\" -ne 0 ]; then\n"
+        "    printf 'Error: No such image: %s\\n' \"$3\" >&2\n"
+        "  fi\n"
+        "  exit \"$inspect_exit\"\n"
         "fi\n"
         "exit 99\n"
     )
     fake_docker.chmod(0o755)
-    return fake_bin, removed_tags
+    return fake_bin, removed_tags, inspected_tags
 
 
 @pytest.mark.parametrize(
@@ -209,11 +231,12 @@ def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path]:
 def test_metadata_build_rejects_malformed_iid_and_cleans_exact_artifacts(
     tmp_path: Path, monkeypatch, malformed_iid: str
 ):
-    fake_bin, removed_tags = _make_fake_docker(tmp_path)
+    fake_bin, removed_tags, inspected_tags = _make_fake_docker(tmp_path)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_DOCKER_IID", malformed_iid)
     monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "0")
     monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
+    monkeypatch.setenv("FAKE_DOCKER_INSPECTED_TAGS", str(inspected_tags))
 
     with pytest.raises(ValueError, match="exact sha256 image ID"):
         with _build_metadata(tmp_path):
@@ -222,15 +245,17 @@ def test_metadata_build_rejects_malformed_iid_and_cleans_exact_artifacts(
     assert list(tmp_path.glob("*.iid")) == []
     cleaned_tags = removed_tags.read_text().splitlines()
     assert len(cleaned_tags) == 1
-    assert cleaned_tags[0].startswith("hummingbot:qte-image-identity-metadata-test-")
+    assert cleaned_tags[0].startswith("image rm --force hummingbot:qte-image-identity-metadata-test-")
+    assert inspected_tags.read_text().splitlines() == [cleaned_tags[0].removeprefix("image rm --force ")]
 
 
 def test_failed_metadata_build_always_removes_unique_iidfile_and_tag(tmp_path: Path, monkeypatch):
-    fake_bin, removed_tags = _make_fake_docker(tmp_path)
+    fake_bin, removed_tags, inspected_tags = _make_fake_docker(tmp_path)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_DOCKER_IID", f"sha256:{'a' * 64}")
     monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "7")
     monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
+    monkeypatch.setenv("FAKE_DOCKER_INSPECTED_TAGS", str(inspected_tags))
 
     with _build_metadata(tmp_path) as image:
         assert image.result.returncode == 7
@@ -238,7 +263,29 @@ def test_failed_metadata_build_always_removes_unique_iidfile_and_tag(tmp_path: P
     assert list(tmp_path.glob("*.iid")) == []
     cleaned_tags = removed_tags.read_text().splitlines()
     assert len(cleaned_tags) == 1
-    assert cleaned_tags[0].startswith("hummingbot:qte-image-identity-metadata-test-")
+    assert cleaned_tags[0].startswith("image rm --force hummingbot:qte-image-identity-metadata-test-")
+    assert inspected_tags.read_text().splitlines() == [cleaned_tags[0].removeprefix("image rm --force ")]
+
+
+def test_failed_build_raises_when_forced_cleanup_leaves_exact_tag_present(tmp_path: Path, monkeypatch):
+    fake_bin, removed_tags, inspected_tags = _make_fake_docker(tmp_path)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_IID", f"sha256:{'b' * 64}")
+    monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "7")
+    monkeypatch.setenv("FAKE_DOCKER_RM_EXIT", "9")
+    monkeypatch.setenv("FAKE_DOCKER_INSPECT_EXIT", "0")
+    monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
+    monkeypatch.setenv("FAKE_DOCKER_INSPECTED_TAGS", str(inspected_tags))
+
+    with pytest.raises(RuntimeError, match="build exited 7.*exact Docker test tag remains"):
+        with _build_metadata(tmp_path) as image:
+            assert image.result.returncode == 7
+
+    assert list(tmp_path.glob("*.iid")) == []
+    cleaned_tags = removed_tags.read_text().splitlines()
+    assert len(cleaned_tags) == 1
+    assert cleaned_tags[0].startswith("image rm --force hummingbot:qte-image-identity-metadata-test-")
+    assert inspected_tags.read_text().splitlines() == [cleaned_tags[0].removeprefix("image rm --force ")]
 
 
 def test_concurrent_metadata_builds_keep_labels_bound_to_their_immutable_image_ids(tmp_path: Path):
@@ -282,6 +329,71 @@ def test_concurrent_metadata_builds_keep_labels_bound_to_their_immutable_image_i
     assert second_labels["org.opencontainers.image.revision"] == second_source_commit
     assert second_labels["branch"] == "isolation-second"
     assert f"COMMIT_SHA={second_source_commit}" in second_environment
+    for image_tag in (first_image_tag, second_image_tag):
+        cleanup_check = subprocess.run(
+            ["docker", "image", "inspect", image_tag],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert cleanup_check.returncode != 0
+
+
+def test_same_content_build_cleanup_preserves_shared_immutable_id_until_every_unique_tag_exits(tmp_path: Path):
+    assert shutil.which("docker"), "BuildKit is required for image identity verification"
+    source_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    both_builds_finished = Barrier(2)
+    first_cleanup_finished = Event()
+    common_args = (
+        "--build-arg",
+        f"SOURCE_COMMIT={source_commit}",
+        "--build-arg",
+        f"COMMIT={source_commit}",
+        "--build-arg",
+        "BRANCH=shared-id-isolation",
+        "--build-arg",
+        "BUILD_DATE=2026-08-25T00:00:00Z",
+    )
+
+    def first_build() -> tuple[str, str]:
+        try:
+            with _build_metadata(tmp_path, *common_args) as image:
+                assert image.result.returncode == 0, image.result.stderr
+                both_builds_finished.wait(timeout=30)
+                assert image.image_id is not None
+                return image.image_id, image.image_tag
+        finally:
+            first_cleanup_finished.set()
+
+    def second_build() -> tuple[str, str, dict[str, str], list[str]]:
+        with _build_metadata(tmp_path, *common_args) as image:
+            assert image.result.returncode == 0, image.result.stderr
+            both_builds_finished.wait(timeout=30)
+            assert first_cleanup_finished.wait(timeout=30)
+            tag_check = subprocess.run(
+                ["docker", "image", "inspect", image.image_tag],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert tag_check.returncode == 0, tag_check.stderr
+            assert image.image_id is not None
+            return image.image_id, image.image_tag, _image_labels(image.image_id), _image_environment(image.image_id)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(first_build)
+        second = executor.submit(second_build)
+        first_image_id, first_image_tag = first.result()
+        second_image_id, second_image_tag, second_labels, second_environment = second.result()
+
+    assert first_image_id == second_image_id
+    assert first_image_tag != second_image_tag
+    assert second_labels["commit"] == source_commit
+    assert second_labels["org.opencontainers.image.revision"] == source_commit
+    assert second_labels["branch"] == "shared-id-isolation"
+    assert f"COMMIT_SHA={source_commit}" in second_environment
     for image_tag in (first_image_tag, second_image_tag):
         cleanup_check = subprocess.run(
             ["docker", "image", "inspect", image_tag],

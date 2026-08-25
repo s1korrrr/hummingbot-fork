@@ -1,17 +1,11 @@
 # TODO
 
-- [x] Add RED immutable-deployment contract tests.
-  DoD: missing/mutable/malformed values fail for the intended reason; exact
-  registry digests and local image IDs describe the accepted behavior.
-- [x] Implement the minimum Compose and Make validation contract.
-  DoD: `make deploy` cannot invoke Docker without a validated immutable
-  identity, an explicit Compose file, and an allowlisted declarative
-  `.compose.env`; `make down` remains image-independent.
-- [x] Update operator documentation.
-  DoD: published-digest and exact-local-ID flows are clear; Gateway's separate
-  mutable-image risk is explicit.
-- [x] Run repository validation and fresh review.
-  DoD: focused tests, Compose config, hooks, actionlint, diff checks, and an
-  independent verdict cover the exact committed range.
-- [x] Update `MEMORY.md` and close out.
-  DoD: durable command/boundary notes and exact evidence are recorded.
+- [-] Task 1: generate and validate complete target locks.
+  DoD: both explicit Conda locks, exact pip hash lock, source binding, validator,
+  generator, and adversarial tests are complete and independently reviewed.
+- [ ] Task 2: consume locks in the release image.
+  DoD: Docker uses only the selected validated locks; both target environment
+  builds or exact blockers are recorded; docs and tests match runtime flow.
+- [ ] Task 3: audit, close out, and push.
+  DoD: all relevant local checks and reviews are recorded, durable memory is
+  updated, and only reviewed commits are non-force pushed.

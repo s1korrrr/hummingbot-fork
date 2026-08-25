@@ -2,102 +2,134 @@
 
 ## Task
 
-- Objective: make the documented Compose deployment consume an explicit
-  immutable Hummingbot image identity instead of `hummingbot/hummingbot:latest`.
+- Objective: make H28 release-image dependency installation deterministic for
+  both `linux/amd64` and `linux/arm64`, without weakening the existing
+  `HOLD_FOR_EVIDENCE` publication gate.
 - Owner repo: `hummingbot`.
-- Capital impact: live-capital-adjacent deployment plumbing; no service start,
-  credentials, orders, publication, merge, or trading action is authorized.
+- Branch: `feat/andrzej_hummingbot_miniforge_release` in the existing isolated
+  `qte_miniforge_release` worktree.
+- Capital impact: release/runtime-adjacent; no image publication, service
+  deployment, credentials, orders, merge, or trading action is authorized.
+- Spec authority: this plan records the dependency-mutation blocker found by
+  the H28 PR audit. There is no separate dependency-lock specification.
 
-## Context and assumptions
+## Evidence and assumptions
 
-- PR #27 publishes digest-only images and intentionally emits no `latest` tag.
-- `docker-compose.yml`, `Makefile`, and `README.md` still route operators through
-  a mutable tag and a stale build comment that omits required source identity.
-- The release lane's exact
-  `hummingbot/hummingbot@sha256:<64 lowercase hex>` reference or a local
-  `sha256:<64 lowercase hex>` image ID is an acceptable immutable runtime input.
+- H28 currently solves broad `setup/environment.yml` ranges during every image
+  build and separately installs unpinned `eip712-structs`.
+- Read-only dry runs succeeded for both `linux-64` and `linux-aarch64` when
+  `CONDA_OVERRIDE_GLIBC=2.17` declared the Linux solver virtual package.
+- Both current solves select Python `3.13.15`; the installed development
+  environment also uses Python 3.13.
+- Installed pip-only inputs are `injective-py==1.13.0` and
+  `eip712-structs==1.1.0`.
+- Conda 26.5 documentation supports target-specific `@EXPLICIT` URL locks with
+  SHA-256 fragments and direct `conda create --file` consumption.
 
-## Constraints
+## Global constraints
 
-- Preserve the current Compose volume, network, Gateway-profile, and shutdown
-  behavior.
-- `make deploy` must fail before invoking Docker on missing, mutable, malformed,
-  multiline, or shell-shaped image input.
-- `.compose.env` is declarative input owned by `make setup`: exactly one
-  `COMPOSE_PROFILES=` or `COMPOSE_PROFILES=gateway` line. It must never be
-  sourced as shell code or control the image identity.
-- Automatic `.env` loading and ambient Compose file/profile/env-file routing
-  must not alter the controlled deployment path.
-- Deploy and shutdown must share a fixed Compose project identity so ambient
-  project routing cannot redirect the kill path.
-- Local builds must continue through the clean-tree, exact-SHA `make build`
-  path; Compose must not regain an unbound inline build path.
-- Gateway remains a separately disclosed mutable-image risk.
+- Release Docker stages must never solve `environment.yml` or a broad package
+  range. They must consume a committed lock selected from `TARGETPLATFORM`.
+- Commit one explicit Conda lock for `linux-64` and one for
+  `linux-aarch64`. Every package URL must be HTTPS, from `conda-forge`, belong
+  to the target subdir or `noarch`, and end in an exact 64-hex SHA-256 fragment.
+- Lock Python to the same selected release version on both targets. Any target,
+  source-fingerprint, package-origin, platform, or hash mismatch fails before
+  source compilation.
+- Commit one pip lock containing only exact versions and SHA-256 hashes for the
+  pip-only packages. Release installation must use `--require-hashes --no-deps`.
+- Keep broad environment recipes available for developer workflows, but pin
+  their pip-only direct requirements to the exact release versions so intent
+  does not diverge silently.
+- A checked-in validator must bind lock artifacts to the canonical source
+  recipes and validate them without network access. A regeneration command and
+  provenance notes must be documented.
+- Preserve the Miniforge digest, image-identity gates, license inventory,
+  notices, tini/runtime contract, immutable deploy contract, and current
+  `HOLD_FOR_EVIDENCE` policy.
+- No placeholder hashes, partial target locks, defaults-channel artifacts,
+  hidden fallback solve, automatic lock refresh, or hosted-CI claim.
 
 ## Options considered
 
-1. Keep `latest` and document the digest separately.
-   - Rejected: the runtime would remain mutable and disconnected from the
-     release output.
-2. Require an immutable image through Compose and validate it in `make deploy`.
-   - Chosen: smallest fail-closed contract compatible with registry digests and
-     exact local image IDs.
-3. Add automatic registry resolution or local build-and-deploy orchestration.
-   - Deferred: adds network, credential, tag-race, and lifecycle behavior not
-     required to close this defect.
+1. Keep broad solves and rely only on the generated license inventory.
+   - Rejected: evidence detects drift after the solve but does not make a later
+     build reproducible.
+2. Add target-specific explicit Conda locks plus a hash-checked pip lock.
+   - Chosen: uses Conda's native no-solve format, keeps platform differences
+     explicit, and requires no permanent lock-tool dependency.
+3. Introduce `conda-lock` or Pixi as a new repository toolchain.
+   - Deferred: unnecessary until the native explicit-lock route is proven;
+     adding a permanent dependency would expand maintenance and bootstrap scope.
 
-## Execution and tests
+## Task 1: Generate and validate complete target locks
 
-1. Add RED tests for missing/mutable/malformed image rejection and exact digest/
-   local-ID acceptance before any Compose invocation.
-2. Require `HUMMINGBOT_IMAGE` in Compose, validate its process-environment value
-   in Make, and parse the allowlisted optional Compose environment as a literal
-   Gateway toggle.
-3. Update README deployment examples and explicitly disclose the Gateway tag.
-4. Run focused tests, Compose config checks, pre-commit, actionlint, and diff
-   hygiene; obtain fresh independent review before pushing.
+- Add a deterministic lock generator and offline validator under `scripts/`.
+- Add both target-specific explicit Conda locks, the exact pip hash lock, and a
+  small provenance/fingerprint record under `setup/locks/`.
+- Pin direct pip-only source requirements to the exact locked versions.
+- Add focused tests for exact target coverage, URL/channel/subdir/hash grammar,
+  source fingerprint binding, pip hashes, unsupported targets, and tampering.
+- DoD: validator passes offline for both targets; every adversarial fixture
+  fails at its intended rule; no release Dockerfile change is included yet.
+
+## Task 2: Consume locks in the release image
+
+- Update `Dockerfile` so `builder-environment` selects the exact Conda lock from
+  `TARGETPLATFORM`, validates all lock inputs, creates the environment without a
+  solve, and installs the pip lock with `--require-hashes --no-deps`.
+- Preserve package URL, selected-Python, pip-report, and license-inventory
+  evidence paths expected downstream.
+- Extend image-identity tests so missing/unsupported/mismatched locks and any
+  fallback to broad recipes fail closed.
+- Update the release gate runbook with the exact regeneration and verification
+  commands and the distinction between reproducible source inputs and actual
+  per-platform runtime evidence.
+- DoD: static/fake tests pass and local `builder-environment` builds succeed for
+  both `linux/amd64` and `linux/arm64`, or the exact external/runtime blocker is
+  recorded without weakening the lock contract.
+
+## Task 3: Audit, close out, and push the reviewed slice
+
+- Run license tests, the complete relevant image-identity suite, changed-file
+  hooks, workflow syntax, lock verification, diff hygiene, and exact-tag cleanup.
+- Obtain independent spec/quality review and a broad final branch review.
+- Update `PLAN.md`, `TODO.md`, and `MEMORY.md` with exact evidence, rollback,
+  residual risks, and any rulings.
+- Commit coherent reviewed slices and non-force push only after checking the
+  remote H28 head has not moved.
+- DoD: pushed source is at least `repo-ready`; image/runtime/legal/publication
+  ceilings remain stated truthfully.
+
+## Test plan
+
+- Unit/static: lock parser/generator/validator and Docker selection contract.
+- Integration: `conda create --dry-run --file <explicit-lock>` where supported,
+  pip `--require-hashes` resolution/download checks, and license inventory tests.
+- Image: both target `builder-environment` builds, environment provenance probe,
+  selected Python equality, and exact cleanup of generated test tags.
+- Regression: existing identity, deploy/down, Miniforge, license-policy, and
+  generated-inventory tests.
 
 ## Risks and rollback
 
-- Risk: existing `make deploy` callers must now supply an immutable identity.
-  This intentional fail-closed break is required because the new release lane
-  does not publish `latest`.
-- Rollback: revert the bounded Compose/Makefile/README/test commit. No external
-  runtime state is created by this work.
+- Lock generation may expose package availability or Python compatibility
+  divergence between architectures. Invalidate the slice rather than omitting a
+  target or substituting a solve.
+- Explicit locks reproduce packages; they do not prove compiled Hummingbot or
+  runtime behavior. That proof remains a separate gate.
+- Package URLs can disappear upstream. Regeneration is an explicit reviewed
+  operation, never an automatic fallback.
+- Rollback: revert the lock-consumption commits to the current H28 source state.
+  Publication remains held throughout, so rollback requires no registry or
+  runtime cleanup.
 
 ## Memory impact
 
-- Record the immutable `HUMMINGBOT_IMAGE` deployment contract and validation
-  commands if confirmed.
+- Record confirmed generation/verification commands, target naming, lock/source
+  binding, Python selection, Docker consumption boundary, and remaining runtime
+  or legal gates.
 
 ## Final notes
 
-- Compose now requires an explicit immutable Hummingbot registry digest or
-  exact local image ID through the documented `make deploy` boundary; mutable,
-  malformed, multiline, or shell-shaped values fail before Docker is invoked.
-- `.compose.env` is never sourced. Its complete contents are matched against
-  the two allowlisted Gateway-profile byte sequences with `cmp` and translated
-  into an explicit `--profile` argument. The Compose file is selected
-  explicitly; ambient file/profile/env-file routing is cleared and automatic
-  `.env` loading is disabled before Docker. Both lifecycle commands use the
-  fixed Compose project name `hummingbot`.
-- `make down` supplies an exact parse-only local image sentinel so shutdown
-  remains available without a deployment image identity; it never pulls or
-  starts that sentinel.
-- The stale inline Compose build path was removed. README documents published
-  digest and clean local-build flows and discloses Gateway's separate mutable
-  `latest` risk.
-- Two independent reviews correctly rejected shell-sourcing, multiline,
-  malformed-reference, ambient Compose routing, unterminated-record, and
-  shutdown regressions. A third review found default `.env` and NUL-byte
-  bypasses. All reproductions are now regression tests.
-- Final validation: 70/70 image-identity tests passed, including real local
-  BuildKit cases; changed-file pre-commit, actionlint, and `git diff --check`
-  passed. The fresh push-gate review returned `READY_WITH_RISK` at 0.97
-  confidence with no blocking correctness or security finding.
-- Residual risk is explicit: direct Compose remains outside Make's validation
-  boundary and optional Gateway remains mutable at `latest`. This is
-  source/test proof, not runtime/deployment proof. No service was started,
-  image published, or trade sent.
-- Remaining before push: commit the reviewed slice and non-force push only if
-  the remote branch head is unchanged.
+- Pending implementation.

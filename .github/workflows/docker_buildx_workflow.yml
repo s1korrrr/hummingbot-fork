@@ -13,7 +13,7 @@ on:
         type: boolean
         default: false
       source_commit:
-        description: Exact lowercase 40-hex workflow commit to publish; must equal github.sha.
+        description: Exact lowercase 40-hex master workflow commit to publish; must equal github.sha.
         required: true
         type: string
 
@@ -67,6 +67,7 @@ jobs:
     outputs:
       confirmed: ${{ steps.confirm.outputs.confirmed }}
       source_commit: ${{ steps.confirm.outputs.source_commit }}
+      source_ref: ${{ steps.confirm.outputs.source_ref }}
     steps:
       - name: Validate explicit release confirmation and source identity
         id: confirm
@@ -74,10 +75,15 @@ jobs:
           CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
           WORKFLOW_COMMIT: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
         shell: bash
         run: |
           if [[ "${CONFIRM_RELEASE}" != "true" ]]; then
             echo "Release publication was not confirmed." >&2
+            exit 1
+          fi
+          if [[ "${WORKFLOW_REF}" != "refs/heads/master" ]]; then
+            echo "Release publication requires the exact reviewed default ref refs/heads/master." >&2
             exit 1
           fi
           if [[ ! "${WORKFLOW_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -92,12 +98,15 @@ jobs:
             echo "source_commit must equal the checked-out hardened workflow commit." >&2
             exit 1
           fi
-          echo "confirmed=true" >> "${GITHUB_OUTPUT}"
-          echo "source_commit=${WORKFLOW_COMMIT}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "confirmed=true"
+            echo "source_commit=${WORKFLOW_COMMIT}"
+            echo "source_ref=${WORKFLOW_REF}"
+          } >> "${GITHUB_OUTPUT}"
 
   publish_release:
     needs: validate_release
-    if: github.event_name == 'workflow_dispatch' && needs.validate_release.outputs.confirmed == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.validate_release.outputs.confirmed == 'true' && needs.validate_release.outputs.source_ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     environment:
       name: hummingbot-image-release

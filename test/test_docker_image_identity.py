@@ -211,15 +211,19 @@ def test_workflow_pr_verification_is_non_pushing_and_binds_pr_head_sha():
 
 def test_workflow_release_publication_is_manual_confirmed_and_uses_immutable_source_identity():
     workflow = _workflow()
+    document = _workflow_document()
 
     assert "workflow_dispatch:" in workflow
     assert "confirm_release:" in workflow
     assert "source_commit:" in workflow
     assert "needs.validate_release.outputs.confirmed == 'true'" in workflow
+    assert "needs.validate_release.outputs.source_ref == 'refs/heads/master'" in workflow
     assert "=~ ^[0-9a-f]{40}$" in workflow
     assert "WORKFLOW_COMMIT: ${{ github.sha }}" in workflow
+    assert "WORKFLOW_REF: ${{ github.ref }}" in workflow
     assert '[[ "${REQUESTED_SOURCE_COMMIT}" != "${WORKFLOW_COMMIT}" ]]' in workflow
     assert "source_commit=${WORKFLOW_COMMIT}" in workflow
+    assert document["jobs"]["validate_release"]["outputs"]["source_ref"] == "${{ steps.confirm.outputs.source_ref }}"
     assert "ref: ${{ needs.validate_release.outputs.source_commit }}" in workflow
     assert "SOURCE_COMMIT=${{ needs.validate_release.outputs.source_commit }}" in workflow
     assert "COMMIT=${{ needs.validate_release.outputs.source_commit }}" in workflow
@@ -339,12 +343,49 @@ def test_workflow_validation_rejects_the_old_unhardened_6a8_source_commit(tmp_pa
             "CONFIRM_RELEASE": "true",
             "REQUESTED_SOURCE_COMMIT": SOURCE_SHA,
             "WORKFLOW_COMMIT": producer_commit,
+            "WORKFLOW_REF": "refs/heads/master",
             "GITHUB_OUTPUT": str(tmp_path / "github-output"),
         },
     )
 
     assert result.returncode != 0
     assert "source_commit must equal the checked-out hardened workflow commit" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "workflow_ref",
+    [
+        "",
+        "master",
+        "refs/heads/development",
+        "refs/heads/feature/image-release",
+        "refs/tags/v2.0.0",
+        "refs/pull/42/merge",
+        "refs/heads/master/extra",
+    ],
+)
+def test_workflow_validation_rejects_every_non_master_release_ref(tmp_path: Path, workflow_ref: str):
+    producer_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", _release_validation_script()],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "CONFIRM_RELEASE": "true",
+            "REQUESTED_SOURCE_COMMIT": producer_commit,
+            "WORKFLOW_COMMIT": producer_commit,
+            "WORKFLOW_REF": workflow_ref,
+            "GITHUB_OUTPUT": str(tmp_path / "github-output"),
+        },
+    )
+
+    assert result.returncode != 0, workflow_ref
+    assert "Release publication requires the exact reviewed default ref refs/heads/master" in result.stderr
 
 
 def test_workflow_validation_accepts_only_the_checked_out_producer_commit(tmp_path: Path):
@@ -363,12 +404,17 @@ def test_workflow_validation_accepts_only_the_checked_out_producer_commit(tmp_pa
             "CONFIRM_RELEASE": "true",
             "REQUESTED_SOURCE_COMMIT": producer_commit,
             "WORKFLOW_COMMIT": producer_commit,
+            "WORKFLOW_REF": "refs/heads/master",
             "GITHUB_OUTPUT": str(output),
         },
     )
 
     assert result.returncode == 0, result.stderr
-    assert output.read_text().splitlines() == ["confirmed=true", f"source_commit={producer_commit}"]
+    assert output.read_text().splitlines() == [
+        "confirmed=true",
+        f"source_commit={producer_commit}",
+        "source_ref=refs/heads/master",
+    ]
 
 
 def test_make_build_command_binds_one_exact_head_sha_to_both_metadata_arguments():

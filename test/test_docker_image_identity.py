@@ -153,10 +153,22 @@ def _build_image(
                 capture_output=True,
                 text=True,
             )
+            build_exit = "not-started" if result is None else str(result.returncode)
             if remaining_tag.returncode == 0:
                 raise RuntimeError(
                     f"Isolated Docker test tag {image_tag} still exists after exact cleanup "
-                    f"(remove exit {cleanup.returncode}): {cleanup.stderr}"
+                    f"(build exit {build_exit}; remove exit {cleanup.returncode}; inspect exit 0): "
+                    f"{cleanup.stderr}"
+                )
+            inspect_output = f"{remaining_tag.stdout}\n{remaining_tag.stderr}"
+            recognized_absence = any(
+                marker in inspect_output for marker in ("No such image", "No such object")
+            )
+            if not recognized_absence:
+                raise RuntimeError(
+                    f"Could not verify exact Docker test tag {image_tag} absence "
+                    f"(build exit {build_exit}; remove exit {cleanup.returncode}; "
+                    f"inspect exit {remaining_tag.returncode}): {inspect_output.strip()}"
                 )
         finally:
             image_id_file.unlink(missing_ok=True)
@@ -252,7 +264,15 @@ def _make_fake_docker(tmp_path: Path) -> tuple[Path, Path, Path]:
         "  exit \"${FAKE_DOCKER_REMOVE_EXIT:-0}\"\n"
         "fi\n"
         "if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n"
-        "  exit \"${FAKE_DOCKER_INSPECT_EXIT:-1}\"\n"
+        "  inspect_exit=\"${FAKE_DOCKER_INSPECT_EXIT:-1}\"\n"
+        "  if [ \"$inspect_exit\" -ne 0 ]; then\n"
+        "    if [ -n \"${FAKE_DOCKER_INSPECT_STDERR:-}\" ]; then\n"
+        "      printf '%s\\n' \"$FAKE_DOCKER_INSPECT_STDERR\" >&2\n"
+        "    else\n"
+        "      printf 'Error: No such image: %s\\n' \"$3\" >&2\n"
+        "    fi\n"
+        "  fi\n"
+        "  exit \"$inspect_exit\"\n"
         "fi\n"
         "exit 99\n"
     )
@@ -360,6 +380,31 @@ def test_failed_build_raises_when_exact_tag_remains_after_forced_cleanup(tmp_pat
     monkeypatch.setenv("FAKE_DOCKER_CALLS", str(docker_calls))
 
     with pytest.raises(RuntimeError, match="still exists after exact cleanup"):
+        with _build_environment(tmp_path) as image:
+            assert image.result.returncode == 7
+
+    assert list(tmp_path.glob("*.iid")) == []
+    cleaned_tag = removed_tags.read_text().strip()
+    assert cleaned_tag.startswith("hummingbot:qte-condaforge-environment-test-")
+    assert f"image rm --force {cleaned_tag}" in docker_calls.read_text().splitlines()
+    assert f"image inspect {cleaned_tag}" in docker_calls.read_text().splitlines()
+
+
+def test_failed_build_raises_when_inspect_cannot_verify_exact_tag_absence(tmp_path: Path, monkeypatch):
+    fake_bin, removed_tags, docker_calls = _make_fake_docker(tmp_path)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_IID", f"sha256:{'d' * 64}")
+    monkeypatch.setenv("FAKE_DOCKER_BUILD_EXIT", "7")
+    monkeypatch.setenv("FAKE_DOCKER_REMOVE_EXIT", "9")
+    monkeypatch.setenv("FAKE_DOCKER_INSPECT_EXIT", "125")
+    monkeypatch.setenv("FAKE_DOCKER_INSPECT_STDERR", "Cannot connect to the Docker daemon")
+    monkeypatch.setenv("FAKE_DOCKER_REMOVED_TAGS", str(removed_tags))
+    monkeypatch.setenv("FAKE_DOCKER_CALLS", str(docker_calls))
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"build exit 7.*remove exit 9.*inspect exit 125.*Cannot connect to the Docker daemon",
+    ):
         with _build_environment(tmp_path) as image:
             assert image.result.returncode == 7
 

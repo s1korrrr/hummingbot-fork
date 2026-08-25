@@ -87,6 +87,13 @@ def test_pip_lock_accepts_uv_multiline_hash_continuations(tmp_path: Path):
     lock_validator._validate_pip_lock(lock, {"injective-py": "1.13.0"})
 
 
+def test_pip_lock_rejects_duplicate_pep503_aliases(tmp_path: Path):
+    lock = tmp_path / "alias.lock"
+    lock.write_text("foo_bar==1 \\\n    --hash=sha256:" + "a" * 64 + "\nfoo-bar==1 \\\n    --hash=sha256:" + "b" * 64 + "\n")
+    with pytest.raises(lock_validator.LockValidationError, match="duplicate"):
+        lock_validator._validate_pip_lock(lock, {"foo-bar": "1"})
+
+
 def test_solve_target_rejects_cache_dependent_fetch_omissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     environment = tmp_path / "environment.yml"
     environment.write_text("dependencies:\n  - python==3.13.15\n  - requests\n")

@@ -162,10 +162,10 @@ def _pip_lock_from_downloads(python: str, temp_root: Path) -> str:
     download_dir.mkdir()
     requirements = [f"{name}=={version}" for name, version in EIP712_DIRECT_REQUIREMENTS.items()]
     result = subprocess.run(
-        [python, "-m", "pip", "download", "--isolated", "--index-url", PYPI_INDEX, "--no-deps", "--dest", str(download_dir), *requirements],
+        [python, "-m", "pip", "download", "--isolated", "--no-cache-dir", "--index-url", PYPI_INDEX, "--no-deps", "--dest", str(download_dir), *requirements],
         check=False,
         capture_output=True,
-        text=True,
+        text=True, env={**_resolver_environment(temp_root), "PIP_CONFIG_FILE": os.devnull},
     )
     if result.returncode != 0:
         raise LockValidationError(f"pip download failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -194,7 +194,7 @@ def _injective_lock_from_uv(uv: str, temp_root: Path, target: str, constraints: 
     output_path = temp_root / f"injective-{target}.lock"
     input_path.write_text("".join(f"{name}=={version}\n" for name, version in INJECTIVE_DIRECT_REQUIREMENTS.items()))
     result = subprocess.run(
-        [uv, "pip", "compile", str(input_path), "--constraint", str(constraints), "--python-version", "3.13", "--python-platform", PIP_TARGETS[target], "--generate-hashes", "--no-annotate", "--no-header", "--no-config", "--default-index", PYPI_INDEX, "--output-file", str(output_path)],
+        [uv, "pip", "compile", str(input_path), "--constraint", str(constraints), "--python-version", PYTHON_VERSION, "--python-platform", PIP_TARGETS[target], "--generate-hashes", "--no-annotate", "--no-header", "--no-config", "--default-index", PYPI_INDEX, "--output-file", str(output_path)],
         check=False, capture_output=True, text=True, env=_resolver_environment(temp_root),
     )
     if result.returncode != 0:

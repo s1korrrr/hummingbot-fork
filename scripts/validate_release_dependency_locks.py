@@ -88,7 +88,7 @@ def _validate_source_pins(environment_path: Path, pip_packages_path: Path) -> No
 
 
 def _canonical_package_name(value: str) -> str:
-    return value.lower().replace("_", "-")
+    return re.sub(r"[-_.]+", "-", value.lower())
 
 
 def _conda_spec_name(spec: str) -> str:
@@ -181,6 +181,7 @@ def _validate_pip_lock(path: Path, expected_requirements: dict[str, str], *, clo
             index += 1
         if not hashes:
             raise LockValidationError(f"{path}: pip requirement {name} has no SHA-256 hash")
+        name = _canonical_package_name(name)
         if name in found:
             raise LockValidationError(f"{path}: duplicate pip requirement {name}")
         found[name] = (version, hashes)

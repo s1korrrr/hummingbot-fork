@@ -1,9 +1,11 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -289,7 +291,8 @@ def test_release_explicitly_preserves_tini_and_execs_the_hummingbot_python():
 
     assert 'ENTRYPOINT ["/usr/bin/tini", "--"]' in dockerfile
     assert (
-        'CMD ["/bin/bash", "-lc", "exec /opt/conda/envs/hummingbot/bin/python '
+        'CMD ["/bin/bash", "-lc", "source /opt/conda/etc/profile.d/conda.sh && '
+        'conda activate hummingbot && exec python '
         './bin/hummingbot_quickstart.py 2>> ./logs/errors.log"]' in dockerfile
     )
 
@@ -357,6 +360,82 @@ def test_conda_environment_records_conda_forge_package_urls_and_selected_python(
     )
     assert probe.returncode == 0, probe.stderr
     assert re.fullmatch(r"3\.1[0-9]\.[0-9]+\n", probe.stdout)
+
+
+def test_runtime_command_activates_the_environment_and_preserves_tini_signal_forwarding():
+    assert shutil.which("docker"), "Docker is required for runtime environment verification"
+    result = _build_environment()
+    assert result.returncode == 0, result.stderr
+
+    cmd_match = re.search(r"^CMD (\[.*\])$", _dockerfile(), flags=re.MULTILINE)
+    assert cmd_match is not None
+    cmd = json.loads(cmd_match.group(1))
+    assert cmd[:2] == ["/bin/bash", "-lc"]
+    shell_command = cmd[2]
+    runtime_tail = "exec python ./bin/hummingbot_quickstart.py 2>> ./logs/errors.log"
+    assert shell_command.endswith(runtime_tail)
+
+    probe_program = (
+        "import json, os, shutil, sys; "
+        "print(json.dumps({'sys_executable': sys.executable, "
+        "'which_python': shutil.which('python'), "
+        "'conda_prefix': os.environ.get('CONDA_PREFIX'), "
+        "'path_head': os.environ['PATH'].split(':', 1)[0]}))"
+    )
+    probe_command = shell_command.removesuffix(runtime_tail) + f"exec python -c {shlex.quote(probe_program)}"
+    probe = subprocess.run(
+        ["docker", "run", "--rm", ENVIRONMENT_IMAGE, "/bin/bash", "-lc", probe_command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert json.loads(probe.stdout) == {
+        "sys_executable": "/opt/conda/envs/hummingbot/bin/python",
+        "which_python": "/opt/conda/envs/hummingbot/bin/python",
+        "conda_prefix": "/opt/conda/envs/hummingbot",
+        "path_head": "/opt/conda/envs/hummingbot/bin",
+    }
+
+    signal_program = "import time; time.sleep(300)"
+    signal_command = shell_command.removesuffix(runtime_tail) + f"exec python -c {shlex.quote(signal_program)}"
+    container = subprocess.run(
+        ["docker", "run", "--detach", ENVIRONMENT_IMAGE, "/bin/bash", "-lc", signal_command],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    try:
+        deadline = time.monotonic() + 5
+        processes = []
+        while time.monotonic() < deadline:
+            process_table = subprocess.run(
+                ["docker", "top", container, "-eo", "pid,ppid,comm,args"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            processes = [line.split(maxsplit=3) for line in process_table[1:]]
+            if any(process[2].startswith("python") for process in processes):
+                break
+            time.sleep(0.1)
+        tini = next(process for process in processes if process[2] == "tini")
+        python = next(process for process in processes if process[2].startswith("python"))
+        assert python[1] == tini[0]
+
+        subprocess.run(["docker", "stop", "--time", "3", container], check=True, capture_output=True, text=True)
+        state = subprocess.run(
+            ["docker", "inspect", container, "--format", "{{json .State}}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        state_document = json.loads(state.stdout)
+        assert state_document["Status"] == "exited"
+        assert state_document["ExitCode"] == 143
+        assert state_document["OOMKilled"] is False
+    finally:
+        subprocess.run(["docker", "rm", "--force", container], check=False, capture_output=True, text=True)
 
 
 def test_workflow_pr_verification_is_non_pushing_and_binds_pr_head_sha():

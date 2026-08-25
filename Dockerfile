@@ -120,4 +120,4 @@ COPY --from=builder /home/ /home/
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # Set the default command to run when starting the container
-CMD ["/bin/bash", "-lc", "exec /opt/conda/envs/hummingbot/bin/python ./bin/hummingbot_quickstart.py 2>> ./logs/errors.log"]
+CMD ["/bin/bash", "-lc", "source /opt/conda/etc/profile.d/conda.sh && conda activate hummingbot && exec python ./bin/hummingbot_quickstart.py 2>> ./logs/errors.log"]

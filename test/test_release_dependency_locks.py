@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts import validate_release_dependency_locks as lock_validator
+from scripts import (
+    generate_release_dependency_locks as lock_generator,
+    validate_release_dependency_locks as lock_validator,
+)
 from scripts.generate_release_dependency_locks import _solve_target, conda_specs_from_environment
-from scripts import generate_release_dependency_locks as lock_generator
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCKS = ROOT / "setup/locks"
@@ -123,6 +125,7 @@ def test_resolver_environment_strips_hostile_pip_and_uv_variables(tmp_path: Path
 
 def test_uv_subprocess_uses_exact_isolated_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     captured = {}
+
     def fake_run(argv, **kwargs):
         captured.update(argv=argv, env=kwargs["env"])
         Path(argv[-1]).write_text("injective-py==1.13.0 \\\n    --hash=sha256:" + "a" * 64 + "\nsafe-pysha3==1.0.4 \\\n    --hash=sha256:" + "b" * 64 + "\n")
@@ -137,6 +140,7 @@ def test_uv_subprocess_uses_exact_isolated_boundary(tmp_path: Path, monkeypatch:
 
 def test_pip_subprocess_uses_isolated_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     captured = {}
+
     def fake_run(argv, **kwargs):
         captured.update(argv=argv, env=kwargs["env"])
         destination = Path(argv[argv.index("--dest") + 1]); destination.mkdir(exist_ok=True)

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -132,6 +133,20 @@ def test_uv_subprocess_uses_exact_isolated_boundary(tmp_path: Path, monkeypatch:
     assert captured["argv"][captured["argv"].index("--python-version") + 1] == "3.13.15"
     assert "--no-config" in captured["argv"] and "https://pypi.org/simple" in captured["argv"]
     assert captured["env"]["UV_CACHE_DIR"] == str(tmp_path / "uv-cache")
+
+
+def test_pip_subprocess_uses_isolated_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    captured = {}
+    def fake_run(argv, **kwargs):
+        captured.update(argv=argv, env=kwargs["env"])
+        destination = Path(argv[argv.index("--dest") + 1]); destination.mkdir(exist_ok=True)
+        (destination / "eip712_structs-1.1.0.tar.gz").write_bytes(b"artifact")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(lock_generator.subprocess, "run", fake_run)
+    lock_generator._pip_lock_from_downloads("python", tmp_path)
+    assert "--isolated" in captured["argv"] and "--no-cache-dir" in captured["argv"] and "--no-deps" in captured["argv"]
+    assert captured["argv"][captured["argv"].index("--index-url") + 1] == "https://pypi.org/simple"
+    assert captured["env"]["PIP_CONFIG_FILE"] == os.devnull
 
 
 def test_solve_target_rejects_cache_dependent_fetch_omissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

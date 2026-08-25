@@ -26,6 +26,7 @@ from controllers.directional_trading.rsi_v5_core.perp_episode_parity_v2 import (
 D = Decimal
 ROOT = Path(__file__).resolve().parents[2]
 V2_RUNNER = ROOT / "scripts/run_perp_episode_parity_v2.py"
+V2_VERIFIER = ROOT / "scripts/verify_perp_episode_parity_v2.py"
 V2_PAIR_VERIFIER = ROOT / "scripts/verify_perp_episode_parity_pair_v2.py"
 
 
@@ -82,12 +83,12 @@ def artifact_payload(**overrides: object) -> dict[str, object]:
         "reward": {"kind": "LOG_RETURN", "value": reward_value},
         "attribution": attribution(),
         "settlement_mode": "force_flat",
-        "terminal_outcome": "SOLVENT",
+        "terminal_outcome": "FLAT",
         "fill_identity": {
-            "fill_ids": ["fill-a", "fill-b", "fill-c"],
+            "ordered_fill_ids": ["fill-a", "fill-b", "fill-c"],
             "fill_timestamps_ns": [1200, 1500, 1800],
-            "first_fill_ns": 1200,
-            "last_fill_ns": 1800,
+            "first_fill_timestamp_ns": 1200,
+            "last_fill_timestamp_ns": 1800,
         },
         "timestamp_identity": {
             "before_as_of_ns": 1000,
@@ -116,10 +117,10 @@ def run_payload(artifact: bytes, **overrides: object) -> dict[str, object]:
         "attribution": attribution(),
         "settlement_mode": "force_flat",
         "fill_identity": {
-            "fill_ids": ["fill-a", "fill-b", "fill-c"],
+            "ordered_fill_ids": ["fill-a", "fill-b", "fill-c"],
             "fill_timestamps_ns": [1200, 1500, 1800],
-            "first_fill_ns": 1200,
-            "last_fill_ns": 1800,
+            "first_fill_timestamp_ns": 1200,
+            "last_fill_timestamp_ns": 1800,
         },
         "quants_lab_artifact_sha256": hashlib.sha256(artifact).hexdigest(),
         "tolerance": "0.000000000000000001",
@@ -249,25 +250,31 @@ def test_v2_compares_every_attribution_component(field: str) -> None:
 @pytest.mark.parametrize(
     ("artifact_override", "mismatch"),
     [
-        ({"settlement_mode": "mark_to_liquidation"}, "settlement_mode"),
         (
             {
-                "fill_identity": {
-                    "fill_ids": ["fill-a", "fill-x", "fill-c"],
-                    "fill_timestamps_ns": [1200, 1500, 1800],
-                    "first_fill_ns": 1200,
-                    "last_fill_ns": 1800,
-                }
+                "settlement_mode": "mark_to_liquidation",
+                "terminal_outcome": "ACTIVE",
             },
-            "fill_identity.fill_ids",
+            "settlement_mode",
         ),
         (
             {
                 "fill_identity": {
-                    "fill_ids": ["fill-a", "fill-b", "fill-c"],
+                    "ordered_fill_ids": ["fill-a", "fill-x", "fill-c"],
+                    "fill_timestamps_ns": [1200, 1500, 1800],
+                    "first_fill_timestamp_ns": 1200,
+                    "last_fill_timestamp_ns": 1800,
+                }
+            },
+            "fill_identity.ordered_fill_ids",
+        ),
+        (
+            {
+                "fill_identity": {
+                    "ordered_fill_ids": ["fill-a", "fill-b", "fill-c"],
                     "fill_timestamps_ns": [1200, 1600, 1800],
-                    "first_fill_ns": 1200,
-                    "last_fill_ns": 1800,
+                    "first_fill_timestamp_ns": 1200,
+                    "last_fill_timestamp_ns": 1800,
                 }
             },
             "fill_identity.fill_timestamps_ns",
@@ -294,10 +301,10 @@ def test_v2_compares_settlement_fill_and_timestamp_identity(
 
 def test_v2_represents_episode_without_fills_using_explicit_null_timestamps() -> None:
     no_fills = {
-        "fill_ids": [],
+        "ordered_fill_ids": [],
         "fill_timestamps_ns": [],
-        "first_fill_ns": None,
-        "last_fill_ns": None,
+        "first_fill_timestamp_ns": None,
+        "last_fill_timestamp_ns": None,
     }
     artifact = artifact_bytes(fill_identity=no_fills)
     result = evaluate_v2_payload(
@@ -453,6 +460,24 @@ def test_v2_cli_requires_exact_artifact_for_readiness(tmp_path: Path) -> None:
         check=False,
     )
     assert run.returncode == 0, run.stderr
+    standalone = subprocess.run(
+        [
+            sys.executable,
+            str(V2_VERIFIER),
+            "--input",
+            str(input_path),
+            "--quants-artifact",
+            str(artifact_path),
+            "--result",
+            str(result_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert standalone.returncode == 0, standalone.stderr
+    assert "PARITY_V2_MATCH" in standalone.stdout
     verified = subprocess.run(
         [
             sys.executable,
@@ -492,3 +517,99 @@ def test_v2_cli_requires_exact_artifact_for_readiness(tmp_path: Path) -> None:
     )
     assert tampered.returncode == 1
     assert "artifact SHA-256 mismatch" in tampered.stderr
+
+
+def test_v2_standalone_verifier_requires_hummingbot_input(tmp_path: Path) -> None:
+    artifact = artifact_bytes()
+    artifact_path = tmp_path / "quants-artifact.json"
+    input_path = tmp_path / "run.json"
+    result_path = tmp_path / "result.json"
+    artifact_path.write_bytes(artifact)
+    input_path.write_text(json.dumps(run_payload(artifact)), encoding="utf-8")
+    run_parity_v2_files(
+        input_path=input_path,
+        quants_artifact_path=artifact_path,
+        output_path=result_path,
+    )
+    verified = subprocess.run(
+        [
+            sys.executable,
+            str(V2_VERIFIER),
+            "--result",
+            str(result_path),
+            "--quants-artifact",
+            str(artifact_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verified.returncode == 2
+    assert "--input" in verified.stderr
+
+
+def test_v2_standalone_verifier_rejects_coordinated_semantic_rehash(
+    tmp_path: Path,
+) -> None:
+    original_artifact = artifact_bytes()
+    artifact_path = tmp_path / "quants-artifact.json"
+    input_path = tmp_path / "run.json"
+    result_path = tmp_path / "result.json"
+    artifact_path.write_bytes(original_artifact)
+    input_path.write_text(
+        json.dumps(run_payload(original_artifact)),
+        encoding="utf-8",
+    )
+    run_parity_v2_files(
+        input_path=input_path,
+        quants_artifact_path=artifact_path,
+        output_path=result_path,
+    )
+
+    changed_artifact = artifact_bytes(
+        settlement_mode="mark_to_liquidation",
+        terminal_outcome="ACTIVE",
+    )
+    artifact_path.write_bytes(changed_artifact)
+    changed_artifact_hash = hashlib.sha256(changed_artifact).hexdigest()
+    run = json.loads(input_path.read_text(encoding="utf-8"))
+    run["quants_lab_artifact_sha256"] = changed_artifact_hash
+    input_path.write_text(json.dumps(run), encoding="utf-8")
+
+    forged = json.loads(result_path.read_text(encoding="utf-8"))
+    forged["actual"]["settlement_mode"] = "mark_to_liquidation"
+    forged["actual"]["terminal_outcome"] = "ACTIVE"
+    forged["expectation"]["settlement_mode"] = "mark_to_liquidation"
+    forged["expectation"]["terminal_outcome"] = "ACTIVE"
+    forged["quants_lab_artifact_sha256"] = changed_artifact_hash
+    forged_without_hash = {
+        key: value for key, value in forged.items() if key != "result_hash"
+    }
+    forged["result_hash"] = hashlib.sha256(
+        json.dumps(
+            forged_without_hash,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    result_path.write_text(json.dumps(forged), encoding="utf-8")
+
+    verified = subprocess.run(
+        [
+            sys.executable,
+            str(V2_VERIFIER),
+            "--input",
+            str(input_path),
+            "--result",
+            str(result_path),
+            "--quants-artifact",
+            str(artifact_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert verified.returncode == 1
+    assert "does not match exact input/artifact re-evaluation" in verified.stderr

@@ -85,13 +85,20 @@ _RESULT_KEYS = {
     "result_hash",
 }
 _FILL_IDENTITY_KEYS = {
-    "fill_ids",
+    "ordered_fill_ids",
     "fill_timestamps_ns",
-    "first_fill_ns",
-    "last_fill_ns",
+    "first_fill_timestamp_ns",
+    "last_fill_timestamp_ns",
 }
 _TIMESTAMP_IDENTITY_KEYS = {"before_as_of_ns", "after_as_of_ns"}
 _REWARD_KEYS = {"kind", "value"}
+_PARITY_TERMINAL_OUTCOMES = {
+    "ACTIVE",
+    "FLAT",
+    "CARRIED",
+    TerminalOutcome.LIQUIDATED.value,
+    TerminalOutcome.INSOLVENT.value,
+}
 
 
 class ParityV2Error(ValueError):
@@ -275,15 +282,15 @@ def _parse_attribution(
 
 def _parse_fill_identity(value: object, label: str) -> dict[str, Any]:
     payload = _exact_keys(value, _FILL_IDENTITY_KEYS, label)
-    fill_ids_value = payload["fill_ids"]
+    fill_ids_value = payload["ordered_fill_ids"]
     if not isinstance(fill_ids_value, list):
-        raise ParityV2Error(f"{label}.fill_ids must be an array")
+        raise ParityV2Error(f"{label}.ordered_fill_ids must be an array")
     fill_ids = [
-        _text(item, f"{label}.fill_ids[{index}]")
+        _text(item, f"{label}.ordered_fill_ids[{index}]")
         for index, item in enumerate(fill_ids_value)
     ]
     if len(fill_ids) != len(set(fill_ids)):
-        raise ParityV2Error(f"{label}.fill_ids must be unique")
+        raise ParityV2Error(f"{label}.ordered_fill_ids must be unique")
     timestamps_value = payload["fill_timestamps_ns"]
     if not isinstance(timestamps_value, list):
         raise ParityV2Error(f"{label}.fill_timestamps_ns must be an array")
@@ -293,23 +300,32 @@ def _parse_fill_identity(value: object, label: str) -> dict[str, Any]:
     ]
     if len(fill_timestamps) != len(fill_ids):
         raise ParityV2Error(
-            f"{label}.fill_timestamps_ns must align one-to-one with fill_ids"
+            f"{label}.fill_timestamps_ns must align one-to-one with ordered_fill_ids"
         )
     if fill_timestamps != sorted(fill_timestamps):
         raise ParityV2Error(f"{label}.fill_timestamps_ns must be monotonic")
     if not fill_ids:
-        if payload["first_fill_ns"] is not None or payload["last_fill_ns"] is not None:
+        if (
+            payload["first_fill_timestamp_ns"] is not None
+            or payload["last_fill_timestamp_ns"] is not None
+        ):
             raise ParityV2Error(
                 f"{label} empty fill IDs require null fill timestamps"
             )
         return {
-            "fill_ids": [],
+            "ordered_fill_ids": [],
             "fill_timestamps_ns": [],
-            "first_fill_ns": None,
-            "last_fill_ns": None,
+            "first_fill_timestamp_ns": None,
+            "last_fill_timestamp_ns": None,
         }
-    first_fill_ns = _integer(payload["first_fill_ns"], f"{label}.first_fill_ns")
-    last_fill_ns = _integer(payload["last_fill_ns"], f"{label}.last_fill_ns")
+    first_fill_ns = _integer(
+        payload["first_fill_timestamp_ns"],
+        f"{label}.first_fill_timestamp_ns",
+    )
+    last_fill_ns = _integer(
+        payload["last_fill_timestamp_ns"],
+        f"{label}.last_fill_timestamp_ns",
+    )
     if first_fill_ns > last_fill_ns:
         raise ParityV2Error(f"{label} timestamps must be monotonic")
     if fill_timestamps[0] != first_fill_ns or fill_timestamps[-1] != last_fill_ns:
@@ -317,10 +333,10 @@ def _parse_fill_identity(value: object, label: str) -> dict[str, Any]:
             f"{label} first/last timestamps must match the fill timestamp sequence"
         )
     return {
-        "fill_ids": fill_ids,
+        "ordered_fill_ids": fill_ids,
         "fill_timestamps_ns": fill_timestamps,
-        "first_fill_ns": first_fill_ns,
-        "last_fill_ns": last_fill_ns,
+        "first_fill_timestamp_ns": first_fill_ns,
+        "last_fill_timestamp_ns": last_fill_ns,
     }
 
 
@@ -361,24 +377,32 @@ def _parse_economics(value: object, label: str) -> dict[str, Any]:
         settlement_mode = TerminalSettlementMode(
             _text(payload["settlement_mode"], f"{label}.settlement_mode")
         )
-        terminal_outcome = TerminalOutcome(
-            _text(payload["terminal_outcome"], f"{label}.terminal_outcome")
-        )
     except ValueError as error:
         raise ParityV2Error(f"{label} terminal enum is invalid") from error
-    reward = _parse_reward(payload["reward"], f"{label}.reward")
-    if terminal_outcome is TerminalOutcome.SOLVENT and reward["kind"] != "LOG_RETURN":
-        raise ParityV2Error(f"{label} solvent outcome requires LOG_RETURN reward")
-    if terminal_outcome is not TerminalOutcome.SOLVENT and reward["kind"] != terminal_outcome.value:
-        raise ParityV2Error(f"{label} terminal outcome and reward kind disagree")
-    expected_outcome = (
-        TerminalOutcome.SOLVENT
-        if nav_after > 0
-        else TerminalOutcome.LIQUIDATED
-        if nav_after == 0
-        else TerminalOutcome.INSOLVENT
+    terminal_outcome = _text(
+        payload["terminal_outcome"], f"{label}.terminal_outcome"
     )
-    if terminal_outcome is not expected_outcome:
+    if terminal_outcome not in _PARITY_TERMINAL_OUTCOMES:
+        raise ParityV2Error(f"{label} terminal enum is invalid")
+    reward = _parse_reward(payload["reward"], f"{label}.reward")
+    if terminal_outcome in {"ACTIVE", "FLAT", "CARRIED"} and reward["kind"] != "LOG_RETURN":
+        raise ParityV2Error(f"{label} solvent outcome requires LOG_RETURN reward")
+    if terminal_outcome in {
+        TerminalOutcome.LIQUIDATED.value,
+        TerminalOutcome.INSOLVENT.value,
+    } and reward["kind"] != terminal_outcome:
+        raise ParityV2Error(f"{label} terminal outcome and reward kind disagree")
+    if nav_after > 0:
+        expected_outcome = {
+            TerminalSettlementMode.FORCE_FLAT: "FLAT",
+            TerminalSettlementMode.CARRY_STATE: "CARRIED",
+            TerminalSettlementMode.MARK_TO_LIQUIDATION: "ACTIVE",
+        }[settlement_mode]
+    elif nav_after == 0:
+        expected_outcome = TerminalOutcome.LIQUIDATED.value
+    else:
+        expected_outcome = TerminalOutcome.INSOLVENT.value
+    if terminal_outcome != expected_outcome:
         raise ParityV2Error(f"{label} terminal outcome does not match nav_after")
     if nav_before <= 0:
         raise ParityV2Error(f"{label} nav_before must be positive")
@@ -394,10 +418,10 @@ def _parse_economics(value: object, label: str) -> dict[str, Any]:
     timestamp_identity = _parse_timestamp_identity(
         payload["timestamp_identity"], f"{label}.timestamp_identity"
     )
-    if fill_identity["fill_ids"] and not (
+    if fill_identity["ordered_fill_ids"] and not (
         timestamp_identity["before_as_of_ns"]
-        <= fill_identity["first_fill_ns"]
-        <= fill_identity["last_fill_ns"]
+        <= fill_identity["first_fill_timestamp_ns"]
+        <= fill_identity["last_fill_timestamp_ns"]
         <= timestamp_identity["after_as_of_ns"]
     ):
         raise ParityV2Error(f"{label} fill timestamps must be inside snapshot timestamps")
@@ -409,7 +433,7 @@ def _parse_economics(value: object, label: str) -> dict[str, Any]:
         "reward": reward,
         "attribution": attribution_wire,
         "settlement_mode": settlement_mode.value,
-        "terminal_outcome": terminal_outcome.value,
+        "terminal_outcome": terminal_outcome,
         "fill_identity": fill_identity,
         "timestamp_identity": timestamp_identity,
     }
@@ -459,10 +483,10 @@ def _actual_economics(value: object) -> tuple[dict[str, Any], Decimal, str]:
     except ValueError as error:
         raise ParityV2Error("run.settlement_mode is invalid") from error
     fill_identity = _parse_fill_identity(payload["fill_identity"], "run.fill_identity")
-    if fill_identity["fill_ids"] and not (
+    if fill_identity["ordered_fill_ids"] and not (
         before.as_of_ns
-        <= fill_identity["first_fill_ns"]
-        <= fill_identity["last_fill_ns"]
+        <= fill_identity["first_fill_timestamp_ns"]
+        <= fill_identity["last_fill_timestamp_ns"]
         <= after.as_of_ns
     ):
         raise ParityV2Error("fill timestamps must be inside snapshot timestamps")
@@ -499,6 +523,14 @@ def _actual_economics(value: object) -> tuple[dict[str, Any], Decimal, str]:
             }
         else:
             reward = {"kind": after_nav.terminal_outcome.value, "value": None}
+    if after_nav.terminal_outcome is TerminalOutcome.SOLVENT:
+        terminal_outcome = {
+            TerminalSettlementMode.FORCE_FLAT: "FLAT",
+            TerminalSettlementMode.CARRY_STATE: "CARRIED",
+            TerminalSettlementMode.MARK_TO_LIQUIDATION: "ACTIVE",
+        }[settlement_mode]
+    else:
+        terminal_outcome = after_nav.terminal_outcome.value
     actual = {
         "episode_id": episode_id,
         "nav_before": _decimal_text(before_nav.nav),
@@ -507,7 +539,7 @@ def _actual_economics(value: object) -> tuple[dict[str, Any], Decimal, str]:
         "reward": reward,
         "attribution": attribution_wire,
         "settlement_mode": settlement_mode.value,
-        "terminal_outcome": after_nav.terminal_outcome.value,
+        "terminal_outcome": terminal_outcome,
         "fill_identity": fill_identity,
         "timestamp_identity": {
             "before_as_of_ns": before.as_of_ns,
@@ -552,10 +584,10 @@ def _compare_economics(
         if actual[field] != expectation[field]:
             mismatches.append(field)
     for field in (
-        "fill_ids",
+        "ordered_fill_ids",
         "fill_timestamps_ns",
-        "first_fill_ns",
-        "last_fill_ns",
+        "first_fill_timestamp_ns",
+        "last_fill_timestamp_ns",
     ):
         if actual["fill_identity"][field] != expectation["fill_identity"][field]:
             mismatches.append(f"fill_identity.{field}")
@@ -609,10 +641,6 @@ def _read_json_file(path: Path, label: str) -> object:
         return json.loads(_read_regular_bytes(path, label).decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ParityV2Error(f"cannot parse {label}: {error}") from error
-
-
-def read_quants_artifact_sha256(path: Path) -> str:
-    return hashlib.sha256(_read_regular_bytes(Path(path), "quants artifact")).hexdigest()
 
 
 def _verified_result(value: object) -> dict[str, Any]:

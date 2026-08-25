@@ -3,6 +3,8 @@
 # linux/arm64: sha256:0d488aad6aec4534ec679b22e1d6105a0d78203b57c78876d0808bfaba1a0562
 FROM docker.io/condaforge/miniforge3:26.5.3-0@sha256:b230e51ddd0ebc4b08bb44d7442c20f9443973e3ddd09cf7f621b04fe449ca66 AS identity-check
 
+ARG TARGETPLATFORM
+
 ARG SOURCE_COMMIT
 ARG COMMIT
 
@@ -59,8 +61,11 @@ WORKDIR /home/hummingbot
 
 # Create conda environment
 COPY setup/environment.yml /tmp/environment.yml
-RUN conda env create -f /tmp/environment.yml && \
+RUN install -d /opt/conda/image-evidence && \
+    PIP_REPORT=/opt/conda/image-evidence/hummingbot-environment-pip-install-report.json \
+        conda env create -f /tmp/environment.yml && \
     conda list -n hummingbot --explicit > /opt/conda/conda-meta/hummingbot-package-urls.txt && \
+    conda list --json > /opt/conda/image-evidence/base-final-conda-list.json && \
     if grep -Fq 'repo.anaconda.com' /opt/conda/conda-meta/hummingbot-package-urls.txt; then \
         echo "The hummingbot environment must not contain defaults-channel packages." >&2; \
         exit 1; \
@@ -81,11 +86,18 @@ COPY scripts/ scripts/
 COPY controllers/ controllers/
 COPY scripts/ scripts-copy/
 COPY setup.py .
-COPY LICENSE .
+COPY LICENSE THIRD_PARTY_NOTICES.md ./
+COPY licenses/miniforge-images-BSD-3-Clause.txt licenses/miniforge-images-BSD-3-Clause.txt
 COPY README.md .
 
 COPY setup/pip_packages.txt /tmp/pip_packages.txt
-RUN conda run -n hummingbot python -m pip install --no-deps -r /tmp/pip_packages.txt && \
+RUN conda run -n hummingbot python -m pip install --no-deps \
+        --report /opt/conda/image-evidence/hummingbot-pip-install-report.json \
+        -r /tmp/pip_packages.txt && \
+    install -m 0644 /tmp/pip_packages.txt \
+        /opt/conda/image-evidence/hummingbot-pip-requirements.txt && \
+    conda list -n hummingbot --json \
+        > /opt/conda/image-evidence/hummingbot-final-conda-list.json && \
     rm /tmp/pip_packages.txt
 
 
@@ -105,6 +117,12 @@ RUN apt-get update && \
 # Build final image using artifacts from builder and identity-bound metadata.
 FROM runtime-bootstrap AS release
 
+ARG SOURCE_COMMIT
+ARG TARGETPLATFORM
+ARG REQUIRE_APPROVED_LICENSE_EVIDENCE=false
+ARG EXPECTED_EVIDENCE_SET_SHA256_AMD64
+ARG EXPECTED_EVIDENCE_SET_SHA256_ARM64
+
 # Create mount points
 RUN mkdir -p /home/hummingbot/conf /home/hummingbot/conf/connectors /home/hummingbot/conf/strategies /home/hummingbot/conf/controllers /home/hummingbot/conf/scripts /home/hummingbot/logs /home/hummingbot/data /home/hummingbot/certs /home/hummingbot/scripts /home/hummingbot/controllers
 
@@ -113,6 +131,41 @@ WORKDIR /home/hummingbot
 # Copy all build artifacts from builder image
 COPY --from=builder /opt/conda/ /opt/conda/
 COPY --from=builder /home/ /home/
+
+# Preserve readable upstream notices and bind the exact final package set to
+# source, platform, artifact hashes where available, and installed license
+# evidence. This is mechanical provenance, not legal approval.
+RUN install -d /usr/share/licenses/hummingbot && \
+    install -m 0644 LICENSE THIRD_PARTY_NOTICES.md \
+        licenses/miniforge-images-BSD-3-Clause.txt \
+        /usr/share/licenses/hummingbot/ && \
+    install -m 0644 /opt/conda/LICENSE.txt \
+        /usr/share/licenses/hummingbot/Miniforge-BSD-3-Clause.txt && \
+    /opt/conda/envs/hummingbot/bin/python \
+        scripts/generate_third_party_license_inventory.py \
+        --conda-prefix /opt/conda \
+        --conda-prefix /opt/conda/envs/hummingbot \
+        --pip-report /opt/conda/image-evidence/hummingbot-environment-pip-install-report.json \
+        --pip-report /opt/conda/image-evidence/hummingbot-pip-install-report.json \
+        --conda-list /opt/conda/image-evidence/base-final-conda-list.json \
+        --conda-list /opt/conda/image-evidence/hummingbot-final-conda-list.json \
+        --python-prefix /opt/conda/envs/hummingbot \
+        --dpkg-root / \
+        --notice /usr/share/licenses/hummingbot/LICENSE \
+        --notice /usr/share/licenses/hummingbot/Miniforge-BSD-3-Clause.txt \
+        --notice /usr/share/licenses/hummingbot/THIRD_PARTY_NOTICES.md \
+        --notice /usr/share/licenses/hummingbot/miniforge-images-BSD-3-Clause.txt \
+        --source-commit "${SOURCE_COMMIT}" \
+        --base-image "docker.io/condaforge/miniforge3:26.5.3-0@sha256:b230e51ddd0ebc4b08bb44d7442c20f9443973e3ddd09cf7f621b04fe449ca66" \
+        --platform "${TARGETPLATFORM}" \
+        --output /usr/share/licenses/hummingbot/third-party-license-inventory.json && \
+    /opt/conda/envs/hummingbot/bin/python \
+        scripts/verify_generated_image_license_inventory.py \
+        /usr/share/licenses/hummingbot/third-party-license-inventory.json \
+        --platform "${TARGETPLATFORM}" \
+        --require-approved-binding "${REQUIRE_APPROVED_LICENSE_EVIDENCE}" \
+        --expected-amd64 "${EXPECTED_EVIDENCE_SET_SHA256_AMD64}" \
+        --expected-arm64 "${EXPECTED_EVIDENCE_SET_SHA256_ARM64}"
 
 # Preserve the pinned Miniforge base's tini contract explicitly. The shell uses
 # exec so the Hummingbot process becomes tini's direct child and receives

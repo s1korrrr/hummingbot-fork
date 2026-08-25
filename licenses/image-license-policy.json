@@ -1,0 +1,25 @@
+{
+  "approved_at": null,
+  "approved_by": null,
+  "approval_reason": null,
+  "base_image": "docker.io/condaforge/miniforge3:26.5.3-0@sha256:b230e51ddd0ebc4b08bb44d7442c20f9443973e3ddd09cf7f621b04fe449ca66",
+  "decision": "HOLD_FOR_EVIDENCE",
+  "expires_at": null,
+  "evidence_set_sha256": {
+    "linux/amd64": null,
+    "linux/arm64": null
+  },
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64"
+  ],
+  "publication_allowed": false,
+  "hold_reason": "Platform-specific final-image inventories and package redistribution review are not complete.",
+  "required_evidence": [
+    "exact final-image evidence set for linux/amd64",
+    "exact final-image evidence set for linux/arm64",
+    "reviewed package-specific redistribution obligations",
+    "named operator or counsel approval"
+  ],
+  "schema_version": 1
+}

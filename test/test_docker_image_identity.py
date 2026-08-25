@@ -23,6 +23,8 @@ WORKFLOW = ROOT / ".github/workflows/docker_buildx_workflow.yml"
 SOURCE_SHA = "6a8b5c37ea5bdfbdfc11127e3fa0a05a35e386ca"  # noqa: mock
 PINNED_MINIFORGE = "docker.io/condaforge/miniforge3:26.5.3-0@sha256:b230e51ddd0ebc4b08bb44d7442c20f9443973e3ddd09cf7f621b04fe449ca66"  # noqa: mock
 ENVIRONMENT_FILES = (ROOT / "setup/environment.yml", ROOT / "setup/environment_dydx.yml")
+THIRD_PARTY_NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
+IMAGE_LICENSE_GATE_DOC = ROOT / "docs/release/image-license-gate.md"
 PINNED_ACTIONS = {
     "actions/checkout": "11bd71901bbe5b1630ceea73d27597364c9af683",  # noqa: mock
     "docker/setup-qemu-action": "29109295f81e9208d7d86ff1c6c12d2833863392",  # noqa: mock
@@ -59,7 +61,11 @@ def _workflow_document() -> dict:
 
 def _release_validation_script() -> str:
     workflow = _workflow_document()
-    return workflow["jobs"]["validate_release"]["steps"][0]["run"]
+    return next(
+        step["run"]
+        for step in workflow["jobs"]["validate_release"]["steps"]
+        if step.get("id") == "confirm"
+    )
 
 
 def _workflow_step(job_name: str, step_id: str) -> dict:
@@ -643,6 +649,78 @@ def test_dockerfile_runs_pip_and_native_build_inside_the_hummingbot_environment(
     assert "conda run -n hummingbot --no-capture-output python setup.py build_ext" in dockerfile
     assert "RUN python3 -m pip install" not in dockerfile
     assert "RUN python3 setup.py build_ext" not in dockerfile
+
+
+def test_release_preserves_license_texts_and_generates_solved_package_inventory():
+    dockerfile = _dockerfile()
+
+    assert THIRD_PARTY_NOTICES.is_file()
+    notices = THIRD_PARTY_NOTICES.read_text()
+    assert "/home/hummingbot/LICENSE" in notices
+    assert "/opt/conda/LICENSE.txt" in notices
+    assert "/usr/share/licenses/hummingbot/third-party-license-inventory.json" in notices
+    assert "does not establish legal clearance" in notices
+    assert "COPY LICENSE THIRD_PARTY_NOTICES.md ./" in dockerfile
+    assert "--report /opt/conda/image-evidence/hummingbot-pip-install-report.json" in dockerfile
+    assert "scripts/generate_third_party_license_inventory.py" in dockerfile
+    assert "--conda-prefix /opt/conda" in dockerfile
+    assert "--conda-prefix /opt/conda/envs/hummingbot" in dockerfile
+    assert "PIP_REPORT=/opt/conda/image-evidence/hummingbot-environment-pip-install-report.json" in dockerfile
+    assert "--pip-report /opt/conda/image-evidence/hummingbot-environment-pip-install-report.json" in dockerfile
+    assert "--pip-report /opt/conda/image-evidence/hummingbot-pip-install-report.json" in dockerfile
+    assert "--conda-list /opt/conda/image-evidence/base-final-conda-list.json" in dockerfile
+    assert "--conda-list /opt/conda/image-evidence/hummingbot-final-conda-list.json" in dockerfile
+    assert "--python-prefix /opt/conda/envs/hummingbot" in dockerfile
+    assert "--dpkg-root /" in dockerfile
+    assert "--source-commit \"${SOURCE_COMMIT}\"" in dockerfile
+    assert "--platform \"${TARGETPLATFORM}\"" in dockerfile
+    assert "--output /usr/share/licenses/hummingbot/third-party-license-inventory.json" in dockerfile
+
+
+def test_image_license_gate_document_preserves_the_authority_boundary():
+    document = IMAGE_LICENSE_GATE_DOC.read_text()
+
+    assert "HOLD_FOR_EVIDENCE" in document
+    assert "legal determination" in document
+    assert "unresolved artifact sources" in document
+    assert "linux/amd64" in document
+    assert "linux/arm64" in document
+    assert "operator or counsel approval" in document
+    assert "does not include `source_commit`" in document
+    assert "must not be cited as source-review" in document
+
+
+def test_manual_publication_is_fail_closed_on_the_reviewed_license_policy():
+    workflow = _workflow_document()
+    validation_steps = workflow["jobs"]["validate_release"]["steps"]
+    checkout_index = next(
+        index
+        for index, step in enumerate(validation_steps)
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    policy_index = next(
+        index
+        for index, step in enumerate(validation_steps)
+        if "validate_image_license_policy.py" in step.get("run", "")
+    )
+    confirmation_index = next(
+        index for index, step in enumerate(validation_steps) if step.get("id") == "confirm"
+    )
+
+    assert checkout_index < policy_index < confirmation_index
+    assert workflow["jobs"]["publish_release"]["needs"] == "validate_release"
+    policy_step = validation_steps[policy_index]
+    assert policy_step["id"] == "license_policy"
+    assert "--github-output \"${GITHUB_OUTPUT}\"" in policy_step["run"]
+    publish_build = next(
+        step
+        for step in workflow["jobs"]["publish_release"]["steps"]
+        if step.get("id") == "image"
+    )
+    build_args = publish_build["with"]["build-args"]
+    assert "REQUIRE_APPROVED_LICENSE_EVIDENCE=true" in build_args
+    assert "EXPECTED_EVIDENCE_SET_SHA256_AMD64=${{ needs.validate_release.outputs.evidence_set_sha256_amd64 }}" in build_args
+    assert "EXPECTED_EVIDENCE_SET_SHA256_ARM64=${{ needs.validate_release.outputs.evidence_set_sha256_arm64 }}" in build_args
 
 
 def test_release_explicitly_preserves_tini_and_execs_the_hummingbot_python():

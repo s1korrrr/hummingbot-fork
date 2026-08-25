@@ -132,4 +132,19 @@
 
 ## Final notes
 
-- Pending implementation.
+- Task 1 completed on 2026-08-25. Added native explicit Conda lock generation
+  and offline validation under `scripts/`, with committed `linux-64` and
+  `linux-aarch64` locks. Both select Python `3.13.15`; each contains 273
+  package URLs pinned to HTTPS `conda-forge` artifacts and SHA-256 fragments.
+- `setup/locks/provenance.json` binds each lock artifact and the canonical
+  `setup/environment.yml` and `setup/pip_packages.txt` inputs. The pip lock
+  contains only `injective-py==1.13.0` and `eip712-structs==1.1.0`, each with
+  an exact SHA-256 hash. Source recipes now use those exact direct pins.
+- Validation run: focused lock tests (15 passed), offline lock validator,
+  `pip download --require-hashes --no-deps`, changed-file pre-commit hooks,
+  Python compilation, diff hygiene, and the existing image-identity test run
+  (no final failures recorded). Dockerfile/image behavior remains untouched.
+- Rollback: revert the Task 1 commit to remove the locks and helpers. No
+  registry, runtime, deployment, credential, or trading state was changed.
+- Follow-up: Task 2 must consume only these validated locks in Docker and run
+  per-platform builder evidence; source reproducibility is not runtime proof.

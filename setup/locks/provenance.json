@@ -1,0 +1,17 @@
+{
+  "artifacts": {
+    "linux-64.explicit.txt": "8b7c136a61f922a6977d4974d2ba6a4a41629608c337fc49a9c5af20cfdd3c67",
+    "linux-aarch64.explicit.txt": "b70b4df7d537f6123fb642870373175554f400ec5699f13f40cda51c40e9e310",
+    "pip-direct.lock.txt": "53993eaacf4d3a15959b4ba2622d46e61a6a887c89d1ecbeb962ed356ef3b163"
+  },
+  "format": 1,
+  "python_version": "3.13.15",
+  "sources": {
+    "setup/environment.yml": "19dc1562a01c6c6b8d3888ccaab0796ad994ac371989e9b0feef4b4c2898e679",
+    "setup/pip_packages.txt": "b74b9772269cdba42e987c1be6e8c9bbf4c66d113f5c7f5c8674abd720cfa971"
+  },
+  "targets": [
+    "linux-64",
+    "linux-aarch64"
+  ]
+}

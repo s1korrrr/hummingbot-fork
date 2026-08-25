@@ -14,6 +14,11 @@
   Docker's exact `sha256:<64-lowercase-hex>` local image ID.
 - Workflow syntax: `actionlint .github/workflows/docker_buildx_workflow.yml`.
 - Changed-file hooks: `conda run -n hummingbot pre-commit run --files <paths>`.
+- Offline dependency lock verification: `python scripts/validate_release_dependency_locks.py`.
+- Regenerate release locks only as an explicit reviewed operation in temporary
+  storage: `python scripts/generate_release_dependency_locks.py --python "$(which python)"`.
+  The generator refuses to overwrite `setup/locks/`; remove or replace prior
+  locks only through a deliberate reviewed change.
 
 ## Architecture and safety
 
@@ -21,6 +26,16 @@
   runtime deployment, and trading authority.
 - No local test, PR push, or source review authorizes service startup,
   credentials, orders, paper, canary, or live trading.
+- Release lock inputs are `setup/environment.yml` and `setup/pip_packages.txt`.
+  `setup/locks/provenance.json` fingerprints those sources and all committed
+  lock artifacts; validation must pass before Docker consumes either target.
+- `setup/locks/linux-64.explicit.txt` and
+  `setup/locks/linux-aarch64.explicit.txt` are native Conda `@EXPLICIT` locks
+  for Python `3.13.15`. They use only `https://conda.anaconda.org/conda-forge/`
+  URLs in the target subdir or `noarch` with lowercase SHA-256 fragments.
+- `setup/locks/pip-direct.lock.txt` is limited to direct `injective-py==1.13.0`
+  and `eip712-structs==1.1.0` hashes; the future release image must install it
+  with `--require-hashes --no-deps`.
 
 ## Known pitfalls
 

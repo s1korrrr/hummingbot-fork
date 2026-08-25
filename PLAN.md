@@ -77,7 +77,7 @@
      `eip712 -> eth-pydantic-types -> cchecksum` edge on Conda Forge.
 3. Use native Conda explicit locks plus target-specific full pip closures.
    - Chosen: Conda remains no-solve; exact `uv 0.11.29` generation resolves a
-     58-package Python 3.13 closure on both manylinux targets; install remains
+     59-package Python 3.13 closure on both manylinux targets; install remains
      resolver-free with exact hashes. `uv` is a pinned regeneration tool, not
      a runtime or global repository dependency.
 

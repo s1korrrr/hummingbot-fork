@@ -211,3 +211,5 @@
   `hexbytes>=1,<2`; both targets resolve 59 pip packages with 49 equal
   Conda/pip overlaps. Source locks remain distinct from target-image runtime
   evidence.
+- Selected option final result: two 367-record Conda locks and two 59-package
+  Injective closures with 49 equal overlaps and zero conflicts.

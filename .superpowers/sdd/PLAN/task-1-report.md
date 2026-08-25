@@ -17,14 +17,16 @@ Publication remains `HOLD_FOR_EVIDENCE`; no Dockerfile, image, deployment, or pu
 
 ## Final validation
 
-- Focused suite: `31 passed`.
+- Focused suite: `34 passed`.
 - Offline validator passed for both targets and Python 3.13.15.
 - Adversaries cover LINK/FETCH identity, hostile origin, exact closure maps,
   missing/extra/version drift, and zero-overlap conflicts.
 
 ## Changed files and commits
 
-Commits: `815d86f`, `43da388`, `e2889d2`, and `b2d4a60`.
+Commits: `7aef9e139`, `743841513`, `815d86f6f`, `43da388cb`,
+`e2889d299`, `b2d4a60b7`, `4c4dca783`, `2e555bd61`, `f0a847c60`, and
+`ca031427b`; this closeout docs commit follows them.
 Artifacts are two explicit locks, two Injective closures,
 `pip-eip712-direct.lock.txt`, and provenance.
 
@@ -34,6 +36,9 @@ Task 2 may proceed only after fresh independent re-review. It must consume
 locks without solves and prove target runtime imports/EIP-712 behavior.
 Generic `pip check` remains intentionally non-clean for the approved pysha3
 metadata substitution.
+
+Exact Python 3.13.15 regeneration byte-matched all six artifacts. Origin and
+PEP 503 alias adversaries are covered.
 
 ## Rollback
 

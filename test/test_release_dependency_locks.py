@@ -120,6 +120,20 @@ def test_resolver_environment_strips_hostile_pip_and_uv_variables(tmp_path: Path
     assert environment["UV_CACHE_DIR"] == str(tmp_path / "uv-cache")
 
 
+def test_uv_subprocess_uses_exact_isolated_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    captured = {}
+    def fake_run(argv, **kwargs):
+        captured.update(argv=argv, env=kwargs["env"])
+        Path(argv[-1]).write_text("injective-py==1.13.0 \\\n    --hash=sha256:" + "a" * 64 + "\nsafe-pysha3==1.0.4 \\\n    --hash=sha256:" + "b" * 64 + "\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(lock_generator.subprocess, "run", fake_run)
+    constraints = tmp_path / "c.txt"; constraints.write_text("")
+    lock_generator._injective_lock_from_uv("uv", tmp_path, "linux-64", constraints)
+    assert captured["argv"][captured["argv"].index("--python-version") + 1] == "3.13.15"
+    assert "--no-config" in captured["argv"] and "https://pypi.org/simple" in captured["argv"]
+    assert captured["env"]["UV_CACHE_DIR"] == str(tmp_path / "uv-cache")
+
+
 def test_solve_target_rejects_cache_dependent_fetch_omissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     environment = tmp_path / "environment.yml"
     environment.write_text("dependencies:\n  - python==3.13.15\n  - requests\n")

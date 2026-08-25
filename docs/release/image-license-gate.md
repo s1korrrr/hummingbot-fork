@@ -56,6 +56,35 @@ login, or publication. A missing, expired, malformed, or held record stops the
 release. This approval record is necessary but not sufficient while dependency
 inputs remain mutable or an inventory contains unresolved artifact sources.
 
+## Locked builder-environment evidence
+
+The release Docker build validates all committed dependency locks offline
+before it installs anything. `TARGETPLATFORM` then selects exactly one reviewed
+pair: `linux/amd64` uses `linux-64.explicit.txt` and
+`pip-injective-linux-64.lock.txt`; `linux/arm64` uses
+`linux-aarch64.explicit.txt` and
+`pip-injective-linux-aarch64.lock.txt`. Empty and unsupported target values fail
+closed. There is no `environment.yml` solve or broad-spec fallback.
+
+The selected `@EXPLICIT` Conda lock creates `/opt/conda/envs/hummingbot`.
+The target Injective closure and direct EIP-712 lock are installed separately
+with hashes required, dependency and build isolation disabled, and distinct
+pip reports. The builder preserves canonical source recipes, selected locks,
+provenance, target mapping, final Conda lists, explicit package URLs, Python
+version, and installed-requirement evidence under `/opt/conda/image-evidence`
+and `/opt/conda/conda-meta`.
+
+After the direct EIP-712 install, the image executes a deterministic EIP-712
+signable-bytes operation and checks the canonical empty-input Keccak-256 digest.
+That runtime reversal gate proves the reviewed `safe-pysha3` substitution works
+for the named operation. Generic `pip check` remains intentionally non-green
+because `eip712-structs` metadata still requests `pysha3`; it is diagnostic,
+not a claimed green gate.
+
+This is local target-image dependency/runtime evidence only. It is not proof of
+the compiled application, final-image license disposition, legal clearance,
+registry publication, deployment, service health, or trading readiness.
+
 ## Current remaining evidence
 
 - exact final-image dependency inventories for `linux/amd64` and `linux/arm64`,
@@ -63,8 +92,8 @@ inputs remain mutable or an inventory contains unresolved artifact sources.
 - resolution or explicit reviewed disposition for every unresolved artifact
   source;
 - package-specific redistribution review for the complete per-platform sets;
-- reproducible dependency locks or another reviewed binding that prevents a
-  later solve from silently changing the approved inventory;
+- exact final-image confirmation that the reviewed locks and builder evidence
+  remain unchanged through source compilation and runtime assembly;
 - explicit operator or counsel approval.
 
 Do not treat a green unit test, a local single-platform build, metadata alone,

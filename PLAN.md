@@ -52,6 +52,14 @@
 - A checked-in validator must bind lock artifacts to the canonical source
   recipes and validate them without network access. A regeneration command and
   provenance notes must be documented.
+- Resolve and validate the combined Conda-plus-pip environment. Every package
+  present in both layers must have the same normalized version in both locks;
+  source constraints such as `urllib3<2` remain binding. Missing, extra, or
+  version-drifted pip transitive entries fail against an exact closure manifest.
+- Python artifact generation must ignore ambient pip/uv configuration, use the
+  explicit `https://pypi.org/simple` origin policy, and bind that policy into
+  provenance. Host indexes, extra indexes, find-links, and local config may not
+  influence committed locks.
 - Preserve the Miniforge digest, image-identity gates, license inventory,
   notices, tini/runtime contract, immutable deploy contract, and current
   `HOLD_FOR_EVIDENCE` policy.
@@ -166,6 +174,14 @@
   partial slice. Read-only feasibility probes then resolved the chosen
   58-package hashed Injective closure for both manylinux targets with exact
   `uv 0.11.29`; Task 1 must now regenerate under that ruling.
+- Re-review correction: standalone closure feasibility is insufficient. The
+  first closures conflict with ten Conda versions, including violating the
+  source `urllib3<2` constraint with `urllib3==2.7.0`. Regeneration must
+  constrain pip resolution against each exact Conda result and prove zero
+  incompatible overlaps. Resolver configuration and PyPI origin must be
+  isolated/bound, and provenance must carry exact normalized closure maps so
+  missing, extra, or drifted transitive entries fail offline. If no compatible
+  combined solution exists, stop and record the exact dependency conflict.
 - Task 1 completed on 2026-08-25. Added native explicit Conda lock generation
   and offline validation under `scripts/`, with committed `linux-64` and
   `linux-aarch64` locks. Both select Python `3.13.15`; each contains 273
@@ -191,3 +207,7 @@
   its non-installing closure download because `coincurve` fails its macOS sdist
   metadata hook, so exact UV target regeneration byte comparison is the
   recorded equivalent. Task 2 still requires target-image runtime evidence.
+- Final combined resolution uses `eth-utils>=5,<6`, `eth-typing>=5,<6`, and
+  `hexbytes>=1,<2`; both targets resolve 59 pip packages with 49 equal
+  Conda/pip overlaps. Source locks remain distinct from target-image runtime
+  evidence.

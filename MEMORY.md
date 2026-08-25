@@ -33,9 +33,11 @@
   `setup/locks/linux-aarch64.explicit.txt` are native Conda `@EXPLICIT` locks
   for Python `3.13.15`. They use only `https://conda.anaconda.org/conda-forge/`
   URLs in the target subdir or `noarch` with lowercase SHA-256 fragments.
-- `setup/locks/pip-direct.lock.txt` is limited to direct `injective-py==1.13.0`
-  and `eip712-structs==1.1.0` hashes; the future release image must install it
-  with `--require-hashes --no-deps`.
+- The six current artifacts are two explicit Conda locks, two 59-package
+  target Injective closures, `pip-eip712-direct.lock.txt`, and provenance.
+  Both targets have 367 Conda entries and 49 version-equal Conda/pip overlaps.
+  Generation strips ambient `UV_*`/`PIP_*`, uses UV `--no-config` and pip
+  `--isolated`, and pins `https://pypi.org/simple`.
 
 ## Known pitfalls
 

@@ -14,8 +14,10 @@ try:
     from scripts.validate_release_dependency_locks import (
         CONDA_FORGE_HOST,
         CONDA_FORGE_PATH,
-        PIP_REQUIREMENTS,
+        EIP712_DIRECT_REQUIREMENTS,
+        INJECTIVE_DIRECT_REQUIREMENTS,
         PYTHON_VERSION,
+        RUNTIME_SUBSTITUTION,
         SHA256_RE,
         TARGETS,
         LockValidationError,
@@ -25,13 +27,22 @@ except ModuleNotFoundError:  # Direct execution adds scripts/ rather than the re
     from validate_release_dependency_locks import (
         CONDA_FORGE_HOST,
         CONDA_FORGE_PATH,
-        PIP_REQUIREMENTS,
+        EIP712_DIRECT_REQUIREMENTS,
+        INJECTIVE_DIRECT_REQUIREMENTS,
         PYTHON_VERSION,
+        RUNTIME_SUBSTITUTION,
         SHA256_RE,
         TARGETS,
         LockValidationError,
         validate_lock_directory,
     )
+
+
+UV_VERSION = "0.11.29"
+PIP_TARGETS = {
+    "linux-64": "x86_64-manylinux_2_17",
+    "linux-aarch64": "aarch64-manylinux_2_17",
+}
 
 
 def _write_explicit_lock(path: Path, records: list[dict[str, object]], target: str) -> None:
@@ -81,6 +92,7 @@ def _solve_target(conda: str, environment: Path, temp_root: Path, target: str) -
     prefix = temp_root / f"hummingbot-{target}"
     environment_variables = os.environ.copy()
     environment_variables["CONDA_OVERRIDE_GLIBC"] = "2.17"
+    environment_variables["CONDA_PKGS_DIRS"] = str(temp_root / "conda-pkgs")
     package_specs = conda_specs_from_environment(environment)
     if not package_specs:
         raise LockValidationError(f"{environment}: no Conda package specifications found")
@@ -108,18 +120,23 @@ def _solve_target(conda: str, environment: Path, temp_root: Path, target: str) -
         raise LockValidationError(f"{target}: Conda solve failed: {result.stderr.strip() or result.stdout.strip()}")
     try:
         payload = json.loads(result.stdout)
-        records = payload["actions"]["FETCH"]
+        fetch_records = payload["actions"]["FETCH"]
+        link_records = payload["actions"]["LINK"]
     except (json.JSONDecodeError, KeyError, TypeError) as error:
         raise LockValidationError(f"{target}: Conda dry-run did not return complete FETCH records") from error
-    if not isinstance(records, list) or not records:
+    if not isinstance(fetch_records, list) or not isinstance(link_records, list) or not link_records:
         raise LockValidationError(f"{target}: Conda dry-run returned no package records")
-    return records
+    fetch = {(record["name"], record["version"]): record for record in fetch_records}
+    linked = {(record["name"], record["version"]): record for record in link_records}
+    if set(fetch) != set(linked) or len(linked) != len(link_records):
+        raise LockValidationError(f"{target}: isolated package cache did not produce a complete link plan")
+    return [linked[identity] for identity in sorted(linked)]
 
 
 def _pip_lock_from_downloads(python: str, temp_root: Path) -> str:
     download_dir = temp_root / "pip-downloads"
     download_dir.mkdir()
-    requirements = [f"{name}=={version}" for name, version in PIP_REQUIREMENTS.items()]
+    requirements = [f"{name}=={version}" for name, version in EIP712_DIRECT_REQUIREMENTS.items()]
     result = subprocess.run(
         [python, "-m", "pip", "download", "--no-deps", "--dest", str(download_dir), *requirements],
         check=False,
@@ -129,10 +146,10 @@ def _pip_lock_from_downloads(python: str, temp_root: Path) -> str:
     if result.returncode != 0:
         raise LockValidationError(f"pip download failed: {result.stderr.strip() or result.stdout.strip()}")
     artifacts = sorted(download_dir.iterdir())
-    if len(artifacts) != len(PIP_REQUIREMENTS):
+    if len(artifacts) != 1:
         raise LockValidationError("pip download did not produce exactly the direct locked inputs")
     rendered = []
-    for name, version in PIP_REQUIREMENTS.items():
+    for name, version in EIP712_DIRECT_REQUIREMENTS.items():
         normalized = name.replace("-", "_").lower()
         matching = [artifact for artifact in artifacts if artifact.name.lower().replace("-", "_").startswith(normalized)]
         if len(matching) != 1:
@@ -142,32 +159,59 @@ def _pip_lock_from_downloads(python: str, temp_root: Path) -> str:
     return "\n".join(rendered) + "\n"
 
 
+def _injective_lock_from_uv(uv: str, temp_root: Path, target: str) -> str:
+    input_path = temp_root / f"injective-{target}.in"
+    output_path = temp_root / f"injective-{target}.lock"
+    input_path.write_text("".join(f"{name}=={version}\n" for name, version in INJECTIVE_DIRECT_REQUIREMENTS.items()))
+    result = subprocess.run(
+        [uv, "pip", "compile", str(input_path), "--python-version", "3.13", "--python-platform", PIP_TARGETS[target], "--generate-hashes", "--no-annotate", "--no-header", "--output-file", str(output_path)],
+        check=False, capture_output=True, text=True, env={**os.environ, "UV_CACHE_DIR": str(temp_root / "uv-cache")},
+    )
+    if result.returncode != 0:
+        raise LockValidationError(f"{target}: uv closure generation failed: {result.stderr.strip() or result.stdout.strip()}")
+    return output_path.read_text()
+
+
+def _validate_uv_version(uv: str) -> None:
+    result = subprocess.run([uv, "--version"], check=False, capture_output=True, text=True)
+    observed = result.stdout.strip() or result.stderr.strip()
+    if result.returncode != 0 or observed.split(maxsplit=2)[:2] != ["uv", UV_VERSION]:
+        raise LockValidationError(f"expected uv {UV_VERSION}, got {observed or 'no version output'}")
+
+
 def _provenance(lock_dir: Path, environment: Path, pip_packages: Path) -> str:
-    artifact_names = [f"{target}.explicit.txt" for target in TARGETS] + ["pip-direct.lock.txt"]
+    artifact_names = [f"{target}.explicit.txt" for target in TARGETS] + [f"pip-injective-{target}.lock.txt" for target in TARGETS] + ["pip-eip712-direct.lock.txt"]
     payload = {
         "artifacts": {name: hashlib.sha256((lock_dir / name).read_bytes()).hexdigest() for name in artifact_names},
         "format": 1,
+        "injective_direct_requirements": INJECTIVE_DIRECT_REQUIREMENTS,
+        "pip_targets": PIP_TARGETS,
         "python_version": PYTHON_VERSION,
+        "runtime_substitution": RUNTIME_SUBSTITUTION,
         "sources": {
             "setup/environment.yml": hashlib.sha256(environment.read_bytes()).hexdigest(),
             "setup/pip_packages.txt": hashlib.sha256(pip_packages.read_bytes()).hexdigest(),
         },
         "targets": list(TARGETS),
+        "uv_version": UV_VERSION,
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
-def generate_locks(lock_dir: Path, environment: Path, pip_packages: Path, conda: str, python: str) -> None:
+def generate_locks(lock_dir: Path, environment: Path, pip_packages: Path, conda: str, python: str, uv: str) -> None:
     """Generate each target in temporary storage, then create a new lock directory."""
     if lock_dir.exists():
         raise LockValidationError(f"refusing to overwrite existing lock directory {lock_dir}")
+    _validate_uv_version(uv)
     with tempfile.TemporaryDirectory(prefix="hummingbot-release-locks-") as temporary:
         temporary_root = Path(temporary)
         staged_locks = temporary_root / "locks"
         staged_locks.mkdir()
         for target in TARGETS:
             _write_explicit_lock(staged_locks / f"{target}.explicit.txt", _solve_target(conda, environment, temporary_root, target), target)
-        (staged_locks / "pip-direct.lock.txt").write_text(_pip_lock_from_downloads(python, temporary_root))
+        for target in TARGETS:
+            (staged_locks / f"pip-injective-{target}.lock.txt").write_text(_injective_lock_from_uv(uv, temporary_root, target))
+        (staged_locks / "pip-eip712-direct.lock.txt").write_text(_pip_lock_from_downloads(python, temporary_root))
         (staged_locks / "provenance.json").write_text(_provenance(staged_locks, environment, pip_packages))
         validate_lock_directory(staged_locks, environment, pip_packages)
         staged_locks.rename(lock_dir)
@@ -180,8 +224,9 @@ def main() -> int:
     parser.add_argument("--pip-packages", type=Path, default=Path("setup/pip_packages.txt"))
     parser.add_argument("--conda", default="conda")
     parser.add_argument("--python", default=os.sys.executable)
+    parser.add_argument("--uv", default="uv")
     args = parser.parse_args()
-    generate_locks(args.lock_dir, args.environment, args.pip_packages, args.conda, args.python)
+    generate_locks(args.lock_dir, args.environment, args.pip_packages, args.conda, args.python, args.uv)
     print(f"generated locks for {', '.join(TARGETS)} in {args.lock_dir}")
     return 0
 

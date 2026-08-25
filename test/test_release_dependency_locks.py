@@ -1,11 +1,12 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts import validate_release_dependency_locks as lock_validator
-from scripts.generate_release_dependency_locks import conda_specs_from_environment
+from scripts.generate_release_dependency_locks import _solve_target, conda_specs_from_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCKS = ROOT / "setup/locks"
@@ -52,11 +53,87 @@ def test_source_recipe_direct_pip_requirements_are_exactly_pinned():
     lock_validator._validate_source_pins(ENVIRONMENT, PIP_PACKAGES)
 
 
+@pytest.mark.parametrize(
+    "pip_section",
+    [
+        "dependencies:\n  - injective-py==1.13.0\n  - pip:\n    - other==1.0\n",
+        "dependencies:\n  - pip:\n    - injective-py==1.13.0\n    - injective-py==1.13.1\n",
+    ],
+)
+def test_source_recipe_rejects_misplaced_or_conflicting_pip_pin(tmp_path: Path, pip_section: str):
+    environment = tmp_path / "environment.yml"
+    environment.write_text(pip_section)
+    pip_packages = tmp_path / "pip_packages.txt"
+    pip_packages.write_text("eip712-structs==1.1.0\n")
+
+    with pytest.raises(lock_validator.LockValidationError, match="dependencies.pip"):
+        lock_validator._validate_source_pins(environment, pip_packages)
+
+
+def test_pip_lock_accepts_uv_multiline_hash_continuations(tmp_path: Path):
+    lock = tmp_path / "uv.lock"
+    lock.write_text(
+        "injective-py==1.13.0 \\\n"
+        f"    --hash=sha256:{'a' * 64} \\\n"
+        f"    --hash=sha256:{'b' * 64}\n"
+    )
+
+    lock_validator._validate_pip_lock(lock, {"injective-py": "1.13.0"})
+
+
+def test_solve_target_rejects_cache_dependent_fetch_omissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    environment = tmp_path / "environment.yml"
+    environment.write_text("dependencies:\n  - python==3.13.15\n  - requests\n")
+    payload = {
+        "actions": {
+            "FETCH": [{"name": "python", "version": "3.13.15"}],
+            "LINK": [{"name": "python", "version": "3.13.15"}, {"name": "requests", "version": "2.0"}],
+        }
+    }
+
+    observed_environment = {}
+
+    def fake_run(*args, **kwargs):
+        observed_environment.update(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr("scripts.generate_release_dependency_locks.subprocess.run", fake_run)
+
+    with pytest.raises(lock_validator.LockValidationError, match="complete link plan"):
+        _solve_target("conda", environment, tmp_path, "linux-64")
+    assert observed_environment["CONDA_PKGS_DIRS"] == str(tmp_path / "conda-pkgs")
+
+
+def test_solve_target_returns_complete_link_plan_records(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    environment = tmp_path / "environment.yml"
+    environment.write_text("dependencies:\n  - python==3.13.15\n")
+    fetch_record = {"name": "python", "version": "3.13.15", "url": "https://fetch.example/python"}
+    link_record = {"name": "python", "version": "3.13.15", "url": "https://link.example/python"}
+    payload = {"actions": {"FETCH": [fetch_record], "LINK": [link_record]}}
+    monkeypatch.setattr(
+        "scripts.generate_release_dependency_locks.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""),
+    )
+
+    assert _solve_target("conda", environment, tmp_path, "linux-64") == [link_record]
+
+
 def test_committed_locks_validate_offline_for_both_release_targets():
     result = lock_validator.validate_lock_directory(LOCKS, ENVIRONMENT, PIP_PACKAGES)
 
     assert result.targets == ("linux-64", "linux-aarch64")
     assert result.python_versions == {"linux-64": "3.13.15", "linux-aarch64": "3.13.15"}
+
+
+def test_both_explicit_locks_cover_every_canonical_conda_source_requirement():
+    source_names = {
+        lock_validator._conda_spec_name(spec)
+        for spec in conda_specs_from_environment(ENVIRONMENT)
+    }
+
+    for target in lock_validator.TARGETS:
+        entries = lock_validator._explicit_entries(LOCKS / f"{target}.explicit.txt", target)
+        assert source_names <= lock_validator._explicit_package_names(entries)
 
 
 def test_validator_rejects_unsupported_target_in_provenance(tmp_path: Path):
@@ -113,7 +190,7 @@ def test_validator_rejects_source_fingerprint_mismatch(tmp_path: Path):
 
 def test_validator_rejects_pip_version_drift_before_fingerprint_check(tmp_path: Path):
     lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
-    lock_path = lock_dir / "pip-direct.lock.txt"
+    lock_path = lock_dir / "pip-injective-linux-64.lock.txt"
     lock_path.write_text(lock_path.read_text().replace("injective-py==1.13.0", "injective-py==1.13.1"))
     _refresh_artifact_fingerprint(lock_dir, lock_path.name)
 
@@ -123,7 +200,7 @@ def test_validator_rejects_pip_version_drift_before_fingerprint_check(tmp_path: 
 
 def test_validator_rejects_pip_hash_drift_before_fingerprint_check(tmp_path: Path):
     lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
-    lock_path = lock_dir / "pip-direct.lock.txt"
+    lock_path = lock_dir / "pip-injective-linux-64.lock.txt"
     lock_path.write_text(lock_path.read_text().replace("--hash=sha256:", "--hash=sha256:" + "0", 1))
     _refresh_artifact_fingerprint(lock_dir, lock_path.name)
 
@@ -135,7 +212,7 @@ def test_validator_rejects_missing_target_lock(tmp_path: Path):
     lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
     (lock_dir / "linux-aarch64.explicit.txt").unlink()
 
-    with pytest.raises(lock_validator.LockValidationError, match="missing lock"):
+    with pytest.raises(lock_validator.LockValidationError, match="inventory"):
         lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)
 
 
@@ -145,4 +222,46 @@ def test_validator_rejects_tampered_lock_content_with_artifact_fingerprint(tmp_p
     lock_path.write_text(lock_path.read_text() + "# content tampering\n")
 
     with pytest.raises(lock_validator.LockValidationError, match="artifact fingerprint mismatch"):
+        lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)
+
+
+def test_validator_rejects_unsupported_extra_lock_artifact(tmp_path: Path):
+    lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
+    (lock_dir / "osx-arm64.explicit.txt").write_text("@EXPLICIT\n")
+
+    with pytest.raises(lock_validator.LockValidationError, match="inventory"):
+        lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("uv_version", "0.11.28", "uv generator version"),
+        ("pip_targets", {"linux-64": "x86_64-manylinux_2_17"}, "pip target mapping"),
+        ("runtime_substitution", {}, "runtime substitution"),
+    ],
+)
+def test_validator_rejects_provenance_generator_target_or_exception_drift(
+    tmp_path: Path, field: str, value: object, message: str
+):
+    lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
+    provenance_path = lock_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    provenance[field] = value
+    provenance_path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(lock_validator.LockValidationError, match=message):
+        lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)
+
+
+def test_validator_rejects_missing_injective_direct_input_before_fingerprint_check(tmp_path: Path):
+    lock_dir, environment, pip_packages = _copy_lock_inputs(tmp_path)
+    lock_path = lock_dir / "pip-injective-linux-aarch64.lock.txt"
+    contents = lock_path.read_text()
+    start = contents.index("safe-pysha3==1.0.4")
+    end = contents.find("\n\n", start)
+    lock_path.write_text(contents[:start] + (contents[end + 2:] if end != -1 else ""))
+    _refresh_artifact_fingerprint(lock_dir, lock_path.name)
+
+    with pytest.raises(lock_validator.LockValidationError, match="coverage"):
         lock_validator.validate_lock_directory(lock_dir, environment, pip_packages)

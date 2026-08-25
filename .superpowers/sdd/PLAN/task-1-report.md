@@ -102,3 +102,151 @@ image, publish an artifact, start a service, or authorize trading.
   them without a solve and demonstrate the target-specific builder behavior.
 - Publication remains `HOLD_FOR_EVIDENCE`. Roll back by reverting this Task 1
   commit; no external cleanup is required.
+
+## Review Correction: NOT_READY
+
+The review found that the original slice cannot be promoted to Task 2. The
+committed locks must be treated as invalid, not as release inputs.
+
+### Cache and source-validation findings
+
+- The generator reads Conda `actions.FETCH`; that list can omit package records
+  satisfied by a pre-existing package cache. The review correctly observed
+  omitted canonical packages including `pytest-asyncio`, `setuptools`, and
+  `requests`. A focused RED test reproduced the defect with `FETCH` containing
+  only Python while `LINK` also contained Requests.
+- The original source-pin check scanned text rather than the YAML
+  `dependencies -> pip` list. RED tests proved it accepted both a misplaced
+  top-level `injective-py` pin and conflicting nested pins. Another RED test
+  proved an extra `osx-arm64.explicit.txt` escaped inventory validation.
+- The corrective implementation was deliberately not retained or committed:
+  it would make the existing partial locks fail closed but could not produce a
+  valid replacement while the pip-closure gate below remains unresolved.
+
+### Bounded pip-closure feasibility evidence
+
+- Method: in temporary storage, downloaded the two direct artifacts without
+  installing them, inspected `injective_py-1.13.0` wheel `METADATA`, and
+  inspected `eip712-structs-1.1.0/setup.py`. A separate pip dry-run reached
+  the same direct edges but could not finish because the `coincurve` sdist
+  metadata path errors under its current scikit-build-core configuration.
+- `injective-py==1.13.0` requires: `aiohttp`, `bech32`, `bip32`, `ecdsa`,
+  `eip712`, `eth-pydantic-types`, `grpcio`, `grpcio-tools`, `hdwallets`,
+  `mnemonic`, `protobuf`, `requests`, `safe-pysha3`, `web3`, and `websockets`.
+- Crucially, `eip712-structs==1.1.0` has an unconditional runtime dependency
+  on `pysha3>=1.0.2` (alongside `eth-utils>=1.4.0`). Conda Forge's exact
+  package API returned HTTP 404 for `pysha3`; `safe-pysha3` is a different
+  normalized distribution and cannot meet the `pysha3` requirement. The gate
+  is therefore infeasible for both `linux-64` and `linux-aarch64` before a
+  complete recursive resolution or a new target solve is attempted.
+
+### Required decision before resuming
+
+Do not regenerate locks or widen the pip lock silently. The smallest
+evidence-backed policy revision is one of:
+
+1. authorize a complete, hash-pinned pip closure that includes `pysha3` and
+   separately prove that its source build supports Python 3.13 on both targets;
+   or
+2. replace `eip712-structs==1.1.0` with an explicitly approved compatible
+   dependency that has a fully Conda-satisfiable closure.
+
+Until one is selected and validated, Task 1 is `NOT_READY`; publication stays
+`HOLD_FOR_EVIDENCE`, and no Dockerfile or deployment work may consume the
+current locks.
+
+### Revised safe-pysha3 ruling result: still blocked
+
+The revised ruling authorized exactly one cache-isolated two-target solve after
+promoting every direct edge except `pysha3`. The generator used a temporary
+`CONDA_PKGS_DIRS` and staged output directory; no current lock was replaced.
+`linux-64` completed, but `linux-aarch64` failed closed with:
+
+```text
+eip712 >=0.3.0,<0.4.0
+  -> eth-pydantic-types >=0.2.4,<0.3
+  -> cchecksum >=0.0.3,<1, which does not exist (perhaps a missing channel)
+```
+
+This is a distinct target-specific closure blocker beyond the approved
+`pysha3 -> safe-pysha3==1.0.4` runtime substitution. The promoted source
+specifications and the uncommitted cache/YAML/inventory/manifest implementation
+were reverted rather than committing a partial or falsely green lock set.
+No further solve is authorized until an explicit ruling resolves the missing
+`cchecksum` edge for `linux-aarch64` (for example, a reviewed replacement
+dependency or separately authorized runtime substitution with target evidence).
+
+### Superseding target-specific Injective closure ruling
+
+Read-only feasibility is positive for the superseding model. The installed
+`uv 0.11.29` compiled `injective-py==1.13.0` plus
+`safe-pysha3==1.0.4` with `--python-version 3.13 --generate-hashes` for both
+`x86_64-manylinux_2_17` and `aarch64-manylinux_2_17`. Each result contained
+2,012 lock lines; the aarch64 result included both direct inputs. This proves
+the chosen pip-closure model can resolve without promoting the incompatible
+`eip712` Conda edge. It is feasibility evidence only: Task 1 remains pending
+the required cache-isolated Conda lock correction, artifact replacement,
+offline provenance validation, adversarial tests, and hash-enforced download
+evidence.
+
+### Correction completion: target closures and fail-closed provenance
+
+- Replaced the obsolete combined `pip-direct.lock.txt` with
+  `pip-injective-linux-64.lock.txt`, `pip-injective-linux-aarch64.lock.txt`,
+  and `pip-eip712-direct.lock.txt`. The two Injective locks each contain the
+  complete 58-package, 2,012-line Python 3.13 manylinux closure generated by
+  `uv 0.11.29`, with every requirement version-pinned and every artifact
+  SHA-256-pinned. The EIP-712 lock contains only
+  `eip712-structs==1.1.0` and its exact hash.
+- Regenerated cache-isolated Conda artifacts for both targets. Each explicit
+  lock now has 367 package URLs selected from the complete `LINK` plan and
+  every source Conda requirement is represented after canonical name
+  normalization. `CONDA_PKGS_DIRS` is confined below the generation temporary
+  directory, so a host cache cannot omit a linked package from the lock.
+- The offline validator now parses the actual YAML `dependencies -> pip`
+  section, requires exactly `injective-py==1.13.0` there, enforces the exact
+  six-file lock-directory inventory, and binds UV version, platform mapping,
+  direct Injective inputs, all artifact fingerprints, and the only approved
+  substitution: `pysha3>=1.0.2 -> safe-pysha3==1.0.4`.
+- RED/GREEN evidence for the final grammar defect: with the non-final UV hash
+  continuation rejected, `test_pip_lock_accepts_uv_multiline_hash_continuations`
+  raised `LockValidationError: pip hash must be an exact lowercase SHA-256`.
+  After allowing a trailing continuation backslash while retaining the exact
+  lowercase 64-hex grammar, that test passed. The final focused suite reported
+  `26 passed in 0.32s`.
+
+#### Final validation
+
+- `python scripts/validate_release_dependency_locks.py`
+  - passed: `validated targets: linux-64, linux-aarch64; Python 3.13.15`.
+- `python -m pytest -q test/test_release_dependency_locks.py`
+  - passed: `26 passed in 0.32s`; includes cache/FETCH omission, LINK-plan,
+    canonical Conda coverage, YAML placement/conflict, inventory, generator,
+    target, and named-exception adversaries.
+- `python -m pre_commit run --files <Task 1 files>`
+  - passed: whitespace, EOF, size, Flake8, private-key/wallet-key, autopep8,
+    and isort hooks; YAML/ESLint were not applicable.
+- `python -m py_compile scripts/validate_release_dependency_locks.py
+  scripts/generate_release_dependency_locks.py` and `git diff --check`
+  - passed.
+- Hash-enforced host-pip attempt: `pip download --require-hashes --no-deps`
+  began both Injective lock downloads but stopped at `coincurve==20.0.0` while
+  evaluating its sdist metadata: `ERROR: Use build.verbose instead of
+  cmake.verbose for scikit-build-core >= 0.10`. This is the pre-existing host
+  macOS metadata-build failure, not a missing or mismatched lock hash. The
+  EIP-712 direct lock download passed. As the approved host-pip fallback,
+  exact `uv 0.11.29` regenerated both target closures in temporary storage and
+  byte-compared them successfully with both committed locks. Generic `pip
+  check` remains known non-clean because the approved pysha3 metadata edge is
+  intentionally represented by `safe-pysha3`; Task 2 owns per-target runtime
+  EIP-712 smoke.
+
+#### Self-review and residual risk
+
+- No Dockerfile or global environment/tool was modified; no image was built,
+  published, deployed, or pushed. The old combined pip lock was retained in a
+  recoverable task-temporary backup during replacement.
+- The source lock validator is offline and fail-closed; the generator itself
+  performs networked resolution only in temporary storage. Upstream artifact
+  availability and per-target native build/runtime behavior remain outside
+  this Task 1 source-proof slice. Publication remains `HOLD_FOR_EVIDENCE`.

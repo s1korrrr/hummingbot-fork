@@ -9,17 +9,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import yaml
+
 TARGETS = ("linux-64", "linux-aarch64")
 PYTHON_VERSION = "3.13.15"
 CONDA_FORGE_HOST = "conda.anaconda.org"
 CONDA_FORGE_PATH = "/conda-forge/"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-PIP_REQUIREMENTS = {
-    "injective-py": "1.13.0",
-    "eip712-structs": "1.1.0",
+PIP_TARGETS = {
+    "linux-64": "x86_64-manylinux_2_17",
+    "linux-aarch64": "aarch64-manylinux_2_17",
 }
+UV_VERSION = "0.11.29"
+INJECTIVE_DIRECT_REQUIREMENTS = {"injective-py": "1.13.0", "safe-pysha3": "1.0.4"}
+EIP712_DIRECT_REQUIREMENTS = {"eip712-structs": "1.1.0"}
+RUNTIME_SUBSTITUTION = {"requirement": "pysha3>=1.0.2", "replacement": "safe-pysha3==1.0.4"}
 PIP_REQUIREMENT_RE = re.compile(r"^([a-z0-9][a-z0-9._-]*)==([^\s\\]+)(?:\s+\\)?$")
-PIP_HASH_RE = re.compile(r"^--hash=sha256:([0-9a-f]{64})$")
+PIP_HASH_RE = re.compile(r"^--hash=sha256:([0-9a-f]{64})(?:\s+\\)?$")
 
 
 class LockValidationError(ValueError):
@@ -64,12 +70,53 @@ def _validate_source_fingerprints(
 
 
 def _validate_source_pins(environment_path: Path, pip_packages_path: Path) -> None:
-    environment_lines = [line.strip() for line in environment_path.read_text().splitlines()]
-    if "- injective-py==1.13.0" not in environment_lines:
-        raise LockValidationError(f"{environment_path}: injective-py must be pinned to 1.13.0")
+    try:
+        environment = _required_mapping(yaml.safe_load(environment_path.read_text()), str(environment_path))
+    except yaml.YAMLError as error:
+        raise LockValidationError(f"{environment_path}: invalid YAML") from error
+    dependencies = environment.get("dependencies")
+    if not isinstance(dependencies, list):
+        raise LockValidationError(f"{environment_path}: dependencies must be a YAML list")
+    pip_sections = [entry["pip"] for entry in dependencies if isinstance(entry, dict) and set(entry) == {"pip"}]
+    if pip_sections != [["injective-py==1.13.0"]]:
+        raise LockValidationError(f"{environment_path}: dependencies.pip must contain only injective-py==1.13.0")
     pip_lines = [line.strip() for line in pip_packages_path.read_text().splitlines() if line.strip()]
     if pip_lines != ["eip712-structs==1.1.0"]:
         raise LockValidationError(f"{pip_packages_path}: eip712-structs must be pinned to 1.1.0")
+
+
+def _canonical_package_name(value: str) -> str:
+    return value.lower().replace("_", "-")
+
+
+def _conda_spec_name(spec: str) -> str:
+    return _canonical_package_name(re.split(r"[<>=!~ ]", spec, maxsplit=1)[0])
+
+
+def _explicit_package_names(entries: tuple[str, ...]) -> set[str]:
+    names = set()
+    for entry in entries:
+        filename = Path(urlsplit(entry).path).name
+        match = re.fullmatch(r"(.+)-([0-9][^-]*)-[^-]+\.(?:conda|tar\.bz2)", filename)
+        if match is None:
+            raise LockValidationError(f"{filename}: cannot identify Conda package name")
+        names.add(_canonical_package_name(match.group(1)))
+    return names
+
+
+def _validate_conda_source_coverage(environment_path: Path, target_entries: dict[str, tuple[str, ...]]) -> None:
+    try:
+        environment = _required_mapping(yaml.safe_load(environment_path.read_text()), str(environment_path))
+    except yaml.YAMLError as error:
+        raise LockValidationError(f"{environment_path}: invalid YAML") from error
+    dependencies = environment.get("dependencies")
+    if not isinstance(dependencies, list):
+        raise LockValidationError(f"{environment_path}: dependencies must be a YAML list")
+    source_names = {_conda_spec_name(item) for item in dependencies if isinstance(item, str) and item.strip()}
+    for target, entries in target_entries.items():
+        missing = sorted(source_names - _explicit_package_names(entries))
+        if missing:
+            raise LockValidationError(f"{target}: explicit lock misses canonical Conda requirements: {', '.join(missing)}")
 
 
 def _explicit_entries(lock_path: Path, target: str) -> tuple[str, ...]:
@@ -100,7 +147,7 @@ def _explicit_entries(lock_path: Path, target: str) -> tuple[str, ...]:
     return entries
 
 
-def _validate_pip_lock(path: Path) -> None:
+def _validate_pip_lock(path: Path, expected_requirements: dict[str, str], *, closure: bool = False) -> None:
     try:
         lines = [line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#")]
     except FileNotFoundError as error:
@@ -125,16 +172,17 @@ def _validate_pip_lock(path: Path) -> None:
         if name in found:
             raise LockValidationError(f"{path}: duplicate pip requirement {name}")
         found[name] = (version, hashes)
-    if set(found) != set(PIP_REQUIREMENTS):
-        raise LockValidationError(f"{path}: pip lock must contain only {sorted(PIP_REQUIREMENTS)}")
-    for name, expected_version in PIP_REQUIREMENTS.items():
+    expected_names = set(expected_requirements)
+    if (not expected_names.issubset(found)) if closure else (set(found) != expected_names):
+        raise LockValidationError(f"{path}: pip lock direct input coverage mismatch")
+    for name, expected_version in expected_requirements.items():
         if found[name][0] != expected_version:
             raise LockValidationError(f"{path}: pinned requirement {name} must be {expected_version}")
 
 
 def _validate_artifact_fingerprints(provenance: dict[str, object], lock_dir: Path) -> None:
     artifacts = _required_mapping(provenance.get("artifacts"), "provenance artifacts")
-    expected_names = {f"{target}.explicit.txt" for target in TARGETS} | {"pip-direct.lock.txt"}
+    expected_names = {f"{target}.explicit.txt" for target in TARGETS} | {f"pip-injective-{target}.lock.txt" for target in TARGETS} | {"pip-eip712-direct.lock.txt"}
     if set(artifacts) != expected_names:
         raise LockValidationError("provenance artifact fingerprint coverage mismatch")
     for name in sorted(expected_names):
@@ -145,8 +193,19 @@ def _validate_artifact_fingerprints(provenance: dict[str, object], lock_dir: Pat
             raise LockValidationError(f"artifact fingerprint mismatch for {name}")
 
 
+def _validate_lock_inventory(lock_dir: Path) -> None:
+    expected = {f"{target}.explicit.txt" for target in TARGETS} | {f"pip-injective-{target}.lock.txt" for target in TARGETS} | {"pip-eip712-direct.lock.txt", "provenance.json"}
+    try:
+        actual = {path.name for path in lock_dir.iterdir()}
+    except FileNotFoundError as error:
+        raise LockValidationError(f"missing lock directory {lock_dir}") from error
+    if actual != expected:
+        raise LockValidationError("lock inventory mismatch")
+
+
 def validate_lock_directory(lock_dir: Path, environment_path: Path, pip_packages_path: Path) -> ValidationResult:
     """Validate source binding and all release lock artifacts without network access."""
+    _validate_lock_inventory(lock_dir)
     provenance = _load_provenance(lock_dir / "provenance.json")
     if provenance.get("format") != 1:
         raise LockValidationError("unsupported provenance format")
@@ -155,14 +214,27 @@ def validate_lock_directory(lock_dir: Path, environment_path: Path, pip_packages
         raise LockValidationError(f"unsupported target coverage {targets!r}")
     if provenance.get("python_version") != PYTHON_VERSION:
         raise LockValidationError(f"provenance must pin Python {PYTHON_VERSION}")
+    if provenance.get("pip_targets") != PIP_TARGETS:
+        raise LockValidationError("pip target mapping mismatch")
+    if provenance.get("uv_version") != UV_VERSION:
+        raise LockValidationError("uv generator version mismatch")
+    if provenance.get("injective_direct_requirements") != INJECTIVE_DIRECT_REQUIREMENTS:
+        raise LockValidationError("Injective direct input binding mismatch")
+    if provenance.get("runtime_substitution") != RUNTIME_SUBSTITUTION:
+        raise LockValidationError("runtime substitution binding mismatch")
     _validate_source_pins(environment_path, pip_packages_path)
     _validate_source_fingerprints(provenance, environment_path, pip_packages_path)
     python_versions = {}
+    target_entries = {}
     for target in TARGETS:
         entries = _explicit_entries(lock_dir / f"{target}.explicit.txt", target)
+        target_entries[target] = entries
         python_entry = next(entry for entry in entries if "/python-" in entry)
         python_versions[target] = re.search(r"/python-([0-9][^-]*)-", python_entry).group(1)
-    _validate_pip_lock(lock_dir / "pip-direct.lock.txt")
+    _validate_conda_source_coverage(environment_path, target_entries)
+    for target in TARGETS:
+        _validate_pip_lock(lock_dir / f"pip-injective-{target}.lock.txt", INJECTIVE_DIRECT_REQUIREMENTS, closure=True)
+    _validate_pip_lock(lock_dir / "pip-eip712-direct.lock.txt", EIP712_DIRECT_REQUIREMENTS)
     _validate_artifact_fingerprints(provenance, lock_dir)
     return ValidationResult(targets=TARGETS, python_versions=python_versions)
 

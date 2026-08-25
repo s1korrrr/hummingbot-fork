@@ -1,4 +1,2 @@
-injective-py==1.13.0 \
-    --hash=sha256:3675bad1c9be932e1673435ae201837d3ee35bf47d302029140baac369d8f501
 eip712-structs==1.1.0 \
     --hash=sha256:b24400aef07b4d0287fb9bf8ce02b0abbe80c476d1b67222a7c5158df3a3e38d

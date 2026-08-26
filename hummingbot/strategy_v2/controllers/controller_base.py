@@ -26,7 +26,8 @@ from hummingbot.strategy_v2.models.position_config import InitialPositionConfig
 from hummingbot.strategy_v2.runnable_base import RunnableBase
 
 if TYPE_CHECKING:
-    from hummingbot.strategy_v2.executors.data_types import PositionSummary
+    from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase, PositionSummary
+    from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 
 
 @dataclass
@@ -204,6 +205,18 @@ class ControllerBase(RunnableBase):
         self.processed_data = {}
         self.executors_update_event = asyncio.Event()
         self.executors_info_queue = asyncio.Queue()
+
+    def get_executor_class_for_config(
+        self,
+        config: "ExecutorConfigBase",
+    ) -> Optional[type["ExecutorBase"]]:
+        """Return a controller-local executor implementation override.
+
+        Default controllers use the orchestrator's immutable type mapping.
+        Specialized controllers may override this hook without changing executor
+        construction for any other controller in the process.
+        """
+        return None
 
     def start(self):
         """

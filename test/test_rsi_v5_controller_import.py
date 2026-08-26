@@ -10,7 +10,10 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
+from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
@@ -37,6 +40,17 @@ class RSIv5ControllerImportTest(unittest.TestCase):
 
         self.assertIsNotNone(RSIv5Controller)
         self.assertIsNotNone(RSIv5ControllerConfig)
+
+    def test_rsi_hyperliquid_import_does_not_mutate_default_position_executor(self):
+        ExecutorOrchestrator._executor_mapping["position_executor"] = PositionExecutor
+
+        from controllers.directional_trading.rsi_v5_hyperliquid import RSIv5HyperliquidController
+
+        self.assertIsNotNone(RSIv5HyperliquidController)
+        self.assertIs(
+            ExecutorOrchestrator._executor_mapping["position_executor"],
+            PositionExecutor,
+        )
 
     def test_rsi_v5_default_sell_threshold_harmonization_preserves_overbought_default(self):
         from controllers.directional_trading.rsi_v5 import RSIv5ControllerConfig
@@ -1957,12 +1971,24 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         )
         controller.processed_data = {"signal": 0, "signal_state": {}}
         controller.executors_info = [
-            SimpleNamespace(id="loss-1", is_active=False, net_pnl_quote=Decimal("-1"))
+            SimpleNamespace(
+                id="loss-1",
+                is_active=False,
+                is_done=True,
+                status=RunnableStatus.TERMINATED,
+                net_pnl_quote=Decimal("-1"),
+            )
         ]
         controller.stop_actions_proposal()
 
         controller.executors_info = [
-            SimpleNamespace(id="loss-1", is_active=False, net_pnl_quote=Decimal("-1"))
+            SimpleNamespace(
+                id="loss-1",
+                is_active=False,
+                is_done=True,
+                status=RunnableStatus.TERMINATED,
+                net_pnl_quote=Decimal("-1"),
+            )
         ]
         controller.stop_actions_proposal()
 
@@ -2131,7 +2157,7 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertFalse(controller.can_create_executor(-1))
         self.assertEqual(controller._last_gate_reason[TradeType.SELL], "held_bag_recovery")
 
-    def test_rsi_v5_bag_recovery_partial_exit_fraction_repeats(self):
+    def test_rsi_v5_bag_recovery_partial_exit_fraction_repeats_without_sell_signal(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig
 
         market_data_provider = MagicMock()
@@ -2156,7 +2182,7 @@ class RSIv5ControllerImportTest(unittest.TestCase):
             actions_queue=asyncio.Queue(),
         )
         controller.processed_data = {
-            "signal": -1,
+            "signal": 0,
             "trend_confirmation": {"direction": "neutral", "confidence": 0.0, "alignment_score": 0.0, "states": {}},
             "signal_state": {"rsi": 82.0, "rsi_prev": 81.0, "ema_fast": 104.0},
         }
@@ -2174,12 +2200,17 @@ class RSIv5ControllerImportTest(unittest.TestCase):
         self.assertEqual(first_actions, [])
         self.assertEqual(len(controller._recovery_trails), 1)
 
+        price_box["value"] = Decimal("107.00")
         second_actions = controller.stop_actions_proposal()
-        self.assertEqual(len(second_actions), 1)
-        self.assertEqual(second_actions[0].executor_config.amount, Decimal("0.10000000"))
-        self.assertEqual(second_actions[0].executor_config.execution_strategy, ExecutionStrategy.LIMIT_CHASER)
-        self.assertEqual(second_actions[0].executor_config.chaser_config.distance, Decimal("0.002"))
-        self.assertEqual(second_actions[0].executor_config.chaser_config.refresh_threshold, Decimal("0.003"))
+        self.assertEqual(second_actions, [])
+
+        price_box["value"] = Decimal("105.30")
+        third_actions = controller.stop_actions_proposal()
+        self.assertEqual(len(third_actions), 1)
+        self.assertEqual(third_actions[0].executor_config.amount, Decimal("0.10000000"))
+        self.assertEqual(third_actions[0].executor_config.execution_strategy, ExecutionStrategy.LIMIT_CHASER)
+        self.assertEqual(third_actions[0].executor_config.chaser_config.distance, Decimal("0.002"))
+        self.assertEqual(third_actions[0].executor_config.chaser_config.refresh_threshold, Decimal("0.003"))
 
         controller.positions_held = [
             SimpleNamespace(
@@ -2190,14 +2221,14 @@ class RSIv5ControllerImportTest(unittest.TestCase):
                 breakeven_price=Decimal("100.00"),
             )
         ]
-        price_box["value"] = Decimal("105.40")
-        third_actions = controller.stop_actions_proposal()
-        self.assertEqual(third_actions, [])
-
-        price_box["value"] = Decimal("105.35")
+        price_box["value"] = Decimal("107.40")
         fourth_actions = controller.stop_actions_proposal()
-        self.assertEqual(len(fourth_actions), 1)
-        self.assertEqual(fourth_actions[0].executor_config.amount, Decimal("0.09000000"))
+        self.assertEqual(fourth_actions, [])
+
+        price_box["value"] = Decimal("105.65")
+        fifth_actions = controller.stop_actions_proposal()
+        self.assertEqual(len(fifth_actions), 1)
+        self.assertEqual(fifth_actions[0].executor_config.amount, Decimal("0.09000000"))
 
     def test_rsi_v5_neutral_zone_does_not_log_not_ready_messages(self):
         from controllers.directional_trading.rsi_v5 import RSIv5Controller, RSIv5ControllerConfig

@@ -22,6 +22,7 @@ from hummingbot.strategy_v2.executors.grid_executor.data_types import GridExecut
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.executors.rsi_position_executor import RSIPositionExecutor, RSIPositionExecutorConfig
 from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -75,6 +76,33 @@ class TestExecutorOrchestrator(unittest.TestCase):
         controller.config.connector_name = connector_name
         controller.config.trading_pair = trading_pair
         return controller
+
+    def test_executor_class_override_is_scoped_to_owning_controller(self):
+        config = RSIPositionExecutorConfig(
+            timestamp=1234,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY,
+            entry_price=Decimal("100"),
+            amount=Decimal("1"),
+        )
+        rsi_controller = MagicMock()
+        rsi_controller.get_executor_class_for_config.return_value = RSIPositionExecutor
+        plain_controller = MagicMock()
+        plain_controller.get_executor_class_for_config.return_value = None
+        self.mock_strategy.controllers = {
+            "rsi": rsi_controller,
+            "plain": plain_controller,
+        }
+
+        self.assertIs(
+            self.orchestrator._resolve_executor_class("rsi", config),
+            RSIPositionExecutor,
+        )
+        self.assertIs(
+            self.orchestrator._resolve_executor_class("plain", config),
+            PositionExecutor,
+        )
 
     @patch.object(PositionExecutor, "start")
     @patch.object(DCAExecutor, "start")

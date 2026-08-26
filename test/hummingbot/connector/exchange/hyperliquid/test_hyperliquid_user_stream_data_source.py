@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from bidict import bidict
 
+import hummingbot.connector.exchange.hyperliquid.hyperliquid_web_utils as web_utils
 from hummingbot.connector.exchange.hyperliquid import hyperliquid_constants as CONSTANTS
 from hummingbot.connector.exchange.hyperliquid.hyperliquid_api_user_stream_data_source import (
     HyperliquidAPIUserStreamDataSource,
@@ -141,6 +142,44 @@ class TestHyperliquidAPIUserStreamDataSource(IsolatedAsyncioWrapperTestCase):
             "INFO",
             "Subscribed to private order and trades changes channels..."
         ))
+
+    async def test_connected_websocket_assistant_sets_message_timeout_and_tracks_ping_task(self):
+        websocket_assistant = AsyncMock()
+        self.data_source._get_ws_assistant = AsyncMock(return_value=websocket_assistant)
+        ping_task = MagicMock()
+
+        with patch(
+            "hummingbot.connector.exchange.hyperliquid.hyperliquid_api_user_stream_data_source.asyncio.create_task",
+            return_value=ping_task,
+        ) as create_task_mock:
+            connected_websocket = await self.data_source._connected_websocket_assistant()
+
+        ping_coroutine = create_task_mock.call_args.args[0]
+        ping_coroutine.close()
+        websocket_assistant.connect.assert_awaited_once_with(
+            ws_url=web_utils.wss_url(self.data_source._domain),
+            ping_timeout=self.data_source.HEARTBEAT_TIME_INTERVAL,
+            message_timeout=CONSTANTS.WS_MESSAGE_TIMEOUT,
+        )
+        self.assertIs(websocket_assistant, connected_websocket)
+        self.assertIs(ping_task, self.data_source._ping_task)
+
+    async def test_user_stream_interruption_cancels_ping_task(self):
+        websocket_assistant = AsyncMock()
+        keep_running = asyncio.Event()
+
+        async def wait_forever():
+            await keep_running.wait()
+
+        ping_task = self.local_event_loop.create_task(wait_forever())
+        await asyncio.sleep(0)
+        self.data_source._ping_task = ping_task
+
+        await self.data_source._on_user_stream_interruption(websocket_assistant)
+
+        self.assertTrue(ping_task.cancelled())
+        self.assertIsNone(self.data_source._ping_task)
+        websocket_assistant.disconnect.assert_awaited_once()
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     @patch("hummingbot.core.data_type.user_stream_tracker_data_source.UserStreamTrackerDataSource._sleep")

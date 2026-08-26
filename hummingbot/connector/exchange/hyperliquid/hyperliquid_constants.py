@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
@@ -6,6 +8,9 @@ BROKER_ID = "HBOT"
 MAX_ORDER_ID_LEN = None
 
 MARKET_ORDER_SLIPPAGE = 0.05
+SPOT_MAX_DECIMALS = 8
+MAX_PRICE_SIGNIFICANT_DIGITS = 5
+MIN_NOTIONAL_SIZE = Decimal("10")
 
 DOMAIN = EXCHANGE_NAME
 TESTNET_DOMAIN = "hyperliquid_testnet"
@@ -67,6 +72,9 @@ ORDER_STATE = {
 }
 
 HEARTBEAT_TIME_INTERVAL = 30.0
+# Detect a silent socket even when TCP remains open. This exceeds the regular
+# keepalive interval so normal ping traffic does not force reconnections.
+WS_MESSAGE_TIMEOUT = 60.0
 
 MAX_REQUEST = 1_200
 ALL_ENDPOINTS_LIMIT = "All"

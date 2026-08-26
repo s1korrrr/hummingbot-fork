@@ -1,0 +1,16 @@
+{
+  "snapshot_id": "fixture-wallet-001",
+  "as_of": "2026-07-09T12:00:00Z",
+  "quote_asset": "USDC",
+  "quote_available": "1000",
+  "total_equity_quote": "5000",
+  "refresh_status": "fresh",
+  "balances": {
+    "SELL01": {"total_units": "100", "available_units": "100", "price_quote": "1.00", "precision": "0.0001", "min_trade_value_quote": "5"},
+    "SELL02": {"total_units": "100", "available_units": "100", "price_quote": "1.00", "precision": "0.0001", "min_trade_value_quote": "5"},
+    "SELL03": {"total_units": "100", "available_units": "100", "price_quote": "1.00", "precision": "0.0001", "min_trade_value_quote": "5"},
+    "SELL04": {"total_units": "100", "available_units": "100", "price_quote": "1.00", "precision": "0.0001", "min_trade_value_quote": "5"},
+    "SELL05": {"total_units": "100", "available_units": "100", "price_quote": "1.00", "precision": "0.0001", "min_trade_value_quote": "5"}
+  },
+  "open_orders": []
+}

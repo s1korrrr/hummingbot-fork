@@ -387,6 +387,25 @@ class HyperliquidAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(trade_event["data"][0]["hash"], msg.trade_id)
         self.assertEqual(trade_event["data"][0]["time"] * 1e-3, msg.timestamp)
 
+    def test_l2_book_websocket_messages_route_only_to_snapshot_queue(self):
+        channel = self.data_source._channel_originating_message(self.get_ws_diff_msg())
+
+        self.assertEqual(self.data_source._snapshot_messages_queue_key, channel)
+        self.assertNotEqual(self.data_source._diff_messages_queue_key, channel)
+
+    async def test_connected_websocket_assistant_sets_message_timeout(self):
+        websocket_assistant = AsyncMock()
+        self.data_source._api_factory.get_ws_assistant = AsyncMock(return_value=websocket_assistant)
+
+        connected_websocket = await self.data_source._connected_websocket_assistant()
+
+        websocket_assistant.connect.assert_awaited_once_with(
+            ws_url=web_utils.wss_url(self.data_source._domain),
+            ping_timeout=CONSTANTS.HEARTBEAT_TIME_INTERVAL,
+            message_timeout=CONSTANTS.WS_MESSAGE_TIMEOUT,
+        )
+        self.assertIs(websocket_assistant, connected_websocket)
+
     async def test_listen_for_order_book_diffs_cancelled(self):
         mock_queue = AsyncMock()
         mock_queue.get.side_effect = asyncio.CancelledError()

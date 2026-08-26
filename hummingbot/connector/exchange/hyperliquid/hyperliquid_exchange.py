@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, AsyncIterable, Dict, List, Literal, Optional, Tuple
 
 from bidict import bidict
@@ -62,6 +62,7 @@ class HyperliquidExchange(ExchangePyBase):
         self._last_trades_poll_timestamp = 1.0
         self.coin_to_asset: Dict[str, int] = {}
         self.name_to_coin: Dict[str, str] = {}
+        self._spot_size_decimals_by_pair: Dict[str, int] = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -170,8 +171,17 @@ class HyperliquidExchange(ExchangePyBase):
         """
         Applies trading rule to quantize order price.
         """
-        d_price = Decimal(round(float(f"{price:.5g}"), 6))
-        return d_price
+        if price.is_nan() or price <= Decimal("0") or price == price.to_integral_value():
+            return price
+        size_decimals = self._spot_size_decimals_by_pair.get(trading_pair)
+        if size_decimals is None:
+            return Decimal(str(round(float(f"{price:.5g}"), 6)))
+        decimal_quantum = Decimal("1").scaleb(-(CONSTANTS.SPOT_MAX_DECIMALS - size_decimals))
+        significant_quantum = Decimal("1").scaleb(
+            price.adjusted() - (CONSTANTS.MAX_PRICE_SIGNIFICANT_DIGITS - 1)
+        )
+        quantum = max(decimal_quantum, significant_quantum)
+        return price.quantize(quantum, rounding=ROUND_DOWN)
 
     async def _update_trading_rules(self):
         exchange_info = await self._api_post(path_url=self.trading_rules_request_path,
@@ -555,29 +565,35 @@ class HyperliquidExchange(ExchangePyBase):
         self.name_to_coin = {asset_info["name"]: asset_info["name"] for asset_info in exchange_info_dict[0]["universe"]}
 
         coin_infos: list = exchange_info_dict[0]["universe"]
-        price_infos: list = exchange_info_dict[1]
-
         for spot_info in filter(web_utils.is_exchange_information_valid, exchange_info_dict[0]["universe"]):
+            if not self._is_valid_spot_entry(exchange_info_dict, spot_info):
+                continue
             self.coin_to_asset[spot_info["name"]] = spot_info["index"] + 10000
             self.name_to_coin[spot_info["name"]] = spot_info["name"]
 
         return_val: list = []
-        for coin_info, price_info in zip(coin_infos, price_infos):
-            base, quote = coin_info["tokens"]
+        for coin_info in coin_infos:
             try:
+                if not self._is_valid_spot_entry(exchange_info_dict, coin_info):
+                    continue
+                base, quote = coin_info["tokens"]
                 ex_name = f'{exchange_info_dict[0]["tokens"][base]["name"].replace(" ", "").upper()}/{exchange_info_dict[0]["tokens"][quote]["name"].replace(" ", "").upper()}'
                 if ex_name not in self.name_to_coin:
                     self.name_to_coin[ex_name] = coin_info["name"]
 
                 trading_pair = await self.trading_pair_associated_to_exchange_symbol(symbol=coin_info["name"])
-                step_size = Decimal(str(10 ** -exchange_info_dict[0]["tokens"][base].get("szDecimals")))
-                price_size = Decimal(str(10 ** -len(price_info.get("markPx").split('.')[1])))
+                size_decimals = int(exchange_info_dict[0]["tokens"][base]["szDecimals"])
+                self._spot_size_decimals_by_pair[trading_pair] = size_decimals
+                step_size = Decimal("1").scaleb(-size_decimals)
+                price_size = Decimal("1").scaleb(-(CONSTANTS.SPOT_MAX_DECIMALS - size_decimals))
                 return_val.append(
                     TradingRule(
                         trading_pair,
-                        min_order_size=step_size,  # asset_price,
+                        min_order_size=step_size,
                         min_base_amount_increment=step_size,
-                        min_price_increment=price_size
+                        min_price_increment=price_size,
+                        min_notional_size=CONSTANTS.MIN_NOTIONAL_SIZE,
+                        max_price_significant_digits=Decimal(CONSTANTS.MAX_PRICE_SIGNIFICANT_DIGITS),
                     )
                 )
             except Exception:
@@ -595,6 +611,8 @@ class HyperliquidExchange(ExchangePyBase):
         self.name_to_coin = {asset_info["name"]: asset_info["name"] for asset_info in exchange_info[0]["universe"]}
 
         for spot_info in filter(web_utils.is_exchange_information_valid, exchange_info[0]["universe"]):
+            if not self._is_valid_spot_entry(exchange_info, spot_info):
+                continue
             self.coin_to_asset[spot_info["name"]] = spot_info["index"] + 10000
             self.name_to_coin[spot_info["name"]] = spot_info["name"]
             base, quote = spot_info["tokens"]
@@ -630,6 +648,19 @@ class HyperliquidExchange(ExchangePyBase):
             self.logger().error(
                 f"Could not resolve the exchange symbols {new_exchange_symbol} and {current_exchange_symbol}")
             mapping.pop(current_exchange_symbol)
+
+    @staticmethod
+    def _is_valid_spot_entry(exchange_info: List, spot_info: Dict[str, Any]) -> bool:
+        tokens = exchange_info[0].get("tokens", [])
+        pair_tokens = spot_info.get("tokens", [])
+        if len(pair_tokens) != 2:
+            return False
+        base, quote = pair_tokens
+        if not isinstance(base, int) or not isinstance(quote, int):
+            return False
+        if base < 0 or quote < 0:
+            return False
+        return base < len(tokens) and quote < len(tokens)
 
     async def _update_balances(self):
         """

@@ -156,6 +156,27 @@ class HyperliquidSpotCandles(CandlesBase):
                                                               method=RESTMethod.POST,
                                                               throttler_limit_id=self.rest_url,
                                                               data=CONSTANTS.HEALTH_CHECK_PAYLOAD)
-        universe = {token["tokens"][0]: token["name"] for token in self._universe["universe"]}
-        tokens = {token["index"]: token["name"] for token in self._universe["tokens"]}
-        self._coins_dict = {tokens[index]: universe[index] for index in universe.keys()}
+        token_names = {
+            token["index"]: str(token["name"]).strip().upper()
+            for token in self._universe.get("tokens", [])
+            if token.get("index") is not None and token.get("name")
+        }
+        requested_pair = self._trading_pair.strip().upper()
+        coins_dict: Dict[str, str] = {}
+        for market in self._universe.get("universe", []):
+            token_indexes = market.get("tokens") or []
+            if len(token_indexes) != 2:
+                continue
+            base_asset = token_names.get(token_indexes[0])
+            quote_asset = token_names.get(token_indexes[1])
+            market_name = str(market.get("name") or "").strip()
+            if not base_asset or not quote_asset or not market_name:
+                continue
+            pair = f"{base_asset}-{quote_asset}"
+            coins_dict.setdefault(pair, market_name)
+            if pair == requested_pair:
+                coins_dict[base_asset] = market_name
+
+        if requested_pair not in coins_dict:
+            raise ValueError(f"Hyperliquid spot market not found for {requested_pair}")
+        self._coins_dict = coins_dict

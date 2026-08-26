@@ -170,12 +170,16 @@ class V2WithControllers(StrategyV2Base):
     def check_manual_kill_switch(self):
         for controller_id, controller in self.controllers.items():
             if controller.config.manual_kill_switch and controller.status == RunnableStatus.RUNNING:
-                self.logger().info(f"Manual cash out for controller {controller_id}.")
+                keep_position = bool(getattr(controller.config, "early_stop_keep_position", False))
+                self.logger().info(
+                    f"Manual stop for controller {controller_id} | keep_position={keep_position}."
+                )
                 controller.stop()
                 executors_to_stop = self.get_executors_by_controller(controller_id)
                 self.executor_orchestrator.execute_actions(
                     [StopExecutorAction(executor_id=executor.id,
-                                        controller_id=executor.controller_id) for executor in executors_to_stop])
+                                        controller_id=executor.controller_id,
+                                        keep_position=keep_position) for executor in executors_to_stop])
             if not controller.config.manual_kill_switch and controller.status == RunnableStatus.TERMINATED:
                 if controller_id in self.drawdown_exited_controllers:
                     continue

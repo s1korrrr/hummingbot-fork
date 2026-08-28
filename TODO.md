@@ -15,7 +15,7 @@
 - [ ] Reconcile and seed verified OKX inventory. **Blocked by wallet truth.**
   DoD: five eligible assets decode and cross-check source economics against read-only available balances; mismatches fail closed and excess is untracked. Latest authenticated 2026-08-28 snapshot proves BTC=0 and XRP=0 against non-zero legacy positions, so the approved five-seed migration correctly refuses to apply.
 - [ ] Verify actual databases and locked runtime.
-  DoD: backups, integrity checks, row/receipt verification, restored cost basis/status, clean logs, and zero order/fill/cancel evidence pass before final configs are unlocked and left stopped.
+  DoD: backups, integrity checks, row/receipt verification, restored cost basis/status, clean logs, and zero order/fill/cancel evidence pass before final configs are unlocked and left stopped. The pre-existing controller-only `ok_rsi.sqlite` is backed up and unmodified; replacing it with a freshly initialized target remains gated by wallet reconciliation.
 - [x] Produce average-price and first-sell economics report from the latest authenticated snapshot.
   DoD: each asset reports wallet/tracked/untracked amounts, breakeven, current price, minimum profit, recovery arm, partial amount, and dynamic conditions without claiming a guaranteed execution price.
 - [ ] Complete validation, review, documentation, and memory harvest.

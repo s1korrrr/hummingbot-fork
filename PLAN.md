@@ -60,8 +60,10 @@
   `2026-08-28T17:59:02Z` proves BTC=0 and XRP=0, while the legacy source tracks
   BTC=0.04057 and XRP=1981.7. This is the exact fail-closed condition from the
   approved design. The real dry-run/apply and locked restoration smoke remain
-  blocked; no `ok_rsi.sqlite` has been created and no synthetic position was
-  inserted.
+  blocked. A pre-existing 2026-08-27 `ok_rsi.sqlite` contains only eight
+  controller-version rows and zero fills/executors/positions/hold-ledger rows;
+  it was backed up and left unmodified. No migrated target or synthetic
+  position was inserted.
 - Reversal condition: obtain a fresh authenticated wallet snapshot that covers
   all five legacy amounts, or explicitly revise the approved policy to migrate
   complete history while seeding only ETH/SOL/BNB and treating BTC/XRP as

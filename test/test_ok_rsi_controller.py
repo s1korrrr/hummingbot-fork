@@ -675,6 +675,17 @@ class OKRSIControllerTest(unittest.TestCase):
             self.assertIsNone(controller.time_limit)
             self.assertTrue(controller.early_stop_keep_position)
 
+    def test_legacy_controller_ids_reject_blanks_and_duplicates(self):
+        from controllers.directional_trading.ok_rsi import OKRSIControllerConfig
+
+        with self.assertRaisesRegex(ValueError, "blank"):
+            OKRSIControllerConfig(id="ok-rsi-btc", legacy_controller_ids=[""])
+        with self.assertRaisesRegex(ValueError, "unique"):
+            OKRSIControllerConfig(
+                id="ok-rsi-btc",
+                legacy_controller_ids=["rsi-v5-btc-usdc-1m", "rsi-v5-btc-usdc-1m"],
+            )
+
     def test_sell_only_script_loads_only_requested_sell_only_pairs(self):
         strategy_class, config = self._load_script_through_trading_core(
             "ok_rsi_sell_only", "ok_rsi_sell_only.yml"

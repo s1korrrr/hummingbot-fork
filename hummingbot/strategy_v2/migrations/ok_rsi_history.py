@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
@@ -13,6 +14,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from hummingbot.model import get_declarative_base
+from hummingbot.model.inventory_cost import InventoryCost  # noqa: F401
 from hummingbot.model.position import Position
 
 
@@ -436,10 +438,11 @@ def migration_plan_to_dict(plan: MigrationPlan) -> dict:
 def _write_canonical_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(f"{path.suffix}.tmp")
-    temporary.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n",
-        encoding="utf-8",
-    )
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
+    with temporary.open("w", encoding="utf-8") as output:
+        output.write(serialized)
+        output.flush()
+        os.fsync(output.fileno())
     temporary.replace(path)
 
 

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from hummingbot.model import get_declarative_base
 from hummingbot.model.position import Position
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
 
 
 class OKRSIHistoryMigrationTest(unittest.TestCase):
@@ -99,6 +100,56 @@ class OKRSIHistoryMigrationTest(unittest.TestCase):
         self.assertEqual(len(current), 5)
         self.assertEqual(ledger, 5)
         self.assertTrue(all(row[1] == "okx" and row[2].endswith("-USDC") for row in current))
+
+        from hummingbot.core.data_type.common import TradeType
+        from hummingbot.strategy_v2.executors.executor_orchestrator import PositionHold
+
+        engine = create_engine(f"sqlite:///{self.target}")
+        try:
+            with Session(engine) as session:
+                btc_entry = session.query(PositionHoldLedger).filter(
+                    PositionHoldLedger.controller_id == "ok-rsi-btc"
+                ).one()
+                restored = PositionHold("okx", "BTC-USDC", TradeType.BUY)
+                restored.add_order_record(btc_entry.to_order_record())
+                summary = restored.get_position_summary(Decimal("70000"))
+                self.assertEqual(summary.amount, Decimal("0.004057"))
+                self.assertEqual(summary.breakeven_price, Decimal("65000"))
+                self.assertEqual(summary.cum_fees_quote, Decimal("1.25"))
+        finally:
+            engine.dispose()
+
+    def test_target_schema_includes_inventory_cost_history_table(self):
+        from hummingbot.strategy_v2.migrations.ok_rsi_history import initialize_target_database
+
+        initialize_target_database(self.target)
+        with closing(sqlite3.connect(self.target)) as connection:
+            tables = {
+                row[0] for row in connection.execute("select name from sqlite_master where type='table'")
+            }
+        self.assertIn("InventoryCost", tables)
+
+    def test_receipt_binds_dry_run_apply_and_verification(self):
+        from hummingbot.strategy_v2.migrations.ok_rsi_history import (
+            apply_ok_rsi_migration,
+            assert_receipt_matches_plan,
+            load_migration_receipt,
+            plan_ok_rsi_migration,
+            verify_ok_rsi_migration,
+            write_applied_receipt,
+            write_dry_run_receipt,
+        )
+
+        receipt_path = self.root / "receipt.json"
+        plan = plan_ok_rsi_migration(self.source, self.target, self.wallet)
+        write_dry_run_receipt(plan, receipt_path)
+        assert_receipt_matches_plan(load_migration_receipt(receipt_path), plan)
+        result = apply_ok_rsi_migration(plan)
+        write_applied_receipt(plan, result, receipt_path)
+        report = verify_ok_rsi_migration(self.target, receipt_path)
+        self.assertEqual(report.integrity_check, "ok")
+        self.assertEqual(report.current_position_count, 5)
+        self.assertEqual(report.current_ledger_count, 5)
 
     def test_first_sell_economics_are_conditional_and_bounded(self):
         from hummingbot.strategy_v2.migrations.ok_rsi_history import calculate_first_sell_economics

@@ -40,6 +40,33 @@
 - Rollback restores checksum-verified backups and the prior local config names while leaving inventory untouched. No rollback step sells or cancels anything.
 - Memory impact: record the final runtime identity, migration/receipt command, position-provenance boundary, no-force-sell invariants, and verified wallet/status commands after completion.
 
+### Progress and current blocker
+
+- Implemented and committed the canonical `ok_rsi.yml` identity, short IDs,
+  explicit legacy mappings, all-false final manual kill switches, and the
+  strict no-force-sell fixture contract.
+- Added a loader-verified, one-shot OKX wallet snapshot strategy whose source
+  contains no order/cancel/executor action calls. The current shell does not
+  have the config password, so it was not started.
+- Added the checksum-bound planner/importer/verifier, deterministic position
+  and ledger seeds, receipt binding, online backup helper, and conditional
+  first-sell economics. The focused warning-clean matrix passed 89 tests plus
+  22 subtests before documentation closeout.
+- Created integrity-checked online backups of `rsi_v5.sqlite` and
+  `ok_rsi_buy_sell.sqlite`. SQLite online backups are logically equivalent but
+  need not have the same byte checksum because page layout/WAL consolidation
+  may differ; each backup has its own recorded SHA-256 and integrity result.
+- The latest authenticated OKX runtime snapshot at
+  `2026-08-28T17:59:02Z` proves BTC=0 and XRP=0, while the legacy source tracks
+  BTC=0.04057 and XRP=1981.7. This is the exact fail-closed condition from the
+  approved design. The real dry-run/apply and locked restoration smoke remain
+  blocked; no `ok_rsi.sqlite` has been created and no synthetic position was
+  inserted.
+- Reversal condition: obtain a fresh authenticated wallet snapshot that covers
+  all five legacy amounts, or explicitly revise the approved policy to migrate
+  complete history while seeding only ETH/SOL/BNB and treating BTC/XRP as
+  historical-only closed/off-wallet positions.
+
 ## OK RSI EEA USDC and locally derived higher timeframes (2026-08-28)
 
 ### Task

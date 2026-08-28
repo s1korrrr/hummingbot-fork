@@ -13,6 +13,7 @@ from hummingbot.client.config.config_helpers import (
 )
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.common import GroupedSetDict, LazyDict, PriceType, TradeType
 from hummingbot.core.data_type.order_book_query_result import OrderBookQueryResult
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
@@ -41,6 +42,7 @@ class MarketDataProvider:
                  connectors: Dict[str, ConnectorBase],
                  rates_update_interval: int = 60):
         self.candles_feeds = {}  # Stores instances of candle feeds
+        self._candle_throttlers: Dict[str, AsyncThrottler] = {}
         self.connectors = connectors  # Stores instances of connectors
         self._rates_update_task = None
         self._rates_update_interval = rates_update_interval
@@ -57,6 +59,7 @@ class MarketDataProvider:
             self._rates_update_task.cancel()
             self._rates_update_task = None
         self.candles_feeds.clear()
+        self._candle_throttlers.clear()
         self._rates_required.clear()
         # Stop non-trading connectors that were started for public data access
         for connector in self._non_trading_connectors.values():
@@ -226,6 +229,11 @@ class MarketDataProvider:
 
             # Create a new feed with updated max_records
             candle_feed = CandlesFactory.get_candle(config)
+            throttler = self._candle_throttlers.get(config.connector)
+            if throttler is None:
+                throttler = AsyncThrottler(rate_limits=candle_feed.rate_limits)
+                self._candle_throttlers[config.connector] = throttler
+            candle_feed.set_throttler(throttler)
             self.candles_feeds[key] = candle_feed
             if hasattr(candle_feed, 'start'):
                 candle_feed.start()

@@ -34,6 +34,21 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
             self.provider.initialize_candles_feed_list(config)
             self.assertTrue("mock_connector_BTC-USDT_1m" in self.provider.candles_feeds)
 
+    @patch.object(CandlesBase, "start", MagicMock())
+    def test_candle_feeds_share_throttler_within_connector_only(self):
+        okx_btc = self.provider.get_candles_feed(
+            CandlesConfig(connector="okx", trading_pair="BTC-USDT", interval="1m", max_records=100)
+        )
+        okx_eth = self.provider.get_candles_feed(
+            CandlesConfig(connector="okx", trading_pair="ETH-USDT", interval="5m", max_records=100)
+        )
+        binance_btc = self.provider.get_candles_feed(
+            CandlesConfig(connector="binance", trading_pair="BTC-USDT", interval="1m", max_records=100)
+        )
+
+        self.assertIs(okx_btc._api_factory.throttler, okx_eth._api_factory.throttler)
+        self.assertIsNot(okx_btc._api_factory.throttler, binance_btc._api_factory.throttler)
+
     def test_get_non_trading_connector(self):
         connector = self.provider.get_non_trading_connector("binance")
         self.assertEqual(connector._trading_required, False)

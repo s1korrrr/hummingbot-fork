@@ -1,7 +1,7 @@
 from test.hummingbot.data_feed.candles_feed.test_candles_base import TestCandlesBase
 
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
-from hummingbot.data_feed.candles_feed.okx_spot_candles import OKXSpotCandles
+from hummingbot.data_feed.candles_feed.okx_spot_candles import OKXSpotCandles, constants as CONSTANTS
 
 
 class TestOKXSpotCandles(TestCandlesBase):
@@ -29,6 +29,12 @@ class TestOKXSpotCandles(TestCandlesBase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.mocking_assistant = NetworkMockingAssistant()
+
+    def test_public_ip_rate_limits_reserve_half_for_non_candle_traffic(self):
+        limits = {rate_limit.limit_id: rate_limit.limit for rate_limit in self.data_feed.rate_limits}
+
+        self.assertEqual(10, limits[CONSTANTS.CANDLES_ENDPOINT])
+        self.assertEqual(5, limits[CONSTANTS.HEALTH_CHECK_ENDPOINT])
 
     @staticmethod
     def get_candles_rest_data_mock():

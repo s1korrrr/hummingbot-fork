@@ -4,9 +4,9 @@
 
 - [x] Present and obtain approval for the architecture and authority boundary.
   DoD: runtime identity, history provenance, wallet reconciliation, no-force-sell behavior, locked validation, and unlocked-stop boundary are explicitly approved.
-- [-] Write and review the repository design specification.
+- [x] Write and review the repository design specification.
   DoD: the spec contains no placeholders or contradictions and the operator approves the written artifact before implementation planning.
-- [ ] Create the TDD implementation plan.
+- [x] Create the TDD implementation plan.
   DoD: every config, migration, restoration, reporting, database, wallet, and runtime requirement maps to fail-first steps and exact validation commands.
 - [ ] Implement config identity and no-force-sell invariants.
   DoD: local runtime plus committed fixtures/docs use `ok_rsi.yml`, `ok_rsi.sqlite`, short IDs, OKX USDC pairs, final false kill switches, and no forced liquidation path.

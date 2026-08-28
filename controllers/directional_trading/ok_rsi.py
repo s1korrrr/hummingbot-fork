@@ -200,6 +200,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     )
     leverage: int = 1
     position_mode: PositionMode = PositionMode.ONEWAY
+    legacy_controller_ids: List[str] = hl_rsi.Field(default_factory=list)
 
     derived_higher_timeframe_max_records: int = hl_rsi.Field(
         default=100,
@@ -264,6 +265,20 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         if len(parts) != 2 or not all(parts):
             raise ValueError("OK RSI trading_pair must use BASE-QUOTE format")
         return trading_pair
+
+    @field_validator("legacy_controller_ids", mode="before")
+    @classmethod
+    def validate_legacy_controller_ids(cls, value):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise ValueError("legacy_controller_ids must be a list")
+        normalized = [str(controller_id).strip() for controller_id in value]
+        if any(not controller_id for controller_id in normalized):
+            raise ValueError("legacy_controller_ids cannot contain blank values")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("legacy_controller_ids must be unique")
+        return normalized
 
     @model_validator(mode="after")
     def validate_okx_spot_contract(self):

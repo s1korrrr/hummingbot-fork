@@ -617,10 +617,10 @@ class OKRSIControllerTest(unittest.TestCase):
         loader = SimpleNamespace(_load_strategy_config=lambda: payload)
         return TradingCore.load_v2_class(loader, strategy_name)
 
-    def test_buy_sell_script_loads_only_requested_buy_sell_pairs(self):
+    def test_buy_sell_script_uses_canonical_ok_rsi_identity(self):
         from scripts.v2_with_controllers import V2WithControllersConfig
 
-        payload = yaml.safe_load((FIXTURES_PATH / "scripts" / "ok_rsi_buy_sell.yml").read_text())
+        payload = yaml.safe_load((FIXTURES_PATH / "scripts" / "ok_rsi.yml").read_text())
         config = V2WithControllersConfig(**payload)
         with patch(
             "hummingbot.client.settings.CONTROLLERS_CONF_DIR_PATH",
@@ -639,13 +639,41 @@ class OKRSIControllerTest(unittest.TestCase):
                 "ok_rsi_bnb.yml",
             },
         )
-        self.assertEqual(
-            {controller.trading_pair for controller in loaded},
-            {"BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC", "BNB-USDC"},
-        )
+        expected = {
+            "ok-rsi-btc": ("BTC-USDC", "rsi-v5-btc-usdc-1m"),
+            "ok-rsi-eth": ("ETH-USDC", "rsi-v5-eth-usdc-1m"),
+            "ok-rsi-sol": ("SOL-USDC", "rsi-v5-sol-usdc-1m"),
+            "ok-rsi-xrp": ("XRP-USDC", "rsi-v5-xrp-usdc-1m"),
+            "ok-rsi-bnb": ("BNB-USDC", "rsi-v5-bnb-usdc-1m"),
+        }
+        self.assertEqual(set(expected), {controller.id for controller in loaded})
+        for controller in loaded:
+            self.assertEqual(controller.connector_name, "okx")
+            self.assertEqual(controller.trading_pair, expected[controller.id][0])
+            self.assertEqual(controller.legacy_controller_ids, [expected[controller.id][1]])
         self.assertTrue(all(controller.trade_mode == "buy_sell" for controller in loaded))
         self.assertTrue(all(controller.sell_only_if_profitable for controller in loaded))
         self.assertEqual(len({controller.id for controller in loaded}), 5)
+
+    def test_buy_sell_profiles_never_force_sell(self):
+        from scripts.v2_with_controllers import V2WithControllersConfig
+
+        payload = yaml.safe_load((FIXTURES_PATH / "scripts" / "ok_rsi.yml").read_text())
+        config = V2WithControllersConfig(**payload)
+        with patch(
+            "hummingbot.client.settings.CONTROLLERS_CONF_DIR_PATH",
+            str(FIXTURES_PATH / "controllers"),
+        ):
+            loaded = config.load_controller_configs()
+
+        for controller in loaded:
+            self.assertEqual(controller.leverage, 1)
+            self.assertFalse(controller.manual_kill_switch)
+            self.assertTrue(controller.sell_only_if_profitable)
+            self.assertIsNone(controller.stop_loss)
+            self.assertIsNone(controller.take_profit)
+            self.assertIsNone(controller.time_limit)
+            self.assertTrue(controller.early_stop_keep_position)
 
     def test_sell_only_script_loads_only_requested_sell_only_pairs(self):
         strategy_class, config = self._load_script_through_trading_core(

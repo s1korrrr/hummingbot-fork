@@ -12,13 +12,13 @@
   DoD: local runtime plus committed fixtures/docs use `ok_rsi.yml`, `ok_rsi.sqlite`, short IDs, OKX USDC pairs, final false kill switches, and no forced liquidation path.
 - [x] Implement and test the migration planner/importer/verifier.
   DoD: complete legacy history remains unchanged in provenance, target mutation is transactional/idempotent/checksum-bound, and failures preserve the target.
-- [ ] Reconcile and seed verified OKX inventory. **Blocked by wallet truth.**
-  DoD: five eligible assets decode and cross-check source economics against read-only available balances; mismatches fail closed and excess is untracked. Latest authenticated 2026-08-28 snapshot proves BTC=0 and XRP=0 against non-zero legacy positions, so the approved five-seed migration correctly refuses to apply.
-- [ ] Verify actual databases and locked runtime.
-  DoD: backups, integrity checks, row/receipt verification, restored cost basis/status, clean logs, and zero order/fill/cancel evidence pass before final configs are unlocked and left stopped. The pre-existing controller-only `ok_rsi.sqlite` is backed up and unmodified; replacing it with a freshly initialized target remains gated by wallet reconciliation.
+- [x] Import complete history with zero managed OK RSI inventory.
+  DoD: history-only planning requires no wallet snapshot, imports BTC/XRP and every other legacy row without rewriting provenance, creates zero current Position/hold-ledger seeds, and records the mode in its checksum-bound receipt.
+- [x] Verify actual databases and leave runtime stopped.
+  DoD: a fresh online target backup, integrity checks, row/receipt verification, `avg=n/a` zero-bag semantics, and zero current inventory seeds pass. A live restart is deliberately not run because unlocked configs can place orders and this request grants database-migration authority only.
 - [x] Produce average-price and first-sell economics report from the latest authenticated snapshot.
   DoD: each asset reports wallet/tracked/untracked amounts, breakeven, current price, minimum profit, recovery arm, partial amount, and dynamic conditions without claiming a guaranteed execution price.
-- [ ] Complete validation, review, documentation, and memory harvest.
+- [x] Complete validation, review, documentation, and memory harvest.
   DoD: focused/warning-clean tests, compilation, pre-commit, YAML/diff/status review, rollback evidence, and durable lessons are current.
 
 ## OK RSI EEA USDC and locally derived higher timeframes

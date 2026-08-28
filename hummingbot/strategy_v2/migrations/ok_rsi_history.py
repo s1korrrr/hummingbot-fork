@@ -70,10 +70,11 @@ class InventorySeed:
 class MigrationPlan:
     source_path: Path
     target_path: Path
-    wallet_snapshot_path: Path
+    inventory_mode: str
+    wallet_snapshot_path: Path | None
     source_sha256: str
     target_pre_sha256: str
-    wallet_snapshot_sha256: str
+    wallet_snapshot_sha256: str | None
     inventory_seeds: tuple[InventorySeed, ...]
 
 
@@ -129,6 +130,7 @@ _FAILED_OK_RSI_IDS = {
     f"ok-rsi-{asset.lower()}-usdc-buy-sell" for asset in ("BTC", "ETH", "SOL", "XRP", "BNB")
 }
 _MISSING_DIGEST = "MISSING"
+_INVENTORY_MODES = {"verified-seed", "history-only"}
 
 
 def file_sha256(path: Path) -> str:
@@ -199,18 +201,34 @@ def load_wallet_snapshot(path: Path) -> dict:
 def plan_ok_rsi_migration(
     source_path: Path,
     target_path: Path,
-    wallet_snapshot_path: Path,
+    wallet_snapshot_path: Path | None = None,
     mappings: Sequence[AssetMapping] = OK_RSI_ASSET_MAPPINGS,
     dust_tolerance: Decimal = Decimal("0"),
+    inventory_mode: str = "verified-seed",
 ) -> MigrationPlan:
     source_path = source_path.resolve()
     target_path = target_path.resolve()
-    wallet_snapshot_path = wallet_snapshot_path.resolve()
     if source_path == target_path:
         raise MigrationValidationError("source and target databases must be different files")
+    if inventory_mode not in _INVENTORY_MODES:
+        raise MigrationValidationError(f"unsupported inventory mode: {inventory_mode}")
     if dust_tolerance < 0 or not dust_tolerance.is_finite():
         raise MigrationValidationError("dust tolerance must be non-negative and finite")
     source_positions = inspect_legacy_source(source_path, mappings)
+    if inventory_mode == "history-only":
+        return MigrationPlan(
+            source_path=source_path,
+            target_path=target_path,
+            inventory_mode=inventory_mode,
+            wallet_snapshot_path=None,
+            source_sha256=file_sha256(source_path),
+            target_pre_sha256=file_sha256(target_path),
+            wallet_snapshot_sha256=None,
+            inventory_seeds=(),
+        )
+    if wallet_snapshot_path is None:
+        raise MigrationValidationError("verified-seed mode requires a wallet snapshot")
+    wallet_snapshot_path = wallet_snapshot_path.resolve()
     wallet = load_wallet_snapshot(wallet_snapshot_path)
     seeds = []
     for source in source_positions:
@@ -236,7 +254,8 @@ def plan_ok_rsi_migration(
             untracked_balance=max(Decimal("0"), total - source.amount),
         ))
     return MigrationPlan(
-        source_path=source_path, target_path=target_path, wallet_snapshot_path=wallet_snapshot_path,
+        source_path=source_path, target_path=target_path, inventory_mode=inventory_mode,
+        wallet_snapshot_path=wallet_snapshot_path,
         source_sha256=file_sha256(source_path), target_pre_sha256=file_sha256(target_path),
         wallet_snapshot_sha256=file_sha256(wallet_snapshot_path), inventory_seeds=tuple(seeds),
     )
@@ -281,6 +300,20 @@ def _failed_controller_row(columns: list[str], row: tuple) -> bool:
     except (TypeError, json.JSONDecodeError):
         pass
     return bool(candidates & _FAILED_OK_RSI_IDS)
+
+
+def _insert_controller_version(connection: sqlite3.Connection, columns: list[str], row: tuple) -> bool:
+    """Import a controller version while treating controller_id as a database-local surrogate key."""
+    payload = dict(zip(columns, row))
+    version_columns = [column for column in columns if column != "controller_id"]
+    quoted = ",".join(f'"{column}"' for column in version_columns)
+    predicate = " and ".join(f'"{column}" is ?' for column in version_columns)
+    values = tuple(payload[column] for column in version_columns)
+    if connection.execute(f'select 1 from "Controllers" where {predicate}', values).fetchone() is not None:
+        return False
+    placeholders = ",".join("?" for _ in version_columns)
+    connection.execute(f'insert into "Controllers" ({quoted}) values ({placeholders})', values)
+    return True
 
 
 def _scaled(value: Decimal) -> int:
@@ -330,7 +363,13 @@ def _insert_seed(connection: sqlite3.Connection, seed: InventorySeed, source_sha
 def apply_ok_rsi_migration(plan: MigrationPlan) -> MigrationResult:
     if file_sha256(plan.source_path) != plan.source_sha256:
         raise MigrationValidationError("source checksum changed after planning")
-    if file_sha256(plan.wallet_snapshot_path) != plan.wallet_snapshot_sha256:
+    if plan.inventory_mode not in _INVENTORY_MODES:
+        raise MigrationValidationError(f"unsupported inventory mode: {plan.inventory_mode}")
+    if plan.inventory_mode == "history-only" and (plan.wallet_snapshot_path is not None or plan.inventory_seeds):
+        raise MigrationValidationError("history-only mode cannot carry a wallet snapshot or inventory seeds")
+    if plan.inventory_mode == "verified-seed" and plan.wallet_snapshot_path is None:
+        raise MigrationValidationError("verified-seed mode requires a wallet snapshot")
+    if plan.wallet_snapshot_path is not None and file_sha256(plan.wallet_snapshot_path) != plan.wallet_snapshot_sha256:
         raise MigrationValidationError("wallet snapshot checksum changed after planning")
     if file_sha256(plan.target_path) != plan.target_pre_sha256:
         raise MigrationValidationError("target checksum changed after planning")
@@ -359,6 +398,12 @@ def apply_ok_rsi_migration(plan: MigrationPlan) -> MigrationResult:
                 for row in source.execute(f'select {quoted} from "{table}"'):
                     if table == "Controllers" and _failed_controller_row(columns, row):
                         excluded += 1
+                        continue
+                    if table == "Controllers" and "controller_id" in columns:
+                        if _insert_controller_version(target, columns, row):
+                            imported += 1
+                        else:
+                            skipped += 1
                         continue
                     if key_columns:
                         row_map = dict(zip(columns, row))
@@ -480,7 +525,7 @@ def assert_receipt_matches_plan(receipt: dict, plan: MigrationPlan) -> None:
     recorded = receipt.get("plan") or {}
     current = migration_plan_to_dict(plan)
     binding_fields = (
-        "source_path", "target_path", "wallet_snapshot_path", "source_sha256",
+        "source_path", "target_path", "inventory_mode", "wallet_snapshot_path", "source_sha256",
         "target_pre_sha256", "wallet_snapshot_sha256", "inventory_seeds",
     )
     differences = [field for field in binding_fields if recorded.get(field) != current.get(field)]
@@ -518,7 +563,8 @@ def verify_ok_rsi_migration(target_path: Path, receipt_path: Path) -> Verificati
         ledger = connection.execute(
             'select count(*) from "PositionHoldLedger" where controller_id like \'ok-rsi-%\''
         ).fetchone()[0]
-    if integrity != "ok" or positions != len(OK_RSI_ASSET_MAPPINGS) or ledger != len(OK_RSI_ASSET_MAPPINGS):
+    expected_current_inventory = len(receipt.get("plan", {}).get("inventory_seeds", []))
+    if integrity != "ok" or positions != expected_current_inventory or ledger != expected_current_inventory:
         raise MigrationValidationError(
             f"target verification failed: integrity={integrity} positions={positions} ledger={ledger}"
         )

@@ -76,6 +76,76 @@ class OKRSIHistoryMigrationTest(unittest.TestCase):
         with self.assertRaisesRegex(MigrationValidationError, "BTC-USDC.*shortfall"):
             plan_ok_rsi_migration(self.source, self.target, self.wallet)
 
+    def test_history_only_imports_all_history_without_current_inventory(self):
+        from hummingbot.strategy_v2.migrations.ok_rsi_history import (
+            apply_ok_rsi_migration,
+            plan_ok_rsi_migration,
+            verify_ok_rsi_migration,
+            write_applied_receipt,
+        )
+
+        plan = plan_ok_rsi_migration(
+            self.source,
+            self.target,
+            inventory_mode="history-only",
+        )
+        self.assertEqual(plan.inventory_mode, "history-only")
+        self.assertIsNone(plan.wallet_snapshot_path)
+        self.assertEqual(plan.inventory_seeds, ())
+
+        result = apply_ok_rsi_migration(plan)
+        self.assertEqual(result.seed_count, 0)
+        receipt_path = self.root / "history-only-receipt.json"
+        write_applied_receipt(plan, result, receipt_path)
+        report = verify_ok_rsi_migration(self.target, receipt_path)
+
+        self.assertEqual(report.current_position_count, 0)
+        self.assertEqual(report.current_ledger_count, 0)
+        with closing(sqlite3.connect(self.target)) as connection:
+            legacy_positions = connection.execute(
+                'select controller_id, connector_name, trading_pair from "Position" '
+                "where controller_id like 'rsi-v5-%' order by controller_id"
+            ).fetchall()
+        self.assertEqual(len(legacy_positions), 5)
+        self.assertTrue(all(row[1] == "binance" and row[2].endswith("-USDC") for row in legacy_positions))
+
+    def test_controller_surrogate_key_collision_preserves_both_versions_idempotently(self):
+        from hummingbot.strategy_v2.migrations.ok_rsi_history import (
+            apply_ok_rsi_migration,
+            initialize_target_database,
+            plan_ok_rsi_migration,
+        )
+
+        initialize_target_database(self.target)
+        with closing(sqlite3.connect(self.source)) as source:
+            source.execute(
+                'insert into "Controllers" (controller_id,id,timestamp,type,config) values (?,?,?,?,?)',
+                (1, "rsi-v5-btc-usdc-1m", 1000, "directional_trading", '{"id":"rsi-v5-btc-usdc-1m"}'),
+            )
+            source.commit()
+        with closing(sqlite3.connect(self.target)) as target:
+            target.execute(
+                'insert into "Controllers" (controller_id,id,timestamp,type,config) values (?,?,?,?,?)',
+                (1, "ok-rsi-btc", 2000, "directional_trading", '{"id":"ok-rsi-btc"}'),
+            )
+            target.commit()
+
+        first = apply_ok_rsi_migration(plan_ok_rsi_migration(
+            self.source, self.target, inventory_mode="history-only"
+        ))
+        second = apply_ok_rsi_migration(plan_ok_rsi_migration(
+            self.source, self.target, inventory_mode="history-only"
+        ))
+
+        with closing(sqlite3.connect(self.target)) as connection:
+            versions = connection.execute(
+                'select controller_id,id from "Controllers" order by controller_id'
+            ).fetchall()
+        self.assertEqual([row[1] for row in versions], ["ok-rsi-btc", "rsi-v5-btc-usdc-1m"])
+        self.assertNotEqual(versions[0][0], versions[1][0])
+        self.assertEqual(first.imported_rows, 6)
+        self.assertEqual(second.imported_rows, 0)
+
     def test_apply_is_idempotent_and_seeds_current_identity(self):
         from hummingbot.strategy_v2.migrations.ok_rsi_history import (
             apply_ok_rsi_migration,

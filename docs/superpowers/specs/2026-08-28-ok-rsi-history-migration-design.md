@@ -3,13 +3,14 @@
 ## Status
 
 - Approved in chat by the operator on 2026-08-28.
+- Revised in chat by the operator on 2026-08-28 to import history with zero current bags for all assets.
 - Owner repository: `hummingbot/`.
 - Target stage: live-adjacent repository and local-runtime preparation only.
 - Forbidden without separate approval: unlocked strategy start, order placement, cancellation, withdrawal, credential mutation, or any other balance mutation.
 
 ## Objective
 
-Create one truthful OKX USDC runtime identity that retains the complete RSI V5 database history, restores only verified open inventory as OK RSI bags with working average prices, exposes legacy and current performance without conflating venues, and never force-sells held inventory.
+Create one truthful OKX USDC runtime identity that retains the complete RSI V5 database history, starts with zero managed OK RSI bags, keeps legacy averages as inactive reference evidence, and never treats an unexplained wallet balance as sellable managed inventory.
 
 ## Final Runtime Identity
 
@@ -37,7 +38,7 @@ Every final profile must preserve these invariants:
 - Ordinary BUY exits remain trailing-only and cannot silently lose their exit contract.
 - Drawdown, shutdown, stale-order cancellation, or runtime restart cannot force liquidation of held inventory.
 - Signal and recovery sells remain bounded by tracked inventory and actual available OKX base balance.
-- A migrated bag cannot sell below the controller's fee-aware cost basis and configured minimum-profit rule.
+- A future OK RSI bag cannot sell below the controller's fee-aware cost basis and configured minimum-profit rule.
 - Recovery sells remain partial and conditional on the configured RSI/reversal/trailing state machine.
 - No transient trailing peak, cooldown, loss streak, or active executor state crosses from RSI V5 into OK RSI.
 
@@ -66,7 +67,7 @@ Every final profile must preserve these invariants:
 The target contains the complete legacy history while preserving original identity:
 
 - Original `TradeFill` rows retain `config_file_path=rsi_v5.yml`, `strategy=v2_with_controllers`, `market=binance`, original USDC symbols, order IDs, trade IDs, timestamps, prices, amounts, and fees.
-- Original orders, order-status rows, executors, controller configurations, position rows, position-hold ledger entries, runtime events when present, and other compatible historical tables retain their original values.
+- Original orders, order-status rows, executors, controller configurations, position rows, position-hold ledger entries, runtime events when present, and other compatible historical tables retain their original values. The autoincrement-only `Controllers.controller_id` surrogate is reassigned on import because it is database-local and collides with current target rows; controller version identity and configuration remain unchanged.
 - No Binance row is relabelled as OKX.
 - No legacy controller ID is rewritten to an OK RSI ID.
 - Target-only schema tables remain intact.
@@ -76,7 +77,16 @@ The target contains the complete legacy history while preserving original identi
 
 Legacy history is available for reporting, but current OK RSI risk state uses only current OK RSI controller IDs. Legacy realized performance must be labelled `RSI V5 · Binance · USDC`; OK RSI performance must be labelled `OK RSI · OKX · USDC`.
 
-## Inventory Seed Contract
+## Inventory Mode Contract
+
+The migrator supports two explicit, receipt-bound modes:
+
+- `verified-seed`: the original wallet-reconciled seed design below. It remains available for a separately approved future adoption of demonstrably identical legacy inventory.
+- `history-only`: imports all legacy data and creates zero current `ok-rsi-*` Position or PositionHoldLedger rows. This is the operator-selected mode applied on 2026-08-28.
+
+In history-only mode, BTC, ETH, SOL, XRP, and BNB legacy positions remain under their original Binance/controller identities. A later OKX deposit does not activate their averages automatically. The active controller reports `avg=n/a` and has no eligible selling price until it executes a real managed buy or the operator separately approves a verified inventory adoption.
+
+### Optional verified-seed mode
 
 Only the five shared base assets are eligible:
 
@@ -104,7 +114,15 @@ For each eligible asset, the migrator must:
 
 The seed is inventory state, not an exchange fill. It must not be inserted as a fabricated OKX `TradeFill` or order.
 
-## Average Price and First-Sell Report
+## Average Price and First-Sell Policy
+
+For active OK RSI inventory, average price is the weighted acquisition cost of all remaining managed buys, with cumulative fees retained for net-profit eligibility. Partial sells reduce amount without replacing this basis with a rolling recent-buy estimate. Once the managed position is flat, its basis resets; later OK RSI buys establish a new basis.
+
+The last 10-15 buys must not be used as a cost basis. It can exclude still-held older units, overweight small recent orders, and become materially false after partial sells.
+
+With the selected history-only migration, all five active rows intentionally show `avg=n/a`, and there is no current selling price. Legacy BTC and XRP averages remain queryable as explicitly labelled historical references, but cannot authorize an OKX sell.
+
+If verified inventory adoption is separately approved later, produce one row per asset containing:
 
 After restoration, produce one row per asset containing:
 
@@ -139,6 +157,7 @@ Add a focused script with these modes:
 --dry-run       inspect, reconcile, and emit a receipt without target mutation
 --apply         apply the exact previously validated plan transactionally
 --verify        reopen the target and independently verify rows, seeds, and checksums
+--history-only  copy history without a wallet snapshot or current inventory seeds
 ```
 
 Required properties:
@@ -161,7 +180,7 @@ Verification uses a separate temporary validation pack with all controllers manu
 2. Start `ok_rsi.yml` or its exact validation projection with all controllers locked.
 3. Confirm the authenticated OKX connector and five USDC markets become ready.
 4. Capture available balances and current mid prices without order actions.
-5. Confirm each migrated controller reports the expected held amount, bag count, cost basis, sellable amount, shortfall, and untracked amount.
+5. In history-only mode, confirm each current controller reports zero managed amount, no cost basis, and no sellable managed inventory while legacy rows remain separately queryable.
 6. Confirm there are no active executors, order creations, cancellations, fills, repeated 429s, persistent ticker timeouts, or hidden recovery sells.
 7. Stop cleanly.
 8. Set all final local controller profiles to `manual_kill_switch: false`.
@@ -172,7 +191,7 @@ Verification uses a separate temporary validation pack with all controllers manu
 - Fail-first loader test for `ok_rsi.yml` and short IDs.
 - Fail-first config audit for USDC identity, no manual kill switches, and no-force-sell invariants.
 - Migration tests for schema compatibility, complete history, unchanged provenance, collision rejection, idempotency, checksum binding, and rollback.
-- Inventory tests for model decoding, five explicit mappings, unsupported-scope exclusion, balance shortfall, excess untracked balance, fee-aware breakeven, and seed restoration.
+- Inventory tests for model decoding, five explicit mappings, unsupported-scope exclusion, balance shortfall, excess untracked balance, fee-aware breakeven, seed restoration, and history-only zero-bag verification.
 - Runtime restoration test proving `StrategyV2Base` supplies the seeded position to the matching OK RSI controller.
 - Status/report tests for separated legacy/current history and first-sell economics.
 - Focused OK RSI and executor-orchestrator suites under warnings-as-errors.
@@ -194,7 +213,7 @@ Verification uses a separate temporary validation pack with all controllers manu
 - `start --v2 ok_rsi.yml` deterministically selects `data/ok_rsi.sqlite`.
 - Five OKX USDC controllers use the approved short IDs and final kill switches are false.
 - The complete legacy history exists in the target with unchanged Binance provenance.
-- Verified shared inventory restores under current OK RSI IDs with correct amount, breakeven, and fees.
+- The selected history-only migration creates zero current OK RSI positions or ledger seeds; legacy positions retain their original IDs, venue, amount, breakeven, and fees.
 - Unsupported or unexplained inventory is reported, not fabricated.
 - No configuration or migration path can force-sell a held bag.
 - A fresh read-only runtime displays correct inventory economics and produces the requested average-price/first-sell table.

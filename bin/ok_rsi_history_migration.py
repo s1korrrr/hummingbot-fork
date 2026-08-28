@@ -25,6 +25,11 @@ def parse_args():
     parser.add_argument("--source", type=Path)
     parser.add_argument("--target", type=Path, required=True)
     parser.add_argument("--wallet-snapshot", type=Path)
+    parser.add_argument(
+        "--history-only",
+        action="store_true",
+        help="copy complete legacy history but create no current OK RSI inventory",
+    )
     parser.add_argument("--receipt", type=Path, required=True)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="plan only (default)")
@@ -39,9 +44,16 @@ def main() -> int:
         report = verify_ok_rsi_migration(args.target, args.receipt)
         print(json.dumps({"status": "verified", **asdict(report)}, sort_keys=True, indent=2))
         return 0
-    if args.source is None or args.wallet_snapshot is None:
-        raise SystemExit("--source and --wallet-snapshot are required for dry-run/apply")
-    plan = plan_ok_rsi_migration(args.source, args.target, args.wallet_snapshot)
+    if args.source is None:
+        raise SystemExit("--source is required for dry-run/apply")
+    if not args.history_only and args.wallet_snapshot is None:
+        raise SystemExit("--wallet-snapshot is required unless --history-only is selected")
+    plan = plan_ok_rsi_migration(
+        args.source,
+        args.target,
+        args.wallet_snapshot,
+        inventory_mode="history-only" if args.history_only else "verified-seed",
+    )
     if args.apply:
         receipt = load_migration_receipt(args.receipt)
         if receipt.get("status") != "dry-run-approved":

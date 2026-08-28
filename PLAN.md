@@ -16,12 +16,15 @@
 - `rsi_v5.sqlite` remains immutable. Verified SQLite backups, checksums, one-transaction apply, idempotency, and pre/post integrity gates are mandatory.
 - Wallet balance access is authenticated read-only. Secrets must not enter source, logs, receipts, tests, or status output.
 - Legacy history cannot contaminate new OK RSI cooldowns, active executors, loss streaks, drawdown, or trailing state.
+- Operator revision on 2026-08-28: import the complete legacy history, including BTC and XRP, but seed zero current OK RSI bags for every asset. Legacy open-position rows remain under their original Binance/controller identity as inactive reference evidence only. A later wallet deposit must never activate that basis automatically; adopting demonstrably identical legacy inventory requires a separate explicit operator action.
+- Future OK RSI cost basis uses the weighted cost (and cumulative fees) of all remaining managed inventory since the latest flat point. A rolling last-10/15-buy estimate is forbidden because partial sells and unequal order sizes make it economically false. With zero managed inventory, average and sell threshold are intentionally `n/a`.
 
 ### Options considered
 
 1. Point OK RSI at `rsi_v5.sqlite` and reuse it directly. Rejected: exact controller/connector matching prevents restoration, while new metadata writes pollute the legacy source.
 2. Rewrite legacy Binance fills and controller IDs as OKX history. Rejected: it falsifies execution provenance and can revive stale risk/executor state.
 3. Build a new `ok_rsi.sqlite`, copy complete legacy history unchanged, and create separately reconciled current-position seeds. Chosen: it preserves audit history while giving the current controller an explicit, testable cost basis.
+4. Build/merge the same complete legacy history but create no current-position seeds. Chosen by the operator after wallet reconciliation proved BTC/XRP absent: it gives historical continuity without claiming that any present or future OKX balance is the legacy economic inventory.
 
 ### Execution and validation
 
@@ -65,9 +68,20 @@
   it was backed up and left unmodified. No migrated target or synthetic
   position was inserted.
 - Reversal condition: obtain a fresh authenticated wallet snapshot that covers
-  all five legacy amounts, or explicitly revise the approved policy to migrate
-  complete history while seeding only ETH/SOL/BNB and treating BTC/XRP as
-  historical-only closed/off-wallet positions.
+  all five legacy amounts and explicitly approve adoption of that same economic
+  inventory. The current approved policy is history-only with zero current bags
+  for all five assets; no wallet snapshot is required and no legacy average can
+  authorize a sell.
+
+### Final notes for history-only revision
+
+- Added and fail-first tested an explicit receipt-bound `history-only` mode. It imports the complete source without a wallet snapshot and rejects any inventory seed carried in that mode.
+- The first real apply failed closed on colliding `Controllers.controller_id` values and rolled back completely. Investigation proved this column is an autoincrement database-local surrogate with no foreign-key consumers. The importer now preserves each controller version's real content, assigns a new local surrogate, and deduplicates idempotently; a focused regression failed before and passed after the repair.
+- Created integrity-checked backup `data/backups/ok_rsi_history_migration_20260828/ok_rsi_pre_history_only_20260828_213604.sqlite` (SHA-256 `b9e558e48c8750f8323902969d2d7330f7ea1d94fd1d4051a96b9256784976df`). Applied receipt `history_only_receipt_20260828_213604.json` imported 89,242 rows, excluded five known failed experimental controller-version rows, created zero seeds, and verified target SHA-256 `116c7fd3185b3528db45e6a4a3938e43324ac7fbf783a6a3871009ee34197dfa` with `PRAGMA integrity_check=ok`.
+- Final database reconciliation: 346 Controllers, 1,997 Orders, 1,302 TradeFills, 1,583 Executors, six legacy Positions, 414 legacy PositionHoldLedger rows, and zero current `ok-rsi-*` Positions/ledger rows. BTC contains 137 buys plus 154 sells (net 0.04057); XRP contains 92 buys plus 97 sells (net 1981.7). All 1,302 TradeFills retain `market=binance`.
+- Warning-clean focused validation passed 80 tests plus 19 subtests across OK RSI, migration, and executor-orchestrator behavior. Compilation, scoped pre-commit, receipt verification, database integrity, provenance/count reconciliation, and diff checks passed.
+- The supplied log shows normal initial readiness delay, four recoverable five-pair ticker timeouts, one recovered candle-health broken pipe, no 429, and clean strategy/clock shutdown. The ticker timeouts originate in shared MarketDataProvider per-pair REST fan-out despite OKX offering one batch ticker request. This is a separate shared-runtime fix; no market-data code or service restart was authorized in this migration slice.
+- No controller was restarted. With all current bags intentionally zero, current average and selling price remain `n/a`. Legacy averages are reporting-only; a later deposit does not activate them.
 
 ## OK RSI EEA USDC and locally derived higher timeframes (2026-08-28)
 

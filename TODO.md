@@ -14,7 +14,9 @@
   DoD: real loader/config/controller lifecycle and a public-data-only 15-feed process complete without credentials or orders; capital-capable restarts are excluded.
 - [x] Run final correctness, risk, execution, maintainability, security, and performance review.
   DoD: official-doc/local-source checklist, risk rails, execution assumptions, tests, compilation, hooks, warning gate, diff/status audit, and findings are resolved or block shipping.
+- [x] Repair and verify the owner-repository full-suite entry point.
+  DoD: `make test` uses the active Hummingbot interpreter, isolates duplicate test module names, and its pre-existing Vertex/shutdown blockers are reproduced and recorded separately from controller results.
 - [x] Update owner-repo plans and workspace learning stores.
   DoD: verified facts, commands, blockers, rollback, and final gate are recorded without secrets.
 - [-] Publish and merge the focused Hummingbot PR only if ready.
-  DoD: intentional commits only; PR targets `master`, description matches the diff, CI/review are green, and the merge is verified on `origin/master`.
+  DoD: intentional commits only; PR targets `master`, description matches the diff, CI/review are green, and the merge is verified on `origin/master`. Deferred: PR #29 is open, but the GitHub Actions budget blocked CI before execution and the local full repository suite has confirmed pre-existing Vertex/shutdown blockers; do not merge or bypass protection until a green replacement gate exists.

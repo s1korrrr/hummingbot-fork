@@ -69,11 +69,10 @@ class IsolatedAsyncioWrapperTestCase(unittest.IsolatedAsyncioTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        # Python 3.13 no longer creates an implicit event loop here. Preserve a
-        # running loop when present; otherwise install an explicit main loop for
-        # the wrapper to restore after IsolatedAsyncioTestCase closes its loop.
+        # Preserve the loop installed for the current test context. Python 3.13
+        # raises when no loop is installed, so create one explicitly in that case.
         try:
-            cls.main_event_loop = asyncio.get_running_loop()
+            cls.main_event_loop = asyncio.get_event_loop()
         except RuntimeError:
             cls.main_event_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(cls.main_event_loop)
@@ -182,6 +181,7 @@ class LocalClassEventLoopWrapperTestCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         if cls.local_event_loop is not None:
+            asyncio.set_event_loop(cls.local_event_loop)
             tasks: Set[Task] = asyncio.all_tasks(cls.local_event_loop)
             for task in tasks:
                 task.cancel()

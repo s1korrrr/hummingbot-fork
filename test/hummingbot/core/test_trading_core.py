@@ -129,9 +129,7 @@ class TradingCoreTest(IsolatedAsyncioWrapperTestCase):
         # Set up mock clock
         self.trading_core.clock = Mock(spec=Clock)
         self.trading_core.clock.remove_iterator = Mock()
-        self.trading_core._clock_task = AsyncMock()
-        self.trading_core._clock_task.done.return_value = False
-        self.trading_core._clock_task.cancel = Mock()
+        self.trading_core._clock_task = asyncio.get_running_loop().create_future()
         self.trading_core._is_running = True
 
         # Add connector

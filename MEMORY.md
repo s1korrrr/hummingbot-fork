@@ -11,6 +11,8 @@
 
 ## Architecture Notes
 - `controllers/directional_trading/ok_rsi.py` is a thin OKX spot specialization of `hl_rsi`; shared signal, regime, DCA, inventory, recovery, and status logic must remain in the base unless an OKX boundary genuinely differs. It accepts only `okx` and `okx_paper_trade` connectors.
+- OK RSI creates one base candle feed per controller and derives configured medium/long trend candles locally. `derived_higher_timeframe_max_records` controls retained derived history; the base feed retains the largest configured interval ratio times that value. Only complete UTC-aligned buckets with every consecutive base timestamp are emitted.
+- The operator's authenticated OKX EEA (`my`/`eea.okx.com`) account returned BTC/ETH/SOL/XRP/BNB/SUI/XLM/ENA-USDC as live spot instruments on 2026-08-28, while their `*-USD` IDs were absent. Local runtime profiles therefore use direct `*-USDC`; another account must recheck its private instrument surface.
 - In `sell_only`, a signal targets 10% of current available base inventory when its quote value is at least $20 and all inventory when it is below $20. Exchange minimums, quantization, and available balance still bound the final order amount.
 - Buy/sell uses the native `scripts/v2_with_controllers.py` launcher: `conf/scripts/ok_rsi_buy_sell.yml` references five independently editable `conf/controllers/ok_rsi_{asset}.yml` files. Sell-only remains `scripts/ok_rsi_sell_only.py` with the compact grouped `conf/scripts/ok_rsi_sell_only.yml`, using `scripts/ok_rsi_script_common.py`.
 - Each OKX buy/sell controller YAML preserves the full corresponding `rsi_v5_{asset}.yml` parameter profile. Only controller identity, OKX connector/pair, and `trade_mode: buy_sell` differ; the historical evidence comments are not OKX-specific validation.
@@ -26,6 +28,8 @@
 - As of 2026-08-28, the broad `make test` gate has pre-existing failures outside OK RSI: the Vertex time-synchronizer failure assertion uses a stale hard-coded timestamp and reproduces on clean `origin/master`; the suite can also remain in `_Py_Finalize` waiting for background threads. Do not report the owner-wide suite green until both are resolved or the canonical CI supplies a clean result.
 
 ## Decision Log
+- 2026-08-28: Preserve editable base/medium/long timeframe fields but remove independent higher-timeframe feeds from OK RSI. Derive higher bars from the one base feed with exact completeness checks and fail closed on gaps or unavailable data.
+- 2026-08-28: Move the local EEA operator groups from USDT to the authenticated account's live USDC IDs: BTC/ETH/SOL/XRP/BNB buy/sell and SUI/XLM/ENA sell-only.
 - 2026-08-27: Keep proportional wallet liquidation specific to `sell_only`; preserve the existing managed-inventory sizing behavior for `buy_sell`.
 - 2026-08-27: Group BTC/ETH/SOL/XRP/BNB in the independent OKX `buy_sell` script and SUI/XLM/ENA in the independent OKX `sell_only` script.
 - 2026-08-27: Keep buy/sell parameters in normal per-asset controller YAMLs for operator tuning; use dynamic expansion only for the uniform sell-only group.

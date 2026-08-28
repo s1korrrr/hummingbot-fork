@@ -1,8 +1,8 @@
-id: ok-rsi-sol-usdt-buy-sell
+id: ok-rsi-sol-usdc-buy-sell
 controller_name: ok_rsi
 controller_type: directional_trading
 connector_name: okx
-trading_pair: SOL-USDT
+trading_pair: SOL-USDC
 trade_mode: buy_sell
 leverage: 1
 position_mode: ONEWAY

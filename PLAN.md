@@ -1,5 +1,48 @@
 # PLAN
 
+## OK RSI EEA USDC and locally derived higher timeframes (2026-08-28)
+
+### Task
+
+- Objective: move the operator's eight OKX spot instruments from USDT to the authenticated EEA-account USDC surface and derive configured higher-timeframe trend candles from the single base candle feed per controller.
+- Owner repo: `hummingbot/`. Capital impact: live-adjacent configuration and signal-input behavior; no bot start, order, cancellation, balance mutation, or deployment is authorized.
+- Venue/instruments: OKX EEA spot, leverage 1, one-way mode. Authenticated read-only evidence returned BTC/ETH/SOL/XRP/BNB/SUI/XLM/ENA-USDC as live and did not return the corresponding USD instrument IDs.
+
+### Hypothesis and invariants
+
+- Exact UTC-aligned aggregation of complete 1m candles produces the same completed OHLCV bars as native OKX 5m/15m feeds while reducing public feed count and rate-limit pressure.
+- Configured medium and long intervals remain operator-editable. Only their data source changes: no separate higher-timeframe feeds are created.
+- A derived bar is valid only when it contains the exact expected number of consecutive base bars. Incomplete, duplicate, misaligned, unsupported, or gapped input fails closed instead of creating a partial trend bar.
+- The current incomplete base candle is excluded by the existing causal preprocessing before aggregation reaches signal logic.
+
+### Options considered
+
+1. Keep native 5m/15m feeds and only change pairs to USDC. Rejected because it retains the observed multi-feed startup/rate-limit burden.
+2. Resample inside the shared `hl_rsi` controller. Rejected for this slice because the requested and account-verified behavior is OKX-specific and would change every venue specialization.
+3. Override OK RSI candle configuration and interval lookup, backed by one pure aggregation function and strict config validation. Chosen as the smallest reviewable venue-owned change.
+
+### Execution and validation
+
+1. Add fail-first tests for exact OHLCV aggregation, gap/incomplete-bucket rejection, one-feed controller configuration, configurable interval derivation, and USDC loader profiles.
+2. Add explicit higher-timeframe derived-history configuration, validate interval multiples, create only the base feed, and aggregate medium/long frames locally.
+3. Update committed fixtures and local operator YAMLs to the authenticated USDC instrument IDs while preserving full editable controller settings.
+4. Run focused tests, loader/config tests, warning-clean dependency tests, compilation, pre-commit, YAML parsing, and diff hygiene. Run only public/read-only candle parity if external verification is needed; never start a trading strategy.
+
+### Risks and rollback
+
+- Risks: aggregation boundary drift, insufficient 1m history, gaps hidden inside a bar, or different volume semantics. Controls: UTC epoch alignment, exact row-count and timestamp-spacing checks, configurable derived history, literal parity fixtures, and fail-closed empty results.
+- Costs: fees, spread, slippage, latency, partial fills, and market impact are unchanged because entry/exit execution logic is not modified. This change is not promotion evidence.
+- Kill switch/rollback: existing manual kill switch remains unchanged. Roll back the controller/config commit to restore native higher-timeframe feeds and USDT configs; no external state is changed by implementation or validation.
+- Memory impact: record the EEA USDC account shape, one-feed aggregation boundary, required base-history sizing, and verified commands after validation.
+
+### Final notes
+
+- Implemented one base feed per controller. With the default 1m/5m/15m and 100 derived records, each feed retains 1,500 one-minute rows and both higher frames are produced locally.
+- Aggregation converts numeric candle inputs, aligns buckets by UTC epoch, excludes active incomplete buckets, and omits any bucket with missing, duplicate, non-consecutive, non-numeric, or non-finite input.
+- Updated the five editable local buy/sell YAMLs and compact three-pair sell-only YAML to direct USDC instrument IDs. Committed loader fixtures mirror the same pairs; local ignored configs remain operator-owned.
+- Validation: fail-first tests produced nine expected failures before implementation and a separate unavailable-feed regression failed before its guard. The final focused suite passed 39 tests plus 19 subtests. The warning-clean controller/dependency matrix passed 331 tests plus 22 subtests. Actual local loader smoke returned eight USDC controllers with exactly one 1m/1,500-row feed each. Public BTC-USDC parity matched native OKX bars for 19 completed 5m and 6 completed 15m bars within `1e-8` OHLCV tolerance. Compilation, scoped pre-commit, YAML, and diff checks passed.
+- No strategy, service, authenticated balance, or order path was started. This remains repository/config readiness, not paper/canary/live promotion evidence.
+
 ## OK RSI positional runtime-constructor regression (2026-08-28)
 
 ### Task

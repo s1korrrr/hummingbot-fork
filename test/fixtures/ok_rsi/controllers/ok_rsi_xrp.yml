@@ -1,8 +1,8 @@
-id: ok-rsi-xrp-usdt-buy-sell
+id: ok-rsi-xrp-usdc-buy-sell
 controller_name: ok_rsi
 controller_type: directional_trading
 connector_name: okx
-trading_pair: XRP-USDT
+trading_pair: XRP-USDC
 trade_mode: buy_sell
 leverage: 1
 position_mode: ONEWAY

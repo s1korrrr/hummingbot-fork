@@ -1,8 +1,8 @@
-id: ok-rsi-bnb-usdt-buy-sell
+id: ok-rsi-bnb-usdc-buy-sell
 controller_name: ok_rsi
 controller_type: directional_trading
 connector_name: okx
-trading_pair: BNB-USDT
+trading_pair: BNB-USDC
 trade_mode: buy_sell
 leverage: 1
 position_mode: ONEWAY

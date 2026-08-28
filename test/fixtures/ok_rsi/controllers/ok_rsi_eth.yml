@@ -1,8 +1,8 @@
-id: ok-rsi-eth-usdt-buy-sell
+id: ok-rsi-eth-usdc-buy-sell
 controller_name: ok_rsi
 controller_type: directional_trading
 connector_name: okx
-trading_pair: ETH-USDT
+trading_pair: ETH-USDC
 trade_mode: buy_sell
 leverage: 1
 position_mode: ONEWAY

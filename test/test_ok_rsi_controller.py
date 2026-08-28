@@ -107,7 +107,150 @@ class OKRSIControllerTest(unittest.TestCase):
         self.assertIsNotNone(OKRSIController)
         self.assertEqual(config.controller_name, "ok_rsi")
         self.assertEqual(config.connector_name, "okx")
-        self.assertEqual(config.trading_pair, "BTC-USDT")
+        self.assertEqual(config.trading_pair, "BTC-USDC")
+
+    def test_derived_higher_timeframe_uses_only_complete_consecutive_base_candles(self):
+        from controllers.directional_trading.ok_rsi import derive_higher_timeframe_candles
+
+        base = pd.DataFrame(
+            [
+                {
+                    "timestamp": 1_800_000_000 + minute * 60,
+                    "open": str(100 + minute),
+                    "high": str(102 + minute),
+                    "low": str(99 + minute),
+                    "close": str(101 + minute),
+                    "volume": str(10 + minute),
+                    "quote_asset_volume": str(1_000 + minute),
+                }
+                for minute in range(6)
+            ]
+        )
+
+        derived = derive_higher_timeframe_candles(
+            base,
+            base_interval="1m",
+            target_interval="5m",
+            current_time=1_800_000_390,
+            max_records=10,
+        )
+
+        self.assertEqual(
+            derived.to_dict(orient="records"),
+            [
+                {
+                    "timestamp": 1_800_000_000,
+                    "open": 100,
+                    "high": 106,
+                    "low": 99,
+                    "close": 105,
+                    "volume": 60,
+                    "quote_asset_volume": 5_010,
+                }
+            ],
+        )
+
+    def test_derived_higher_timeframe_drops_bucket_with_missing_base_candle(self):
+        from controllers.directional_trading.ok_rsi import derive_higher_timeframe_candles
+
+        base = pd.DataFrame(
+            {
+                "timestamp": [1_800_000_000, 1_800_000_060, 1_800_000_180, 1_800_000_240],
+                "open": [100, 101, 103, 104],
+                "high": [101, 102, 104, 105],
+                "low": [99, 100, 102, 103],
+                "close": [100.5, 101.5, 103.5, 104.5],
+                "volume": [1, 1, 1, 1],
+            }
+        )
+
+        derived = derive_higher_timeframe_candles(
+            base,
+            base_interval="1m",
+            target_interval="5m",
+            current_time=1_800_000_360,
+            max_records=10,
+        )
+
+        self.assertTrue(derived.empty)
+
+    def test_controller_creates_only_base_feed_with_history_for_derived_intervals(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+
+        config = OKRSIControllerConfig(
+            id="derived-feed",
+            interval="1m",
+            trend_confirmation_medium_interval="5m",
+            trend_confirmation_long_interval="15m",
+            derived_higher_timeframe_max_records=100,
+        )
+        controller = OKRSIController(
+            config,
+            self._provider(base_balance=Decimal("0"), price=Decimal("50000")),
+            asyncio.Queue(),
+        )
+
+        feeds = controller.get_candles_config()
+
+        self.assertEqual(len(feeds), 1)
+        self.assertEqual(feeds[0].interval, "1m")
+        self.assertEqual(feeds[0].max_records, 1500)
+
+    def test_controller_derives_configured_interval_without_requesting_native_feed(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+
+        provider = self._provider(base_balance=Decimal("0"), price=Decimal("50000"))
+        start = 1_799_998_200
+        provider.time.return_value = 1_800_000_060
+        provider.get_candles_df.return_value = pd.DataFrame(
+            {
+                "timestamp": [start + minute * 60 for minute in range(30)],
+                "open": [100 + minute for minute in range(30)],
+                "high": [101 + minute for minute in range(30)],
+                "low": [99 + minute for minute in range(30)],
+                "close": [100.5 + minute for minute in range(30)],
+                "volume": [1] * 30,
+            }
+        )
+        controller = OKRSIController(
+            OKRSIControllerConfig(
+                id="configurable-derived-interval",
+                interval="1m",
+                trend_confirmation_medium_interval="30m",
+                trend_confirmation_long_interval="1h",
+            ),
+            provider,
+            asyncio.Queue(),
+        )
+
+        derived = controller._get_interval_candles_df("30m")
+
+        self.assertEqual(len(derived), 1)
+        self.assertEqual(derived.iloc[0]["timestamp"], start)
+        self.assertTrue(all(call.kwargs["interval"] == "1m" for call in provider.get_candles_df.call_args_list))
+
+    def test_derived_interval_returns_unavailable_when_base_feed_read_fails(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+
+        provider = self._provider(base_balance=Decimal("0"), price=Decimal("50000"))
+        provider.get_candles_df.side_effect = RuntimeError("feed unavailable")
+        controller = OKRSIController(
+            OKRSIControllerConfig(id="derived-feed-unavailable"),
+            provider,
+            asyncio.Queue(),
+        )
+
+        self.assertIsNone(controller._get_interval_candles_df("5m"))
+
+    def test_config_rejects_higher_timeframe_that_is_not_a_base_interval_multiple(self):
+        from controllers.directional_trading.ok_rsi import OKRSIControllerConfig
+
+        with self.assertRaisesRegex(ValueError, "multiple of the base interval"):
+            OKRSIControllerConfig(
+                id="invalid-derived-ratio",
+                interval="5m",
+                trend_confirmation_medium_interval="3m",
+            )
 
     def test_okx_controller_is_a_thin_specialization_of_shared_rsi_logic(self):
         from controllers.directional_trading.hl_rsi import HLRSIController, HLRSIControllerConfig
@@ -450,7 +593,7 @@ class OKRSIControllerTest(unittest.TestCase):
                 update_interval=0.001,
             )
 
-            for expected_initializations in (3, 6):
+            for expected_initializations in (1, 2):
                 controller.start()
                 await asyncio.sleep(0.005)
                 self.assertEqual(controller.status, RunnableStatus.RUNNING)
@@ -498,7 +641,7 @@ class OKRSIControllerTest(unittest.TestCase):
         )
         self.assertEqual(
             {controller.trading_pair for controller in loaded},
-            {"BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT"},
+            {"BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC", "BNB-USDC"},
         )
         self.assertTrue(all(controller.trade_mode == "buy_sell" for controller in loaded))
         self.assertTrue(all(controller.sell_only_if_profitable for controller in loaded))
@@ -514,19 +657,22 @@ class OKRSIControllerTest(unittest.TestCase):
         self.assertEqual(config.__class__.__name__, "OKRSISellOnlyConfig")
         self.assertEqual(
             {controller.trading_pair for controller in loaded},
-            {"SUI-USDT", "XLM-USDT", "ENA-USDT"},
+            {"SUI-USDC", "XLM-USDC", "ENA-USDC"},
         )
         self.assertTrue(all(controller.trade_mode == "sell_only" for controller in loaded))
         self.assertTrue(all(not controller.sell_only_if_profitable for controller in loaded))
         self.assertTrue(all(controller.sell_only_inventory_fraction == Decimal("0.10") for controller in loaded))
         self.assertTrue(all(controller.sell_all_below_quote == Decimal("20") for controller in loaded))
+        self.assertTrue(all(controller.trend_confirmation_medium_interval == "5m" for controller in loaded))
+        self.assertTrue(all(controller.trend_confirmation_long_interval == "15m" for controller in loaded))
+        self.assertTrue(all(controller.derived_higher_timeframe_max_records == 100 for controller in loaded))
         self.assertEqual(strategy_class.markets, {"okx": {controller.trading_pair for controller in loaded}})
 
     def test_single_mode_script_rejects_duplicate_pair(self):
         from scripts.ok_rsi_sell_only import OKRSISellOnlyConfig
 
         with self.assertRaisesRegex(ValueError, "unique"):
-            OKRSISellOnlyConfig(trading_pairs=["SUI-USDT", "SUI-USDT"])
+            OKRSISellOnlyConfig(trading_pairs=["SUI-USDC", "SUI-USDC"])
 
         for empty_pairs in (None, [], ""):
             with self.subTest(empty_pairs=empty_pairs):
@@ -548,7 +694,7 @@ class OKRSIControllerTest(unittest.TestCase):
             with self.subTest(invalid_override=invalid_override):
                 with self.assertRaises(ValueError):
                     OKRSISellOnlyConfig(
-                        trading_pairs=["SUI-USDT"],
+                        trading_pairs=["SUI-USDC"],
                         **invalid_override,
                     )
 

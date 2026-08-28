@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
 
+import pandas as pd
 from pydantic import field_validator, model_validator
 
 from controllers.directional_trading import hl_rsi
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.okx_spot_candles.constants import INTERVALS as OKX_CANDLE_INTERVALS
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
@@ -30,9 +32,76 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
 _DECIMAL_CONVERSION_ERRORS = (ArithmeticError, TypeError, ValueError)
 _EXECUTION_INPUT_ERRORS = (ArithmeticError, AttributeError, KeyError, RuntimeError, TypeError, ValueError)
 
+_CANDLE_VALUE_COLUMNS = ("open", "high", "low", "close")
+_CANDLE_SUM_COLUMNS = (
+    "volume",
+    "quote_asset_volume",
+    "n_trades",
+    "taker_buy_base_volume",
+    "taker_buy_quote_volume",
+)
+
 
 class ExecutorInputUnavailable(ValueError):
     """Raised when an executor cannot be constructed from valid exchange inputs."""
+
+
+def derive_higher_timeframe_candles(
+    base_candles: pd.DataFrame,
+    *,
+    base_interval: str,
+    target_interval: str,
+    current_time: float,
+    max_records: int,
+) -> pd.DataFrame:
+    """Aggregate complete, consecutive base candles into UTC-aligned higher-timeframe bars."""
+    output_columns = [
+        "timestamp",
+        *[column for column in (*_CANDLE_VALUE_COLUMNS, *_CANDLE_SUM_COLUMNS) if column in base_candles.columns],
+    ]
+    if base_candles.empty or not {"timestamp", *_CANDLE_VALUE_COLUMNS}.issubset(base_candles.columns):
+        return pd.DataFrame(columns=output_columns)
+
+    base_seconds = CandlesBase.interval_to_seconds[base_interval]
+    target_seconds = CandlesBase.interval_to_seconds[target_interval]
+    if target_seconds <= base_seconds or target_seconds % base_seconds != 0:
+        raise ValueError("target interval must be a larger whole multiple of the base interval")
+
+    frame = base_candles[output_columns].copy()
+    frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce")
+    numeric_columns = [column for column in output_columns if column != "timestamp"]
+    frame[numeric_columns] = frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    frame = frame.dropna(subset=["timestamp"]).sort_values("timestamp")
+    frame["timestamp"] = frame["timestamp"].astype("int64")
+    frame["bucket_timestamp"] = (frame["timestamp"] // target_seconds) * target_seconds
+    frame = frame[frame["bucket_timestamp"] + target_seconds <= int(current_time)]
+
+    expected_count = target_seconds // base_seconds
+    records = []
+    for bucket_timestamp, bucket in frame.groupby("bucket_timestamp", sort=True):
+        expected_timestamps = list(
+            range(int(bucket_timestamp), int(bucket_timestamp) + target_seconds, base_seconds)
+        )
+        if bucket["timestamp"].tolist() != expected_timestamps or len(bucket) != expected_count:
+            continue
+        if bucket[numeric_columns].isna().any().any():
+            continue
+        if not bucket[numeric_columns].map(math.isfinite).all().all():
+            continue
+        record = {
+            "timestamp": int(bucket_timestamp),
+            "open": bucket["open"].iloc[0],
+            "high": bucket["high"].max(),
+            "low": bucket["low"].min(),
+            "close": bucket["close"].iloc[-1],
+        }
+        for column in _CANDLE_SUM_COLUMNS:
+            if column in bucket.columns:
+                record[column] = bucket[column].sum()
+        else:
+            records.append(record)
+
+    return pd.DataFrame(records, columns=output_columns).tail(max_records).reset_index(drop=True)
 
 
 @dataclass(frozen=True)
@@ -122,7 +191,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         ),
     )
     trading_pair: str = hl_rsi.Field(
-        default="BTC-USDT",
+        default="BTC-USDC",
         client_data=ClientFieldData(
             prompt=lambda mi: "Trading pair:",
             prompt_on_new=True,
@@ -131,6 +200,17 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     )
     leverage: int = 1
     position_mode: PositionMode = PositionMode.ONEWAY
+
+    derived_higher_timeframe_max_records: int = hl_rsi.Field(
+        default=100,
+        ge=20,
+        le=2000,
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Derived higher-timeframe records:",
+            prompt_on_new=False,
+            is_updatable=True,
+        ),
+    )
 
     sell_only_inventory_fraction: Decimal = hl_rsi.Field(
         default=Decimal("0.10"),
@@ -208,6 +288,16 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             if interval is not None and interval not in OKX_CANDLE_INTERVALS:
                 raise ValueError(f"unsupported OKX candle interval for {field_name}: {interval}")
 
+        if self.trend_confirmation_enabled:
+            base_seconds = CandlesBase.interval_to_seconds[self.interval]
+            for field_name in ("trend_confirmation_medium_interval", "trend_confirmation_long_interval"):
+                interval = getattr(self, field_name)
+                if interval is None:
+                    continue
+                target_seconds = CandlesBase.interval_to_seconds[interval]
+                if target_seconds <= base_seconds or target_seconds % base_seconds != 0:
+                    raise ValueError(f"{field_name} must be a larger whole multiple of the base interval")
+
         for field_name in type(self).model_fields:
             value = getattr(self, field_name, None)
             if isinstance(value, Decimal) and not value.is_finite():
@@ -271,6 +361,54 @@ class OKRSIController(hl_rsi.HLRSIController):
     def __init__(self, config: OKRSIControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
+
+    def _derived_base_max_records(self) -> int:
+        if not self.config.trend_confirmation_enabled:
+            return self.max_records
+        base_seconds = CandlesBase.interval_to_seconds[self.config.interval]
+        ratios = [1]
+        for interval in (
+            self.config.trend_confirmation_medium_interval,
+            self.config.trend_confirmation_long_interval,
+        ):
+            if interval:
+                ratios.append(CandlesBase.interval_to_seconds[interval] // base_seconds)
+        return max(self.max_records, max(ratios) * self.config.derived_higher_timeframe_max_records)
+
+    def _build_default_candles_config(self) -> List[hl_rsi.CandlesConfig]:
+        return [
+            hl_rsi.CandlesConfig(
+                connector=self.config.candles_connector or self.config.connector_name,
+                trading_pair=self.config.candles_trading_pair or self.config.trading_pair,
+                interval=self.config.interval,
+                max_records=self._derived_base_max_records(),
+            )
+        ]
+
+    def _get_interval_candles_df(self, interval: Optional[str]) -> Optional[pd.DataFrame]:
+        if not interval:
+            return None
+        try:
+            base_candles = self.market_data_provider.get_candles_df(
+                connector_name=self.config.candles_connector or self.config.connector_name,
+                trading_pair=self.config.candles_trading_pair or self.config.trading_pair,
+                interval=self.config.interval,
+                max_records=self._derived_base_max_records(),
+            )
+        except _EXECUTION_INPUT_ERRORS:
+            return None
+        if base_candles is None or base_candles.empty:
+            return None
+        if interval == self.config.interval:
+            return base_candles.copy()
+        derived = derive_higher_timeframe_candles(
+            base_candles,
+            base_interval=self.config.interval,
+            target_interval=interval,
+            current_time=self.market_data_provider.time(),
+            max_records=self.config.derived_higher_timeframe_max_records,
+        )
+        return derived if not derived.empty else None
 
     def _get_mid_price(self) -> Optional[Decimal]:
         try:

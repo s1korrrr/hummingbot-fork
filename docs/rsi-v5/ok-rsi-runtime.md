@@ -40,6 +40,30 @@ leverage `1`, and `ONEWAY` position mode. Paper execution still uses public
 candle pairs must match, and all configured candle intervals must be supported
 by the checked-out OKX candle implementation.
 
+The current EEA operator profiles use the authenticated account's live USDC
+instrument IDs: BTC/ETH/SOL/XRP/BNB-USDC for buy/sell and SUI/XLM/ENA-USDC for
+sell-only. Regional availability must be rechecked through OKX's authenticated
+account-instruments endpoint before copying these profiles to another account.
+
+Each controller creates only its configured base candle feed. Medium and long
+trend intervals remain editable, but their candles are derived locally from
+complete UTC-aligned base bars:
+
+```yaml
+interval: 1m
+trend_confirmation_enabled: true
+trend_confirmation_medium_interval: 5m
+trend_confirmation_long_interval: 15m
+derived_higher_timeframe_max_records: 100
+```
+
+The base feed retains enough rows for the configured largest interval and
+derived record count. A derived bucket is omitted unless it contains exactly
+the expected consecutive base timestamps; the active incomplete bucket is
+also omitted. Higher intervals must be larger whole multiples of the base
+interval. This removes independent higher-timeframe REST/WebSocket feeds while
+keeping timeframe selection explicit in configuration.
+
 The ordinary buy/sell path is trailing-only. Configuring a fixed stop loss,
 take profit, time limit, positive `take_profit_pct`, or positive
 `max_hold_time_seconds` is rejected because those inherited fields are not

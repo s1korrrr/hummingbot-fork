@@ -4,7 +4,7 @@ from typing import List, Literal
 from controllers.directional_trading import ok_rsi as ok_rsi_controller
 
 
-def normalize_okx_usdt_pairs(value) -> List[str]:
+def normalize_okx_usdc_pairs(value) -> List[str]:
     if value is None:
         raise ValueError("At least one OKX trading pair is required")
     if isinstance(value, str):
@@ -14,8 +14,8 @@ def normalize_okx_usdt_pairs(value) -> List[str]:
     normalized = [str(pair).strip().upper() for pair in value]
     for pair in normalized:
         parts = pair.split("-")
-        if len(parts) != 2 or not all(parts) or parts[1] != "USDT":
-            raise ValueError(f"OKX spot pair must use BASE-USDT format: {pair!r}")
+        if len(parts) != 2 or not all(parts) or parts[1] != "USDC":
+            raise ValueError(f"OKX EEA spot pair must use BASE-USDC format: {pair!r}")
     if not normalized:
         raise ValueError("At least one OKX trading pair is required")
     if len(normalized) != len(set(normalized)):
@@ -31,6 +31,10 @@ def build_ok_rsi_controller_configs(
         "connector_name": config.connector_name,
         "leverage": config.leverage,
         "interval": config.interval,
+        "trend_confirmation_enabled": config.trend_confirmation_enabled,
+        "trend_confirmation_medium_interval": config.trend_confirmation_medium_interval,
+        "trend_confirmation_long_interval": config.trend_confirmation_long_interval,
+        "derived_higher_timeframe_max_records": config.derived_higher_timeframe_max_records,
         "strict_hmm_mode": config.strict_hmm_mode,
         "total_amount_quote": config.total_amount_quote,
         "usd_per_entry": config.usd_per_entry,

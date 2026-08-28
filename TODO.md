@@ -1,5 +1,18 @@
 # TODO
 
+## OK RSI EEA USDC and locally derived higher timeframes
+
+- [x] Add fail-first aggregation, feed-count, config-validation, and USDC loader tests.
+  DoD: tests fail for the missing local aggregation behavior and old USDT fixtures before production/config changes.
+- [x] Implement strict local higher-timeframe derivation in `controllers/directional_trading/ok_rsi.py`.
+  DoD: each controller initializes only its base feed; configured medium/long frames are derived only from complete consecutive base bars.
+- [x] Update committed fixtures and local operator YAMLs to EEA-account-confirmed USDC pairs.
+  DoD: five editable buy/sell profiles and three compact sell-only pairs use `*-USDC` without changing spot-only risk semantics.
+- [x] Run focused, loader, warning-clean dependency, formatting, YAML, and diff validation.
+  DoD: exact commands and observed results are recorded; no strategy or order path is started.
+- [x] Close out plan and durable memory.
+  DoD: final behavior, rollback, residual risk, and verified commands are current with no secret material.
+
 ## OK RSI positional runtime-constructor regression
 
 - [x] Reproduce the exact `StrategyV2Base` positional constructor failure.

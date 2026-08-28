@@ -1,8 +1,8 @@
-id: ok-rsi-btc-usdt-buy-sell
+id: ok-rsi-btc-usdc-buy-sell
 controller_name: ok_rsi
 controller_type: directional_trading
 connector_name: okx
-trading_pair: BTC-USDT
+trading_pair: BTC-USDC
 trade_mode: buy_sell
 leverage: 1
 position_mode: ONEWAY

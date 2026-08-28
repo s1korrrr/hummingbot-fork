@@ -490,9 +490,13 @@ class FirstSellEconomics:
 For a known BTC bag/config, assert:
 
 ```python
-assert report.minimum_signal_price == breakeven * (Decimal("1") + min_profit_pct)
-assert report.recovery_arm_price == breakeven * (
-    Decimal("1") + max(min_profit_pct, bag_recovery_target_pct)
+fee_per_unit = cum_fees_quote / tracked_amount
+assert report.minimum_signal_price == (
+    breakeven * (Decimal("1") + min_profit_pct) + fee_per_unit
+)
+assert report.recovery_arm_price == (
+    breakeven * (Decimal("1") + max(min_profit_pct, bag_recovery_target_pct))
+    + fee_per_unit
 )
 assert report.first_recovery_amount == min(tracked, wallet) * recovery_partial_exit_fraction
 ```
@@ -509,7 +513,7 @@ conda run -n hummingbot python -W error -m pytest -q \
 
 - [ ] **Step 3: Implement pure calculations and compact status projection**
 
-Reuse the controller's existing min-profit, recovery-target, recovery-fraction, balance, and cost-basis semantics. Do not create a second sell decision engine. The receipt/CLI report uses the pure dataclass; controller status displays the same values from current processed state and separate legacy performance.
+Reuse the controller's existing fee-aware net-PnL, min-profit, recovery-target, recovery-fraction, balance, and cost-basis semantics. Do not create a second sell decision engine. The receipt/CLI report uses the pure dataclass; controller status displays the same values from current processed state and separate legacy performance.
 
 - [ ] **Step 4: Run GREEN and complete focused warning-clean suite**
 

@@ -173,6 +173,12 @@ creates a position for inventory that the authenticated wallet cannot prove.
 Excess wallet inventory is reported as untracked and is not assigned a
 fabricated average price.
 
+Reported minimum-signal and recovery-arm prices include migrated cumulative
+fees per tracked base unit because the controller gates both paths on net PnL,
+not gross price appreciation. They remain conditional eligibility levels: RSI,
+reversal/trailing state, exchange quantization, spread, and available balance
+still determine whether and where an order is eventually submitted or filled.
+
 Before `--apply`, make SQLite online backups, verify integrity, stop every
 writer, and review all five reconciliations. Apply requires the exact dry-run
 receipt and rechecks source, target, and wallet-snapshot checksums. Verification

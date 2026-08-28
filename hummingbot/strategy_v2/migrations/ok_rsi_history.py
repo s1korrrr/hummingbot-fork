@@ -103,6 +103,8 @@ class FirstSellEconomics:
     tracked_amount: Decimal
     untracked_amount: Decimal
     breakeven_price: Decimal
+    cum_fees_quote: Decimal
+    fee_adjustment_per_unit: Decimal
     minimum_signal_price: Decimal
     recovery_arm_price: Decimal
     recovery_fraction: Decimal
@@ -394,27 +396,35 @@ def apply_ok_rsi_migration(plan: MigrationPlan) -> MigrationResult:
 
 def calculate_first_sell_economics(
     *, controller_id: str, pair: str, wallet_available: Decimal, tracked_amount: Decimal,
-    untracked_amount: Decimal, breakeven_price: Decimal, min_profit_pct: Decimal,
+    untracked_amount: Decimal, breakeven_price: Decimal, cum_fees_quote: Decimal, min_profit_pct: Decimal,
     bag_recovery_target_pct: Decimal, recovery_partial_exit_fraction: Decimal,
     recovery_pullback_pct: Decimal,
 ) -> FirstSellEconomics:
-    values = (wallet_available, tracked_amount, untracked_amount, breakeven_price, min_profit_pct,
+    values = (wallet_available, tracked_amount, untracked_amount, breakeven_price, cum_fees_quote, min_profit_pct,
               bag_recovery_target_pct, recovery_partial_exit_fraction, recovery_pullback_pct)
     if not all(value.is_finite() and value >= 0 for value in values):
         raise MigrationValidationError("sell economics inputs must be non-negative and finite")
     if breakeven_price <= 0 or tracked_amount <= 0 or not Decimal("0") < recovery_partial_exit_fraction <= 1:
         raise MigrationValidationError("sell economics require positive basis/amount and a bounded fraction")
-    minimum_signal_price = breakeven_price * (Decimal("1") + min_profit_pct)
-    recovery_arm_price = breakeven_price * (Decimal("1") + max(min_profit_pct, bag_recovery_target_pct))
+    fee_adjustment_per_unit = cum_fees_quote / tracked_amount
+    minimum_signal_price = (
+        breakeven_price * (Decimal("1") + min_profit_pct) + fee_adjustment_per_unit
+    )
+    recovery_arm_price = (
+        breakeven_price * (Decimal("1") + max(min_profit_pct, bag_recovery_target_pct))
+        + fee_adjustment_per_unit
+    )
     return FirstSellEconomics(
         controller_id=controller_id, pair=pair, wallet_available=wallet_available,
         tracked_amount=tracked_amount, untracked_amount=untracked_amount, breakeven_price=breakeven_price,
+        cum_fees_quote=cum_fees_quote, fee_adjustment_per_unit=fee_adjustment_per_unit,
         minimum_signal_price=minimum_signal_price, recovery_arm_price=recovery_arm_price,
         recovery_fraction=recovery_partial_exit_fraction,
         first_recovery_amount=min(tracked_amount, wallet_available) * recovery_partial_exit_fraction,
         recovery_pullback_pct=recovery_pullback_pct,
         conditions=(
             "Conditional arm only; no sale is guaranteed at this price.",
+            "Eligibility prices include migrated cumulative fees and configured net-profit targets.",
             "A sell still requires the configured RSI/reversal or recovery pullback trigger.",
             "Execution remains bounded by tracked inventory, available balance, and exchange quantization.",
         ),

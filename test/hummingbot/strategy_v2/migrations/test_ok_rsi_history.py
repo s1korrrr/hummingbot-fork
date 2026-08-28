@@ -157,12 +157,14 @@ class OKRSIHistoryMigrationTest(unittest.TestCase):
         report = calculate_first_sell_economics(
             controller_id="ok-rsi-btc", pair="BTC-USDC", wallet_available=Decimal("0.005"),
             tracked_amount=Decimal("0.004057"), untracked_amount=Decimal("0.000943"),
-            breakeven_price=Decimal("65000"), min_profit_pct=Decimal("0.01"),
+            breakeven_price=Decimal("65000"), cum_fees_quote=Decimal("1.25"), min_profit_pct=Decimal("0.01"),
             bag_recovery_target_pct=Decimal("0.02"), recovery_partial_exit_fraction=Decimal("0.10"),
             recovery_pullback_pct=Decimal("0.003"),
         )
-        self.assertEqual(report.minimum_signal_price, Decimal("65650"))
-        self.assertEqual(report.recovery_arm_price, Decimal("66300"))
+        fee_per_unit = Decimal("1.25") / Decimal("0.004057")
+        self.assertEqual(report.minimum_signal_price, Decimal("65650") + fee_per_unit)
+        self.assertEqual(report.recovery_arm_price, Decimal("66300") + fee_per_unit)
+        self.assertEqual(report.fee_adjustment_per_unit, fee_per_unit)
         self.assertEqual(report.first_recovery_amount, Decimal("0.0004057"))
         self.assertIn("conditional", " ".join(report.conditions).lower())
 

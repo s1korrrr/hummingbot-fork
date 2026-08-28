@@ -1,5 +1,37 @@
 # PLAN
 
+## OK RSI positional runtime-constructor regression (2026-08-28)
+
+### Task
+
+- Objective: repair the startup failure `HLRSIController.__init__() got multiple values for argument 'config'` reproduced when `StrategyV2Base.add_controller()` constructs `OKRSIController(config, market_data_provider, actions_queue)`.
+- Owner repo: `hummingbot/` only. Capital impact: local runtime correctness; no service restart, credentials, config deployment, or order authority.
+- Root-cause hypothesis: `OKRSIController.__init__` binds the positional config correctly, but then forwards it to `HLRSIController` by keyword alongside positional `*args`; Python assigns the first forwarded positional argument to `config` and rejects the duplicate keyword.
+
+### Options considered
+
+1. Change `StrategyV2Base.add_controller()` to construct this controller with keywords. Rejected because it would alter the shared runtime for every controller and hide a subclass compatibility defect.
+2. Remove the specialization constructor. Viable, but broader than necessary because the subclass initializes OKX-specific trailing state.
+3. Forward `config` positionally, matching `HLRSIController` and the runtime constructor contract. Chosen as the smallest compatible repair.
+
+### Execution and validation
+
+1. Add a fail-first regression that constructs `OKRSIController` with the exact positional signature used by `StrategyV2Base`.
+2. Change only the superclass call to positional forwarding.
+3. Run the focused OK RSI suite, the real loader/config path tests, compilation, pre-commit for touched files, and diff hygiene.
+
+### Risks and rollback
+
+- Risk: keyword-based test construction could regress. Existing focused tests cover keyword construction and will remain green.
+- Rollback: revert the one constructor-forwarding line and its regression test. No external runtime state is changed.
+- Memory impact: record the positional controller-construction contract if the repair is verified.
+
+### Final notes
+
+- Root cause confirmed: `StrategyV2Base.add_controller()` calls every controller as `(config, market_data_provider, actions_queue)`. Forwarding `config` by keyword while forwarding the remaining positional arguments assigned the provider to the base `config` parameter a second time.
+- Repair: `OKRSIController` now forwards `config` positionally and retains its OKX-specific trailing-state initialization. Existing keyword-based construction remains covered.
+- Validation: the focused warning-clean gate passed 33 tests plus 19 subtests; the full scoped controller/dependency matrix passed 325 tests plus 22 subtests. Changed-file compilation, hooks, and diff hygiene are required before commit. No service or order path was started.
+
 ## OK RSI end-to-end controller audit and merge-readiness gate (2026-08-28)
 
 ### Task
@@ -74,6 +106,6 @@
 - Validation: 324 tests plus 22 subtests passed in one ordered matrix with `python -W error -m pytest`; focused OK tests passed 32/32; scoped pre-commit, YAML, flake8, autopep8, isort, secret checks, Python compilation, and `git diff --check` passed. Python 3.13 owned-loop test setup and a fake AsyncMock task were repaired so the matrix is order-independent and warning-clean.
 - Full-suite runner: `conda run -n hummingbot make test` initially collected with global Python 3.12 because the Makefile invoked a bare `coverage` entry point, while the active Hummingbot environment and compiled extensions use Python 3.13. After binding coverage to the active interpreter, collection exposed duplicate `test_data_types.py` module names in separate executor directories. The Makefile now invokes `python -m coverage` and pytest `--import-mode=importlib`, binding the environment correctly and isolating same-named tests.
 - Full-suite result: the repaired command collected 6,731 cached node IDs and executed beyond collection, but the legacy repository suite did not produce a green terminal result: it retained a Vertex hard-coded timestamp failure and waited indefinitely in Python `_Py_Finalize` for background threads. A detached clean `origin/master` worktree reproduced the Vertex failure (`1 failed, 1 warning`), proving it is pre-existing. The event-loop wrapper regressions exposed during triage were repaired and now pass 15/15; the controller dependency matrix remains warning-clean at 324 tests plus 22 subtests.
-- Publication gate: GitHub Actions could not start the required job because the account Actions budget prevented execution (`INFRA_FAILURE`), and the build job was skipped. The branch may be updated with the reviewed repairs, but merge remains held because neither remote CI nor the full repository replacement gate is green; this is not a controller-scope failure and does not authorize bypassing branch protection.
+- Publication gate: GitHub Actions could not start the required job because the account Actions budget prevented execution (`INFRA_FAILURE`), and the build job was skipped. On 2026-08-28 the operator explicitly authorized merging while ignoring Actions/CI. After the positional runtime-constructor repair, the scoped warning-clean controller/dependency gate passed 325 tests plus 22 subtests. The clean-base Vertex failure and owner-suite shutdown leak remain documented pre-existing risks; this override grants repository merge authority only and does not grant paper/canary/live or order authority.
 - Review: no P0/P1 correctness, maintainability, ordinary-security, or performance issue remains in the scoped diff. No secrets, authenticated exchange calls, order placement, service mutation, silent executor fallback, debug prints, or new dependency were introduced.
 - Residual non-merge blockers: `recent_trades_lookback` remains an inherited compatibility/no-op field in the shared RSI family; separate Hummingbot processes cannot coordinate one IP budget; authenticated balances/fills, spread, slippage, latency, partial fills, and exchange cancellation remain unverified. There is no portfolio-wide exposure allocator or calendar-day loss reset across scripts. These block paper/canary/live promotion, not repository merge.

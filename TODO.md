@@ -1,5 +1,14 @@
 # TODO
 
+## OK RSI positional runtime-constructor regression
+
+- [x] Reproduce the exact `StrategyV2Base` positional constructor failure.
+  DoD: a focused regression fails with the observed duplicate `config` error before production code changes.
+- [x] Repair positional forwarding without changing controller semantics.
+  DoD: positional and existing keyword construction both initialize successfully.
+- [x] Run focused runtime-path validation and close out evidence.
+  DoD: OK RSI tests, compile/lint, diff checks, and plan/memory notes are current; no service or order action occurs.
+
 ## OK RSI end-to-end controller audit and merge readiness
 
 - [x] Establish exact ownership, branch/base, documentation, and authority boundaries.
@@ -18,5 +27,5 @@
   DoD: `make test` uses the active Hummingbot interpreter, isolates duplicate test module names, and its pre-existing Vertex/shutdown blockers are reproduced and recorded separately from controller results.
 - [x] Update owner-repo plans and workspace learning stores.
   DoD: verified facts, commands, blockers, rollback, and final gate are recorded without secrets.
-- [-] Publish and merge the focused Hummingbot PR only if ready.
-  DoD: intentional commits only; PR targets `master`, description matches the diff, CI/review are green, and the merge is verified on `origin/master`. Deferred: PR #29 is open, but the GitHub Actions budget blocked CI before execution and the local full repository suite has confirmed pre-existing Vertex/shutdown blockers; do not merge or bypass protection until a green replacement gate exists.
+- [x] Publish the focused Hummingbot PR and obtain explicit merge authorization.
+  DoD: intentional commits only; PR #29 targets `master`, its description matches the diff, the operator explicitly accepted the documented CI/full-suite risks on 2026-08-28, and the final scoped warning-clean gate passed 325 tests plus 22 subtests immediately before merge. The resulting merge SHA is verified during root gitlink integration.

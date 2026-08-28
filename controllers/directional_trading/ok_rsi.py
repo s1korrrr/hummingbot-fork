@@ -269,7 +269,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         return cls._logger
 
     def __init__(self, config: OKRSIControllerConfig, *args, **kwargs):
-        super().__init__(config=config, *args, **kwargs)
+        super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
 
     def _get_mid_price(self) -> Optional[Decimal]:

@@ -116,6 +116,19 @@ class OKRSIControllerTest(unittest.TestCase):
         self.assertTrue(issubclass(OKRSIController, HLRSIController))
         self.assertTrue(issubclass(OKRSIControllerConfig, HLRSIControllerConfig))
 
+    def test_controller_accepts_strategy_v2_positional_constructor_contract(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+
+        config = OKRSIControllerConfig(id="ok-rsi-runtime-constructor")
+        provider = self._provider(base_balance=Decimal("0"), price=Decimal("50000"))
+        actions_queue = asyncio.Queue()
+
+        controller = OKRSIController(config, provider, actions_queue)
+
+        self.assertIs(controller.config, config)
+        self.assertIs(controller.market_data_provider, provider)
+        self.assertIs(controller.actions_queue, actions_queue)
+
     def test_config_rejects_non_okx_connector(self):
         from controllers.directional_trading.ok_rsi import OKRSIControllerConfig
 

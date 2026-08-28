@@ -27,7 +27,7 @@ class AsyncThrottlerUnitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.ev_loop: asyncio.AbstractEventLoop = asyncio.get_event_loop()
+        cls.ev_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
 
         cls.rate_limits: List[RateLimit] = [
             RateLimit(limit_id=TEST_POOL_ID, limit=1, time_interval=5.0),
@@ -43,6 +43,11 @@ class AsyncThrottlerUnitTests(unittest.TestCase):
                       time_interval=5.0,
                       linked_limits=[LinkedLimitWeightPair(TEST_WEIGHTED_POOL_ID, 1)]),
         ]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.ev_loop.close()
+        super().tearDownClass()
 
     def setUp(self) -> None:
         super().setUp()
@@ -224,6 +229,29 @@ class AsyncThrottlerUnitTests(unittest.TestCase):
             self.ev_loop.run_until_complete(
                 asyncio.wait_for(context.acquire(), 1.0)
             )
+
+    def test_concurrent_acquires_reserve_capacity_atomically(self):
+        throttler = AsyncThrottler(
+            rate_limits=[RateLimit(limit_id="atomic", limit=1, time_interval=5.0)],
+            retry_interval=0.01,
+        )
+
+        async def run_concurrent_acquires():
+            tasks = [
+                asyncio.create_task(throttler.execute_task(limit_id="atomic").acquire())
+                for _ in range(2)
+            ]
+            await asyncio.sleep(0.05)
+            completed = sum(task.done() for task in tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            return completed
+
+        completed = self.ev_loop.run_until_complete(run_concurrent_acquires())
+
+        self.assertEqual(1, completed)
+        self.assertEqual(1, len(throttler._task_logs))
 
     def test_within_capacity_returns_true_for_throttler_without_configured_limits(self):
         throttler = AsyncThrottler(rate_limits=[])

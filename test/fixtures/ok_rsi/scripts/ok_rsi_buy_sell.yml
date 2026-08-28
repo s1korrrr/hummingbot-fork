@@ -1,0 +1,9 @@
+script_file_name: v2_with_controllers.py
+controllers_config:
+  - ok_rsi_btc.yml
+  - ok_rsi_eth.yml
+  - ok_rsi_sol.yml
+  - ok_rsi_xrp.yml
+  - ok_rsi_bnb.yml
+max_global_drawdown_quote: '100'
+max_controller_drawdown_quote: '50'

@@ -8,7 +8,8 @@ ifeq ($(DYDX),1)
 endif
 
 test:
-	coverage run -m pytest \
+	python -m coverage run -m pytest \
+	--import-mode=importlib \
  	--ignore="test/mock" \
  	--ignore="test/hummingbot/connector/exchange/ndax/" \
  	--ignore="test/hummingbot/connector/derivative/dydx_v4_perpetual/" \
@@ -18,15 +19,15 @@ test:
  	--ignore="test/hummingbot/strategy/cross_exchange_market_making/" \
 
 run_coverage: test
-	coverage report
-	coverage html
+	python -m coverage report
+	python -m coverage html
 
 report_coverage:
-	coverage report
-	coverage html
+	python -m coverage report
+	python -m coverage html
 
 development-diff-cover:
-	coverage xml
+	python -m coverage xml
 	diff-cover --compare-branch=origin/development coverage.xml
 
 build:

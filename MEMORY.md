@@ -1,0 +1,37 @@
+# MEMORY
+
+## Repo Overview
+- This nested repository owns Hummingbot execution controllers and local runtime configuration.
+
+## Commands
+- Focused OK RSI tests: `conda run -n hummingbot python -m unittest test.test_ok_rsi_controller -v`.
+- Warning-clean OK RSI dependency matrix: `conda run -n hummingbot python -W error -m pytest -q test/test_ok_rsi_controller.py test/test_hl_rsi_controller.py test/hummingbot/core/api_throttler/test_async_throttler.py test/hummingbot/core/web_assistant/test_web_assistants_factory.py test/hummingbot/data_feed/test_market_data_provider.py test/hummingbot/data_feed/candles_feed/okx_spot_candles/test_okx_spot_candles.py test/hummingbot/connector/exchange/okx/test_okx_exchange.py test/hummingbot/core/test_trading_core.py test/hummingbot/strategy_v2/controllers/test_controller_base.py test/hummingbot/strategy_v2/controllers/test_directional_trading_controller_base.py test/hummingbot/strategy_v2/executors/position_executor/test_data_types.py test/hummingbot/strategy_v2/executors/position_executor/test_position_executor.py test/rsi_v5/test_position_executor_contract.py`.
+- Changed-file lint: `conda run -n hummingbot pre-commit run --files <changed files>`.
+- Full-suite entry points must use `python -m coverage`, not a bare `coverage` executable, so `conda run -n hummingbot make test` cannot resolve a global Python installation. Pytest also needs `--import-mode=importlib` because separate executor directories contain same-named test modules.
+
+## Architecture Notes
+- `controllers/directional_trading/ok_rsi.py` is a thin OKX spot specialization of `hl_rsi`; shared signal, regime, DCA, inventory, recovery, and status logic must remain in the base unless an OKX boundary genuinely differs. It accepts only `okx` and `okx_paper_trade` connectors.
+- In `sell_only`, a signal targets 10% of current available base inventory when its quote value is at least $20 and all inventory when it is below $20. Exchange minimums, quantization, and available balance still bound the final order amount.
+- Buy/sell uses the native `scripts/v2_with_controllers.py` launcher: `conf/scripts/ok_rsi_buy_sell.yml` references five independently editable `conf/controllers/ok_rsi_{asset}.yml` files. Sell-only remains `scripts/ok_rsi_sell_only.py` with the compact grouped `conf/scripts/ok_rsi_sell_only.yml`, using `scripts/ok_rsi_script_common.py`.
+- Each OKX buy/sell controller YAML preserves the full corresponding `rsi_v5_{asset}.yml` parameter profile. Only controller identity, OKX connector/pair, and `trade_mode: buy_sell` differ; the historical evidence comments are not OKX-specific validation.
+- Ordinary BUY trailing is continuously adaptive and profile-free: every pair uses the same neutral 1.5% activation / 0.35% delta anchors. Activation scales by `(ATR / 0.002)^0.70`, while delta scales independently by `(ATR / 0.002)^0.35`. The controller clamps activation to 0.3%-5%, delta to 0.1%-2%, multiplier to 0.5x-2.5x, and preserves at least 0.4% initial locked profit.
+- A trailing selection is frozen when the BUY `PositionExecutorConfig` is constructed. Missing ATR or an impossible trailing contract raises instead of silently creating a BUY without its ordinary exit. Recovery trailing remains a separate held-inventory mechanism.
+- `get_custom_info()["trailing_policy"]` exposes anchors, selected activation/delta, initial locked profit, ATR, baseline, and volatility ratio for parent status surfaces.
+
+## Known Pitfalls / Sharp Edges
+- `conf/controllers/` and `conf/scripts/` are locally ignored runtime configuration directories. Portable loader tests must use committed fixtures under `test/fixtures/ok_rsi/`, never assume operator YAMLs exist.
+- Hummingbot `TradingCore.load_v2_class` selects the first alphabetically exposed `BaseClientModel` subclass in a script module. Import controller config classes through their module (not directly at script module scope), or the controller model can be mistaken for the script config model.
+- `MarketDataProvider` candle feeds for one connector must share one `AsyncThrottler`; separate per-feed throttlers produce an immediate OKX startup burst. OKX public limits are IP-wide, so spot candle feeds reserve 50% of the documented history/time endpoint budgets for connector or other-process traffic. A five-pair x three-timeframe public-only smoke reached 15/15 ready feeds in 10.321s with no log errors and zero live candle tasks after stop. Separate processes still cannot coordinate one IP budget and should be staggered.
+- With Python 3.13, legacy tests that call `asyncio.get_event_loop()` after another async suite closes the implicit loop are order-dependent. Test classes that own a loop must create and close it explicitly; task lifecycle tests should use a real `Future`/`Task`, not an `AsyncMock` pretending to be one.
+- As of 2026-08-28, the broad `make test` gate has pre-existing failures outside OK RSI: the Vertex time-synchronizer failure assertion uses a stale hard-coded timestamp and reproduces on clean `origin/master`; the suite can also remain in `_Py_Finalize` waiting for background threads. Do not report the owner-wide suite green until both are resolved or the canonical CI supplies a clean result.
+
+## Decision Log
+- 2026-08-27: Keep proportional wallet liquidation specific to `sell_only`; preserve the existing managed-inventory sizing behavior for `buy_sell`.
+- 2026-08-27: Group BTC/ETH/SOL/XRP/BNB in the independent OKX `buy_sell` script and SUI/XLM/ENA in the independent OKX `sell_only` script.
+- 2026-08-27: Keep buy/sell parameters in normal per-asset controller YAMLs for operator tuning; use dynamic expansion only for the uniform sell-only group.
+- 2026-08-27: Protect full RSI V5-to-OKX profile parity with a regression test that excludes only identity/market fields.
+- 2026-08-27: Keep `OKRSIControllerConfig` behind the helper module namespace so Hummingbot discovers each script config correctly.
+- 2026-08-27: Use continuous asymmetric ATR adaptation for OK RSI ordinary BUY trailing; treat YAML activation/delta as anchors, not regime profiles, and keep hard independent bounds plus a locked-profit floor.
+- 2026-08-28: Share candle throttling per connector and reserve half of the OKX public-IP budget; retain independent REST/websocket connections per feed and validate with a real public-data-only multi-feed startup/shutdown smoke.
+- 2026-08-28: The operator explicitly authorized merging OK RSI PR #29 despite the GitHub Actions budget failure and documented pre-existing Vertex/shutdown suite blockers, after a fresh warning-clean controller/dependency gate passed 324 tests plus 22 subtests. This is repository merge authority only, not paper/canary/live or order authority.
+- 2026-08-28: `StrategyV2Base.add_controller()` constructs controllers positionally as `(config, market_data_provider, actions_queue)`. Controller specializations with `*args` must forward `config` positionally too; `super().__init__(config=config, *args)` duplicates the base `config` argument at runtime even when keyword-only unit construction passes.

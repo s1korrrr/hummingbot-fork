@@ -9,6 +9,7 @@ import pandas as pd
 from bidict import bidict
 
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+from hummingbot.core.api_throttler.async_throttler_base import AsyncThrottlerBase
 from hummingbot.core.network_base import NetworkBase
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -63,6 +64,10 @@ class CandlesBase(NetworkBase):
             self.logger().exception(
                 f"Interval {interval} is not supported. Available Intervals: {self.intervals.keys()}")
             raise
+
+    def set_throttler(self, throttler: AsyncThrottlerBase) -> None:
+        """Share a venue-level request budget without sharing feed connections or processors."""
+        self._api_factory.set_throttler(throttler)
 
     async def start_network(self):
         """

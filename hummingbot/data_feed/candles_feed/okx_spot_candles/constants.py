@@ -7,7 +7,9 @@ WSS_URL = "wss://ws.okx.com:8443/ws/v5/business"
 
 # GET / Candlesticks history (https://www.okx.com/docs-v5/en/?shell#order-book-trading-market-data-get-candlesticks-history)
 # Retrieve history candlestick charts from recent years(It is last 3 months supported for 1s candlestick).
-# Rate Limit: 20 requests per 2 seconds
+# Official rate limit: 20 requests per 2 seconds, shared by public IP.
+# Candle feeds reserve half of the IP budget for the OKX connector and other
+# Hummingbot processes using the same public endpoints.
 # Rate limit rule: IP
 CANDLES_ENDPOINT = "/api/v5/market/history-candles"
 INTERVALS = bidict({
@@ -33,10 +35,11 @@ MAX_RESULTS_PER_CANDLESTICK_REST_REQUEST = 100
 
 # Get system time (https://www.okx.com/docs-v5/en/?shell#public-data-rest-api-get-system-time)
 # Retrieve API server time.
-# Rate Limit: 10 requests per 2 seconds
+# Official rate limit: 10 requests per 2 seconds, shared by public IP.
+# Keep the same 50% process-local reservation used for candle history.
 # Rate limit rule: IP
 HEALTH_CHECK_ENDPOINT = "/api/v5/public/time"
 
 RATE_LIMITS = [
-    RateLimit(CANDLES_ENDPOINT, limit=20, time_interval=2, linked_limits=[LinkedLimitWeightPair("raw", 1)]),
-    RateLimit(HEALTH_CHECK_ENDPOINT, limit=10, time_interval=2, linked_limits=[LinkedLimitWeightPair("raw", 1)])]
+    RateLimit(CANDLES_ENDPOINT, limit=10, time_interval=2, linked_limits=[LinkedLimitWeightPair("raw", 1)]),
+    RateLimit(HEALTH_CHECK_ENDPOINT, limit=5, time_interval=2, linked_limits=[LinkedLimitWeightPair("raw", 1)])]

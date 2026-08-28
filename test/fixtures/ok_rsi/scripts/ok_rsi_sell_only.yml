@@ -1,0 +1,18 @@
+script_file_name: ok_rsi_sell_only.py
+connector_name: okx
+trading_pairs:
+  - SUI-USDT
+  - XLM-USDT
+  - ENA-USDT
+leverage: 1
+interval: 1m
+strict_hmm_mode: false
+total_amount_quote: '500'
+usd_per_entry: '25'
+max_total_position_usd: '500'
+max_executors_per_side: 1
+sell_rsi_overbought: 76.0
+sell_only_inventory_fraction: '0.10'
+sell_all_below_quote: '20'
+max_global_drawdown_quote: '100'
+max_controller_drawdown_quote: '50'

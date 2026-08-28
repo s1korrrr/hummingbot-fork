@@ -69,13 +69,11 @@ class IsolatedAsyncioWrapperTestCase(unittest.IsolatedAsyncioTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        # Save the current event loop
+        # Preserve the loop installed for the current test context. Python 3.13
+        # raises when no loop is installed, so create one explicitly in that case.
         try:
-            # This will trigger a RuntimeError if no event loop is running or no event loop is set.
-            # Meaning, set_event_loop(None) has been called.
             cls.main_event_loop = asyncio.get_event_loop()
         except RuntimeError:
-            # If no event loop exists, create one
             cls.main_event_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(cls.main_event_loop)
         assert cls.main_event_loop is not None
@@ -183,6 +181,7 @@ class LocalClassEventLoopWrapperTestCase(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         if cls.local_event_loop is not None:
+            asyncio.set_event_loop(cls.local_event_loop)
             tasks: Set[Task] = asyncio.all_tasks(cls.local_event_loop)
             for task in tasks:
                 task.cancel()

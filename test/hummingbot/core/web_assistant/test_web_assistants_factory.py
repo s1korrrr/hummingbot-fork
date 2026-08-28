@@ -12,7 +12,12 @@ class WebAssistantsFactoryTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
-        cls.ev_loop = asyncio.get_event_loop()
+        cls.ev_loop = asyncio.new_event_loop()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.ev_loop.close()
+        super().tearDownClass()
 
     def async_run_with_timeout(self, coroutine: Awaitable, timeout: int = 1):
         ret = self.ev_loop.run_until_complete(asyncio.wait_for(coroutine, timeout))

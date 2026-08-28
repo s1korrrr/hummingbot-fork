@@ -1,5 +1,45 @@
 # PLAN
 
+## OK RSI unified history and inventory migration (2026-08-28)
+
+### Task
+
+- Objective: rename the OKX USDC runtime to `ok_rsi.yml`/`ok_rsi.sqlite`, shorten controller IDs to `ok-rsi-{asset}`, preserve the complete RSI V5 history with truthful Binance provenance, and restore only wallet-verified open inventory as fee-aware OK RSI bags that can never be force-sold.
+- Owner repo: `hummingbot/`. Capital impact: live-adjacent local configuration and persistence migration. Target stage is repository/local-runtime preparation; unlocked startup, orders, cancellations, credentials mutation, withdrawal, or balance mutation are forbidden without separate approval.
+- Approved design: `docs/superpowers/specs/2026-08-28-ok-rsi-history-migration-design.md`.
+
+### Assumptions and constraints
+
+- Final venue/pairs are OKX spot BTC/ETH/SOL/XRP/BNB-USDC with leverage 1 and controller IDs `ok-rsi-{asset}`.
+- Final local profiles have `manual_kill_switch: false`, but the unlocked process remains stopped after a separate locked verification projection.
+- Complete historical rows are copied without rewriting venue, pair, controller, order, or trade identity. Current OK RSI inventory is seeded separately and explicitly; no fabricated OKX fills are allowed.
+- `rsi_v5.sqlite` remains immutable. Verified SQLite backups, checksums, one-transaction apply, idempotency, and pre/post integrity gates are mandatory.
+- Wallet balance access is authenticated read-only. Secrets must not enter source, logs, receipts, tests, or status output.
+- Legacy history cannot contaminate new OK RSI cooldowns, active executors, loss streaks, drawdown, or trailing state.
+
+### Options considered
+
+1. Point OK RSI at `rsi_v5.sqlite` and reuse it directly. Rejected: exact controller/connector matching prevents restoration, while new metadata writes pollute the legacy source.
+2. Rewrite legacy Binance fills and controller IDs as OKX history. Rejected: it falsifies execution provenance and can revive stale risk/executor state.
+3. Build a new `ok_rsi.sqlite`, copy complete legacy history unchanged, and create separately reconciled current-position seeds. Chosen: it preserves audit history while giving the current controller an explicit, testable cost basis.
+
+### Execution and validation
+
+1. Commit and review the approved design, then write the TDD implementation plan.
+2. Add fail-first config, migrator, position-restoration, reporting, and no-force-sell tests.
+3. Implement the pure migration planner/validator, transactional importer, receipt, and verification modes.
+4. Rename/update local configs, committed fixtures, docs, and status/report surfaces.
+5. Run dry-run on database copies, then capture wallet balances in a temporary locked read-only runtime.
+6. Back up and migrate the real target, verify restored averages and first-sell economics, and run the locked startup/status/log gate.
+7. Stop, set final kill switches false, leave unlocked runtime stopped, and close out exact evidence and rollback.
+
+### Risks and rollback
+
+- Principal risks: scaled-decimal misinterpretation, duplicate/colliding rows, stale position state, wallet/source mismatch, fabricated provenance, accidental unlocked start, and incorrect sell thresholds. Controls are model decoding, independent reconstruction, explicit mappings, fail-closed reconciliation, checksum-bound receipts, locked runtime proof, and no-order database audits.
+- Fees, spread, slippage, latency, partial fills, and market impact are not used to claim an exact future execution price. The report distinguishes eligibility/arm thresholds from dynamic execution.
+- Rollback restores checksum-verified backups and the prior local config names while leaving inventory untouched. No rollback step sells or cancels anything.
+- Memory impact: record the final runtime identity, migration/receipt command, position-provenance boundary, no-force-sell invariants, and verified wallet/status commands after completion.
+
 ## OK RSI EEA USDC and locally derived higher timeframes (2026-08-28)
 
 ### Task

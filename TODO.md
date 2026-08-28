@@ -1,5 +1,26 @@
 # TODO
 
+## OK RSI unified history and inventory migration
+
+- [x] Present and obtain approval for the architecture and authority boundary.
+  DoD: runtime identity, history provenance, wallet reconciliation, no-force-sell behavior, locked validation, and unlocked-stop boundary are explicitly approved.
+- [-] Write and review the repository design specification.
+  DoD: the spec contains no placeholders or contradictions and the operator approves the written artifact before implementation planning.
+- [ ] Create the TDD implementation plan.
+  DoD: every config, migration, restoration, reporting, database, wallet, and runtime requirement maps to fail-first steps and exact validation commands.
+- [ ] Implement config identity and no-force-sell invariants.
+  DoD: local runtime plus committed fixtures/docs use `ok_rsi.yml`, `ok_rsi.sqlite`, short IDs, OKX USDC pairs, final false kill switches, and no forced liquidation path.
+- [ ] Implement and test the migration planner/importer/verifier.
+  DoD: complete legacy history remains unchanged in provenance, target mutation is transactional/idempotent/checksum-bound, and failures preserve the target.
+- [ ] Reconcile and seed verified OKX inventory.
+  DoD: five eligible assets decode and cross-check source economics against read-only available balances; mismatches fail closed and excess is untracked.
+- [ ] Verify actual databases and locked runtime.
+  DoD: backups, integrity checks, row/receipt verification, restored cost basis/status, clean logs, and zero order/fill/cancel evidence pass before final configs are unlocked and left stopped.
+- [ ] Produce average-price and first-sell economics report.
+  DoD: each asset reports wallet/tracked/untracked amounts, breakeven, current price, minimum profit, recovery arm, partial amount, and dynamic conditions without claiming a guaranteed execution price.
+- [ ] Complete validation, review, documentation, and memory harvest.
+  DoD: focused/warning-clean tests, compilation, pre-commit, YAML/diff/status review, rollback evidence, and durable lessons are current.
+
 ## OK RSI EEA USDC and locally derived higher timeframes
 
 - [x] Add fail-first aggregation, feed-count, config-validation, and USDC loader tests.

@@ -62,6 +62,15 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_require_scale_in_signal=True,
         episode_scale_in_setup_bars=30,
         episode_scale_in_stabilization_bars=15,
+        episode_level_fractions=[Decimal("0.10"), Decimal("0.15"), Decimal("0.20"), Decimal("0.25"), Decimal("0.30")],
+        episode_dip_atr_levels=[Decimal("2"), Decimal("4"), Decimal("6"), Decimal("9"), Decimal("13")],
+        episode_basis_improvement_atr=Decimal("0.50"),
+        episode_last_fill_gap_atr=Decimal("1.00"),
+        episode_distribution_atr_levels=[Decimal("6"), Decimal("9"), Decimal("12")],
+        episode_remaining_fractions=[Decimal("0.80"), Decimal("0.60"), Decimal("0.40")],
+        episode_trail_atr=Decimal("3"),
+        episode_trail_min=Decimal("0.01"),
+        episode_trail_max=Decimal("0.05"),
         episode_hostile_risk_latch=True,
         episode_recovery_exit_enabled=True,
     )
@@ -73,6 +82,14 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.require_scale_in_signal is True
     assert policy.setup_bars == 30
     assert policy.stabilization_bars == 15
+    assert policy.dip_atr_levels == tuple(map(Decimal, ("2", "4", "6", "9", "13")))
+    assert policy.basis_improvement_atr == Decimal("0.50")
+    assert policy.last_fill_gap_atr == Decimal("1.00")
+    assert policy.distribution_atr_levels == tuple(map(Decimal, ("6", "9", "12")))
+    assert policy.remaining_fractions == tuple(map(Decimal, ("0.80", "0.60", "0.40")))
+    assert policy.trail_atr == Decimal("3")
+    assert policy.trail_min == Decimal("0.01")
+    assert policy.trail_max == Decimal("0.05")
     assert policy.hostile_risk_latch is True
     assert policy.recovery_exit_enabled is True
 

@@ -44,6 +44,9 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_require_scale_in_signal is False
     assert legacy.episode_scale_in_setup_bars == 10
     assert legacy.episode_scale_in_stabilization_bars == 2
+    assert legacy.episode_dip_atr_levels == [Decimal("2"), Decimal("3"), Decimal("4"), Decimal("5"), Decimal("6")]
+    assert legacy.episode_distribution_atr_levels == [Decimal("4"), Decimal("7"), Decimal("10")]
+    assert legacy.episode_trail_atr == Decimal("2")
     assert legacy.episode_hostile_risk_latch is False
     assert legacy.episode_recovery_exit_enabled is False
     with pytest.raises(ValueError, match="assignment"):

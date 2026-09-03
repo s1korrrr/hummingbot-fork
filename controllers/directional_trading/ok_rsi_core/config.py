@@ -51,6 +51,23 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_require_scale_in_signal: bool = False
     episode_scale_in_setup_bars: int = hl_rsi.Field(default=10, ge=1, le=600)
     episode_scale_in_stabilization_bars: int = hl_rsi.Field(default=2, ge=1, le=240)
+    episode_level_fractions: List[Decimal] = hl_rsi.Field(
+        default_factory=lambda: list(map(Decimal, (".10", ".15", ".20", ".25", ".30")))
+    )
+    episode_dip_atr_levels: List[Decimal] = hl_rsi.Field(
+        default_factory=lambda: list(map(Decimal, ("2", "3", "4", "5", "6")))
+    )
+    episode_basis_improvement_atr: Decimal = hl_rsi.Field(default=Decimal(".05"), ge=0)
+    episode_last_fill_gap_atr: Decimal = hl_rsi.Field(default=Decimal(".25"), ge=0)
+    episode_distribution_atr_levels: List[Decimal] = hl_rsi.Field(
+        default_factory=lambda: list(map(Decimal, ("4", "7", "10")))
+    )
+    episode_remaining_fractions: List[Decimal] = hl_rsi.Field(
+        default_factory=lambda: list(map(Decimal, (".8", ".6", ".4")))
+    )
+    episode_trail_atr: Decimal = hl_rsi.Field(default=Decimal("2"), gt=0)
+    episode_trail_min: Decimal = hl_rsi.Field(default=Decimal(".005"), gt=0, lt=1)
+    episode_trail_max: Decimal = hl_rsi.Field(default=Decimal(".04"), gt=0, lt=1)
     episode_hostile_risk_latch: bool = False
     episode_recovery_exit_enabled: bool = False
 

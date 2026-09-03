@@ -50,11 +50,19 @@ def guard_disabled_restore(config, store=None):
 
 
 def policy_config(config):
+    hard_cap = Decimal(str(config.max_total_position_usd))
+    configured_budget = config.episode_budget_quote
+    budget = hard_cap if configured_budget is None else min(hard_cap, Decimal(str(configured_budget)))
     return EpisodeConfig(
         controller_id=config.id, connector=config.connector_name, trading_pair=config.trading_pair,
-        mode=config.trade_mode, budget_quote=config.max_total_position_usd, mark_cap_quote=config.max_total_position_usd,
+        mode=config.trade_mode, budget_quote=budget, mark_cap_quote=hard_cap,
         fee_rate=config.episode_fee_rate, min_profit=Decimal(str(config.min_profit_pct_for_sell)),
         require_profit=config.trade_mode == "buy_sell" or config.sell_only_if_profitable,
+        sequential_scale_ins=config.episode_sequential_scale_ins,
+        require_scale_in_signal=config.episode_require_scale_in_signal,
+        stabilization_bars=config.episode_scale_in_stabilization_bars,
+        hostile_risk_latch=config.episode_hostile_risk_latch,
+        recovery_exit_enabled=config.episode_recovery_exit_enabled,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -239,6 +247,7 @@ class EpisodeRuntime:
                     level_id=f"{EPISODE_LEVEL_PREFIX}{request.episode_id}:{request.level}",
                     episode_id=request.episode_id, episode_level=request.level,
                     episode_revision=request.revision, episode_expires_at=request.expires_at,
+                    episode_intent=request.intent,
                 )
                 actions.append(CreateExecutorAction(controller_id=self.config.controller_id, executor_config=executor_config))
             return actions

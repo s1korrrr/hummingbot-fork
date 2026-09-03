@@ -12,10 +12,11 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 def setup_controller(*, mode="buy_sell", store=None, **config_values):
     from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
     from controllers.directional_trading.rsi_v5_runtime_store import RSIV5RuntimeStore
+    maximum_position = config_values.pop("max_total_position_usd", Decimal("500"))
     config = OKRSIControllerConfig(
         id="episode-test", episode_enabled=True, strict_hmm_mode=False,
         connector_name="okx", trading_pair="ETH-USDT", trade_mode=mode,
-        max_total_position_usd=Decimal("500"), **config_values)
+        max_total_position_usd=maximum_position, **config_values)
     provider = MagicMock()
     provider.time.return_value = 10020
     provider.get_available_balance.return_value = Decimal("1000")
@@ -46,10 +47,32 @@ def test_durable_reservation_precedes_action_and_restart_never_redispatches():
     created = actions(controller)
     assert len(created) == 1 and isinstance(created[0], CreateExecutorAction)
     request_id = created[0].executor_config.id
+    assert created[0].executor_config.episode_intent == "SCOUT_BUY"
     assert request_id in store.load(controller.config.id)[-1].payload["state"]["orders"]
     restarted, _ = setup_controller(store=store)
     assert actions(restarted) == []
     assert request_id in restarted._episode_runtime.state.orders
+
+
+def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
+    controller, _ = setup_controller(
+        max_total_position_usd=Decimal("1500"),
+        episode_budget_quote=Decimal("500"),
+        episode_sequential_scale_ins=True,
+        episode_require_scale_in_signal=True,
+        episode_scale_in_stabilization_bars=15,
+        episode_hostile_risk_latch=True,
+        episode_recovery_exit_enabled=True,
+    )
+
+    policy = controller._episode_runtime.config
+    assert policy.budget_quote == Decimal("500")
+    assert policy.mark_cap_quote == Decimal("1500")
+    assert policy.sequential_scale_ins is True
+    assert policy.require_scale_in_signal is True
+    assert policy.stabilization_bars == 15
+    assert policy.hostile_risk_latch is True
+    assert policy.recovery_exit_enabled is True
 
 
 def test_failed_checkpoint_produces_no_executor():
@@ -124,6 +147,15 @@ def test_direct_factory_cannot_change_an_authorized_quantity():
     created = actions(controller)[0]
     with pytest.raises(ValueError, match="authorization"):
         controller.get_executor_class_for_config(created.executor_config.model_copy(update={"amount": Decimal("100")}))
+
+
+def test_direct_factory_rejects_changed_execution_intent():
+    controller, _ = setup_controller()
+    created = actions(controller)[0]
+    with pytest.raises(ValueError, match="authorization"):
+        controller.get_executor_class_for_config(
+            created.executor_config.model_copy(update={"episode_intent": "TERMINAL_PROFIT_EXIT"})
+        )
 
 
 @pytest.mark.parametrize("enabled", [False, True])

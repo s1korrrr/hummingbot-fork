@@ -57,6 +57,10 @@ def completed_market_context(candles: pd.DataFrame, current_time: float) -> dict
     atr_1m, atr_15m, atr_1h = _atr(frame), _atr(medium), _atr(long)
     if min(atr_1m, atr_15m, atr_1h) <= 0:
         raise ContextUnavailable("nonpositive ATR")
+    hourly_recovered = bool(
+        long.close.iloc[-2] > ema_long20.iloc[-2] > ema_long20.iloc[-3]
+        and long.close.iloc[-1] > ema_long20.iloc[-1] > ema_long20.iloc[-2]
+    )
     return {
         "timestamp": int(frame.timestamp.iloc[-1] + 60),
         "htf_timestamp": int(long.timestamp.iloc[-1] + 3600),
@@ -64,6 +68,7 @@ def completed_market_context(candles: pd.DataFrame, current_time: float) -> dict
         "atr_1m": Decimal(str(atr_1m)), "atr_15m": Decimal(str(atr_15m)),
         "atr_1h": Decimal(str(atr_1h)), "anchor": Decimal(str(anchor)),
         "recovery": bool(medium.close.iloc[-1] > ema_medium20.iloc[-1] > ema_medium20.iloc[-2]),
+        "hourly_recovered": hourly_recovered,
         "markup": bool(long.close.iloc[-1] > anchor and ema_long20.iloc[-1] > ema_long20.iloc[-2]
                        and ema_medium20.iloc[-1] > ema_medium50.iloc[-1]),
         "reset": bool(long.close.iloc[-1] < ema_long20.iloc[-1]),

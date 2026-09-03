@@ -1,8 +1,7 @@
-# OK RSI lifecycle
+# OK RSI lifecycle v2
 
-No remaining local implementation or comparison tasks.
-
-Completed evidence and research limitations are recorded in
-[the archived plan](docs/plans/archive/2026-09-03-ok-rsi-lifecycle.md).
-Paper/live validation, operational activation, and additional tuning are outside
-this completed task's authority and scope.
+- [x] Add validated opt-in configuration and completed-candle context.
+- [x] Implement causal sequential scale-ins and hostile risk latch with TDD.
+- [x] Implement profitable recovery exit and explicit native execution intent.
+- [x] Run the full focused native validation and freeze source receipts.
+- [ ] Hand the verified native source to the Quants Lab ablation matrix.

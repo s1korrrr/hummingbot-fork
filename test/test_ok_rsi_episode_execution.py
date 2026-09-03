@@ -56,6 +56,21 @@ def test_fill_receipt_keeps_actual_fee_currency_and_duplicate_identity():
     assert receipt == instance.get_custom_info()["episode_receipt"]
 
 
+def test_fill_receipt_preserves_native_episode_intent():
+    from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutorConfig
+
+    instance = executor()
+    instance.config = EpisodeOrderExecutorConfig(
+        **instance.config.model_dump(),
+        episode_id="episode-1",
+        episode_expires_at=60,
+        episode_intent="SCOUT_BUY",
+    )
+    instance._order.order = order()
+
+    assert instance.get_custom_info()["episode_receipt"]["intent"] == "SCOUT_BUY"
+
+
 def test_unknown_third_asset_fee_is_visible_and_not_zero_cost():
     instance = executor()
     instance._order.order = order(fee_token="BNB")

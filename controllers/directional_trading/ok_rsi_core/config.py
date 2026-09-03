@@ -46,6 +46,12 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_assignment_id: Optional[str] = None
     episode_initial_base: Decimal = hl_rsi.Field(default=Decimal("0"), ge=0)
     episode_initial_cost: Optional[Decimal] = hl_rsi.Field(default=None, gt=0)
+    episode_budget_quote: Optional[Decimal] = hl_rsi.Field(default=None, gt=0)
+    episode_sequential_scale_ins: bool = False
+    episode_require_scale_in_signal: bool = False
+    episode_scale_in_stabilization_bars: int = hl_rsi.Field(default=2, ge=1, le=240)
+    episode_hostile_risk_latch: bool = False
+    episode_recovery_exit_enabled: bool = False
 
     derived_higher_timeframe_max_records: int = hl_rsi.Field(
         default=100,
@@ -174,6 +180,8 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
                 raise ValueError("sell_only episode requires explicit assignment ID and positive initial base")
             if self.sell_only_if_profitable and self.episode_initial_cost is None:
                 raise ValueError("profitable sell_only episode assignment requires initial cost")
+            if self.episode_recovery_exit_enabled and self.episode_initial_cost is None:
+                raise ValueError("sell_only recovery exit requires assigned cost")
         if self.episode_enabled and self.trade_mode == "buy_sell" and self.episode_initial_base:
             raise ValueError("buy_sell episode requires fresh inventory")
         if self.trade_mode == "buy_sell" and not self.use_trailing_exit and not self.episode_enabled:

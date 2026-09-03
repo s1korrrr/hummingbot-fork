@@ -22,6 +22,7 @@ def test_context_ignores_forming_candle_and_uses_prior_high():
     assert result["timestamp"] == now - 30
     assert result["anchor"] < Decimal("105")
     assert result["recovery"] is True
+    assert result["hourly_recovered"] is True
 
 
 def test_context_rejects_latest_gap_and_short_history():
@@ -36,6 +37,36 @@ def test_context_rejects_latest_gap_and_short_history():
 
 def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     from controllers.directional_trading.ok_rsi import OKRSIControllerConfig
-    assert OKRSIControllerConfig(id="legacy").episode_enabled is False
+    legacy = OKRSIControllerConfig(id="legacy")
+    assert legacy.episode_enabled is False
+    assert legacy.episode_budget_quote is None
+    assert legacy.episode_sequential_scale_ins is False
+    assert legacy.episode_require_scale_in_signal is False
+    assert legacy.episode_scale_in_stabilization_bars == 2
+    assert legacy.episode_hostile_risk_latch is False
+    assert legacy.episode_recovery_exit_enabled is False
     with pytest.raises(ValueError, match="assignment"):
         OKRSIControllerConfig(id="candidate", episode_enabled=True, trade_mode="sell_only")
+
+
+def test_candidate_episode_budget_must_be_positive_and_finite():
+    from controllers.directional_trading.ok_rsi import OKRSIControllerConfig
+
+    for value in (Decimal("0"), Decimal("-1"), Decimal("NaN")):
+        with pytest.raises(ValueError):
+            OKRSIControllerConfig(id="candidate", episode_enabled=True, episode_budget_quote=value)
+
+
+def test_profitable_sell_only_recovery_requires_assigned_cost_basis():
+    from controllers.directional_trading.ok_rsi import OKRSIControllerConfig
+
+    with pytest.raises(ValueError, match="cost"):
+        OKRSIControllerConfig(
+            id="candidate",
+            episode_enabled=True,
+            episode_recovery_exit_enabled=True,
+            trade_mode="sell_only",
+            episode_assignment_id="assigned",
+            episode_initial_base=Decimal("1"),
+            sell_only_if_profitable=False,
+        )

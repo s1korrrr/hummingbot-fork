@@ -105,6 +105,7 @@ class OKRSIController(hl_rsi.HLRSIController):
                 or type(config.leverage) is not int or config.leverage != 1
                 or type(config.episode_level) is not int or type(config.episode_revision) is not int
                 or type(config.episode_expires_at) is not int
+                or config.episode_intent != request.intent
                 or config.timestamp != expected_timestamp
                 or config.controller_id != self.config.id
                 or config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair

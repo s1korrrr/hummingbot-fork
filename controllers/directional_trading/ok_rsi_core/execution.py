@@ -47,6 +47,7 @@ class EpisodeOrderExecutorConfig(OrderExecutorConfig):
     episode_expires_at: int
     episode_revision: int = 0
     episode_level: int = -1
+    episode_intent: str = "UNSPECIFIED"
 
 
 class EpisodeOrderExecutor(OrderExecutor):
@@ -135,6 +136,7 @@ class EpisodeOrderExecutor(OrderExecutor):
         return {
             "gross_base": str(gross_base), "gross_quote": str(gross_quote),
             "base_fee": str(base_fee), "quote_fee": str(quote_fee),
+            "intent": getattr(self.config, "episode_intent", "UNSPECIFIED"),
             "fees_known": not errors,
             "final": self.status == RunnableStatus.TERMINATED and all_done and not errors,
             "errors": sorted(set(errors)),
@@ -159,6 +161,7 @@ class EpisodeOrderExecutor(OrderExecutor):
                 "cumulative_fee_paid_quote": str(quote_fees), "actual_base_fee": str(base_fee),
                 "creation_timestamp": native.creation_timestamp,
                 "last_update_timestamp": native.last_update_timestamp,
+                "episode_intent": getattr(self.config, "episode_intent", "UNSPECIFIED"),
                 "order_fills": {key: fill.to_json() for key, fill in native.order_fills.items()},
             })
         return records

@@ -28,6 +28,16 @@ PHASES = {
     "EXIT",
     "COOLDOWN",
 }
+ORDER_INTENTS = {
+    "UNSPECIFIED",
+    "SCOUT_BUY",
+    "SCALE_IN_BUY",
+    "RECOVERY_TAKE_PROFIT",
+    "DISTRIBUTION_SELL",
+    "TRAILING_PROFIT_EXIT",
+    "TERMINAL_PROFIT_EXIT",
+}
+SELL_INTENTS = ORDER_INTENTS - {"UNSPECIFIED", "SCOUT_BUY", "SCALE_IN_BUY"}
 
 
 class EpisodeInputError(ValueError):
@@ -93,6 +103,10 @@ class EpisodeConfig:
     stabilization_bars: int = 2
     interval_seconds: int = 60
     require_profit: bool = True
+    sequential_scale_ins: bool = False
+    require_scale_in_signal: bool = False
+    hostile_risk_latch: bool = False
+    recovery_exit_enabled: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -103,8 +117,15 @@ class EpisodeConfig:
                 raise EpisodeInputError(f"invalid {name}")
         if self.mode not in ("buy_sell", "sell_only"):
             raise EpisodeInputError("unsupported mode")
-        if type(self.require_profit) is not bool:
-            raise EpisodeInputError("invalid profit guard flag")
+        for name in (
+            "require_profit",
+            "sequential_scale_ins",
+            "require_scale_in_signal",
+            "hostile_risk_latch",
+            "recovery_exit_enabled",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise EpisodeInputError(f"invalid boolean {name}")
         for name in ("budget_quote", "mark_cap_quote", "trail_atr", "trail_min", "trail_max"):
             object.__setattr__(self, name, _decimal(getattr(self, name), name, positive=True))
         for name in (
@@ -179,6 +200,7 @@ class MarketSnapshot:
     valid: bool = True
     entry_signal: bool = False
     recovery: bool = False
+    hourly_recovered: bool = False
     markup: bool = False
     reset: bool = False
     hostile: bool = False
@@ -212,7 +234,17 @@ class MarketSnapshot:
         object.__setattr__(self, "quality_factor", _decimal(self.quality_factor, "quality_factor"))
         if self.quality_factor > ONE:
             raise EpisodeInputError("quality factor cannot enlarge allocation")
-        for name in ("valid", "entry_signal", "recovery", "markup", "reset", "hostile", "cascade", "buy_allowed"):
+        for name in (
+            "valid",
+            "entry_signal",
+            "recovery",
+            "hourly_recovered",
+            "markup",
+            "reset",
+            "hostile",
+            "cascade",
+            "buy_allowed",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
         if self.valid and (
@@ -233,6 +265,7 @@ class OrderRequest:
     reserved_quote: Decimal
     expires_at: int
     revision: int
+    intent: str = "UNSPECIFIED"
 
     def __post_init__(self):
         for name in ("id", "episode_id"):
@@ -243,6 +276,13 @@ class OrderRequest:
                 raise EpisodeInputError("invalid request integer")
         if self.side not in ("BUY", "SELL") or self.expires_at <= 0 or self.revision <= 0:
             raise EpisodeInputError("invalid request boundary")
+        if self.intent not in ORDER_INTENTS:
+            raise EpisodeInputError("invalid request intent")
+        if self.intent != "UNSPECIFIED" and (
+            (self.side == "BUY" and self.intent not in {"SCOUT_BUY", "SCALE_IN_BUY"})
+            or (self.side == "SELL" and self.intent not in SELL_INTENTS)
+        ):
+            raise EpisodeInputError("request intent contradicts side")
         if (self.side == "BUY" and self.level < 0) or (self.side == "SELL" and self.level != -1):
             raise EpisodeInputError("invalid request level")
         for name in ("amount", "price", "reserved_quote"):
@@ -321,6 +361,8 @@ class EpisodeState:
     cooldown_htf_timestamp: int = 0
     assignment_consumed: bool = False
     cost_known: bool = True
+    adverse_entry_latched: bool = False
+    exit_intent: str | None = None
     fault: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -332,7 +374,9 @@ class EpisodeState:
             values = copy.deepcopy(payload)
             if values.get("schema_version") != 1 or values.get("phase") not in PHASES:
                 raise EpisodeInputError("unsupported episode schema/phase")
-            for name in ("assignment_consumed", "cost_known"):
+            values.setdefault("adverse_entry_latched", False)
+            values.setdefault("exit_intent", None)
+            for name in ("assignment_consumed", "cost_known", "adverse_entry_latched"):
                 if type(values[name]) is not bool:
                     raise EpisodeInputError(f"invalid checkpoint boolean {name}")
             for name in (
@@ -349,6 +393,8 @@ class EpisodeState:
                     raise EpisodeInputError(f"invalid checkpoint integer {name}")
             if any(level not in ("OPEN", "AUTHORIZED", "SKIPPED") for level in values["levels"]):
                 raise EpisodeInputError("invalid checkpoint level")
+            if values["exit_intent"] is not None and values["exit_intent"] not in SELL_INTENTS:
+                raise EpisodeInputError("invalid checkpoint exit intent")
             decimal_fields = (
                 "base",
                 "cost",
@@ -518,6 +564,7 @@ def _start_episode(config: EpisodeConfig, state: EpisodeState, market: MarketSna
     state.levels = ["OPEN"] * len(config.level_fractions)
     state.frozen_anchor = market.anchor
     state.frozen_atr = market.atr_1h
+    state.adverse_entry_latched = config.hostile_risk_latch and (market.hostile or market.reset)
 
 
 def _request(
@@ -530,6 +577,7 @@ def _request(
     price: Decimal,
     reserve: Decimal,
     level: int,
+    intent: str,
 ) -> OrderRequest:
     state.command_revision += 1
     identity = _hash((state.episode_id, state.command_revision, side, level))
@@ -543,6 +591,7 @@ def _request(
         reserve,
         market.timestamp + config.setup_bars * config.interval_seconds,
         state.command_revision,
+        intent,
     )
     state.orders[identity] = OrderProgress(request)
     return request
@@ -557,21 +606,69 @@ def _finish_if_flat(state: EpisodeState, market: MarketSnapshot) -> bool:
     return False
 
 
-def _sell(config: EpisodeConfig, state: EpisodeState, market: MarketSnapshot) -> Transition:
-    if not state.cost_known and config.require_profit:
+def minimum_profit_price(config: EpisodeConfig, state: EpisodeState) -> Decimal | None:
+    if not state.base or not state.cost_known:
+        return None
+    return (state.cost / state.base) * (ONE + config.min_profit) / (ONE - config.fee_rate)
+
+
+def _trail_distance(config: EpisodeConfig, market: MarketSnapshot) -> Decimal:
+    return min(config.trail_max, max(config.trail_min, config.trail_atr * market.atr_15m / market.bid))
+
+
+def _arm_recovery_trail(config: EpisodeConfig, state: EpisodeState, market: MarketSnapshot) -> None:
+    distance = _trail_distance(config, market)
+    state.phase = "RECOVER"
+    state.target_base = state.base
+    state.peak = market.bid
+    state.floor = state.peak * (ONE - distance)
+    equity = state.sell_proceeds + state.base * market.bid * (ONE - config.fee_rate) - state.gross_spent
+    state.equity_peak = equity
+    state.equity_floor = equity - state.base * state.peak * distance
+    state.exit_intent = "RECOVERY_TAKE_PROFIT"
+
+
+def _sell(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    market: MarketSnapshot,
+    *,
+    intent: str | None = None,
+) -> Transition:
+    request_intent = intent or state.exit_intent or (
+        "TERMINAL_PROFIT_EXIT" if state.phase == "EXIT" else "DISTRIBUTION_SELL"
+    )
+    profit_protected = config.require_profit or request_intent == "RECOVERY_TAKE_PROFIT"
+    if not state.cost_known and profit_protected:
         return Transition(state, reason="basis_unavailable")
-    min_price = (state.cost / state.base) * (ONE + config.min_profit) / (ONE - config.fee_rate) if state.base else ZERO
-    if config.require_profit and market.bid < min_price:
+    min_price = minimum_profit_price(config, state) or ZERO
+    if profit_protected and market.bid < min_price:
         return Transition(state, reason="profit_guard_blocked")
     # Price-bounded limit: no unconstrained market fallback can defeat the floor.
-    price = _ceil(max(market.bid, min_price if config.require_profit else ZERO), market.price_step)
+    price = _ceil(max(market.bid, min_price if profit_protected else ZERO), market.price_step)
     pending = sum((order.reserved_base for order in state.orders.values()), ZERO)
     needed = max(ZERO, state.base - state.target_base - pending)
     amount = _floor(min(needed, market.base_available), market.amount_step)
     if amount <= 0 or amount < market.min_amount or amount * price < market.min_notional:
         return Transition(state, reason="dust" if needed > 0 else "target_satisfied")
-    request = _request(config, state, market, side="SELL", amount=amount, price=price, reserve=ZERO, level=-1)
-    return Transition(state, (request,), reason="terminal_exit" if state.phase == "EXIT" else "distribution")
+    request = _request(
+        config,
+        state,
+        market,
+        side="SELL",
+        amount=amount,
+        price=price,
+        reserve=ZERO,
+        level=-1,
+        intent=request_intent,
+    )
+    reason = {
+        "RECOVERY_TAKE_PROFIT": "recovery_take_profit",
+        "DISTRIBUTION_SELL": "distribution",
+        "TRAILING_PROFIT_EXIT": "trailing_profit_exit",
+        "TERMINAL_PROFIT_EXIT": "terminal_exit",
+    }[request_intent]
+    return Transition(state, (request,), reason=reason)
 
 
 def transition(
@@ -627,6 +724,15 @@ def transition(
     if market.timestamp == state.timestamp:
         return Transition(state, cancel_ids=cancellations, reason="same_candle")
     state.timestamp = market.timestamp
+    if (
+        config.hostile_risk_latch
+        and state.episode_id
+        and state.base
+        and (market.hostile or market.reset)
+    ):
+        state.adverse_entry_latched = True
+    elif state.adverse_entry_latched and market.hourly_recovered:
+        state.adverse_entry_latched = False
     if state.phase == "COOLDOWN":
         if state.base > 0:
             state.phase, state.target_base = "EXIT", ZERO
@@ -657,8 +763,9 @@ def transition(
         state.phase = "RECOVER"
     if _finish_if_flat(state, market):
         return Transition(state, reason="episode_completed")
-    if state.phase in ("MARKUP", "DISTRIBUTE", "EXIT"):
-        distance = min(config.trail_max, max(config.trail_min, config.trail_atr * market.atr_15m / market.bid))
+    recovery_trail = state.phase == "RECOVER" and state.exit_intent == "RECOVERY_TAKE_PROFIT"
+    if state.phase in ("MARKUP", "DISTRIBUTE", "EXIT") or recovery_trail:
+        distance = _trail_distance(config, market)
         state.peak = max(state.peak, market.bid)
         state.floor = max(state.floor, state.peak * (ONE - distance))
         equity = state.sell_proceeds + state.base * market.bid * (ONE - config.fee_rate) - state.gross_spent
@@ -666,8 +773,10 @@ def transition(
         floor = state.equity_peak - state.base * state.peak * distance
         state.equity_floor = max(state.equity_floor if state.equity_floor is not None else floor, floor)
         if market.bid <= state.floor or equity <= state.equity_floor:
+            if state.phase != "EXIT" and not recovery_trail:
+                state.exit_intent = "TRAILING_PROFIT_EXIT"
             state.phase, state.target_base = "EXIT", ZERO
-        elif state.phase != "EXIT":
+        elif state.phase != "EXIT" and not recovery_trail:
             extension = (state.peak - state.distribution_basis) / state.distribution_atr
             for threshold, fraction in zip(config.distribution_atr_levels, config.remaining_fractions):
                 if extension >= threshold:
@@ -679,7 +788,7 @@ def transition(
             return Transition(state, cancel_ids=cancellations, reason="pending_execution")
         if state.base > state.target_base:
             return _sell(config, state, market)
-        return Transition(state, reason="runner")
+        return Transition(state, reason="recovery_runner" if recovery_trail else "runner")
     if pending:
         return Transition(state, cancel_ids=cancellations, reason="pending_execution")
     # Available balance can exclude other reservations; never adopt the surplus.
@@ -697,6 +806,7 @@ def transition(
         state.distribution_atr = market.atr_1h
         state.peak = market.bid
         state.floor = ZERO
+        state.exit_intent = None
         return Transition(state, reason="markup_armed")
     if market.cascade or (market.hostile and state.base > 0):
         if state.base:
@@ -704,6 +814,12 @@ def transition(
         return Transition(state, reason="defensive")
     if state.base and market.recovery:
         state.phase = "RECOVER"
+        if config.recovery_exit_enabled:
+            profit_floor = minimum_profit_price(config, state)
+            if profit_floor is None or market.bid < profit_floor:
+                return Transition(state, reason="recovery_profit_guard")
+            _arm_recovery_trail(config, state, market)
+            return Transition(state, reason="recovery_exit_armed")
         return Transition(state, reason="recovering")
     if config.mode == "sell_only":
         return Transition(state, reason="sell_only_observe")
@@ -726,10 +842,16 @@ def transition(
         state.phase = "ACCUMULATE" if state.base else "WATCH"
         return Transition(state, reason="need_deeper_level")
     # First purchase is always the scout; a gap cannot multiply initial risk.
-    level = 0 if state.gross_spent == 0 and state.levels[0] == "OPEN" else max(eligible)
+    level = 0 if state.gross_spent == 0 and state.levels[0] == "OPEN" else (
+        min(eligible) if config.sequential_scale_ins else max(eligible)
+    )
     if level not in eligible:
         return Transition(state, reason="need_scout_level")
-    factor = (config.hostile_scout_fraction if market.hostile else ONE) * market.quality_factor
+    factor = (
+        config.hostile_scout_fraction
+        if market.hostile or (level == 0 and state.adverse_entry_latched)
+        else ONE
+    ) * market.quality_factor
     factor *= min(ONE, state.frozen_atr / market.atr_1h)
     if (market.hostile and level > 0) or factor == 0:
         return Transition(state, reason="zero_allocation" if factor == 0 else "regime_veto")
@@ -737,6 +859,8 @@ def transition(
         if not market.entry_signal:
             return Transition(state, reason="need_entry_confirmation")
     else:
+        if state.adverse_entry_latched:
+            return Transition(state, reason="adverse_regime_latch")
         if state.setup_level != level:
             state.setup_level, state.setup_low, state.setup_start, state.no_new_low = (
                 level,
@@ -746,8 +870,10 @@ def transition(
             )
             return Transition(state, reason="level_armed")
         if market.timestamp - state.setup_start >= config.setup_bars * config.interval_seconds:
-            state.levels[level] = "SKIPPED"
             state.setup_level = -1
+            if config.sequential_scale_ins:
+                return Transition(state, reason="setup_expired_rearm")
+            state.levels[level] = "SKIPPED"
             return Transition(state, reason="setup_expired")
         if market.low < state.setup_low:
             state.setup_low, state.no_new_low = market.low, 0
@@ -756,6 +882,8 @@ def transition(
         rebound = max(config.rebound_atr * market.atr_1m, 2 * (market.ask - market.bid))
         if state.no_new_low < config.stabilization_bars or market.ask < state.setup_low + rebound:
             return Transition(state, reason="need_stabilization")
+        if config.require_scale_in_signal and not market.entry_signal:
+            return Transition(state, reason="need_scale_in_signal")
         if market.ask > state.last_fill_price - config.last_fill_gap_atr * market.atr_1m:
             return Transition(state, reason="last_fill_gap")
     cap = config.budget_quote * config.level_fractions[level] * factor
@@ -777,11 +905,22 @@ def transition(
         after = (state.cost + reserve) / (state.base + amount)
         if before - after < config.basis_improvement_atr * state.frozen_atr:
             return Transition(state, reason="insufficient_basis_improvement")
-    for index in range(level):
-        if state.levels[index] == "OPEN":
-            state.levels[index] = "SKIPPED"
+    if not config.sequential_scale_ins:
+        for index in range(level):
+            if state.levels[index] == "OPEN":
+                state.levels[index] = "SKIPPED"
     state.levels[level] = "AUTHORIZED"
     state.setup_level = -1
     state.phase = "SCOUT" if level == 0 else "ACCUMULATE"
-    request = _request(config, state, market, side="BUY", amount=amount, price=price, reserve=reserve, level=level)
+    request = _request(
+        config,
+        state,
+        market,
+        side="BUY",
+        amount=amount,
+        price=price,
+        reserve=reserve,
+        level=level,
+        intent="SCOUT_BUY" if level == 0 else "SCALE_IN_BUY",
+    )
     return Transition(state, (request,), reason="scout" if level == 0 else "scale_in")

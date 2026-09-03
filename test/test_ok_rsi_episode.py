@@ -128,6 +128,152 @@ def test_setup_waits_for_two_subsequent_closed_bars_and_skips_crossed_levels():
     assert third.requests[0].reserved_quote <= D("250")
 
 
+def test_sequential_scale_in_selects_lowest_eligible_level_without_skips():
+    cfg = config(sequential_scale_ins=True)
+    state, _ = bought(cfg)
+    first = transition(
+        cfg, state, market(timestamp=6120, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=D("1"))
+    )
+    second = transition(
+        cfg, first.state, market(timestamp=6180, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+    third = transition(
+        cfg, second.state, market(timestamp=6240, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+
+    assert third.requests[0].level == 1
+    assert third.state.levels[2:4] == ["OPEN", "OPEN"]
+
+
+def test_causal_scale_in_requires_fresh_owner_buy_signal_at_authorization():
+    cfg = config(sequential_scale_ins=True, require_scale_in_signal=True)
+    state, _ = bought(cfg)
+    armed = transition(
+        cfg,
+        state,
+        market(timestamp=6120, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=D("1")),
+    )
+    once = transition(
+        cfg,
+        armed.state,
+        market(timestamp=6180, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1")),
+    )
+    blocked = transition(
+        cfg,
+        once.state,
+        market(
+            timestamp=6240,
+            bid=D("96.8"),
+            ask=D("96.8"),
+            low=D("96.1"),
+            base_available=D("1"),
+            entry_signal=False,
+        ),
+    )
+    admitted = transition(
+        cfg,
+        blocked.state,
+        market(timestamp=6300, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1")),
+    )
+
+    assert blocked.reason == "need_scale_in_signal"
+    assert not blocked.requests
+    assert admitted.requests[0].level == 1
+
+
+def test_sequential_setup_expiry_rearms_level_instead_of_consuming_budget():
+    cfg = config(sequential_scale_ins=True, setup_bars=2)
+    state, _ = bought(cfg)
+    armed = transition(
+        cfg, state, market(timestamp=6120, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=D("1"))
+    )
+    once = transition(
+        cfg, armed.state, market(timestamp=6180, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+    expired = transition(
+        cfg, once.state, market(timestamp=6240, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+
+    assert expired.reason == "setup_expired_rearm"
+    assert expired.state.levels[1] == "OPEN"
+    assert remaining_budget(cfg, expired.state) == D("900")
+
+
+def test_adverse_episode_latch_blocks_scale_in_until_completed_hourly_recovery():
+    cfg = config(sequential_scale_ins=True, hostile_risk_latch=True, stabilization_bars=1)
+    first = transition(cfg, EpisodeState(), market(reset=True))
+    assert first.requests[0].reserved_quote <= D("25")
+    scout_base = first.requests[0].amount
+    fill = OrderUpdate(first.requests[0].id, filled_base=scout_base, filled_quote=D("25"), done=True)
+    state = transition(
+        cfg,
+        first.state,
+        market(timestamp=6060, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=scout_base),
+        [fill],
+    ).state
+    armed = transition(
+        cfg,
+        state,
+        market(timestamp=6120, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=scout_base),
+    )
+    blocked = transition(
+        cfg,
+        armed.state,
+        market(timestamp=6180, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=scout_base),
+    )
+    released = transition(
+        cfg,
+        blocked.state,
+        market(
+            timestamp=6240,
+            bid=D("96.8"),
+            ask=D("96.8"),
+            low=D("96.1"),
+            base_available=scout_base,
+            hourly_recovered=True,
+        ),
+    )
+    admitted = transition(
+        cfg,
+        released.state,
+        market(
+            timestamp=6300,
+            bid=D("96.8"),
+            ask=D("96.8"),
+            low=D("96.1"),
+            base_available=scout_base,
+            hourly_recovered=True,
+        ),
+    )
+
+    assert blocked.reason == "adverse_regime_latch"
+    assert not blocked.requests
+    assert released.reason == "level_armed"
+    assert admitted.requests[0].level == 1
+
+
+def test_hostile_context_after_scout_latches_episode_before_any_scale_in():
+    cfg = config(sequential_scale_ins=True, hostile_risk_latch=True, stabilization_bars=1)
+    first = transition(cfg, EpisodeState(), market())
+    scout_base = first.requests[0].amount
+    fill = OrderUpdate(first.requests[0].id, scout_base, D("100"), done=True)
+    defensive = transition(
+        cfg,
+        first.state,
+        market(timestamp=6060, base_available=scout_base, hostile=True, entry_signal=False),
+        [fill],
+    )
+    blocked = transition(
+        cfg,
+        defensive.state,
+        market(timestamp=6120, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=scout_base),
+    )
+
+    assert defensive.state.adverse_entry_latched is True
+    assert blocked.reason == "adverse_regime_latch"
+    assert not blocked.requests
+
+
 def test_same_bar_cannot_count_again_as_stabilization():
     cfg = config()
     state, _ = bought(cfg)
@@ -159,6 +305,162 @@ def test_state_roundtrip_preserves_budget_levels_and_pending_identity():
         transition(replace(cfg, budget_quote=D("2000")), restored, market(timestamp=6120))
 
 
+def test_requests_carry_exact_scout_scale_and_distribution_intents():
+    cfg = config()
+    scout = transition(cfg, EpisodeState(), market())
+    assert scout.requests[0].intent == "SCOUT_BUY"
+    fill = OrderUpdate(scout.requests[0].id, D("1"), D("100"), done=True)
+    state = transition(
+        cfg,
+        scout.state,
+        market(timestamp=6060, base_available=D("1"), entry_signal=False),
+        [fill],
+    ).state
+    armed = transition(
+        cfg, state, market(timestamp=6120, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=D("1"))
+    )
+    once = transition(
+        cfg, armed.state, market(timestamp=6180, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+    scale = transition(
+        cfg, once.state, market(timestamp=6240, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+    assert scale.requests[0].intent == "SCALE_IN_BUY"
+
+    markup = transition(
+        cfg,
+        state,
+        market(timestamp=6300, bid=D("101"), ask=D("101"), low=D("101"), base_available=D("1"), markup=True),
+    )
+    distribution = transition(
+        cfg,
+        markup.state,
+        market(timestamp=6360, bid=D("108"), ask=D("108"), low=D("108"), base_available=D("1")),
+    )
+    assert distribution.requests[0].intent == "DISTRIBUTION_SELL"
+
+
+def test_profitable_recovery_arms_trail_and_exits_without_hourly_markup():
+    cfg = config(recovery_exit_enabled=True)
+    state, _ = bought(cfg)
+    armed = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            atr_15m=D(".1"),
+            base_available=D("1"),
+            recovery=True,
+        ),
+    )
+    higher = transition(
+        cfg,
+        armed.state,
+        market(timestamp=6180, bid=D("102"), ask=D("102"), low=D("102"), atr_15m=D(".1"), base_available=D("1")),
+    )
+    result = transition(
+        cfg,
+        higher.state,
+        market(
+            timestamp=6240,
+            bid=D("101.4"),
+            ask=D("101.4"),
+            low=D("101.4"),
+            atr_15m=D(".1"),
+            base_available=D("1"),
+        ),
+    )
+
+    assert armed.state.phase == "RECOVER"
+    assert armed.reason == "recovery_exit_armed"
+    assert not armed.requests
+    assert result.state.phase == "EXIT"
+    assert result.reason == "recovery_take_profit"
+    assert result.requests[0].side == "SELL"
+    assert result.requests[0].intent == "RECOVERY_TAKE_PROFIT"
+
+
+def test_recovery_exit_never_bypasses_fee_adjusted_profit_floor():
+    cfg = config(min_profit=D(".02"), recovery_exit_enabled=True)
+    state, _ = bought(cfg)
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("101.99"),
+            ask=D("101.99"),
+            low=D("101.99"),
+            base_available=D("1"),
+            recovery=True,
+        ),
+    )
+
+    assert result.state.phase == "RECOVER"
+    assert result.reason == "recovery_profit_guard"
+    assert not result.requests
+
+
+def test_sell_only_assignment_uses_same_profitable_recovery_exit_without_buying():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="inventory-1",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        recovery_exit_enabled=True,
+    )
+    armed = transition(
+        cfg,
+        EpisodeState(),
+        market(base_available=D("1"), bid=D("101"), ask=D("101"), atr_15m=D(".1"), recovery=True),
+    )
+    result = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            base_available=D("1"),
+            bid=D("100.4"),
+            ask=D("100.4"),
+            low=D("100.4"),
+            atr_15m=D(".1"),
+        ),
+    )
+
+    assert armed.reason == "recovery_exit_armed"
+    assert not armed.requests
+    assert len(result.requests) == 1
+    assert result.requests[0].side == "SELL"
+    assert result.requests[0].intent == "RECOVERY_TAKE_PROFIT"
+
+
+def test_sell_only_recovery_trail_remains_profit_protected_when_ordinary_sells_are_not():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="inventory-1",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        require_profit=False,
+        recovery_exit_enabled=True,
+    )
+    armed = transition(
+        cfg,
+        EpisodeState(),
+        market(base_available=D("1"), bid=D("101"), ask=D("101"), atr_15m=D(".1"), recovery=True),
+    )
+    blocked = transition(
+        cfg,
+        armed.state,
+        market(timestamp=6060, base_available=D("1"), bid=D("99"), ask=D("99"), low=D("99"), atr_15m=D(".1")),
+    )
+
+    assert blocked.reason == "profit_guard_blocked"
+    assert not blocked.requests
+
+
 def test_distribution_targets_ratchet_and_profit_guard_blocks_terminal_sale():
     cfg = config()
     state, _ = bought(cfg)
@@ -171,6 +473,7 @@ def test_distribution_targets_ratchet_and_profit_guard_blocks_terminal_sale():
     )
     assert distribute.state.target_base == D("0.6")
     assert distribute.requests[0].side == "SELL"
+    assert distribute.requests[0].intent == "DISTRIBUTION_SELL"
     assert distribute.requests[0].amount == D("0.4")
     fill = OrderUpdate(distribute.requests[0].id, D("0.4"), D("43.2"), done=True)
     crash = transition(

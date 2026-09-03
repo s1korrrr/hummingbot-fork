@@ -214,6 +214,37 @@ def test_status_exposes_episode_basis_profit_floor_and_adverse_latch():
     assert status["adverse_entry_latched"] is True
 
 
+def test_status_selects_latest_entry_across_episode_revision_resets():
+    from controllers.directional_trading.ok_rsi_core.episode import OrderProgress, OrderRequest
+
+    controller, _ = setup_controller()
+    runtime = controller._episode_runtime
+
+    def request(identifier, episode, revision, expires_at, price):
+        return OrderRequest(
+            id=identifier,
+            episode_id=episode,
+            level=0,
+            side="BUY",
+            amount=Decimal("1"),
+            price=price,
+            reserved_quote=price,
+            expires_at=expires_at,
+            revision=revision,
+            intent="SCOUT_BUY",
+            pricing_policy="TOP_OF_BOOK",
+            reference_price=price,
+        )
+
+    old = request("old", "episode-1", 4, 10_000, Decimal("100"))
+    newest = request("new", "episode-2", 1, 20_000, Decimal("90"))
+    runtime.state.orders = {old.id: OrderProgress(old), newest.id: OrderProgress(newest)}
+
+    status = runtime.status()
+
+    assert status["last_entry_selected_price"] == "90"
+
+
 def test_direct_factory_cannot_change_an_authorized_quantity():
     controller, _ = setup_controller()
     created = actions(controller)[0]

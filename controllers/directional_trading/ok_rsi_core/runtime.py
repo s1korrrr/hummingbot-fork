@@ -136,7 +136,10 @@ class EpisodeRuntime:
         buy_requests = [
             order.request for order in self.state.orders.values() if order.request.side == "BUY"
         ]
-        last_entry = max(buy_requests, key=lambda request: request.revision) if buy_requests else None
+        last_entry = max(
+            buy_requests,
+            key=lambda request: (request.expires_at, request.revision),
+        ) if buy_requests else None
         return {"enabled": True, "phase": self.state.phase, "episode_id": self.state.episode_id,
                 "reason": self.reason, "hold_reason": self.hold_reason,
                 "base": str(self.state.base), "gross_spent": str(self.state.gross_spent),

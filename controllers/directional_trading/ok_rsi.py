@@ -75,20 +75,48 @@ class OKRSIController(hl_rsi.HLRSIController):
         return super().stop_actions_proposal()
 
     def get_executor_class_for_config(self, config):
-        if self._episode_runtime is not None and config.id in self._episode_runtime.state.orders:
-            from controllers.directional_trading.ok_rsi_core.execution import (
-                EpisodeOrderExecutor,
-                EpisodeOrderExecutorConfig,
-            )
-            if not isinstance(config, EpisodeOrderExecutorConfig):
-                raise ValueError("episode request requires its bounded native executor configuration")
-            request = self._episode_runtime.state.orders[config.id].request
-            if (config.amount != request.amount or config.price != request.price or config.side.name != request.side
-                    or config.episode_expires_at != request.expires_at
-                    or config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair):
-                raise ValueError("executor parameters differ from durable episode authorization")
-            return EpisodeOrderExecutor
-        return super().get_executor_class_for_config(config)
+        runtime = self._episode_runtime
+        if runtime is None:
+            return super().get_executor_class_for_config(config)
+        from controllers.directional_trading.ok_rsi_core.execution import (
+            EPISODE_LEVEL_PREFIX,
+            EpisodeOrderExecutor,
+            EpisodeOrderExecutorConfig,
+        )
+        if not isinstance(config, EpisodeOrderExecutorConfig):
+            raise ValueError("episode request requires its bounded native executor configuration")
+        progress = runtime.state.orders.get(config.id)
+        claimed = getattr(self, "_episode_factory_claimed_ids", set())
+        if progress is None or progress.done or progress.seen or config.id in claimed:
+            raise ValueError("episode request is unknown, settled, or already dispatched")
+        request = progress.request
+        if runtime.hold_reason or runtime.state.fault or self.config.manual_kill_switch:
+            raise ValueError("episode executor construction is on hold")
+        if request.side not in {"BUY", "SELL"} or (request.side == "BUY" and self.config.trade_mode == "sell_only"):
+            raise ValueError("episode mode forbids this executor side")
+        expected_timestamp = request.expires_at - runtime.config.setup_bars * runtime.config.interval_seconds
+        expected_action = PositionAction.OPEN if request.side == "BUY" else PositionAction.CLOSE
+        if (request.episode_id != runtime.state.episode_id
+                or config.type != "order_executor"
+                or config.execution_strategy is not ExecutionStrategy.LIMIT_MAKER
+                or config.chaser_config is not None
+                or config.amount != request.amount or config.price != request.price
+                or config.side is not TradeType[request.side] or config.position_action is not expected_action
+                or type(config.leverage) is not int or config.leverage != 1
+                or type(config.episode_level) is not int or type(config.episode_revision) is not int
+                or type(config.episode_expires_at) is not int
+                or config.timestamp != expected_timestamp
+                or config.controller_id != self.config.id
+                or config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair
+                or config.episode_id != request.episode_id or config.episode_level != request.level
+                or config.episode_revision != request.revision or config.episode_expires_at != request.expires_at
+                or config.level_id != f"{EPISODE_LEVEL_PREFIX}{request.episode_id}:{request.level}"):
+            raise ValueError("executor parameters differ from durable episode authorization")
+        # The orchestrator resolves immediately before constructing and starting
+        # the executor. A constructor failure remains reserved and is not retried
+        # implicitly. Restored unknown requests are never re-emitted by runtime.
+        self._episode_factory_claimed_ids = claimed | {config.id}
+        return EpisodeOrderExecutor
 
     def validate_runtime_state_transfer(self, source):
         previous = getattr(source, "_episode_runtime", None)

@@ -60,11 +60,19 @@ class EpisodeOrderExecutor(OrderExecutor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._episode_orders = {}
+        self._episode_order_ids = set()
         self._episode_submitted = False
 
     def _remember_orders(self):
         for tracked in [self._order, *self._partial_filled_orders, *self._canceled_orders, *self._failed_orders]:
-            if tracked is not None and tracked.order is not None:
+            if tracked is None:
+                continue
+            self._episode_order_ids.add(tracked.order_id)
+            if tracked.order is None:
+                native = self.get_in_flight_order(self.config.connector_name, tracked.order_id)
+                if native is not None:
+                    tracked.order = native
+            if tracked.order is not None:
                 self._episode_orders[tracked.order_id] = tracked.order
 
     def place_open_order(self):
@@ -121,13 +129,14 @@ class EpisodeOrderExecutor(OrderExecutor):
             base_fee += native_base_fee
             quote_fee += native_quote_fee
             errors.extend(native_errors)
+        unresolved = self._episode_order_ids - self._episode_orders.keys()
+        errors.extend(f"unresolved_native_order:{order_id}" for order_id in unresolved)
         all_done = all(native.is_done for native in self._episode_orders.values())
-        pending_unknown = self._order is not None and self._order.order is None
         return {
             "gross_base": str(gross_base), "gross_quote": str(gross_quote),
             "base_fee": str(base_fee), "quote_fee": str(quote_fee),
             "fees_known": not errors,
-            "final": self.status == RunnableStatus.TERMINATED and all_done and not pending_unknown and not errors,
+            "final": self.status == RunnableStatus.TERMINATED and all_done and not errors,
             "errors": sorted(set(errors)),
         }
 
@@ -156,7 +165,7 @@ class EpisodeOrderExecutor(OrderExecutor):
 
     async def control_shutdown_process(self):
         self._remember_orders()
-        if self._order is not None and self._order.order is None:
+        if self._episode_order_ids - self._episode_orders.keys():
             return
         if any(not native.is_done for native in self._episode_orders.values()):
             if self._order is not None and self._order.is_open:

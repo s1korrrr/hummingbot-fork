@@ -127,3 +127,41 @@ def test_episode_order_expiry_cancels_without_new_submission():
     asyncio.run(instance.control_task())
     assert instance.status == RunnableStatus.SHUTTING_DOWN
     instance._strategy.buy.assert_not_called()
+
+
+def test_cancelled_unknown_native_order_retains_reservation():
+    instance = executor()
+    instance.get_in_flight_order = MagicMock(return_value=None)
+    instance.process_order_canceled_event(None, None, SimpleNamespace(order_id="order-1"))
+    asyncio.run(instance.control_task())
+    receipt = instance.get_custom_info()["episode_receipt"]
+    assert instance.status == RunnableStatus.SHUTTING_DOWN
+    assert receipt["final"] is False
+    assert receipt["fees_known"] is False
+    assert "unresolved_native_order:order-1" in receipt["errors"]
+
+
+def test_late_native_partial_record_after_unknown_cancel_is_reconciled():
+    instance = executor()
+    instance.get_in_flight_order = MagicMock(return_value=None)
+    instance.process_order_canceled_event(None, None, SimpleNamespace(order_id="order-1"))
+    asyncio.run(instance.control_task())
+    assert instance.status == RunnableStatus.SHUTTING_DOWN
+    native = order(state=OrderState.CANCELED)
+    instance.get_in_flight_order.return_value = native
+    asyncio.run(instance.control_task())
+    receipt = instance.get_custom_info()["episode_receipt"]
+    assert receipt["gross_base"] == "0.4"
+    assert receipt["base_fee"] == "0.001"
+    assert receipt["final"] is True
+
+
+def test_failed_unknown_native_order_retains_reservation():
+    instance = executor()
+    instance.get_in_flight_order = MagicMock(return_value=None)
+    instance.process_order_failed_event(None, None, SimpleNamespace(order_id="order-1"))
+    asyncio.run(instance.control_task())
+    assert instance.status == RunnableStatus.SHUTTING_DOWN
+    receipt = instance.get_custom_info()["episode_receipt"]
+    assert receipt["final"] is False
+    assert "unresolved_native_order:order-1" in receipt["errors"]

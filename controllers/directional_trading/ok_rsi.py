@@ -106,6 +106,11 @@ class OKRSIController(hl_rsi.HLRSIController):
                 or type(config.episode_level) is not int or type(config.episode_revision) is not int
                 or type(config.episode_expires_at) is not int
                 or config.episode_intent != request.intent
+                or config.episode_setup_policy != request.setup_policy
+                or config.episode_setup_started_at != request.setup_started_at
+                or config.episode_setup_low != request.setup_low
+                or config.episode_setup_rebound != request.setup_rebound
+                or config.episode_setup_no_new_low != request.setup_no_new_low
                 or config.timestamp != expected_timestamp
                 or config.controller_id != self.config.id
                 or config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair

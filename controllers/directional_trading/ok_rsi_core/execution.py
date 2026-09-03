@@ -48,6 +48,11 @@ class EpisodeOrderExecutorConfig(OrderExecutorConfig):
     episode_revision: int = 0
     episode_level: int = -1
     episode_intent: str = "UNSPECIFIED"
+    episode_setup_policy: str = "IMMEDIATE"
+    episode_setup_started_at: int = 0
+    episode_setup_low: Decimal = ZERO
+    episode_setup_rebound: Decimal = ZERO
+    episode_setup_no_new_low: int = 0
 
 
 class EpisodeOrderExecutor(OrderExecutor):

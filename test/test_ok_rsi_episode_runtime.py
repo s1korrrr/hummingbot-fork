@@ -73,7 +73,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_trail_max=Decimal("0.05"),
         episode_hostile_risk_latch=True,
         episode_recovery_exit_enabled=True,
-        episode_adaptive_entry_pricing=True,
+        episode_scout_rebound_confirmation=True,
     )
 
     policy = controller._episode_runtime.config
@@ -93,7 +93,46 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.trail_max == Decimal("0.05")
     assert policy.hostile_risk_latch is True
     assert policy.recovery_exit_enabled is True
-    assert policy.adaptive_entry_pricing is True
+    assert policy.adaptive_entry_pricing is False
+    assert policy.scout_rebound_confirmation is True
+    assert policy.rebound_atr == Decimal("0.25")
+
+
+def test_rebound_scout_persists_setup_then_emits_exact_owner_receipt():
+    controller, store = setup_controller(episode_scout_rebound_confirmation=True)
+
+    assert actions(controller) == []
+    armed = controller._episode_runtime.status()
+    assert armed["setup_policy"] == "SCOUT_REBOUND_V1"
+    assert armed["setup_started_at"] == 10020
+    assert armed["setup_low"] == "93"
+    restarted, _ = setup_controller(
+        store=store,
+        episode_scout_rebound_confirmation=True,
+    )
+    restarted.processed_data = {"signal": 0, "signal_state": {"condition_ok": True}}
+    restarted.market_data_provider.time.return_value = 10080
+    first_context = context() | {"timestamp": 10080, "low": Decimal("93.1")}
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=first_context,
+    ):
+        assert restarted.determine_executor_actions() == []
+    restarted.market_data_provider.time.return_value = 10140
+    second_context = context() | {"timestamp": 10140, "low": Decimal("93.1")}
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=second_context,
+    ):
+        created = restarted.determine_executor_actions()
+
+    assert len(created) == 1
+    executor = created[0].executor_config
+    assert executor.episode_setup_policy == "SCOUT_REBOUND_V1"
+    assert executor.episode_setup_started_at == 10020
+    assert executor.episode_setup_low == Decimal("93")
+    assert executor.episode_setup_rebound == Decimal("0.25")
+    assert executor.episode_setup_no_new_low == 2
 
 
 def test_adaptive_entry_pricing_maps_owner_signal_context_and_exposes_receipt():
@@ -258,6 +297,29 @@ def test_direct_factory_rejects_changed_execution_intent():
     with pytest.raises(ValueError, match="authorization"):
         controller.get_executor_class_for_config(
             created.executor_config.model_copy(update={"episode_intent": "TERMINAL_PROFIT_EXIT"})
+        )
+
+
+def test_direct_factory_rejects_changed_rebound_setup_receipt():
+    controller, _ = setup_controller(episode_scout_rebound_confirmation=True)
+    assert actions(controller) == []
+    controller.processed_data = {"signal": 0, "signal_state": {"condition_ok": True}}
+    controller.market_data_provider.time.return_value = 10080
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context() | {"timestamp": 10080, "low": Decimal("93.1")},
+    ):
+        assert controller.determine_executor_actions() == []
+    controller.market_data_provider.time.return_value = 10140
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context() | {"timestamp": 10140, "low": Decimal("93.1")},
+    ):
+        created = controller.determine_executor_actions()[0]
+
+    with pytest.raises(ValueError, match="authorization"):
+        controller.get_executor_class_for_config(
+            created.executor_config.model_copy(update={"episode_setup_low": Decimal("1")})
         )
 
 

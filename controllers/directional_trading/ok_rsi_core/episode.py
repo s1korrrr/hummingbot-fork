@@ -126,6 +126,7 @@ class EpisodeConfig:
     hostile_risk_latch: bool = False
     recovery_exit_enabled: bool = False
     adaptive_entry_pricing: bool = False
+    scout_rebound_confirmation: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -143,6 +144,7 @@ class EpisodeConfig:
             "hostile_risk_latch",
             "recovery_exit_enabled",
             "adaptive_entry_pricing",
+            "scout_rebound_confirmation",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -164,6 +166,8 @@ class EpisodeConfig:
             or not ZERO < self.trail_min <= self.trail_max < ONE
         ):
             raise EpisodeInputError("invalid fee, sizing factor or trailing range")
+        if self.adaptive_entry_pricing and self.scout_rebound_confirmation:
+            raise EpisodeInputError("adaptive maker and rebound scout treatments cannot be combined")
         for name in ("level_fractions", "dip_atr_levels", "distribution_atr_levels", "remaining_fractions"):
             object.__setattr__(self, name, tuple(_decimal(x, name, positive=True) for x in getattr(self, name)))
         if (
@@ -204,6 +208,8 @@ class EpisodeConfig:
         # An unresolved episode may not be stranded by a code-only upgrade.
         if not self.adaptive_entry_pricing:
             values.pop("adaptive_entry_pricing")
+        if not self.scout_rebound_confirmation:
+            values.pop("scout_rebound_confirmation")
         return _hash(values)
 
 
@@ -307,12 +313,17 @@ class OrderRequest:
     pricing_discount_atr: Decimal = ZERO
     signal_confidence: Decimal = ZERO
     trend_alignment: Decimal = ZERO
+    setup_policy: str = "IMMEDIATE"
+    setup_started_at: int = 0
+    setup_low: Decimal = ZERO
+    setup_rebound: Decimal = ZERO
+    setup_no_new_low: int = 0
 
     def __post_init__(self):
         for name in ("id", "episode_id"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise EpisodeInputError("invalid request identity")
-        for name in ("level", "expires_at", "revision"):
+        for name in ("level", "expires_at", "revision", "setup_started_at", "setup_no_new_low"):
             if type(getattr(self, name)) is not int:
                 raise EpisodeInputError("invalid request integer")
         if self.side not in ("BUY", "SELL") or self.expires_at <= 0 or self.revision <= 0:
@@ -321,6 +332,8 @@ class OrderRequest:
             raise EpisodeInputError("invalid request intent")
         if self.pricing_policy not in {"UNRECORDED", "TOP_OF_BOOK", "ADAPTIVE_MAKER_V1"}:
             raise EpisodeInputError("invalid entry pricing policy")
+        if self.setup_policy not in {"IMMEDIATE", "SCOUT_REBOUND_V1"}:
+            raise EpisodeInputError("invalid entry setup policy")
         if self.intent != "UNSPECIFIED" and (
             (self.side == "BUY" and self.intent not in {"SCOUT_BUY", "SCALE_IN_BUY"})
             or (self.side == "SELL" and self.intent not in SELL_INTENTS)
@@ -330,7 +343,14 @@ class OrderRequest:
             raise EpisodeInputError("invalid request level")
         for name in ("amount", "price", "reserved_quote"):
             object.__setattr__(self, name, _decimal(getattr(self, name), name, positive=name != "reserved_quote"))
-        for name in ("reference_price", "pricing_discount", "pricing_discount_atr", "signal_confidence"):
+        for name in (
+            "reference_price",
+            "pricing_discount",
+            "pricing_discount_atr",
+            "signal_confidence",
+            "setup_low",
+            "setup_rebound",
+        ):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
         object.__setattr__(self, "trend_alignment", _signed_decimal(self.trend_alignment, "trend_alignment"))
         if self.signal_confidence > ONE or not -ONE <= self.trend_alignment <= ONE:
@@ -342,6 +362,19 @@ class OrderRequest:
                 raise EpisodeInputError("top-of-book receipt cannot contain a discount")
             if self.pricing_policy == "ADAPTIVE_MAKER_V1" and self.pricing_discount <= 0:
                 raise EpisodeInputError("adaptive receipt requires a passive discount")
+        if self.setup_policy == "IMMEDIATE":
+            if any((self.setup_started_at, self.setup_low, self.setup_rebound, self.setup_no_new_low)):
+                raise EpisodeInputError("immediate entry cannot carry rebound setup state")
+        elif (
+            self.side != "BUY"
+            or self.level != 0
+            or self.setup_started_at <= 0
+            or self.setup_low <= 0
+            or self.setup_rebound <= 0
+            or self.setup_no_new_low <= 0
+            or self.price < self.setup_low + self.setup_rebound
+        ):
+            raise EpisodeInputError("rebound entry receipt contradicts request")
 
 
 @dataclass(frozen=True)
@@ -572,17 +605,17 @@ def _validate_accounting(config: EpisodeConfig, state: EpisodeState) -> None:
         reserve = request.amount * request.price * (ONE + config.fee_rate) if request.side == "BUY" else ZERO
         if reserve != request.reserved_quote:
             raise EpisodeInputError("checkpoint reservation mismatch")
-            if request.side == "BUY":
-                if request.level >= len(state.levels):
-                    raise EpisodeInputError("checkpoint authorization level mismatch")
-                rearmed_without_fill = (
-                    config.adaptive_entry_pricing
-                    and state.levels[request.level] == "OPEN"
-                    and order.done
-                    and not any((order.filled_base, order.filled_quote, order.fee_quote, order.fee_base))
-                )
-                if state.levels[request.level] != "AUTHORIZED" and not rearmed_without_fill:
-                    raise EpisodeInputError("checkpoint authorization level mismatch")
+        if request.side == "BUY":
+            if request.level >= len(state.levels):
+                raise EpisodeInputError("checkpoint authorization level mismatch")
+            rearmed_without_fill = (
+                config.adaptive_entry_pricing
+                and state.levels[request.level] == "OPEN"
+                and order.done
+                and not any((order.filled_base, order.filled_quote, order.fee_quote, order.fee_base))
+            )
+            if state.levels[request.level] != "AUTHORIZED" and not rearmed_without_fill:
+                raise EpisodeInputError("checkpoint authorization level mismatch")
     if sum(not order.done for order in current) > 1:
         raise EpisodeInputError("multiple unresolved episode requests")
 
@@ -650,6 +683,24 @@ def _start_episode(config: EpisodeConfig, state: EpisodeState, market: MarketSna
     state.adverse_entry_latched = config.hostile_risk_latch and (market.hostile or market.reset)
 
 
+def _abandon_unfunded_episode(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    market: MarketSnapshot,
+) -> EpisodeState:
+    current = [order for order in state.orders.values() if order.request.episode_id == state.episode_id]
+    if state.base or state.gross_spent or any(not order.done for order in current):
+        raise EpisodeInputError("cannot abandon a funded or unresolved episode")
+    return EpisodeState(
+        config_hash=config.identity,
+        episode_number=state.episode_number,
+        timestamp=market.timestamp,
+        orders=state.orders,
+        last_valid_bid=state.last_valid_bid,
+        assignment_consumed=state.assignment_consumed,
+    )
+
+
 def _request(
     config: EpisodeConfig,
     state: EpisodeState,
@@ -662,6 +713,7 @@ def _request(
     level: int,
     intent: str,
     entry_price_selection: AdaptiveEntryPriceSelection | None = None,
+    setup_receipt: dict | None = None,
 ) -> OrderRequest:
     state.command_revision += 1
     identity = _hash((state.episode_id, state.command_revision, side, level))
@@ -685,6 +737,7 @@ def _request(
         state.command_revision,
         intent,
         **pricing,
+        **(setup_receipt or {}),
     )
     state.orders[identity] = OrderProgress(request)
     return request
@@ -788,6 +841,22 @@ def transition(
         raise EpisodeInputError("out-of-order market observation")
     if market.valid:
         state.last_valid_bid = market.bid
+    setup_context_reset = bool(
+        config.scout_rebound_confirmation
+        and state.episode_id
+        and state.base == 0
+        and state.gross_spent == 0
+        and state.setup_level == 0
+        and (
+            not market.valid
+            or market.cascade
+            or market.hostile
+            or market.reset
+            or not market.buy_allowed
+            or market.recovery
+            or (state.timestamp >= 0 and market.timestamp > state.timestamp + config.interval_seconds)
+        )
+    )
     if (
         not market.valid
         or market.cascade
@@ -799,6 +868,8 @@ def transition(
         state.setup_level, state.no_new_low = -1, 0
     for update in updates:
         _apply_update(config, state, market, update)
+    if setup_context_reset:
+        state = _abandon_unfunded_episode(config, state, market)
     pending = [order for order in state.orders.values() if not order.done]
     cancellations = tuple(
         order.request.id
@@ -920,6 +991,12 @@ def transition(
         return Transition(state, reason="sell_only_observe")
     if not market.buy_allowed:
         return Transition(state, reason="buy_veto")
+    if (
+        config.scout_rebound_confirmation
+        and state.base == 0
+        and (market.hostile or market.reset or market.recovery or market.cascade)
+    ):
+        return Transition(state, reason="scout_rebound_context_blocked")
     if not state.episode_id:
         if not market.entry_signal or market.ask > market.anchor - config.dip_atr_levels[0] * market.atr_1h:
             return Transition(state, reason="need_dislocation")
@@ -929,24 +1006,56 @@ def transition(
         # retaining the original episode/order identity for late-fill safety.
         state.frozen_anchor = market.anchor
         state.frozen_atr = market.atr_1h
-    open_levels = [index for index, value in enumerate(state.levels) if value == "OPEN"]
-    if not open_levels or remaining_budget(config, state) <= 0:
-        state.phase = "EXHAUSTED"
-        return Transition(state, reason="exhausted")
-    eligible = [
-        index
-        for index in open_levels
-        if market.ask <= state.frozen_anchor - config.dip_atr_levels[index] * state.frozen_atr
-    ]
-    if not eligible:
-        state.phase = "ACCUMULATE" if state.base else "WATCH"
-        return Transition(state, reason="need_deeper_level")
-    # First purchase is always the scout; a gap cannot multiply initial risk.
-    level = 0 if state.gross_spent == 0 and state.levels[0] == "OPEN" else (
-        min(eligible) if config.sequential_scale_ins else max(eligible)
-    )
-    if level not in eligible:
-        return Transition(state, reason="need_scout_level")
+    setup_receipt = None
+    if config.scout_rebound_confirmation and state.gross_spent == 0 and state.levels[0] == "OPEN":
+        if state.setup_level != 0:
+            if not market.entry_signal:
+                return Transition(state, reason="need_entry_confirmation")
+            state.setup_level = 0
+            state.setup_low = market.low
+            state.setup_start = market.timestamp
+            state.no_new_low = 0
+            state.phase = "WATCH"
+            return Transition(state, reason="scout_rebound_armed")
+        if market.timestamp - state.setup_start >= config.setup_bars * config.interval_seconds:
+            return Transition(
+                _abandon_unfunded_episode(config, state, market),
+                reason="scout_rebound_expired",
+            )
+        if market.low < state.setup_low:
+            state.setup_low, state.no_new_low = market.low, 0
+        else:
+            state.no_new_low += 1
+        rebound = max(config.rebound_atr * market.atr_1m, 2 * (market.ask - market.bid))
+        if state.no_new_low < config.stabilization_bars or market.ask < state.setup_low + rebound:
+            return Transition(state, reason="need_scout_rebound")
+        level = 0
+        setup_receipt = {
+            "setup_policy": "SCOUT_REBOUND_V1",
+            "setup_started_at": state.setup_start,
+            "setup_low": state.setup_low,
+            "setup_rebound": rebound,
+            "setup_no_new_low": state.no_new_low,
+        }
+    else:
+        open_levels = [index for index, value in enumerate(state.levels) if value == "OPEN"]
+        if not open_levels or remaining_budget(config, state) <= 0:
+            state.phase = "EXHAUSTED"
+            return Transition(state, reason="exhausted")
+        eligible = [
+            index
+            for index in open_levels
+            if market.ask <= state.frozen_anchor - config.dip_atr_levels[index] * state.frozen_atr
+        ]
+        if not eligible:
+            state.phase = "ACCUMULATE" if state.base else "WATCH"
+            return Transition(state, reason="need_deeper_level")
+        # First purchase is always the scout; a gap cannot multiply initial risk.
+        level = 0 if state.gross_spent == 0 and state.levels[0] == "OPEN" else (
+            min(eligible) if config.sequential_scale_ins else max(eligible)
+        )
+        if level not in eligible:
+            return Transition(state, reason="need_scout_level")
     factor = (
         config.hostile_scout_fraction
         if market.hostile or (level == 0 and state.adverse_entry_latched)
@@ -956,7 +1065,7 @@ def transition(
     if (market.hostile and level > 0) or factor == 0:
         return Transition(state, reason="zero_allocation" if factor == 0 else "regime_veto")
     if level == 0:
-        if not market.entry_signal:
+        if setup_receipt is None and not market.entry_signal:
             return Transition(state, reason="need_entry_confirmation")
     else:
         if state.adverse_entry_latched:
@@ -1046,5 +1155,6 @@ def transition(
         level=level,
         intent="SCOUT_BUY" if level == 0 else "SCALE_IN_BUY",
         entry_price_selection=entry_price_selection,
+        setup_receipt=setup_receipt,
     )
     return Transition(state, (request,), reason="scout" if level == 0 else "scale_in")

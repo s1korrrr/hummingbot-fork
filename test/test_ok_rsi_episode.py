@@ -221,9 +221,122 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     cfg = config(adaptive_entry_pricing=False)
     legacy_values = asdict(cfg)
     legacy_values.pop("adaptive_entry_pricing")
+    legacy_values.pop("scout_rebound_confirmation")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
+    assert replace(cfg, scout_rebound_confirmation=True).identity != cfg.identity
+
+
+def test_rebound_scout_latches_signal_tracks_low_and_waits_for_causal_reclaim():
+    cfg = config(scout_rebound_confirmation=True)
+
+    armed = transition(cfg, EpisodeState(), market(low=D("99.8")))
+    lower = transition(
+        cfg,
+        armed.state,
+        market(timestamp=6060, bid=D("99.05"), ask=D("99.1"), low=D("99"), entry_signal=False),
+    )
+    once = transition(
+        cfg,
+        lower.state,
+        market(timestamp=6120, bid=D("99.05"), ask=D("99.1"), low=D("99.05"), entry_signal=False),
+    )
+    confirmed = transition(
+        cfg,
+        once.state,
+        market(timestamp=6180, bid=D("100.25"), ask=D("100.3"), low=D("99.05"), entry_signal=False),
+    )
+
+    assert armed.reason == "scout_rebound_armed"
+    assert armed.requests == ()
+    assert armed.state.setup_level == 0
+    assert lower.state.setup_low == D("99")
+    assert lower.state.no_new_low == 0
+    assert once.reason == "need_scout_rebound"
+    assert confirmed.reason == "scout"
+    request = confirmed.requests[0]
+    assert request.price == D("100.3")
+    assert request.setup_policy == "SCOUT_REBOUND_V1"
+    assert request.setup_started_at == 6000
+    assert request.setup_low == D("99")
+    assert request.setup_rebound == D("0.25")
+    assert request.setup_no_new_low == 2
+    assert EpisodeState.from_dict(confirmed.state.to_dict()).orders[request.id].request == request
+
+
+def test_rebound_scout_timeout_abandons_empty_episode_and_requires_fresh_signal():
+    cfg = config(scout_rebound_confirmation=True, setup_bars=2, stabilization_bars=1)
+    armed = transition(cfg, EpisodeState(), market(low=D("99.8")))
+    waiting = transition(
+        cfg,
+        armed.state,
+        market(timestamp=6060, bid=D("99"), ask=D("99.1"), low=D("99"), entry_signal=False),
+    )
+
+    expired = transition(
+        cfg,
+        waiting.state,
+        market(timestamp=6120, bid=D("99"), ask=D("99.1"), low=D("99"), entry_signal=False),
+    )
+    no_signal = transition(
+        cfg,
+        expired.state,
+        market(timestamp=6180, bid=D("99"), ask=D("99.1"), low=D("99"), entry_signal=False),
+    )
+    fresh = transition(
+        cfg,
+        no_signal.state,
+        market(timestamp=6240, bid=D("99"), ask=D("99.1"), low=D("99"), entry_signal=True),
+    )
+
+    assert expired.reason == "scout_rebound_expired"
+    assert expired.state.episode_id is None
+    assert expired.state.setup_level == -1
+    assert no_signal.reason == "need_dislocation"
+    assert no_signal.requests == ()
+    assert fresh.reason == "scout_rebound_armed"
+    assert fresh.state.episode_id is not None
+
+
+@pytest.mark.parametrize("context_flag", ["hostile", "reset", "recovery", "cascade"])
+def test_rebound_scout_context_reset_abandons_unfunded_setup(context_flag):
+    cfg = config(scout_rebound_confirmation=True)
+    armed = transition(cfg, EpisodeState(), market(low=D("99.8")))
+
+    cleared = transition(
+        cfg,
+        armed.state,
+        market(timestamp=6060, entry_signal=False, **{context_flag: True}),
+    )
+
+    assert cleared.requests == ()
+    assert cleared.state.episode_id is None
+    assert cleared.state.setup_level == -1
+
+
+def test_rebound_scout_is_opt_in_and_sell_only_never_arms_it():
+    immediate = transition(config(), EpisodeState(), market())
+    sell_only = transition(
+        config(
+            mode="sell_only",
+            scout_rebound_confirmation=True,
+            assignment_id="assigned",
+            initial_base=D("1"),
+            initial_cost=D("100"),
+        ),
+        EpisodeState(),
+        market(base_available=D("1")),
+    )
+
+    assert immediate.requests[0].setup_policy == "IMMEDIATE"
+    assert sell_only.state.setup_level == -1
+    assert all(request.side != "BUY" for request in sell_only.requests)
+
+
+def test_entry_treatments_cannot_be_composed_without_a_new_policy_contract():
+    with pytest.raises(EpisodeInputError, match="cannot be combined"):
+        config(adaptive_entry_pricing=True, scout_rebound_confirmation=True)
 
 
 def test_stabilization_window_must_fit_before_setup_expiry():
@@ -426,6 +539,16 @@ def test_state_roundtrip_preserves_budget_levels_and_pending_identity():
     assert remaining_budget(cfg, again.state) == D("900")
     with pytest.raises(EpisodeInputError, match="configuration"):
         transition(replace(cfg, budget_quote=D("2000")), restored, market(timestamp=6120))
+
+
+def test_checkpoint_rejects_buy_authorization_with_reopened_level():
+    cfg = config()
+    reserved = transition(cfg, EpisodeState(), market())
+    corrupted = EpisodeState.from_dict(reserved.state.to_dict())
+    corrupted.levels[0] = "OPEN"
+
+    with pytest.raises(EpisodeInputError, match="authorization level"):
+        transition(cfg, corrupted, market(timestamp=6060))
 
 
 def test_requests_carry_exact_scout_scale_and_distribution_intents():

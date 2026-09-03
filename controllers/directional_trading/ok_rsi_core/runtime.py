@@ -63,6 +63,7 @@ def policy_config(config):
         require_scale_in_signal=config.episode_require_scale_in_signal,
         setup_bars=config.episode_scale_in_setup_bars,
         stabilization_bars=config.episode_scale_in_stabilization_bars,
+        rebound_atr=config.episode_rebound_atr,
         level_fractions=tuple(config.episode_level_fractions),
         dip_atr_levels=tuple(config.episode_dip_atr_levels),
         basis_improvement_atr=config.episode_basis_improvement_atr,
@@ -75,6 +76,7 @@ def policy_config(config):
         hostile_risk_latch=config.episode_hostile_risk_latch,
         recovery_exit_enabled=config.episode_recovery_exit_enabled,
         adaptive_entry_pricing=config.episode_adaptive_entry_pricing,
+        scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -140,6 +142,11 @@ class EpisodeRuntime:
             buy_requests,
             key=lambda request: (request.expires_at, request.revision),
         ) if buy_requests else None
+        active_setup = (
+            self.config.scout_rebound_confirmation
+            and self.state.base == 0
+            and self.state.setup_level == 0
+        )
         return {"enabled": True, "phase": self.state.phase, "episode_id": self.state.episode_id,
                 "reason": self.reason, "hold_reason": self.hold_reason,
                 "base": str(self.state.base), "gross_spent": str(self.state.gross_spent),
@@ -154,6 +161,14 @@ class EpisodeRuntime:
                 "last_entry_discount_atr": str(last_entry.pricing_discount_atr) if last_entry else None,
                 "last_entry_confidence": str(last_entry.signal_confidence) if last_entry else None,
                 "last_entry_trend_alignment": str(last_entry.trend_alignment) if last_entry else None,
+                "setup_policy": "SCOUT_REBOUND_V1" if active_setup else None,
+                "setup_started_at": self.state.setup_start if active_setup else None,
+                "setup_low": str(self.state.setup_low) if active_setup else None,
+                "last_entry_setup_policy": last_entry.setup_policy if last_entry else None,
+                "last_entry_setup_started_at": last_entry.setup_started_at if last_entry else None,
+                "last_entry_setup_low": str(last_entry.setup_low) if last_entry else None,
+                "last_entry_setup_rebound": str(last_entry.setup_rebound) if last_entry else None,
+                "last_entry_setup_no_new_low": last_entry.setup_no_new_low if last_entry else None,
                 "target_base": str(self.state.target_base), "levels": list(self.state.levels),
                 "pending": [key for key, order in self.state.orders.items() if not order.done],
                 "config_hash": self.config.identity, "checkpoint_sequence": self.sequence}
@@ -290,6 +305,11 @@ class EpisodeRuntime:
                     episode_id=request.episode_id, episode_level=request.level,
                     episode_revision=request.revision, episode_expires_at=request.expires_at,
                     episode_intent=request.intent,
+                    episode_setup_policy=request.setup_policy,
+                    episode_setup_started_at=request.setup_started_at,
+                    episode_setup_low=request.setup_low,
+                    episode_setup_rebound=request.setup_rebound,
+                    episode_setup_no_new_low=request.setup_no_new_low,
                 )
                 actions.append(CreateExecutorAction(controller_id=self.config.controller_id, executor_config=executor_config))
             return actions

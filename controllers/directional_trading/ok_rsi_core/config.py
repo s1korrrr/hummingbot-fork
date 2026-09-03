@@ -43,6 +43,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     legacy_controller_ids: List[str] = hl_rsi.Field(default_factory=list)
     episode_enabled: bool = hl_rsi.Field(default=False)
     episode_adaptive_entry_pricing: bool = False
+    episode_scout_rebound_confirmation: bool = False
     episode_fee_rate: Decimal = hl_rsi.Field(default=Decimal("0.001"), ge=0, lt=Decimal("0.1"))
     episode_assignment_id: Optional[str] = None
     episode_initial_base: Decimal = hl_rsi.Field(default=Decimal("0"), ge=0)
@@ -52,6 +53,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_require_scale_in_signal: bool = False
     episode_scale_in_setup_bars: int = hl_rsi.Field(default=10, ge=1, le=600)
     episode_scale_in_stabilization_bars: int = hl_rsi.Field(default=2, ge=1, le=240)
+    episode_rebound_atr: Decimal = hl_rsi.Field(default=Decimal(".25"), gt=0)
     episode_level_fractions: List[Decimal] = hl_rsi.Field(
         default_factory=lambda: list(map(Decimal, (".10", ".15", ".20", ".25", ".30")))
     )

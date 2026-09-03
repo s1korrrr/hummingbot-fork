@@ -16,6 +16,7 @@ from controllers.directional_trading.ok_rsi_core.episode import (
     EpisodeState,
     MarketSnapshot,
     OrderUpdate,
+    minimum_profit_price,
     transition,
 )
 from controllers.directional_trading.ok_rsi_core.execution import EPISODE_LEVEL_PREFIX, EpisodeOrderExecutorConfig
@@ -120,9 +121,14 @@ class EpisodeRuntime:
             self.hold_reason = f"restore_failed:{exc}"
 
     def status(self):
+        profit_floor = minimum_profit_price(self.config, self.state)
         return {"enabled": True, "phase": self.state.phase, "episode_id": self.state.episode_id,
                 "reason": self.reason, "hold_reason": self.hold_reason,
                 "base": str(self.state.base), "gross_spent": str(self.state.gross_spent),
+                "cost": str(self.state.cost), "cost_known": self.state.cost_known,
+                "sell_proceeds": str(self.state.sell_proceeds),
+                "minimum_profit_price": str(profit_floor) if profit_floor is not None else None,
+                "adverse_entry_latched": self.state.adverse_entry_latched,
                 "target_base": str(self.state.target_base), "levels": list(self.state.levels),
                 "pending": [key for key, order in self.state.orders.items() if not order.done],
                 "config_hash": self.config.identity, "checkpoint_sequence": self.sequence}

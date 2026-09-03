@@ -142,6 +142,27 @@ def test_native_partial_receipt_reconciles_cash_fee_and_net_inventory_before_dec
     assert restarted._episode_runtime.state.base == Decimal(".3996")
 
 
+def test_status_exposes_episode_basis_profit_floor_and_adverse_latch():
+    from controllers.directional_trading.ok_rsi_core.episode import minimum_profit_price
+
+    controller, _ = setup_controller()
+    runtime = controller._episode_runtime
+    runtime.state.base = Decimal("2")
+    runtime.state.cost = Decimal("188")
+    runtime.state.gross_spent = Decimal("188")
+    runtime.state.sell_proceeds = Decimal("0")
+    runtime.state.cost_known = True
+    runtime.state.adverse_entry_latched = True
+
+    status = runtime.status()
+
+    assert status["cost"] == "188"
+    assert status["cost_known"] is True
+    assert status["sell_proceeds"] == "0"
+    assert status["minimum_profit_price"] == str(minimum_profit_price(runtime.config, runtime.state))
+    assert status["adverse_entry_latched"] is True
+
+
 def test_direct_factory_cannot_change_an_authorized_quantity():
     controller, _ = setup_controller()
     created = actions(controller)[0]

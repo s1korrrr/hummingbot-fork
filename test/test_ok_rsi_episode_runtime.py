@@ -131,3 +131,26 @@ def test_framework_config_loader_resolves_public_controller_after_config_extract
     from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
     config = OKRSIControllerConfig(id="loader-regression", strict_hmm_mode=False, episode_enabled=enabled)
     assert config.get_controller_class() is OKRSIController
+
+
+@pytest.mark.parametrize("error", ["unresolved_native_order:order-1", "incomplete_fill_records"])
+def test_transient_native_receipt_recovers_without_restart_and_retains_reservation(error):
+    controller, _ = setup_controller()
+    created = actions(controller)[0]
+    native = SimpleNamespace(
+        id=created.executor_config.id, connector_name="okx", trading_pair="ETH-USDT",
+        is_active=True, is_done=False, custom_info={"episode_receipt": dict(
+            gross_base="0", gross_quote="0", base_fee="0", quote_fee="0", final=False,
+            fees_known=False, errors=[error])})
+    controller.executors_info = [native]
+    assert actions(controller) == []
+    runtime = controller._episode_runtime
+    assert runtime.hold_reason is None
+    assert runtime.reason.startswith("reconciliation_pending:")
+    assert runtime.state.orders[native.id].reserved_quote > 0
+    native.is_active, native.is_done = False, True
+    native.custom_info["episode_receipt"] = dict(gross_base=".4", gross_quote="37.6", base_fee=".0004",
+                                                 quote_fee="0", final=True, fees_known=True, errors=[])
+    assert actions(controller) == []
+    assert runtime.state.base == Decimal(".3996")
+    assert runtime.state.orders[native.id].done

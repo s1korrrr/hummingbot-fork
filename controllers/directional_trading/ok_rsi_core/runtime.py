@@ -28,6 +28,10 @@ CHECKPOINT = "OK_RSI_EPISODE_CHECKPOINT"
 ZERO = Decimal("0")
 
 
+class ReconciliationPending(EpisodeInputError):
+    """Native fill detail is incomplete; keep reservations and recheck reports."""
+
+
 def guard_disabled_restore(config, store=None):
     """Disabling a flag cannot silently transfer an unresolved episode's exits."""
     if store is None:
@@ -128,6 +132,12 @@ class EpisodeRuntime:
             receipt = (executor.custom_info or {}).get("episode_receipt")
             if not isinstance(receipt, dict):
                 raise EpisodeInputError("native_execution_receipt_unavailable")
+            errors = receipt.get("errors", [])
+            if receipt.get("fees_known") is False and errors and all(
+                isinstance(error, str) and (error == "incomplete_fill_records" or error.startswith("unresolved_native_order:"))
+                for error in errors
+            ):
+                raise ReconciliationPending(",".join(errors))
             updates.append(OrderUpdate(
                 request_id=executor.id, filled_base=receipt["gross_base"], filled_quote=receipt["gross_quote"],
                 fee_base=receipt["base_fee"], fee_quote=receipt["quote_fee"],
@@ -232,6 +242,9 @@ class EpisodeRuntime:
                 )
                 actions.append(CreateExecutorAction(controller_id=self.config.controller_id, executor_config=executor_config))
             return actions
+        except ReconciliationPending as exc:
+            self.reason = f"reconciliation_pending:{exc}"
+            return []
         except (EpisodeInputError, ValueError, TypeError, KeyError, ArithmeticError) as exc:
             self.hold_reason = str(exc)
             return []

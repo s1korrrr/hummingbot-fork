@@ -572,10 +572,17 @@ def _validate_accounting(config: EpisodeConfig, state: EpisodeState) -> None:
         reserve = request.amount * request.price * (ONE + config.fee_rate) if request.side == "BUY" else ZERO
         if reserve != request.reserved_quote:
             raise EpisodeInputError("checkpoint reservation mismatch")
-        if request.side == "BUY" and (
-            request.level >= len(state.levels) or state.levels[request.level] != "AUTHORIZED"
-        ):
-            raise EpisodeInputError("checkpoint authorization level mismatch")
+            if request.side == "BUY":
+                if request.level >= len(state.levels):
+                    raise EpisodeInputError("checkpoint authorization level mismatch")
+                rearmed_without_fill = (
+                    config.adaptive_entry_pricing
+                    and state.levels[request.level] == "OPEN"
+                    and order.done
+                    and not any((order.filled_base, order.filled_quote, order.fee_quote, order.fee_base))
+                )
+                if state.levels[request.level] != "AUTHORIZED" and not rearmed_without_fill:
+                    raise EpisodeInputError("checkpoint authorization level mismatch")
     if sum(not order.done for order in current) > 1:
         raise EpisodeInputError("multiple unresolved episode requests")
 
@@ -591,6 +598,7 @@ def _apply_update(config: EpisodeConfig, state: EpisodeState, market: MarketSnap
         raise EpisodeInputError("cumulative execution receipt decreased")
     if order.done and not update.done:
         raise EpisodeInputError("terminal order became pending")
+    became_terminal = not order.done and update.done
     db, dq, fq, fb = (getattr(update, name) - getattr(order, name) for name in values)
     if any((db, dq, fq, fb)) and order.request.episode_id != state.episode_id:
         raise EpisodeInputError("closed episode receipt changed; explicit reconciliation required")
@@ -605,6 +613,14 @@ def _apply_update(config: EpisodeConfig, state: EpisodeState, market: MarketSnap
         setattr(order, name, getattr(update, name))
     order.done = update.done
     order.seen = True
+    if (
+        order.request.side == "BUY"
+        and config.adaptive_entry_pricing
+        and became_terminal
+        and not any((update.filled_base, update.filled_quote, update.fee_quote, update.fee_base))
+        and state.levels[order.request.level] == "AUTHORIZED"
+    ):
+        state.levels[order.request.level] = "OPEN"
     for name, value in _accounting(config, state).items():
         setattr(state, name, value)
     if db == ZERO and dq == ZERO and (fq or fb):
@@ -674,8 +690,10 @@ def _request(
     return request
 
 
-def _finish_if_flat(state: EpisodeState, market: MarketSnapshot) -> bool:
+def _finish_if_flat(config: EpisodeConfig, state: EpisodeState, market: MarketSnapshot) -> bool:
     current = [order for order in state.orders.values() if order.request.episode_id == state.episode_id]
+    if config.adaptive_entry_pricing and state.gross_spent == 0 and any(level == "OPEN" for level in state.levels):
+        return False
     if state.episode_id and state.base == 0 and current and all(order.done for order in current):
         state.phase = "COOLDOWN"
         state.cooldown_htf_timestamp = market.htf_timestamp
@@ -838,7 +856,7 @@ def transition(
         state.gross_spent = config.initial_cost or ZERO
         state.assignment_consumed = True
         state.phase = "RECOVER"
-    if _finish_if_flat(state, market):
+    if _finish_if_flat(config, state, market):
         return Transition(state, reason="episode_completed")
     recovery_trail = state.phase == "RECOVER" and state.exit_intent == "RECOVERY_TAKE_PROFIT"
     if state.phase in ("MARKUP", "DISTRIBUTE", "EXIT") or recovery_trail:
@@ -906,6 +924,11 @@ def transition(
         if not market.entry_signal or market.ask > market.anchor - config.dip_atr_levels[0] * market.atr_1h:
             return Transition(state, reason="need_dislocation")
         _start_episode(config, state, market)
+    elif config.adaptive_entry_pricing and state.gross_spent == 0 and state.levels[0] == "OPEN" and market.entry_signal:
+        # A fresh signal after a zero-fill expiry gets fresh causal levels while
+        # retaining the original episode/order identity for late-fill safety.
+        state.frozen_anchor = market.anchor
+        state.frozen_atr = market.atr_1h
     open_levels = [index for index, value in enumerate(state.levels) if value == "OPEN"]
     if not open_levels or remaining_budget(config, state) <= 0:
         state.phase = "EXHAUSTED"

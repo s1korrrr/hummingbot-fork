@@ -85,6 +85,52 @@ def test_pending_reservation_is_not_spend_and_partial_fill_moves_it_once():
     assert not second.requests
 
 
+def test_zero_fill_terminal_buy_rearms_level_without_suppressing_next_signal():
+    cfg = config(adaptive_entry_pricing=True)
+    first = transition(cfg, EpisodeState(), market(entry_confidence=D("0.8")))
+    request = first.requests[0]
+
+    expired = transition(
+        cfg,
+        first.state,
+        market(timestamp=6060, entry_signal=False, entry_confidence=D("0.8")),
+        [OrderUpdate(request.id, filled_base=D("0"), filled_quote=D("0"), done=True)],
+    )
+
+    assert expired.state.levels[0] == "OPEN"
+    assert remaining_budget(cfg, expired.state) == D("1000")
+    assert expired.reason == "need_entry_confirmation"
+    retried = transition(
+        cfg,
+        expired.state,
+        market(timestamp=6120, entry_signal=True, entry_confidence=D("0.8")),
+    )
+    assert retried.requests[0].level == 0
+    assert retried.requests[0].id != request.id
+    duplicate = transition(
+        cfg,
+        retried.state,
+        market(timestamp=6180, entry_signal=False, entry_confidence=D("0.8")),
+        [OrderUpdate(request.id, filled_base=D("0"), filled_quote=D("0"), done=True)],
+    )
+    assert duplicate.state.levels[0] == "AUTHORIZED"
+
+
+def test_partially_filled_terminal_buy_consumes_level_once():
+    cfg = config(adaptive_entry_pricing=True)
+    first = transition(cfg, EpisodeState(), market(entry_confidence=D("0.8")))
+    request = first.requests[0]
+    closed = transition(
+        cfg,
+        first.state,
+        market(timestamp=6060, base_available=D("0.5"), entry_signal=False, entry_confidence=D("0.8")),
+        [OrderUpdate(request.id, filled_base=D("0.5"), filled_quote=D("49.5"), done=True)],
+    )
+
+    assert closed.state.levels[0] == "AUTHORIZED"
+    assert closed.state.base == D("0.5")
+
+
 def test_base_fee_reduces_inventory_without_double_counting_quote_cost():
     cfg = config()
     first = transition(cfg, EpisodeState(), market())

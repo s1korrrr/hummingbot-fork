@@ -73,6 +73,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_trail_max=Decimal("0.05"),
         episode_hostile_risk_latch=True,
         episode_recovery_exit_enabled=True,
+        episode_adaptive_entry_pricing=True,
     )
 
     policy = controller._episode_runtime.config
@@ -92,6 +93,37 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.trail_max == Decimal("0.05")
     assert policy.hostile_risk_latch is True
     assert policy.recovery_exit_enabled is True
+    assert policy.adaptive_entry_pricing is True
+
+
+def test_adaptive_entry_pricing_maps_owner_signal_context_and_exposes_receipt():
+    controller, _ = setup_controller(episode_adaptive_entry_pricing=True)
+    controller.processed_data = {
+        "signal": 1,
+        "signal_state": {"condition_ok": True, "signal_strength_score": 0.8},
+        "trend_confirmation": {"alignment_score": -0.2},
+    }
+
+    created = actions(controller)
+
+    assert len(created) == 1
+    assert created[0].executor_config.price == Decimal("93.80")
+    status = controller.get_custom_info()["episode"]
+    assert status["last_entry_pricing_policy"] == "ADAPTIVE_MAKER_V1"
+    assert status["last_entry_reference_price"] == "94"
+    assert status["last_entry_selected_price"] == "93.8"
+    assert status["last_entry_discount"] == "0.2"
+    assert status["last_entry_discount_atr"] == "0.2"
+    assert status["last_entry_confidence"] == "0.8"
+    assert status["last_entry_trend_alignment"] == "-0.2"
+
+
+def test_adaptive_entry_pricing_fails_closed_when_owner_inputs_are_missing():
+    controller, _ = setup_controller(episode_adaptive_entry_pricing=True)
+
+    assert actions(controller) == []
+    assert controller._episode_runtime.reason.startswith("context_unavailable:")
+    assert controller._episode_runtime.state.orders == {}
 
 
 def test_failed_checkpoint_produces_no_executor():

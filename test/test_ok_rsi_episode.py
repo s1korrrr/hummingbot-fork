@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal as D
 
 import pytest
@@ -106,6 +106,78 @@ def test_zero_or_hostile_followup_admission_cannot_be_upsized_to_minimum():
     too_small = transition(config(budget_quote=D("10")), EpisodeState(), market(min_notional=D("20")))
     assert not too_small.requests
     assert too_small.reason == "below_exchange_minimum"
+
+
+def test_adaptive_pricing_changes_price_not_authorization_or_quote_cap():
+    result = transition(
+        config(adaptive_entry_pricing=True),
+        EpisodeState(),
+        market(
+            bid=D("99.95"),
+            ask=D("100"),
+            entry_confidence=D("0.8"),
+            trend_alignment=D("-0.2"),
+        ),
+    )
+
+    assert result.reason == "scout"
+    assert len(result.requests) == 1
+    request = result.requests[0]
+    assert request.price == D("99.80")
+    assert request.reference_price == D("100")
+    assert request.pricing_policy == "ADAPTIVE_MAKER_V1"
+    assert request.pricing_discount == D("0.20")
+    assert request.pricing_discount_atr == D("0.20")
+    assert request.signal_confidence == D("0.8")
+    assert request.trend_alignment == D("-0.2")
+    assert request.reserved_quote <= D("100")
+
+    restored = EpisodeState.from_dict(result.state.to_dict())
+    restored_request = restored.orders[request.id].request
+    assert restored_request == request
+
+
+def test_disabled_adaptive_pricing_preserves_top_of_book_behavior():
+    result = transition(
+        config(adaptive_entry_pricing=False),
+        EpisodeState(),
+        market(
+            bid=D("99.95"),
+            ask=D("100"),
+            entry_confidence=D("0.1"),
+            trend_alignment=D("-1"),
+        ),
+    )
+
+    request = result.requests[0]
+    assert request.price == D("100")
+    assert request.reference_price == D("100")
+    assert request.pricing_policy == "TOP_OF_BOOK"
+    assert request.pricing_discount == D("0")
+
+
+def test_adaptive_pricing_never_authorizes_a_sell_only_buy():
+    cfg = config(
+        mode="sell_only",
+        adaptive_entry_pricing=True,
+        assignment_id="assigned",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+    )
+    result = transition(cfg, EpisodeState(), market(base_available=D("1"), entry_signal=True))
+
+    assert all(request.side != "BUY" for request in result.requests)
+
+
+def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
+    from controllers.directional_trading.ok_rsi_core.episode import _hash
+
+    cfg = config(adaptive_entry_pricing=False)
+    legacy_values = asdict(cfg)
+    legacy_values.pop("adaptive_entry_pricing")
+
+    assert cfg.identity == _hash(legacy_values)
+    assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
 
 
 def test_stabilization_window_must_fit_before_setup_expiry():

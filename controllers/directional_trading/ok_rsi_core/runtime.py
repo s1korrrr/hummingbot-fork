@@ -74,6 +74,7 @@ def policy_config(config):
         trail_max=config.episode_trail_max,
         hostile_risk_latch=config.episode_hostile_risk_latch,
         recovery_exit_enabled=config.episode_recovery_exit_enabled,
+        adaptive_entry_pricing=config.episode_adaptive_entry_pricing,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -132,6 +133,10 @@ class EpisodeRuntime:
 
     def status(self):
         profit_floor = minimum_profit_price(self.config, self.state)
+        buy_requests = [
+            order.request for order in self.state.orders.values() if order.request.side == "BUY"
+        ]
+        last_entry = max(buy_requests, key=lambda request: request.revision) if buy_requests else None
         return {"enabled": True, "phase": self.state.phase, "episode_id": self.state.episode_id,
                 "reason": self.reason, "hold_reason": self.hold_reason,
                 "base": str(self.state.base), "gross_spent": str(self.state.gross_spent),
@@ -139,6 +144,13 @@ class EpisodeRuntime:
                 "sell_proceeds": str(self.state.sell_proceeds),
                 "minimum_profit_price": str(profit_floor) if profit_floor is not None else None,
                 "adverse_entry_latched": self.state.adverse_entry_latched,
+                "last_entry_pricing_policy": last_entry.pricing_policy if last_entry else None,
+                "last_entry_reference_price": str(last_entry.reference_price) if last_entry else None,
+                "last_entry_selected_price": str(last_entry.price) if last_entry else None,
+                "last_entry_discount": str(last_entry.pricing_discount) if last_entry else None,
+                "last_entry_discount_atr": str(last_entry.pricing_discount_atr) if last_entry else None,
+                "last_entry_confidence": str(last_entry.signal_confidence) if last_entry else None,
+                "last_entry_trend_alignment": str(last_entry.trend_alignment) if last_entry else None,
                 "target_base": str(self.state.target_base), "levels": list(self.state.levels),
                 "pending": [key for key, order in self.state.orders.items() if not order.done],
                 "config_hash": self.config.identity, "checkpoint_sequence": self.sequence}
@@ -191,6 +203,16 @@ class EpisodeRuntime:
         if base_available is None or quote_available is None:
             raise ContextUnavailable("wallet availability unknown")
         state = (c.processed_data or {}).get("signal_state", {})
+        entry_confidence = Decimal("1")
+        trend_alignment = Decimal("0")
+        if self.config.mode == "buy_sell" and self.config.adaptive_entry_pricing:
+            if "signal_strength_score" not in state:
+                raise ContextUnavailable("adaptive entry signal confidence unavailable")
+            trend = (c.processed_data or {}).get("trend_confirmation")
+            if not isinstance(trend, dict) or "alignment_score" not in trend:
+                raise ContextUnavailable("adaptive entry trend alignment unavailable")
+            entry_confidence = state["signal_strength_score"]
+            trend_alignment = trend["alignment_score"]
         buy_allowed = not (c._operator_entry_paused or c._check_consecutive_loss_pause()
                            or c._is_flash_crash_cooldown(provider.time()))
         buy_allowed = buy_allowed and bool(state.get("condition_ok", False))
@@ -205,6 +227,7 @@ class EpisodeRuntime:
             min_notional=max(c._rule_decimal(rule, "min_notional_size"), c._rule_decimal(rule, "min_order_value")),
             amount_step=c._base_amount_increment(rule), price_step=c._rule_decimal(rule, "min_price_increment"),
             entry_signal=int((c.processed_data or {}).get("signal", 0)) > 0,
+            entry_confidence=entry_confidence, trend_alignment=trend_alignment,
             valid=not c.config.manual_kill_switch, buy_allowed=bool(buy_allowed),
         )
         self.last_market = snapshot

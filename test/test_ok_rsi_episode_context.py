@@ -49,6 +49,7 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_trail_atr == Decimal("2")
     assert legacy.episode_hostile_risk_latch is False
     assert legacy.episode_recovery_exit_enabled is False
+    assert legacy.episode_adaptive_entry_pricing is False
     with pytest.raises(ValueError, match="assignment"):
         OKRSIControllerConfig(id="candidate", episode_enabled=True, trade_mode="sell_only")
 

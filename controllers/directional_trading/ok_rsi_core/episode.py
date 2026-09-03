@@ -14,6 +14,12 @@ from dataclasses import asdict, dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
+from controllers.directional_trading.ok_rsi_core.entry_pricing import (
+    AdaptiveEntryPriceInputError,
+    AdaptiveEntryPriceSelection,
+    select_adaptive_entry_price,
+)
+
 ZERO = Decimal("0")
 ONE = Decimal("1")
 PHASES = {
@@ -53,6 +59,18 @@ def _decimal(value: Any, name: str, *, positive: bool = False) -> Decimal:
         raise EpisodeInputError(f"invalid {name}") from exc
     if not result.is_finite() or result < 0 or (positive and result <= 0):
         raise EpisodeInputError(f"invalid {name}: must be finite and {'positive' if positive else 'nonnegative'}")
+    return result
+
+
+def _signed_decimal(value: Any, name: str) -> Decimal:
+    try:
+        if isinstance(value, bool):
+            raise ValueError("boolean amount")
+        result = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise EpisodeInputError(f"invalid {name}") from exc
+    if not result.is_finite():
+        raise EpisodeInputError(f"invalid {name}: must be finite")
     return result
 
 
@@ -107,6 +125,7 @@ class EpisodeConfig:
     require_scale_in_signal: bool = False
     hostile_risk_latch: bool = False
     recovery_exit_enabled: bool = False
+    adaptive_entry_pricing: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -123,6 +142,7 @@ class EpisodeConfig:
             "require_scale_in_signal",
             "hostile_risk_latch",
             "recovery_exit_enabled",
+            "adaptive_entry_pricing",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -179,7 +199,12 @@ class EpisodeConfig:
 
     @property
     def identity(self) -> str:
-        return _hash(asdict(self))
+        values = asdict(self)
+        # Preserve pre-adaptive checkpoint identity while the opt-in is off.
+        # An unresolved episode may not be stranded by a code-only upgrade.
+        if not self.adaptive_entry_pricing:
+            values.pop("adaptive_entry_pricing")
+        return _hash(values)
 
 
 @dataclass(frozen=True)
@@ -209,6 +234,8 @@ class MarketSnapshot:
     cascade: bool = False
     buy_allowed: bool = True
     quality_factor: Decimal = ONE
+    entry_confidence: Decimal = ONE
+    trend_alignment: Decimal = ZERO
 
     def __post_init__(self):
         if type(self.timestamp) is not int or self.timestamp < 0 or type(self.htf_timestamp) is not int:
@@ -236,6 +263,12 @@ class MarketSnapshot:
         object.__setattr__(self, "quality_factor", _decimal(self.quality_factor, "quality_factor"))
         if self.quality_factor > ONE:
             raise EpisodeInputError("quality factor cannot enlarge allocation")
+        object.__setattr__(self, "entry_confidence", _decimal(self.entry_confidence, "entry_confidence"))
+        object.__setattr__(self, "trend_alignment", _signed_decimal(self.trend_alignment, "trend_alignment"))
+        if self.entry_confidence > ONE:
+            raise EpisodeInputError("entry confidence must be within [0,1]")
+        if not -ONE <= self.trend_alignment <= ONE:
+            raise EpisodeInputError("trend alignment must be within [-1,1]")
         for name in (
             "valid",
             "entry_signal",
@@ -268,6 +301,12 @@ class OrderRequest:
     expires_at: int
     revision: int
     intent: str = "UNSPECIFIED"
+    pricing_policy: str = "UNRECORDED"
+    reference_price: Decimal = ZERO
+    pricing_discount: Decimal = ZERO
+    pricing_discount_atr: Decimal = ZERO
+    signal_confidence: Decimal = ZERO
+    trend_alignment: Decimal = ZERO
 
     def __post_init__(self):
         for name in ("id", "episode_id"):
@@ -280,6 +319,8 @@ class OrderRequest:
             raise EpisodeInputError("invalid request boundary")
         if self.intent not in ORDER_INTENTS:
             raise EpisodeInputError("invalid request intent")
+        if self.pricing_policy not in {"UNRECORDED", "TOP_OF_BOOK", "ADAPTIVE_MAKER_V1"}:
+            raise EpisodeInputError("invalid entry pricing policy")
         if self.intent != "UNSPECIFIED" and (
             (self.side == "BUY" and self.intent not in {"SCOUT_BUY", "SCALE_IN_BUY"})
             or (self.side == "SELL" and self.intent not in SELL_INTENTS)
@@ -289,6 +330,18 @@ class OrderRequest:
             raise EpisodeInputError("invalid request level")
         for name in ("amount", "price", "reserved_quote"):
             object.__setattr__(self, name, _decimal(getattr(self, name), name, positive=name != "reserved_quote"))
+        for name in ("reference_price", "pricing_discount", "pricing_discount_atr", "signal_confidence"):
+            object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        object.__setattr__(self, "trend_alignment", _signed_decimal(self.trend_alignment, "trend_alignment"))
+        if self.signal_confidence > ONE or not -ONE <= self.trend_alignment <= ONE:
+            raise EpisodeInputError("invalid entry pricing context")
+        if self.pricing_policy != "UNRECORDED":
+            if self.side != "BUY" or self.reference_price <= 0 or self.reference_price - self.price != self.pricing_discount:
+                raise EpisodeInputError("entry pricing receipt contradicts request")
+            if self.pricing_policy == "TOP_OF_BOOK" and self.pricing_discount != 0:
+                raise EpisodeInputError("top-of-book receipt cannot contain a discount")
+            if self.pricing_policy == "ADAPTIVE_MAKER_V1" and self.pricing_discount <= 0:
+                raise EpisodeInputError("adaptive receipt requires a passive discount")
 
 
 @dataclass(frozen=True)
@@ -427,8 +480,20 @@ class EpisodeState:
                 for name in ("filled_base", "filled_quote", "fee_quote", "fee_base"):
                     raw[name] = _decimal(raw[name], name)
                 request = raw["request"]
-                for name in ("amount", "price", "reserved_quote"):
+                for name in (
+                    "amount",
+                    "price",
+                    "reserved_quote",
+                    "reference_price",
+                    "pricing_discount",
+                    "pricing_discount_atr",
+                    "signal_confidence",
+                ):
+                    if name not in request:
+                        continue
                     request[name] = _decimal(request[name], name)
+                if "trend_alignment" in request:
+                    request["trend_alignment"] = _signed_decimal(request["trend_alignment"], "trend_alignment")
                 raw["request"] = OrderRequest(**request)
                 if key != raw["request"].id or raw["request"].side not in ("BUY", "SELL"):
                     raise EpisodeInputError("invalid stored order identity")
@@ -580,9 +645,18 @@ def _request(
     reserve: Decimal,
     level: int,
     intent: str,
+    entry_price_selection: AdaptiveEntryPriceSelection | None = None,
 ) -> OrderRequest:
     state.command_revision += 1
     identity = _hash((state.episode_id, state.command_revision, side, level))
+    pricing = {} if entry_price_selection is None else {
+        "pricing_policy": entry_price_selection.policy,
+        "reference_price": entry_price_selection.reference_price,
+        "pricing_discount": entry_price_selection.discount,
+        "pricing_discount_atr": entry_price_selection.discount_atr,
+        "signal_confidence": entry_price_selection.signal_confidence,
+        "trend_alignment": entry_price_selection.trend_alignment,
+    }
     request = OrderRequest(
         identity,
         state.episode_id or "",
@@ -594,6 +668,7 @@ def _request(
         market.timestamp + config.setup_bars * config.interval_seconds,
         state.command_revision,
         intent,
+        **pricing,
     )
     state.orders[identity] = OrderProgress(request)
     return request
@@ -893,7 +968,30 @@ def transition(
         return Transition(state, reason="zero_allocation")
     if cap > remaining_budget(config, state) or cap > market.quote_available:
         return Transition(state, reason="insufficient_episode_cash")
-    price = _floor(market.ask, market.price_step)
+    reference_price = _floor(market.ask, market.price_step)
+    if config.adaptive_entry_pricing:
+        try:
+            entry_price_selection = select_adaptive_entry_price(
+                bid=market.bid,
+                ask=market.ask,
+                atr_1m=market.atr_1m,
+                price_step=market.price_step,
+                signal_confidence=market.entry_confidence,
+                trend_alignment=market.trend_alignment,
+            )
+        except AdaptiveEntryPriceInputError as exc:
+            raise EpisodeInputError(str(exc)) from exc
+    else:
+        entry_price_selection = AdaptiveEntryPriceSelection(
+            policy="TOP_OF_BOOK",
+            reference_price=reference_price,
+            price=reference_price,
+            discount=ZERO,
+            discount_atr=ZERO,
+            signal_confidence=market.entry_confidence,
+            trend_alignment=market.trend_alignment,
+        )
+    price = entry_price_selection.price
     if price <= 0:
         return Transition(state, reason="price_below_tick")
     amount = _floor(cap / (price * (ONE + config.fee_rate)), market.amount_step)
@@ -924,5 +1022,6 @@ def transition(
         reserve=reserve,
         level=level,
         intent="SCOUT_BUY" if level == 0 else "SCALE_IN_BUY",
+        entry_price_selection=entry_price_selection,
     )
     return Transition(state, (request,), reason="scout" if level == 0 else "scale_in")

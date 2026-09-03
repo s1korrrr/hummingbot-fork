@@ -1,0 +1,431 @@
+from dataclasses import replace
+from decimal import Decimal as D
+
+import pytest
+
+from controllers.directional_trading.ok_rsi_core.episode import (
+    EpisodeConfig,
+    EpisodeInputError,
+    EpisodeState,
+    MarketSnapshot,
+    OrderUpdate,
+    remaining_budget,
+    transition,
+)
+
+
+def config(**overrides):
+    values = dict(
+        controller_id="test-btc",
+        connector="okx",
+        trading_pair="BTC-USDC",
+        mode="buy_sell",
+        budget_quote=D("1000"),
+        mark_cap_quote=D("1000"),
+        fee_rate=D("0"),
+    )
+    return EpisodeConfig(**(values | overrides))
+
+
+def market(**overrides):
+    values = dict(
+        timestamp=6000,
+        bid=D("100"),
+        ask=D("100"),
+        low=D("100"),
+        atr_1m=D("1"),
+        atr_15m=D("1"),
+        atr_1h=D("1"),
+        anchor=D("102"),
+        quote_available=D("5000"),
+        base_available=D("0"),
+        min_amount=D("0.001"),
+        min_notional=D("1"),
+        amount_step=D("0.001"),
+        price_step=D("0.01"),
+        htf_timestamp=3600,
+        entry_signal=True,
+    )
+    return MarketSnapshot(**(values | overrides))
+
+
+def bought(cfg=None):
+    cfg = cfg or config()
+    first = transition(cfg, EpisodeState(), market())
+    order = first.requests[0]
+    filled = OrderUpdate(order.id, filled_base=D("1"), filled_quote=D("100"), done=True)
+    second = transition(cfg, first.state, market(timestamp=6060, base_available=D("1"), entry_signal=False), [filled])
+    return second.state, filled
+
+
+def test_spent_budget_does_not_reopen_on_price_decline_or_duplicate_fill():
+    cfg = config()
+    state, fill = bought(cfg)
+    result = transition(
+        cfg,
+        state,
+        market(timestamp=6120, bid=D("75"), ask=D("75"), low=D("75"), base_available=D("1"), entry_signal=False),
+        [fill],
+    )
+    assert result.state.gross_spent == D("100")
+    assert remaining_budget(cfg, result.state) == D("900")
+    assert result.state.base == D("1")
+
+
+def test_pending_reservation_is_not_spend_and_partial_fill_moves_it_once():
+    cfg = config(fee_rate=D("0.01"))
+    first = transition(cfg, EpisodeState(), market())
+    request = first.requests[0]
+    assert request.reserved_quote <= D("100")
+    partial = OrderUpdate(request.id, filled_base=D("0.4"), filled_quote=D("40"), fee_quote=D("0.4"))
+    second = transition(cfg, first.state, market(timestamp=6060, base_available=D("0.4")), [partial])
+    assert second.state.gross_spent == D("40.4")
+    assert second.state.base == D("0.4")
+    assert remaining_budget(cfg, second.state) == D("1000") - request.reserved_quote
+    assert not second.requests
+
+
+def test_base_fee_reduces_inventory_without_double_counting_quote_cost():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market())
+    request = first.requests[0]
+    result = transition(
+        cfg,
+        first.state,
+        market(timestamp=6060, base_available=D("0.99"), entry_signal=False),
+        [OrderUpdate(request.id, D("1"), D("100"), fee_base=D("0.01"), done=True)],
+    )
+    assert result.state.base == D("0.99")
+    assert result.state.cost == D("100")
+    assert result.state.gross_spent == D("100")
+
+
+def test_zero_or_hostile_followup_admission_cannot_be_upsized_to_minimum():
+    first = transition(config(), EpisodeState(), market(cascade=True))
+    assert not first.requests
+    too_small = transition(config(budget_quote=D("10")), EpisodeState(), market(min_notional=D("20")))
+    assert not too_small.requests
+    assert too_small.reason == "below_exchange_minimum"
+
+
+def test_setup_waits_for_two_subsequent_closed_bars_and_skips_crossed_levels():
+    cfg = config()
+    state, _ = bought(cfg)
+    first = transition(
+        cfg, state, market(timestamp=6120, bid=D("96.8"), ask=D("96.8"), low=D("96"), base_available=D("1"))
+    )
+    assert not first.requests
+    second = transition(
+        cfg, first.state, market(timestamp=6180, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+    assert not second.requests
+    third = transition(
+        cfg, second.state, market(timestamp=6240, bid=D("96.8"), ask=D("96.8"), low=D("96.1"), base_available=D("1"))
+    )
+    assert len(third.requests) == 1
+    assert third.requests[0].level == 3
+    assert third.state.levels[1:3] == ["SKIPPED", "SKIPPED"]
+    assert third.requests[0].reserved_quote <= D("250")
+
+
+def test_same_bar_cannot_count_again_as_stabilization():
+    cfg = config()
+    state, _ = bought(cfg)
+    snap = market(timestamp=6120, bid=D("97"), ask=D("97"), low=D("96"), base_available=D("1"))
+    once = transition(cfg, state, snap)
+    again = transition(cfg, once.state, snap)
+    assert once.state.to_dict() == again.state.to_dict()
+    assert not again.requests
+
+
+def test_unknown_or_reversed_execution_receipt_fails_closed():
+    cfg = config()
+    state, fill = bought(cfg)
+    with pytest.raises(EpisodeInputError, match="unknown"):
+        transition(cfg, state, market(timestamp=6120), [replace(fill, request_id="foreign")])
+    with pytest.raises(EpisodeInputError, match="decreased"):
+        transition(cfg, state, market(timestamp=6120), [replace(fill, filled_base=D("0.5"))])
+
+
+def test_state_roundtrip_preserves_budget_levels_and_pending_identity():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market())
+    restored = EpisodeState.from_dict(first.state.to_dict())
+    assert restored.to_dict() == first.state.to_dict()
+    again = transition(cfg, restored, market(timestamp=6060))
+    assert not again.requests
+    assert remaining_budget(cfg, again.state) == D("900")
+    with pytest.raises(EpisodeInputError, match="configuration"):
+        transition(replace(cfg, budget_quote=D("2000")), restored, market(timestamp=6120))
+
+
+def test_distribution_targets_ratchet_and_profit_guard_blocks_terminal_sale():
+    cfg = config()
+    state, _ = bought(cfg)
+    markup = transition(
+        cfg, state, market(timestamp=6120, bid=D("101"), ask=D("101"), low=D("101"), base_available=D("1"), markup=True)
+    )
+    assert markup.state.phase == "MARKUP"
+    distribute = transition(
+        cfg, markup.state, market(timestamp=6180, bid=D("108"), ask=D("108"), low=D("108"), base_available=D("1"))
+    )
+    assert distribute.state.target_base == D("0.6")
+    assert distribute.requests[0].side == "SELL"
+    assert distribute.requests[0].amount == D("0.4")
+    fill = OrderUpdate(distribute.requests[0].id, D("0.4"), D("43.2"), done=True)
+    crash = transition(
+        cfg,
+        distribute.state,
+        market(timestamp=6240, bid=D("90"), ask=D("90"), low=D("90"), base_available=D("0.6")),
+        [fill],
+    )
+    assert crash.state.phase == "EXIT"
+    assert crash.state.target_base == D("0")
+    assert crash.reason == "profit_guard_blocked"
+    assert not crash.requests
+    assert crash.state.gross_spent == D("100")
+    assert crash.state.cost == D("60")
+
+
+def test_sell_only_assignment_never_creates_buy_or_adopts_deposit():
+    cfg = config(mode="sell_only", assignment_id="inventory-1", initial_base=D("1"), initial_cost=D("100"))
+    first = transition(cfg, EpisodeState(), market(base_available=D("5")))
+    assert first.state.base == D("1")
+    assert first.state.phase == "RECOVER"
+    assert not first.requests
+    another = transition(cfg, first.state, market(timestamp=6060, base_available=D("10"), bid=D("75"), ask=D("75")))
+    assert another.state.base == D("1")
+    assert not another.requests
+
+
+def test_data_failure_cancels_pending_without_releasing_reservation():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market())
+    result = transition(cfg, first.state, market(timestamp=6060, valid=False))
+    assert result.cancel_ids == (first.requests[0].id,)
+    assert remaining_budget(cfg, result.state) == D("900")
+    assert not result.requests
+
+
+def test_operator_veto_blocks_all_levels_without_consuming_authorization():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market(buy_allowed=False))
+    assert not first.requests
+    assert remaining_budget(cfg, first.state) == D("1000")
+    state, _ = bought(cfg)
+    veto = transition(
+        cfg,
+        state,
+        market(timestamp=6120, bid=D("96"), ask=D("96"), low=D("96"), base_available=D("1"), buy_allowed=False),
+    )
+    assert not veto.requests
+    assert veto.reason == "buy_veto"
+
+
+def test_sell_only_basis_larger_than_buy_budget_does_not_block_exit():
+    cfg = config(mode="sell_only", assignment_id="owned", initial_base=D("20"), initial_cost=D("2000"))
+    first = transition(cfg, EpisodeState(), market(base_available=D("20"), markup=True, bid=D("102"), ask=D("102")))
+    follow = transition(cfg, first.state, market(timestamp=6060, base_available=D("20"), bid=D("112"), ask=D("112")))
+    assert follow.requests[0].side == "SELL"
+    assert follow.state.fault is None
+
+
+def test_pending_sell_does_not_hide_new_high_or_terminal_breach():
+    cfg = config()
+    state, _ = bought(cfg)
+    arm = transition(cfg, state, market(timestamp=6120, base_available=D("1"), markup=True, bid=D("102"), ask=D("102")))
+    first = transition(cfg, arm.state, market(timestamp=6180, base_available=D("1"), bid=D("108"), ask=D("108")))
+    high = transition(cfg, first.state, market(timestamp=6240, base_available=D("0.6"), bid=D("115"), ask=D("115")))
+    assert high.state.peak == D("115")
+    assert high.state.target_base == D("0.4")
+    assert not high.requests
+    crash = transition(cfg, high.state, market(timestamp=6300, base_available=D("0.6"), bid=D("103"), ask=D("103")))
+    assert crash.state.phase == "EXIT"
+    assert crash.state.target_base == D("0")
+    assert crash.cancel_ids == (first.requests[0].id,)
+    assert not crash.requests
+
+
+def test_quality_attenuation_zero_cannot_create_minimum_order():
+    result = transition(config(), EpisodeState(), market(quality_factor=D("0")))
+    assert not result.requests
+    assert result.reason == "zero_allocation"
+    with pytest.raises(EpisodeInputError):
+        market(quality_factor=D("1.01"))
+
+
+def test_price_bound_violations_record_actual_spend_and_block_new_orders():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market())
+    order = first.requests[0]
+    overrun = OrderUpdate(order.id, filled_base=D("1"), filled_quote=D("102"), done=True)
+    result = transition(cfg, first.state, market(timestamp=6060, base_available=D("1")), [overrun])
+    assert result.state.gross_spent == D("102")
+    assert result.reason == "buy_reservation_overrun"
+    assert not result.requests
+
+
+def test_confirmation_gap_restarts_stabilization_instead_of_counting_missing_bar():
+    cfg = config()
+    state, _ = bought(cfg)
+    snap = market(timestamp=6120, base_available=D("1"), bid=D("96.8"), ask=D("96.8"), low=D("96"))
+    armed = transition(cfg, state, snap)
+    once = transition(cfg, armed.state, replace(snap, timestamp=6180, low=D("96.1")))
+    gap = transition(cfg, once.state, replace(snap, timestamp=6300, low=D("96.1")))
+    assert not gap.requests
+    assert gap.state.no_new_low == 0
+
+
+def test_invalid_data_does_not_preserve_almost_confirmed_setup():
+    cfg = config()
+    state, _ = bought(cfg)
+    snap = market(timestamp=6120, base_available=D("1"), bid=D("96.8"), ask=D("96.8"), low=D("96"))
+    armed = transition(cfg, state, snap)
+    once = transition(cfg, armed.state, replace(snap, timestamp=6180, low=D("96.1")))
+    invalid = transition(cfg, once.state, replace(snap, timestamp=6240, valid=False))
+    resumed = transition(cfg, invalid.state, replace(snap, timestamp=6300, low=D("96.1")))
+    assert not resumed.requests
+    assert resumed.state.no_new_low == 0
+
+
+def test_episode_can_only_restart_after_later_higher_timeframe_reset():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market())
+    closed = transition(
+        cfg, first.state, market(timestamp=6060), [OrderUpdate(first.requests[0].id, D("0"), D("0"), done=True)]
+    )
+    assert closed.state.phase == "COOLDOWN"
+    same_hour = transition(cfg, closed.state, market(timestamp=6120, reset=True))
+    assert same_hour.state.phase == "COOLDOWN"
+    later = transition(cfg, same_hour.state, market(timestamp=7260, htf_timestamp=7200, reset=True))
+    assert later.state.phase == "WATCH"
+    assert not later.requests
+
+
+def test_late_fees_consume_cash_without_changing_already_filled_quantity():
+    cfg = config(fee_rate=D(".01"))
+    first = transition(cfg, EpisodeState(), market())
+    req = first.requests[0]
+    fill = OrderUpdate(req.id, D(".5"), D("50"), done=True)
+    done = transition(cfg, first.state, market(timestamp=6060, base_available=D(".5"), entry_signal=False), [fill])
+    fees = transition(
+        cfg,
+        done.state,
+        market(timestamp=6120, base_available=D(".5"), entry_signal=False),
+        [replace(fill, fee_quote=D(".5"))],
+    )
+    assert fees.state.base == D(".5")
+    assert fees.state.gross_spent == D("50.5")
+    assert fees.state.cost == D("50.5")
+
+
+def test_terminal_partial_sell_reissues_only_unfilled_target_after_ack():
+    cfg = config(mode="sell_only", assignment_id="owned", initial_base=D("1"), initial_cost=D("100"))
+    arm = transition(cfg, EpisodeState(), market(base_available=D("1"), markup=True, bid=D("102"), ask=D("102")))
+    high = transition(cfg, arm.state, market(timestamp=6060, base_available=D("1"), bid=D("112"), ask=D("112")))
+    completed = transition(
+        cfg,
+        high.state,
+        market(timestamp=6120, base_available=D(".8"), bid=D("105"), ask=D("105")),
+        [OrderUpdate(high.requests[0].id, D(".2"), D("22.4"), done=True)],
+    )
+    assert completed.state.phase == "EXIT"
+    assert completed.requests[0].amount == D(".8")
+    assert completed.requests[0].id != high.requests[0].id
+
+
+def test_cooldown_reset_cannot_erase_a_late_fill():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market())
+    req = first.requests[0]
+    cancelled = transition(cfg, first.state, market(timestamp=6060), [OrderUpdate(req.id, D("0"), D("0"), done=True)])
+    late = transition(
+        cfg,
+        cancelled.state,
+        market(timestamp=7260, htf_timestamp=7200, reset=True, base_available=D("1")),
+        [OrderUpdate(req.id, D("1"), D("100"), done=True)],
+    )
+    assert late.state.base == D("1")
+    assert late.state.gross_spent == D("100")
+    assert late.state.phase == "EXIT"
+    assert not late.requests
+
+
+def test_old_receipt_identity_survives_episode_reset_and_fails_on_new_fill():
+    cfg = config()
+    first = transition(cfg, EpisodeState(), market())
+    req = first.requests[0]
+    cancelled = transition(cfg, first.state, market(timestamp=6060), [OrderUpdate(req.id, D("0"), D("0"), done=True)])
+    reset = transition(cfg, cancelled.state, market(timestamp=7260, htf_timestamp=7200, reset=True))
+    assert req.id in reset.state.orders
+    with pytest.raises(EpisodeInputError, match="closed episode"):
+        transition(
+            cfg,
+            reset.state,
+            market(timestamp=7320, base_available=D("1")),
+            [OrderUpdate(req.id, D("1"), D("100"), done=True)],
+        )
+
+
+@pytest.mark.parametrize("field,value", [("done", "false"), ("filled_base", "-1"), ("seen", 1)])
+def test_corrupt_checkpoint_cannot_release_pending_reservation(field, value):
+    state = transition(config(), EpisodeState(), market()).state.to_dict()
+    order = next(iter(state["orders"].values()))
+    order[field] = value
+    with pytest.raises(EpisodeInputError):
+        EpisodeState.from_dict(state)
+
+
+@pytest.mark.parametrize(
+    "change", [{"fee_rate": D("NaN")}, {"budget_quote": D("-1")}, {"level_fractions": (D("1"), D("1"))}]
+)
+def test_invalid_config_is_rejected(change):
+    with pytest.raises((EpisodeInputError, ValueError)):
+        config(**change)
+
+
+@pytest.mark.parametrize("field", ["base", "cost", "gross_spent", "sell_proceeds"])
+def test_restored_accounting_must_match_attributed_receipts(field):
+    cfg = config()
+    state, _ = bought(cfg)
+    payload = state.to_dict()
+    payload[field] = "0" if field != "sell_proceeds" else "10"
+    restored = EpisodeState.from_dict(payload)
+    with pytest.raises(EpisodeInputError, match="accounting"):
+        transition(cfg, restored, market(timestamp=6120, base_available=D("1"), markup=True))
+
+
+def test_late_fee_restatement_does_not_trigger_equity_price_reversal():
+    cfg = config(fee_rate=D(".01"))
+    first = transition(cfg, EpisodeState(), market())
+    request = first.requests[0]
+    receipt = OrderUpdate(request.id, D(".5"), D("50"), done=True)
+    snap = market(
+        timestamp=6060, bid=D("103"), ask=D("103"), low=D("103"), atr_15m=D(".1"), base_available=D(".5"), markup=True
+    )
+    markup = transition(cfg, first.state, snap, [receipt])
+    unchanged = transition(cfg, markup.state, replace(snap, timestamp=6120))
+    corrected = transition(cfg, unchanged.state, replace(snap, timestamp=6180), [replace(receipt, fee_quote=D(".5"))])
+    assert corrected.state.phase == "MARKUP"
+    assert not corrected.requests
+    assert corrected.state.cost == D("50.5")
+    assert corrected.state.equity_peak == unchanged.state.equity_peak - D(".5")
+    reversal = transition(cfg, corrected.state, replace(snap, timestamp=6240, bid=D("102"), ask=D("102")))
+    assert reversal.state.phase == "EXIT"
+
+
+def test_late_buy_fee_after_partial_sale_is_allocated_to_remaining_inventory():
+    cfg = config(fee_rate=D(".01"))
+    first = transition(cfg, EpisodeState(), market())
+    receipt = OrderUpdate(first.requests[0].id, D(".5"), D("50"), done=True)
+    snap = market(timestamp=6060, bid=D("108"), ask=D("108"), low=D("108"), base_available=D(".5"), markup=True)
+    markup = transition(cfg, first.state, snap, [receipt])
+    sale = transition(cfg, markup.state, replace(snap, timestamp=6120))
+    sold = OrderUpdate(sale.requests[0].id, D(".2"), D("21.6"), done=True)
+    filled = transition(cfg, sale.state, replace(snap, timestamp=6180, base_available=D(".3")), [sold])
+    corrected = transition(
+        cfg, filled.state, replace(snap, timestamp=6240, base_available=D(".3")), [replace(receipt, fee_quote=D(".5"))]
+    )
+    assert corrected.state.base == D(".3")
+    assert corrected.state.cost == D("30.3")
+    assert corrected.state.gross_spent == D("50.5")

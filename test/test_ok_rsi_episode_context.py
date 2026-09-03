@@ -42,6 +42,7 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_budget_quote is None
     assert legacy.episode_sequential_scale_ins is False
     assert legacy.episode_require_scale_in_signal is False
+    assert legacy.episode_scale_in_setup_bars == 10
     assert legacy.episode_scale_in_stabilization_bars == 2
     assert legacy.episode_hostile_risk_latch is False
     assert legacy.episode_recovery_exit_enabled is False

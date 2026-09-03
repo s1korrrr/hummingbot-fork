@@ -60,6 +60,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_budget_quote=Decimal("500"),
         episode_sequential_scale_ins=True,
         episode_require_scale_in_signal=True,
+        episode_scale_in_setup_bars=30,
         episode_scale_in_stabilization_bars=15,
         episode_hostile_risk_latch=True,
         episode_recovery_exit_enabled=True,
@@ -70,6 +71,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.mark_cap_quote == Decimal("1500")
     assert policy.sequential_scale_ins is True
     assert policy.require_scale_in_signal is True
+    assert policy.setup_bars == 30
     assert policy.stabilization_bars == 15
     assert policy.hostile_risk_latch is True
     assert policy.recovery_exit_enabled is True

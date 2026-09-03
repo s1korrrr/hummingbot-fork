@@ -49,6 +49,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_budget_quote: Optional[Decimal] = hl_rsi.Field(default=None, gt=0)
     episode_sequential_scale_ins: bool = False
     episode_require_scale_in_signal: bool = False
+    episode_scale_in_setup_bars: int = hl_rsi.Field(default=10, ge=1, le=600)
     episode_scale_in_stabilization_bars: int = hl_rsi.Field(default=2, ge=1, le=240)
     episode_hostile_risk_latch: bool = False
     episode_recovery_exit_enabled: bool = False

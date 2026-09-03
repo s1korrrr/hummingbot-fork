@@ -166,6 +166,8 @@ class EpisodeConfig:
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise EpisodeInputError(f"invalid {name}")
+        if self.stabilization_bars > self.setup_bars:
+            raise EpisodeInputError("stabilization_bars cannot exceed setup_bars")
         if self.initial_cost is not None:
             object.__setattr__(self, "initial_cost", _decimal(self.initial_cost, "initial_cost", positive=True))
         if self.mode == "sell_only" and (not self.assignment_id or self.initial_base <= ZERO):

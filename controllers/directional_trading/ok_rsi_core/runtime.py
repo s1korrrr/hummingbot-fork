@@ -61,6 +61,7 @@ def policy_config(config):
         require_profit=config.trade_mode == "buy_sell" or config.sell_only_if_profitable,
         sequential_scale_ins=config.episode_sequential_scale_ins,
         require_scale_in_signal=config.episode_require_scale_in_signal,
+        setup_bars=config.episode_scale_in_setup_bars,
         stabilization_bars=config.episode_scale_in_stabilization_bars,
         hostile_risk_latch=config.episode_hostile_risk_latch,
         recovery_exit_enabled=config.episode_recovery_exit_enabled,

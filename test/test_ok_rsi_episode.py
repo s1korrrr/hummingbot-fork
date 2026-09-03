@@ -108,6 +108,11 @@ def test_zero_or_hostile_followup_admission_cannot_be_upsized_to_minimum():
     assert too_small.reason == "below_exchange_minimum"
 
 
+def test_stabilization_window_must_fit_before_setup_expiry():
+    with pytest.raises(EpisodeInputError, match="stabilization_bars cannot exceed setup_bars"):
+        config(setup_bars=10, stabilization_bars=15)
+
+
 def test_setup_waits_for_two_subsequent_closed_bars_and_skips_crossed_levels():
     cfg = config()
     state, _ = bought(cfg)

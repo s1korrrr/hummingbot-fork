@@ -210,3 +210,98 @@ repositories or their unrelated dirty state.
 - Formatting: local Black (120 columns), isort and flake8 passed for pure core
   and its tests. The Hummingbot environment lacks Black; the existing global
   formatter was used without installing dependencies.
+- Integrated runtime commit ee4d32a9f as 6fd4f36d3; pure core and runtime at
+  6771156f1 passed 127 tests plus 19 subtests with warnings as errors. A further
+  framework loader regression after config extraction was reproduced in both
+  modes and fixed at 6f0cefa84 (two red, then two green tests).
+- Review accounting amendments: validate restored totals and authorizations
+  against cumulative receipts, restate remaining average cost for late fees,
+  and adjust equity ratchets for accounting corrections. Missing-price base
+  fees use the retained last valid causal bid. Pure suite now 36 tests green.
+- Research adapter audit found native maker/chaser price adjustment was omitted
+  for OrderExecutor actions. Apply the actual native get_order_price helper to
+  both baseline and candidate before comparison. Initial baseline dollar rows
+  are withdrawn and retained as superseded adapter diagnostics; final comparison
+  must select only source-bound runs with the corrected shared adapter.
+- Independent native review found incomplete factory authorization checks and
+  falsely terminal zero receipts after cancellation without a native order
+  object. Scoped runtime fixes and regression tests are in progress before
+  final source freeze. Real exchange ordering remains outside this authority.
+- Runtime source frozen at 01c234695800e84fbb2924eef83baed3c7a32a3c, including
+  all reported factory/cancellation fixes. Final owner command:
+
+      /Users/s1kor/anaconda3/envs/hummingbot/bin/python -W error -m pytest -q test/test_ok_rsi_episode.py test/test_ok_rsi_episode_runtime.py test/test_ok_rsi_episode_execution.py test/test_ok_rsi_episode_factory.py test/test_ok_rsi_episode_context.py test/test_ok_rsi_controller.py test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py --tb=short
+
+  Observed: 159 passed and 19 subtests passed in 8.21 seconds. Scoped commit
+  hooks (formatting/import order/lint/private-key detection) passed. Independent
+  final review is rechecking the specific repaired cases, not widening scope.
+- Fresh baseline signals and actual native market contexts completed for all
+  three pairs, 40,320 decisions each. Corrected shared-adapter economic runs
+  are now running against the frozen source with no candidate parameter edits.
+- Bounded final review identified one linked recovery issue: explicitly transient
+  missing native order/fill details must be rechecked without permanently
+  stopping reconciliation. Reproduced two failures, fixed only that branch,
+  then the final integrated command passed 161 tests plus 19 subtests in 6.07s
+  at 102649fded90f8ae5c05ea12112b86990267dbec. Unsupported fee valuations and
+  contradictory receipts retain hard holds. Independent reviewer cleared the
+  fixes at this SHA with no remaining actionable findings in scope.
+- Research was notified of the final source update. The synthetic complete
+  receipts never exercise the new transient-error branch, but final source
+  identities/equivalence must be recorded explicitly rather than silently
+  assigning older results to newer bytes.
+
+## Completed outcome
+
+Local implementation and the predeclared comparison are complete. The final
+runtime source is 102649fded90f8ae5c05ea12112b86990267dbec. Public ok_rsi.py
+is 475 lines, compared with 702 in the baseline. Shared buy_sell/sell_only
+policy is opt-in; original operator YAMLs and running systems were untouched.
+The economic matrix evaluates buy_sell. Sell_only is covered by pure/native
+runtime tests, not a separate historical inventory-assignment backtest.
+
+Canonical research output:
+/Users/s1kor/.codex/worktrees/ok-rsi-lifecycle-research-20260903/output/backtests/ok_rsi_episode_20260903/
+
+Files: comparison.html, comparison.md, comparison.csv, weekly.csv, daily_pnl.png,
+report_manifest.json, reproducibility.json, and cells/*/result.json with the
+hashed source/config/data inputs and action/event/balance/decision Parquet ledgers.
+The research preregistration is docs/reports/OK_RSI_EPISODE_COMPARISON_PREREGISTRATION_2026-09-03.md
+in that worktree. Its frozen hypothesis requires higher PnL without worse
+drawdown on each pair, retaining improvement at 20 bps per side.
+
+All 33 canonical cells completed: 18 diagnostic cost rows, six strict audits,
+six no-fill controls, and three baseline repeats. Five strict audits completed;
+BTC baseline's strict audit stopped at an aggregate-inventory profit invariant.
+The corresponding uncensored primary row retains six violations. All candidate
+cells have zero native hold rows. No-fill books finish with 5,000 quote, zero
+base and zero PnL. These are simulated diagnostics, not admitted owner economics.
+
+Primary 15 bps results (USDC PnL; drawdown is uniform completed-1m NAV):
+
+| Pair | Baseline PnL | Candidate PnL | Baseline DD | Candidate DD | Average deployed baseline/candidate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BTC-USDC | 17.6412 | 38.6648 | 0.1063% | 0.4801% | 75.8791 / 238.4629 |
+| ETH-USDC | 0.6066 | 33.7382 | 0.0259% | 0.3000% | 6.9349 / 150.2776 |
+| BNB-USDC | 2.0782 | 31.4995 | 0.0854% | 0.2528% | 25.7335 / 151.9278 |
+
+The fixed hypothesis is rejected on all three pairs: higher marked PnL comes
+with higher deployment and worse drawdown. This also holds at 20 bps. Results
+do not establish a timing improvement at matched deployment. Gains for BTC and
+ETH concentrate in the Aug 15-21 rebound. No parameters were tuned in response.
+
+Baseline repeats and final-source candidate reruns have byte-identical four
+ledgers and metrics across each asset. Root independently verified all six
+primary balance hashes, 40,320 equally spaced decision marks per book, exact
+realized plus unrealized PnL reconciliation, and exact recomputed drawdowns.
+Research verified all 33 bundles, hashing 10,802 unique files. The focused
+research suite passed 16 tests; Ruff passed. The runtime suite passed 161 tests
+and 19 subtests. Independent code review cleared every actionable finding in
+scope. Existing runtime-store SQLite teardown warnings remain separately noted
+in the runbook; that expanded invocation was not green.
+
+Remaining limits: Binance proxy data; absent historical OKX BBO/queue/native
+fill timing; optimistic full fills; assumed effective costs; one inspected
+28-day window with no untouched holdout. Real native cancellation/fill ordering
+is unverified. No paper/live activation or baseline promotion is authorized.
+Retain the candidate disabled. Any later study should distinguish sizing from
+entry/exit timing using a separately frozen comparison and untouched evidence.

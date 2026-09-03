@@ -25,6 +25,11 @@ The all-in budget and mark cap use `max_total_position_usd`. `episode_fee_rate`
 is an explicit conservative fee reserve, default 0.001. Actual native receipt
 fees are reconciled in their real base/quote currencies. Unknown third-asset
 valuation or incomplete native fill detail puts the controller on hold.
+Restored accounting is checked against cumulative episode receipts before a
+decision. Late acquisition fees restate the average cost of remaining inventory
+and the episode equity trail. When pricing is unavailable, base-fee restatement
+uses the explicitly retained last valid bid, so missing prices do not manufacture
+a reversal. Actual inventory and cash still reflect the full reported fee.
 
 Sell-only requires immutable `episode_assignment_id` and positive
 `episode_initial_base`. `episode_initial_cost` is the total acquisition cost in
@@ -72,8 +77,15 @@ Owner verification command:
 
 ```bash
 /Users/s1kor/anaconda3/envs/hummingbot/bin/python -W error -m pytest -q \
+  test/test_ok_rsi_episode.py \
   test/test_ok_rsi_episode_runtime.py test/test_ok_rsi_episode_execution.py \
+  test/test_ok_rsi_episode_factory.py \
   test/test_ok_rsi_episode_context.py test/test_ok_rsi_controller.py \
-  test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py \
-  test/test_rsi_v5_runtime_store.py
+  test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py
 ```
+
+The above focused integration command passed 161 tests and 19 subtests in
+6.07 seconds at source commit `102649fde`. An expanded command also including
+`test/test_rsi_v5_runtime_store.py` passed its assertions but failed pytest
+teardown under warnings-as-errors because existing SQLite connections were not
+closed. That expanded invocation is not a clean validation result.

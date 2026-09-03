@@ -304,6 +304,7 @@ class EpisodeState:
     frozen_anchor: Decimal = ZERO
     frozen_atr: Decimal = ZERO
     last_fill_price: Decimal = ZERO
+    last_valid_bid: Decimal = ZERO
     setup_level: int = -1
     setup_low: Decimal = ZERO
     setup_start: int = 0
@@ -355,6 +356,7 @@ class EpisodeState:
                 "frozen_anchor",
                 "frozen_atr",
                 "last_fill_price",
+                "last_valid_bid",
                 "setup_low",
                 "distribution_start_base",
                 "distribution_basis",
@@ -493,7 +495,9 @@ def _apply_update(config: EpisodeConfig, state: EpisodeState, market: MarketSnap
     for name, value in _accounting(config, state).items():
         setattr(state, name, value)
     if db == ZERO and dq == ZERO and (fq or fb):
-        restatement = fq + fb * market.bid * (ONE - config.fee_rate)
+        # Missing books cannot erase an accounting correction. Use the last
+        # explicitly valid causal valuation while preserving actual fee units.
+        restatement = fq + fb * state.last_valid_bid * (ONE - config.fee_rate)
         for name in ("equity_peak", "equity_floor"):
             if getattr(state, name) is not None:
                 setattr(state, name, getattr(state, name) - restatement)
@@ -590,6 +594,8 @@ def transition(
     _validate_accounting(config, state)
     if market.timestamp < state.timestamp:
         raise EpisodeInputError("out-of-order market observation")
+    if market.valid:
+        state.last_valid_bid = market.bid
     if (
         not market.valid
         or market.cascade

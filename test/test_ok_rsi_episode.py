@@ -429,3 +429,24 @@ def test_late_buy_fee_after_partial_sale_is_allocated_to_remaining_inventory():
     assert corrected.state.base == D(".3")
     assert corrected.state.cost == D("30.3")
     assert corrected.state.gross_spent == D("50.5")
+
+
+def test_base_fee_restatement_during_invalid_book_uses_last_valid_valuation():
+    cfg = config(fee_rate=D(".01"))
+    first = transition(cfg, EpisodeState(), market())
+    receipt = OrderUpdate(first.requests[0].id, D(".5"), D("50"), done=True)
+    snap = market(
+        timestamp=6060, bid=D("103"), ask=D("103"), low=D("103"), atr_15m=D(".1"), base_available=D(".5"), markup=True
+    )
+    markup = transition(cfg, first.state, snap, [receipt])
+    stable = transition(cfg, markup.state, replace(snap, timestamp=6120))
+    invalid = transition(
+        cfg,
+        stable.state,
+        replace(snap, timestamp=6180, valid=False, bid=D("0"), ask=D("0")),
+        [replace(receipt, fee_base=D(".005"))],
+    )
+    recovered = transition(cfg, invalid.state, replace(snap, timestamp=6240, base_available=D(".495")))
+    assert recovered.state.phase == "MARKUP"
+    assert not recovered.requests
+    assert recovered.state.base == D(".495")

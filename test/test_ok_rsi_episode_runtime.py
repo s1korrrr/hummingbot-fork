@@ -124,3 +124,10 @@ def test_direct_factory_cannot_change_an_authorized_quantity():
     created = actions(controller)[0]
     with pytest.raises(ValueError, match="authorization"):
         controller.get_executor_class_for_config(created.executor_config.model_copy(update={"amount": Decimal("100")}))
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_framework_config_loader_resolves_public_controller_after_config_extraction(enabled):
+    from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+    config = OKRSIControllerConfig(id="loader-regression", strict_hmm_mode=False, episode_enabled=enabled)
+    assert config.get_controller_class() is OKRSIController

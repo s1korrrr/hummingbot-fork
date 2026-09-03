@@ -14,6 +14,12 @@ from hummingbot.data_feed.candles_feed.okx_spot_candles.constants import INTERVA
 
 
 class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
+    def get_controller_class(self):
+        # ControllerConfigBase otherwise searches this helper module, while
+        # the public controller remains in directional_trading.ok_rsi.
+        from controllers.directional_trading.ok_rsi import OKRSIController
+        return OKRSIController
+
     controller_name: str = "ok_rsi"
     controller_type: str = "directional_trading"
     connector_name: str = hl_rsi.Field(

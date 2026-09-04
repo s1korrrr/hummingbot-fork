@@ -439,6 +439,12 @@ def test_reserved_adaptive_entry_maps_hard_reservation_rail_and_receipt():
     status = controller.get_custom_info()["episode"]
     assert status["last_entry_pricing_policy"] == "ADAPTIVE_RESERVED_ENTRY_V2"
     assert status["entry_reservation_allowed"] is True
+    assert status["entry_market_valid"] is True
+    assert status["entry_market_cascade"] is False
+    assert status["entry_market_hostile"] is False
+    assert status["entry_market_recovery"] is False
+    assert status["entry_market_markup"] is False
+    assert status["entry_market_buy_allowed"] is True
     assert status["last_entry_expires_at"] == created[0].executor_config.episode_expires_at
 
 

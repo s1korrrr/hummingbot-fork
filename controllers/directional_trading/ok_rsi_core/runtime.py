@@ -193,6 +193,12 @@ class EpisodeRuntime:
                     if self.last_market
                     else None
                 ),
+                "entry_market_valid": getattr(self.last_market, "valid", None) if self.last_market else None,
+                "entry_market_cascade": getattr(self.last_market, "cascade", None) if self.last_market else None,
+                "entry_market_hostile": getattr(self.last_market, "hostile", None) if self.last_market else None,
+                "entry_market_recovery": getattr(self.last_market, "recovery", None) if self.last_market else None,
+                "entry_market_markup": getattr(self.last_market, "markup", None) if self.last_market else None,
+                "entry_market_buy_allowed": getattr(self.last_market, "buy_allowed", None) if self.last_market else None,
                 "setup_policy": setup_policy,
                 "setup_started_at": self.state.setup_start if active_setup else None,
                 "setup_confirmation_started_at": (

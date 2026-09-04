@@ -112,6 +112,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_structure_held_runner=True,
         episode_markup_release_runner=True,
         episode_bounded_markup_runner=True,
+        episode_stage_preserving_runner=True,
         episode_thin_scout_release=True,
         episode_thin_scout_rearm=True,
         episode_profitable_rearm=True,
@@ -141,6 +142,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.structure_held_runner is True
     assert policy.markup_release_runner is True
     assert policy.bounded_markup_runner is True
+    assert policy.stage_preserving_runner is True
     assert policy.thin_scout_release is True
     assert policy.thin_scout_rearm is True
     assert policy.profitable_episode_rearm is True
@@ -162,6 +164,40 @@ def test_public_config_rejects_bounded_runner_without_markup_release():
             episode_structure_held_runner=True,
             episode_bounded_markup_runner=True,
         )
+
+
+def test_public_config_rejects_stage_preserving_without_bounded_runner():
+    with pytest.raises(ValueError, match="stage preserving"):
+        setup_controller(episode_stage_preserving_runner=True)
+    with pytest.raises(ValueError, match="stage preserving"):
+        setup_controller(
+            episode_structure_held_runner=True,
+            episode_markup_release_runner=True,
+            episode_stage_preserving_runner=True,
+        )
+
+
+def test_stage_preserving_status_exposes_causal_target_stage():
+    controller, _ = setup_controller(
+        episode_structure_held_runner=True,
+        episode_markup_release_runner=True,
+        episode_bounded_markup_runner=True,
+        episode_stage_preserving_runner=True,
+    )
+    runtime = controller._episode_runtime
+    runtime.state.distribution_start_base = Decimal("1")
+    runtime.state.distribution_basis = Decimal("100")
+    runtime.state.distribution_atr = Decimal("1")
+    runtime.state.peak = Decimal("106.5")
+
+    status = runtime.status()
+
+    assert status["stage_preserving_runner_enabled"] is True
+    assert status["stage_preserving_runner_stage_index"] == 1
+    assert status["stage_preserving_runner_threshold_atr"] == "4"
+    assert status["stage_preserving_runner_target_fraction"] == "0.8"
+    assert status["stage_preserving_runner_target_base"] == "0.8"
+    assert status["exit_policy"] == "STAGE_PRESERVING_RUNNER_V8"
 
 
 def test_public_config_rejects_thin_scout_rearm_without_release():

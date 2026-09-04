@@ -61,6 +61,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_structure_held_runner: bool = False
     episode_markup_release_runner: bool = False
     episode_bounded_markup_runner: bool = False
+    episode_stage_preserving_runner: bool = False
     episode_fee_rate: Decimal = hl_rsi.Field(default=Decimal("0.001"), ge=0, lt=Decimal("0.1"))
     episode_assignment_id: Optional[str] = None
     episode_initial_base: Decimal = hl_rsi.Field(default=Decimal("0"), ge=0)
@@ -229,6 +230,11 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             and not self.episode_markup_release_runner
         ):
             raise ValueError("bounded markup runner requires markup release runner")
+        if (
+            self.episode_stage_preserving_runner
+            and not self.episode_bounded_markup_runner
+        ):
+            raise ValueError("stage preserving runner requires bounded markup runner")
         if self.episode_adaptive_reserved_entry and not self.episode_adaptive_entry_pricing:
             raise ValueError("reserved adaptive entry requires adaptive entry pricing")
         if self.episode_adaptive_reference_fallback and not self.episode_adaptive_reserved_entry:

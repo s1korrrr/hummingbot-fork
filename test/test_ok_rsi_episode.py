@@ -637,6 +637,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("structure_held_runner")
     legacy_values.pop("markup_release_runner")
     legacy_values.pop("bounded_markup_runner")
+    legacy_values.pop("stage_preserving_runner")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
@@ -669,6 +670,13 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
         markup_release_runner=True,
         bounded_markup_runner=True,
     ).identity != cfg.identity
+    assert replace(
+        cfg,
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+    ).identity != cfg.identity
 
 
 def test_markup_release_runner_requires_structure_held_runner():
@@ -681,6 +689,17 @@ def test_bounded_markup_runner_requires_markup_release_runner():
         config(bounded_markup_runner=True)
     with pytest.raises(EpisodeInputError, match="bounded markup"):
         config(structure_held_runner=True, bounded_markup_runner=True)
+
+
+def test_stage_preserving_runner_requires_bounded_markup_runner():
+    with pytest.raises(EpisodeInputError, match="stage preserving"):
+        config(stage_preserving_runner=True)
+    with pytest.raises(EpisodeInputError, match="stage preserving"):
+        config(
+            structure_held_runner=True,
+            markup_release_runner=True,
+            stage_preserving_runner=True,
+        )
 
 
 def test_deep_recovery_rotation_requires_capital_release():
@@ -3321,6 +3340,83 @@ def test_bounded_markup_runner_keeps_runner_before_final_distribution_threshold(
     assert result.requests[0].exit_target_base == D("0.4")
 
 
+@pytest.mark.parametrize(
+    ("extension", "target", "amount"),
+    (("3.9", "1", None), ("4.3", ".8", ".2"), ("6.5", ".8", ".2"), ("9.98", ".6", ".4")),
+)
+def test_stage_preserving_runner_uses_existing_distribution_stage(
+    extension, target, amount
+):
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D(extension)
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert result.state.structure_runner_active is True
+    assert result.state.target_base == D(target)
+    if amount is None:
+        assert not result.requests
+    else:
+        assert result.requests[0].amount == D(amount)
+        assert result.requests[0].exit_policy == "STAGE_PRESERVING_RUNNER_V8"
+        assert result.requests[0].exit_target_base == D(target)
+
+
+def test_stage_preserving_runner_exits_fully_at_bounded_threshold():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (
+        state.peak - state.distribution_basis
+    ) / cfg.distribution_atr_levels[-1]
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert result.state.phase == "EXIT"
+    assert result.state.structure_runner_active is False
+    assert result.state.target_base == D("0")
+    assert result.requests[0].amount == D("1")
+    assert result.requests[0].exit_policy == "STAGE_PRESERVING_RUNNER_V8"
+
+
 def test_bounded_markup_runner_exits_fully_at_final_distribution_threshold():
     cfg = config(
         structure_held_runner=True,
@@ -3427,6 +3523,74 @@ def test_bounded_markup_runner_never_retains_inventory_during_risk_override():
     assert result.requests[0].exit_trail_breach == "RISK_OVERRIDE"
 
 
+def test_stage_preserving_runner_releases_everything_on_markup_loss():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D("6.5")
+    held = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"), ask=D("102.4"), low=D("102.4"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True, markup=True,
+        ),
+    )
+    partial = held.requests[0]
+
+    result = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6300,
+            bid=D("103.2"), ask=D("103.2"), low=D("103.2"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D(".8"),
+            hourly_recovered=True, markup=False,
+        ),
+        [OrderUpdate(partial.id, filled_base=D(".2"), filled_quote=D("20.48"), done=True)],
+    )
+
+    assert result.state.target_base == D("0")
+    assert result.state.structure_runner_active is False
+    assert result.requests[0].amount == D(".8")
+    assert result.requests[0].exit_policy == "STAGE_PRESERVING_RUNNER_V8"
+    assert result.requests[0].exit_trail_breach == "MARKUP_LOSS"
+
+
+def test_stage_preserving_runner_never_retains_inventory_during_risk_override():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D("6.5")
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"), ask=D("102.4"), low=D("102.4"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True, markup=True, hostile=True,
+        ),
+    )
+
+    assert result.state.target_base == D("0")
+    assert result.state.structure_runner_active is False
+    assert result.requests[0].amount == D("1")
+    assert result.requests[0].exit_policy == "STAGE_PRESERVING_RUNNER_V8"
+    assert result.requests[0].exit_trail_breach == "RISK_OVERRIDE"
+
+
 def test_bounded_markup_runner_does_not_change_recovery_trail_semantics():
     cfg = config(
         recovery_exit_enabled=True,
@@ -3480,6 +3644,55 @@ def test_sell_only_uses_same_bounded_markup_runner_without_buying():
 
     assert held.state.structure_runner_active is True
     assert held.requests[0].exit_policy == "BOUNDED_MARKUP_RUNNER_V7"
+    assert all(order.request.side != "BUY" for order in held.state.orders.values())
+
+
+def test_sell_only_uses_same_stage_preserving_runner_without_buying():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="inventory-1",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+    )
+    armed = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("102"), ask=D("102"), low=D("102"), atr_15m=D("0.1"),
+            atr_1h=D("10"), base_available=D("1"), markup=True,
+        ),
+    )
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            bid=D("103"), ask=D("103"), low=D("103"), atr_15m=D("0.1"),
+            atr_1h=D("10"), base_available=D("1"), hourly_recovered=True,
+            markup=True,
+        ),
+    )
+    high.state.distribution_atr = (
+        high.state.peak - high.state.distribution_basis
+    ) / D("6.5")
+    held = transition(
+        cfg,
+        high.state,
+        market(
+            timestamp=6120,
+            bid=D("102.4"), ask=D("102.4"), low=D("102.4"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True, markup=True,
+        ),
+    )
+
+    assert held.state.target_base == D(".8")
+    assert held.requests[0].amount == D(".2")
+    assert held.requests[0].exit_policy == "STAGE_PRESERVING_RUNNER_V8"
     assert all(order.request.side != "BUY" for order in held.state.orders.values())
 
 

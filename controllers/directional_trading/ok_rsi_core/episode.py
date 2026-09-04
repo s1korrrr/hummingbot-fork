@@ -55,6 +55,7 @@ EXIT_POLICIES = {
     "STRUCTURE_HELD_RUNNER_V1",
     "MARKUP_RELEASED_RUNNER_V1",
     "BOUNDED_MARKUP_RUNNER_V7",
+    "STAGE_PRESERVING_RUNNER_V8",
     "THIN_SCOUT_RELEASE_V1",
     "DEEP_RECOVERY_CAPITAL_RELEASE_V4",
     "DEEP_RECOVERY_ROTATION_EXIT_V5",
@@ -187,6 +188,7 @@ class EpisodeConfig:
     structure_held_runner: bool = False
     markup_release_runner: bool = False
     bounded_markup_runner: bool = False
+    stage_preserving_runner: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -219,6 +221,7 @@ class EpisodeConfig:
             "structure_held_runner",
             "markup_release_runner",
             "bounded_markup_runner",
+            "stage_preserving_runner",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -262,6 +265,8 @@ class EpisodeConfig:
             raise EpisodeInputError("markup release runner requires structure held runner")
         if self.bounded_markup_runner and not self.markup_release_runner:
             raise EpisodeInputError("bounded markup runner requires markup release runner")
+        if self.stage_preserving_runner and not self.bounded_markup_runner:
+            raise EpisodeInputError("stage preserving runner requires bounded markup runner")
         if self.adaptive_reserved_entry and not self.adaptive_entry_pricing:
             raise EpisodeInputError("reserved adaptive entry requires adaptive entry pricing")
         if self.adaptive_reference_fallback and not self.adaptive_reserved_entry:
@@ -351,6 +356,8 @@ class EpisodeConfig:
             values.pop("markup_release_runner")
         if not self.bounded_markup_runner:
             values.pop("bounded_markup_runner")
+        if not self.stage_preserving_runner:
+            values.pop("stage_preserving_runner")
         return _hash(values)
 
 
@@ -548,6 +555,7 @@ class OrderRequest:
         elif self.exit_trail_breach == "MARKUP_LOSS" and self.exit_policy not in {
             "MARKUP_RELEASED_RUNNER_V1",
             "BOUNDED_MARKUP_RUNNER_V7",
+            "STAGE_PRESERVING_RUNNER_V8",
         }:
             raise EpisodeInputError("markup loss receipt requires markup release policy")
         elif self.exit_trail_breach == "RISK_OVERRIDE" and self.exit_risk_clear:
@@ -1612,6 +1620,27 @@ def _reduce_exit_target(config: EpisodeConfig, state: EpisodeState, target: Deci
             state.exit_target_revision += 1
 
 
+def stage_preserving_runner_target(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    extension: Decimal | None,
+) -> tuple[Decimal, int, Decimal | None, Decimal]:
+    """Derive the protected target from the distribution stage already earned."""
+    fraction = ONE
+    stage_index = 0
+    threshold = None
+    if extension is not None and extension >= ZERO:
+        for index, (level, remaining) in enumerate(
+            zip(config.distribution_atr_levels, config.remaining_fractions),
+            start=1,
+        ):
+            if extension >= level:
+                fraction = remaining
+                stage_index = index
+                threshold = level
+    return state.distribution_start_base * fraction, stage_index, threshold, fraction
+
+
 def _exit_trail_breach(*, price_breached: bool, equity_breached: bool) -> str:
     if price_breached and equity_breached:
         return "PRICE_AND_EQUITY"
@@ -1673,7 +1702,9 @@ def _exit_receipt(
     )
     return {
         "exit_policy": (
-            "BOUNDED_MARKUP_RUNNER_V7"
+            "STAGE_PRESERVING_RUNNER_V8"
+            if config.stage_preserving_runner
+            else "BOUNDED_MARKUP_RUNNER_V7"
             if config.bounded_markup_runner
             else "MARKUP_RELEASED_RUNNER_V1"
             if config.markup_release_runner
@@ -1966,7 +1997,14 @@ def transition(
         if hold_structure:
             state.exit_intent = "DISTRIBUTION_SELL"
             state.phase = "DISTRIBUTE"
-            _reduce_exit_target(config, state, state.distribution_start_base * config.remaining_fractions[-1])
+            runner_target = state.distribution_start_base * config.remaining_fractions[-1]
+            if config.stage_preserving_runner:
+                runner_target, _, _, _ = stage_preserving_runner_target(
+                    config,
+                    state,
+                    distribution_extension,
+                )
+            _reduce_exit_target(config, state, runner_target)
             state.structure_runner_active = True
             state.last_exit_trail_breach = trail_breach
             state.last_exit_hourly_recovered = market.hourly_recovered

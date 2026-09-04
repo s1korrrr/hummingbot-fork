@@ -76,6 +76,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_scout_rebound_confirmation=True,
         episode_structure_held_runner=True,
         episode_markup_release_runner=True,
+        episode_thin_scout_release=True,
     )
 
     policy = controller._episode_runtime.config
@@ -99,12 +100,115 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.scout_rebound_confirmation is True
     assert policy.structure_held_runner is True
     assert policy.markup_release_runner is True
+    assert policy.thin_scout_release is True
     assert policy.rebound_atr == Decimal("0.25")
 
 
 def test_public_config_rejects_markup_release_without_structure_runner():
     with pytest.raises(ValueError, match="markup release"):
         setup_controller(episode_markup_release_runner=True)
+
+
+def test_thin_scout_release_receipt_maps_to_executor_and_status():
+    from controllers.directional_trading.ok_rsi_core.episode import (
+        EpisodeState,
+        OrderProgress,
+        OrderRequest,
+        Transition,
+    )
+
+    controller, _ = setup_controller(episode_thin_scout_release=True)
+    runtime = controller._episode_runtime
+    buy = OrderRequest(
+        id="scout-buy-1",
+        episode_id="episode-1",
+        level=0,
+        side="BUY",
+        amount=Decimal("1"),
+        price=Decimal("100"),
+        reserved_quote=Decimal("100"),
+        expires_at=10000,
+        revision=1,
+        intent="SCOUT_BUY",
+    )
+    request = OrderRequest(
+        id="thin-scout-sell-1",
+        episode_id="episode-1",
+        level=-1,
+        side="SELL",
+        amount=Decimal("1"),
+        price=Decimal("104"),
+        reserved_quote=Decimal("0"),
+        expires_at=10620,
+        revision=2,
+        intent="THIN_SCOUT_RELEASE",
+        exit_policy="THIN_SCOUT_RELEASE_V1",
+        exit_risk_clear=True,
+        exit_target_base=Decimal("0"),
+        exit_target_revision=1,
+    )
+    state = EpisodeState(
+        config_hash=runtime.config.identity,
+        phase="EXIT",
+        episode_number=1,
+        episode_id="episode-1",
+        timestamp=10020,
+        levels=["AUTHORIZED", "OPEN", "OPEN", "OPEN", "OPEN"],
+        orders={
+            buy.id: OrderProgress(
+                buy,
+                filled_base=Decimal("1"),
+                filled_quote=Decimal("100"),
+                done=True,
+                seen=True,
+                terminal_cause="FILLED",
+            ),
+            request.id: OrderProgress(request),
+        },
+        base=Decimal("1"),
+        cost=Decimal("100"),
+        gross_spent=Decimal("100"),
+        distribution_start_base=Decimal("1"),
+        distribution_basis=Decimal("100"),
+        distribution_atr=Decimal("1"),
+        target_base=Decimal("0"),
+        peak=Decimal("104"),
+        command_revision=2,
+        exit_intent="THIN_SCOUT_RELEASE",
+        exit_target_revision=1,
+    )
+    result = Transition(state=state, requests=(request,), reason="thin_scout_release")
+
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context(),
+    ), patch("controllers.directional_trading.ok_rsi_core.runtime.transition", return_value=result):
+        created = controller.determine_executor_actions()[0]
+
+    executor = created.executor_config.model_copy(update={"controller_id": controller.config.id})
+    assert executor.episode_intent == "THIN_SCOUT_RELEASE"
+    assert executor.episode_exit_policy == "THIN_SCOUT_RELEASE_V1"
+    assert executor.episode_exit_risk_clear is True
+    assert executor.episode_exit_target_base == Decimal("0")
+    assert executor.episode_exit_target_revision == 1
+    assert controller.get_executor_class_for_config(executor).__name__ == "EpisodeOrderExecutor"
+    runtime.last_market = SimpleNamespace(
+        hourly_recovered=False,
+        markup=True,
+        cascade=False,
+        hostile=False,
+        reset=False,
+    )
+    status = runtime.status()
+    assert status["thin_scout_release_enabled"] is True
+    assert status["thin_scout_inventory"] is True
+    assert status["acquisition_levels"] == [0]
+    assert status["distribution_start_base"] == "1"
+    assert status["distribution_basis"] == "100"
+    assert status["distribution_atr"] == "1"
+    assert status["distribution_extension_atr"] == "4"
+    assert status["first_distribution_atr"] == "4"
+    assert status["exit_policy"] == "THIN_SCOUT_RELEASE_V1"
 
 
 def test_markup_release_receipt_maps_to_executor_and_status():

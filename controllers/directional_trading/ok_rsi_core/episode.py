@@ -42,11 +42,17 @@ ORDER_INTENTS = {
     "SCALE_IN_BUY",
     "RECOVERY_TAKE_PROFIT",
     "DISTRIBUTION_SELL",
+    "THIN_SCOUT_RELEASE",
     "TRAILING_PROFIT_EXIT",
     "TERMINAL_PROFIT_EXIT",
 }
 SELL_INTENTS = ORDER_INTENTS - {"UNSPECIFIED", "SCOUT_BUY", "SCALE_IN_BUY"}
-EXIT_POLICIES = {"DEFAULT", "STRUCTURE_HELD_RUNNER_V1", "MARKUP_RELEASED_RUNNER_V1"}
+EXIT_POLICIES = {
+    "DEFAULT",
+    "STRUCTURE_HELD_RUNNER_V1",
+    "MARKUP_RELEASED_RUNNER_V1",
+    "THIN_SCOUT_RELEASE_V1",
+}
 EXIT_TRAIL_BREACHES = {
     "NONE",
     "PRICE",
@@ -160,6 +166,7 @@ class EpisodeConfig:
     adaptive_entry_pricing: bool = False
     adaptive_reserved_entry: bool = False
     adaptive_reference_fallback: bool = False
+    thin_scout_release: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -184,6 +191,7 @@ class EpisodeConfig:
             "adaptive_entry_pricing",
             "adaptive_reserved_entry",
             "adaptive_reference_fallback",
+            "thin_scout_release",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -269,6 +277,8 @@ class EpisodeConfig:
             values.pop("adaptive_reserved_entry")
         if not self.adaptive_reference_fallback:
             values.pop("adaptive_reference_fallback")
+        if not self.thin_scout_release:
+            values.pop("thin_scout_release")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -811,6 +821,21 @@ def remaining_budget(config: EpisodeConfig, state: EpisodeState) -> Decimal:
     )
 
 
+def acquisition_levels(state: EpisodeState) -> tuple[int, ...]:
+    """Return current-episode BUY levels with positive attributed inventory."""
+    return tuple(
+        sorted(
+            {
+                order.request.level
+                for order in state.orders.values()
+                if order.request.episode_id == state.episode_id
+                and order.request.side == "BUY"
+                and order.filled_base - order.fee_base > ZERO
+            }
+        )
+    )
+
+
 def _accounting(config: EpisodeConfig, state: EpisodeState) -> dict[str, Decimal]:
     """Project the one accumulation then liquidation episode from fill truth.
 
@@ -1265,12 +1290,22 @@ def _exit_trail_breach(*, price_breached: bool, equity_breached: bool) -> str:
     return "NONE"
 
 
-def _structure_exit_receipt(
+def _exit_receipt(
     config: EpisodeConfig,
     state: EpisodeState,
     market: MarketSnapshot,
     trail_breach: str,
+    request_intent: str,
 ) -> dict[str, Any]:
+    if request_intent == "THIN_SCOUT_RELEASE":
+        return {
+            "exit_policy": "THIN_SCOUT_RELEASE_V1",
+            "exit_hourly_recovered": market.hourly_recovered,
+            "exit_risk_clear": not (market.cascade or market.hostile or market.reset),
+            "exit_trail_breach": trail_breach,
+            "exit_target_base": state.target_base,
+            "exit_target_revision": state.exit_target_revision,
+        }
     if not config.structure_held_runner:
         return {}
     use_target_context = (
@@ -1309,7 +1344,10 @@ def _sell(
     request_intent = intent or state.exit_intent or (
         "TERMINAL_PROFIT_EXIT" if state.phase == "EXIT" else "DISTRIBUTION_SELL"
     )
-    profit_protected = config.require_profit or request_intent == "RECOVERY_TAKE_PROFIT"
+    profit_protected = config.require_profit or request_intent in {
+        "RECOVERY_TAKE_PROFIT",
+        "THIN_SCOUT_RELEASE",
+    }
     if not state.cost_known and profit_protected:
         return Transition(state, reason="basis_unavailable")
     min_price = minimum_profit_price(config, state) or ZERO
@@ -1332,11 +1370,18 @@ def _sell(
         reserve=ZERO,
         level=-1,
         intent=request_intent,
-        exit_receipt=_structure_exit_receipt(config, state, market, trail_breach),
+        exit_receipt=_exit_receipt(
+            config,
+            state,
+            market,
+            trail_breach,
+            request_intent,
+        ),
     )
     mapped_reason = {
         "RECOVERY_TAKE_PROFIT": "recovery_take_profit",
         "DISTRIBUTION_SELL": "distribution",
+        "THIN_SCOUT_RELEASE": "thin_scout_release",
         "TRAILING_PROFIT_EXIT": "trailing_profit_exit",
         "TERMINAL_PROFIT_EXIT": "terminal_exit",
     }[request_intent]
@@ -1541,10 +1586,25 @@ def transition(
                 state.last_exit_risk_clear = risk_clear
         elif state.phase != "EXIT" and not recovery_trail:
             extension = (state.peak - state.distribution_basis) / state.distribution_atr
-            for threshold, fraction in zip(config.distribution_atr_levels, config.remaining_fractions):
-                if extension >= threshold:
-                    _reduce_exit_target(config, state, state.distribution_start_base * fraction)
-                    state.phase = "DISTRIBUTE"
+            thin_scout = (
+                config.thin_scout_release
+                and config.mode == "buy_sell"
+                and state.target_base == state.distribution_start_base
+                and extension >= config.distribution_atr_levels[0]
+                and acquisition_levels(state) == (0,)
+            )
+            if thin_scout:
+                previous_revision = state.exit_target_revision
+                state.exit_intent = "THIN_SCOUT_RELEASE"
+                state.phase = "EXIT"
+                _reduce_exit_target(config, state, ZERO)
+                if state.exit_target_revision == previous_revision:
+                    state.exit_target_revision += 1
+            else:
+                for threshold, fraction in zip(config.distribution_atr_levels, config.remaining_fractions):
+                    if extension >= threshold:
+                        _reduce_exit_target(config, state, state.distribution_start_base * fraction)
+                        state.phase = "DISTRIBUTE"
         if pending:
             if state.phase == "EXIT":
                 cancellations = _mark_termination(pending, "LIFECYCLE")

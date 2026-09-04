@@ -623,6 +623,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("adaptive_entry_pricing")
     legacy_values.pop("adaptive_reserved_entry")
     legacy_values.pop("adaptive_reference_fallback")
+    legacy_values.pop("thin_scout_release")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -635,6 +636,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     assert replace(cfg, scout_rebound_confirmation=True).identity != cfg.identity
     assert replace(cfg, recovery_aware_scout=True).identity != cfg.identity
     assert replace(cfg, recovery_rebound_scout=True).identity != cfg.identity
+    assert replace(cfg, thin_scout_release=True).identity != cfg.identity
     structure = replace(cfg, structure_held_runner=True)
     structure_values = legacy_values | {"structure_held_runner": True}
     assert structure.identity == _hash(structure_values)
@@ -1446,6 +1448,308 @@ def test_distribution_targets_ratchet_and_profit_guard_blocks_terminal_sale():
     assert not crash.requests
     assert crash.state.gross_spent == D("100")
     assert crash.state.cost == D("60")
+
+
+def test_profitable_thin_scout_release_is_opt_in_and_uses_existing_first_target():
+    default_state, _ = bought(config())
+    default_markup = transition(
+        config(),
+        default_state,
+        market(
+            timestamp=6120,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    default_distribution = transition(
+        config(),
+        default_markup.state,
+        market(
+            timestamp=6180,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("1"),
+        ),
+    )
+
+    cfg = config(thin_scout_release=True)
+    state, _ = bought(cfg)
+    markup = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    released = transition(
+        cfg,
+        markup.state,
+        market(
+            timestamp=6180,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("1"),
+        ),
+    )
+
+    assert default_distribution.state.phase == "DISTRIBUTE"
+    assert default_distribution.state.target_base == D(".8")
+    assert default_distribution.requests[0].amount == D(".2")
+    assert default_distribution.requests[0].intent == "DISTRIBUTION_SELL"
+    assert default_distribution.requests[0].exit_policy == "DEFAULT"
+    assert released.state.phase == "EXIT"
+    assert released.state.target_base == D("0")
+    assert released.state.exit_intent == "THIN_SCOUT_RELEASE"
+    assert released.reason == "thin_scout_release"
+    assert released.requests[0].amount == D("1")
+    assert released.requests[0].intent == "THIN_SCOUT_RELEASE"
+    assert released.requests[0].exit_policy == "THIN_SCOUT_RELEASE_V1"
+    assert released.requests[0].exit_target_base == D("0")
+    assert released.requests[0].exit_target_revision == 1
+
+
+def test_thin_scout_release_excludes_any_episode_with_a_scale_in_fill():
+    cfg = config(thin_scout_release=True)
+    state, _ = bought(cfg)
+    setup = market(
+        timestamp=6120,
+        bid=D("96.8"),
+        ask=D("96.8"),
+        low=D("96"),
+        base_available=D("1"),
+    )
+    armed = transition(cfg, state, setup)
+    confirmed = transition(cfg, armed.state, replace(setup, timestamp=6180, low=D("96.1")))
+    scale = transition(cfg, confirmed.state, replace(setup, timestamp=6240, low=D("96.1")))
+    scale_request = scale.requests[0]
+    scale_fill = OrderUpdate(
+        scale_request.id,
+        scale_request.amount,
+        scale_request.amount * scale_request.price,
+        done=True,
+    )
+    base = D("1") + scale_request.amount
+    settled = transition(
+        cfg,
+        scale.state,
+        market(timestamp=6300, base_available=base, entry_signal=False),
+        [scale_fill],
+    )
+    markup = transition(
+        cfg,
+        settled.state,
+        market(
+            timestamp=6360,
+            bid=D("105"),
+            ask=D("105"),
+            low=D("105"),
+            base_available=base,
+            markup=True,
+        ),
+    )
+    distributed = transition(
+        cfg,
+        markup.state,
+        market(
+            timestamp=6420,
+            bid=D("110"),
+            ask=D("110"),
+            low=D("110"),
+            base_available=base,
+        ),
+    )
+
+    assert scale_request.level > 0
+    assert distributed.state.phase == "DISTRIBUTE"
+    assert distributed.state.target_base > D("0")
+    assert distributed.requests[0].amount < base
+    assert distributed.requests[0].intent == "DISTRIBUTION_SELL"
+    assert distributed.requests[0].exit_policy == "DEFAULT"
+
+
+def test_sell_only_assignment_never_becomes_a_thin_scout_release():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="assigned-inventory",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        thin_scout_release=True,
+    )
+    assigned = transition(
+        cfg,
+        EpisodeState(),
+        market(base_available=D("1"), entry_signal=False),
+    )
+    markup = transition(
+        cfg,
+        assigned.state,
+        market(
+            timestamp=6060,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+    distributed = transition(
+        cfg,
+        markup.state,
+        market(
+            timestamp=6120,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("1"),
+            entry_signal=False,
+        ),
+    )
+
+    assert distributed.state.phase == "DISTRIBUTE"
+    assert distributed.state.target_base == D(".8")
+    assert distributed.requests[0].intent == "DISTRIBUTION_SELL"
+    assert distributed.requests[0].exit_policy == "DEFAULT"
+    assert all(order.request.side == "SELL" for order in distributed.state.orders.values())
+
+
+def test_thin_scout_release_keeps_profit_guard_and_retries_only_unfilled_base():
+    cfg = config(
+        thin_scout_release=True,
+        require_profit=False,
+        min_profit=D(".10"),
+    )
+    state, _ = bought(cfg)
+    markup = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("100"),
+            ask=D("100"),
+            low=D("100"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    blocked = transition(
+        cfg,
+        markup.state,
+        market(
+            timestamp=6180,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("1"),
+        ),
+    )
+
+    assert blocked.state.phase == "EXIT"
+    assert blocked.state.target_base == D("0")
+    assert blocked.state.exit_intent == "THIN_SCOUT_RELEASE"
+    assert blocked.reason == "profit_guard_blocked"
+    assert not blocked.requests
+
+    authorized = transition(
+        cfg,
+        blocked.state,
+        market(
+            timestamp=6240,
+            bid=D("111"),
+            ask=D("111"),
+            low=D("111"),
+            base_available=D("1"),
+        ),
+    )
+    pending = transition(
+        cfg,
+        authorized.state,
+        market(
+            timestamp=6300,
+            bid=D("111"),
+            ask=D("111"),
+            low=D("111"),
+            base_available=D("1"),
+        ),
+    )
+    partial = transition(
+        cfg,
+        EpisodeState.from_dict(authorized.state.to_dict()),
+        market(
+            timestamp=6300,
+            bid=D("111"),
+            ask=D("111"),
+            low=D("111"),
+            base_available=D(".6"),
+        ),
+        [OrderUpdate(authorized.requests[0].id, D(".4"), D("44.4"), done=True)],
+    )
+
+    assert authorized.requests[0].intent == "THIN_SCOUT_RELEASE"
+    assert authorized.requests[0].exit_policy == "THIN_SCOUT_RELEASE_V1"
+    assert pending.reason == "pending_execution"
+    assert not pending.requests
+    assert partial.state.base == D(".6")
+    assert partial.requests[0].amount == D(".6")
+    assert partial.requests[0].intent == "THIN_SCOUT_RELEASE"
+    assert partial.requests[0].exit_policy == "THIN_SCOUT_RELEASE_V1"
+
+
+def test_thin_scout_release_dust_stays_latched_until_exchange_minimum_allows_it():
+    cfg = config(thin_scout_release=True)
+    state, _ = bought(cfg)
+    markup = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    dust = transition(
+        cfg,
+        markup.state,
+        market(
+            timestamp=6180,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("1"),
+            min_amount=D("2"),
+        ),
+    )
+    released = transition(
+        cfg,
+        EpisodeState.from_dict(dust.state.to_dict()),
+        market(
+            timestamp=6240,
+            bid=D("105"),
+            ask=D("105"),
+            low=D("105"),
+            base_available=D("1"),
+        ),
+    )
+
+    assert dust.state.phase == "EXIT"
+    assert dust.state.target_base == D("0")
+    assert dust.reason == "dust"
+    assert not dust.requests
+    assert released.requests[0].amount == D("1")
+    assert released.requests[0].intent == "THIN_SCOUT_RELEASE"
 
 
 def _structure_runner_setup(cfg):

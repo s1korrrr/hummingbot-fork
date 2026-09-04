@@ -45,6 +45,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_adaptive_entry_pricing: bool = False
     episode_adaptive_reserved_entry: bool = False
     episode_adaptive_reference_fallback: bool = False
+    episode_thin_scout_release: bool = False
     episode_scout_rebound_confirmation: bool = False
     episode_recovery_aware_scout: bool = False
     episode_recovery_rebound_scout: bool = False

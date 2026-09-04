@@ -85,6 +85,30 @@ def test_fill_receipt_preserves_native_episode_intent():
     assert instance.get_custom_info()["episode_receipt"]["intent"] == "SCOUT_BUY"
 
 
+def test_fill_receipt_preserves_thin_scout_release_authorization():
+    from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutorConfig
+
+    instance = executor()
+    instance.config = EpisodeOrderExecutorConfig(
+        **instance.config.model_dump(),
+        episode_id="episode-1",
+        episode_expires_at=60,
+        episode_intent="THIN_SCOUT_RELEASE",
+        episode_exit_policy="THIN_SCOUT_RELEASE_V1",
+        episode_exit_risk_clear=True,
+        episode_exit_target_base=Decimal("0"),
+        episode_exit_target_revision=1,
+    )
+    instance._order.order = order(side=TradeType.SELL)
+
+    receipt = instance.get_custom_info()["episode_receipt"]
+    assert receipt["intent"] == "THIN_SCOUT_RELEASE"
+    assert receipt["exit_policy"] == "THIN_SCOUT_RELEASE_V1"
+    assert receipt["exit_risk_clear"] is True
+    assert receipt["exit_target_base"] == "0"
+    assert receipt["exit_target_revision"] == 1
+
+
 def test_fill_receipt_preserves_native_structure_exit_authorization():
     from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutorConfig
 

@@ -16,6 +16,7 @@ from controllers.directional_trading.ok_rsi_core.episode import (
     EpisodeState,
     MarketSnapshot,
     OrderUpdate,
+    acquisition_levels,
     minimum_profit_price,
     transition,
 )
@@ -78,6 +79,7 @@ def policy_config(config):
         adaptive_entry_pricing=config.episode_adaptive_entry_pricing,
         adaptive_reserved_entry=config.episode_adaptive_reserved_entry,
         adaptive_reference_fallback=config.episode_adaptive_reference_fallback,
+        thin_scout_release=config.episode_thin_scout_release,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
@@ -169,7 +171,21 @@ class EpisodeRuntime:
             if active_setup
             else None
         )
-        if self.config.markup_release_runner:
+        levels = acquisition_levels(self.state)
+        thin_scout_inventory = (
+            self.config.mode == "buy_sell"
+            and self.state.base > ZERO
+            and levels == (0,)
+        )
+        distribution_extension = (
+            (self.state.peak - self.state.distribution_basis)
+            / self.state.distribution_atr
+            if self.state.distribution_atr > ZERO
+            else None
+        )
+        if self.state.exit_intent == "THIN_SCOUT_RELEASE":
+            exit_policy = "THIN_SCOUT_RELEASE_V1"
+        elif self.config.markup_release_runner:
             exit_policy = "MARKUP_RELEASED_RUNNER_V1"
         elif self.config.structure_held_runner:
             exit_policy = "STRUCTURE_HELD_RUNNER_V1"
@@ -221,6 +237,18 @@ class EpisodeRuntime:
                 "entry_market_recovery": getattr(self.last_market, "recovery", None) if self.last_market else None,
                 "entry_market_markup": getattr(self.last_market, "markup", None) if self.last_market else None,
                 "entry_market_buy_allowed": getattr(self.last_market, "buy_allowed", None) if self.last_market else None,
+                "thin_scout_release_enabled": self.config.thin_scout_release,
+                "thin_scout_inventory": thin_scout_inventory,
+                "acquisition_levels": list(levels),
+                "distribution_start_base": str(self.state.distribution_start_base),
+                "distribution_basis": str(self.state.distribution_basis),
+                "distribution_atr": str(self.state.distribution_atr),
+                "distribution_extension_atr": (
+                    str(distribution_extension)
+                    if distribution_extension is not None
+                    else None
+                ),
+                "first_distribution_atr": str(self.config.distribution_atr_levels[0]),
                 "setup_policy": setup_policy,
                 "setup_started_at": self.state.setup_start if active_setup else None,
                 "setup_confirmation_started_at": (

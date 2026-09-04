@@ -201,6 +201,8 @@ class EpisodeRuntime:
                 "structure_runner_active": self.state.structure_runner_active,
                 "structure_runner_target_base": str(runner_target),
                 "last_exit_trail_breach": self.state.last_exit_trail_breach,
+                "last_exit_hourly_recovered": self.state.last_exit_hourly_recovered,
+                "last_exit_risk_clear": self.state.last_exit_risk_clear,
                 "exit_target_revision": self.state.exit_target_revision,
                 "target_base": str(self.state.target_base), "levels": list(self.state.levels),
                 "pending": [key for key, order in self.state.orders.items() if not order.done],

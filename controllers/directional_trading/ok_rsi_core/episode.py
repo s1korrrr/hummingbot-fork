@@ -562,6 +562,8 @@ class EpisodeState:
     structure_runner_active: bool = False
     exit_target_revision: int = 0
     last_exit_trail_breach: str = "NONE"
+    last_exit_hourly_recovered: bool = False
+    last_exit_risk_clear: bool = False
     fault: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -572,6 +574,8 @@ class EpisodeState:
             values.pop("exit_target_revision")
         if self.last_exit_trail_breach == "NONE":
             values.pop("last_exit_trail_breach")
+            values.pop("last_exit_hourly_recovered")
+            values.pop("last_exit_risk_clear")
         for order in values["orders"].values():
             request = order["request"]
             if request["exit_policy"] == "DEFAULT":
@@ -598,7 +602,16 @@ class EpisodeState:
             values.setdefault("structure_runner_active", False)
             values.setdefault("exit_target_revision", 0)
             values.setdefault("last_exit_trail_breach", "NONE")
-            for name in ("assignment_consumed", "cost_known", "adverse_entry_latched", "structure_runner_active"):
+            values.setdefault("last_exit_hourly_recovered", False)
+            values.setdefault("last_exit_risk_clear", False)
+            for name in (
+                "assignment_consumed",
+                "cost_known",
+                "adverse_entry_latched",
+                "structure_runner_active",
+                "last_exit_hourly_recovered",
+                "last_exit_risk_clear",
+            ):
                 if type(values[name]) is not bool:
                     raise EpisodeInputError(f"invalid checkpoint boolean {name}")
             for name in (
@@ -955,11 +968,21 @@ def _structure_exit_receipt(
 ) -> dict[str, Any]:
     if not config.structure_held_runner:
         return {}
+    use_target_context = (
+        state.last_exit_trail_breach != "NONE"
+        and (state.structure_runner_active or state.phase == "EXIT")
+    )
     return {
         "exit_policy": "STRUCTURE_HELD_RUNNER_V1",
-        "exit_hourly_recovered": market.hourly_recovered,
-        "exit_risk_clear": not (market.cascade or market.hostile or market.reset),
-        "exit_trail_breach": trail_breach,
+        "exit_hourly_recovered": (
+            state.last_exit_hourly_recovered if use_target_context else market.hourly_recovered
+        ),
+        "exit_risk_clear": (
+            state.last_exit_risk_clear
+            if use_target_context
+            else not (market.cascade or market.hostile or market.reset)
+        ),
+        "exit_trail_breach": state.last_exit_trail_breach if use_target_context else trail_breach,
         "exit_target_base": state.target_base,
         "exit_target_revision": state.exit_target_revision,
     }
@@ -1154,6 +1177,7 @@ def transition(
         equity_breached = equity <= state.equity_floor
         trail_breach = _exit_trail_breach(price_breached=price_breached, equity_breached=equity_breached)
         risk_clear = not (market.cascade or market.hostile or market.reset)
+        entering_exit = state.phase != "EXIT"
         hold_structure = (
             config.structure_held_runner
             and state.phase != "EXIT"
@@ -1176,16 +1200,20 @@ def transition(
             _reduce_exit_target(config, state, state.distribution_start_base * config.remaining_fractions[-1])
             state.structure_runner_active = True
             state.last_exit_trail_breach = trail_breach
+            state.last_exit_hourly_recovered = market.hourly_recovered
+            state.last_exit_risk_clear = risk_clear
             structure_runner_distribution = True
         elif trail_breach != "NONE" or force_structure_exit:
             if state.phase != "EXIT" and not recovery_trail:
                 state.exit_intent = "TRAILING_PROFIT_EXIT"
             state.phase = "EXIT"
             _reduce_exit_target(config, state, ZERO)
-            if config.structure_held_runner and not recovery_trail:
+            if config.structure_held_runner and not recovery_trail and entering_exit:
                 state.structure_runner_active = False
                 exit_breach = "RISK_OVERRIDE" if not risk_clear else trail_breach
                 state.last_exit_trail_breach = exit_breach
+                state.last_exit_hourly_recovered = market.hourly_recovered
+                state.last_exit_risk_clear = risk_clear
         elif state.phase != "EXIT" and not recovery_trail:
             extension = (state.peak - state.distribution_basis) / state.distribution_atr
             for threshold, fraction in zip(config.distribution_atr_levels, config.remaining_fractions):
@@ -1226,6 +1254,8 @@ def transition(
         state.structure_runner_active = False
         state.exit_target_revision = 0
         state.last_exit_trail_breach = "NONE"
+        state.last_exit_hourly_recovered = False
+        state.last_exit_risk_clear = False
         return Transition(state, reason="markup_armed")
     if market.cascade or (market.hostile and state.base > 0):
         if state.base:

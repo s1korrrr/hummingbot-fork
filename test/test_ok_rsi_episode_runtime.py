@@ -176,6 +176,8 @@ def test_status_exposes_persisted_structure_runner_state():
     runtime.state.structure_runner_active = True
     runtime.state.exit_target_revision = 3
     runtime.state.last_exit_trail_breach = "EQUITY"
+    runtime.state.last_exit_hourly_recovered = True
+    runtime.state.last_exit_risk_clear = True
     runtime.last_market = SimpleNamespace(
         hourly_recovered=True,
         cascade=False,
@@ -191,6 +193,8 @@ def test_status_exposes_persisted_structure_runner_state():
     assert status["structure_runner_active"] is True
     assert status["structure_runner_target_base"] == "0.4"
     assert status["last_exit_trail_breach"] == "EQUITY"
+    assert status["last_exit_hourly_recovered"] is True
+    assert status["last_exit_risk_clear"] is True
     assert status["exit_target_revision"] == 3
 
 

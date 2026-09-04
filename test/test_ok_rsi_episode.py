@@ -1199,6 +1199,60 @@ def test_structure_runner_terminal_target_cancels_pending_excess_without_duplica
     assert not terminal.requests
 
 
+def test_terminal_retry_preserves_context_that_revised_the_target():
+    cfg = config(structure_held_runner=True)
+    held = transition(
+        cfg,
+        _structure_runner_setup(cfg),
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+    )
+    pending = held.requests[0]
+    terminal = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6300,
+            bid=D("102.3"),
+            ask=D("102.3"),
+            low=D("102.3"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=False,
+        ),
+    )
+    retried = transition(
+        cfg,
+        terminal.state,
+        market(
+            timestamp=6360,
+            bid=D("102.2"),
+            ask=D("102.2"),
+            low=D("102.2"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+        [OrderUpdate(pending.id, filled_base=D("0"), filled_quote=D("0"), done=True)],
+    )
+
+    assert retried.requests[0].amount == D("1")
+    assert retried.requests[0].exit_hourly_recovered is False
+    assert retried.requests[0].exit_risk_clear is True
+    assert retried.requests[0].exit_trail_breach == "PRICE_AND_EQUITY"
+    assert retried.requests[0].exit_target_revision == 2
+
+
 @pytest.mark.parametrize("risk_flag", ["cascade", "hostile", "reset"])
 def test_structure_runner_never_protects_inventory_during_unsafe_context(risk_flag):
     cfg = config(structure_held_runner=True)

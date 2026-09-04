@@ -127,6 +127,7 @@ class EpisodeConfig:
     recovery_exit_enabled: bool = False
     adaptive_entry_pricing: bool = False
     scout_rebound_confirmation: bool = False
+    recovery_aware_scout: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -145,6 +146,7 @@ class EpisodeConfig:
             "recovery_exit_enabled",
             "adaptive_entry_pricing",
             "scout_rebound_confirmation",
+            "recovery_aware_scout",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -166,8 +168,14 @@ class EpisodeConfig:
             or not ZERO < self.trail_min <= self.trail_max < ONE
         ):
             raise EpisodeInputError("invalid fee, sizing factor or trailing range")
-        if self.adaptive_entry_pricing and self.scout_rebound_confirmation:
-            raise EpisodeInputError("adaptive maker and rebound scout treatments cannot be combined")
+        if sum(
+            (
+                self.adaptive_entry_pricing,
+                self.scout_rebound_confirmation,
+                self.recovery_aware_scout,
+            )
+        ) > 1:
+            raise EpisodeInputError("entry treatments cannot be combined")
         for name in ("level_fractions", "dip_atr_levels", "distribution_atr_levels", "remaining_fractions"):
             object.__setattr__(self, name, tuple(_decimal(x, name, positive=True) for x in getattr(self, name)))
         if (
@@ -210,6 +218,8 @@ class EpisodeConfig:
             values.pop("adaptive_entry_pricing")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
+        if not self.recovery_aware_scout:
+            values.pop("recovery_aware_scout")
         return _hash(values)
 
 
@@ -332,7 +342,11 @@ class OrderRequest:
             raise EpisodeInputError("invalid request intent")
         if self.pricing_policy not in {"UNRECORDED", "TOP_OF_BOOK", "ADAPTIVE_MAKER_V1"}:
             raise EpisodeInputError("invalid entry pricing policy")
-        if self.setup_policy not in {"IMMEDIATE", "SCOUT_REBOUND_V1"}:
+        if self.setup_policy not in {
+            "IMMEDIATE",
+            "SCOUT_REBOUND_V1",
+            "RECOVERY_AWARE_SCOUT_V1",
+        }:
             raise EpisodeInputError("invalid entry setup policy")
         if self.intent != "UNSPECIFIED" and (
             (self.side == "BUY" and self.intent not in {"SCOUT_BUY", "SCALE_IN_BUY"})
@@ -365,6 +379,13 @@ class OrderRequest:
         if self.setup_policy == "IMMEDIATE":
             if any((self.setup_started_at, self.setup_low, self.setup_rebound, self.setup_no_new_low)):
                 raise EpisodeInputError("immediate entry cannot carry rebound setup state")
+        elif self.setup_policy == "RECOVERY_AWARE_SCOUT_V1":
+            if (
+                self.side != "BUY"
+                or self.level != 0
+                or any((self.setup_started_at, self.setup_low, self.setup_rebound, self.setup_no_new_low))
+            ):
+                raise EpisodeInputError("recovery-aware scout receipt contradicts request")
         elif (
             self.side != "BUY"
             or self.level != 0
@@ -1000,6 +1021,8 @@ def transition(
     if not state.episode_id:
         if not market.entry_signal or market.ask > market.anchor - config.dip_atr_levels[0] * market.atr_1h:
             return Transition(state, reason="need_dislocation")
+        if config.recovery_aware_scout and market.recovery:
+            return Transition(state, reason="recovery_scout_deferred")
         _start_episode(config, state, market)
     elif config.adaptive_entry_pricing and state.gross_spent == 0 and state.levels[0] == "OPEN" and market.entry_signal:
         # A fresh signal after a zero-fill expiry gets fresh causal levels while
@@ -1056,6 +1079,8 @@ def transition(
         )
         if level not in eligible:
             return Transition(state, reason="need_scout_level")
+    if config.recovery_aware_scout and level == 0:
+        setup_receipt = {"setup_policy": "RECOVERY_AWARE_SCOUT_V1"}
     factor = (
         config.hostile_scout_fraction
         if market.hostile or (level == 0 and state.adverse_entry_latched)

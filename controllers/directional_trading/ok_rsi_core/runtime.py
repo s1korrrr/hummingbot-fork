@@ -77,6 +77,7 @@ def policy_config(config):
         recovery_exit_enabled=config.episode_recovery_exit_enabled,
         adaptive_entry_pricing=config.episode_adaptive_entry_pricing,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
+        recovery_aware_scout=config.episode_recovery_aware_scout,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )

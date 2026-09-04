@@ -222,10 +222,71 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values = asdict(cfg)
     legacy_values.pop("adaptive_entry_pricing")
     legacy_values.pop("scout_rebound_confirmation")
+    legacy_values.pop("recovery_aware_scout")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
     assert replace(cfg, scout_rebound_confirmation=True).identity != cfg.identity
+    assert replace(cfg, recovery_aware_scout=True).identity != cfg.identity
+
+
+def test_recovery_aware_scout_preserves_immediate_non_recovery_entry():
+    baseline = transition(config(), EpisodeState(), market(recovery=False))
+    routed = transition(
+        config(recovery_aware_scout=True),
+        EpisodeState(),
+        market(recovery=False),
+    )
+
+    assert routed.reason == baseline.reason == "scout"
+    assert len(routed.requests) == len(baseline.requests) == 1
+    expected = baseline.requests[0]
+    request = routed.requests[0]
+    assert (request.id, request.amount, request.price, request.reserved_quote) == (
+        expected.id,
+        expected.amount,
+        expected.price,
+        expected.reserved_quote,
+    )
+    assert request.setup_policy == "RECOVERY_AWARE_SCOUT_V1"
+    assert request.setup_started_at == 0
+    assert request.setup_low == 0
+    assert EpisodeState.from_dict(routed.state.to_dict()).orders[request.id].request == request
+
+
+def test_recovery_aware_scout_defers_recovery_pulse_and_requires_later_signal():
+    cfg = config(recovery_aware_scout=True)
+
+    deferred = transition(cfg, EpisodeState(), market(recovery=True))
+    cleared_without_signal = transition(
+        cfg,
+        deferred.state,
+        market(timestamp=6060, recovery=False, entry_signal=False),
+    )
+    admitted = transition(
+        cfg,
+        cleared_without_signal.state,
+        market(timestamp=6120, recovery=False, entry_signal=True),
+    )
+
+    assert deferred.reason == "recovery_scout_deferred"
+    assert deferred.requests == ()
+    assert deferred.state.episode_id is None
+    assert cleared_without_signal.reason == "need_dislocation"
+    assert admitted.reason == "scout"
+    assert admitted.requests[0].setup_policy == "RECOVERY_AWARE_SCOUT_V1"
+
+
+@pytest.mark.parametrize("context", [{"hostile": True}, {"reset": True}, {"hostile": True, "reset": True}])
+def test_recovery_aware_scout_does_not_veto_non_recovery_hostile_or_reset_context(context):
+    result = transition(
+        config(recovery_aware_scout=True),
+        EpisodeState(),
+        market(recovery=False, **context),
+    )
+
+    assert result.reason == "scout"
+    assert result.requests[0].setup_policy == "RECOVERY_AWARE_SCOUT_V1"
 
 
 def test_rebound_scout_latches_signal_tracks_low_and_waits_for_causal_reclaim():
@@ -337,6 +398,10 @@ def test_rebound_scout_is_opt_in_and_sell_only_never_arms_it():
 def test_entry_treatments_cannot_be_composed_without_a_new_policy_contract():
     with pytest.raises(EpisodeInputError, match="cannot be combined"):
         config(adaptive_entry_pricing=True, scout_rebound_confirmation=True)
+    with pytest.raises(EpisodeInputError, match="cannot be combined"):
+        config(adaptive_entry_pricing=True, recovery_aware_scout=True)
+    with pytest.raises(EpisodeInputError, match="cannot be combined"):
+        config(scout_rebound_confirmation=True, recovery_aware_scout=True)
 
 
 def test_stabilization_window_must_fit_before_setup_expiry():

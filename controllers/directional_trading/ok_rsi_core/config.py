@@ -44,6 +44,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_enabled: bool = hl_rsi.Field(default=False)
     episode_adaptive_entry_pricing: bool = False
     episode_scout_rebound_confirmation: bool = False
+    episode_recovery_aware_scout: bool = False
     episode_fee_rate: Decimal = hl_rsi.Field(default=Decimal("0.001"), ge=0, lt=Decimal("0.1"))
     episode_assignment_id: Optional[str] = None
     episode_initial_base: Decimal = hl_rsi.Field(default=Decimal("0"), ge=0)

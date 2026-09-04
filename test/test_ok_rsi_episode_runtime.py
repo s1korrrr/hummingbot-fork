@@ -98,6 +98,35 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.rebound_atr == Decimal("0.25")
 
 
+def test_recovery_aware_scout_maps_context_and_persists_route_receipt():
+    controller, store = setup_controller(episode_recovery_aware_scout=True)
+
+    recovery_context = context() | {"recovery": True}
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=recovery_context,
+    ):
+        assert controller.determine_executor_actions() == []
+    assert controller._episode_runtime.reason == "recovery_scout_deferred"
+    assert controller._episode_runtime.state.episode_id is None
+
+    restarted, _ = setup_controller(store=store, episode_recovery_aware_scout=True)
+    restarted.market_data_provider.time.return_value = 10080
+    next_context = context() | {"timestamp": 10080, "recovery": False}
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=next_context,
+    ):
+        created = restarted.determine_executor_actions()
+
+    assert len(created) == 1
+    executor = created[0].executor_config
+    assert executor.episode_setup_policy == "RECOVERY_AWARE_SCOUT_V1"
+    assert executor.episode_setup_started_at == 0
+    status = restarted.get_custom_info()["episode"]
+    assert status["last_entry_setup_policy"] == "RECOVERY_AWARE_SCOUT_V1"
+
+
 def test_rebound_scout_persists_setup_then_emits_exact_owner_receipt():
     controller, store = setup_controller(episode_scout_rebound_confirmation=True)
 

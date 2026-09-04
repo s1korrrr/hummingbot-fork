@@ -1,7 +1,8 @@
-# OK RSI scout probe and rebound completion v17
+# OK RSI bounded markup runner v18
 
-- [x] Add RED probe/remainder, abandonment, restart, parity, and receipt tests.
-- [x] Implement the bounded scout split in `ok_rsi_core` and runtime config.
-- [x] Cover exact quote caps, late receipts, `buy_sell`, and `sell_only`.
-- [x] Run the full focused native suite, Ruff, and shadow diff.
+- [x] Diagnose V7/V8/V15 and freeze the existing final-distribution boundary.
+- [x] Add RED runner eligibility, boundary, restart, and receipt tests.
+- [x] Implement the bounded markup runner in `ok_rsi_core` and runtime config.
+- [x] Cover exact default-off identity, risk exits, and `sell_only` buy inertia.
+- [x] Run the focused native suite, Ruff, and shadow diff.
 - [ ] Hand the exact native source identity to the Quants Lab replay.

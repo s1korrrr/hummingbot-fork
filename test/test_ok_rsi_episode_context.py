@@ -57,6 +57,7 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_scout_probe_fraction == Decimal("0.5")
     assert legacy.episode_structure_held_runner is False
     assert legacy.episode_markup_release_runner is False
+    assert legacy.episode_bounded_markup_runner is False
     assert legacy.episode_scout_rebound_confirmation is False
     assert legacy.episode_recovery_aware_scout is False
     with pytest.raises(ValueError, match="assignment"):

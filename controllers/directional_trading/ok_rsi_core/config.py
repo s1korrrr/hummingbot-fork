@@ -60,6 +60,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_recovery_rebound_scout: bool = False
     episode_structure_held_runner: bool = False
     episode_markup_release_runner: bool = False
+    episode_bounded_markup_runner: bool = False
     episode_fee_rate: Decimal = hl_rsi.Field(default=Decimal("0.001"), ge=0, lt=Decimal("0.1"))
     episode_assignment_id: Optional[str] = None
     episode_initial_base: Decimal = hl_rsi.Field(default=Decimal("0"), ge=0)
@@ -223,6 +224,11 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError("buy_sell episode requires fresh inventory")
         if self.episode_markup_release_runner and not self.episode_structure_held_runner:
             raise ValueError("markup release runner requires structure held runner")
+        if (
+            self.episode_bounded_markup_runner
+            and not self.episode_markup_release_runner
+        ):
+            raise ValueError("bounded markup runner requires markup release runner")
         if self.episode_adaptive_reserved_entry and not self.episode_adaptive_entry_pricing:
             raise ValueError("reserved adaptive entry requires adaptive entry pricing")
         if self.episode_adaptive_reference_fallback and not self.episode_adaptive_reserved_entry:

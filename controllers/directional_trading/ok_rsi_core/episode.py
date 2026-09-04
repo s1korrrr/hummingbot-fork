@@ -54,6 +54,7 @@ EXIT_POLICIES = {
     "DEFAULT",
     "STRUCTURE_HELD_RUNNER_V1",
     "MARKUP_RELEASED_RUNNER_V1",
+    "BOUNDED_MARKUP_RUNNER_V7",
     "THIN_SCOUT_RELEASE_V1",
     "DEEP_RECOVERY_CAPITAL_RELEASE_V4",
     "DEEP_RECOVERY_ROTATION_EXIT_V5",
@@ -185,6 +186,7 @@ class EpisodeConfig:
     recovery_rebound_scout: bool = False
     structure_held_runner: bool = False
     markup_release_runner: bool = False
+    bounded_markup_runner: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -216,6 +218,7 @@ class EpisodeConfig:
             "recovery_rebound_scout",
             "structure_held_runner",
             "markup_release_runner",
+            "bounded_markup_runner",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -257,6 +260,8 @@ class EpisodeConfig:
             raise EpisodeInputError("scout probe treatment cannot be combined")
         if self.markup_release_runner and not self.structure_held_runner:
             raise EpisodeInputError("markup release runner requires structure held runner")
+        if self.bounded_markup_runner and not self.markup_release_runner:
+            raise EpisodeInputError("bounded markup runner requires markup release runner")
         if self.adaptive_reserved_entry and not self.adaptive_entry_pricing:
             raise EpisodeInputError("reserved adaptive entry requires adaptive entry pricing")
         if self.adaptive_reference_fallback and not self.adaptive_reserved_entry:
@@ -344,6 +349,8 @@ class EpisodeConfig:
             values.pop("structure_held_runner")
         if not self.markup_release_runner:
             values.pop("markup_release_runner")
+        if not self.bounded_markup_runner:
+            values.pop("bounded_markup_runner")
         return _hash(values)
 
 
@@ -538,7 +545,10 @@ class OrderRequest:
                 raise EpisodeInputError("default exit policy cannot carry structure receipt")
         elif self.side != "SELL":
             raise EpisodeInputError("structure exit policy requires a sell request")
-        elif self.exit_trail_breach == "MARKUP_LOSS" and self.exit_policy != "MARKUP_RELEASED_RUNNER_V1":
+        elif self.exit_trail_breach == "MARKUP_LOSS" and self.exit_policy not in {
+            "MARKUP_RELEASED_RUNNER_V1",
+            "BOUNDED_MARKUP_RUNNER_V7",
+        }:
             raise EpisodeInputError("markup loss receipt requires markup release policy")
         elif self.exit_trail_breach == "RISK_OVERRIDE" and self.exit_risk_clear:
             raise EpisodeInputError("risk override receipt contradicts clear context")
@@ -1663,7 +1673,9 @@ def _exit_receipt(
     )
     return {
         "exit_policy": (
-            "MARKUP_RELEASED_RUNNER_V1"
+            "BOUNDED_MARKUP_RUNNER_V7"
+            if config.bounded_markup_runner
+            else "MARKUP_RELEASED_RUNNER_V1"
             if config.markup_release_runner
             else "STRUCTURE_HELD_RUNNER_V1"
         ),
@@ -1909,6 +1921,19 @@ def transition(
         trail_breach = _exit_trail_breach(price_breached=price_breached, equity_breached=equity_breached)
         risk_clear = not (market.cascade or market.hostile or market.reset)
         entering_exit = state.phase != "EXIT"
+        distribution_extension = (
+            (state.peak - state.distribution_basis) / state.distribution_atr
+            if not recovery_trail
+            else None
+        )
+        bounded_runner_eligible = (
+            not config.bounded_markup_runner
+            or (
+                distribution_extension is not None
+                and distribution_extension >= ZERO
+                and distribution_extension < config.distribution_atr_levels[-1]
+            )
+        )
         hold_structure = (
             config.structure_held_runner
             and state.phase != "EXIT"
@@ -1916,6 +1941,7 @@ def transition(
             and trail_breach != "NONE"
             and market.hourly_recovered
             and risk_clear
+            and bounded_runner_eligible
             and (not config.markup_release_runner or market.markup)
         )
         markup_release = (
@@ -1963,7 +1989,9 @@ def transition(
                 state.last_exit_hourly_recovered = market.hourly_recovered
                 state.last_exit_risk_clear = risk_clear
         elif state.phase != "EXIT" and not recovery_trail:
-            extension = (state.peak - state.distribution_basis) / state.distribution_atr
+            if distribution_extension is None:
+                raise EpisodeInputError("distribution extension unavailable")
+            extension = distribution_extension
             thin_scout = (
                 config.thin_scout_release
                 and config.mode == "buy_sell"

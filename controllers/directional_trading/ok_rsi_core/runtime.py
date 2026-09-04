@@ -92,6 +92,7 @@ def policy_config(config):
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
         structure_held_runner=config.episode_structure_held_runner,
         markup_release_runner=config.episode_markup_release_runner,
+        bounded_markup_runner=config.episode_bounded_markup_runner,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -195,6 +196,12 @@ class EpisodeRuntime:
             if self.state.distribution_atr > ZERO
             else None
         )
+        bounded_runner_eligible = (
+            self.config.bounded_markup_runner
+            and distribution_extension is not None
+            and distribution_extension >= ZERO
+            and distribution_extension < self.config.distribution_atr_levels[-1]
+        )
         if self.state.exit_intent == "THIN_SCOUT_RELEASE":
             exit_policy = "THIN_SCOUT_RELEASE_V1"
         elif self.state.exit_intent == "RECOVERY_ROTATION_EXIT":
@@ -203,6 +210,8 @@ class EpisodeRuntime:
             exit_policy = "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
         elif self.state.exit_intent == "RECOVERY_CAPITAL_RELEASE":
             exit_policy = "DEEP_RECOVERY_CAPITAL_RELEASE_V4"
+        elif self.config.bounded_markup_runner:
+            exit_policy = "BOUNDED_MARKUP_RUNNER_V7"
         elif self.config.markup_release_runner:
             exit_policy = "MARKUP_RELEASED_RUNNER_V1"
         elif self.config.structure_held_runner:
@@ -262,6 +271,13 @@ class EpisodeRuntime:
                 "deep_recovery_capital_release_enabled": self.config.deep_recovery_capital_release,
                 "deep_recovery_rotation_exit_enabled": self.config.deep_recovery_rotation_exit,
                 "deep_recovery_strength_runner_enabled": self.config.deep_recovery_strength_runner,
+                "bounded_markup_runner_enabled": self.config.bounded_markup_runner,
+                "bounded_markup_runner_max_extension_atr": (
+                    str(self.config.distribution_atr_levels[-1])
+                    if self.config.bounded_markup_runner
+                    else None
+                ),
+                "bounded_markup_runner_eligible": bounded_runner_eligible,
                 "scout_probe_rebound_enabled": self.config.scout_probe_rebound,
                 "scout_probe_fraction": str(self.config.scout_probe_fraction),
                 "scout_plan_quote": str(self.state.scout_plan_quote),

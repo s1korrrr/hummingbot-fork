@@ -195,6 +195,7 @@ def test_stage_preserving_status_exposes_causal_target_stage():
     assert status["stage_preserving_runner_enabled"] is True
     assert status["stage_preserving_runner_stage_index"] == 1
     assert status["stage_preserving_runner_threshold_atr"] == "4"
+    assert status["stage_preserving_runner_next_threshold_atr"] == "7"
     assert status["stage_preserving_runner_target_fraction"] == "0.8"
     assert status["stage_preserving_runner_target_base"] == "0.8"
     assert status["exit_policy"] == "STAGE_PRESERVING_RUNNER_V8"

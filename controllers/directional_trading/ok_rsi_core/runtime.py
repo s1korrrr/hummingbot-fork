@@ -214,6 +214,11 @@ class EpisodeRuntime:
             self.state,
             distribution_extension,
         )
+        stage_next_threshold = (
+            self.config.distribution_atr_levels[stage_index]
+            if stage_index < len(self.config.distribution_atr_levels)
+            else None
+        )
         if self.state.exit_intent == "THIN_SCOUT_RELEASE":
             exit_policy = "THIN_SCOUT_RELEASE_V1"
         elif self.state.exit_intent == "RECOVERY_ROTATION_EXIT":
@@ -300,6 +305,12 @@ class EpisodeRuntime:
                     str(stage_threshold)
                     if self.config.stage_preserving_runner
                     and stage_threshold is not None
+                    else None
+                ),
+                "stage_preserving_runner_next_threshold_atr": (
+                    str(stage_next_threshold)
+                    if self.config.stage_preserving_runner
+                    and stage_next_threshold is not None
                     else None
                 ),
                 "stage_preserving_runner_target_fraction": (

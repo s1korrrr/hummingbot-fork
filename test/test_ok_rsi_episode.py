@@ -629,6 +629,8 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("deep_recovery_capital_release")
     legacy_values.pop("deep_recovery_rotation_exit")
     legacy_values.pop("deep_recovery_strength_runner")
+    legacy_values.pop("scout_probe_rebound")
+    legacy_values.pop("scout_probe_fraction")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -1090,6 +1092,268 @@ def test_entry_treatments_cannot_be_composed_without_a_new_policy_contract():
 def test_stabilization_window_must_fit_before_setup_expiry():
     with pytest.raises(EpisodeInputError, match="stabilization_bars cannot exceed setup_bars"):
         config(setup_bars=10, stabilization_bars=15)
+
+
+def test_scout_probe_preserves_price_and_confirms_quote_bounded_remainder():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        adaptive_reserved_entry=True,
+        adaptive_reference_fallback=True,
+        scout_probe_rebound=True,
+        scout_probe_fraction=D("0.5"),
+    )
+    opened = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("1"), bid=D("99.99"), ask=D("100")),
+    )
+    probe = opened.requests[0]
+
+    assert probe.intent == "SCOUT_BUY"
+    assert probe.setup_policy == "SCOUT_PROBE_REBOUND_V1"
+    assert probe.setup_started_at == 6000
+    assert probe.setup_low == D("100")
+    assert probe.setup_rebound == 0
+    assert probe.reference_price == D("100")
+    assert probe.reserved_quote <= D("50")
+    assert opened.state.scout_plan_quote == D("100")
+    assert opened.state.scout_probe_request_id == probe.id
+
+    probe_quote = probe.amount * probe.price
+    filled = transition(
+        cfg,
+        opened.state,
+        market(
+            timestamp=6060,
+            bid=D("98.19"),
+            ask=D("98.20"),
+            low=D("98"),
+            base_available=probe.amount,
+            entry_signal=False,
+            entry_confidence=D("1"),
+        ),
+        [
+            OrderUpdate(
+                probe.id,
+                filled_base=probe.amount,
+                filled_quote=probe_quote,
+                done=True,
+                terminal_cause="FILLED",
+            )
+        ],
+    )
+    once = transition(
+        cfg,
+        filled.state,
+        market(
+            timestamp=6120,
+            bid=D("98.19"),
+            ask=D("98.20"),
+            low=D("98.10"),
+            base_available=probe.amount,
+            entry_signal=False,
+            entry_confidence=D("1"),
+        ),
+    )
+    confirmed = transition(
+        cfg,
+        once.state,
+        market(
+            timestamp=6180,
+            bid=D("98.39"),
+            ask=D("98.40"),
+            low=D("98.10"),
+            base_available=probe.amount,
+            entry_signal=False,
+            entry_confidence=D("1"),
+        ),
+    )
+
+    assert filled.reason == "need_scout_probe_rebound"
+    assert once.reason == "need_scout_probe_rebound"
+    assert len(confirmed.requests) == 1
+    remainder = confirmed.requests[0]
+    assert confirmed.reason == "scout_probe_remainder"
+    assert remainder.level == 0
+    assert remainder.intent == "SCOUT_BUY"
+    assert remainder.setup_policy == "SCOUT_PROBE_REBOUND_V1"
+    assert remainder.setup_started_at == 6000
+    assert remainder.setup_low == D("98")
+    assert remainder.setup_rebound == D("0.25")
+    assert remainder.setup_no_new_low == 2
+    assert remainder.reference_price == D("98.40")
+    assert remainder.reference_price >= remainder.setup_low + remainder.setup_rebound
+    assert probe_quote + remainder.reserved_quote <= D("100")
+    assert confirmed.state.scout_plan_quote == 0
+
+
+@pytest.mark.parametrize("unsafe", ["recovery", "hostile", "reset", "cascade"])
+def test_scout_probe_unsafe_context_abandons_only_unspent_remainder(unsafe):
+    cfg = config(scout_probe_rebound=True, scout_probe_fraction=D("0.5"))
+    opened = transition(cfg, EpisodeState(), market())
+    probe = opened.requests[0]
+    probe_quote = probe.amount * probe.price
+    result = transition(
+        cfg,
+        opened.state,
+        market(
+            timestamp=6060,
+            base_available=probe.amount,
+            entry_signal=False,
+            **{unsafe: True},
+        ),
+        [
+            OrderUpdate(
+                probe.id,
+                filled_base=probe.amount,
+                filled_quote=probe_quote,
+                done=True,
+            )
+        ],
+    )
+
+    assert not result.requests
+    assert result.state.base == probe.amount
+    assert result.state.scout_plan_quote == 0
+    assert result.state.scout_probe_request_id == ""
+
+
+def test_scout_probe_timeout_and_zero_fill_do_not_leave_stale_remainder():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        scout_probe_rebound=True,
+        scout_probe_fraction=D("0.5"),
+    )
+    opened = transition(cfg, EpisodeState(), market(entry_confidence=D("1")))
+    probe = opened.requests[0]
+    zero = transition(
+        cfg,
+        opened.state,
+        market(timestamp=6060, entry_signal=False, entry_confidence=D("1")),
+        [
+            OrderUpdate(
+                probe.id,
+                filled_base=0,
+                filled_quote=0,
+                done=True,
+            )
+        ],
+    )
+    assert zero.state.scout_plan_quote == 0
+    assert zero.state.scout_probe_request_id == ""
+    assert zero.state.levels[0] == "OPEN"
+
+    reopened = transition(cfg, zero.state, market(timestamp=6120, entry_confidence=D("1")))
+    retried = reopened.requests[0]
+    retried_quote = retried.amount * retried.price
+    timed_out = transition(
+        cfg,
+        reopened.state,
+        market(
+            timestamp=6120 + cfg.setup_bars * cfg.interval_seconds,
+            base_available=retried.amount,
+            entry_signal=False,
+            entry_confidence=D("1"),
+        ),
+        [
+            OrderUpdate(
+                retried.id,
+                filled_base=retried.amount,
+                filled_quote=retried_quote,
+                done=True,
+            )
+        ],
+    )
+    assert not timed_out.requests
+    assert timed_out.state.base == retried.amount
+    assert timed_out.state.scout_plan_quote == 0
+    assert timed_out.state.scout_probe_request_id == ""
+
+
+def test_scout_remainder_zero_fill_cannot_reopen_filled_probe_level():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        scout_probe_rebound=True,
+        scout_probe_fraction=D("0.5"),
+        stabilization_bars=1,
+    )
+    opened = transition(cfg, EpisodeState(), market(entry_confidence=D("1")))
+    probe = opened.requests[0]
+    probe_quote = probe.amount * probe.price
+    waiting = transition(
+        cfg,
+        opened.state,
+        market(
+            timestamp=6060,
+            bid=D("98"),
+            ask=D("98"),
+            low=D("97"),
+            base_available=probe.amount,
+            entry_signal=False,
+            entry_confidence=D("1"),
+        ),
+        [
+            OrderUpdate(
+                probe.id,
+                filled_base=probe.amount,
+                filled_quote=probe_quote,
+                done=True,
+            )
+        ],
+    )
+    confirmed = transition(
+        cfg,
+        waiting.state,
+        market(
+            timestamp=6120,
+            bid=D("97.49"),
+            ask=D("97.50"),
+            low=D("97.10"),
+            base_available=probe.amount,
+            entry_signal=False,
+            entry_confidence=D("1"),
+        ),
+    )
+    remainder = confirmed.requests[0]
+    expired = transition(
+        cfg,
+        confirmed.state,
+        market(
+            timestamp=6180,
+            base_available=probe.amount,
+            entry_signal=False,
+            entry_confidence=D("1"),
+        ),
+        [
+            OrderUpdate(
+                remainder.id,
+                filled_base=0,
+                filled_quote=0,
+                done=True,
+            )
+        ],
+    )
+
+    assert expired.state.levels[0] == "AUTHORIZED"
+    assert expired.state.base == probe.amount
+
+
+def test_scout_probe_option_is_identity_neutral_when_disabled_and_inert_in_sell_only():
+    legacy = config()
+    assert config(scout_probe_fraction=D("0.9")).identity == legacy.identity
+    enabled = config(scout_probe_rebound=True, scout_probe_fraction=D("0.5"))
+    assert enabled.identity != legacy.identity
+    sell_only = config(
+        mode="sell_only",
+        assignment_id="bag",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        scout_probe_rebound=True,
+        scout_probe_fraction=D("0.5"),
+    )
+    result = transition(sell_only, EpisodeState(), market(base_available=D("1")))
+    assert not result.requests
+    assert result.state.scout_plan_quote == 0
 
 
 def test_setup_waits_for_two_subsequent_closed_bars_and_skips_crossed_levels():

@@ -51,6 +51,10 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_deep_recovery_capital_release: bool = False
     episode_deep_recovery_rotation_exit: bool = False
     episode_deep_recovery_strength_runner: bool = False
+    episode_scout_probe_rebound: bool = False
+    episode_scout_probe_fraction: Decimal = hl_rsi.Field(
+        default=Decimal("0.5"), gt=Decimal("0"), lt=Decimal("1")
+    )
     episode_scout_rebound_confirmation: bool = False
     episode_recovery_aware_scout: bool = False
     episode_recovery_rebound_scout: bool = False
@@ -246,6 +250,12 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError(
                 "deep recovery strength runner and rotation are mutually exclusive"
             )
+        if self.episode_scout_probe_rebound and (
+            self.episode_scout_rebound_confirmation
+            or self.episode_recovery_aware_scout
+            or self.episode_recovery_rebound_scout
+        ):
+            raise ValueError("scout probe treatment cannot be combined")
         if self.trade_mode == "buy_sell" and not self.use_trailing_exit and not self.episode_enabled:
             raise ValueError("buy_sell mode requires the trailing exit because no other ordinary exit is enabled")
 

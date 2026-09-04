@@ -178,6 +178,8 @@ class EpisodeConfig:
     deep_recovery_capital_release: bool = False
     deep_recovery_rotation_exit: bool = False
     deep_recovery_strength_runner: bool = False
+    scout_probe_rebound: bool = False
+    scout_probe_fraction: Decimal = Decimal(".5")
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -208,6 +210,7 @@ class EpisodeConfig:
             "deep_recovery_capital_release",
             "deep_recovery_rotation_exit",
             "deep_recovery_strength_runner",
+            "scout_probe_rebound",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -222,6 +225,7 @@ class EpisodeConfig:
             "fee_rate",
             "min_profit",
             "hostile_scout_fraction",
+            "scout_probe_fraction",
             "rebound_atr",
             "basis_improvement_atr",
             "last_fill_gap_atr",
@@ -231,6 +235,7 @@ class EpisodeConfig:
         if (
             self.fee_rate >= ONE
             or self.hostile_scout_fraction > ONE
+            or not ZERO < self.scout_probe_fraction <= ONE
             or not ZERO < self.trail_min <= self.trail_max < ONE
         ):
             raise EpisodeInputError("invalid fee, sizing factor or trailing range")
@@ -243,6 +248,13 @@ class EpisodeConfig:
             )
         ) > 1:
             raise EpisodeInputError("entry treatments cannot be combined")
+        if self.scout_probe_rebound and (
+            self.scout_probe_fraction >= ONE
+            or self.scout_rebound_confirmation
+            or self.recovery_aware_scout
+            or self.recovery_rebound_scout
+        ):
+            raise EpisodeInputError("scout probe treatment cannot be combined")
         if self.markup_release_runner and not self.structure_held_runner:
             raise EpisodeInputError("markup release runner requires structure held runner")
         if self.adaptive_reserved_entry and not self.adaptive_entry_pricing:
@@ -319,6 +331,9 @@ class EpisodeConfig:
             values.pop("deep_recovery_rotation_exit")
         if not self.deep_recovery_strength_runner:
             values.pop("deep_recovery_strength_runner")
+        if not self.scout_probe_rebound:
+            values.pop("scout_probe_rebound")
+            values.pop("scout_probe_fraction")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -441,6 +456,8 @@ class OrderRequest:
     setup_low: Decimal = ZERO
     setup_rebound: Decimal = ZERO
     setup_no_new_low: int = 0
+    setup_stage: str = "NONE"
+    setup_plan_quote: Decimal = ZERO
     exit_policy: str = "DEFAULT"
     exit_hourly_recovered: bool = False
     exit_risk_clear: bool = False
@@ -484,11 +501,23 @@ class OrderRequest:
             raise EpisodeInputError("non-fallback request cannot carry a parent request")
         if self.setup_policy not in {
             "IMMEDIATE",
+            "SCOUT_PROBE_REBOUND_V1",
             "SCOUT_REBOUND_V1",
             "RECOVERY_AWARE_SCOUT_V1",
             "RECOVERY_REBOUND_SCOUT_V1",
         }:
             raise EpisodeInputError("invalid entry setup policy")
+        if self.setup_stage not in {"NONE", "PROBE", "REMAINDER"}:
+            raise EpisodeInputError("invalid entry setup stage")
+        object.__setattr__(
+            self,
+            "setup_plan_quote",
+            _decimal(self.setup_plan_quote, "setup_plan_quote"),
+        )
+        if self.setup_policy != "SCOUT_PROBE_REBOUND_V1" and (
+            self.setup_stage != "NONE" or self.setup_plan_quote
+        ):
+            raise EpisodeInputError("non-probe setup cannot carry probe receipt")
         if self.exit_policy not in EXIT_POLICIES or self.exit_trail_breach not in EXIT_TRAIL_BREACHES:
             raise EpisodeInputError("invalid exit policy receipt")
         if type(self.exit_hourly_recovered) is not bool or type(self.exit_risk_clear) is not bool:
@@ -557,9 +586,33 @@ class OrderRequest:
                     self.setup_low,
                     self.setup_rebound,
                     self.setup_no_new_low,
+                    self.setup_stage != "NONE",
+                    self.setup_plan_quote,
                 )
             ):
                 raise EpisodeInputError("immediate entry cannot carry rebound setup state")
+        elif self.setup_policy == "SCOUT_PROBE_REBOUND_V1":
+            probe = (
+                self.setup_stage == "PROBE"
+                and self.setup_started_at > 0
+                and self.setup_confirmation_started_at == 0
+                and self.setup_low > 0
+                and self.setup_rebound == 0
+                and self.setup_no_new_low == 0
+                and self.setup_plan_quote > self.reserved_quote
+            )
+            remainder = (
+                self.setup_stage == "REMAINDER"
+                and self.setup_started_at > 0
+                and self.setup_confirmation_started_at == 0
+                and self.setup_low > 0
+                and self.setup_rebound > 0
+                and self.setup_no_new_low > 0
+                and self.setup_plan_quote >= self.reserved_quote > 0
+                and self.reference_price >= self.setup_low + self.setup_rebound
+            )
+            if self.side != "BUY" or self.level != 0 or not (probe or remainder):
+                raise EpisodeInputError("scout probe receipt contradicts request")
         elif self.setup_policy == "RECOVERY_AWARE_SCOUT_V1":
             if (
                 self.side != "BUY"
@@ -571,6 +624,8 @@ class OrderRequest:
                         self.setup_low,
                         self.setup_rebound,
                         self.setup_no_new_low,
+                        self.setup_stage != "NONE",
+                        self.setup_plan_quote,
                     )
                 )
             ):
@@ -684,6 +739,8 @@ class EpisodeState:
     setup_start: int = 0
     setup_confirmation_start: int = 0
     no_new_low: int = 0
+    scout_plan_quote: Decimal = ZERO
+    scout_probe_request_id: str = ""
     distribution_start_base: Decimal = ZERO
     distribution_basis: Decimal = ZERO
     distribution_atr: Decimal = ZERO
@@ -711,6 +768,10 @@ class EpisodeState:
             values.pop("structure_runner_active")
         if not self.exit_target_revision:
             values.pop("exit_target_revision")
+        if not self.scout_plan_quote:
+            values.pop("scout_plan_quote")
+        if not self.scout_probe_request_id:
+            values.pop("scout_probe_request_id")
         if self.last_exit_trail_breach == "NONE":
             values.pop("last_exit_trail_breach")
             values.pop("last_exit_hourly_recovered")
@@ -721,6 +782,9 @@ class EpisodeState:
             if order["terminal_cause"] == "UNRECORDED":
                 order.pop("terminal_cause")
             request = order["request"]
+            if request["setup_stage"] == "NONE":
+                request.pop("setup_stage")
+                request.pop("setup_plan_quote")
             if not request["parent_request_id"]:
                 request.pop("parent_request_id")
             if request["exit_policy"] == "DEFAULT":
@@ -744,6 +808,10 @@ class EpisodeState:
             values.setdefault("adverse_entry_latched", False)
             values.setdefault("exit_intent", None)
             values.setdefault("setup_confirmation_start", 0)
+            values.setdefault("scout_plan_quote", "0")
+            values.setdefault("scout_probe_request_id", "")
+            if not isinstance(values["scout_probe_request_id"], str):
+                raise EpisodeInputError("invalid scout probe request identity")
             values.setdefault("structure_runner_active", False)
             values.setdefault("exit_target_revision", 0)
             values.setdefault("last_exit_trail_breach", "NONE")
@@ -788,6 +856,7 @@ class EpisodeState:
                 "last_fill_price",
                 "last_valid_bid",
                 "setup_low",
+                "scout_plan_quote",
                 "distribution_start_base",
                 "distribution_basis",
                 "distribution_atr",
@@ -812,6 +881,8 @@ class EpisodeState:
                     raw[name] = _decimal(raw[name], name)
                 request = raw["request"]
                 request.setdefault("parent_request_id", "")
+                request.setdefault("setup_stage", "NONE")
+                request.setdefault("setup_plan_quote", "0")
                 for name in (
                     "amount",
                     "price",
@@ -917,6 +988,25 @@ def _validate_accounting(config: EpisodeConfig, state: EpisodeState) -> None:
         raise EpisodeInputError("checkpoint recovery confirmation clock is invalid")
     if state.episode_id and len(state.levels) != len(config.level_fractions):
         raise EpisodeInputError("checkpoint level allocation mismatch")
+    if state.scout_plan_quote or state.scout_probe_request_id:
+        probe = state.orders.get(state.scout_probe_request_id)
+        if (
+            not config.scout_probe_rebound
+            or state.scout_plan_quote <= ZERO
+            or not state.scout_probe_request_id
+            or state.setup_level != 0
+            or state.setup_start <= 0
+            or state.setup_low <= ZERO
+            or probe is None
+            or probe.request.episode_id != state.episode_id
+            or probe.request.setup_policy != "SCOUT_PROBE_REBOUND_V1"
+            or probe.request.setup_stage != "PROBE"
+            or probe.request.setup_plan_quote != state.scout_plan_quote
+            or state.scout_plan_quote > config.budget_quote
+        ):
+            raise EpisodeInputError("checkpoint scout probe state is invalid")
+    elif state.setup_level == 0 and config.scout_probe_rebound:
+        raise EpisodeInputError("checkpoint scout probe plan is missing")
     current = [order for order in state.orders.values() if order.request.episode_id == state.episode_id]
     fallback_parents = set()
     for child in current:
@@ -1024,6 +1114,13 @@ def _apply_update(config: EpisodeConfig, state: EpisodeState, market: MarketSnap
         and became_terminal
         and not any((update.filled_base, update.filled_quote, update.fee_quote, update.fee_base))
         and state.levels[order.request.level] == "AUTHORIZED"
+        and not any(
+            other.request.episode_id == state.episode_id
+            and other.request.side == "BUY"
+            and other.request.level == order.request.level
+            and other.filled_base > ZERO
+            for other in state.orders.values()
+        )
     ):
         state.levels[order.request.level] = "OPEN"
     for name, value in _accounting(config, state).items():
@@ -1117,6 +1214,161 @@ def _request(
     )
     state.orders[identity] = OrderProgress(request)
     return request
+
+
+def _entry_price_selection(
+    config: EpisodeConfig,
+    market: MarketSnapshot,
+) -> AdaptiveEntryPriceSelection:
+    reference_price = _floor(market.ask, market.price_step)
+    if config.adaptive_entry_pricing:
+        try:
+            selection = select_adaptive_entry_price(
+                bid=market.bid,
+                ask=market.ask,
+                atr_1m=market.atr_1m,
+                price_step=market.price_step,
+                signal_confidence=market.entry_confidence,
+                trend_alignment=market.trend_alignment,
+            )
+        except AdaptiveEntryPriceInputError as exc:
+            raise EpisodeInputError(str(exc)) from exc
+        if config.adaptive_reserved_entry:
+            selection = replace(
+                selection,
+                policy=ADAPTIVE_RESERVED_ENTRY_POLICY,
+            )
+        return selection
+    return AdaptiveEntryPriceSelection(
+        policy="TOP_OF_BOOK",
+        reference_price=reference_price,
+        price=reference_price,
+        discount=ZERO,
+        discount_atr=ZERO,
+        signal_confidence=market.entry_confidence,
+        trend_alignment=market.trend_alignment,
+    )
+
+
+def _clear_scout_probe(state: EpisodeState) -> None:
+    state.scout_plan_quote = ZERO
+    state.scout_probe_request_id = ""
+    state.setup_level = -1
+    state.setup_low = ZERO
+    state.setup_start = 0
+    state.setup_confirmation_start = 0
+    state.no_new_low = 0
+
+
+def _scout_probe_remainder(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    market: MarketSnapshot,
+) -> Transition | None:
+    if not config.scout_probe_rebound or state.scout_plan_quote <= ZERO:
+        return None
+    probe = state.orders.get(state.scout_probe_request_id)
+    if (
+        probe is None
+        or probe.request.episode_id != state.episode_id
+        or probe.request.level != 0
+        or probe.request.setup_policy != "SCOUT_PROBE_REBOUND_V1"
+        or probe.request.setup_stage != "PROBE"
+        or probe.request.setup_plan_quote != state.scout_plan_quote
+    ):
+        raise EpisodeInputError("scout probe checkpoint contradicts authorization")
+    if (
+        not market.valid
+        or market.cascade
+        or market.hostile
+        or market.reset
+        or market.recovery
+        or market.markup
+        or not market.buy_allowed
+        or not market.reservation_allowed
+        or state.phase in {"MARKUP", "DISTRIBUTE", "EXIT", "COOLDOWN"}
+        or market.timestamp - state.setup_start >= config.setup_bars * config.interval_seconds
+    ):
+        _clear_scout_probe(state)
+        return None
+    if probe.done and probe.filled_base <= ZERO:
+        _clear_scout_probe(state)
+        return None
+    if market.low < state.setup_low:
+        state.setup_low = market.low
+        state.no_new_low = 0
+    else:
+        state.no_new_low += 1
+    current = [
+        order
+        for order in state.orders.values()
+        if order.request.episode_id == state.episode_id
+    ]
+    if not probe.done or any(not order.done for order in current):
+        return None
+    rebound = max(
+        config.rebound_atr * market.atr_1m,
+        2 * (market.ask - market.bid),
+    )
+    if (
+        state.no_new_low < config.stabilization_bars
+        or market.ask < state.setup_low + rebound
+    ):
+        return Transition(state, reason="need_scout_probe_rebound")
+    spent = sum(
+        order.filled_quote + order.fee_quote
+        for order in current
+        if order.request.side == "BUY" and order.request.level == 0
+    )
+    cap = state.scout_plan_quote - spent
+    if cap <= ZERO:
+        _clear_scout_probe(state)
+        return None
+    selection = _entry_price_selection(config, market)
+    price = selection.price
+    if price <= ZERO:
+        _clear_scout_probe(state)
+        return Transition(state, reason="price_below_tick")
+    amount = _floor(cap / (price * (ONE + config.fee_rate)), market.amount_step)
+    reserve = amount * price * (ONE + config.fee_rate)
+    if amount <= ZERO or amount < market.min_amount or amount * price < market.min_notional:
+        _clear_scout_probe(state)
+        return Transition(state, reason="scout_probe_remainder_below_exchange_minimum")
+    if reserve > remaining_budget(config, state) or reserve > market.quote_available:
+        return Transition(state, reason="scout_probe_remainder_insufficient_cash")
+    if state.base * market.ask + amount * market.ask > config.mark_cap_quote:
+        return Transition(state, reason="scout_probe_remainder_mark_cap")
+    if state.base <= ZERO:
+        raise EpisodeInputError("scout probe remainder requires attributed inventory")
+    before = state.cost / state.base
+    after = (state.cost + reserve) / (state.base + amount)
+    if before - after < config.basis_improvement_atr * state.frozen_atr:
+        return Transition(state, reason="scout_probe_remainder_basis_guard")
+    setup_receipt = {
+        "setup_policy": "SCOUT_PROBE_REBOUND_V1",
+        "setup_started_at": state.setup_start,
+        "setup_low": state.setup_low,
+        "setup_rebound": rebound,
+        "setup_no_new_low": state.no_new_low,
+        "setup_stage": "REMAINDER",
+        "setup_plan_quote": state.scout_plan_quote,
+    }
+    _clear_scout_probe(state)
+    state.phase = "SCOUT"
+    request = _request(
+        config,
+        state,
+        market,
+        side="BUY",
+        amount=amount,
+        price=price,
+        reserve=reserve,
+        level=0,
+        intent="SCOUT_BUY",
+        entry_price_selection=selection,
+        setup_receipt=setup_receipt,
+    )
+    return Transition(state, (request,), reason="scout_probe_remainder")
 
 
 def _mark_termination(orders: list[OrderProgress], cause: str) -> tuple[str, ...]:
@@ -1257,6 +1509,8 @@ def _adaptive_reference_fallback(
         "setup_low": request.setup_low,
         "setup_rebound": request.setup_rebound,
         "setup_no_new_low": request.setup_no_new_low,
+        "setup_stage": request.setup_stage,
+        "setup_plan_quote": request.setup_plan_quote,
     }
     state.levels[request.level] = "AUTHORIZED"
     state.setup_level = -1
@@ -1525,6 +1779,12 @@ def transition(
         and state.gross_spent == 0
         and state.setup_level == 0
     )
+    scout_probe_setup = bool(
+        config.scout_probe_rebound
+        and state.episode_id
+        and state.scout_plan_quote > ZERO
+        and state.scout_probe_request_id
+    )
     setup_context_reset = bool(
         (global_rebound_setup or recovery_rebound_setup)
         and (
@@ -1537,16 +1797,21 @@ def transition(
             or (state.timestamp >= 0 and market.timestamp > state.timestamp + config.interval_seconds)
         )
     )
-    if (
+    reset_setup = bool(
         not market.valid
         or market.cascade
         or market.hostile
         or not market.buy_allowed
         or (market.recovery and not recovery_rebound_setup)
         or (state.timestamp >= 0 and market.timestamp > state.timestamp + config.interval_seconds)
-    ):
-        state.setup_level, state.no_new_low = -1, 0
-        state.setup_confirmation_start = 0
+        or (scout_probe_setup and market.reset)
+    )
+    if reset_setup:
+        if scout_probe_setup:
+            _clear_scout_probe(state)
+        else:
+            state.setup_level, state.no_new_low = -1, 0
+            state.setup_confirmation_start = 0
     for update in updates:
         _apply_update(config, state, market, update)
     if setup_context_reset:
@@ -1583,6 +1848,9 @@ def transition(
         state.adverse_entry_latched = True
     elif state.adverse_entry_latched and market.hourly_recovered:
         state.adverse_entry_latched = False
+    probe_remainder = _scout_probe_remainder(config, state, market)
+    if probe_remainder is not None:
+        return probe_remainder
     fallback = _adaptive_reference_fallback(config, state, market)
     if fallback is not None:
         return fallback
@@ -1992,39 +2260,26 @@ def transition(
             return Transition(state, reason="need_scale_in_signal")
         if market.ask > state.last_fill_price - config.last_fill_gap_atr * market.atr_1m:
             return Transition(state, reason="last_fill_gap")
-    cap = config.budget_quote * config.level_fractions[level] * factor
-    if cap <= 0:
+    full_cap = config.budget_quote * config.level_fractions[level] * factor
+    if full_cap <= 0:
         return Transition(state, reason="zero_allocation")
-    if cap > remaining_budget(config, state) or cap > market.quote_available:
+    if full_cap > remaining_budget(config, state) or full_cap > market.quote_available:
         return Transition(state, reason="insufficient_episode_cash")
-    reference_price = _floor(market.ask, market.price_step)
-    if config.adaptive_entry_pricing:
-        try:
-            entry_price_selection = select_adaptive_entry_price(
-                bid=market.bid,
-                ask=market.ask,
-                atr_1m=market.atr_1m,
-                price_step=market.price_step,
-                signal_confidence=market.entry_confidence,
-                trend_alignment=market.trend_alignment,
-            )
-        except AdaptiveEntryPriceInputError as exc:
-            raise EpisodeInputError(str(exc)) from exc
-        if config.adaptive_reserved_entry:
-            entry_price_selection = replace(
-                entry_price_selection,
-                policy=ADAPTIVE_RESERVED_ENTRY_POLICY,
-            )
-    else:
-        entry_price_selection = AdaptiveEntryPriceSelection(
-            policy="TOP_OF_BOOK",
-            reference_price=reference_price,
-            price=reference_price,
-            discount=ZERO,
-            discount_atr=ZERO,
-            signal_confidence=market.entry_confidence,
-            trend_alignment=market.trend_alignment,
-        )
+    probe_plan = bool(
+        config.scout_probe_rebound
+        and level == 0
+        and state.gross_spent == ZERO
+    )
+    cap = full_cap * config.scout_probe_fraction if probe_plan else full_cap
+    if probe_plan:
+        setup_receipt = {
+            "setup_policy": "SCOUT_PROBE_REBOUND_V1",
+            "setup_started_at": market.timestamp,
+            "setup_low": market.low,
+            "setup_stage": "PROBE",
+            "setup_plan_quote": full_cap,
+        }
+    entry_price_selection = _entry_price_selection(config, market)
     price = entry_price_selection.price
     if price <= 0:
         return Transition(state, reason="price_below_tick")
@@ -2060,4 +2315,11 @@ def transition(
         entry_price_selection=entry_price_selection,
         setup_receipt=setup_receipt,
     )
+    if probe_plan:
+        state.scout_plan_quote = full_cap
+        state.scout_probe_request_id = request.id
+        state.setup_level = 0
+        state.setup_low = market.low
+        state.setup_start = market.timestamp
+        state.no_new_low = 0
     return Transition(state, (request,), reason="scout" if level == 0 else "scale_in")

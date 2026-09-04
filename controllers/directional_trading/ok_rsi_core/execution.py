@@ -55,6 +55,8 @@ class EpisodeOrderExecutorConfig(OrderExecutorConfig):
     episode_setup_low: Decimal = ZERO
     episode_setup_rebound: Decimal = ZERO
     episode_setup_no_new_low: int = 0
+    episode_setup_stage: str = "NONE"
+    episode_setup_plan_quote: Decimal = ZERO
     episode_exit_policy: str = "DEFAULT"
     episode_exit_hourly_recovered: bool = False
     episode_exit_risk_clear: bool = False

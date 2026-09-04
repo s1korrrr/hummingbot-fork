@@ -54,6 +54,41 @@ def test_durable_reservation_precedes_action_and_restart_never_redispatches():
     assert request_id in restarted._episode_runtime.state.orders
 
 
+def test_scout_probe_config_maps_and_persists_exact_native_receipt():
+    controller, store = setup_controller(
+        episode_scout_probe_rebound=True,
+        episode_scout_probe_fraction=Decimal("0.5"),
+    )
+    created = actions(controller)
+
+    assert len(created) == 1
+    executor = created[0].executor_config
+    assert controller._episode_runtime.config.scout_probe_rebound is True
+    assert controller._episode_runtime.config.scout_probe_fraction == Decimal("0.5")
+    assert executor.episode_setup_policy == "SCOUT_PROBE_REBOUND_V1"
+    assert executor.episode_setup_stage == "PROBE"
+    assert executor.episode_setup_started_at == 10020
+    assert executor.episode_setup_low == Decimal("93")
+    assert executor.episode_setup_plan_quote == Decimal("50")
+    assert executor.amount * executor.price <= Decimal("25")
+    status = controller._episode_runtime.status()
+    assert status["scout_probe_rebound_enabled"] is True
+    assert status["scout_probe_fraction"] == "0.5"
+    assert status["scout_plan_quote"] == "50.00"
+    assert status["scout_probe_request_id"] == executor.id
+    assert status["last_entry_setup_stage"] == "PROBE"
+    assert status["last_entry_setup_plan_quote"] == "50.00"
+
+    restarted, _ = setup_controller(
+        store=store,
+        episode_scout_probe_rebound=True,
+        episode_scout_probe_fraction=Decimal("0.5"),
+    )
+    restored = restarted._episode_runtime.state
+    assert restored.scout_plan_quote == Decimal("50.0")
+    assert restored.scout_probe_request_id == executor.id
+
+
 def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     controller, _ = setup_controller(
         max_total_position_usd=Decimal("1500"),

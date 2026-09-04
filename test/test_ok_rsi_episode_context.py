@@ -53,6 +53,8 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_adaptive_reserved_entry is False
     assert legacy.episode_adaptive_reference_fallback is False
     assert legacy.episode_thin_scout_release is False
+    assert legacy.episode_scout_probe_rebound is False
+    assert legacy.episode_scout_probe_fraction == Decimal("0.5")
     assert legacy.episode_structure_held_runner is False
     assert legacy.episode_markup_release_runner is False
     assert legacy.episode_scout_rebound_confirmation is False

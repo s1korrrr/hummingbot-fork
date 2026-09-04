@@ -85,6 +85,8 @@ def policy_config(config):
         deep_recovery_capital_release=config.episode_deep_recovery_capital_release,
         deep_recovery_rotation_exit=config.episode_deep_recovery_rotation_exit,
         deep_recovery_strength_runner=config.episode_deep_recovery_strength_runner,
+        scout_probe_rebound=config.episode_scout_probe_rebound,
+        scout_probe_fraction=config.episode_scout_probe_fraction,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
@@ -165,12 +167,17 @@ class EpisodeRuntime:
         ) if buy_orders else None
         last_entry = last_entry_progress.request if last_entry_progress else None
         active_setup = (
-            (self.config.scout_rebound_confirmation or self.config.recovery_rebound_scout)
-            and self.state.base == 0
+            (
+                self.config.scout_rebound_confirmation
+                or self.config.recovery_rebound_scout
+                or self.config.scout_probe_rebound
+            )
             and self.state.setup_level == 0
         )
         setup_policy = (
-            "RECOVERY_REBOUND_SCOUT_V1"
+            "SCOUT_PROBE_REBOUND_V1"
+            if active_setup and self.config.scout_probe_rebound
+            else "RECOVERY_REBOUND_SCOUT_V1"
             if active_setup and self.config.recovery_rebound_scout
             else "SCOUT_REBOUND_V1"
             if active_setup
@@ -255,6 +262,10 @@ class EpisodeRuntime:
                 "deep_recovery_capital_release_enabled": self.config.deep_recovery_capital_release,
                 "deep_recovery_rotation_exit_enabled": self.config.deep_recovery_rotation_exit,
                 "deep_recovery_strength_runner_enabled": self.config.deep_recovery_strength_runner,
+                "scout_probe_rebound_enabled": self.config.scout_probe_rebound,
+                "scout_probe_fraction": str(self.config.scout_probe_fraction),
+                "scout_plan_quote": str(self.state.scout_plan_quote),
+                "scout_probe_request_id": self.state.scout_probe_request_id or None,
                 "assignment_consumed": self.state.assignment_consumed,
                 "configured_level_count": len(self.config.level_fractions),
                 "thin_scout_inventory": thin_scout_inventory,
@@ -282,6 +293,8 @@ class EpisodeRuntime:
                 "last_entry_setup_low": str(last_entry.setup_low) if last_entry else None,
                 "last_entry_setup_rebound": str(last_entry.setup_rebound) if last_entry else None,
                 "last_entry_setup_no_new_low": last_entry.setup_no_new_low if last_entry else None,
+                "last_entry_setup_stage": last_entry.setup_stage if last_entry else None,
+                "last_entry_setup_plan_quote": str(last_entry.setup_plan_quote) if last_entry else None,
                 "exit_policy": exit_policy,
                 "exit_hourly_recovered": self.last_market.hourly_recovered if self.last_market else None,
                 "exit_markup": getattr(self.last_market, "markup", None) if self.last_market else None,
@@ -441,6 +454,8 @@ class EpisodeRuntime:
                     episode_setup_low=request.setup_low,
                     episode_setup_rebound=request.setup_rebound,
                     episode_setup_no_new_low=request.setup_no_new_low,
+                    episode_setup_stage=request.setup_stage,
+                    episode_setup_plan_quote=request.setup_plan_quote,
                     episode_exit_policy=request.exit_policy,
                     episode_exit_hourly_recovered=request.exit_hourly_recovered,
                     episode_exit_risk_clear=request.exit_risk_clear,

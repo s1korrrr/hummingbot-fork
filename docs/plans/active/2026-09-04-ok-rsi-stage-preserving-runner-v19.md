@@ -40,7 +40,7 @@ and identity stay exact.
 - [x] Add failing reducer, configuration, identity, and runtime tests.
 - [x] Implement the shared pure transition and runtime receipts.
 - [x] Run focused native validation and commit exact paths.
-- [ ] Hand the exact source identity to Quants Lab.
+- [x] Hand the exact source identity to Quants Lab.
 
 ## Native evidence
 
@@ -54,3 +54,12 @@ The focused native suite completed with `290 passed, 19 subtests passed` across
 the episode reducer, context, runtime, execution, factory, entry pricing,
 controller, and wallet tests. Ruff, PyCompile, and `git diff --check` passed on
 all touched Python paths.
+
+Quants Lab replayed controller source commit `66daf1339` across the continuous
+May-August BTC-USDC, ETH-USDC, and BNB-USDC window. Research commit `cd0c2aa`
+sealed exact V15 buy-root parity, causal stage receipts, changed-sell
+attribution, the frozen gate, and 15 detailed Plotly charts. V19 preserved all
+36 filled buys and improved aggregate modeled PnL by `13.566494687500` USDC
+without increasing maximum deployment or worsening drawdown. The sealed report
+verdict is `ACCEPT_FOR_LOCAL_CONTROLS_ONLY`; it grants no paper, canary, live,
+order, or capital authority.

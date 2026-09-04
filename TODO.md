@@ -5,4 +5,4 @@
 - [x] Implement the stage-preserving runner in `ok_rsi_core` and runtime config.
 - [x] Cover exact default-off identity, release rails, and sell-only buy inertia.
 - [x] Run the focused native suite, Ruff, and shadow diff.
-- [ ] Hand the exact native source identity to the Quants Lab replay.
+- [x] Hand the exact native source identity to the Quants Lab replay.

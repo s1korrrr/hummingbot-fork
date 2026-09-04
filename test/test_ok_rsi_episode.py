@@ -224,12 +224,26 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
+    legacy_values.pop("structure_held_runner")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
     assert replace(cfg, scout_rebound_confirmation=True).identity != cfg.identity
     assert replace(cfg, recovery_aware_scout=True).identity != cfg.identity
     assert replace(cfg, recovery_rebound_scout=True).identity != cfg.identity
+    assert replace(cfg, structure_held_runner=True).identity != cfg.identity
+
+
+def test_disabled_structure_runner_preserves_legacy_checkpoint_shape():
+    state = transition(config(), EpisodeState(), market()).state
+    payload = state.to_dict()
+
+    assert "structure_runner_active" not in payload
+    assert "exit_target_revision" not in payload
+    assert "last_exit_trail_breach" not in payload
+    request = next(iter(payload["orders"].values()))["request"]
+    assert not any(key.startswith("exit_") for key in request)
+    assert EpisodeState.from_dict(payload).to_dict() == payload
 
 
 def test_recovery_aware_scout_preserves_immediate_non_recovery_entry():
@@ -1019,6 +1033,252 @@ def test_distribution_targets_ratchet_and_profit_guard_blocks_terminal_sale():
     assert not crash.requests
     assert crash.state.gross_spent == D("100")
     assert crash.state.cost == D("60")
+
+
+def _structure_runner_setup(cfg):
+    state, _ = bought(cfg)
+    armed = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("102"),
+            ask=D("102"),
+            low=D("102"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6180,
+            bid=D("103"),
+            ask=D("103"),
+            low=D("103"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+    )
+    assert high.state.target_base == D("1")
+    assert not high.requests
+    return high.state
+
+
+def test_structure_held_trail_breach_sells_excess_and_keeps_final_runner():
+    cfg = config(structure_held_runner=True)
+    state = _structure_runner_setup(cfg)
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+    )
+
+    assert result.state.phase == "DISTRIBUTE"
+    assert result.state.target_base == D("0.4")
+    assert result.state.structure_runner_active is True
+    assert result.state.exit_target_revision == 1
+    assert result.reason == "structure_runner_distribution"
+    assert len(result.requests) == 1
+    request = result.requests[0]
+    assert request.side == "SELL"
+    assert request.intent == "DISTRIBUTION_SELL"
+    assert request.amount == D("0.6")
+    assert request.exit_policy == "STRUCTURE_HELD_RUNNER_V1"
+    assert request.exit_hourly_recovered is True
+    assert request.exit_risk_clear is True
+    assert request.exit_trail_breach == "PRICE_AND_EQUITY"
+    assert request.exit_target_base == D("0.4")
+    assert request.exit_target_revision == 1
+
+    restored = EpisodeState.from_dict(result.state.to_dict())
+    assert restored.to_dict() == result.state.to_dict()
+    assert restored.structure_runner_active is True
+    assert restored.last_exit_trail_breach == "PRICE_AND_EQUITY"
+
+
+def test_structure_runner_exits_only_after_later_unrecovered_trail_breach():
+    cfg = config(structure_held_runner=True)
+    held = transition(
+        cfg,
+        _structure_runner_setup(cfg),
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+    )
+    first = held.requests[0]
+    filled = OrderUpdate(first.id, filled_base=D("0.6"), filled_quote=D("61.44"), done=True)
+
+    terminal = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6300,
+            bid=D("102.3"),
+            ask=D("102.3"),
+            low=D("102.3"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("0.4"),
+            hourly_recovered=False,
+        ),
+        [filled],
+    )
+
+    assert terminal.state.phase == "EXIT"
+    assert terminal.state.target_base == D("0")
+    assert terminal.state.structure_runner_active is False
+    assert terminal.state.exit_target_revision == 2
+    assert terminal.reason == "trailing_profit_exit"
+    assert terminal.requests[0].amount == D("0.4")
+    assert terminal.requests[0].intent == "TRAILING_PROFIT_EXIT"
+    assert terminal.requests[0].exit_hourly_recovered is False
+    assert terminal.requests[0].exit_risk_clear is True
+    assert terminal.requests[0].exit_target_base == D("0")
+    assert terminal.requests[0].exit_target_revision == 2
+
+
+def test_structure_runner_terminal_target_cancels_pending_excess_without_duplicate_sell():
+    cfg = config(structure_held_runner=True)
+    held = transition(
+        cfg,
+        _structure_runner_setup(cfg),
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+    )
+
+    terminal = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6300,
+            bid=D("102.3"),
+            ask=D("102.3"),
+            low=D("102.3"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=False,
+        ),
+    )
+
+    assert terminal.state.phase == "EXIT"
+    assert terminal.state.target_base == D("0")
+    assert terminal.state.exit_target_revision == 2
+    assert terminal.cancel_ids == (held.requests[0].id,)
+    assert not terminal.requests
+
+
+@pytest.mark.parametrize("risk_flag", ["cascade", "hostile", "reset"])
+def test_structure_runner_never_protects_inventory_during_unsafe_context(risk_flag):
+    cfg = config(structure_held_runner=True)
+    state = _structure_runner_setup(cfg)
+    risky_market = dict(
+        timestamp=6240,
+        bid=D("103.1"),
+        ask=D("103.1"),
+        low=D("103.1"),
+        atr_15m=D("0.1"),
+        atr_1h=D("10"),
+        base_available=D("1"),
+        hourly_recovered=True,
+    )
+    risky_market[risk_flag] = True
+
+    result = transition(cfg, state, market(**risky_market))
+
+    assert result.state.phase == "EXIT"
+    assert result.state.target_base == D("0")
+    assert result.state.structure_runner_active is False
+    assert result.requests[0].amount == D("1")
+    assert result.requests[0].exit_risk_clear is False
+    assert result.requests[0].exit_trail_breach == "RISK_OVERRIDE"
+
+
+def test_sell_only_uses_same_structure_held_runner_without_buy_authorization():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="inventory-1",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        structure_held_runner=True,
+    )
+    armed = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("102"),
+            ask=D("102"),
+            low=D("102"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            bid=D("103"),
+            ask=D("103"),
+            low=D("103"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+    )
+    result = transition(
+        cfg,
+        high.state,
+        market(
+            timestamp=6120,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+        ),
+    )
+
+    assert result.state.target_base == D("0.4")
+    assert result.requests[0].side == "SELL"
+    assert result.requests[0].amount == D("0.6")
+    assert all(order.request.side != "BUY" for order in result.state.orders.values())
 
 
 def test_sell_only_assignment_never_creates_buy_or_adopts_deposit():

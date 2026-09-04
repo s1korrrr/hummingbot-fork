@@ -71,6 +71,33 @@ def test_fill_receipt_preserves_native_episode_intent():
     assert instance.get_custom_info()["episode_receipt"]["intent"] == "SCOUT_BUY"
 
 
+def test_fill_receipt_preserves_native_structure_exit_authorization():
+    from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutorConfig
+
+    instance = executor()
+    instance.config = EpisodeOrderExecutorConfig(
+        **instance.config.model_dump(),
+        episode_id="episode-1",
+        episode_expires_at=60,
+        episode_intent="DISTRIBUTION_SELL",
+        episode_exit_policy="STRUCTURE_HELD_RUNNER_V1",
+        episode_exit_hourly_recovered=True,
+        episode_exit_risk_clear=True,
+        episode_exit_trail_breach="PRICE_AND_EQUITY",
+        episode_exit_target_base=Decimal("0.4"),
+        episode_exit_target_revision=2,
+    )
+    instance._order.order = order(side=TradeType.SELL)
+
+    receipt = instance.get_custom_info()["episode_receipt"]
+    assert receipt["exit_policy"] == "STRUCTURE_HELD_RUNNER_V1"
+    assert receipt["exit_hourly_recovered"] is True
+    assert receipt["exit_risk_clear"] is True
+    assert receipt["exit_trail_breach"] == "PRICE_AND_EQUITY"
+    assert receipt["exit_target_base"] == "0.4"
+    assert receipt["exit_target_revision"] == 2
+
+
 def test_unknown_third_asset_fee_is_visible_and_not_zero_cost():
     instance = executor()
     instance._order.order = order(fee_token="BNB")

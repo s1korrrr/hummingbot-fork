@@ -44,6 +44,8 @@ ORDER_INTENTS = {
     "TERMINAL_PROFIT_EXIT",
 }
 SELL_INTENTS = ORDER_INTENTS - {"UNSPECIFIED", "SCOUT_BUY", "SCALE_IN_BUY"}
+EXIT_POLICIES = {"DEFAULT", "STRUCTURE_HELD_RUNNER_V1"}
+EXIT_TRAIL_BREACHES = {"NONE", "PRICE", "EQUITY", "PRICE_AND_EQUITY", "RISK_OVERRIDE"}
 
 
 class EpisodeInputError(ValueError):
@@ -129,6 +131,7 @@ class EpisodeConfig:
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
+    structure_held_runner: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -149,6 +152,7 @@ class EpisodeConfig:
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
+            "structure_held_runner",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -225,6 +229,8 @@ class EpisodeConfig:
             values.pop("recovery_aware_scout")
         if not self.recovery_rebound_scout:
             values.pop("recovery_rebound_scout")
+        if not self.structure_held_runner:
+            values.pop("structure_held_runner")
         return _hash(values)
 
 
@@ -334,6 +340,12 @@ class OrderRequest:
     setup_low: Decimal = ZERO
     setup_rebound: Decimal = ZERO
     setup_no_new_low: int = 0
+    exit_policy: str = "DEFAULT"
+    exit_hourly_recovered: bool = False
+    exit_risk_clear: bool = False
+    exit_trail_breach: str = "NONE"
+    exit_target_base: Decimal = ZERO
+    exit_target_revision: int = 0
 
     def __post_init__(self):
         for name in ("id", "episode_id"):
@@ -346,6 +358,7 @@ class OrderRequest:
             "setup_started_at",
             "setup_confirmation_started_at",
             "setup_no_new_low",
+            "exit_target_revision",
         ):
             if type(getattr(self, name)) is not int:
                 raise EpisodeInputError("invalid request integer")
@@ -362,6 +375,28 @@ class OrderRequest:
             "RECOVERY_REBOUND_SCOUT_V1",
         }:
             raise EpisodeInputError("invalid entry setup policy")
+        if self.exit_policy not in EXIT_POLICIES or self.exit_trail_breach not in EXIT_TRAIL_BREACHES:
+            raise EpisodeInputError("invalid exit policy receipt")
+        if type(self.exit_hourly_recovered) is not bool or type(self.exit_risk_clear) is not bool:
+            raise EpisodeInputError("invalid exit context receipt")
+        object.__setattr__(self, "exit_target_base", _decimal(self.exit_target_base, "exit_target_base"))
+        if self.exit_target_revision < 0:
+            raise EpisodeInputError("invalid exit target revision")
+        if self.exit_policy == "DEFAULT":
+            if any(
+                (
+                    self.exit_hourly_recovered,
+                    self.exit_risk_clear,
+                    self.exit_trail_breach != "NONE",
+                    self.exit_target_base,
+                    self.exit_target_revision,
+                )
+            ):
+                raise EpisodeInputError("default exit policy cannot carry structure receipt")
+        elif self.side != "SELL":
+            raise EpisodeInputError("structure exit policy requires a sell request")
+        elif self.exit_trail_breach == "RISK_OVERRIDE" and self.exit_risk_clear:
+            raise EpisodeInputError("risk override receipt contradicts clear context")
         if self.intent != "UNSPECIFIED" and (
             (self.side == "BUY" and self.intent not in {"SCOUT_BUY", "SCALE_IN_BUY"})
             or (self.side == "SELL" and self.intent not in SELL_INTENTS)
@@ -524,10 +559,32 @@ class EpisodeState:
     cost_known: bool = True
     adverse_entry_latched: bool = False
     exit_intent: str | None = None
+    structure_runner_active: bool = False
+    exit_target_revision: int = 0
+    last_exit_trail_breach: str = "NONE"
     fault: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_value(asdict(self))
+        values = asdict(self)
+        if not self.structure_runner_active:
+            values.pop("structure_runner_active")
+        if not self.exit_target_revision:
+            values.pop("exit_target_revision")
+        if self.last_exit_trail_breach == "NONE":
+            values.pop("last_exit_trail_breach")
+        for order in values["orders"].values():
+            request = order["request"]
+            if request["exit_policy"] == "DEFAULT":
+                for name in (
+                    "exit_policy",
+                    "exit_hourly_recovered",
+                    "exit_risk_clear",
+                    "exit_trail_breach",
+                    "exit_target_base",
+                    "exit_target_revision",
+                ):
+                    request.pop(name)
+        return _json_value(values)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> EpisodeState:
@@ -538,7 +595,10 @@ class EpisodeState:
             values.setdefault("adverse_entry_latched", False)
             values.setdefault("exit_intent", None)
             values.setdefault("setup_confirmation_start", 0)
-            for name in ("assignment_consumed", "cost_known", "adverse_entry_latched"):
+            values.setdefault("structure_runner_active", False)
+            values.setdefault("exit_target_revision", 0)
+            values.setdefault("last_exit_trail_breach", "NONE")
+            for name in ("assignment_consumed", "cost_known", "adverse_entry_latched", "structure_runner_active"):
                 if type(values[name]) is not bool:
                     raise EpisodeInputError(f"invalid checkpoint boolean {name}")
             for name in (
@@ -551,6 +611,7 @@ class EpisodeState:
                 "no_new_low",
                 "command_revision",
                 "cooldown_htf_timestamp",
+                "exit_target_revision",
             ):
                 if type(values[name]) is not int or values[name] < (-1 if name in ("timestamp", "setup_level") else 0):
                     raise EpisodeInputError(f"invalid checkpoint integer {name}")
@@ -558,6 +619,8 @@ class EpisodeState:
                 raise EpisodeInputError("invalid checkpoint level")
             if values["exit_intent"] is not None and values["exit_intent"] not in SELL_INTENTS:
                 raise EpisodeInputError("invalid checkpoint exit intent")
+            if values["last_exit_trail_breach"] not in EXIT_TRAIL_BREACHES:
+                raise EpisodeInputError("invalid checkpoint exit trail breach")
             decimal_fields = (
                 "base",
                 "cost",
@@ -596,6 +659,7 @@ class EpisodeState:
                     "pricing_discount",
                     "pricing_discount_atr",
                     "signal_confidence",
+                    "exit_target_base",
                 ):
                     if name not in request:
                         continue
@@ -699,6 +763,12 @@ def _validate_accounting(config: EpisodeConfig, state: EpisodeState) -> None:
                 raise EpisodeInputError("checkpoint authorization level mismatch")
     if sum(not order.done for order in current) > 1:
         raise EpisodeInputError("multiple unresolved episode requests")
+    if state.structure_runner_active and (
+        not config.structure_held_runner
+        or state.phase != "DISTRIBUTE"
+        or state.target_base <= ZERO
+    ):
+        raise EpisodeInputError("checkpoint structure runner state is invalid")
 
 
 def _apply_update(config: EpisodeConfig, state: EpisodeState, market: MarketSnapshot, update: OrderUpdate) -> None:
@@ -795,6 +865,7 @@ def _request(
     intent: str,
     entry_price_selection: AdaptiveEntryPriceSelection | None = None,
     setup_receipt: dict | None = None,
+    exit_receipt: dict | None = None,
 ) -> OrderRequest:
     state.command_revision += 1
     identity = _hash((state.episode_id, state.command_revision, side, level))
@@ -819,6 +890,7 @@ def _request(
         intent,
         **pricing,
         **(setup_receipt or {}),
+        **(exit_receipt or {}),
     )
     state.orders[identity] = OrderProgress(request)
     return request
@@ -857,12 +929,50 @@ def _arm_recovery_trail(config: EpisodeConfig, state: EpisodeState, market: Mark
     state.exit_intent = "RECOVERY_TAKE_PROFIT"
 
 
+def _reduce_exit_target(config: EpisodeConfig, state: EpisodeState, target: Decimal) -> None:
+    target = min(state.target_base, target)
+    if target < state.target_base:
+        state.target_base = target
+        if config.structure_held_runner:
+            state.exit_target_revision += 1
+
+
+def _exit_trail_breach(*, price_breached: bool, equity_breached: bool) -> str:
+    if price_breached and equity_breached:
+        return "PRICE_AND_EQUITY"
+    if price_breached:
+        return "PRICE"
+    if equity_breached:
+        return "EQUITY"
+    return "NONE"
+
+
+def _structure_exit_receipt(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    market: MarketSnapshot,
+    trail_breach: str,
+) -> dict[str, Any]:
+    if not config.structure_held_runner:
+        return {}
+    return {
+        "exit_policy": "STRUCTURE_HELD_RUNNER_V1",
+        "exit_hourly_recovered": market.hourly_recovered,
+        "exit_risk_clear": not (market.cascade or market.hostile or market.reset),
+        "exit_trail_breach": trail_breach,
+        "exit_target_base": state.target_base,
+        "exit_target_revision": state.exit_target_revision,
+    }
+
+
 def _sell(
     config: EpisodeConfig,
     state: EpisodeState,
     market: MarketSnapshot,
     *,
     intent: str | None = None,
+    trail_breach: str = "NONE",
+    reason: str | None = None,
 ) -> Transition:
     request_intent = intent or state.exit_intent or (
         "TERMINAL_PROFIT_EXIT" if state.phase == "EXIT" else "DISTRIBUTION_SELL"
@@ -890,14 +1000,15 @@ def _sell(
         reserve=ZERO,
         level=-1,
         intent=request_intent,
+        exit_receipt=_structure_exit_receipt(config, state, market, trail_breach),
     )
-    reason = {
+    mapped_reason = {
         "RECOVERY_TAKE_PROFIT": "recovery_take_profit",
         "DISTRIBUTION_SELL": "distribution",
         "TRAILING_PROFIT_EXIT": "trailing_profit_exit",
         "TERMINAL_PROFIT_EXIT": "terminal_exit",
     }[request_intent]
-    return Transition(state, (request,), reason=reason)
+    return Transition(state, (request,), reason=reason or mapped_reason)
 
 
 def transition(
@@ -1039,22 +1150,60 @@ def transition(
         state.equity_peak = max(state.equity_peak if state.equity_peak is not None else equity, equity)
         floor = state.equity_peak - state.base * state.peak * distance
         state.equity_floor = max(state.equity_floor if state.equity_floor is not None else floor, floor)
-        if market.bid <= state.floor or equity <= state.equity_floor:
+        price_breached = market.bid <= state.floor
+        equity_breached = equity <= state.equity_floor
+        trail_breach = _exit_trail_breach(price_breached=price_breached, equity_breached=equity_breached)
+        risk_clear = not (market.cascade or market.hostile or market.reset)
+        hold_structure = (
+            config.structure_held_runner
+            and state.phase != "EXIT"
+            and not recovery_trail
+            and trail_breach != "NONE"
+            and market.hourly_recovered
+            and risk_clear
+        )
+        force_structure_exit = (
+            config.structure_held_runner
+            and state.phase != "EXIT"
+            and not recovery_trail
+            and (not risk_clear or (trail_breach != "NONE" and not market.hourly_recovered))
+        )
+        exit_breach = trail_breach
+        structure_runner_distribution = False
+        if hold_structure:
+            state.exit_intent = "DISTRIBUTION_SELL"
+            state.phase = "DISTRIBUTE"
+            _reduce_exit_target(config, state, state.distribution_start_base * config.remaining_fractions[-1])
+            state.structure_runner_active = True
+            state.last_exit_trail_breach = trail_breach
+            structure_runner_distribution = True
+        elif trail_breach != "NONE" or force_structure_exit:
             if state.phase != "EXIT" and not recovery_trail:
                 state.exit_intent = "TRAILING_PROFIT_EXIT"
-            state.phase, state.target_base = "EXIT", ZERO
+            state.phase = "EXIT"
+            _reduce_exit_target(config, state, ZERO)
+            if config.structure_held_runner and not recovery_trail:
+                state.structure_runner_active = False
+                exit_breach = "RISK_OVERRIDE" if not risk_clear else trail_breach
+                state.last_exit_trail_breach = exit_breach
         elif state.phase != "EXIT" and not recovery_trail:
             extension = (state.peak - state.distribution_basis) / state.distribution_atr
             for threshold, fraction in zip(config.distribution_atr_levels, config.remaining_fractions):
                 if extension >= threshold:
-                    state.target_base = min(state.target_base, state.distribution_start_base * fraction)
+                    _reduce_exit_target(config, state, state.distribution_start_base * fraction)
                     state.phase = "DISTRIBUTE"
         if pending:
             if state.phase == "EXIT":
                 cancellations = tuple(order.request.id for order in pending)
             return Transition(state, cancel_ids=cancellations, reason="pending_execution")
         if state.base > state.target_base:
-            return _sell(config, state, market)
+            return _sell(
+                config,
+                state,
+                market,
+                trail_breach=exit_breach,
+                reason="structure_runner_distribution" if structure_runner_distribution else None,
+            )
         return Transition(state, reason="recovery_runner" if recovery_trail else "runner")
     if pending:
         return Transition(state, cancel_ids=cancellations, reason="pending_execution")
@@ -1074,6 +1223,9 @@ def transition(
         state.peak = market.bid
         state.floor = ZERO
         state.exit_intent = None
+        state.structure_runner_active = False
+        state.exit_target_revision = 0
+        state.last_exit_trail_breach = "NONE"
         return Transition(state, reason="markup_armed")
     if market.cascade or (market.hostile and state.base > 0):
         if state.base:

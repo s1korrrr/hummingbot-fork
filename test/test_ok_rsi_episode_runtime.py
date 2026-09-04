@@ -74,6 +74,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_hostile_risk_latch=True,
         episode_recovery_exit_enabled=True,
         episode_scout_rebound_confirmation=True,
+        episode_structure_held_runner=True,
     )
 
     policy = controller._episode_runtime.config
@@ -95,7 +96,102 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.recovery_exit_enabled is True
     assert policy.adaptive_entry_pricing is False
     assert policy.scout_rebound_confirmation is True
+    assert policy.structure_held_runner is True
     assert policy.rebound_atr == Decimal("0.25")
+
+
+def test_structure_exit_receipt_maps_to_executor_and_factory_rejects_mutation():
+    from controllers.directional_trading.ok_rsi_core.episode import (
+        EpisodeState,
+        OrderProgress,
+        OrderRequest,
+        Transition,
+    )
+
+    controller, _ = setup_controller(episode_structure_held_runner=True)
+    runtime = controller._episode_runtime
+    request = OrderRequest(
+        id="structure-sell-1",
+        episode_id="episode-1",
+        level=-1,
+        side="SELL",
+        amount=Decimal("0.6"),
+        price=Decimal("102.4"),
+        reserved_quote=Decimal("0"),
+        expires_at=10620,
+        revision=1,
+        intent="DISTRIBUTION_SELL",
+        exit_policy="STRUCTURE_HELD_RUNNER_V1",
+        exit_hourly_recovered=True,
+        exit_risk_clear=True,
+        exit_trail_breach="PRICE_AND_EQUITY",
+        exit_target_base=Decimal("0.4"),
+        exit_target_revision=1,
+    )
+    state = EpisodeState(
+        config_hash=runtime.config.identity,
+        phase="DISTRIBUTE",
+        episode_number=1,
+        episode_id="episode-1",
+        timestamp=10020,
+        levels=["AUTHORIZED"] * len(runtime.config.level_fractions),
+        orders={request.id: OrderProgress(request)},
+        base=Decimal("1"),
+        cost=Decimal("100"),
+        gross_spent=Decimal("100"),
+        distribution_start_base=Decimal("1"),
+        target_base=Decimal("0.4"),
+        command_revision=1,
+        structure_runner_active=True,
+        exit_target_revision=1,
+        last_exit_trail_breach="PRICE_AND_EQUITY",
+    )
+    result = Transition(state=state, requests=(request,), reason="structure_runner_distribution")
+
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context(),
+    ), patch("controllers.directional_trading.ok_rsi_core.runtime.transition", return_value=result):
+        created = controller.determine_executor_actions()[0]
+
+    executor = created.executor_config.model_copy(update={"controller_id": controller.config.id})
+    assert executor.episode_exit_policy == "STRUCTURE_HELD_RUNNER_V1"
+    assert executor.episode_exit_hourly_recovered is True
+    assert executor.episode_exit_risk_clear is True
+    assert executor.episode_exit_trail_breach == "PRICE_AND_EQUITY"
+    assert executor.episode_exit_target_base == Decimal("0.4")
+    assert executor.episode_exit_target_revision == 1
+    with pytest.raises(ValueError, match="authorization"):
+        controller.get_executor_class_for_config(
+            executor.model_copy(update={"episode_exit_target_revision": 2})
+        )
+    assert controller.get_executor_class_for_config(executor).__name__ == "EpisodeOrderExecutor"
+
+
+def test_status_exposes_persisted_structure_runner_state():
+    controller, _ = setup_controller(episode_structure_held_runner=True)
+    runtime = controller._episode_runtime
+    runtime.state.distribution_start_base = Decimal("1")
+    runtime.state.target_base = Decimal("0.4")
+    runtime.state.structure_runner_active = True
+    runtime.state.exit_target_revision = 3
+    runtime.state.last_exit_trail_breach = "EQUITY"
+    runtime.last_market = SimpleNamespace(
+        hourly_recovered=True,
+        cascade=False,
+        hostile=False,
+        reset=False,
+    )
+
+    status = runtime.status()
+
+    assert status["exit_policy"] == "STRUCTURE_HELD_RUNNER_V1"
+    assert status["exit_hourly_recovered"] is True
+    assert status["exit_risk_clear"] is True
+    assert status["structure_runner_active"] is True
+    assert status["structure_runner_target_base"] == "0.4"
+    assert status["last_exit_trail_breach"] == "EQUITY"
+    assert status["exit_target_revision"] == 3
 
 
 def test_recovery_aware_scout_maps_context_and_persists_route_receipt():

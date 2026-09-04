@@ -79,6 +79,7 @@ def policy_config(config):
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
+        structure_held_runner=config.episode_structure_held_runner,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -137,6 +138,14 @@ class EpisodeRuntime:
 
     def status(self):
         profit_floor = minimum_profit_price(self.config, self.state)
+        runner_target = (
+            self.state.distribution_start_base * self.config.remaining_fractions[-1]
+            if self.state.distribution_start_base
+            else ZERO
+        )
+        risk_clear = None if self.last_market is None else not (
+            self.last_market.cascade or self.last_market.hostile or self.last_market.reset
+        )
         buy_requests = [
             order.request for order in self.state.orders.values() if order.request.side == "BUY"
         ]
@@ -184,6 +193,15 @@ class EpisodeRuntime:
                 "last_entry_setup_low": str(last_entry.setup_low) if last_entry else None,
                 "last_entry_setup_rebound": str(last_entry.setup_rebound) if last_entry else None,
                 "last_entry_setup_no_new_low": last_entry.setup_no_new_low if last_entry else None,
+                "exit_policy": (
+                    "STRUCTURE_HELD_RUNNER_V1" if self.config.structure_held_runner else "DEFAULT"
+                ),
+                "exit_hourly_recovered": self.last_market.hourly_recovered if self.last_market else None,
+                "exit_risk_clear": risk_clear,
+                "structure_runner_active": self.state.structure_runner_active,
+                "structure_runner_target_base": str(runner_target),
+                "last_exit_trail_breach": self.state.last_exit_trail_breach,
+                "exit_target_revision": self.state.exit_target_revision,
                 "target_base": str(self.state.target_base), "levels": list(self.state.levels),
                 "pending": [key for key, order in self.state.orders.items() if not order.done],
                 "config_hash": self.config.identity, "checkpoint_sequence": self.sequence}
@@ -326,6 +344,12 @@ class EpisodeRuntime:
                     episode_setup_low=request.setup_low,
                     episode_setup_rebound=request.setup_rebound,
                     episode_setup_no_new_low=request.setup_no_new_low,
+                    episode_exit_policy=request.exit_policy,
+                    episode_exit_hourly_recovered=request.exit_hourly_recovered,
+                    episode_exit_risk_clear=request.exit_risk_clear,
+                    episode_exit_trail_breach=request.exit_trail_breach,
+                    episode_exit_target_base=request.exit_target_base,
+                    episode_exit_target_revision=request.exit_target_revision,
                 )
                 actions.append(CreateExecutorAction(controller_id=self.config.controller_id, executor_config=executor_config))
             return actions

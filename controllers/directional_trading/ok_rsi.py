@@ -113,6 +113,12 @@ class OKRSIController(hl_rsi.HLRSIController):
                 or config.episode_setup_low != request.setup_low
                 or config.episode_setup_rebound != request.setup_rebound
                 or config.episode_setup_no_new_low != request.setup_no_new_low
+                or config.episode_exit_policy != request.exit_policy
+                or config.episode_exit_hourly_recovered != request.exit_hourly_recovered
+                or config.episode_exit_risk_clear != request.exit_risk_clear
+                or config.episode_exit_trail_breach != request.exit_trail_breach
+                or config.episode_exit_target_base != request.exit_target_base
+                or config.episode_exit_target_revision != request.exit_target_revision
                 or config.timestamp != expected_timestamp
                 or config.controller_id != self.config.id
                 or config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair

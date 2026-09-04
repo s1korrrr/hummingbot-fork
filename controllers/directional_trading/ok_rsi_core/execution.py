@@ -54,6 +54,12 @@ class EpisodeOrderExecutorConfig(OrderExecutorConfig):
     episode_setup_low: Decimal = ZERO
     episode_setup_rebound: Decimal = ZERO
     episode_setup_no_new_low: int = 0
+    episode_exit_policy: str = "DEFAULT"
+    episode_exit_hourly_recovered: bool = False
+    episode_exit_risk_clear: bool = False
+    episode_exit_trail_breach: str = "NONE"
+    episode_exit_target_base: Decimal = ZERO
+    episode_exit_target_revision: int = 0
 
 
 class EpisodeOrderExecutor(OrderExecutor):
@@ -143,6 +149,12 @@ class EpisodeOrderExecutor(OrderExecutor):
             "gross_base": str(gross_base), "gross_quote": str(gross_quote),
             "base_fee": str(base_fee), "quote_fee": str(quote_fee),
             "intent": getattr(self.config, "episode_intent", "UNSPECIFIED"),
+            "exit_policy": getattr(self.config, "episode_exit_policy", "DEFAULT"),
+            "exit_hourly_recovered": getattr(self.config, "episode_exit_hourly_recovered", False),
+            "exit_risk_clear": getattr(self.config, "episode_exit_risk_clear", False),
+            "exit_trail_breach": getattr(self.config, "episode_exit_trail_breach", "NONE"),
+            "exit_target_base": str(getattr(self.config, "episode_exit_target_base", ZERO)),
+            "exit_target_revision": getattr(self.config, "episode_exit_target_revision", 0),
             "fees_known": not errors,
             "final": self.status == RunnableStatus.TERMINATED and all_done and not errors,
             "errors": sorted(set(errors)),
@@ -168,6 +180,14 @@ class EpisodeOrderExecutor(OrderExecutor):
                 "creation_timestamp": native.creation_timestamp,
                 "last_update_timestamp": native.last_update_timestamp,
                 "episode_intent": getattr(self.config, "episode_intent", "UNSPECIFIED"),
+                "episode_exit_policy": getattr(self.config, "episode_exit_policy", "DEFAULT"),
+                "episode_exit_hourly_recovered": getattr(
+                    self.config, "episode_exit_hourly_recovered", False
+                ),
+                "episode_exit_risk_clear": getattr(self.config, "episode_exit_risk_clear", False),
+                "episode_exit_trail_breach": getattr(self.config, "episode_exit_trail_breach", "NONE"),
+                "episode_exit_target_base": str(getattr(self.config, "episode_exit_target_base", ZERO)),
+                "episode_exit_target_revision": getattr(self.config, "episode_exit_target_revision", 0),
                 "order_fills": {key: fill.to_json() for key, fill in native.order_fills.items()},
             })
         return records

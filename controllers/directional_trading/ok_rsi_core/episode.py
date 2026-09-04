@@ -167,6 +167,7 @@ class EpisodeConfig:
     adaptive_reserved_entry: bool = False
     adaptive_reference_fallback: bool = False
     thin_scout_release: bool = False
+    thin_scout_rearm: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -192,6 +193,7 @@ class EpisodeConfig:
             "adaptive_reserved_entry",
             "adaptive_reference_fallback",
             "thin_scout_release",
+            "thin_scout_rearm",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -233,6 +235,8 @@ class EpisodeConfig:
             raise EpisodeInputError("reserved adaptive entry requires adaptive entry pricing")
         if self.adaptive_reference_fallback and not self.adaptive_reserved_entry:
             raise EpisodeInputError("reference fallback requires reserved adaptive entry")
+        if self.thin_scout_rearm and not self.thin_scout_release:
+            raise EpisodeInputError("thin scout rearm requires thin scout release")
         for name in ("level_fractions", "dip_atr_levels", "distribution_atr_levels", "remaining_fractions"):
             object.__setattr__(self, name, tuple(_decimal(x, name, positive=True) for x in getattr(self, name)))
         if (
@@ -279,6 +283,8 @@ class EpisodeConfig:
             values.pop("adaptive_reference_fallback")
         if not self.thin_scout_release:
             values.pop("thin_scout_release")
+        if not self.thin_scout_rearm:
+            values.pop("thin_scout_rearm")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -1239,15 +1245,31 @@ def _adaptive_reference_fallback(
     return Transition(state, (child,), reason="adaptive_reference_fallback")
 
 
-def _finish_if_flat(config: EpisodeConfig, state: EpisodeState, market: MarketSnapshot) -> bool:
+def _finish_if_flat(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    market: MarketSnapshot,
+) -> Transition | None:
     current = [order for order in state.orders.values() if order.request.episode_id == state.episode_id]
     if config.adaptive_entry_pricing and state.gross_spent == 0 and any(level == "OPEN" for level in state.levels):
-        return False
+        return None
     if state.episode_id and state.base == 0 and current and all(order.done for order in current):
+        if config.thin_scout_rearm and state.exit_intent == "THIN_SCOUT_RELEASE":
+            return Transition(
+                EpisodeState(
+                    config_hash=config.identity,
+                    episode_number=state.episode_number,
+                    timestamp=market.timestamp,
+                    orders=state.orders,
+                    last_valid_bid=state.last_valid_bid,
+                    assignment_consumed=state.assignment_consumed,
+                ),
+                reason="thin_scout_rearmed",
+            )
         state.phase = "COOLDOWN"
         state.cooldown_htf_timestamp = market.htf_timestamp
-        return True
-    return False
+        return Transition(state, reason="episode_completed")
+    return None
 
 
 def minimum_profit_price(config: EpisodeConfig, state: EpisodeState) -> Decimal | None:
@@ -1515,8 +1537,9 @@ def transition(
         state.gross_spent = config.initial_cost or ZERO
         state.assignment_consumed = True
         state.phase = "RECOVER"
-    if _finish_if_flat(config, state, market):
-        return Transition(state, reason="episode_completed")
+    completed = _finish_if_flat(config, state, market)
+    if completed is not None:
+        return completed
     recovery_trail = state.phase == "RECOVER" and state.exit_intent == "RECOVERY_TAKE_PROFIT"
     if state.phase in ("MARKUP", "DISTRIBUTE", "EXIT") or recovery_trail:
         distance = _trail_distance(config, market)
@@ -1594,6 +1617,10 @@ def transition(
                 and acquisition_levels(state) == (0,)
             )
             if thin_scout:
+                episode_amount = _floor(state.base, market.amount_step)
+                wallet_amount = _floor(market.base_available, market.amount_step)
+                if wallet_amount < episode_amount:
+                    return Transition(state, reason="inventory_balance_shortfall")
                 previous_revision = state.exit_target_revision
                 state.exit_intent = "THIN_SCOUT_RELEASE"
                 state.phase = "EXIT"

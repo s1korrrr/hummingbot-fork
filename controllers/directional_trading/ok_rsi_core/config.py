@@ -46,6 +46,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_adaptive_reserved_entry: bool = False
     episode_adaptive_reference_fallback: bool = False
     episode_thin_scout_release: bool = False
+    episode_thin_scout_rearm: bool = False
     episode_scout_rebound_confirmation: bool = False
     episode_recovery_aware_scout: bool = False
     episode_recovery_rebound_scout: bool = False
@@ -218,6 +219,8 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError("reserved adaptive entry requires adaptive entry pricing")
         if self.episode_adaptive_reference_fallback and not self.episode_adaptive_reserved_entry:
             raise ValueError("reference fallback requires reserved adaptive entry")
+        if self.episode_thin_scout_rearm and not self.episode_thin_scout_release:
+            raise ValueError("thin scout rearm requires thin scout release")
         if self.trade_mode == "buy_sell" and not self.use_trailing_exit and not self.episode_enabled:
             raise ValueError("buy_sell mode requires the trailing exit because no other ordinary exit is enabled")
 

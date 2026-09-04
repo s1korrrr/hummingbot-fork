@@ -624,6 +624,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("adaptive_reserved_entry")
     legacy_values.pop("adaptive_reference_fallback")
     legacy_values.pop("thin_scout_release")
+    legacy_values.pop("thin_scout_rearm")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -637,6 +638,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     assert replace(cfg, recovery_aware_scout=True).identity != cfg.identity
     assert replace(cfg, recovery_rebound_scout=True).identity != cfg.identity
     assert replace(cfg, thin_scout_release=True).identity != cfg.identity
+    assert replace(cfg, thin_scout_release=True, thin_scout_rearm=True).identity != cfg.identity
     structure = replace(cfg, structure_held_runner=True)
     structure_values = legacy_values | {"structure_held_runner": True}
     assert structure.identity == _hash(structure_values)
@@ -1750,6 +1752,144 @@ def test_thin_scout_release_dust_stays_latched_until_exchange_minimum_allows_it(
     assert not dust.requests
     assert released.requests[0].amount == D("1")
     assert released.requests[0].intent == "THIN_SCOUT_RELEASE"
+
+
+def test_thin_scout_release_does_not_latch_when_wallet_cannot_cover_episode_inventory():
+    cfg = config(thin_scout_release=True)
+    state, _ = bought(cfg)
+    markup = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+
+    short = transition(
+        cfg,
+        markup.state,
+        market(
+            timestamp=6180,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D(".4"),
+        ),
+    )
+
+    assert short.reason == "inventory_balance_shortfall"
+    assert short.state.phase == "MARKUP"
+    assert short.state.target_base == D("1")
+    assert short.state.exit_intent is None
+    assert not short.requests
+
+
+def test_thin_scout_rearm_reopens_entry_after_reconciled_full_release():
+    cfg = config(thin_scout_release=True, thin_scout_rearm=True)
+    state, _ = bought(cfg)
+    markup = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    released = transition(
+        cfg,
+        markup.state,
+        market(
+            timestamp=6180,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("1"),
+        ),
+    )
+    release = released.requests[0]
+    settled = transition(
+        cfg,
+        released.state,
+        market(
+            timestamp=6240,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("0"),
+            entry_signal=False,
+        ),
+        [
+            OrderUpdate(
+                release.id,
+                release.amount,
+                release.amount * release.price,
+                done=True,
+            )
+        ],
+    )
+
+    assert settled.reason == "thin_scout_rearmed"
+    assert settled.state.phase == "WATCH"
+    assert settled.state.episode_id is None
+    assert settled.state.episode_number == released.state.episode_number
+    assert settled.state.orders[release.id].done is True
+    assert settled.state.base == D("0")
+    assert not settled.requests
+
+    restored = EpisodeState.from_dict(settled.state.to_dict())
+    duplicate = transition(
+        cfg,
+        restored,
+        market(
+            timestamp=6300,
+            bid=D("104"),
+            ask=D("104"),
+            low=D("104"),
+            base_available=D("0"),
+            entry_signal=False,
+        ),
+        [
+            OrderUpdate(
+                release.id,
+                release.amount,
+                release.amount * release.price,
+                done=True,
+            )
+        ],
+    )
+    assert duplicate.state.base == D("0")
+    assert duplicate.state.gross_spent == D("0")
+    assert duplicate.state.sell_proceeds == D("0")
+    assert duplicate.state.orders[release.id].done is True
+
+    next_entry = transition(
+        cfg,
+        duplicate.state,
+        market(
+            timestamp=6360,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=D("0"),
+            entry_signal=True,
+        ),
+    )
+    assert next_entry.requests[0].side == "BUY"
+    assert next_entry.requests[0].level == 0
+
+
+def test_thin_scout_rearm_requires_thin_scout_release():
+    with pytest.raises(EpisodeInputError, match="thin scout rearm"):
+        config(thin_scout_rearm=True)
 
 
 def _structure_runner_setup(cfg):

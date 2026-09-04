@@ -2124,6 +2124,7 @@ def transition(
                 previous_revision = state.exit_target_revision
                 state.exit_intent = "THIN_SCOUT_RELEASE"
                 state.phase = "EXIT"
+                state.structure_runner_active = False
                 _reduce_exit_target(config, state, ZERO)
                 if state.exit_target_revision == previous_revision:
                     state.exit_target_revision += 1

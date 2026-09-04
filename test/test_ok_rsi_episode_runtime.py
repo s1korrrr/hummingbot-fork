@@ -164,6 +164,59 @@ def test_rebound_scout_persists_setup_then_emits_exact_owner_receipt():
     assert executor.episode_setup_no_new_low == 2
 
 
+def test_recovery_rebound_setup_survives_restart_and_emits_route_receipt():
+    controller, store = setup_controller(episode_recovery_rebound_scout=True)
+    recovery_context = context() | {"recovery": True}
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=recovery_context,
+    ):
+        assert controller.determine_executor_actions() == []
+    armed = controller._episode_runtime.status()
+    assert armed["setup_policy"] == "RECOVERY_REBOUND_SCOUT_V1"
+    assert armed["setup_started_at"] == 10020
+    assert armed["setup_confirmation_started_at"] is None
+
+    restarted, _ = setup_controller(
+        store=store,
+        episode_recovery_rebound_scout=True,
+    )
+    restarted.processed_data = {"signal": 0, "signal_state": {"condition_ok": True}}
+    restarted.market_data_provider.time.return_value = 10080
+    cleared_context = context() | {
+        "timestamp": 10080,
+        "recovery": False,
+        "low": Decimal("93.1"),
+    }
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=cleared_context,
+    ):
+        assert restarted.determine_executor_actions() == []
+    assert restarted._episode_runtime.status()["setup_confirmation_started_at"] == 10080
+
+    for timestamp in (10140, 10200):
+        restarted.market_data_provider.time.return_value = timestamp
+        followup = context() | {
+            "timestamp": timestamp,
+            "recovery": False,
+            "low": Decimal("93.1"),
+        }
+        with patch(
+            "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+            return_value=followup,
+        ):
+            created = restarted.determine_executor_actions()
+
+    assert len(created) == 1
+    executor = created[0].executor_config
+    assert executor.episode_setup_policy == "RECOVERY_REBOUND_SCOUT_V1"
+    assert executor.episode_setup_started_at == 10020
+    assert executor.episode_setup_confirmation_started_at == 10080
+    assert executor.episode_setup_low == Decimal("93")
+    assert executor.episode_setup_no_new_low == 2
+
+
 def test_adaptive_entry_pricing_maps_owner_signal_context_and_exposes_receipt():
     controller, _ = setup_controller(episode_adaptive_entry_pricing=True)
     controller.processed_data = {

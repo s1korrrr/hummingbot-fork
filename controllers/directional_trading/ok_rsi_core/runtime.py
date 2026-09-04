@@ -78,6 +78,7 @@ def policy_config(config):
         adaptive_entry_pricing=config.episode_adaptive_entry_pricing,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
+        recovery_rebound_scout=config.episode_recovery_rebound_scout,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -144,9 +145,16 @@ class EpisodeRuntime:
             key=lambda request: (request.expires_at, request.revision),
         ) if buy_requests else None
         active_setup = (
-            self.config.scout_rebound_confirmation
+            (self.config.scout_rebound_confirmation or self.config.recovery_rebound_scout)
             and self.state.base == 0
             and self.state.setup_level == 0
+        )
+        setup_policy = (
+            "RECOVERY_REBOUND_SCOUT_V1"
+            if active_setup and self.config.recovery_rebound_scout
+            else "SCOUT_REBOUND_V1"
+            if active_setup
+            else None
         )
         return {"enabled": True, "phase": self.state.phase, "episode_id": self.state.episode_id,
                 "reason": self.reason, "hold_reason": self.hold_reason,
@@ -162,11 +170,17 @@ class EpisodeRuntime:
                 "last_entry_discount_atr": str(last_entry.pricing_discount_atr) if last_entry else None,
                 "last_entry_confidence": str(last_entry.signal_confidence) if last_entry else None,
                 "last_entry_trend_alignment": str(last_entry.trend_alignment) if last_entry else None,
-                "setup_policy": "SCOUT_REBOUND_V1" if active_setup else None,
+                "setup_policy": setup_policy,
                 "setup_started_at": self.state.setup_start if active_setup else None,
+                "setup_confirmation_started_at": (
+                    (self.state.setup_confirmation_start or None) if active_setup else None
+                ),
                 "setup_low": str(self.state.setup_low) if active_setup else None,
                 "last_entry_setup_policy": last_entry.setup_policy if last_entry else None,
                 "last_entry_setup_started_at": last_entry.setup_started_at if last_entry else None,
+                "last_entry_setup_confirmation_started_at": (
+                    last_entry.setup_confirmation_started_at if last_entry else None
+                ),
                 "last_entry_setup_low": str(last_entry.setup_low) if last_entry else None,
                 "last_entry_setup_rebound": str(last_entry.setup_rebound) if last_entry else None,
                 "last_entry_setup_no_new_low": last_entry.setup_no_new_low if last_entry else None,
@@ -308,6 +322,7 @@ class EpisodeRuntime:
                     episode_intent=request.intent,
                     episode_setup_policy=request.setup_policy,
                     episode_setup_started_at=request.setup_started_at,
+                    episode_setup_confirmation_started_at=request.setup_confirmation_started_at,
                     episode_setup_low=request.setup_low,
                     episode_setup_rebound=request.setup_rebound,
                     episode_setup_no_new_low=request.setup_no_new_low,

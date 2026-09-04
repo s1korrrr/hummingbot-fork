@@ -128,6 +128,7 @@ class EpisodeConfig:
     adaptive_entry_pricing: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
+    recovery_rebound_scout: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -147,6 +148,7 @@ class EpisodeConfig:
             "adaptive_entry_pricing",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
+            "recovery_rebound_scout",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -173,6 +175,7 @@ class EpisodeConfig:
                 self.adaptive_entry_pricing,
                 self.scout_rebound_confirmation,
                 self.recovery_aware_scout,
+                self.recovery_rebound_scout,
             )
         ) > 1:
             raise EpisodeInputError("entry treatments cannot be combined")
@@ -220,6 +223,8 @@ class EpisodeConfig:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
             values.pop("recovery_aware_scout")
+        if not self.recovery_rebound_scout:
+            values.pop("recovery_rebound_scout")
         return _hash(values)
 
 
@@ -325,6 +330,7 @@ class OrderRequest:
     trend_alignment: Decimal = ZERO
     setup_policy: str = "IMMEDIATE"
     setup_started_at: int = 0
+    setup_confirmation_started_at: int = 0
     setup_low: Decimal = ZERO
     setup_rebound: Decimal = ZERO
     setup_no_new_low: int = 0
@@ -333,7 +339,14 @@ class OrderRequest:
         for name in ("id", "episode_id"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise EpisodeInputError("invalid request identity")
-        for name in ("level", "expires_at", "revision", "setup_started_at", "setup_no_new_low"):
+        for name in (
+            "level",
+            "expires_at",
+            "revision",
+            "setup_started_at",
+            "setup_confirmation_started_at",
+            "setup_no_new_low",
+        ):
             if type(getattr(self, name)) is not int:
                 raise EpisodeInputError("invalid request integer")
         if self.side not in ("BUY", "SELL") or self.expires_at <= 0 or self.revision <= 0:
@@ -346,6 +359,7 @@ class OrderRequest:
             "IMMEDIATE",
             "SCOUT_REBOUND_V1",
             "RECOVERY_AWARE_SCOUT_V1",
+            "RECOVERY_REBOUND_SCOUT_V1",
         }:
             raise EpisodeInputError("invalid entry setup policy")
         if self.intent != "UNSPECIFIED" and (
@@ -377,19 +391,56 @@ class OrderRequest:
             if self.pricing_policy == "ADAPTIVE_MAKER_V1" and self.pricing_discount <= 0:
                 raise EpisodeInputError("adaptive receipt requires a passive discount")
         if self.setup_policy == "IMMEDIATE":
-            if any((self.setup_started_at, self.setup_low, self.setup_rebound, self.setup_no_new_low)):
+            if any(
+                (
+                    self.setup_started_at,
+                    self.setup_confirmation_started_at,
+                    self.setup_low,
+                    self.setup_rebound,
+                    self.setup_no_new_low,
+                )
+            ):
                 raise EpisodeInputError("immediate entry cannot carry rebound setup state")
         elif self.setup_policy == "RECOVERY_AWARE_SCOUT_V1":
             if (
                 self.side != "BUY"
                 or self.level != 0
-                or any((self.setup_started_at, self.setup_low, self.setup_rebound, self.setup_no_new_low))
+                or any(
+                    (
+                        self.setup_started_at,
+                        self.setup_confirmation_started_at,
+                        self.setup_low,
+                        self.setup_rebound,
+                        self.setup_no_new_low,
+                    )
+                )
             ):
                 raise EpisodeInputError("recovery-aware scout receipt contradicts request")
+        elif self.setup_policy == "RECOVERY_REBOUND_SCOUT_V1":
+            immediate = not any(
+                (
+                    self.setup_started_at,
+                    self.setup_confirmation_started_at,
+                    self.setup_low,
+                    self.setup_rebound,
+                    self.setup_no_new_low,
+                )
+            )
+            confirmed = (
+                self.setup_started_at > 0
+                and self.setup_confirmation_started_at > self.setup_started_at
+                and self.setup_low > 0
+                and self.setup_rebound > 0
+                and self.setup_no_new_low > 0
+                and self.price >= self.setup_low + self.setup_rebound
+            )
+            if self.side != "BUY" or self.level != 0 or not (immediate or confirmed):
+                raise EpisodeInputError("recovery rebound scout receipt contradicts request")
         elif (
             self.side != "BUY"
             or self.level != 0
             or self.setup_started_at <= 0
+            or self.setup_confirmation_started_at != 0
             or self.setup_low <= 0
             or self.setup_rebound <= 0
             or self.setup_no_new_low <= 0
@@ -457,6 +508,7 @@ class EpisodeState:
     setup_level: int = -1
     setup_low: Decimal = ZERO
     setup_start: int = 0
+    setup_confirmation_start: int = 0
     no_new_low: int = 0
     distribution_start_base: Decimal = ZERO
     distribution_basis: Decimal = ZERO
@@ -485,6 +537,7 @@ class EpisodeState:
                 raise EpisodeInputError("unsupported episode schema/phase")
             values.setdefault("adverse_entry_latched", False)
             values.setdefault("exit_intent", None)
+            values.setdefault("setup_confirmation_start", 0)
             for name in ("assignment_consumed", "cost_known", "adverse_entry_latched"):
                 if type(values[name]) is not bool:
                     raise EpisodeInputError(f"invalid checkpoint boolean {name}")
@@ -494,6 +547,7 @@ class EpisodeState:
                 "timestamp",
                 "setup_level",
                 "setup_start",
+                "setup_confirmation_start",
                 "no_new_low",
                 "command_revision",
                 "cooldown_htf_timestamp",
@@ -615,6 +669,12 @@ def _accounting(config: EpisodeConfig, state: EpisodeState) -> dict[str, Decimal
 def _validate_accounting(config: EpisodeConfig, state: EpisodeState) -> None:
     if any(getattr(state, name) != value for name, value in _accounting(config, state).items()):
         raise EpisodeInputError("checkpoint accounting contradicts execution receipts")
+    if state.setup_confirmation_start and (
+        state.setup_level != 0
+        or state.setup_start <= 0
+        or state.setup_confirmation_start <= state.setup_start
+    ):
+        raise EpisodeInputError("checkpoint recovery confirmation clock is invalid")
     if state.episode_id and len(state.levels) != len(config.level_fractions):
         raise EpisodeInputError("checkpoint level allocation mismatch")
     current = [order for order in state.orders.values() if order.request.episode_id == state.episode_id]
@@ -862,19 +922,29 @@ def transition(
         raise EpisodeInputError("out-of-order market observation")
     if market.valid:
         state.last_valid_bid = market.bid
-    setup_context_reset = bool(
+    global_rebound_setup = bool(
         config.scout_rebound_confirmation
         and state.episode_id
         and state.base == 0
         and state.gross_spent == 0
         and state.setup_level == 0
+    )
+    recovery_rebound_setup = bool(
+        config.recovery_rebound_scout
+        and state.episode_id
+        and state.base == 0
+        and state.gross_spent == 0
+        and state.setup_level == 0
+    )
+    setup_context_reset = bool(
+        (global_rebound_setup or recovery_rebound_setup)
         and (
             not market.valid
             or market.cascade
             or market.hostile
             or market.reset
             or not market.buy_allowed
-            or market.recovery
+            or (global_rebound_setup and market.recovery)
             or (state.timestamp >= 0 and market.timestamp > state.timestamp + config.interval_seconds)
         )
     )
@@ -883,14 +953,24 @@ def transition(
         or market.cascade
         or market.hostile
         or not market.buy_allowed
-        or market.recovery
+        or (market.recovery and not recovery_rebound_setup)
         or (state.timestamp >= 0 and market.timestamp > state.timestamp + config.interval_seconds)
     ):
         state.setup_level, state.no_new_low = -1, 0
+        state.setup_confirmation_start = 0
     for update in updates:
         _apply_update(config, state, market, update)
     if setup_context_reset:
         state = _abandon_unfunded_episode(config, state, market)
+        if recovery_rebound_setup:
+            return Transition(
+                state,
+                reason=(
+                    "data_unavailable"
+                    if not market.valid
+                    else "recovery_rebound_abandoned"
+                ),
+            )
     pending = [order for order in state.orders.values() if not order.done]
     cancellations = tuple(
         order.request.id
@@ -1024,13 +1104,63 @@ def transition(
         if config.recovery_aware_scout and market.recovery:
             return Transition(state, reason="recovery_scout_deferred")
         _start_episode(config, state, market)
+        if config.recovery_rebound_scout and market.recovery:
+            state.setup_level = 0
+            state.setup_low = market.low
+            state.setup_start = market.timestamp
+            state.setup_confirmation_start = 0
+            state.no_new_low = 0
+            state.phase = "WATCH"
+            return Transition(state, reason="recovery_rebound_armed")
     elif config.adaptive_entry_pricing and state.gross_spent == 0 and state.levels[0] == "OPEN" and market.entry_signal:
         # A fresh signal after a zero-fill expiry gets fresh causal levels while
         # retaining the original episode/order identity for late-fill safety.
         state.frozen_anchor = market.anchor
         state.frozen_atr = market.atr_1h
     setup_receipt = None
-    if config.scout_rebound_confirmation and state.gross_spent == 0 and state.levels[0] == "OPEN":
+    recovery_rebound_setup = bool(
+        config.recovery_rebound_scout
+        and state.gross_spent == 0
+        and state.levels[0] == "OPEN"
+        and state.setup_level == 0
+    )
+    if recovery_rebound_setup:
+        if market.low < state.setup_low:
+            state.setup_low = market.low
+            state.no_new_low = 0
+        if market.recovery:
+            state.setup_confirmation_start = 0
+            state.no_new_low = 0
+            return Transition(state, reason="recovery_rebound_wait")
+        if state.setup_confirmation_start == 0:
+            state.setup_confirmation_start = market.timestamp
+            state.no_new_low = 0
+            return Transition(state, reason="recovery_rebound_cleared")
+        if (
+            market.timestamp - state.setup_confirmation_start
+            >= config.setup_bars * config.interval_seconds
+        ):
+            return Transition(
+                _abandon_unfunded_episode(config, state, market),
+                reason="recovery_rebound_expired",
+            )
+        if market.low < state.setup_low:
+            state.setup_low, state.no_new_low = market.low, 0
+        else:
+            state.no_new_low += 1
+        rebound = max(config.rebound_atr * market.atr_1m, 2 * (market.ask - market.bid))
+        if state.no_new_low < config.stabilization_bars or market.ask < state.setup_low + rebound:
+            return Transition(state, reason="need_recovery_rebound")
+        level = 0
+        setup_receipt = {
+            "setup_policy": "RECOVERY_REBOUND_SCOUT_V1",
+            "setup_started_at": state.setup_start,
+            "setup_confirmation_started_at": state.setup_confirmation_start,
+            "setup_low": state.setup_low,
+            "setup_rebound": rebound,
+            "setup_no_new_low": state.no_new_low,
+        }
+    elif config.scout_rebound_confirmation and state.gross_spent == 0 and state.levels[0] == "OPEN":
         if state.setup_level != 0:
             if not market.entry_signal:
                 return Transition(state, reason="need_entry_confirmation")
@@ -1081,6 +1211,8 @@ def transition(
             return Transition(state, reason="need_scout_level")
     if config.recovery_aware_scout and level == 0:
         setup_receipt = {"setup_policy": "RECOVERY_AWARE_SCOUT_V1"}
+    elif config.recovery_rebound_scout and level == 0 and setup_receipt is None:
+        setup_receipt = {"setup_policy": "RECOVERY_REBOUND_SCOUT_V1"}
     factor = (
         config.hostile_scout_fraction
         if market.hostile or (level == 0 and state.adverse_entry_latched)
@@ -1168,6 +1300,7 @@ def transition(
                 state.levels[index] = "SKIPPED"
     state.levels[level] = "AUTHORIZED"
     state.setup_level = -1
+    state.setup_confirmation_start = 0
     state.phase = "SCOUT" if level == 0 else "ACCUMULATE"
     request = _request(
         config,

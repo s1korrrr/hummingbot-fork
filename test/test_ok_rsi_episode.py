@@ -223,11 +223,13 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("adaptive_entry_pricing")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
+    legacy_values.pop("recovery_rebound_scout")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
     assert replace(cfg, scout_rebound_confirmation=True).identity != cfg.identity
     assert replace(cfg, recovery_aware_scout=True).identity != cfg.identity
+    assert replace(cfg, recovery_rebound_scout=True).identity != cfg.identity
 
 
 def test_recovery_aware_scout_preserves_immediate_non_recovery_entry():
@@ -287,6 +289,202 @@ def test_recovery_aware_scout_does_not_veto_non_recovery_hostile_or_reset_contex
 
     assert result.reason == "scout"
     assert result.requests[0].setup_policy == "RECOVERY_AWARE_SCOUT_V1"
+
+
+def test_recovery_rebound_scout_preserves_exact_immediate_non_recovery_entry():
+    baseline = transition(config(), EpisodeState(), market(recovery=False))
+    routed = transition(
+        config(recovery_rebound_scout=True),
+        EpisodeState(),
+        market(recovery=False),
+    )
+
+    expected = baseline.requests[0]
+    request = routed.requests[0]
+    assert routed.reason == baseline.reason == "scout"
+    assert (request.id, request.amount, request.price, request.reserved_quote) == (
+        expected.id,
+        expected.amount,
+        expected.price,
+        expected.reserved_quote,
+    )
+    assert request.setup_policy == "RECOVERY_REBOUND_SCOUT_V1"
+    assert request.setup_started_at == 0
+    assert request.setup_confirmation_started_at == 0
+
+
+def test_recovery_rebound_scout_waits_for_clear_then_confirms_original_opportunity():
+    cfg = config(recovery_rebound_scout=True)
+    armed = transition(
+        cfg,
+        EpisodeState(),
+        market(recovery=True, low=D("99.8")),
+    )
+    waiting = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            recovery=True,
+            low=D("99"),
+            bid=D("99.05"),
+            ask=D("99.1"),
+            entry_signal=False,
+        ),
+    )
+    cleared = transition(
+        cfg,
+        waiting.state,
+        market(
+            timestamp=6120,
+            recovery=False,
+            low=D("99.05"),
+            bid=D("99.05"),
+            ask=D("99.1"),
+            entry_signal=False,
+        ),
+    )
+    once = transition(
+        cfg,
+        cleared.state,
+        market(
+            timestamp=6180,
+            recovery=False,
+            low=D("99.05"),
+            bid=D("99.05"),
+            ask=D("99.1"),
+            entry_signal=False,
+        ),
+    )
+    confirmed = transition(
+        cfg,
+        once.state,
+        market(
+            timestamp=6240,
+            recovery=False,
+            low=D("99.05"),
+            bid=D("100.25"),
+            ask=D("100.3"),
+            entry_signal=False,
+        ),
+    )
+
+    assert armed.reason == "recovery_rebound_armed"
+    assert armed.state.setup_start == 6000
+    assert armed.state.setup_confirmation_start == 0
+    assert waiting.reason == "recovery_rebound_wait"
+    assert waiting.state.setup_low == D("99")
+    assert cleared.reason == "recovery_rebound_cleared"
+    assert cleared.state.setup_confirmation_start == 6120
+    assert once.reason == "need_recovery_rebound"
+    assert confirmed.reason == "scout"
+    request = confirmed.requests[0]
+    assert request.setup_policy == "RECOVERY_REBOUND_SCOUT_V1"
+    assert request.setup_started_at == 6000
+    assert request.setup_confirmation_started_at == 6120
+    assert request.setup_low == D("99")
+    assert request.setup_rebound == D("0.25")
+    assert request.setup_no_new_low == 2
+    assert EpisodeState.from_dict(confirmed.state.to_dict()).orders[request.id].request == request
+    with pytest.raises(EpisodeInputError, match="recovery rebound"):
+        replace(request, setup_confirmation_started_at=request.setup_started_at)
+
+
+def test_recovery_rebound_wait_does_not_consume_post_clear_confirmation_window():
+    cfg = config(
+        recovery_rebound_scout=True,
+        setup_bars=2,
+        stabilization_bars=1,
+    )
+    result = transition(cfg, EpisodeState(), market(recovery=True))
+    for timestamp in (6060, 6120, 6180, 6240, 6300):
+        result = transition(
+            cfg,
+            result.state,
+            market(timestamp=timestamp, recovery=True, entry_signal=False),
+        )
+
+    assert result.reason == "recovery_rebound_wait"
+    assert result.state.episode_id is not None
+    assert result.state.setup_confirmation_start == 0
+    cleared = transition(
+        cfg,
+        result.state,
+        market(timestamp=6360, recovery=False, entry_signal=False),
+    )
+    assert cleared.reason == "recovery_rebound_cleared"
+    assert cleared.state.setup_confirmation_start == 6360
+
+
+@pytest.mark.parametrize("context_flag", ["hostile", "reset", "cascade"])
+def test_recovery_rebound_unsafe_context_abandons_unfunded_setup(context_flag):
+    cfg = config(recovery_rebound_scout=True)
+    armed = transition(cfg, EpisodeState(), market(recovery=True))
+
+    abandoned = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            recovery=True,
+            entry_signal=False,
+            **{context_flag: True},
+        ),
+    )
+
+    assert abandoned.reason == "recovery_rebound_abandoned"
+    assert abandoned.requests == ()
+    assert abandoned.state.episode_id is None
+    assert abandoned.state.setup_level == -1
+
+
+def test_recovery_rebound_post_clear_timeout_abandons_and_requires_fresh_signal():
+    cfg = config(
+        recovery_rebound_scout=True,
+        setup_bars=2,
+        stabilization_bars=1,
+    )
+    armed = transition(cfg, EpisodeState(), market(recovery=True))
+    cleared = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            recovery=False,
+            bid=D("99"),
+            ask=D("99.1"),
+            low=D("99"),
+            entry_signal=False,
+        ),
+    )
+    waiting = transition(
+        cfg,
+        cleared.state,
+        market(
+            timestamp=6120,
+            recovery=False,
+            bid=D("99"),
+            ask=D("99.1"),
+            low=D("99"),
+            entry_signal=False,
+        ),
+    )
+    expired = transition(
+        cfg,
+        waiting.state,
+        market(
+            timestamp=6180,
+            recovery=False,
+            bid=D("99"),
+            ask=D("99.1"),
+            low=D("99"),
+            entry_signal=False,
+        ),
+    )
+
+    assert expired.reason == "recovery_rebound_expired"
+    assert expired.state.episode_id is None
+    assert expired.requests == ()
 
 
 def test_rebound_scout_latches_signal_tracks_low_and_waits_for_causal_reclaim():
@@ -395,6 +593,24 @@ def test_rebound_scout_is_opt_in_and_sell_only_never_arms_it():
     assert all(request.side != "BUY" for request in sell_only.requests)
 
 
+def test_recovery_rebound_scout_never_arms_for_sell_only_inventory():
+    result = transition(
+        config(
+            mode="sell_only",
+            recovery_rebound_scout=True,
+            assignment_id="assigned",
+            initial_base=D("1"),
+            initial_cost=D("100"),
+        ),
+        EpisodeState(),
+        market(base_available=D("1"), recovery=True),
+    )
+
+    assert result.state.setup_level == -1
+    assert result.state.setup_confirmation_start == 0
+    assert all(request.side != "BUY" for request in result.requests)
+
+
 def test_entry_treatments_cannot_be_composed_without_a_new_policy_contract():
     with pytest.raises(EpisodeInputError, match="cannot be combined"):
         config(adaptive_entry_pricing=True, scout_rebound_confirmation=True)
@@ -402,6 +618,10 @@ def test_entry_treatments_cannot_be_composed_without_a_new_policy_contract():
         config(adaptive_entry_pricing=True, recovery_aware_scout=True)
     with pytest.raises(EpisodeInputError, match="cannot be combined"):
         config(scout_rebound_confirmation=True, recovery_aware_scout=True)
+    with pytest.raises(EpisodeInputError, match="cannot be combined"):
+        config(recovery_aware_scout=True, recovery_rebound_scout=True)
+    with pytest.raises(EpisodeInputError, match="cannot be combined"):
+        config(scout_rebound_confirmation=True, recovery_rebound_scout=True)
 
 
 def test_stabilization_window_must_fit_before_setup_expiry():
@@ -988,6 +1208,15 @@ def test_corrupt_checkpoint_cannot_release_pending_reservation(field, value):
     order[field] = value
     with pytest.raises(EpisodeInputError):
         EpisodeState.from_dict(state)
+
+
+def test_legacy_checkpoint_defaults_recovery_confirmation_clock_to_zero():
+    payload = EpisodeState().to_dict()
+    payload.pop("setup_confirmation_start")
+
+    restored = EpisodeState.from_dict(payload)
+
+    assert restored.setup_confirmation_start == 0
 
 
 @pytest.mark.parametrize(

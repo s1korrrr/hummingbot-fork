@@ -50,6 +50,7 @@ class EpisodeOrderExecutorConfig(OrderExecutorConfig):
     episode_intent: str = "UNSPECIFIED"
     episode_setup_policy: str = "IMMEDIATE"
     episode_setup_started_at: int = 0
+    episode_setup_confirmation_started_at: int = 0
     episode_setup_low: Decimal = ZERO
     episode_setup_rebound: Decimal = ZERO
     episode_setup_no_new_low: int = 0

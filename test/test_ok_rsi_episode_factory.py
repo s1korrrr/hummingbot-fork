@@ -29,6 +29,7 @@ def pending_request():
     ("episode_level", False), ("episode_revision", True),
     ("episode_revision", 1000), ("episode_expires_at", 20000), ("level_id", "legacy"),
     ("episode_intent", "TERMINAL_PROFIT_EXIT"),
+    ("episode_setup_confirmation_started_at", 1),
 ])
 def test_factory_rejects_every_changed_authorization_field(field, value):
     controller, config = pending_request()

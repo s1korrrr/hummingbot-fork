@@ -63,6 +63,10 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_bounded_markup_runner: bool = False
     episode_stage_preserving_runner: bool = False
     episode_next_stage_confirmation: bool = False
+    episode_earned_stage_risk_skim: bool = False
+    episode_earned_stage_risk_skim_fraction: Decimal = hl_rsi.Field(
+        default=Decimal("0.1"), gt=Decimal("0"), le=Decimal("1")
+    )
     episode_fee_rate: Decimal = hl_rsi.Field(default=Decimal("0.001"), ge=0, lt=Decimal("0.1"))
     episode_assignment_id: Optional[str] = None
     episode_initial_base: Decimal = hl_rsi.Field(default=Decimal("0"), ge=0)
@@ -241,6 +245,11 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             and not self.episode_stage_preserving_runner
         ):
             raise ValueError("next stage confirmation requires stage preserving runner")
+        if (
+            self.episode_earned_stage_risk_skim
+            and not self.episode_next_stage_confirmation
+        ):
+            raise ValueError("earned stage risk skim requires next stage confirmation")
         if self.episode_adaptive_reserved_entry and not self.episode_adaptive_entry_pricing:
             raise ValueError("reserved adaptive entry requires adaptive entry pricing")
         if self.episode_adaptive_reference_fallback and not self.episode_adaptive_reserved_entry:

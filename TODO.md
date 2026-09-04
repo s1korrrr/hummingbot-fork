@@ -1,9 +1,8 @@
-# OK RSI next-stage confirmed distribution v20
+# OK RSI earned-stage risk skim v21
 
-- [x] Diagnose V19 sell episodes and freeze the causal rule and gate.
-- [x] Add RED earned-stage, released-stage, trail, restart, and receipt tests.
-- [x] Implement the default-false option in `ok_rsi_core` and runtime config.
-- [x] Cover exact default-off identity, release rails, and sell-only buy inertia.
-- [x] Run the focused native suite, Ruff, PyCompile, and shadow diff.
-- [x] Hand exact native commit `5dc23d03c173236b56eb9aec32ba2be02d120d16`
-  to Quants Lab and record the frozen marked-exposure rejection.
+- [x] Attribute V20's BNB marked-exposure failure and freeze a 10% chunk skim.
+- [x] Add RED 98/78/58 target, dependency, receipt, and identity tests.
+- [x] Implement the default-false V21 option in shared `ok_rsi_core` logic.
+- [x] Cover protected exits, retries, final stage, and sell-only buy inertia.
+- [x] Run focused native verification and commit the exact intended paths.
+- [ ] Hand the exact source identity to the frozen Quants Lab replay.

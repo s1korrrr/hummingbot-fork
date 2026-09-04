@@ -114,6 +114,8 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_bounded_markup_runner=True,
         episode_stage_preserving_runner=True,
         episode_next_stage_confirmation=True,
+        episode_earned_stage_risk_skim=True,
+        episode_earned_stage_risk_skim_fraction=Decimal("0.1"),
         episode_thin_scout_release=True,
         episode_thin_scout_rearm=True,
         episode_profitable_rearm=True,
@@ -145,6 +147,8 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.bounded_markup_runner is True
     assert policy.stage_preserving_runner is True
     assert policy.next_stage_confirmation is True
+    assert policy.earned_stage_risk_skim is True
+    assert policy.earned_stage_risk_skim_fraction == Decimal("0.1")
     assert policy.thin_scout_release is True
     assert policy.thin_scout_rearm is True
     assert policy.profitable_episode_rearm is True
@@ -188,6 +192,19 @@ def test_public_config_rejects_next_stage_confirmation_without_stage_preserving(
             episode_markup_release_runner=True,
             episode_bounded_markup_runner=True,
             episode_next_stage_confirmation=True,
+        )
+
+
+def test_public_config_rejects_earned_stage_risk_skim_without_confirmation():
+    with pytest.raises(ValueError, match="earned stage risk skim"):
+        setup_controller(episode_earned_stage_risk_skim=True)
+    with pytest.raises(ValueError, match="earned stage risk skim"):
+        setup_controller(
+            episode_structure_held_runner=True,
+            episode_markup_release_runner=True,
+            episode_bounded_markup_runner=True,
+            episode_stage_preserving_runner=True,
+            episode_earned_stage_risk_skim=True,
         )
 
 
@@ -239,6 +256,32 @@ def test_next_stage_confirmation_status_exposes_earned_and_released_stages():
     assert status["next_stage_confirmation_target_fraction"] == "1"
     assert status["next_stage_confirmation_target_base"] == "1"
     assert status["exit_policy"] == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+
+
+def test_earned_stage_risk_skim_status_exposes_fraction_and_target():
+    controller, _ = setup_controller(
+        episode_structure_held_runner=True,
+        episode_markup_release_runner=True,
+        episode_bounded_markup_runner=True,
+        episode_stage_preserving_runner=True,
+        episode_next_stage_confirmation=True,
+        episode_earned_stage_risk_skim=True,
+        episode_earned_stage_risk_skim_fraction=Decimal("0.1"),
+    )
+    runtime = controller._episode_runtime
+    runtime.state.distribution_start_base = Decimal("1")
+    runtime.state.distribution_basis = Decimal("100")
+    runtime.state.distribution_atr = Decimal("1")
+    runtime.state.peak = Decimal("106.5")
+
+    status = runtime.status()
+
+    assert status["earned_stage_risk_skim_enabled"] is True
+    assert status["earned_stage_risk_skim_fraction"] == "0.1"
+    assert status["earned_stage_risk_skim_stage_index"] == 1
+    assert status["earned_stage_risk_skim_target_fraction"] == "0.98"
+    assert status["earned_stage_risk_skim_target_base"] == "0.98"
+    assert status["exit_policy"] == "EARNED_STAGE_RISK_SKIM_V10"
 
 
 def test_public_config_rejects_thin_scout_rearm_without_release():

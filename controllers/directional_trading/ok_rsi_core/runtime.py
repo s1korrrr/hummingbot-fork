@@ -17,6 +17,7 @@ from controllers.directional_trading.ok_rsi_core.episode import (
     MarketSnapshot,
     OrderUpdate,
     acquisition_levels,
+    earned_stage_risk_skim_target,
     minimum_profit_price,
     next_stage_confirmed_distribution_target,
     stage_preserving_runner_target,
@@ -97,6 +98,8 @@ def policy_config(config):
         bounded_markup_runner=config.episode_bounded_markup_runner,
         stage_preserving_runner=config.episode_stage_preserving_runner,
         next_stage_confirmation=config.episode_next_stage_confirmation,
+        earned_stage_risk_skim=config.episode_earned_stage_risk_skim,
+        earned_stage_risk_skim_fraction=config.episode_earned_stage_risk_skim_fraction,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -237,6 +240,17 @@ class EpisodeRuntime:
             if next_stage_earned_index < len(self.config.distribution_atr_levels)
             else None
         )
+        (
+            risk_skim_target_base,
+            risk_skim_stage_index,
+            _,
+            _,
+            risk_skim_target_fraction,
+        ) = earned_stage_risk_skim_target(
+            self.config,
+            self.state,
+            distribution_extension,
+        )
         if self.state.exit_intent == "THIN_SCOUT_RELEASE":
             exit_policy = "THIN_SCOUT_RELEASE_V1"
         elif self.state.exit_intent == "RECOVERY_ROTATION_EXIT":
@@ -245,6 +259,8 @@ class EpisodeRuntime:
             exit_policy = "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
         elif self.state.exit_intent == "RECOVERY_CAPITAL_RELEASE":
             exit_policy = "DEEP_RECOVERY_CAPITAL_RELEASE_V4"
+        elif self.config.earned_stage_risk_skim:
+            exit_policy = "EARNED_STAGE_RISK_SKIM_V10"
         elif self.config.next_stage_confirmation:
             exit_policy = "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
         elif self.config.stage_preserving_runner:
@@ -374,6 +390,27 @@ class EpisodeRuntime:
                 "next_stage_confirmation_target_base": (
                     str(next_stage_target_base)
                     if self.config.next_stage_confirmation
+                    else None
+                ),
+                "earned_stage_risk_skim_enabled": self.config.earned_stage_risk_skim,
+                "earned_stage_risk_skim_fraction": (
+                    str(self.config.earned_stage_risk_skim_fraction)
+                    if self.config.earned_stage_risk_skim
+                    else None
+                ),
+                "earned_stage_risk_skim_stage_index": (
+                    risk_skim_stage_index
+                    if self.config.earned_stage_risk_skim
+                    else None
+                ),
+                "earned_stage_risk_skim_target_fraction": (
+                    str(risk_skim_target_fraction)
+                    if self.config.earned_stage_risk_skim
+                    else None
+                ),
+                "earned_stage_risk_skim_target_base": (
+                    str(risk_skim_target_base)
+                    if self.config.earned_stage_risk_skim
                     else None
                 ),
                 "scout_probe_rebound_enabled": self.config.scout_probe_rebound,

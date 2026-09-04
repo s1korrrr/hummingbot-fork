@@ -60,6 +60,8 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_bounded_markup_runner is False
     assert legacy.episode_stage_preserving_runner is False
     assert legacy.episode_next_stage_confirmation is False
+    assert legacy.episode_earned_stage_risk_skim is False
+    assert legacy.episode_earned_stage_risk_skim_fraction == Decimal("0.1")
     assert legacy.episode_scout_rebound_confirmation is False
     assert legacy.episode_recovery_aware_scout is False
     with pytest.raises(ValueError, match="assignment"):

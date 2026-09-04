@@ -639,6 +639,8 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("bounded_markup_runner")
     legacy_values.pop("stage_preserving_runner")
     legacy_values.pop("next_stage_confirmation")
+    legacy_values.pop("earned_stage_risk_skim")
+    legacy_values.pop("earned_stage_risk_skim_fraction")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
@@ -686,6 +688,15 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
         stage_preserving_runner=True,
         next_stage_confirmation=True,
     ).identity != cfg.identity
+    assert replace(
+        cfg,
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+        earned_stage_risk_skim=True,
+    ).identity != cfg.identity
 
 
 def test_markup_release_runner_requires_structure_held_runner():
@@ -721,6 +732,22 @@ def test_next_stage_confirmation_requires_stage_preserving_runner():
             bounded_markup_runner=True,
             next_stage_confirmation=True,
         )
+
+
+def test_earned_stage_risk_skim_requires_confirmation_and_valid_fraction():
+    with pytest.raises(EpisodeInputError, match="earned stage risk skim"):
+        config(earned_stage_risk_skim=True)
+    with pytest.raises(EpisodeInputError, match="earned stage risk skim"):
+        config(
+            structure_held_runner=True,
+            markup_release_runner=True,
+            bounded_markup_runner=True,
+            stage_preserving_runner=True,
+            earned_stage_risk_skim=True,
+        )
+    for fraction in (D("0"), D("1.01")):
+        with pytest.raises(EpisodeInputError, match="risk skim fraction"):
+            config(earned_stage_risk_skim_fraction=fraction)
 
 
 def test_deep_recovery_rotation_requires_capital_release():
@@ -3489,6 +3516,173 @@ def test_next_stage_confirmation_releases_only_previously_earned_stage(
         assert request.exit_target_base == D(target)
 
 
+@pytest.mark.parametrize(
+    ("extension", "target", "amount"),
+    (
+        ("3.9", "1", None),
+        ("4", ".98", ".02"),
+        ("6.5", ".98", ".02"),
+        ("7", ".78", ".22"),
+        ("9.98", ".78", ".22"),
+        ("10", ".58", ".42"),
+    ),
+)
+def test_earned_stage_risk_skim_releases_ten_percent_of_each_earned_chunk(
+    extension, target, amount
+):
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+        earned_stage_risk_skim=True,
+        earned_stage_risk_skim_fraction=D(".1"),
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D(extension)
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("103"), ask=D("103"), low=D("103"), atr_15m=D("0.1"),
+            atr_1h=D("10"), base_available=D("1"), hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert result.state.target_base == D(target)
+    if amount is None:
+        assert not result.requests
+    else:
+        request = result.requests[0]
+        assert request.amount == D(amount)
+        assert request.exit_policy == "EARNED_STAGE_RISK_SKIM_V10"
+        assert request.exit_target_base == D(target)
+
+
+def test_earned_stage_risk_skim_protected_trail_releases_full_earned_stage():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+        earned_stage_risk_skim=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D("6.5")
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"), ask=D("102.4"), low=D("102.4"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True, markup=True,
+        ),
+    )
+
+    assert result.state.structure_runner_active is True
+    assert result.state.target_base == D(".8")
+    assert result.requests[0].amount == D(".2")
+    assert result.requests[0].exit_policy == "EARNED_STAGE_RISK_SKIM_V10"
+    assert result.requests[0].exit_trail_breach == "PRICE_AND_EQUITY"
+
+
+def test_earned_stage_risk_skim_retry_preserves_policy_and_target():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+        earned_stage_risk_skim=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D("4")
+    first = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("103"), ask=D("103"), low=D("103"), atr_15m=D("0.1"),
+            atr_1h=D("10"), base_available=D("1"), hourly_recovered=True,
+            markup=True,
+        ),
+    )
+    request = first.requests[0]
+
+    retried = transition(
+        cfg,
+        EpisodeState.from_dict(first.state.to_dict()),
+        market(
+            timestamp=6300,
+            bid=D("103.1"), ask=D("103.1"), low=D("103.1"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True, markup=True,
+        ),
+        [
+            OrderUpdate(
+                request.id,
+                filled_base=D("0"),
+                filled_quote=D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+
+    retry = retried.requests[0]
+    assert retry.id != request.id
+    assert retry.amount == request.amount == D(".02")
+    assert retry.exit_policy == "EARNED_STAGE_RISK_SKIM_V10"
+    assert retry.exit_target_base == request.exit_target_base == D(".98")
+    assert retry.exit_target_revision == request.exit_target_revision == 1
+
+
+@pytest.mark.parametrize(
+    ("extension", "market_values", "breach"),
+    (
+        ("6.5", {"hostile": True}, "RISK_OVERRIDE"),
+        ("10", {}, "PRICE_AND_EQUITY"),
+    ),
+)
+def test_earned_stage_risk_skim_keeps_full_exit_rails(
+    extension, market_values, breach
+):
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+        earned_stage_risk_skim=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D(extension)
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"), ask=D("102.4"), low=D("102.4"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True, markup=True, **market_values,
+        ),
+    )
+
+    assert result.state.phase == "EXIT"
+    assert result.state.target_base == D("0")
+    assert result.requests[0].amount == D("1")
+    assert result.requests[0].exit_policy == "EARNED_STAGE_RISK_SKIM_V10"
+    assert result.requests[0].exit_trail_breach == breach
+
+
 def test_next_stage_confirmation_trail_releases_current_earned_stage():
     cfg = config(
         structure_held_runner=True,
@@ -3960,6 +4154,46 @@ def test_sell_only_uses_same_next_stage_confirmation_without_buying():
     assert high.requests[0].side == "SELL"
     assert high.requests[0].amount == D(".2")
     assert high.requests[0].exit_policy == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+    assert all(order.request.side != "BUY" for order in high.state.orders.values())
+
+
+def test_sell_only_uses_same_earned_stage_risk_skim_without_buying():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="inventory-1",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+        earned_stage_risk_skim=True,
+    )
+    armed = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("102"), ask=D("102"), low=D("102"), atr_15m=D("0.1"),
+            atr_1h=D("10"), base_available=D("1"), markup=True,
+        ),
+    )
+    armed.state.distribution_atr = D("1")
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            bid=D("107"), ask=D("107"), low=D("107"), atr_15m=D("0.1"),
+            atr_1h=D("1"), base_available=D("1"), hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert high.state.target_base == D(".78")
+    assert high.requests[0].side == "SELL"
+    assert high.requests[0].amount == D(".22")
+    assert high.requests[0].exit_policy == "EARNED_STAGE_RISK_SKIM_V10"
     assert all(order.request.side != "BUY" for order in high.state.orders.values())
 
 

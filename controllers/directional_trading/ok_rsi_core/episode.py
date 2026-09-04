@@ -57,6 +57,7 @@ EXIT_POLICIES = {
     "BOUNDED_MARKUP_RUNNER_V7",
     "STAGE_PRESERVING_RUNNER_V8",
     "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9",
+    "EARNED_STAGE_RISK_SKIM_V10",
     "THIN_SCOUT_RELEASE_V1",
     "DEEP_RECOVERY_CAPITAL_RELEASE_V4",
     "DEEP_RECOVERY_ROTATION_EXIT_V5",
@@ -191,6 +192,8 @@ class EpisodeConfig:
     bounded_markup_runner: bool = False
     stage_preserving_runner: bool = False
     next_stage_confirmation: bool = False
+    earned_stage_risk_skim: bool = False
+    earned_stage_risk_skim_fraction: Decimal = Decimal(".1")
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -225,6 +228,7 @@ class EpisodeConfig:
             "bounded_markup_runner",
             "stage_preserving_runner",
             "next_stage_confirmation",
+            "earned_stage_risk_skim",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -238,6 +242,7 @@ class EpisodeConfig:
             "rebound_atr",
             "basis_improvement_atr",
             "last_fill_gap_atr",
+            "earned_stage_risk_skim_fraction",
             "initial_base",
         ):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
@@ -245,8 +250,11 @@ class EpisodeConfig:
             self.fee_rate >= ONE
             or self.hostile_scout_fraction > ONE
             or not ZERO < self.scout_probe_fraction <= ONE
+            or not ZERO < self.earned_stage_risk_skim_fraction <= ONE
             or not ZERO < self.trail_min <= self.trail_max < ONE
         ):
+            if not ZERO < self.earned_stage_risk_skim_fraction <= ONE:
+                raise EpisodeInputError("invalid earned stage risk skim fraction")
             raise EpisodeInputError("invalid fee, sizing factor or trailing range")
         if sum(
             (
@@ -272,6 +280,8 @@ class EpisodeConfig:
             raise EpisodeInputError("stage preserving runner requires bounded markup runner")
         if self.next_stage_confirmation and not self.stage_preserving_runner:
             raise EpisodeInputError("next stage confirmation requires stage preserving runner")
+        if self.earned_stage_risk_skim and not self.next_stage_confirmation:
+            raise EpisodeInputError("earned stage risk skim requires next stage confirmation")
         if self.adaptive_reserved_entry and not self.adaptive_entry_pricing:
             raise EpisodeInputError("reserved adaptive entry requires adaptive entry pricing")
         if self.adaptive_reference_fallback and not self.adaptive_reserved_entry:
@@ -365,6 +375,9 @@ class EpisodeConfig:
             values.pop("stage_preserving_runner")
         if not self.next_stage_confirmation:
             values.pop("next_stage_confirmation")
+        if not self.earned_stage_risk_skim:
+            values.pop("earned_stage_risk_skim")
+            values.pop("earned_stage_risk_skim_fraction")
         return _hash(values)
 
 
@@ -564,6 +577,7 @@ class OrderRequest:
             "BOUNDED_MARKUP_RUNNER_V7",
             "STAGE_PRESERVING_RUNNER_V8",
             "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9",
+            "EARNED_STAGE_RISK_SKIM_V10",
         }:
             raise EpisodeInputError("markup loss receipt requires markup release policy")
         elif self.exit_trail_breach == "RISK_OVERRIDE" and self.exit_risk_clear:
@@ -1675,6 +1689,33 @@ def next_stage_confirmed_distribution_target(
     )
 
 
+def earned_stage_risk_skim_target(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    extension: Decimal | None,
+) -> tuple[Decimal, int, int, Decimal | None, Decimal]:
+    """Skim part of the earned chunk while its balance awaits confirmation."""
+    (
+        _,
+        earned_stage_index,
+        released_stage_index,
+        earned_threshold,
+        released_fraction,
+    ) = next_stage_confirmed_distribution_target(config, state, extension)
+    target_fraction = released_fraction
+    if earned_stage_index:
+        earned_fraction = config.remaining_fractions[earned_stage_index - 1]
+        unconfirmed_chunk = released_fraction - earned_fraction
+        target_fraction -= unconfirmed_chunk * config.earned_stage_risk_skim_fraction
+    return (
+        state.distribution_start_base * target_fraction,
+        earned_stage_index,
+        released_stage_index,
+        earned_threshold,
+        target_fraction,
+    )
+
+
 def _exit_trail_breach(*, price_breached: bool, equity_breached: bool) -> str:
     if price_breached and equity_breached:
         return "PRICE_AND_EQUITY"
@@ -1736,7 +1777,9 @@ def _exit_receipt(
     )
     return {
         "exit_policy": (
-            "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+            "EARNED_STAGE_RISK_SKIM_V10"
+            if config.earned_stage_risk_skim
+            else "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
             if config.next_stage_confirmation
             else "STAGE_PRESERVING_RUNNER_V8"
             if config.stage_preserving_runner
@@ -2085,7 +2128,22 @@ def transition(
                 if state.exit_target_revision == previous_revision:
                     state.exit_target_revision += 1
             else:
-                if config.next_stage_confirmation:
+                if config.earned_stage_risk_skim:
+                    (
+                        skim_target,
+                        earned_stage_index,
+                        _,
+                        _,
+                        _,
+                    ) = earned_stage_risk_skim_target(
+                        config,
+                        state,
+                        extension,
+                    )
+                    if earned_stage_index:
+                        state.phase = "DISTRIBUTE"
+                    _reduce_exit_target(config, state, skim_target)
+                elif config.next_stage_confirmation:
                     (
                         confirmed_target,
                         earned_stage_index,

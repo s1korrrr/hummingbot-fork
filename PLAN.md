@@ -1,9 +1,9 @@
 # Active plan
 
-V20 native implementation and Quants Lab replay are complete. The option stays
-disabled because the frozen marked-exposure gate rejected the candidate;
-preserve it as evidence for the next sell-timing iteration.
+Implement and test the research-only V21 earned-stage risk skim as a
+disabled-by-default continuation of V20's shared state machine.
 
-- Execution: [docs/plans/active/2026-09-04-ok-rsi-next-stage-confirmed-distribution-v20.md](docs/plans/active/2026-09-04-ok-rsi-next-stage-confirmed-distribution-v20.md)
+- Execution: [docs/plans/active/2026-09-04-ok-rsi-earned-stage-risk-skim-v21.md](docs/plans/active/2026-09-04-ok-rsi-earned-stage-risk-skim-v21.md)
+- Rejected predecessor: [docs/plans/active/2026-09-04-ok-rsi-next-stage-confirmed-distribution-v20.md](docs/plans/active/2026-09-04-ok-rsi-next-stage-confirmed-distribution-v20.md)
 - Authority: local research only; no paper/live activation, exchange action,
   deployment, push, or pull request.

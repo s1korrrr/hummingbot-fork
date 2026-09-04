@@ -84,6 +84,7 @@ def policy_config(config):
         profitable_episode_rearm=config.episode_profitable_rearm,
         deep_recovery_capital_release=config.episode_deep_recovery_capital_release,
         deep_recovery_rotation_exit=config.episode_deep_recovery_rotation_exit,
+        deep_recovery_strength_runner=config.episode_deep_recovery_strength_runner,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
@@ -191,6 +192,8 @@ class EpisodeRuntime:
             exit_policy = "THIN_SCOUT_RELEASE_V1"
         elif self.state.exit_intent == "RECOVERY_ROTATION_EXIT":
             exit_policy = "DEEP_RECOVERY_ROTATION_EXIT_V5"
+        elif self.state.exit_intent == "RECOVERY_STRENGTH_RELEASE":
+            exit_policy = "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
         elif self.state.exit_intent == "RECOVERY_CAPITAL_RELEASE":
             exit_policy = "DEEP_RECOVERY_CAPITAL_RELEASE_V4"
         elif self.config.markup_release_runner:
@@ -251,6 +254,7 @@ class EpisodeRuntime:
                 "profitable_episode_rearm_enabled": self.config.profitable_episode_rearm,
                 "deep_recovery_capital_release_enabled": self.config.deep_recovery_capital_release,
                 "deep_recovery_rotation_exit_enabled": self.config.deep_recovery_rotation_exit,
+                "deep_recovery_strength_runner_enabled": self.config.deep_recovery_strength_runner,
                 "assignment_consumed": self.state.assignment_consumed,
                 "configured_level_count": len(self.config.level_fractions),
                 "thin_scout_inventory": thin_scout_inventory,

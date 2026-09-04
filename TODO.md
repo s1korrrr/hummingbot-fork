@@ -1,7 +1,7 @@
-# OK RSI lifecycle v2
+# OK RSI recovery-strength runner v16
 
-- [x] Add validated opt-in configuration and completed-candle context.
-- [x] Implement causal sequential scale-ins and hostile risk latch with TDD.
-- [x] Implement profitable recovery exit and explicit native execution intent.
-- [x] Run the full focused native validation and freeze source receipts.
-- [ ] Hand the verified native source to the Quants Lab ablation matrix.
+- [x] Add RED formula, config dependency, policy identity, and status tests.
+- [x] Implement the normalized retained-runner target in `ok_rsi_core`.
+- [x] Cover durable retry, restart, `buy_sell`, and `sell_only` behavior.
+- [x] Run the full focused native suite, Ruff, and shadow diff.
+- [ ] Hand the exact native source identity to the Quants Lab replay.

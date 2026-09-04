@@ -45,6 +45,7 @@ ORDER_INTENTS = {
     "THIN_SCOUT_RELEASE",
     "RECOVERY_CAPITAL_RELEASE",
     "RECOVERY_ROTATION_EXIT",
+    "RECOVERY_STRENGTH_RELEASE",
     "TRAILING_PROFIT_EXIT",
     "TERMINAL_PROFIT_EXIT",
 }
@@ -56,6 +57,7 @@ EXIT_POLICIES = {
     "THIN_SCOUT_RELEASE_V1",
     "DEEP_RECOVERY_CAPITAL_RELEASE_V4",
     "DEEP_RECOVERY_ROTATION_EXIT_V5",
+    "DEEP_RECOVERY_STRENGTH_RUNNER_V6",
 }
 EXIT_TRAIL_BREACHES = {
     "NONE",
@@ -175,6 +177,7 @@ class EpisodeConfig:
     profitable_episode_rearm: bool = False
     deep_recovery_capital_release: bool = False
     deep_recovery_rotation_exit: bool = False
+    deep_recovery_strength_runner: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -204,6 +207,7 @@ class EpisodeConfig:
             "profitable_episode_rearm",
             "deep_recovery_capital_release",
             "deep_recovery_rotation_exit",
+            "deep_recovery_strength_runner",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -250,6 +254,14 @@ class EpisodeConfig:
         if self.deep_recovery_rotation_exit and not self.deep_recovery_capital_release:
             raise EpisodeInputError(
                 "deep recovery rotation requires deep recovery capital release"
+            )
+        if self.deep_recovery_strength_runner and not self.deep_recovery_capital_release:
+            raise EpisodeInputError(
+                "deep recovery strength runner requires deep recovery capital release"
+            )
+        if self.deep_recovery_strength_runner and self.deep_recovery_rotation_exit:
+            raise EpisodeInputError(
+                "deep recovery strength runner and rotation are mutually exclusive"
             )
         for name in ("level_fractions", "dip_atr_levels", "distribution_atr_levels", "remaining_fractions"):
             object.__setattr__(self, name, tuple(_decimal(x, name, positive=True) for x in getattr(self, name)))
@@ -305,6 +317,8 @@ class EpisodeConfig:
             values.pop("deep_recovery_capital_release")
         if not self.deep_recovery_rotation_exit:
             values.pop("deep_recovery_rotation_exit")
+        if not self.deep_recovery_strength_runner:
+            values.pop("deep_recovery_strength_runner")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -1378,6 +1392,15 @@ def _exit_receipt(
             "exit_target_base": state.target_base,
             "exit_target_revision": state.exit_target_revision,
         }
+    if request_intent == "RECOVERY_STRENGTH_RELEASE":
+        return {
+            "exit_policy": "DEEP_RECOVERY_STRENGTH_RUNNER_V6",
+            "exit_hourly_recovered": market.hourly_recovered,
+            "exit_risk_clear": not (market.cascade or market.hostile or market.reset),
+            "exit_trail_breach": trail_breach,
+            "exit_target_base": state.target_base,
+            "exit_target_revision": state.exit_target_revision,
+        }
     if not config.structure_held_runner:
         return {}
     use_target_context = (
@@ -1421,6 +1444,7 @@ def _sell(
         "THIN_SCOUT_RELEASE",
         "RECOVERY_CAPITAL_RELEASE",
         "RECOVERY_ROTATION_EXIT",
+        "RECOVERY_STRENGTH_RELEASE",
     }
     if not state.cost_known and profit_protected:
         return Transition(state, reason="basis_unavailable")
@@ -1458,6 +1482,7 @@ def _sell(
         "THIN_SCOUT_RELEASE": "thin_scout_release",
         "RECOVERY_CAPITAL_RELEASE": "deep_recovery_capital_release",
         "RECOVERY_ROTATION_EXIT": "deep_recovery_rotation_exit",
+        "RECOVERY_STRENGTH_RELEASE": "deep_recovery_strength_runner",
         "TRAILING_PROFIT_EXIT": "trailing_profit_exit",
         "TERMINAL_PROFIT_EXIT": "terminal_exit",
     }[request_intent]
@@ -1597,7 +1622,8 @@ def transition(
     recovery_trail = state.phase == "RECOVER" and state.exit_intent == "RECOVERY_TAKE_PROFIT"
     if (
         state.phase == "DISTRIBUTE"
-        and state.exit_intent == "RECOVERY_CAPITAL_RELEASE"
+        and state.exit_intent
+        in {"RECOVERY_CAPITAL_RELEASE", "RECOVERY_STRENGTH_RELEASE"}
         and not pending
         and _floor(max(ZERO, state.base - state.target_base), market.amount_step) == ZERO
     ):
@@ -1747,19 +1773,37 @@ def transition(
             and weak_extension
         ):
             rotation_exit = config.deep_recovery_rotation_exit
-            state.phase = "EXIT" if rotation_exit else "DISTRIBUTE"
-            state.exit_intent = (
-                "RECOVERY_ROTATION_EXIT"
-                if rotation_exit
-                else "RECOVERY_CAPITAL_RELEASE"
+            strength_runner = config.deep_recovery_strength_runner
+            extension = max(
+                ZERO,
+                (state.peak - state.distribution_basis) / state.distribution_atr,
             )
-            _reduce_exit_target(
-                config,
-                state,
-                ZERO
-                if rotation_exit
-                else state.distribution_start_base * config.remaining_fractions[-1],
+            recovery_strength = min(
+                ONE,
+                extension / config.distribution_atr_levels[0],
             )
+            if rotation_exit:
+                state.phase = "EXIT"
+                state.exit_intent = "RECOVERY_ROTATION_EXIT"
+                target = ZERO
+                reason = "deep_recovery_rotation_exit"
+            elif strength_runner:
+                state.phase = "DISTRIBUTE"
+                state.exit_intent = "RECOVERY_STRENGTH_RELEASE"
+                target = (
+                    state.distribution_start_base
+                    * config.remaining_fractions[-1]
+                    * recovery_strength
+                )
+                reason = "deep_recovery_strength_runner"
+            else:
+                state.phase = "DISTRIBUTE"
+                state.exit_intent = "RECOVERY_CAPITAL_RELEASE"
+                target = (
+                    state.distribution_start_base * config.remaining_fractions[-1]
+                )
+                reason = "deep_recovery_capital_release"
+            _reduce_exit_target(config, state, target)
             if state.exit_target_revision == 0:
                 state.exit_target_revision = 1
             return _sell(
@@ -1767,11 +1811,7 @@ def transition(
                 state,
                 market,
                 intent=state.exit_intent,
-                reason=(
-                    "deep_recovery_rotation_exit"
-                    if rotation_exit
-                    else "deep_recovery_capital_release"
-                ),
+                reason=reason,
             )
         state.phase = "MARKUP"
         return Transition(state, reason="markup_armed")

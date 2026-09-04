@@ -1,8 +1,8 @@
 # Active plan
 
-Implement the approved research-only OK RSI lifecycle-v2 controller design.
+Implement the research-only V16 recovery-strength runner as a bounded,
+disabled-by-default continuation of the shared OK RSI lifecycle.
 
-- Design: [docs/superpowers/specs/2026-09-03-ok-rsi-lifecycle-v2-design.md](docs/superpowers/specs/2026-09-03-ok-rsi-lifecycle-v2-design.md)
-- Execution: [docs/superpowers/plans/2026-09-03-ok-rsi-lifecycle-v2.md](docs/superpowers/plans/2026-09-03-ok-rsi-lifecycle-v2.md)
+- Execution: [docs/plans/active/2026-09-04-ok-rsi-recovery-strength-runner-v16.md](docs/plans/active/2026-09-04-ok-rsi-recovery-strength-runner-v16.md)
 - Authority: local research only; no paper/live activation, exchange action,
   deployment, push, or pull request.

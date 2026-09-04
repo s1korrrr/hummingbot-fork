@@ -127,6 +127,17 @@ def test_public_config_rejects_deep_recovery_rotation_without_release():
         setup_controller(episode_deep_recovery_rotation_exit=True)
 
 
+def test_public_config_rejects_strength_runner_without_release_or_with_rotation():
+    with pytest.raises(ValueError, match="recovery strength"):
+        setup_controller(episode_deep_recovery_strength_runner=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        setup_controller(
+            episode_deep_recovery_capital_release=True,
+            episode_deep_recovery_rotation_exit=True,
+            episode_deep_recovery_strength_runner=True,
+        )
+
+
 def test_rotation_exit_status_preserves_its_v5_policy_identity():
     controller, _ = setup_controller(
         episode_deep_recovery_capital_release=True,
@@ -140,6 +151,23 @@ def test_rotation_exit_status_preserves_its_v5_policy_identity():
     assert status["deep_recovery_capital_release_enabled"] is True
     assert status["deep_recovery_rotation_exit_enabled"] is True
     assert status["exit_policy"] == "DEEP_RECOVERY_ROTATION_EXIT_V5"
+
+
+def test_strength_runner_maps_to_policy_and_runtime_status():
+    controller, _ = setup_controller(
+        episode_deep_recovery_capital_release=True,
+        episode_deep_recovery_strength_runner=True,
+    )
+    runtime = controller._episode_runtime
+    runtime.state.exit_intent = "RECOVERY_STRENGTH_RELEASE"
+
+    status = runtime.status()
+
+    assert runtime.config.deep_recovery_strength_runner is True
+    assert status["deep_recovery_capital_release_enabled"] is True
+    assert status["deep_recovery_strength_runner_enabled"] is True
+    assert status["deep_recovery_rotation_exit_enabled"] is False
+    assert status["exit_policy"] == "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
 
 
 def test_thin_scout_release_receipt_maps_to_executor_and_status():

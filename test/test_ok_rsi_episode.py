@@ -628,6 +628,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("profitable_episode_rearm")
     legacy_values.pop("deep_recovery_capital_release")
     legacy_values.pop("deep_recovery_rotation_exit")
+    legacy_values.pop("deep_recovery_strength_runner")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -649,6 +650,11 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
         deep_recovery_capital_release=True,
         deep_recovery_rotation_exit=True,
     ).identity != cfg.identity
+    assert replace(
+        cfg,
+        deep_recovery_capital_release=True,
+        deep_recovery_strength_runner=True,
+    ).identity != cfg.identity
     structure = replace(cfg, structure_held_runner=True)
     structure_values = legacy_values | {"structure_held_runner": True}
     assert structure.identity == _hash(structure_values)
@@ -664,6 +670,17 @@ def test_markup_release_runner_requires_structure_held_runner():
 def test_deep_recovery_rotation_requires_capital_release():
     with pytest.raises(EpisodeInputError, match="deep recovery rotation"):
         config(deep_recovery_rotation_exit=True)
+
+
+def test_deep_recovery_strength_runner_requires_release_and_excludes_rotation():
+    with pytest.raises(EpisodeInputError, match="recovery strength"):
+        config(deep_recovery_strength_runner=True)
+    with pytest.raises(EpisodeInputError, match="mutually exclusive"):
+        config(
+            deep_recovery_capital_release=True,
+            deep_recovery_rotation_exit=True,
+            deep_recovery_strength_runner=True,
+        )
 
 
 def test_disabled_structure_runner_preserves_legacy_checkpoint_shape():
@@ -2270,6 +2287,79 @@ def test_deep_recovery_rotation_exits_the_full_episode_to_normal_cooldown():
     assert not completed.requests
 
 
+def test_deep_recovery_strength_runner_scales_target_by_normalized_extension():
+    cfg = config(
+        deep_recovery_capital_release=True,
+        deep_recovery_strength_runner=True,
+    )
+    state, total_base = _deep_recovery_state(cfg)
+    basis = state.cost / state.base
+    bid = D("99")
+    released = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6420,
+            bid=bid,
+            ask=bid,
+            low=bid,
+            base_available=total_base,
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+
+    extension = (bid - basis) / D("1")
+    strength = extension / cfg.distribution_atr_levels[0]
+    v14_target = total_base * cfg.remaining_fractions[-1]
+    expected_target = v14_target * strength
+
+    assert D("0") < strength < D("1")
+    assert released.state.phase == "DISTRIBUTE"
+    assert released.state.target_base == expected_target
+    assert D("0") < released.state.target_base < v14_target
+    assert released.state.exit_target_revision == 1
+    assert released.state.exit_intent == "RECOVERY_STRENGTH_RELEASE"
+    assert released.reason == "deep_recovery_strength_runner"
+    request = released.requests[0]
+    assert request.intent == "RECOVERY_STRENGTH_RELEASE"
+    assert request.exit_policy == "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
+    assert request.exit_target_base == expected_target
+    assert D("0") <= total_base - expected_target - request.amount < D(".001")
+    assert request.price >= basis
+
+    restored = EpisodeState.from_dict(released.state.to_dict())
+    assert restored.exit_intent == "RECOVERY_STRENGTH_RELEASE"
+    assert restored.target_base == expected_target
+
+    expired = transition(
+        cfg,
+        restored,
+        market(
+            timestamp=6480,
+            bid=bid,
+            ask=bid,
+            low=bid,
+            base_available=total_base,
+            entry_signal=False,
+        ),
+        [
+            OrderUpdate(
+                request.id,
+                D("0"),
+                D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+    retry = expired.requests[0]
+    assert retry.id != request.id
+    assert retry.intent == "RECOVERY_STRENGTH_RELEASE"
+    assert retry.exit_policy == "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
+    assert retry.exit_target_base == expected_target
+
+
 def test_deep_recovery_release_excludes_shallow_and_strong_markup():
     cfg = config(deep_recovery_capital_release=True)
     shallow, _ = bought(cfg)
@@ -2499,6 +2589,37 @@ def test_sell_only_assignment_uses_shared_deep_recovery_rotation_without_buying(
     assert rotation.requests[0].amount == D("1")
     assert rotation.requests[0].intent == "RECOVERY_ROTATION_EXIT"
     assert all(order.request.side == "SELL" for order in rotation.state.orders.values())
+
+
+def test_sell_only_assignment_uses_shared_recovery_strength_runner_without_buying():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="assigned-deep-bag",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        deep_recovery_capital_release=True,
+        deep_recovery_strength_runner=True,
+    )
+    release = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            entry_signal=True,
+            markup=True,
+        ),
+    )
+
+    assert release.state.assignment_consumed is True
+    assert release.state.phase == "DISTRIBUTE"
+    assert release.state.target_base == D(".1")
+    assert release.requests[0].amount == D(".9")
+    assert release.requests[0].intent == "RECOVERY_STRENGTH_RELEASE"
+    assert release.requests[0].exit_policy == "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
+    assert all(order.request.side == "SELL" for order in release.state.orders.values())
 
 
 def _structure_runner_setup(cfg):

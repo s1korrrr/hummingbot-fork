@@ -50,6 +50,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_profitable_rearm: bool = False
     episode_deep_recovery_capital_release: bool = False
     episode_deep_recovery_rotation_exit: bool = False
+    episode_deep_recovery_strength_runner: bool = False
     episode_scout_rebound_confirmation: bool = False
     episode_recovery_aware_scout: bool = False
     episode_recovery_rebound_scout: bool = False
@@ -230,6 +231,20 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         ):
             raise ValueError(
                 "deep recovery rotation requires deep recovery capital release"
+            )
+        if (
+            self.episode_deep_recovery_strength_runner
+            and not self.episode_deep_recovery_capital_release
+        ):
+            raise ValueError(
+                "deep recovery strength runner requires deep recovery capital release"
+            )
+        if (
+            self.episode_deep_recovery_strength_runner
+            and self.episode_deep_recovery_rotation_exit
+        ):
+            raise ValueError(
+                "deep recovery strength runner and rotation are mutually exclusive"
             )
         if self.trade_mode == "buy_sell" and not self.use_trailing_exit and not self.episode_enabled:
             raise ValueError("buy_sell mode requires the trailing exit because no other ordinary exit is enabled")

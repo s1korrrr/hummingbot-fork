@@ -259,6 +259,330 @@ def test_reserved_adaptive_entry_requires_adaptive_pricing():
         config(adaptive_reserved_entry=True)
 
 
+def test_reference_fallback_requires_reserved_adaptive_entry():
+    with pytest.raises(EpisodeInputError, match="reference fallback"):
+        config(
+            adaptive_entry_pricing=True,
+            adaptive_reference_fallback=True,
+        )
+
+
+def test_natural_expiry_creates_one_quote_bounded_reference_fallback():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        adaptive_reserved_entry=True,
+        adaptive_reference_fallback=True,
+    )
+    first = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("99.95"),
+            ask=D("100"),
+            entry_confidence=D("0.8"),
+            trend_alignment=D("-0.2"),
+        ),
+    )
+    parent = first.requests[0]
+
+    expired = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=parent.expires_at,
+            bid=D("99.90"),
+            ask=D("100"),
+            entry_signal=False,
+            buy_allowed=False,
+            hostile=True,
+            entry_confidence=D("0.8"),
+            trend_alignment=D("-0.2"),
+        ),
+        [
+            OrderUpdate(
+                parent.id,
+                filled_base=D("0"),
+                filled_quote=D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+
+    assert expired.reason == "adaptive_reference_fallback"
+    assert len(expired.requests) == 1
+    child = expired.requests[0]
+    assert child.pricing_policy == "ADAPTIVE_REFERENCE_FALLBACK_V3"
+    assert child.parent_request_id == parent.id
+    assert child.price == D("99.89")
+    assert child.price <= parent.reference_price
+    assert child.price < D("99.90")
+    assert child.amount <= parent.amount
+    assert child.reserved_quote <= parent.reserved_quote
+    assert child.expires_at == parent.expires_at + 600
+
+    restored = EpisodeState.from_dict(expired.state.to_dict())
+    assert restored.orders[child.id].request == child
+    duplicate = transition(
+        cfg,
+        restored,
+        market(
+            timestamp=parent.expires_at + 60,
+            entry_signal=False,
+            buy_allowed=False,
+            recovery=True,
+            markup=True,
+            entry_confidence=D("0.8"),
+            trend_alignment=D("-0.2"),
+        ),
+        [
+            OrderUpdate(
+                parent.id,
+                filled_base=D("0"),
+                filled_quote=D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+    assert duplicate.requests == ()
+    assert duplicate.cancel_ids == ()
+    assert duplicate.reason == "pending_execution"
+
+
+def test_reference_fallback_rejects_unproven_hard_or_stale_terminal():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        adaptive_reserved_entry=True,
+        adaptive_reference_fallback=True,
+    )
+    first = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("0.8")),
+    )
+    parent = first.requests[0]
+    hard = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=6060,
+            entry_signal=False,
+            buy_allowed=False,
+            reservation_allowed=False,
+            entry_confidence=D("0.8"),
+        ),
+    )
+    assert hard.cancel_ids == (parent.id,)
+    terminal = transition(
+        cfg,
+        hard.state,
+        market(
+            timestamp=6120,
+            entry_signal=False,
+            entry_confidence=D("0.8"),
+        ),
+        [
+            OrderUpdate(
+                parent.id,
+                filled_base=D("0"),
+                filled_quote=D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+    assert terminal.requests == ()
+
+    fresh = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("0.8")),
+    )
+    stale_parent = fresh.requests[0]
+    stale = transition(
+        cfg,
+        fresh.state,
+        market(
+            timestamp=stale_parent.expires_at + 120,
+            entry_signal=False,
+            entry_confidence=D("0.8"),
+        ),
+        [
+            OrderUpdate(
+                stale_parent.id,
+                filled_base=D("0"),
+                filled_quote=D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+    assert stale.requests == ()
+
+    simultaneous = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("0.8")),
+    )
+    simultaneous_parent = simultaneous.requests[0]
+    blocked = transition(
+        cfg,
+        simultaneous.state,
+        market(
+            timestamp=simultaneous_parent.expires_at,
+            entry_signal=False,
+            buy_allowed=False,
+            reservation_allowed=False,
+            entry_confidence=D("0.8"),
+        ),
+        [
+            OrderUpdate(
+                simultaneous_parent.id,
+                D("0"),
+                D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+    assert blocked.requests == ()
+    assert blocked.state.orders[simultaneous_parent.id].terminal_cause == "HARD_RAIL"
+    cleared = transition(
+        cfg,
+        blocked.state,
+        market(
+            timestamp=simultaneous_parent.expires_at + 60,
+            entry_signal=False,
+            entry_confidence=D("0.8"),
+        ),
+    )
+    assert cleared.requests == ()
+
+
+def test_reference_fallback_does_not_rebuy_after_an_exit_intent_is_armed():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        adaptive_reserved_entry=True,
+        adaptive_reference_fallback=True,
+    )
+    first = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("0.8")),
+    )
+    parent = first.requests[0]
+    first.state.phase = "RECOVER"
+    first.state.exit_intent = "RECOVERY_TAKE_PROFIT"
+
+    result = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=parent.expires_at,
+            entry_signal=False,
+            entry_confidence=D("0.8"),
+        ),
+        [
+            OrderUpdate(
+                parent.id,
+                D("0"),
+                D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+
+    assert result.requests == ()
+
+
+def test_reference_fallback_requires_terminal_cause_and_never_adds_third_stage():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        adaptive_reserved_entry=True,
+        adaptive_reference_fallback=True,
+    )
+    first = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("0.8")),
+    )
+    parent = first.requests[0]
+    with pytest.raises(EpisodeInputError, match="terminal cause"):
+        transition(
+            cfg,
+            first.state,
+            market(timestamp=parent.expires_at, entry_confidence=D("0.8")),
+            [OrderUpdate(parent.id, D("0"), D("0"), done=True)],
+        )
+
+    fallback = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=parent.expires_at,
+            bid=D("99.9"),
+            entry_signal=False,
+            entry_confidence=D("0.8"),
+        ),
+        [OrderUpdate(parent.id, D("0"), D("0"), done=True, terminal_cause="NATURAL_EXPIRY")],
+    )
+    child = fallback.requests[0]
+    finished = transition(
+        cfg,
+        fallback.state,
+        market(
+            timestamp=child.expires_at,
+            entry_signal=False,
+            entry_confidence=D("0.8"),
+        ),
+        [OrderUpdate(child.id, D("0"), D("0"), done=True, terminal_cause="NATURAL_EXPIRY")],
+    )
+    assert finished.requests == ()
+    assert finished.state.levels[0] == "OPEN"
+
+
+def test_reference_fallback_checkpoint_rejects_unknown_parent():
+    cfg = config(
+        adaptive_entry_pricing=True,
+        adaptive_reserved_entry=True,
+        adaptive_reference_fallback=True,
+    )
+    first = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("0.8")),
+    )
+    parent = first.requests[0]
+    fallback = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=parent.expires_at,
+            bid=D("99.9"),
+            entry_signal=False,
+            entry_confidence=D("0.8"),
+        ),
+        [OrderUpdate(parent.id, D("0"), D("0"), done=True, terminal_cause="NATURAL_EXPIRY")],
+    )
+    child = fallback.requests[0]
+    payload = fallback.state.to_dict()
+    payload["orders"][child.id]["request"]["parent_request_id"] = "missing-parent"
+    restored = EpisodeState.from_dict(payload)
+
+    with pytest.raises(EpisodeInputError, match="fallback parent"):
+        transition(
+            cfg,
+            restored,
+            market(
+                timestamp=parent.expires_at + 60,
+                entry_signal=False,
+                entry_confidence=D("0.8"),
+            ),
+        )
+
+
 def test_disabled_adaptive_pricing_preserves_top_of_book_behavior():
     result = transition(
         config(adaptive_entry_pricing=False),
@@ -298,6 +622,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values = asdict(cfg)
     legacy_values.pop("adaptive_entry_pricing")
     legacy_values.pop("adaptive_reserved_entry")
+    legacy_values.pop("adaptive_reference_fallback")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")

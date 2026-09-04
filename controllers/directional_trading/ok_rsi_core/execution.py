@@ -48,6 +48,7 @@ class EpisodeOrderExecutorConfig(OrderExecutorConfig):
     episode_revision: int = 0
     episode_level: int = -1
     episode_intent: str = "UNSPECIFIED"
+    episode_entry_parent_request_id: str = ""
     episode_setup_policy: str = "IMMEDIATE"
     episode_setup_started_at: int = 0
     episode_setup_confirmation_started_at: int = 0
@@ -75,6 +76,7 @@ class EpisodeOrderExecutor(OrderExecutor):
         self._episode_orders = {}
         self._episode_order_ids = set()
         self._episode_submitted = False
+        self._episode_terminal_cause = "PENDING"
 
     def _remember_orders(self):
         for tracked in [self._order, *self._partial_filled_orders, *self._canceled_orders, *self._failed_orders]:
@@ -97,9 +99,24 @@ class EpisodeOrderExecutor(OrderExecutor):
 
     async def control_task(self):
         expiry = getattr(self.config, "episode_expires_at", None)
-        if expiry is not None and self._strategy.current_timestamp >= expiry:
+        if (
+            expiry is not None
+            and self._strategy.current_timestamp >= expiry
+            and self._episode_terminal_cause == "PENDING"
+            and self.status == RunnableStatus.RUNNING
+        ):
+            self._episode_terminal_cause = "NATURAL_EXPIRY"
             self._status = RunnableStatus.SHUTTING_DOWN
         await super().control_task()
+
+    def early_stop(self, keep_position: bool = True):
+        expiry = getattr(self.config, "episode_expires_at", None)
+        self._episode_terminal_cause = (
+            "NATURAL_EXPIRY"
+            if expiry is not None and self._strategy.current_timestamp >= expiry
+            else "EXTERNAL_TERMINAL"
+        )
+        super().early_stop(keep_position=keep_position)
 
     def update_tracked_order_with_order_id(self, order_id):
         super().update_tracked_order_with_order_id(order_id)
@@ -112,6 +129,8 @@ class EpisodeOrderExecutor(OrderExecutor):
     def process_order_canceled_event(self, _, market, event):
         self._remember_orders()
         if self._order and event.order_id == self._order.order_id:
+            if self._episode_terminal_cause == "PENDING":
+                self._episode_terminal_cause = "EXTERNAL_TERMINAL"
             super().process_order_canceled_event(_, market, event)
             self._status = RunnableStatus.SHUTTING_DOWN
 
@@ -120,11 +139,13 @@ class EpisodeOrderExecutor(OrderExecutor):
         if self._order and event.order_id == self._order.order_id:
             # The native failure path can retry a full amount after a partial
             # fill. Keep the native order object until its status is terminal.
+            self._episode_terminal_cause = "EXTERNAL_TERMINAL"
             self._status = RunnableStatus.SHUTTING_DOWN
 
     def process_order_completed_event(self, _, market, event):
         self.update_tracked_order_with_order_id(event.order_id)
         if event.order_id in self._episode_orders:
+            self._episode_terminal_cause = "FILLED"
             self._status = RunnableStatus.SHUTTING_DOWN
 
     def _receipt(self):
@@ -145,10 +166,19 @@ class EpisodeOrderExecutor(OrderExecutor):
         unresolved = self._episode_order_ids - self._episode_orders.keys()
         errors.extend(f"unresolved_native_order:{order_id}" for order_id in unresolved)
         all_done = all(native.is_done for native in self._episode_orders.values())
+        final = self.status == RunnableStatus.TERMINATED and all_done and not errors
+        terminal_cause = self._episode_terminal_cause if final else "PENDING"
+        if final and gross_base > ZERO:
+            terminal_cause = "FILLED"
         return {
             "gross_base": str(gross_base), "gross_quote": str(gross_quote),
             "base_fee": str(base_fee), "quote_fee": str(quote_fee),
             "intent": getattr(self.config, "episode_intent", "UNSPECIFIED"),
+            "entry_parent_request_id": getattr(
+                self.config,
+                "episode_entry_parent_request_id",
+                "",
+            ),
             "exit_policy": getattr(self.config, "episode_exit_policy", "DEFAULT"),
             "exit_hourly_recovered": getattr(self.config, "episode_exit_hourly_recovered", False),
             "exit_risk_clear": getattr(self.config, "episode_exit_risk_clear", False),
@@ -156,7 +186,8 @@ class EpisodeOrderExecutor(OrderExecutor):
             "exit_target_base": str(getattr(self.config, "episode_exit_target_base", ZERO)),
             "exit_target_revision": getattr(self.config, "episode_exit_target_revision", 0),
             "fees_known": not errors,
-            "final": self.status == RunnableStatus.TERMINATED and all_done and not errors,
+            "final": final,
+            "terminal_cause": terminal_cause,
             "errors": sorted(set(errors)),
         }
 

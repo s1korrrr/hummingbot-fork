@@ -15,6 +15,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 from controllers.directional_trading.ok_rsi_core.entry_pricing import (
+    ADAPTIVE_REFERENCE_FALLBACK_POLICY,
     ADAPTIVE_RESERVED_ENTRY_POLICY,
     AdaptiveEntryPriceInputError,
     AdaptiveEntryPriceSelection,
@@ -53,6 +54,27 @@ EXIT_TRAIL_BREACHES = {
     "PRICE_AND_EQUITY",
     "RISK_OVERRIDE",
     "MARKUP_LOSS",
+}
+RESERVED_ENTRY_POLICIES = {
+    ADAPTIVE_RESERVED_ENTRY_POLICY,
+    ADAPTIVE_REFERENCE_FALLBACK_POLICY,
+}
+TERMINAL_CAUSES = {
+    "UNRECORDED",
+    "PENDING",
+    "FILLED",
+    "NATURAL_EXPIRY",
+    "EXTERNAL_TERMINAL",
+    "HARD_RAIL",
+    "LIFECYCLE",
+    "CONTEXT",
+}
+TERMINATION_REQUESTS = {
+    "NONE",
+    "NATURAL_EXPIRY",
+    "HARD_RAIL",
+    "LIFECYCLE",
+    "CONTEXT",
 }
 
 
@@ -137,6 +159,7 @@ class EpisodeConfig:
     recovery_exit_enabled: bool = False
     adaptive_entry_pricing: bool = False
     adaptive_reserved_entry: bool = False
+    adaptive_reference_fallback: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -160,6 +183,7 @@ class EpisodeConfig:
             "recovery_exit_enabled",
             "adaptive_entry_pricing",
             "adaptive_reserved_entry",
+            "adaptive_reference_fallback",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -199,6 +223,8 @@ class EpisodeConfig:
             raise EpisodeInputError("markup release runner requires structure held runner")
         if self.adaptive_reserved_entry and not self.adaptive_entry_pricing:
             raise EpisodeInputError("reserved adaptive entry requires adaptive entry pricing")
+        if self.adaptive_reference_fallback and not self.adaptive_reserved_entry:
+            raise EpisodeInputError("reference fallback requires reserved adaptive entry")
         for name in ("level_fractions", "dip_atr_levels", "distribution_atr_levels", "remaining_fractions"):
             object.__setattr__(self, name, tuple(_decimal(x, name, positive=True) for x in getattr(self, name)))
         if (
@@ -241,6 +267,8 @@ class EpisodeConfig:
             values.pop("adaptive_entry_pricing")
         if not self.adaptive_reserved_entry:
             values.pop("adaptive_reserved_entry")
+        if not self.adaptive_reference_fallback:
+            values.pop("adaptive_reference_fallback")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -356,6 +384,7 @@ class OrderRequest:
     pricing_discount_atr: Decimal = ZERO
     signal_confidence: Decimal = ZERO
     trend_alignment: Decimal = ZERO
+    parent_request_id: str = ""
     setup_policy: str = "IMMEDIATE"
     setup_started_at: int = 0
     setup_confirmation_started_at: int = 0
@@ -393,8 +422,16 @@ class OrderRequest:
             "TOP_OF_BOOK",
             "ADAPTIVE_MAKER_V1",
             ADAPTIVE_RESERVED_ENTRY_POLICY,
+            ADAPTIVE_REFERENCE_FALLBACK_POLICY,
         }:
             raise EpisodeInputError("invalid entry pricing policy")
+        if not isinstance(self.parent_request_id, str):
+            raise EpisodeInputError("invalid parent request identity")
+        if self.pricing_policy == ADAPTIVE_REFERENCE_FALLBACK_POLICY:
+            if not self.parent_request_id or self.parent_request_id == self.id:
+                raise EpisodeInputError("reference fallback requires a distinct parent request")
+        elif self.parent_request_id:
+            raise EpisodeInputError("non-fallback request cannot carry a parent request")
         if self.setup_policy not in {
             "IMMEDIATE",
             "SCOUT_REBOUND_V1",
@@ -457,6 +494,11 @@ class OrderRequest:
                 ADAPTIVE_RESERVED_ENTRY_POLICY,
             } and self.pricing_discount <= 0:
                 raise EpisodeInputError("adaptive receipt requires a passive discount")
+            if (
+                self.pricing_policy == ADAPTIVE_REFERENCE_FALLBACK_POLICY
+                and self.pricing_discount < 0
+            ):
+                raise EpisodeInputError("reference fallback cannot exceed its parent reference")
         if self.setup_policy == "IMMEDIATE":
             if any(
                 (
@@ -525,12 +567,19 @@ class OrderUpdate:
     fee_base: Decimal = ZERO
     done: bool = False
     fees_known: bool = True
+    terminal_cause: str = "UNRECORDED"
 
     def __post_init__(self):
         for name in ("filled_base", "filled_quote", "fee_quote", "fee_base"):
             object.__setattr__(self, name, _decimal(getattr(self, name), name))
         if type(self.done) is not bool or type(self.fees_known) is not bool:
             raise EpisodeInputError("invalid execution status")
+        if self.terminal_cause not in TERMINAL_CAUSES:
+            raise EpisodeInputError("invalid terminal cause")
+        if not self.done and self.terminal_cause not in {"UNRECORDED", "PENDING"}:
+            raise EpisodeInputError("nonterminal update cannot carry a terminal cause")
+        if self.done and self.terminal_cause == "PENDING":
+            raise EpisodeInputError("terminal update cannot remain pending")
         if not self.request_id or (self.filled_base > 0 and self.filled_quote <= 0):
             raise EpisodeInputError("invalid execution identity or quote amount")
 
@@ -544,6 +593,14 @@ class OrderProgress:
     fee_base: Decimal = ZERO
     done: bool = False
     seen: bool = False
+    termination_requested: str = "NONE"
+    terminal_cause: str = "UNRECORDED"
+
+    def __post_init__(self):
+        if self.termination_requested not in TERMINATION_REQUESTS:
+            raise EpisodeInputError("invalid requested termination cause")
+        if self.terminal_cause not in TERMINAL_CAUSES:
+            raise EpisodeInputError("invalid stored terminal cause")
 
     @property
     def reserved_quote(self) -> Decimal:
@@ -609,7 +666,13 @@ class EpisodeState:
             values.pop("last_exit_hourly_recovered")
             values.pop("last_exit_risk_clear")
         for order in values["orders"].values():
+            if order["termination_requested"] == "NONE":
+                order.pop("termination_requested")
+            if order["terminal_cause"] == "UNRECORDED":
+                order.pop("terminal_cause")
             request = order["request"]
+            if not request["parent_request_id"]:
+                request.pop("parent_request_id")
             if request["exit_policy"] == "DEFAULT":
                 for name in (
                     "exit_policy",
@@ -691,11 +754,14 @@ class EpisodeState:
                         raise EpisodeInputError(f"invalid {name}")
             orders = {}
             for key, raw in values["orders"].items():
+                raw.setdefault("termination_requested", "NONE")
+                raw.setdefault("terminal_cause", "UNRECORDED")
                 if type(raw["done"]) is not bool or type(raw["seen"]) is not bool:
                     raise EpisodeInputError("invalid checkpoint execution status")
                 for name in ("filled_base", "filled_quote", "fee_quote", "fee_base"):
                     raw[name] = _decimal(raw[name], name)
                 request = raw["request"]
+                request.setdefault("parent_request_id", "")
                 for name in (
                     "amount",
                     "price",
@@ -787,6 +853,28 @@ def _validate_accounting(config: EpisodeConfig, state: EpisodeState) -> None:
     if state.episode_id and len(state.levels) != len(config.level_fractions):
         raise EpisodeInputError("checkpoint level allocation mismatch")
     current = [order for order in state.orders.values() if order.request.episode_id == state.episode_id]
+    fallback_parents = set()
+    for child in current:
+        parent_id = child.request.parent_request_id
+        if not parent_id:
+            continue
+        if parent_id in fallback_parents:
+            raise EpisodeInputError("fallback parent has multiple children")
+        fallback_parents.add(parent_id)
+        parent = state.orders.get(parent_id)
+        if (
+            parent is None
+            or parent.request.episode_id != child.request.episode_id
+            or parent.request.level != child.request.level
+            or parent.request.pricing_policy != ADAPTIVE_RESERVED_ENTRY_POLICY
+            or not parent.done
+            or parent.terminal_cause != "NATURAL_EXPIRY"
+            or parent.request.revision >= child.request.revision
+            or parent.request.reference_price != child.request.reference_price
+            or child.request.amount > parent.request.amount
+            or child.request.reserved_quote > parent.request.reserved_quote
+        ):
+            raise EpisodeInputError("fallback parent receipt is invalid")
     for order in current:
         request = order.request
         expected = _hash((state.episode_id, request.revision, request.side, request.level))
@@ -828,6 +916,12 @@ def _apply_update(config: EpisodeConfig, state: EpisodeState, market: MarketSnap
     if order.done and not update.done:
         raise EpisodeInputError("terminal order became pending")
     became_terminal = not order.done and update.done
+    if (
+        config.adaptive_reference_fallback
+        and became_terminal
+        and update.terminal_cause == "UNRECORDED"
+    ):
+        raise EpisodeInputError("reference fallback requires an explicit terminal cause")
     db, dq, fq, fb = (getattr(update, name) - getattr(order, name) for name in values)
     if any((db, dq, fq, fb)) and order.request.episode_id != state.episode_id:
         raise EpisodeInputError("closed episode receipt changed; explicit reconciliation required")
@@ -842,6 +936,23 @@ def _apply_update(config: EpisodeConfig, state: EpisodeState, market: MarketSnap
         setattr(order, name, getattr(update, name))
     order.done = update.done
     order.seen = True
+    if config.adaptive_reference_fallback and became_terminal:
+        if any((update.filled_base, update.filled_quote, update.fee_quote, update.fee_base)):
+            order.terminal_cause = "FILLED"
+        elif (
+            not market.valid
+            or market.cascade
+            or (
+                order.request.side == "BUY"
+                and order.request.pricing_policy in RESERVED_ENTRY_POLICIES
+                and not market.reservation_allowed
+            )
+        ):
+            order.terminal_cause = "HARD_RAIL"
+        elif order.termination_requested != "NONE":
+            order.terminal_cause = order.termination_requested
+        else:
+            order.terminal_cause = update.terminal_cause
     if (
         order.request.side == "BUY"
         and config.adaptive_entry_pricing
@@ -909,6 +1020,7 @@ def _request(
     level: int,
     intent: str,
     entry_price_selection: AdaptiveEntryPriceSelection | None = None,
+    parent_request_id: str = "",
     setup_receipt: dict | None = None,
     exit_receipt: dict | None = None,
 ) -> OrderRequest:
@@ -934,11 +1046,172 @@ def _request(
         state.command_revision,
         intent,
         **pricing,
+        parent_request_id=parent_request_id,
         **(setup_receipt or {}),
         **(exit_receipt or {}),
     )
     state.orders[identity] = OrderProgress(request)
     return request
+
+
+def _mark_termination(orders: list[OrderProgress], cause: str) -> tuple[str, ...]:
+    if cause not in TERMINATION_REQUESTS - {"NONE"}:
+        raise EpisodeInputError("invalid requested termination cause")
+    for order in orders:
+        if order.termination_requested == "NONE" or cause == "HARD_RAIL":
+            order.termination_requested = cause
+    return tuple(order.request.id for order in orders)
+
+
+def _pending_cancellations(
+    config: EpisodeConfig,
+    pending: list[OrderProgress],
+    market: MarketSnapshot,
+) -> tuple[str, ...]:
+    cancelled = []
+    for order in pending:
+        request = order.request
+        reserved_entry = bool(
+            config.adaptive_reserved_entry
+            and request.pricing_policy in RESERVED_ENTRY_POLICIES
+        )
+        hard_rail = bool(
+            not market.valid
+            or market.cascade
+            or (
+                request.side == "BUY"
+                and reserved_entry
+                and not market.reservation_allowed
+            )
+        )
+        expired = market.timestamp >= request.expires_at
+        context_cancel = bool(
+            request.side == "BUY"
+            and not reserved_entry
+            and (
+                market.hostile
+                or not market.buy_allowed
+                or market.markup
+                or market.recovery
+            )
+        )
+        cause = (
+            "HARD_RAIL"
+            if hard_rail
+            else "NATURAL_EXPIRY"
+            if expired
+            else "CONTEXT"
+            if context_cancel
+            else None
+        )
+        if cause is not None:
+            _mark_termination([order], cause)
+            cancelled.append(request.id)
+    return tuple(cancelled)
+
+
+def _adaptive_reference_fallback(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    market: MarketSnapshot,
+) -> Transition | None:
+    if (
+        not config.adaptive_reference_fallback
+        or config.mode != "buy_sell"
+        or state.phase in {"MARKUP", "DISTRIBUTE", "EXIT", "COOLDOWN"}
+        or state.exit_intent is not None
+        or not market.reservation_allowed
+        or market.cascade
+        or not market.valid
+        or state.base > market.base_available
+    ):
+        return None
+    child_parents = {
+        order.request.parent_request_id
+        for order in state.orders.values()
+        if order.request.parent_request_id
+    }
+    eligible = [
+        order
+        for order in state.orders.values()
+        if order.request.episode_id == state.episode_id
+        and order.request.pricing_policy == ADAPTIVE_RESERVED_ENTRY_POLICY
+        and order.done
+        and order.terminal_cause == "NATURAL_EXPIRY"
+        and not any((order.filled_base, order.filled_quote, order.fee_quote, order.fee_base))
+        and order.request.id not in child_parents
+        and order.request.expires_at <= market.timestamp
+        <= order.request.expires_at + config.interval_seconds
+    ]
+    if len(eligible) > 1:
+        raise EpisodeInputError("multiple adaptive reference fallbacks are eligible")
+    if not eligible:
+        return None
+    source = eligible[0]
+    request = source.request
+    if state.levels[request.level] != "OPEN":
+        raise EpisodeInputError("reference fallback source level is not open")
+    maker_ceiling = _floor(market.bid - market.price_step, market.price_step)
+    price = min(request.reference_price, maker_ceiling)
+    if price <= 0:
+        return Transition(state, reason="fallback_price_below_tick")
+    amount = min(
+        request.amount,
+        _floor(
+            request.reserved_quote / (price * (ONE + config.fee_rate)),
+            market.amount_step,
+        ),
+    )
+    reserve = amount * price * (ONE + config.fee_rate)
+    if amount <= 0 or amount < market.min_amount or amount * price < market.min_notional:
+        return Transition(state, reason="fallback_below_exchange_minimum")
+    if reserve > request.reserved_quote:
+        raise EpisodeInputError("reference fallback enlarged the parent reservation")
+    if reserve > remaining_budget(config, state) or reserve > market.quote_available:
+        return Transition(state, reason="fallback_insufficient_episode_cash")
+    if state.base * market.ask + amount * market.ask > config.mark_cap_quote:
+        return Transition(state, reason="fallback_mark_exposure_cap")
+    if state.base > 0:
+        before = state.cost / state.base
+        after = (state.cost + reserve) / (state.base + amount)
+        if before - after < config.basis_improvement_atr * state.frozen_atr:
+            return Transition(state, reason="fallback_insufficient_basis_improvement")
+    selection = AdaptiveEntryPriceSelection(
+        policy=ADAPTIVE_REFERENCE_FALLBACK_POLICY,
+        reference_price=request.reference_price,
+        price=price,
+        discount=request.reference_price - price,
+        discount_atr=(request.reference_price - price) / market.atr_1m,
+        signal_confidence=request.signal_confidence,
+        trend_alignment=request.trend_alignment,
+    )
+    setup_receipt = {
+        "setup_policy": request.setup_policy,
+        "setup_started_at": request.setup_started_at,
+        "setup_confirmation_started_at": request.setup_confirmation_started_at,
+        "setup_low": request.setup_low,
+        "setup_rebound": request.setup_rebound,
+        "setup_no_new_low": request.setup_no_new_low,
+    }
+    state.levels[request.level] = "AUTHORIZED"
+    state.setup_level = -1
+    state.setup_confirmation_start = 0
+    state.phase = "SCOUT" if request.level == 0 else "ACCUMULATE"
+    child = _request(
+        config,
+        state,
+        market,
+        side="BUY",
+        amount=amount,
+        price=price,
+        reserve=reserve,
+        level=request.level,
+        intent=request.intent,
+        entry_price_selection=selection,
+        parent_request_id=request.id,
+        setup_receipt=setup_receipt,
+    )
+    return Transition(state, (child,), reason="adaptive_reference_fallback")
 
 
 def _finish_if_flat(config: EpisodeConfig, state: EpisodeState, market: MarketSnapshot) -> bool:
@@ -1142,30 +1415,14 @@ def transition(
                 ),
             )
     pending = [order for order in state.orders.values() if not order.done]
-    cancellations = tuple(
-        order.request.id
-        for order in pending
-        if not market.valid
-        or market.cascade
-        or market.timestamp >= order.request.expires_at
-        or (
-            order.request.side == "BUY"
-            and (
-                not market.reservation_allowed
-                if (
-                    config.adaptive_reserved_entry
-                    and order.request.pricing_policy == ADAPTIVE_RESERVED_ENTRY_POLICY
-                )
-                else market.hostile
-                or not market.buy_allowed
-                or market.markup
-                or market.recovery
-            )
-        )
-    )
+    cancellations = _pending_cancellations(config, pending, market)
     if state.fault or remaining_budget(config, state) < 0:
         state.fault = state.fault or "episode_budget_overrun"
-        return Transition(state, cancel_ids=tuple(order.request.id for order in pending), reason=state.fault)
+        return Transition(
+            state,
+            cancel_ids=_mark_termination(pending, "HARD_RAIL"),
+            reason=state.fault,
+        )
     if not market.valid:
         return Transition(state, cancel_ids=cancellations, reason="data_unavailable")
     if market.timestamp == state.timestamp:
@@ -1180,12 +1437,17 @@ def transition(
         state.adverse_entry_latched = True
     elif state.adverse_entry_latched and market.hourly_recovered:
         state.adverse_entry_latched = False
+    fallback = _adaptive_reference_fallback(config, state, market)
+    if fallback is not None:
+        return fallback
     if state.phase == "COOLDOWN":
         if state.base > 0:
             state.phase, state.target_base = "EXIT", ZERO
             if pending:
                 return Transition(
-                    state, cancel_ids=tuple(order.request.id for order in pending), reason="late_fill_pending"
+                    state,
+                    cancel_ids=_mark_termination(pending, "LIFECYCLE"),
+                    reason="late_fill_pending",
                 )
             return _sell(config, state, market)
         if config.mode == "buy_sell" and market.reset and market.htf_timestamp > state.cooldown_htf_timestamp:
@@ -1285,7 +1547,7 @@ def transition(
                     state.phase = "DISTRIBUTE"
         if pending:
             if state.phase == "EXIT":
-                cancellations = tuple(order.request.id for order in pending)
+                cancellations = _mark_termination(pending, "LIFECYCLE")
             return Transition(state, cancel_ids=cancellations, reason="pending_execution")
         if state.base > state.target_base:
             return _sell(

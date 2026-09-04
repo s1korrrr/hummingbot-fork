@@ -106,6 +106,7 @@ class OKRSIController(hl_rsi.HLRSIController):
                 or type(config.episode_level) is not int or type(config.episode_revision) is not int
                 or type(config.episode_expires_at) is not int
                 or config.episode_intent != request.intent
+                or config.episode_entry_parent_request_id != request.parent_request_id
                 or config.episode_setup_policy != request.setup_policy
                 or config.episode_setup_started_at != request.setup_started_at
                 or config.episode_setup_confirmation_started_at

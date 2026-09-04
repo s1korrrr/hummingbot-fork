@@ -448,6 +448,55 @@ def test_reserved_adaptive_entry_maps_hard_reservation_rail_and_receipt():
     assert status["last_entry_expires_at"] == created[0].executor_config.episode_expires_at
 
 
+def test_reference_fallback_maps_terminal_proven_parent_to_native_child():
+    controller, _ = setup_controller(
+        episode_adaptive_entry_pricing=True,
+        episode_adaptive_reserved_entry=True,
+        episode_adaptive_reference_fallback=True,
+    )
+    controller.processed_data = {
+        "signal": 1,
+        "signal_state": {"condition_ok": True, "signal_strength_score": 0.8},
+        "trend_confirmation": {"alignment_score": -0.2},
+    }
+    parent = actions(controller)[0].executor_config
+    controller.executors_info = [SimpleNamespace(
+        id=parent.id,
+        connector_name="okx",
+        trading_pair="ETH-USDT",
+        is_active=False,
+        is_done=True,
+        custom_info={"episode_receipt": {
+            "gross_base": "0",
+            "gross_quote": "0",
+            "base_fee": "0",
+            "quote_fee": "0",
+            "final": True,
+            "fees_known": True,
+            "terminal_cause": "NATURAL_EXPIRY",
+            "errors": [],
+        }},
+    )]
+    controller.processed_data["signal"] = 0
+    controller.processed_data["signal_state"]["condition_ok"] = False
+    controller.market_data_provider.time.return_value = parent.episode_expires_at
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context() | {"timestamp": parent.episode_expires_at},
+    ):
+        created = controller.determine_executor_actions()
+
+    assert len(created) == 1
+    child = created[0].executor_config
+    assert child.episode_entry_parent_request_id == parent.id
+    assert child.episode_expires_at == parent.episode_expires_at + 600
+    status = controller.get_custom_info()["episode"]
+    assert status["last_entry_pricing_policy"] == "ADAPTIVE_REFERENCE_FALLBACK_V3"
+    assert status["last_entry_parent_request_id"] == parent.id
+    assert status["last_entry_termination_requested"] == "NONE"
+    assert status["last_entry_terminal_cause"] == "UNRECORDED"
+
+
 def test_reserved_adaptive_entry_persists_then_operator_pause_stops_native_order():
     controller, _ = setup_controller(
         episode_adaptive_entry_pricing=True,
@@ -498,6 +547,9 @@ def test_reserved_adaptive_entry_persists_then_operator_pause_stops_native_order
     assert len(stopped) == 1
     assert isinstance(stopped[0], StopExecutorAction)
     assert stopped[0].executor_id == created.executor_config.id
+    status = controller.get_custom_info()["episode"]
+    assert status["last_entry_termination_requested"] == "HARD_RAIL"
+    assert status["last_entry_terminal_cause"] == "UNRECORDED"
 
 
 def test_manual_kill_returns_only_stop_for_active_episode_order():

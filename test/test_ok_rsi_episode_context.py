@@ -51,6 +51,7 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_recovery_exit_enabled is False
     assert legacy.episode_adaptive_entry_pricing is False
     assert legacy.episode_adaptive_reserved_entry is False
+    assert legacy.episode_adaptive_reference_fallback is False
     assert legacy.episode_structure_held_runner is False
     assert legacy.episode_markup_release_runner is False
     assert legacy.episode_scout_rebound_confirmation is False
@@ -60,6 +61,13 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
 
     with pytest.raises(ValueError, match="reserved adaptive"):
         OKRSIControllerConfig(id="candidate", episode_adaptive_reserved_entry=True)
+
+    with pytest.raises(ValueError, match="reference fallback"):
+        OKRSIControllerConfig(
+            id="candidate",
+            episode_adaptive_entry_pricing=True,
+            episode_adaptive_reference_fallback=True,
+        )
 
 
 def test_candidate_episode_budget_must_be_positive_and_finite():

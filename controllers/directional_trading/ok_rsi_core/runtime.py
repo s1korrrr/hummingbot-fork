@@ -77,6 +77,7 @@ def policy_config(config):
         recovery_exit_enabled=config.episode_recovery_exit_enabled,
         adaptive_entry_pricing=config.episode_adaptive_entry_pricing,
         adaptive_reserved_entry=config.episode_adaptive_reserved_entry,
+        adaptive_reference_fallback=config.episode_adaptive_reference_fallback,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
@@ -148,13 +149,14 @@ class EpisodeRuntime:
         risk_clear = None if self.last_market is None else not (
             self.last_market.cascade or self.last_market.hostile or self.last_market.reset
         )
-        buy_requests = [
-            order.request for order in self.state.orders.values() if order.request.side == "BUY"
+        buy_orders = [
+            order for order in self.state.orders.values() if order.request.side == "BUY"
         ]
-        last_entry = max(
-            buy_requests,
-            key=lambda request: (request.expires_at, request.revision),
-        ) if buy_requests else None
+        last_entry_progress = max(
+            buy_orders,
+            key=lambda order: (order.request.expires_at, order.request.revision),
+        ) if buy_orders else None
+        last_entry = last_entry_progress.request if last_entry_progress else None
         active_setup = (
             (self.config.scout_rebound_confirmation or self.config.recovery_rebound_scout)
             and self.state.base == 0
@@ -187,7 +189,14 @@ class EpisodeRuntime:
                 "last_entry_discount_atr": str(last_entry.pricing_discount_atr) if last_entry else None,
                 "last_entry_confidence": str(last_entry.signal_confidence) if last_entry else None,
                 "last_entry_trend_alignment": str(last_entry.trend_alignment) if last_entry else None,
+                "last_entry_parent_request_id": last_entry.parent_request_id if last_entry else None,
                 "last_entry_expires_at": last_entry.expires_at if last_entry else None,
+                "last_entry_termination_requested": (
+                    last_entry_progress.termination_requested if last_entry_progress else None
+                ),
+                "last_entry_terminal_cause": (
+                    last_entry_progress.terminal_cause if last_entry_progress else None
+                ),
                 "entry_reservation_allowed": (
                     getattr(self.last_market, "reservation_allowed", None)
                     if self.last_market
@@ -250,6 +259,7 @@ class EpisodeRuntime:
                 request_id=executor.id, filled_base=receipt["gross_base"], filled_quote=receipt["gross_quote"],
                 fee_base=receipt["base_fee"], fee_quote=receipt["quote_fee"],
                 done=receipt["final"], fees_known=receipt["fees_known"],
+                terminal_cause=receipt.get("terminal_cause", "UNRECORDED"),
             ))
         held = sum((Decimal(str(position.amount)) for position in c.positions_held
                     if position.connector_name == self.config.connector and position.trading_pair == self.config.trading_pair
@@ -364,6 +374,7 @@ class EpisodeRuntime:
                     episode_id=request.episode_id, episode_level=request.level,
                     episode_revision=request.revision, episode_expires_at=request.expires_at,
                     episode_intent=request.intent,
+                    episode_entry_parent_request_id=request.parent_request_id,
                     episode_setup_policy=request.setup_policy,
                     episode_setup_started_at=request.setup_started_at,
                     episode_setup_confirmation_started_at=request.setup_confirmation_started_at,

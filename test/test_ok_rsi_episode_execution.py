@@ -26,6 +26,20 @@ def order(*, side=TradeType.BUY, fee_token="ETH", fee="0.001", state=OrderState.
     return result
 
 
+def unfilled_order(*, state=OrderState.OPEN):
+    return InFlightOrder(
+        client_order_id="order-1",
+        exchange_order_id="exchange-1",
+        trading_pair="ETH-USDT",
+        order_type=OrderType.LIMIT_MAKER,
+        trade_type=TradeType.BUY,
+        price=Decimal("100"),
+        amount=Decimal("1"),
+        creation_timestamp=1,
+        initial_state=state,
+    )
+
+
 def executor():
     from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutor
     strategy = MagicMock()
@@ -190,10 +204,38 @@ def test_episode_order_expiry_cancels_without_new_submission():
     from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutorConfig
     instance = executor()
     instance.config = EpisodeOrderExecutorConfig(**instance.config.model_dump(), episode_id="episode-1", episode_expires_at=3)
-    instance._order.order = order()
+    instance._order.order = unfilled_order()
     asyncio.run(instance.control_task())
     assert instance.status == RunnableStatus.SHUTTING_DOWN
+    assert instance.get_custom_info()["episode_receipt"]["terminal_cause"] == "PENDING"
     instance._strategy.buy.assert_not_called()
+
+    instance._order.order = unfilled_order(state=OrderState.CANCELED)
+    instance.process_order_canceled_event(None, None, SimpleNamespace(order_id="order-1"))
+    asyncio.run(instance.control_task())
+    receipt = instance.get_custom_info()["episode_receipt"]
+    assert receipt["final"] is True
+    assert receipt["terminal_cause"] == "NATURAL_EXPIRY"
+
+
+def test_episode_external_stop_is_not_reported_as_natural_expiry():
+    from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutorConfig
+
+    instance = executor()
+    instance.config = EpisodeOrderExecutorConfig(
+        **instance.config.model_dump(),
+        episode_id="episode-1",
+        episode_expires_at=60,
+    )
+    instance._order.order = unfilled_order(state=OrderState.CANCELED)
+    instance.early_stop()
+    instance._strategy.current_timestamp = 61
+    instance.process_order_canceled_event(None, None, SimpleNamespace(order_id="order-1"))
+    asyncio.run(instance.control_task())
+
+    receipt = instance.get_custom_info()["episode_receipt"]
+    assert receipt["final"] is True
+    assert receipt["terminal_cause"] == "EXTERNAL_TERMINAL"
 
 
 def test_cancelled_unknown_native_order_retains_reservation():

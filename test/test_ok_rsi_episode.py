@@ -638,6 +638,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("markup_release_runner")
     legacy_values.pop("bounded_markup_runner")
     legacy_values.pop("stage_preserving_runner")
+    legacy_values.pop("next_stage_confirmation")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
@@ -677,6 +678,14 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
         bounded_markup_runner=True,
         stage_preserving_runner=True,
     ).identity != cfg.identity
+    assert replace(
+        cfg,
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+    ).identity != cfg.identity
 
 
 def test_markup_release_runner_requires_structure_held_runner():
@@ -699,6 +708,18 @@ def test_stage_preserving_runner_requires_bounded_markup_runner():
             structure_held_runner=True,
             markup_release_runner=True,
             stage_preserving_runner=True,
+        )
+
+
+def test_next_stage_confirmation_requires_stage_preserving_runner():
+    with pytest.raises(EpisodeInputError, match="next stage confirmation"):
+        config(next_stage_confirmation=True)
+    with pytest.raises(EpisodeInputError, match="next stage confirmation"):
+        config(
+            structure_held_runner=True,
+            markup_release_runner=True,
+            bounded_markup_runner=True,
+            next_stage_confirmation=True,
         )
 
 
@@ -3417,6 +3438,213 @@ def test_stage_preserving_runner_exits_fully_at_bounded_threshold():
     assert result.requests[0].exit_policy == "STAGE_PRESERVING_RUNNER_V8"
 
 
+@pytest.mark.parametrize(
+    ("extension", "target", "amount", "phase"),
+    (
+        ("3.9", "1", None, "MARKUP"),
+        ("4", "1", None, "DISTRIBUTE"),
+        ("6.5", "1", None, "DISTRIBUTE"),
+        ("7", ".8", ".2", "DISTRIBUTE"),
+        ("9.98", ".8", ".2", "DISTRIBUTE"),
+        ("10", ".6", ".4", "DISTRIBUTE"),
+    ),
+)
+def test_next_stage_confirmation_releases_only_previously_earned_stage(
+    extension, target, amount, phase
+):
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D(extension)
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("103"),
+            ask=D("103"),
+            low=D("103"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert result.state.phase == phase
+    assert result.state.target_base == D(target)
+    if amount is None:
+        assert not result.requests
+    else:
+        request = result.requests[0]
+        assert request.amount == D(amount)
+        assert request.exit_policy == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+        assert request.exit_target_base == D(target)
+
+
+def test_next_stage_confirmation_trail_releases_current_earned_stage():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D("6.5")
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert result.state.structure_runner_active is True
+    assert result.state.target_base == D(".8")
+    assert result.requests[0].amount == D(".2")
+    assert result.requests[0].exit_policy == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+    assert result.requests[0].exit_trail_breach == "PRICE_AND_EQUITY"
+
+
+def test_next_stage_confirmation_retry_preserves_policy_and_target():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D("7")
+    first = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("103"), ask=D("103"), low=D("103"), atr_15m=D("0.1"),
+            atr_1h=D("10"), base_available=D("1"), hourly_recovered=True,
+            markup=True,
+        ),
+    )
+    request = first.requests[0]
+
+    retried = transition(
+        cfg,
+        EpisodeState.from_dict(first.state.to_dict()),
+        market(
+            timestamp=6300,
+            bid=D("103.1"), ask=D("103.1"), low=D("103.1"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True, markup=True,
+        ),
+        [
+            OrderUpdate(
+                request.id,
+                filled_base=D("0"),
+                filled_quote=D("0"),
+                done=True,
+                terminal_cause="NATURAL_EXPIRY",
+            )
+        ],
+    )
+
+    retry = retried.requests[0]
+    assert retry.id != request.id
+    assert retry.amount == request.amount == D(".2")
+    assert retry.exit_policy == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+    assert retry.exit_target_base == request.exit_target_base == D(".8")
+    assert retry.exit_target_revision == request.exit_target_revision == 1
+
+
+@pytest.mark.parametrize(
+    ("market_values", "breach"),
+    (
+        ({"markup": False}, "MARKUP_LOSS"),
+        ({"markup": True, "hostile": True}, "RISK_OVERRIDE"),
+    ),
+)
+def test_next_stage_confirmation_release_rails_exit_fully(market_values, breach):
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (state.peak - state.distribution_basis) / D("6.5")
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"), ask=D("102.4"), low=D("102.4"),
+            atr_15m=D("0.1"), atr_1h=D("10"), base_available=D("1"),
+            hourly_recovered=True,
+            **market_values,
+        ),
+    )
+
+    assert result.state.target_base == D("0")
+    assert result.state.structure_runner_active is False
+    assert result.requests[0].amount == D("1")
+    assert result.requests[0].exit_policy == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+    assert result.requests[0].exit_trail_breach == breach
+
+
+def test_next_stage_confirmation_keeps_bounded_full_exit_on_trail_at_final_stage():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+    )
+    state = _structure_runner_setup(cfg)
+    state.distribution_atr = (
+        state.peak - state.distribution_basis
+    ) / cfg.distribution_atr_levels[-1]
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert result.state.phase == "EXIT"
+    assert result.state.target_base == D("0")
+    assert result.requests[0].amount == D("1")
+    assert result.requests[0].exit_policy == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+
+
 def test_bounded_markup_runner_exits_fully_at_final_distribution_threshold():
     cfg = config(
         structure_held_runner=True,
@@ -3694,6 +3922,45 @@ def test_sell_only_uses_same_stage_preserving_runner_without_buying():
     assert held.requests[0].amount == D(".2")
     assert held.requests[0].exit_policy == "STAGE_PRESERVING_RUNNER_V8"
     assert all(order.request.side != "BUY" for order in held.state.orders.values())
+
+
+def test_sell_only_uses_same_next_stage_confirmation_without_buying():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="inventory-1",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        structure_held_runner=True,
+        markup_release_runner=True,
+        bounded_markup_runner=True,
+        stage_preserving_runner=True,
+        next_stage_confirmation=True,
+    )
+    armed = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("102"), ask=D("102"), low=D("102"), atr_15m=D("0.1"),
+            atr_1h=D("10"), base_available=D("1"), markup=True,
+        ),
+    )
+    armed.state.distribution_atr = D("1")
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6060,
+            bid=D("107"), ask=D("107"), low=D("107"), atr_15m=D("0.1"),
+            atr_1h=D("1"), base_available=D("1"), hourly_recovered=True,
+            markup=True,
+        ),
+    )
+
+    assert high.state.target_base == D(".8")
+    assert high.requests[0].side == "SELL"
+    assert high.requests[0].amount == D(".2")
+    assert high.requests[0].exit_policy == "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+    assert all(order.request.side != "BUY" for order in high.state.orders.values())
 
 
 def test_active_runner_latches_zero_target_on_later_markup_loss_without_new_trail_breach():

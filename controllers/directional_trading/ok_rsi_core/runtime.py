@@ -18,6 +18,7 @@ from controllers.directional_trading.ok_rsi_core.episode import (
     OrderUpdate,
     acquisition_levels,
     minimum_profit_price,
+    next_stage_confirmed_distribution_target,
     stage_preserving_runner_target,
     transition,
 )
@@ -95,6 +96,7 @@ def policy_config(config):
         markup_release_runner=config.episode_markup_release_runner,
         bounded_markup_runner=config.episode_bounded_markup_runner,
         stage_preserving_runner=config.episode_stage_preserving_runner,
+        next_stage_confirmation=config.episode_next_stage_confirmation,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -219,6 +221,22 @@ class EpisodeRuntime:
             if stage_index < len(self.config.distribution_atr_levels)
             else None
         )
+        (
+            next_stage_target_base,
+            next_stage_earned_index,
+            next_stage_released_index,
+            next_stage_earned_threshold,
+            next_stage_target_fraction,
+        ) = next_stage_confirmed_distribution_target(
+            self.config,
+            self.state,
+            distribution_extension,
+        )
+        next_stage_threshold = (
+            self.config.distribution_atr_levels[next_stage_earned_index]
+            if next_stage_earned_index < len(self.config.distribution_atr_levels)
+            else None
+        )
         if self.state.exit_intent == "THIN_SCOUT_RELEASE":
             exit_policy = "THIN_SCOUT_RELEASE_V1"
         elif self.state.exit_intent == "RECOVERY_ROTATION_EXIT":
@@ -227,6 +245,8 @@ class EpisodeRuntime:
             exit_policy = "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
         elif self.state.exit_intent == "RECOVERY_CAPITAL_RELEASE":
             exit_policy = "DEEP_RECOVERY_CAPITAL_RELEASE_V4"
+        elif self.config.next_stage_confirmation:
+            exit_policy = "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
         elif self.config.stage_preserving_runner:
             exit_policy = "STAGE_PRESERVING_RUNNER_V8"
         elif self.config.bounded_markup_runner:
@@ -321,6 +341,39 @@ class EpisodeRuntime:
                 "stage_preserving_runner_target_base": (
                     str(stage_target_base)
                     if self.config.stage_preserving_runner
+                    else None
+                ),
+                "next_stage_confirmation_enabled": self.config.next_stage_confirmation,
+                "next_stage_confirmation_earned_stage_index": (
+                    next_stage_earned_index
+                    if self.config.next_stage_confirmation
+                    else None
+                ),
+                "next_stage_confirmation_released_stage_index": (
+                    next_stage_released_index
+                    if self.config.next_stage_confirmation
+                    else None
+                ),
+                "next_stage_confirmation_earned_threshold_atr": (
+                    str(next_stage_earned_threshold)
+                    if self.config.next_stage_confirmation
+                    and next_stage_earned_threshold is not None
+                    else None
+                ),
+                "next_stage_confirmation_next_threshold_atr": (
+                    str(next_stage_threshold)
+                    if self.config.next_stage_confirmation
+                    and next_stage_threshold is not None
+                    else None
+                ),
+                "next_stage_confirmation_target_fraction": (
+                    str(next_stage_target_fraction)
+                    if self.config.next_stage_confirmation
+                    else None
+                ),
+                "next_stage_confirmation_target_base": (
+                    str(next_stage_target_base)
+                    if self.config.next_stage_confirmation
                     else None
                 ),
                 "scout_probe_rebound_enabled": self.config.scout_probe_rebound,

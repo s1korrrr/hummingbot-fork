@@ -56,6 +56,7 @@ EXIT_POLICIES = {
     "MARKUP_RELEASED_RUNNER_V1",
     "BOUNDED_MARKUP_RUNNER_V7",
     "STAGE_PRESERVING_RUNNER_V8",
+    "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9",
     "THIN_SCOUT_RELEASE_V1",
     "DEEP_RECOVERY_CAPITAL_RELEASE_V4",
     "DEEP_RECOVERY_ROTATION_EXIT_V5",
@@ -189,6 +190,7 @@ class EpisodeConfig:
     markup_release_runner: bool = False
     bounded_markup_runner: bool = False
     stage_preserving_runner: bool = False
+    next_stage_confirmation: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -222,6 +224,7 @@ class EpisodeConfig:
             "markup_release_runner",
             "bounded_markup_runner",
             "stage_preserving_runner",
+            "next_stage_confirmation",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -267,6 +270,8 @@ class EpisodeConfig:
             raise EpisodeInputError("bounded markup runner requires markup release runner")
         if self.stage_preserving_runner and not self.bounded_markup_runner:
             raise EpisodeInputError("stage preserving runner requires bounded markup runner")
+        if self.next_stage_confirmation and not self.stage_preserving_runner:
+            raise EpisodeInputError("next stage confirmation requires stage preserving runner")
         if self.adaptive_reserved_entry and not self.adaptive_entry_pricing:
             raise EpisodeInputError("reserved adaptive entry requires adaptive entry pricing")
         if self.adaptive_reference_fallback and not self.adaptive_reserved_entry:
@@ -358,6 +363,8 @@ class EpisodeConfig:
             values.pop("bounded_markup_runner")
         if not self.stage_preserving_runner:
             values.pop("stage_preserving_runner")
+        if not self.next_stage_confirmation:
+            values.pop("next_stage_confirmation")
         return _hash(values)
 
 
@@ -556,6 +563,7 @@ class OrderRequest:
             "MARKUP_RELEASED_RUNNER_V1",
             "BOUNDED_MARKUP_RUNNER_V7",
             "STAGE_PRESERVING_RUNNER_V8",
+            "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9",
         }:
             raise EpisodeInputError("markup loss receipt requires markup release policy")
         elif self.exit_trail_breach == "RISK_OVERRIDE" and self.exit_risk_clear:
@@ -1641,6 +1649,32 @@ def stage_preserving_runner_target(
     return state.distribution_start_base * fraction, stage_index, threshold, fraction
 
 
+def next_stage_confirmed_distribution_target(
+    config: EpisodeConfig,
+    state: EpisodeState,
+    extension: Decimal | None,
+) -> tuple[Decimal, int, int, Decimal | None, Decimal]:
+    """Release only the stage confirmed by the next configured threshold."""
+    _, earned_stage_index, earned_threshold, _ = stage_preserving_runner_target(
+        config,
+        state,
+        extension,
+    )
+    released_stage_index = max(0, earned_stage_index - 1)
+    released_fraction = (
+        config.remaining_fractions[released_stage_index - 1]
+        if released_stage_index
+        else ONE
+    )
+    return (
+        state.distribution_start_base * released_fraction,
+        earned_stage_index,
+        released_stage_index,
+        earned_threshold,
+        released_fraction,
+    )
+
+
 def _exit_trail_breach(*, price_breached: bool, equity_breached: bool) -> str:
     if price_breached and equity_breached:
         return "PRICE_AND_EQUITY"
@@ -1702,7 +1736,9 @@ def _exit_receipt(
     )
     return {
         "exit_policy": (
-            "STAGE_PRESERVING_RUNNER_V8"
+            "NEXT_STAGE_CONFIRMED_DISTRIBUTION_V9"
+            if config.next_stage_confirmation
+            else "STAGE_PRESERVING_RUNNER_V8"
             if config.stage_preserving_runner
             else "BOUNDED_MARKUP_RUNNER_V7"
             if config.bounded_markup_runner
@@ -2049,10 +2085,33 @@ def transition(
                 if state.exit_target_revision == previous_revision:
                     state.exit_target_revision += 1
             else:
-                for threshold, fraction in zip(config.distribution_atr_levels, config.remaining_fractions):
-                    if extension >= threshold:
-                        _reduce_exit_target(config, state, state.distribution_start_base * fraction)
+                if config.next_stage_confirmation:
+                    (
+                        confirmed_target,
+                        earned_stage_index,
+                        _,
+                        _,
+                        _,
+                    ) = next_stage_confirmed_distribution_target(
+                        config,
+                        state,
+                        extension,
+                    )
+                    if earned_stage_index:
                         state.phase = "DISTRIBUTE"
+                    _reduce_exit_target(config, state, confirmed_target)
+                else:
+                    for threshold, fraction in zip(
+                        config.distribution_atr_levels,
+                        config.remaining_fractions,
+                    ):
+                        if extension >= threshold:
+                            _reduce_exit_target(
+                                config,
+                                state,
+                                state.distribution_start_base * fraction,
+                            )
+                            state.phase = "DISTRIBUTE"
         if pending:
             if state.phase == "EXIT":
                 cancellations = _mark_termination(pending, "LIFECYCLE")

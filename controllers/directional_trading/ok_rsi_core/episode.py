@@ -1277,9 +1277,9 @@ def _finish_if_flat(
                     assignment_consumed=state.assignment_consumed,
                 ),
                 reason=(
-                    "profitable_episode_rearmed"
-                    if profitable_rearm
-                    else "thin_scout_rearmed"
+                    "thin_scout_rearmed"
+                    if state.exit_intent == "THIN_SCOUT_RELEASE"
+                    else "profitable_episode_rearmed"
                 ),
             )
         state.phase = "COOLDOWN"

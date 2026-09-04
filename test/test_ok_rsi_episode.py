@@ -1792,7 +1792,11 @@ def test_thin_scout_release_does_not_latch_when_wallet_cannot_cover_episode_inve
 
 
 def test_thin_scout_rearm_reopens_entry_after_reconciled_full_release():
-    cfg = config(thin_scout_release=True, thin_scout_rearm=True)
+    cfg = config(
+        thin_scout_release=True,
+        thin_scout_rearm=True,
+        profitable_episode_rearm=True,
+    )
     state, _ = bought(cfg)
     markup = transition(
         cfg,

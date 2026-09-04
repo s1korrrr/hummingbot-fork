@@ -189,6 +189,8 @@ class EpisodeRuntime:
         )
         if self.state.exit_intent == "THIN_SCOUT_RELEASE":
             exit_policy = "THIN_SCOUT_RELEASE_V1"
+        elif self.state.exit_intent == "RECOVERY_ROTATION_EXIT":
+            exit_policy = "DEEP_RECOVERY_ROTATION_EXIT_V5"
         elif self.state.exit_intent == "RECOVERY_CAPITAL_RELEASE":
             exit_policy = "DEEP_RECOVERY_CAPITAL_RELEASE_V4"
         elif self.config.markup_release_runner:

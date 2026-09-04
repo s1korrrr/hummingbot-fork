@@ -127,6 +127,21 @@ def test_public_config_rejects_deep_recovery_rotation_without_release():
         setup_controller(episode_deep_recovery_rotation_exit=True)
 
 
+def test_rotation_exit_status_preserves_its_v5_policy_identity():
+    controller, _ = setup_controller(
+        episode_deep_recovery_capital_release=True,
+        episode_deep_recovery_rotation_exit=True,
+    )
+    runtime = controller._episode_runtime
+    runtime.state.exit_intent = "RECOVERY_ROTATION_EXIT"
+
+    status = runtime.status()
+
+    assert status["deep_recovery_capital_release_enabled"] is True
+    assert status["deep_recovery_rotation_exit_enabled"] is True
+    assert status["exit_policy"] == "DEEP_RECOVERY_ROTATION_EXIT_V5"
+
+
 def test_thin_scout_release_receipt_maps_to_executor_and_status():
     from controllers.directional_trading.ok_rsi_core.episode import (
         EpisodeState,

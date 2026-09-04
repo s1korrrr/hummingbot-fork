@@ -75,6 +75,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_recovery_exit_enabled=True,
         episode_scout_rebound_confirmation=True,
         episode_structure_held_runner=True,
+        episode_markup_release_runner=True,
     )
 
     policy = controller._episode_runtime.config
@@ -97,7 +98,89 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.adaptive_entry_pricing is False
     assert policy.scout_rebound_confirmation is True
     assert policy.structure_held_runner is True
+    assert policy.markup_release_runner is True
     assert policy.rebound_atr == Decimal("0.25")
+
+
+def test_public_config_rejects_markup_release_without_structure_runner():
+    with pytest.raises(ValueError, match="markup release"):
+        setup_controller(episode_markup_release_runner=True)
+
+
+def test_markup_release_receipt_maps_to_executor_and_status():
+    from controllers.directional_trading.ok_rsi_core.episode import (
+        EpisodeState,
+        OrderProgress,
+        OrderRequest,
+        Transition,
+    )
+
+    controller, _ = setup_controller(
+        episode_structure_held_runner=True,
+        episode_markup_release_runner=True,
+    )
+    runtime = controller._episode_runtime
+    request = OrderRequest(
+        id="markup-release-sell-1",
+        episode_id="episode-1",
+        level=-1,
+        side="SELL",
+        amount=Decimal("0.4"),
+        price=Decimal("103.2"),
+        reserved_quote=Decimal("0"),
+        expires_at=10620,
+        revision=1,
+        intent="TRAILING_PROFIT_EXIT",
+        exit_policy="MARKUP_RELEASED_RUNNER_V1",
+        exit_hourly_recovered=True,
+        exit_risk_clear=True,
+        exit_trail_breach="MARKUP_LOSS",
+        exit_target_base=Decimal("0"),
+        exit_target_revision=2,
+    )
+    state = EpisodeState(
+        config_hash=runtime.config.identity,
+        phase="EXIT",
+        episode_number=1,
+        episode_id="episode-1",
+        timestamp=10020,
+        levels=["AUTHORIZED"] * len(runtime.config.level_fractions),
+        orders={request.id: OrderProgress(request)},
+        base=Decimal("0.4"),
+        cost=Decimal("40"),
+        gross_spent=Decimal("100"),
+        distribution_start_base=Decimal("1"),
+        target_base=Decimal("0"),
+        command_revision=1,
+        exit_target_revision=2,
+        last_exit_trail_breach="MARKUP_LOSS",
+        last_exit_hourly_recovered=True,
+        last_exit_risk_clear=True,
+    )
+    result = Transition(state=state, requests=(request,), reason="trailing_profit_exit")
+
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context(),
+    ), patch("controllers.directional_trading.ok_rsi_core.runtime.transition", return_value=result):
+        created = controller.determine_executor_actions()[0]
+
+    executor = created.executor_config.model_copy(update={"controller_id": controller.config.id})
+    assert executor.episode_exit_policy == "MARKUP_RELEASED_RUNNER_V1"
+    assert executor.episode_exit_trail_breach == "MARKUP_LOSS"
+    assert executor.episode_exit_target_base == Decimal("0")
+    assert executor.episode_exit_target_revision == 2
+    assert controller.get_executor_class_for_config(executor).__name__ == "EpisodeOrderExecutor"
+    runtime.last_market = SimpleNamespace(
+        hourly_recovered=True,
+        markup=False,
+        cascade=False,
+        hostile=False,
+        reset=False,
+    )
+    status = runtime.status()
+    assert status["exit_policy"] == "MARKUP_RELEASED_RUNNER_V1"
+    assert status["exit_markup"] is False
 
 
 def test_structure_exit_receipt_maps_to_executor_and_factory_rejects_mutation():

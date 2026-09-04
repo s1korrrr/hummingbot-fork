@@ -44,8 +44,15 @@ ORDER_INTENTS = {
     "TERMINAL_PROFIT_EXIT",
 }
 SELL_INTENTS = ORDER_INTENTS - {"UNSPECIFIED", "SCOUT_BUY", "SCALE_IN_BUY"}
-EXIT_POLICIES = {"DEFAULT", "STRUCTURE_HELD_RUNNER_V1"}
-EXIT_TRAIL_BREACHES = {"NONE", "PRICE", "EQUITY", "PRICE_AND_EQUITY", "RISK_OVERRIDE"}
+EXIT_POLICIES = {"DEFAULT", "STRUCTURE_HELD_RUNNER_V1", "MARKUP_RELEASED_RUNNER_V1"}
+EXIT_TRAIL_BREACHES = {
+    "NONE",
+    "PRICE",
+    "EQUITY",
+    "PRICE_AND_EQUITY",
+    "RISK_OVERRIDE",
+    "MARKUP_LOSS",
+}
 
 
 class EpisodeInputError(ValueError):
@@ -132,6 +139,7 @@ class EpisodeConfig:
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
     structure_held_runner: bool = False
+    markup_release_runner: bool = False
     assignment_id: str | None = None
     initial_base: Decimal = ZERO
     initial_cost: Decimal | None = None
@@ -153,6 +161,7 @@ class EpisodeConfig:
             "recovery_aware_scout",
             "recovery_rebound_scout",
             "structure_held_runner",
+            "markup_release_runner",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -183,6 +192,8 @@ class EpisodeConfig:
             )
         ) > 1:
             raise EpisodeInputError("entry treatments cannot be combined")
+        if self.markup_release_runner and not self.structure_held_runner:
+            raise EpisodeInputError("markup release runner requires structure held runner")
         for name in ("level_fractions", "dip_atr_levels", "distribution_atr_levels", "remaining_fractions"):
             object.__setattr__(self, name, tuple(_decimal(x, name, positive=True) for x in getattr(self, name)))
         if (
@@ -231,6 +242,8 @@ class EpisodeConfig:
             values.pop("recovery_rebound_scout")
         if not self.structure_held_runner:
             values.pop("structure_held_runner")
+        if not self.markup_release_runner:
+            values.pop("markup_release_runner")
         return _hash(values)
 
 
@@ -395,6 +408,8 @@ class OrderRequest:
                 raise EpisodeInputError("default exit policy cannot carry structure receipt")
         elif self.side != "SELL":
             raise EpisodeInputError("structure exit policy requires a sell request")
+        elif self.exit_trail_breach == "MARKUP_LOSS" and self.exit_policy != "MARKUP_RELEASED_RUNNER_V1":
+            raise EpisodeInputError("markup loss receipt requires markup release policy")
         elif self.exit_trail_breach == "RISK_OVERRIDE" and self.exit_risk_clear:
             raise EpisodeInputError("risk override receipt contradicts clear context")
         if self.intent != "UNSPECIFIED" and (
@@ -973,7 +988,11 @@ def _structure_exit_receipt(
         and (state.structure_runner_active or state.phase == "EXIT")
     )
     return {
-        "exit_policy": "STRUCTURE_HELD_RUNNER_V1",
+        "exit_policy": (
+            "MARKUP_RELEASED_RUNNER_V1"
+            if config.markup_release_runner
+            else "STRUCTURE_HELD_RUNNER_V1"
+        ),
         "exit_hourly_recovered": (
             state.last_exit_hourly_recovered if use_target_context else market.hourly_recovered
         ),
@@ -1185,12 +1204,24 @@ def transition(
             and trail_breach != "NONE"
             and market.hourly_recovered
             and risk_clear
+            and (not config.markup_release_runner or market.markup)
+        )
+        markup_release = (
+            config.markup_release_runner
+            and state.phase != "EXIT"
+            and not recovery_trail
+            and not market.markup
+            and (state.structure_runner_active or trail_breach != "NONE")
         )
         force_structure_exit = (
             config.structure_held_runner
             and state.phase != "EXIT"
             and not recovery_trail
-            and (not risk_clear or (trail_breach != "NONE" and not market.hourly_recovered))
+            and (
+                not risk_clear
+                or (trail_breach != "NONE" and not market.hourly_recovered)
+                or markup_release
+            )
         )
         exit_breach = trail_breach
         structure_runner_distribution = False
@@ -1210,7 +1241,12 @@ def transition(
             _reduce_exit_target(config, state, ZERO)
             if config.structure_held_runner and not recovery_trail and entering_exit:
                 state.structure_runner_active = False
-                exit_breach = "RISK_OVERRIDE" if not risk_clear else trail_breach
+                if not risk_clear:
+                    exit_breach = "RISK_OVERRIDE"
+                elif markup_release:
+                    exit_breach = "MARKUP_LOSS"
+                else:
+                    exit_breach = trail_breach
                 state.last_exit_trail_breach = exit_breach
                 state.last_exit_hourly_recovered = market.hourly_recovered
                 state.last_exit_risk_clear = risk_clear

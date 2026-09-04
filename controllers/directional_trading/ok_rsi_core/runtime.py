@@ -80,6 +80,7 @@ def policy_config(config):
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
         structure_held_runner=config.episode_structure_held_runner,
+        markup_release_runner=config.episode_markup_release_runner,
         assignment_id=config.episode_assignment_id, initial_base=config.episode_initial_base,
         initial_cost=config.episode_initial_cost,
     )
@@ -165,6 +166,12 @@ class EpisodeRuntime:
             if active_setup
             else None
         )
+        if self.config.markup_release_runner:
+            exit_policy = "MARKUP_RELEASED_RUNNER_V1"
+        elif self.config.structure_held_runner:
+            exit_policy = "STRUCTURE_HELD_RUNNER_V1"
+        else:
+            exit_policy = "DEFAULT"
         return {"enabled": True, "phase": self.state.phase, "episode_id": self.state.episode_id,
                 "reason": self.reason, "hold_reason": self.hold_reason,
                 "base": str(self.state.base), "gross_spent": str(self.state.gross_spent),
@@ -193,10 +200,9 @@ class EpisodeRuntime:
                 "last_entry_setup_low": str(last_entry.setup_low) if last_entry else None,
                 "last_entry_setup_rebound": str(last_entry.setup_rebound) if last_entry else None,
                 "last_entry_setup_no_new_low": last_entry.setup_no_new_low if last_entry else None,
-                "exit_policy": (
-                    "STRUCTURE_HELD_RUNNER_V1" if self.config.structure_held_runner else "DEFAULT"
-                ),
+                "exit_policy": exit_policy,
                 "exit_hourly_recovered": self.last_market.hourly_recovered if self.last_market else None,
+                "exit_markup": getattr(self.last_market, "markup", None) if self.last_market else None,
                 "exit_risk_clear": risk_clear,
                 "structure_runner_active": self.state.structure_runner_active,
                 "structure_runner_target_base": str(runner_target),

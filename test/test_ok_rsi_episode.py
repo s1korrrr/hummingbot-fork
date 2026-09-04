@@ -225,13 +225,23 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
     legacy_values.pop("structure_held_runner")
+    legacy_values.pop("markup_release_runner")
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
     assert replace(cfg, scout_rebound_confirmation=True).identity != cfg.identity
     assert replace(cfg, recovery_aware_scout=True).identity != cfg.identity
     assert replace(cfg, recovery_rebound_scout=True).identity != cfg.identity
-    assert replace(cfg, structure_held_runner=True).identity != cfg.identity
+    structure = replace(cfg, structure_held_runner=True)
+    structure_values = legacy_values | {"structure_held_runner": True}
+    assert structure.identity == _hash(structure_values)
+    assert structure.identity != cfg.identity
+    assert replace(cfg, structure_held_runner=True, markup_release_runner=True).identity != cfg.identity
+
+
+def test_markup_release_runner_requires_structure_held_runner():
+    with pytest.raises(EpisodeInputError, match="markup release"):
+        config(markup_release_runner=True)
 
 
 def test_disabled_structure_runner_preserves_legacy_checkpoint_shape():
@@ -1332,6 +1342,259 @@ def test_sell_only_uses_same_structure_held_runner_without_buy_authorization():
     assert result.state.target_base == D("0.4")
     assert result.requests[0].side == "SELL"
     assert result.requests[0].amount == D("0.6")
+    assert all(order.request.side != "BUY" for order in result.state.orders.values())
+
+
+def _markup_release_held_runner(cfg, *, sell_only=False):
+    if sell_only:
+        armed = transition(
+            cfg,
+            EpisodeState(),
+            market(
+                bid=D("102"),
+                ask=D("102"),
+                low=D("102"),
+                atr_15m=D("0.1"),
+                atr_1h=D("10"),
+                base_available=D("1"),
+                markup=True,
+            ),
+        )
+        high = transition(
+            cfg,
+            armed.state,
+            market(
+                timestamp=6060,
+                bid=D("103"),
+                ask=D("103"),
+                low=D("103"),
+                atr_15m=D("0.1"),
+                atr_1h=D("10"),
+                base_available=D("1"),
+                hourly_recovered=True,
+                markup=True,
+            ),
+        )
+        state = high.state
+        high_timestamp = 6120
+    else:
+        state = _structure_runner_setup(cfg)
+        high_timestamp = 6240
+    held = transition(
+        cfg,
+        state,
+        market(
+            timestamp=high_timestamp,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=True,
+        ),
+    )
+    assert held.state.structure_runner_active is True
+    assert held.state.target_base == D("0.4")
+    return held
+
+
+def test_markup_loss_at_initial_trail_breach_uses_terminal_target():
+    cfg = config(structure_held_runner=True, markup_release_runner=True)
+    state = _structure_runner_setup(cfg)
+
+    result = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=False,
+        ),
+    )
+
+    assert result.state.phase == "EXIT"
+    assert result.state.target_base == D("0")
+    assert result.state.structure_runner_active is False
+    assert result.reason == "trailing_profit_exit"
+    request = result.requests[0]
+    assert request.amount == D("1")
+    assert request.exit_policy == "MARKUP_RELEASED_RUNNER_V1"
+    assert request.exit_trail_breach == "MARKUP_LOSS"
+    assert request.exit_hourly_recovered is True
+    assert request.exit_risk_clear is True
+
+    with pytest.raises(EpisodeInputError, match="markup loss"):
+        replace(request, exit_policy="STRUCTURE_HELD_RUNNER_V1")
+
+
+def test_active_runner_latches_zero_target_on_later_markup_loss_without_new_trail_breach():
+    cfg = config(structure_held_runner=True, markup_release_runner=True)
+    held = _markup_release_held_runner(cfg)
+    partial = held.requests[0]
+    fill = OrderUpdate(
+        partial.id,
+        filled_base=D("0.6"),
+        filled_quote=D("61.44"),
+        done=True,
+    )
+
+    result = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6300,
+            bid=D("103.2"),
+            ask=D("103.2"),
+            low=D("103.2"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("0.4"),
+            hourly_recovered=True,
+            markup=False,
+        ),
+        [fill],
+    )
+
+    assert result.state.phase == "EXIT"
+    assert result.state.target_base == D("0")
+    assert result.state.exit_target_revision == 2
+    assert result.state.last_exit_trail_breach == "MARKUP_LOSS"
+    assert result.requests[0].amount == D("0.4")
+    assert result.requests[0].exit_trail_breach == "MARKUP_LOSS"
+
+
+def test_markup_loss_target_stays_zero_until_profit_guard_allows_full_retry():
+    cfg = config(
+        structure_held_runner=True,
+        markup_release_runner=True,
+        min_profit=D("0.02"),
+    )
+    held = _markup_release_held_runner(cfg)
+    partial = held.requests[0]
+    fill = OrderUpdate(
+        partial.id,
+        filled_base=D("0.6"),
+        filled_quote=D("61.44"),
+        done=True,
+    )
+
+    blocked = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6300,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("0.4"),
+            hourly_recovered=True,
+            markup=False,
+        ),
+        [fill],
+    )
+    assert blocked.reason == "profit_guard_blocked"
+    assert blocked.state.phase == "EXIT"
+    assert blocked.state.target_base == D("0")
+    assert blocked.state.last_exit_trail_breach == "MARKUP_LOSS"
+    assert not blocked.requests
+
+    retried = transition(
+        cfg,
+        blocked.state,
+        market(
+            timestamp=6360,
+            bid=D("103"),
+            ask=D("103"),
+            low=D("103"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("0.4"),
+            hourly_recovered=True,
+            markup=False,
+        ),
+    )
+    assert retried.requests[0].amount == D("0.4")
+    assert retried.requests[0].exit_policy == "MARKUP_RELEASED_RUNNER_V1"
+    assert retried.requests[0].exit_trail_breach == "MARKUP_LOSS"
+    assert retried.requests[0].exit_target_revision == 2
+
+
+def test_markup_loss_cancels_pending_runner_sell_without_duplicate_quantity():
+    cfg = config(structure_held_runner=True, markup_release_runner=True)
+    held = _markup_release_held_runner(cfg)
+
+    result = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6300,
+            bid=D("103.2"),
+            ask=D("103.2"),
+            low=D("103.2"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("1"),
+            hourly_recovered=True,
+            markup=False,
+        ),
+    )
+
+    assert result.state.phase == "EXIT"
+    assert result.state.target_base == D("0")
+    assert result.cancel_ids == (held.requests[0].id,)
+    assert not result.requests
+
+
+def test_sell_only_uses_same_markup_loss_runner_release_without_buying():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="inventory-1",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        structure_held_runner=True,
+        markup_release_runner=True,
+    )
+    held = _markup_release_held_runner(cfg, sell_only=True)
+    partial = held.requests[0]
+
+    result = transition(
+        cfg,
+        held.state,
+        market(
+            timestamp=6180,
+            bid=D("103.2"),
+            ask=D("103.2"),
+            low=D("103.2"),
+            atr_15m=D("0.1"),
+            atr_1h=D("10"),
+            base_available=D("0.4"),
+            hourly_recovered=True,
+            markup=False,
+            entry_signal=True,
+        ),
+        [
+            OrderUpdate(
+                partial.id,
+                filled_base=D("0.6"),
+                filled_quote=D("61.44"),
+                done=True,
+            )
+        ],
+    )
+
+    assert result.requests[0].side == "SELL"
+    assert result.requests[0].amount == D("0.4")
+    assert result.requests[0].exit_trail_breach == "MARKUP_LOSS"
     assert all(order.request.side != "BUY" for order in result.state.orders.values())
 
 

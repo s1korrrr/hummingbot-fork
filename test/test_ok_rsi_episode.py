@@ -625,6 +625,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("adaptive_reference_fallback")
     legacy_values.pop("thin_scout_release")
     legacy_values.pop("thin_scout_rearm")
+    legacy_values.pop("profitable_episode_rearm")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -639,6 +640,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     assert replace(cfg, recovery_rebound_scout=True).identity != cfg.identity
     assert replace(cfg, thin_scout_release=True).identity != cfg.identity
     assert replace(cfg, thin_scout_release=True, thin_scout_rearm=True).identity != cfg.identity
+    assert replace(cfg, profitable_episode_rearm=True).identity != cfg.identity
     structure = replace(cfg, structure_held_runner=True)
     structure_values = legacy_values | {"structure_held_runner": True}
     assert structure.identity == _hash(structure_values)
@@ -1890,6 +1892,224 @@ def test_thin_scout_rearm_reopens_entry_after_reconciled_full_release():
 def test_thin_scout_rearm_requires_thin_scout_release():
     with pytest.raises(EpisodeInputError, match="thin scout rearm"):
         config(thin_scout_rearm=True)
+
+
+def _completed_profitable_episode(cfg):
+    state, _ = bought(cfg)
+    armed = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("102"),
+            ask=D("102"),
+            low=D("102"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6180,
+            bid=D("103"),
+            ask=D("103"),
+            low=D("103"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    exiting = transition(
+        cfg,
+        high.state,
+        market(
+            timestamp=6240,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+        ),
+    )
+    request = exiting.requests[0]
+    completed = transition(
+        cfg,
+        exiting.state,
+        market(
+            timestamp=6300,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            base_available=D("0"),
+            entry_signal=True,
+        ),
+        [
+            OrderUpdate(
+                request.id,
+                request.amount,
+                request.amount * request.price,
+                done=True,
+            )
+        ],
+    )
+    return completed, request
+
+
+def test_profitable_episode_rearm_reopens_after_any_profitable_buy_sell_exit():
+    cfg = config(profitable_episode_rearm=True)
+
+    completed, request = _completed_profitable_episode(cfg)
+
+    assert completed.reason == "profitable_episode_rearmed"
+    assert completed.state.phase == "WATCH"
+    assert completed.state.episode_id is None
+    assert completed.state.base == D("0")
+    assert completed.state.orders[request.id].done is True
+    assert completed.requests == ()
+
+    restored = EpisodeState.from_dict(completed.state.to_dict())
+    next_entry = transition(
+        cfg,
+        restored,
+        market(
+            timestamp=6360,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=D("0"),
+            entry_signal=True,
+        ),
+    )
+    assert next_entry.requests[0].side == "BUY"
+    assert next_entry.requests[0].level == 0
+
+
+def test_profitable_episode_rearm_is_default_off_and_requires_positive_net_cash():
+    ordinary, _ = _completed_profitable_episode(config())
+    assert ordinary.reason == "episode_completed"
+    assert ordinary.state.phase == "COOLDOWN"
+
+    cfg = config(profitable_episode_rearm=True, require_profit=False)
+    state, _ = bought(cfg)
+    armed = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6120,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6180,
+            bid=D("99.5"),
+            ask=D("99.5"),
+            low=D("99.5"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+            markup=True,
+        ),
+    )
+    exiting = transition(
+        cfg,
+        high.state,
+        market(
+            timestamp=6240,
+            bid=D("98.9"),
+            ask=D("98.9"),
+            low=D("98.9"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+        ),
+    )
+    request = exiting.requests[0]
+    completed = transition(
+        cfg,
+        exiting.state,
+        market(timestamp=6300, base_available=D("0"), entry_signal=False),
+        [OrderUpdate(request.id, request.amount, request.amount * request.price, done=True)],
+    )
+    assert completed.state.sell_proceeds < completed.state.gross_spent
+    assert completed.reason == "episode_completed"
+    assert completed.state.phase == "COOLDOWN"
+
+
+def test_profitable_episode_rearm_does_not_reassign_sell_only_inventory():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="assigned",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        profitable_episode_rearm=True,
+    )
+    assigned = transition(
+        cfg,
+        EpisodeState(),
+        market(base_available=D("1"), entry_signal=False),
+    )
+    armed = transition(
+        cfg,
+        assigned.state,
+        market(
+            timestamp=6060,
+            bid=D("102"),
+            ask=D("102"),
+            low=D("102"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+    high = transition(
+        cfg,
+        armed.state,
+        market(
+            timestamp=6120,
+            bid=D("103"),
+            ask=D("103"),
+            low=D("103"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+    exiting = transition(
+        cfg,
+        high.state,
+        market(
+            timestamp=6180,
+            bid=D("102.4"),
+            ask=D("102.4"),
+            low=D("102.4"),
+            atr_15m=D("0.1"),
+            base_available=D("1"),
+            entry_signal=False,
+        ),
+    )
+    request = exiting.requests[0]
+    completed = transition(
+        cfg,
+        exiting.state,
+        market(timestamp=6240, base_available=D("0"), entry_signal=False),
+        [OrderUpdate(request.id, request.amount, request.amount * request.price, done=True)],
+    )
+
+    assert completed.state.sell_proceeds > completed.state.gross_spent
+    assert completed.reason == "episode_completed"
+    assert completed.state.phase == "COOLDOWN"
+    assert completed.state.assignment_consumed is True
 
 
 def _structure_runner_setup(cfg):

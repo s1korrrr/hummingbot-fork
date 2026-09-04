@@ -168,6 +168,7 @@ class EpisodeConfig:
     adaptive_reference_fallback: bool = False
     thin_scout_release: bool = False
     thin_scout_rearm: bool = False
+    profitable_episode_rearm: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -194,6 +195,7 @@ class EpisodeConfig:
             "adaptive_reference_fallback",
             "thin_scout_release",
             "thin_scout_rearm",
+            "profitable_episode_rearm",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -285,6 +287,8 @@ class EpisodeConfig:
             values.pop("thin_scout_release")
         if not self.thin_scout_rearm:
             values.pop("thin_scout_rearm")
+        if not self.profitable_episode_rearm:
+            values.pop("profitable_episode_rearm")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -1254,7 +1258,15 @@ def _finish_if_flat(
     if config.adaptive_entry_pricing and state.gross_spent == 0 and any(level == "OPEN" for level in state.levels):
         return None
     if state.episode_id and state.base == 0 and current and all(order.done for order in current):
-        if config.thin_scout_rearm and state.exit_intent == "THIN_SCOUT_RELEASE":
+        profitable_rearm = bool(
+            config.profitable_episode_rearm
+            and config.mode == "buy_sell"
+            and state.sell_proceeds > state.gross_spent
+        )
+        thin_scout_rearm = bool(
+            config.thin_scout_rearm and state.exit_intent == "THIN_SCOUT_RELEASE"
+        )
+        if profitable_rearm or thin_scout_rearm:
             return Transition(
                 EpisodeState(
                     config_hash=config.identity,
@@ -1264,7 +1276,11 @@ def _finish_if_flat(
                     last_valid_bid=state.last_valid_bid,
                     assignment_consumed=state.assignment_consumed,
                 ),
-                reason="thin_scout_rearmed",
+                reason=(
+                    "profitable_episode_rearmed"
+                    if profitable_rearm
+                    else "thin_scout_rearmed"
+                ),
             )
         state.phase = "COOLDOWN"
         state.cooldown_htf_timestamp = market.htf_timestamp

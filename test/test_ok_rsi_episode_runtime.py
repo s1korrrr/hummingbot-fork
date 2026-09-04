@@ -78,6 +78,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_markup_release_runner=True,
         episode_thin_scout_release=True,
         episode_thin_scout_rearm=True,
+        episode_profitable_rearm=True,
     )
 
     policy = controller._episode_runtime.config
@@ -103,6 +104,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.markup_release_runner is True
     assert policy.thin_scout_release is True
     assert policy.thin_scout_rearm is True
+    assert policy.profitable_episode_rearm is True
     assert policy.rebound_atr == Decimal("0.25")
 
 
@@ -209,6 +211,7 @@ def test_thin_scout_release_receipt_maps_to_executor_and_status():
     status = runtime.status()
     assert status["thin_scout_release_enabled"] is True
     assert status["thin_scout_rearm_enabled"] is False
+    assert status["profitable_episode_rearm_enabled"] is False
     assert status["thin_scout_inventory"] is True
     assert status["acquisition_levels"] == [0]
     assert status["distribution_start_base"] == "1"

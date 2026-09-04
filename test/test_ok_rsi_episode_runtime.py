@@ -79,6 +79,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_thin_scout_release=True,
         episode_thin_scout_rearm=True,
         episode_profitable_rearm=True,
+        episode_deep_recovery_capital_release=True,
     )
 
     policy = controller._episode_runtime.config
@@ -105,6 +106,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.thin_scout_release is True
     assert policy.thin_scout_rearm is True
     assert policy.profitable_episode_rearm is True
+    assert policy.deep_recovery_capital_release is True
     assert policy.rebound_atr == Decimal("0.25")
 
 

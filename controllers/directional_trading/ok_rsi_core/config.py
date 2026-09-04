@@ -48,6 +48,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     episode_thin_scout_release: bool = False
     episode_thin_scout_rearm: bool = False
     episode_profitable_rearm: bool = False
+    episode_deep_recovery_capital_release: bool = False
     episode_scout_rebound_confirmation: bool = False
     episode_recovery_aware_scout: bool = False
     episode_recovery_rebound_scout: bool = False

@@ -626,6 +626,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("thin_scout_release")
     legacy_values.pop("thin_scout_rearm")
     legacy_values.pop("profitable_episode_rearm")
+    legacy_values.pop("deep_recovery_capital_release")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -641,6 +642,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     assert replace(cfg, thin_scout_release=True).identity != cfg.identity
     assert replace(cfg, thin_scout_release=True, thin_scout_rearm=True).identity != cfg.identity
     assert replace(cfg, profitable_episode_rearm=True).identity != cfg.identity
+    assert replace(cfg, deep_recovery_capital_release=True).identity != cfg.identity
     structure = replace(cfg, structure_held_runner=True)
     structure_values = legacy_values | {"structure_held_runner": True}
     assert structure.identity == _hash(structure_values)
@@ -2114,6 +2116,287 @@ def test_profitable_episode_rearm_does_not_reassign_sell_only_inventory():
     assert completed.reason == "episode_completed"
     assert completed.state.phase == "COOLDOWN"
     assert completed.state.assignment_consumed is True
+
+
+def _deep_recovery_state(cfg):
+    state, _ = bought(cfg)
+    setup = market(
+        timestamp=6120,
+        bid=D("95.8"),
+        ask=D("95.8"),
+        low=D("95"),
+        base_available=D("1"),
+        entry_signal=False,
+    )
+    armed = transition(cfg, state, setup)
+    stable = transition(cfg, armed.state, replace(setup, timestamp=6180, low=D("95.1")))
+    scale = transition(cfg, stable.state, replace(setup, timestamp=6240, low=D("95.1")))
+    request = scale.requests[0]
+    assert request.level == len(cfg.level_fractions) - 1
+    total_base = state.base + request.amount
+    settled = transition(
+        cfg,
+        scale.state,
+        market(
+            timestamp=6300,
+            bid=D("96"),
+            ask=D("96"),
+            low=D("96"),
+            base_available=total_base,
+            entry_signal=False,
+        ),
+        [OrderUpdate(request.id, request.amount, request.amount * request.price, done=True)],
+    )
+    recovered = transition(
+        cfg,
+        settled.state,
+        market(
+            timestamp=6360,
+            bid=D("98"),
+            ask=D("98"),
+            low=D("98"),
+            base_available=total_base,
+            entry_signal=False,
+            recovery=True,
+        ),
+    )
+    assert recovered.state.phase == "RECOVER"
+    return recovered.state, total_base
+
+
+def test_deep_recovery_releases_principal_to_existing_runner_target():
+    cfg = config(deep_recovery_capital_release=True)
+    state, total_base = _deep_recovery_state(cfg)
+    basis = state.cost / state.base
+    release = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6420,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=total_base,
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+
+    assert (D("99") - basis) / D("1") < cfg.distribution_atr_levels[0]
+    assert release.state.phase == "DISTRIBUTE"
+    assert release.state.target_base == total_base * cfg.remaining_fractions[-1]
+    assert release.state.exit_target_revision == 1
+    assert release.state.exit_intent == "RECOVERY_CAPITAL_RELEASE"
+    assert release.reason == "deep_recovery_capital_release"
+    assert len(release.requests) == 1
+    request = release.requests[0]
+    assert request.side == "SELL"
+    assert request.intent == "RECOVERY_CAPITAL_RELEASE"
+    assert request.exit_policy == "DEEP_RECOVERY_CAPITAL_RELEASE_V4"
+    assert request.exit_target_base == release.state.target_base
+    assert request.exit_target_revision == 1
+    assert request.price >= state.cost / state.base
+
+
+def test_deep_recovery_release_excludes_shallow_and_strong_markup():
+    cfg = config(deep_recovery_capital_release=True)
+    shallow, _ = bought(cfg)
+    recovered = transition(
+        cfg,
+        shallow,
+        market(
+            timestamp=6120,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=D("1"),
+            entry_signal=False,
+            recovery=True,
+        ),
+    )
+    shallow_markup = transition(
+        cfg,
+        recovered.state,
+        market(
+            timestamp=6180,
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+    deep, total_base = _deep_recovery_state(cfg)
+    basis = deep.cost / deep.base
+    strong_price = basis + cfg.distribution_atr_levels[0] * D("1")
+    strong_markup = transition(
+        cfg,
+        deep,
+        market(
+            timestamp=6420,
+            bid=strong_price,
+            ask=strong_price,
+            low=strong_price,
+            base_available=total_base,
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+
+    assert shallow_markup.reason == "markup_armed"
+    assert not shallow_markup.requests
+    assert strong_markup.reason == "markup_armed"
+    assert not strong_markup.requests
+
+
+def test_deep_recovery_release_is_profit_protected_and_retries_only_unfilled_base():
+    cfg = config(
+        deep_recovery_capital_release=True,
+        require_profit=False,
+        min_profit=D(".03"),
+    )
+    state, total_base = _deep_recovery_state(cfg)
+    profit_floor = state.cost / state.base * (D("1") + cfg.min_profit)
+    ordinary = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6420,
+            bid=profit_floor - D(".01"),
+            ask=profit_floor - D(".01"),
+            low=profit_floor - D(".01"),
+            base_available=total_base,
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+    assert ordinary.reason == "markup_armed"
+    assert not ordinary.requests
+
+    state, total_base = _deep_recovery_state(cfg)
+    authorized = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6420,
+            bid=profit_floor + D(".01"),
+            ask=profit_floor + D(".01"),
+            low=profit_floor + D(".01"),
+            base_available=total_base,
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+    pending = transition(
+        cfg,
+        authorized.state,
+        market(
+            timestamp=6480,
+            bid=profit_floor + D(".02"),
+            ask=profit_floor + D(".02"),
+            low=profit_floor + D(".02"),
+            base_available=total_base,
+            entry_signal=False,
+        ),
+    )
+    request = authorized.requests[0]
+    partial_amount = request.amount / D("2")
+    partial = transition(
+        cfg,
+        EpisodeState.from_dict(authorized.state.to_dict()),
+        market(
+            timestamp=6480,
+            bid=profit_floor + D(".02"),
+            ask=profit_floor + D(".02"),
+            low=profit_floor + D(".02"),
+            base_available=total_base - partial_amount,
+            entry_signal=False,
+        ),
+        [
+            OrderUpdate(
+                request.id,
+                partial_amount,
+                partial_amount * request.price,
+                done=True,
+            )
+        ],
+    )
+
+    assert request.price >= profit_floor
+    assert pending.reason == "pending_execution"
+    assert not pending.requests
+    assert partial.requests[0].intent == "RECOVERY_CAPITAL_RELEASE"
+    assert partial.requests[0].amount <= request.amount - partial_amount
+
+
+def test_deep_recovery_release_reconciles_to_ordinary_runner_and_survives_restart():
+    cfg = config(deep_recovery_capital_release=True)
+    state, total_base = _deep_recovery_state(cfg)
+    authorized = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6420,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=total_base,
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+    request = authorized.requests[0]
+    reconciled = transition(
+        cfg,
+        EpisodeState.from_dict(authorized.state.to_dict()),
+        market(
+            timestamp=6480,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=authorized.state.target_base,
+            entry_signal=False,
+        ),
+        [OrderUpdate(request.id, request.amount, request.amount * request.price, done=True)],
+    )
+
+    assert reconciled.reason == "dust"
+    assert reconciled.state.phase == "DISTRIBUTE"
+    assert reconciled.state.base >= authorized.state.target_base
+    assert reconciled.state.base - authorized.state.target_base < D(".001")
+    assert reconciled.state.exit_intent == "DISTRIBUTION_SELL"
+    assert not reconciled.requests
+    assert EpisodeState.from_dict(reconciled.state.to_dict()).to_dict() == reconciled.state.to_dict()
+
+
+def test_sell_only_assignment_uses_shared_deep_recovery_release_without_buy_history():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="assigned-deep-bag",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        deep_recovery_capital_release=True,
+    )
+    release = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+
+    assert release.state.assignment_consumed is True
+    assert release.state.phase == "DISTRIBUTE"
+    assert release.state.target_base == D(".4")
+    assert release.requests[0].amount == D(".6")
+    assert release.requests[0].intent == "RECOVERY_CAPITAL_RELEASE"
+    assert all(order.request.side == "SELL" for order in release.state.orders.values())
 
 
 def _structure_runner_setup(cfg):

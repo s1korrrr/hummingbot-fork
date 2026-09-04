@@ -43,6 +43,7 @@ ORDER_INTENTS = {
     "RECOVERY_TAKE_PROFIT",
     "DISTRIBUTION_SELL",
     "THIN_SCOUT_RELEASE",
+    "RECOVERY_CAPITAL_RELEASE",
     "TRAILING_PROFIT_EXIT",
     "TERMINAL_PROFIT_EXIT",
 }
@@ -52,6 +53,7 @@ EXIT_POLICIES = {
     "STRUCTURE_HELD_RUNNER_V1",
     "MARKUP_RELEASED_RUNNER_V1",
     "THIN_SCOUT_RELEASE_V1",
+    "DEEP_RECOVERY_CAPITAL_RELEASE_V4",
 }
 EXIT_TRAIL_BREACHES = {
     "NONE",
@@ -169,6 +171,7 @@ class EpisodeConfig:
     thin_scout_release: bool = False
     thin_scout_rearm: bool = False
     profitable_episode_rearm: bool = False
+    deep_recovery_capital_release: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -196,6 +199,7 @@ class EpisodeConfig:
             "thin_scout_release",
             "thin_scout_rearm",
             "profitable_episode_rearm",
+            "deep_recovery_capital_release",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -289,6 +293,8 @@ class EpisodeConfig:
             values.pop("thin_scout_rearm")
         if not self.profitable_episode_rearm:
             values.pop("profitable_episode_rearm")
+        if not self.deep_recovery_capital_release:
+            values.pop("deep_recovery_capital_release")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -1344,6 +1350,15 @@ def _exit_receipt(
             "exit_target_base": state.target_base,
             "exit_target_revision": state.exit_target_revision,
         }
+    if request_intent == "RECOVERY_CAPITAL_RELEASE":
+        return {
+            "exit_policy": "DEEP_RECOVERY_CAPITAL_RELEASE_V4",
+            "exit_hourly_recovered": market.hourly_recovered,
+            "exit_risk_clear": not (market.cascade or market.hostile or market.reset),
+            "exit_trail_breach": trail_breach,
+            "exit_target_base": state.target_base,
+            "exit_target_revision": state.exit_target_revision,
+        }
     if not config.structure_held_runner:
         return {}
     use_target_context = (
@@ -1385,6 +1400,7 @@ def _sell(
     profit_protected = config.require_profit or request_intent in {
         "RECOVERY_TAKE_PROFIT",
         "THIN_SCOUT_RELEASE",
+        "RECOVERY_CAPITAL_RELEASE",
     }
     if not state.cost_known and profit_protected:
         return Transition(state, reason="basis_unavailable")
@@ -1420,6 +1436,7 @@ def _sell(
         "RECOVERY_TAKE_PROFIT": "recovery_take_profit",
         "DISTRIBUTION_SELL": "distribution",
         "THIN_SCOUT_RELEASE": "thin_scout_release",
+        "RECOVERY_CAPITAL_RELEASE": "deep_recovery_capital_release",
         "TRAILING_PROFIT_EXIT": "trailing_profit_exit",
         "TERMINAL_PROFIT_EXIT": "terminal_exit",
     }[request_intent]
@@ -1557,6 +1574,13 @@ def transition(
     if completed is not None:
         return completed
     recovery_trail = state.phase == "RECOVER" and state.exit_intent == "RECOVERY_TAKE_PROFIT"
+    if (
+        state.phase == "DISTRIBUTE"
+        and state.exit_intent == "RECOVERY_CAPITAL_RELEASE"
+        and not pending
+        and _floor(max(ZERO, state.base - state.target_base), market.amount_step) == ZERO
+    ):
+        state.exit_intent = "DISTRIBUTION_SELL"
     if state.phase in ("MARKUP", "DISTRIBUTE", "EXIT") or recovery_trail:
         distance = _trail_distance(config, market)
         state.peak = max(state.peak, market.bid)
@@ -1667,12 +1691,12 @@ def transition(
     if state.base > market.base_available:
         return Transition(state, reason="inventory_balance_shortfall")
     if state.base and market.markup:
+        origin_phase = state.phase
         if config.require_profit and (
             not state.cost_known
             or market.bid * (ONE - config.fee_rate) * state.base < state.cost * (ONE + config.min_profit)
         ):
             return Transition(state, reason="markup_profit_guard")
-        state.phase = "MARKUP"
         state.distribution_start_base = state.target_base = state.base
         state.distribution_basis = state.cost / state.base if state.cost_known else market.bid
         state.distribution_atr = market.atr_1h
@@ -1684,6 +1708,40 @@ def transition(
         state.last_exit_trail_breach = "NONE"
         state.last_exit_hourly_recovered = False
         state.last_exit_risk_clear = False
+        profit_floor = minimum_profit_price(config, state)
+        weak_extension = (
+            (state.peak - state.distribution_basis) / state.distribution_atr
+            < config.distribution_atr_levels[0]
+        )
+        attributed_deep_inventory = (
+            len(config.level_fractions) - 1 in acquisition_levels(state)
+            or (config.mode == "sell_only" and state.assignment_consumed)
+        )
+        if (
+            config.deep_recovery_capital_release
+            and origin_phase in {"RECOVER", "DEFENSIVE", "EXHAUSTED"}
+            and attributed_deep_inventory
+            and profit_floor is not None
+            and market.bid >= profit_floor
+            and weak_extension
+        ):
+            state.phase = "DISTRIBUTE"
+            state.exit_intent = "RECOVERY_CAPITAL_RELEASE"
+            _reduce_exit_target(
+                config,
+                state,
+                state.distribution_start_base * config.remaining_fractions[-1],
+            )
+            if state.exit_target_revision == 0:
+                state.exit_target_revision = 1
+            return _sell(
+                config,
+                state,
+                market,
+                intent="RECOVERY_CAPITAL_RELEASE",
+                reason="deep_recovery_capital_release",
+            )
+        state.phase = "MARKUP"
         return Transition(state, reason="markup_armed")
     if market.cascade or (market.hostile and state.base > 0):
         if state.base:

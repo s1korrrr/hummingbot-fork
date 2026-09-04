@@ -82,6 +82,7 @@ def policy_config(config):
         thin_scout_release=config.episode_thin_scout_release,
         thin_scout_rearm=config.episode_thin_scout_rearm,
         profitable_episode_rearm=config.episode_profitable_rearm,
+        deep_recovery_capital_release=config.episode_deep_recovery_capital_release,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
@@ -187,13 +188,16 @@ class EpisodeRuntime:
         )
         if self.state.exit_intent == "THIN_SCOUT_RELEASE":
             exit_policy = "THIN_SCOUT_RELEASE_V1"
+        elif self.state.exit_intent == "RECOVERY_CAPITAL_RELEASE":
+            exit_policy = "DEEP_RECOVERY_CAPITAL_RELEASE_V4"
         elif self.config.markup_release_runner:
             exit_policy = "MARKUP_RELEASED_RUNNER_V1"
         elif self.config.structure_held_runner:
             exit_policy = "STRUCTURE_HELD_RUNNER_V1"
         else:
             exit_policy = "DEFAULT"
-        return {"enabled": True, "phase": self.state.phase, "episode_id": self.state.episode_id,
+        return {"enabled": True, "mode": self.config.mode,
+                "phase": self.state.phase, "episode_id": self.state.episode_id,
                 "reason": self.reason, "hold_reason": self.hold_reason,
                 "base": str(self.state.base), "gross_spent": str(self.state.gross_spent),
                 "cost": str(self.state.cost), "cost_known": self.state.cost_known,
@@ -242,6 +246,9 @@ class EpisodeRuntime:
                 "thin_scout_release_enabled": self.config.thin_scout_release,
                 "thin_scout_rearm_enabled": self.config.thin_scout_rearm,
                 "profitable_episode_rearm_enabled": self.config.profitable_episode_rearm,
+                "deep_recovery_capital_release_enabled": self.config.deep_recovery_capital_release,
+                "assignment_consumed": self.state.assignment_consumed,
+                "configured_level_count": len(self.config.level_fractions),
                 "thin_scout_inventory": thin_scout_inventory,
                 "acquisition_levels": list(levels),
                 "distribution_start_base": str(self.state.distribution_start_base),

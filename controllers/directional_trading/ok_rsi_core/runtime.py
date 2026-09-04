@@ -191,6 +191,9 @@ class EpisodeRuntime:
                 "last_entry_trend_alignment": str(last_entry.trend_alignment) if last_entry else None,
                 "last_entry_parent_request_id": last_entry.parent_request_id if last_entry else None,
                 "last_entry_expires_at": last_entry.expires_at if last_entry else None,
+                "last_entry_reserved_quote": (
+                    str(last_entry.reserved_quote) if last_entry else None
+                ),
                 "last_entry_termination_requested": (
                     last_entry_progress.termination_requested if last_entry_progress else None
                 ),
@@ -200,6 +203,16 @@ class EpisodeRuntime:
                 "entry_reservation_allowed": (
                     getattr(self.last_market, "reservation_allowed", None)
                     if self.last_market
+                    else None
+                ),
+                "entry_market_bid": (
+                    str(getattr(self.last_market, "bid", None))
+                    if getattr(self.last_market, "bid", None) is not None
+                    else None
+                ),
+                "entry_market_price_step": (
+                    str(getattr(self.last_market, "price_step", None))
+                    if getattr(self.last_market, "price_step", None) is not None
                     else None
                 ),
                 "entry_market_valid": getattr(self.last_market, "valid", None) if self.last_market else None,

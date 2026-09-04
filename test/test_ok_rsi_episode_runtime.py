@@ -493,8 +493,15 @@ def test_reference_fallback_maps_terminal_proven_parent_to_native_child():
     status = controller.get_custom_info()["episode"]
     assert status["last_entry_pricing_policy"] == "ADAPTIVE_REFERENCE_FALLBACK_V3"
     assert status["last_entry_parent_request_id"] == parent.id
+    assert Decimal(status["last_entry_reserved_quote"]) == (
+        child.amount
+        * child.price
+        * (Decimal("1") + controller._episode_runtime.config.fee_rate)
+    )
     assert status["last_entry_termination_requested"] == "NONE"
     assert status["last_entry_terminal_cause"] == "UNRECORDED"
+    assert status["entry_market_bid"] == "94"
+    assert status["entry_market_price_step"] == "0.01"
 
 
 def test_reserved_adaptive_entry_persists_then_operator_pause_stops_native_order():

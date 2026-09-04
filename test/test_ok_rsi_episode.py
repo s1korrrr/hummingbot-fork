@@ -627,6 +627,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     legacy_values.pop("thin_scout_rearm")
     legacy_values.pop("profitable_episode_rearm")
     legacy_values.pop("deep_recovery_capital_release")
+    legacy_values.pop("deep_recovery_rotation_exit")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -643,6 +644,11 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     assert replace(cfg, thin_scout_release=True, thin_scout_rearm=True).identity != cfg.identity
     assert replace(cfg, profitable_episode_rearm=True).identity != cfg.identity
     assert replace(cfg, deep_recovery_capital_release=True).identity != cfg.identity
+    assert replace(
+        cfg,
+        deep_recovery_capital_release=True,
+        deep_recovery_rotation_exit=True,
+    ).identity != cfg.identity
     structure = replace(cfg, structure_held_runner=True)
     structure_values = legacy_values | {"structure_held_runner": True}
     assert structure.identity == _hash(structure_values)
@@ -653,6 +659,11 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
 def test_markup_release_runner_requires_structure_held_runner():
     with pytest.raises(EpisodeInputError, match="markup release"):
         config(markup_release_runner=True)
+
+
+def test_deep_recovery_rotation_requires_capital_release():
+    with pytest.raises(EpisodeInputError, match="deep recovery rotation"):
+        config(deep_recovery_rotation_exit=True)
 
 
 def test_disabled_structure_runner_preserves_legacy_checkpoint_shape():
@@ -2198,6 +2209,67 @@ def test_deep_recovery_releases_principal_to_existing_runner_target():
     assert request.price >= state.cost / state.base
 
 
+def test_deep_recovery_rotation_exits_the_full_episode_to_normal_cooldown():
+    cfg = config(
+        deep_recovery_capital_release=True,
+        deep_recovery_rotation_exit=True,
+    )
+    state, total_base = _deep_recovery_state(cfg)
+    rotated = transition(
+        cfg,
+        state,
+        market(
+            timestamp=6420,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=total_base,
+            entry_signal=False,
+            markup=True,
+        ),
+    )
+
+    assert rotated.state.phase == "EXIT"
+    assert rotated.state.target_base == 0
+    assert rotated.state.exit_target_revision == 1
+    assert rotated.state.exit_intent == "RECOVERY_ROTATION_EXIT"
+    assert rotated.reason == "deep_recovery_rotation_exit"
+    request = rotated.requests[0]
+    assert request.amount == total_base
+    assert request.intent == "RECOVERY_ROTATION_EXIT"
+    assert request.exit_policy == "DEEP_RECOVERY_ROTATION_EXIT_V5"
+    assert request.exit_target_base == 0
+    assert request.price >= state.cost / state.base
+
+    restored = EpisodeState.from_dict(rotated.state.to_dict())
+    completed = transition(
+        cfg,
+        restored,
+        market(
+            timestamp=6480,
+            bid=D("99"),
+            ask=D("99"),
+            low=D("99"),
+            base_available=D("0"),
+            entry_signal=False,
+        ),
+        [
+            OrderUpdate(
+                request.id,
+                request.amount,
+                request.amount * request.price,
+                done=True,
+            )
+        ],
+    )
+
+    assert completed.reason == "episode_completed"
+    assert completed.state.phase == "COOLDOWN"
+    assert completed.state.base == 0
+    assert completed.state.sell_proceeds > completed.state.gross_spent
+    assert not completed.requests
+
+
 def test_deep_recovery_release_excludes_shallow_and_strong_markup():
     cfg = config(deep_recovery_capital_release=True)
     shallow, _ = bought(cfg)
@@ -2397,6 +2469,36 @@ def test_sell_only_assignment_uses_shared_deep_recovery_release_without_buy_hist
     assert release.requests[0].amount == D(".6")
     assert release.requests[0].intent == "RECOVERY_CAPITAL_RELEASE"
     assert all(order.request.side == "SELL" for order in release.state.orders.values())
+
+
+def test_sell_only_assignment_uses_shared_deep_recovery_rotation_without_buying():
+    cfg = config(
+        mode="sell_only",
+        assignment_id="assigned-deep-bag",
+        initial_base=D("1"),
+        initial_cost=D("100"),
+        deep_recovery_capital_release=True,
+        deep_recovery_rotation_exit=True,
+    )
+    rotation = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("101"),
+            ask=D("101"),
+            low=D("101"),
+            base_available=D("1"),
+            entry_signal=True,
+            markup=True,
+        ),
+    )
+
+    assert rotation.state.assignment_consumed is True
+    assert rotation.state.phase == "EXIT"
+    assert rotation.state.target_base == 0
+    assert rotation.requests[0].amount == D("1")
+    assert rotation.requests[0].intent == "RECOVERY_ROTATION_EXIT"
+    assert all(order.request.side == "SELL" for order in rotation.state.orders.values())
 
 
 def _structure_runner_setup(cfg):

@@ -80,6 +80,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
         episode_thin_scout_rearm=True,
         episode_profitable_rearm=True,
         episode_deep_recovery_capital_release=True,
+        episode_deep_recovery_rotation_exit=True,
     )
 
     policy = controller._episode_runtime.config
@@ -107,6 +108,7 @@ def test_lifecycle_v2_configuration_maps_without_changing_hard_cap():
     assert policy.thin_scout_rearm is True
     assert policy.profitable_episode_rearm is True
     assert policy.deep_recovery_capital_release is True
+    assert policy.deep_recovery_rotation_exit is True
     assert policy.rebound_atr == Decimal("0.25")
 
 
@@ -118,6 +120,11 @@ def test_public_config_rejects_markup_release_without_structure_runner():
 def test_public_config_rejects_thin_scout_rearm_without_release():
     with pytest.raises(ValueError, match="thin scout rearm"):
         setup_controller(episode_thin_scout_rearm=True)
+
+
+def test_public_config_rejects_deep_recovery_rotation_without_release():
+    with pytest.raises(ValueError, match="deep recovery rotation"):
+        setup_controller(episode_deep_recovery_rotation_exit=True)
 
 
 def test_thin_scout_release_receipt_maps_to_executor_and_status():

@@ -66,7 +66,8 @@ receipts. Disabled behavior and identity remain exact.
 - [x] Add failing reducer, configuration, identity, and runtime tests.
 - [x] Implement the shared pure transition and runtime receipts.
 - [x] Run focused native validation and commit exact paths.
-- [ ] Hand the exact source identity to Quants Lab.
+- [x] Hand exact commit `5dc23d03c173236b56eb9aec32ba2be02d120d16`
+  to the Quants Lab replay.
 
 ## Native evidence
 
@@ -75,3 +76,10 @@ configuration, policy identity, stage targets, and status fields did not yet
 exist. After implementation, 18 targeted cases passed. The complete focused
 OK RSI suite completed with `305 passed, 19 subtests passed`. Ruff, PyCompile,
 and `git diff --check` passed on the touched native and test paths.
+
+Quants Lab then replayed the exact native commit on continuous May-August
+BTC/ETH/BNB data. V20 retained every V19 buy and improved modeled aggregate
+PnL by 15.3704526485555 USDC, but it failed the frozen maximum marked-exposure
+gate: BNB reached 1.0177380363 times V19 against a 1.0025 limit. The native
+option remains disabled and V20 is rejected development evidence; no paper or
+live authority was granted.

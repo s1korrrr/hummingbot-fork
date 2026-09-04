@@ -76,6 +76,7 @@ def policy_config(config):
         hostile_risk_latch=config.episode_hostile_risk_latch,
         recovery_exit_enabled=config.episode_recovery_exit_enabled,
         adaptive_entry_pricing=config.episode_adaptive_entry_pricing,
+        adaptive_reserved_entry=config.episode_adaptive_reserved_entry,
         scout_rebound_confirmation=config.episode_scout_rebound_confirmation,
         recovery_aware_scout=config.episode_recovery_aware_scout,
         recovery_rebound_scout=config.episode_recovery_rebound_scout,
@@ -186,6 +187,12 @@ class EpisodeRuntime:
                 "last_entry_discount_atr": str(last_entry.pricing_discount_atr) if last_entry else None,
                 "last_entry_confidence": str(last_entry.signal_confidence) if last_entry else None,
                 "last_entry_trend_alignment": str(last_entry.trend_alignment) if last_entry else None,
+                "last_entry_expires_at": last_entry.expires_at if last_entry else None,
+                "entry_reservation_allowed": (
+                    getattr(self.last_market, "reservation_allowed", None)
+                    if self.last_market
+                    else None
+                ),
                 "setup_policy": setup_policy,
                 "setup_started_at": self.state.setup_start if active_setup else None,
                 "setup_confirmation_started_at": (
@@ -272,11 +279,14 @@ class EpisodeRuntime:
                 raise ContextUnavailable("adaptive entry trend alignment unavailable")
             entry_confidence = state["signal_strength_score"]
             trend_alignment = trend["alignment_score"]
-        buy_allowed = not (c._operator_entry_paused or c._check_consecutive_loss_pause()
-                           or c._is_flash_crash_cooldown(provider.time()))
-        buy_allowed = buy_allowed and bool(state.get("condition_ok", False))
+        reservation_allowed = not (
+            c._operator_entry_paused
+            or c._check_consecutive_loss_pause()
+            or c._is_flash_crash_cooldown(provider.time())
+        )
         if c.config.strict_hmm_mode and (c.processed_data or {}).get("regime_error"):
-            buy_allowed = False
+            reservation_allowed = False
+        buy_allowed = reservation_allowed and bool(state.get("condition_ok", False))
         snapshot = MarketSnapshot(
             **context,
             bid=provider.get_price_by_type(c.config.connector_name, c.config.trading_pair, PriceType.BestBid),
@@ -287,7 +297,9 @@ class EpisodeRuntime:
             amount_step=c._base_amount_increment(rule), price_step=c._rule_decimal(rule, "min_price_increment"),
             entry_signal=int((c.processed_data or {}).get("signal", 0)) > 0,
             entry_confidence=entry_confidence, trend_alignment=trend_alignment,
-            valid=not c.config.manual_kill_switch, buy_allowed=bool(buy_allowed),
+            valid=not c.config.manual_kill_switch,
+            buy_allowed=bool(buy_allowed),
+            reservation_allowed=bool(reservation_allowed),
         )
         self.last_market = snapshot
         return snapshot
@@ -331,11 +343,11 @@ class EpisodeRuntime:
                 return []
             self.state = result.state
             self.reason = result.reason
-            if self.controller.config.manual_kill_switch:
-                return []
             actions = [StopExecutorAction(controller_id=self.config.controller_id, executor_id=request_id, keep_position=True)
                        for request_id in result.cancel_ids
                        if any(ex.id == request_id and ex.is_active for ex in self.controller.executors_info)]
+            if self.controller.config.manual_kill_switch:
+                return actions
             for request in result.requests:
                 executor_config = EpisodeOrderExecutorConfig(
                     id=request.id, timestamp=market.timestamp, connector_name=self.config.connector,

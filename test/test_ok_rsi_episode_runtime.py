@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
 
 def setup_controller(*, mode="buy_sell", store=None, **config_values):
@@ -420,6 +420,109 @@ def test_adaptive_entry_pricing_maps_owner_signal_context_and_exposes_receipt():
     assert status["last_entry_discount_atr"] == "0.2"
     assert status["last_entry_confidence"] == "0.8"
     assert status["last_entry_trend_alignment"] == "-0.2"
+
+
+def test_reserved_adaptive_entry_maps_hard_reservation_rail_and_receipt():
+    controller, _ = setup_controller(
+        episode_adaptive_entry_pricing=True,
+        episode_adaptive_reserved_entry=True,
+    )
+    controller.processed_data = {
+        "signal": 1,
+        "signal_state": {"condition_ok": True, "signal_strength_score": 0.8},
+        "trend_confirmation": {"alignment_score": -0.2},
+    }
+
+    created = actions(controller)
+
+    assert len(created) == 1
+    status = controller.get_custom_info()["episode"]
+    assert status["last_entry_pricing_policy"] == "ADAPTIVE_RESERVED_ENTRY_V2"
+    assert status["entry_reservation_allowed"] is True
+    assert status["last_entry_expires_at"] == created[0].executor_config.episode_expires_at
+
+
+def test_reserved_adaptive_entry_persists_then_operator_pause_stops_native_order():
+    controller, _ = setup_controller(
+        episode_adaptive_entry_pricing=True,
+        episode_adaptive_reserved_entry=True,
+    )
+    controller.processed_data = {
+        "signal": 1,
+        "signal_state": {"condition_ok": True, "signal_strength_score": 0.8},
+        "trend_confirmation": {"alignment_score": -0.2},
+    }
+    created = actions(controller)[0]
+    controller.executors_info = [SimpleNamespace(
+        id=created.executor_config.id,
+        connector_name="okx",
+        trading_pair="ETH-USDT",
+        is_active=True,
+        is_done=False,
+        custom_info={"episode_receipt": {
+            "gross_base": "0",
+            "gross_quote": "0",
+            "base_fee": "0",
+            "quote_fee": "0",
+            "final": False,
+            "fees_known": True,
+            "errors": [],
+        }},
+    )]
+    controller.processed_data["signal"] = 0
+    controller.processed_data["signal_state"]["condition_ok"] = False
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context() | {
+            "timestamp": 10080,
+            "hostile": True,
+            "recovery": True,
+            "markup": True,
+        },
+    ):
+        assert controller.determine_executor_actions() == []
+
+    controller._operator_entry_paused = True
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context() | {"timestamp": 10140},
+    ):
+        stopped = controller.determine_executor_actions()
+
+    assert len(stopped) == 1
+    assert isinstance(stopped[0], StopExecutorAction)
+    assert stopped[0].executor_id == created.executor_config.id
+
+
+def test_manual_kill_returns_only_stop_for_active_episode_order():
+    controller, _ = setup_controller()
+    created = actions(controller)[0]
+    controller.executors_info = [SimpleNamespace(
+        id=created.executor_config.id,
+        connector_name="okx",
+        trading_pair="ETH-USDT",
+        is_active=True,
+        is_done=False,
+        custom_info={"episode_receipt": {
+            "gross_base": "0",
+            "gross_quote": "0",
+            "base_fee": "0",
+            "quote_fee": "0",
+            "final": False,
+            "fees_known": True,
+            "errors": [],
+        }},
+    )]
+    controller.config.manual_kill_switch = True
+    with patch(
+        "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
+        return_value=context() | {"timestamp": 10080},
+    ):
+        stopped = controller.determine_executor_actions()
+
+    assert len(stopped) == 1
+    assert isinstance(stopped[0], StopExecutorAction)
+    assert stopped[0].executor_id == created.executor_config.id
 
 
 def test_adaptive_entry_pricing_fails_closed_when_owner_inputs_are_missing():

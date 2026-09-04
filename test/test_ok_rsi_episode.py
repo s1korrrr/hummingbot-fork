@@ -183,6 +183,82 @@ def test_adaptive_pricing_changes_price_not_authorization_or_quote_cap():
     assert restored_request == request
 
 
+def test_reserved_adaptive_entry_keeps_authorized_order_through_context_decay():
+    cfg = config(adaptive_entry_pricing=True, adaptive_reserved_entry=True)
+    first = transition(
+        cfg,
+        EpisodeState(),
+        market(
+            bid=D("99.95"),
+            ask=D("100"),
+            entry_confidence=D("0.8"),
+            trend_alignment=D("-0.2"),
+        ),
+    )
+    request = first.requests[0]
+
+    decayed = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=6060,
+            entry_signal=False,
+            buy_allowed=False,
+            reservation_allowed=True,
+            hostile=True,
+            recovery=True,
+            markup=True,
+            entry_confidence=D("0.8"),
+            trend_alignment=D("-0.2"),
+        ),
+    )
+
+    assert request.pricing_policy == "ADAPTIVE_RESERVED_ENTRY_V2"
+    assert decayed.cancel_ids == ()
+    assert decayed.reason == "pending_execution"
+    assert not decayed.requests
+
+
+def test_reserved_adaptive_entry_still_cancels_for_hard_rail_or_expiry():
+    cfg = config(adaptive_entry_pricing=True, adaptive_reserved_entry=True)
+    first = transition(
+        cfg,
+        EpisodeState(),
+        market(entry_confidence=D("0.8")),
+    )
+    request = first.requests[0]
+
+    hard_rail = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=6060,
+            entry_signal=False,
+            buy_allowed=False,
+            reservation_allowed=False,
+            entry_confidence=D("0.8"),
+        ),
+    )
+    expired = transition(
+        cfg,
+        first.state,
+        market(
+            timestamp=request.expires_at,
+            entry_signal=False,
+            reservation_allowed=True,
+            entry_confidence=D("0.8"),
+        ),
+    )
+
+    assert hard_rail.cancel_ids == (request.id,)
+    assert expired.cancel_ids == (request.id,)
+
+
+def test_reserved_adaptive_entry_requires_adaptive_pricing():
+    with pytest.raises(EpisodeInputError, match="reserved adaptive"):
+        config(adaptive_reserved_entry=True)
+
+
 def test_disabled_adaptive_pricing_preserves_top_of_book_behavior():
     result = transition(
         config(adaptive_entry_pricing=False),
@@ -221,6 +297,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
     cfg = config(adaptive_entry_pricing=False)
     legacy_values = asdict(cfg)
     legacy_values.pop("adaptive_entry_pricing")
+    legacy_values.pop("adaptive_reserved_entry")
     legacy_values.pop("scout_rebound_confirmation")
     legacy_values.pop("recovery_aware_scout")
     legacy_values.pop("recovery_rebound_scout")
@@ -229,6 +306,7 @@ def test_disabled_adaptive_pricing_preserves_pre_feature_config_identity():
 
     assert cfg.identity == _hash(legacy_values)
     assert replace(cfg, adaptive_entry_pricing=True).identity != cfg.identity
+    assert replace(cfg, adaptive_entry_pricing=True, adaptive_reserved_entry=True).identity != cfg.identity
     assert replace(cfg, scout_rebound_confirmation=True).identity != cfg.identity
     assert replace(cfg, recovery_aware_scout=True).identity != cfg.identity
     assert replace(cfg, recovery_rebound_scout=True).identity != cfg.identity

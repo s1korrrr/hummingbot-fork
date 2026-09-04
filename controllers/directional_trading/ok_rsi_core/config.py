@@ -43,6 +43,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     legacy_controller_ids: List[str] = hl_rsi.Field(default_factory=list)
     episode_enabled: bool = hl_rsi.Field(default=False)
     episode_adaptive_entry_pricing: bool = False
+    episode_adaptive_reserved_entry: bool = False
     episode_scout_rebound_confirmation: bool = False
     episode_recovery_aware_scout: bool = False
     episode_recovery_rebound_scout: bool = False
@@ -211,6 +212,8 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError("buy_sell episode requires fresh inventory")
         if self.episode_markup_release_runner and not self.episode_structure_held_runner:
             raise ValueError("markup release runner requires structure held runner")
+        if self.episode_adaptive_reserved_entry and not self.episode_adaptive_entry_pricing:
+            raise ValueError("reserved adaptive entry requires adaptive entry pricing")
         if self.trade_mode == "buy_sell" and not self.use_trailing_exit and not self.episode_enabled:
             raise ValueError("buy_sell mode requires the trailing exit because no other ordinary exit is enabled")
 

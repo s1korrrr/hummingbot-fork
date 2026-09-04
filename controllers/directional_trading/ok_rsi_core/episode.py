@@ -10,11 +10,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 from controllers.directional_trading.ok_rsi_core.entry_pricing import (
+    ADAPTIVE_RESERVED_ENTRY_POLICY,
     AdaptiveEntryPriceInputError,
     AdaptiveEntryPriceSelection,
     select_adaptive_entry_price,
@@ -135,6 +136,7 @@ class EpisodeConfig:
     hostile_risk_latch: bool = False
     recovery_exit_enabled: bool = False
     adaptive_entry_pricing: bool = False
+    adaptive_reserved_entry: bool = False
     scout_rebound_confirmation: bool = False
     recovery_aware_scout: bool = False
     recovery_rebound_scout: bool = False
@@ -157,6 +159,7 @@ class EpisodeConfig:
             "hostile_risk_latch",
             "recovery_exit_enabled",
             "adaptive_entry_pricing",
+            "adaptive_reserved_entry",
             "scout_rebound_confirmation",
             "recovery_aware_scout",
             "recovery_rebound_scout",
@@ -194,6 +197,8 @@ class EpisodeConfig:
             raise EpisodeInputError("entry treatments cannot be combined")
         if self.markup_release_runner and not self.structure_held_runner:
             raise EpisodeInputError("markup release runner requires structure held runner")
+        if self.adaptive_reserved_entry and not self.adaptive_entry_pricing:
+            raise EpisodeInputError("reserved adaptive entry requires adaptive entry pricing")
         for name in ("level_fractions", "dip_atr_levels", "distribution_atr_levels", "remaining_fractions"):
             object.__setattr__(self, name, tuple(_decimal(x, name, positive=True) for x in getattr(self, name)))
         if (
@@ -234,6 +239,8 @@ class EpisodeConfig:
         # An unresolved episode may not be stranded by a code-only upgrade.
         if not self.adaptive_entry_pricing:
             values.pop("adaptive_entry_pricing")
+        if not self.adaptive_reserved_entry:
+            values.pop("adaptive_reserved_entry")
         if not self.scout_rebound_confirmation:
             values.pop("scout_rebound_confirmation")
         if not self.recovery_aware_scout:
@@ -273,6 +280,7 @@ class MarketSnapshot:
     hostile: bool = False
     cascade: bool = False
     buy_allowed: bool = True
+    reservation_allowed: bool = True
     quality_factor: Decimal = ONE
     entry_confidence: Decimal = ONE
     trend_alignment: Decimal = ZERO
@@ -319,6 +327,7 @@ class MarketSnapshot:
             "hostile",
             "cascade",
             "buy_allowed",
+            "reservation_allowed",
         ):
             if type(getattr(self, name)) is not bool:
                 raise EpisodeInputError(f"invalid boolean {name}")
@@ -379,7 +388,12 @@ class OrderRequest:
             raise EpisodeInputError("invalid request boundary")
         if self.intent not in ORDER_INTENTS:
             raise EpisodeInputError("invalid request intent")
-        if self.pricing_policy not in {"UNRECORDED", "TOP_OF_BOOK", "ADAPTIVE_MAKER_V1"}:
+        if self.pricing_policy not in {
+            "UNRECORDED",
+            "TOP_OF_BOOK",
+            "ADAPTIVE_MAKER_V1",
+            ADAPTIVE_RESERVED_ENTRY_POLICY,
+        }:
             raise EpisodeInputError("invalid entry pricing policy")
         if self.setup_policy not in {
             "IMMEDIATE",
@@ -438,7 +452,10 @@ class OrderRequest:
                 raise EpisodeInputError("entry pricing receipt contradicts request")
             if self.pricing_policy == "TOP_OF_BOOK" and self.pricing_discount != 0:
                 raise EpisodeInputError("top-of-book receipt cannot contain a discount")
-            if self.pricing_policy == "ADAPTIVE_MAKER_V1" and self.pricing_discount <= 0:
+            if self.pricing_policy in {
+                "ADAPTIVE_MAKER_V1",
+                ADAPTIVE_RESERVED_ENTRY_POLICY,
+            } and self.pricing_discount <= 0:
                 raise EpisodeInputError("adaptive receipt requires a passive discount")
         if self.setup_policy == "IMMEDIATE":
             if any(
@@ -1132,8 +1149,18 @@ def transition(
         or market.cascade
         or market.timestamp >= order.request.expires_at
         or (
-            (market.hostile or not market.buy_allowed or market.markup or market.recovery)
-            and order.request.side == "BUY"
+            order.request.side == "BUY"
+            and (
+                not market.reservation_allowed
+                if (
+                    config.adaptive_reserved_entry
+                    and order.request.pricing_policy == ADAPTIVE_RESERVED_ENTRY_POLICY
+                )
+                else market.hostile
+                or not market.buy_allowed
+                or market.markup
+                or market.recovery
+            )
         )
     )
     if state.fault or remaining_budget(config, state) < 0:
@@ -1488,6 +1515,11 @@ def transition(
             )
         except AdaptiveEntryPriceInputError as exc:
             raise EpisodeInputError(str(exc)) from exc
+        if config.adaptive_reserved_entry:
+            entry_price_selection = replace(
+                entry_price_selection,
+                policy=ADAPTIVE_RESERVED_ENTRY_POLICY,
+            )
     else:
         entry_price_selection = AdaptiveEntryPriceSelection(
             policy="TOP_OF_BOOK",

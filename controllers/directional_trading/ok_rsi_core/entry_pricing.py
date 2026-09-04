@@ -9,6 +9,7 @@ from typing import Any
 ZERO = Decimal("0")
 ONE = Decimal("1")
 ADAPTIVE_MAKER_POLICY = "ADAPTIVE_MAKER_V1"
+ADAPTIVE_RESERVED_ENTRY_POLICY = "ADAPTIVE_RESERVED_ENTRY_V2"
 
 
 class AdaptiveEntryPriceInputError(ValueError):

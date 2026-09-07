@@ -74,6 +74,7 @@ class OKRSIControllerTest(unittest.TestCase):
                 trade_mode="sell_only",
                 sell_only_if_profitable=False,
                 strict_hmm_mode=False,
+                durable_candle_watermark_enabled=True,
             ),
             market_data_provider=self._provider(base_balance=base_balance, price=price),
             actions_queue=asyncio.Queue(),
@@ -97,6 +98,7 @@ class OKRSIControllerTest(unittest.TestCase):
                 trailing_activation_pct=0.015,
                 trailing_delta_pct=0.0035,
                 use_adaptive_trailing=True,
+                durable_candle_watermark_enabled=True,
             ),
             market_data_provider=self._provider(base_balance=Decimal("0"), price=Decimal("50000")),
             actions_queue=asyncio.Queue(),
@@ -111,6 +113,7 @@ class OKRSIControllerTest(unittest.TestCase):
         return controller
 
     def _install_temp_watermark(self, controller, *, timestamp: int) -> MarketsRecorder:
+        controller.config.durable_candle_watermark_enabled = True
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         manager = SQLConnectionManager(
@@ -196,6 +199,14 @@ class OKRSIControllerTest(unittest.TestCase):
         self.assertEqual(config.controller_name, "ok_rsi")
         self.assertEqual(config.connector_name, "okx")
         self.assertEqual(config.trading_pair, "BTC-USDC")
+        self.assertFalse(config.durable_candle_watermark_enabled)
+
+        with self.assertRaisesRegex(ValueError, "legacy action path"):
+            OKRSIControllerConfig(
+                id="invalid-combined-runtime",
+                durable_candle_watermark_enabled=True,
+                episode_enabled=True,
+            )
 
     def test_derived_higher_timeframe_uses_only_complete_consecutive_base_candles(self):
         from controllers.directional_trading.ok_rsi import derive_higher_timeframe_candles
@@ -707,6 +718,61 @@ class OKRSIControllerTest(unittest.TestCase):
         self.assertEqual(
             reconstructed._watermark_result.outcome,
             ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+        )
+
+    def test_missing_watermark_initializes_from_owner_evaluated_closed_candle_without_action(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller = self._controller(
+            base_balance=Decimal("0.01"), price=Decimal("50000")
+        )
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        manager = SQLConnectionManager(
+            ClientConfigAdapter(ClientConfigMap()),
+            SQLConnectionType.TRADE_FILLS,
+            db_path=str(Path(temp_dir.name) / "controller-watermark.sqlite"),
+        )
+        recorder = MarketsRecorder.__new__(MarketsRecorder)
+        recorder._sql_manager = manager
+
+        async def evaluate_latest_closed(instance):
+            instance._last_evaluated_candle_timestamp = 1_700_033_160
+            instance.processed_data = {
+                "signal": -1,
+                "candle_timestamp": 1_700_033_160.0,
+                "data_health": {"ready": True},
+            }
+
+        with (
+            patch.object(
+                MarketsRecorder, "get_existing_instance", return_value=recorder
+            ),
+            patch.object(
+                hl_rsi.HLRSIController,
+                "update_processed_data",
+                new=evaluate_latest_closed,
+            ),
+        ):
+            asyncio.run(controller.update_processed_data())
+
+        initialized = recorder.load_controller_candle_watermark(
+            controller._watermark_namespace
+        )
+        self.assertEqual(
+            initialized.outcome,
+            ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+        )
+        self.assertEqual(
+            initialized.state.candle_open_timestamp_s, 1_700_033_160
+        )
+        self.assertEqual(controller._watermark_result.outcome, ControllerCandleWatermarkOutcome.SEEDED)
+        self.assertFalse(controller._watermark_initialization_required)
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_initialized",
         )
 
     def test_durable_watermark_absence_and_cas_failure_permanently_hold_without_retry(self):

@@ -41,6 +41,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     leverage: int = 1
     position_mode: PositionMode = PositionMode.ONEWAY
     legacy_controller_ids: List[str] = hl_rsi.Field(default_factory=list)
+    durable_candle_watermark_enabled: bool = hl_rsi.Field(default=False)
     episode_enabled: bool = hl_rsi.Field(default=False)
     episode_adaptive_entry_pricing: bool = False
     episode_adaptive_reserved_entry: bool = False
@@ -177,6 +178,10 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
 
     @model_validator(mode="after")
     def validate_okx_spot_contract(self):
+        if self.durable_candle_watermark_enabled and self.episode_enabled:
+            raise ValueError(
+                "durable candle watermark currently guards only the legacy action path"
+            )
         candles_connector = str(self.candles_connector or "okx").strip().lower()
         if candles_connector == "okx_paper_trade":
             candles_connector = "okx"

@@ -5,6 +5,7 @@ HummingbotBase = declarative_base()
 
 def get_declarative_base():
     from .chart_snapshot import ChartSnapshot  # noqa: F401
+    from .controller_candle_watermark import ControllerCandleWatermark  # noqa: F401
     from .controllers import Controllers  # noqa: F401
     from .executors import Executors  # noqa: F401
     from .funding_payment import FundingPayment  # noqa: F401

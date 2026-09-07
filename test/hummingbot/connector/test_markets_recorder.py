@@ -1,12 +1,16 @@
 import asyncio
+import sqlite3
+import tempfile
 import time
 from decimal import Decimal
+from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Awaitable
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -22,6 +26,11 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model.controller_candle_watermark import (
+    ControllerCandleWatermarkNamespace,
+    ControllerCandleWatermarkOutcome,
+    ControllerCandleWatermarkState,
+)
 from hummingbot.model.executors import Executors
 from hummingbot.model.market_data import MarketData
 from hummingbot.model.order import Order
@@ -1178,3 +1187,275 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(0.05, record.base_fee)
         self.assertEqual(5.0, record.quote_fee)
         self.assertEqual(0.002, record.position_rent_refunded)
+
+    @staticmethod
+    def _watermark_namespace(
+        *, controller_id: str = "ok-rsi-btc", trading_pair: str = "BTC-USDC"
+    ) -> ControllerCandleWatermarkNamespace:
+        return ControllerCandleWatermarkNamespace(
+            controller_id=controller_id,
+            connector_name="okx",
+            trading_pair=trading_pair,
+            interval="1m",
+        )
+
+    @classmethod
+    def _watermark_state(
+        cls,
+        *,
+        controller_id: str = "ok-rsi-btc",
+        trading_pair: str = "BTC-USDC",
+        timestamp: int = 1_700_033_100,
+        revision: int = 0,
+    ) -> ControllerCandleWatermarkState:
+        return ControllerCandleWatermarkState(
+            namespace=cls._watermark_namespace(controller_id=controller_id, trading_pair=trading_pair),
+            candle_open_timestamp_s=timestamp,
+            revision=revision,
+            schema_version=1,
+            updated_at_ms=(timestamp + 60) * 1000,
+        )
+
+    @staticmethod
+    def _file_recorder(db_path: Path) -> MarketsRecorder:
+        manager = SQLConnectionManager(
+            ClientConfigAdapter(ClientConfigMap()),
+            SQLConnectionType.TRADE_FILLS,
+            db_path=str(db_path),
+        )
+        recorder = MarketsRecorder.__new__(MarketsRecorder)
+        recorder._sql_manager = manager
+        return recorder
+
+    def test_watermark_explicit_seed_reopen_and_missing_row_are_typed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "seed.sqlite"
+            first = self._file_recorder(db_path)
+            state = self._watermark_state()
+
+            seeded = first.seed_controller_candle_watermark(state)
+            self.assertEqual(seeded.outcome, ControllerCandleWatermarkOutcome.SEEDED)
+            self.assertEqual(seeded.state, state)
+
+            reopened = self._file_recorder(db_path)
+            loaded = reopened.load_controller_candle_watermark(state.namespace)
+            self.assertEqual(loaded.outcome, ControllerCandleWatermarkOutcome.ALREADY_COMMITTED)
+            self.assertEqual(loaded.state, state)
+
+            missing = reopened.load_controller_candle_watermark(
+                self._watermark_namespace(controller_id="ok-rsi-shadow")
+            )
+            self.assertEqual(missing.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+            self.assertIsNone(missing.state)
+
+    def test_watermark_cas_is_monotonic_first_writer_only_and_namespace_isolated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "cas.sqlite"
+            first = self._file_recorder(db_path)
+            second = self._file_recorder(db_path)
+            btc = self._watermark_state()
+            eth = self._watermark_state(controller_id="ok-rsi-eth", trading_pair="ETH-USDC")
+            self.assertEqual(
+                first.seed_controller_candle_watermark(btc).outcome,
+                ControllerCandleWatermarkOutcome.SEEDED,
+            )
+            self.assertEqual(
+                first.seed_controller_candle_watermark(eth).outcome,
+                ControllerCandleWatermarkOutcome.SEEDED,
+            )
+            stale_first = first.load_controller_candle_watermark(btc.namespace).state
+            stale_second = second.load_controller_candle_watermark(btc.namespace).state
+
+            advanced = first.compare_and_advance_controller_candle_watermark(
+                stale_first,
+                desired_candle_open_timestamp_s=1_700_033_160,
+                updated_at_ms=1_700_033_220_000,
+            )
+            self.assertEqual(advanced.outcome, ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER)
+            self.assertTrue(advanced.proposal_eligible)
+            self.assertEqual(advanced.state.revision, 1)
+
+            duplicate = second.compare_and_advance_controller_candle_watermark(
+                stale_second,
+                desired_candle_open_timestamp_s=1_700_033_160,
+                updated_at_ms=1_700_033_220_000,
+            )
+            self.assertEqual(duplicate.outcome, ControllerCandleWatermarkOutcome.ALREADY_COMMITTED)
+            self.assertFalse(duplicate.proposal_eligible)
+
+            conflict = second.compare_and_advance_controller_candle_watermark(
+                stale_second,
+                desired_candle_open_timestamp_s=1_700_033_220,
+                updated_at_ms=1_700_033_280_000,
+            )
+            self.assertEqual(conflict.outcome, ControllerCandleWatermarkOutcome.CAS_CONFLICT)
+
+            regression = first.compare_and_advance_controller_candle_watermark(
+                advanced.state,
+                desired_candle_open_timestamp_s=1_700_033_100,
+                updated_at_ms=1_700_033_280_000,
+            )
+            self.assertEqual(regression.outcome, ControllerCandleWatermarkOutcome.REGRESSION)
+            self.assertEqual(first.load_controller_candle_watermark(eth.namespace).state, eth)
+
+    def test_watermark_missing_incompatible_and_corrupt_store_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "invalid.sqlite"
+            recorder = self._file_recorder(db_path)
+            namespace = self._watermark_namespace()
+            recorder.sql_manager.engine.dispose()
+            raw = sqlite3.connect(db_path)
+            raw.execute("DROP TABLE controller_candle_watermark")
+            raw.commit()
+            raw.close()
+
+            missing_table = recorder.load_controller_candle_watermark(namespace)
+            self.assertEqual(missing_table.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                "CREATE TABLE controller_candle_watermark ("
+                "controller_id TEXT PRIMARY KEY, connector_name TEXT, trading_pair TEXT, interval TEXT, "
+                "candle_open_timestamp_s TEXT, revision TEXT, schema_version TEXT, updated_at_ms TEXT)"
+            )
+            raw.commit()
+            raw.close()
+            incompatible = recorder.load_controller_candle_watermark(namespace)
+            self.assertEqual(incompatible.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+
+            recorder.sql_manager.engine.dispose()
+            raw = sqlite3.connect(db_path)
+            raw.execute("DROP TABLE controller_candle_watermark")
+            raw.execute(
+                "CREATE TABLE controller_candle_watermark ("
+                "controller_id TEXT NOT NULL, connector_name TEXT NOT NULL, trading_pair TEXT NOT NULL, "
+                "interval TEXT NOT NULL, candle_open_timestamp_s BIGINT NOT NULL, revision BIGINT NOT NULL, "
+                "schema_version INTEGER NOT NULL, updated_at_ms BIGINT NOT NULL, "
+                "PRIMARY KEY (controller_id, connector_name, trading_pair, interval))"
+            )
+            raw.execute(
+                "INSERT INTO controller_candle_watermark VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("ok-rsi-btc", "okx", "BTC-USDC", "1m", 1_700_033_101, 0, 1, 1_700_033_160_000),
+            )
+            raw.commit()
+            raw.close()
+            corrupt = recorder.load_controller_candle_watermark(namespace)
+            self.assertEqual(corrupt.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+
+    def test_watermark_lock_and_commit_failure_roll_back_without_grant(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "failures.sqlite"
+            recorder = self._file_recorder(db_path)
+            state = self._watermark_state()
+            self.assertEqual(
+                recorder.seed_controller_candle_watermark(state).outcome,
+                ControllerCandleWatermarkOutcome.SEEDED,
+            )
+
+            locked = sqlite3.connect(db_path, timeout=0)
+            locked.execute("BEGIN IMMEDIATE")
+            locked.execute("UPDATE controller_candle_watermark SET updated_at_ms = updated_at_ms")
+            try:
+                result = recorder.compare_and_advance_controller_candle_watermark(
+                    state,
+                    desired_candle_open_timestamp_s=1_700_033_160,
+                    updated_at_ms=1_700_033_220_000,
+                )
+            finally:
+                locked.rollback()
+                locked.close()
+            self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+            self.assertFalse(result.proposal_eligible)
+
+            flush_session = recorder.sql_manager.get_new_session()
+            with patch.object(flush_session, "flush", side_effect=RuntimeError("injected flush failure")):
+                with patch.object(recorder.sql_manager, "get_new_session", return_value=flush_session):
+                    flush_failed = recorder.compare_and_advance_controller_candle_watermark(
+                        state,
+                        desired_candle_open_timestamp_s=1_700_033_160,
+                        updated_at_ms=1_700_033_220_000,
+                    )
+            flush_session.close()
+            self.assertEqual(flush_failed.outcome, ControllerCandleWatermarkOutcome.COMMIT_FAILED)
+            self.assertFalse(flush_failed.proposal_eligible)
+            self.assertEqual(recorder.load_controller_candle_watermark(state.namespace).state, state)
+
+            session = recorder.sql_manager.get_new_session()
+            with patch.object(session, "commit", side_effect=RuntimeError("injected commit failure")):
+                with patch.object(recorder.sql_manager, "get_new_session", return_value=session):
+                    failed = recorder.compare_and_advance_controller_candle_watermark(
+                        state,
+                        desired_candle_open_timestamp_s=1_700_033_160,
+                        updated_at_ms=1_700_033_220_000,
+                    )
+            session.close()
+            self.assertEqual(failed.outcome, ControllerCandleWatermarkOutcome.COMMIT_FAILED)
+            self.assertFalse(failed.proposal_eligible)
+            self.assertEqual(recorder.load_controller_candle_watermark(state.namespace).state, state)
+
+    def test_watermark_session_acquisition_failures_are_typed_for_load_seed_and_cas(self):
+        error_factories = (
+            ("runtime", lambda: RuntimeError("injected session factory failure")),
+            ("sqlalchemy", lambda: SQLAlchemyError("injected session factory failure")),
+            (
+                "operational",
+                lambda: OperationalError(
+                    "open session",
+                    {},
+                    RuntimeError("injected session factory failure"),
+                ),
+            ),
+        )
+
+        for error_name, error_factory in error_factories:
+            with self.subTest(api="load", error=error_name), tempfile.TemporaryDirectory() as temp_dir:
+                recorder = self._file_recorder(Path(temp_dir) / "load.sqlite")
+                with patch.object(
+                    recorder.sql_manager,
+                    "get_new_session",
+                    side_effect=error_factory(),
+                ):
+                    result = recorder.load_controller_candle_watermark(self._watermark_namespace())
+                self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+                self.assertFalse(result.proposal_eligible)
+                self.assertIsNone(result.state)
+
+            with self.subTest(api="seed", error=error_name), tempfile.TemporaryDirectory() as temp_dir:
+                recorder = self._file_recorder(Path(temp_dir) / "seed.sqlite")
+                state = self._watermark_state()
+                read_session = recorder.sql_manager.get_new_session()
+                with patch.object(
+                    recorder.sql_manager,
+                    "get_new_session",
+                    side_effect=[read_session, error_factory()],
+                ):
+                    result = recorder.seed_controller_candle_watermark(state)
+                self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+                self.assertFalse(result.proposal_eligible)
+                self.assertIsNone(result.state)
+                self.assertEqual(
+                    recorder.load_controller_candle_watermark(state.namespace).outcome,
+                    ControllerCandleWatermarkOutcome.INVALID_STATE,
+                )
+
+            with self.subTest(api="cas", error=error_name), tempfile.TemporaryDirectory() as temp_dir:
+                recorder = self._file_recorder(Path(temp_dir) / "cas.sqlite")
+                state = self._watermark_state()
+                self.assertEqual(
+                    recorder.seed_controller_candle_watermark(state).outcome,
+                    ControllerCandleWatermarkOutcome.SEEDED,
+                )
+                with patch.object(
+                    recorder.sql_manager,
+                    "get_new_session",
+                    side_effect=error_factory(),
+                ):
+                    result = recorder.compare_and_advance_controller_candle_watermark(
+                        state,
+                        desired_candle_open_timestamp_s=1_700_033_160,
+                        updated_at_ms=1_700_033_220_000,
+                    )
+                self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+                self.assertFalse(result.proposal_eligible)
+                self.assertEqual(result.state, state)
+                self.assertEqual(recorder.load_controller_candle_watermark(state.namespace).state, state)

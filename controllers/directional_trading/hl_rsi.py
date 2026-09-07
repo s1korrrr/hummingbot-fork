@@ -502,6 +502,7 @@ class HLRSIController(DirectionalTradingControllerBase):
         self._last_gate_reason: Dict[TradeType, Optional[str]] = {TradeType.BUY: None, TradeType.SELL: None}
         self._last_signal_log_signature: Dict[str, Optional[str]] = {}
         self._last_processed_timestamp: Optional[float] = None
+        self._last_evaluated_candle_timestamp: Optional[float] = None
         self._last_buy_signal_candle_ts: Optional[float] = None
         self._last_buy_signal_role: Optional[str] = None
         self._pending_buy_confirmation: Optional[BuyConfirmationSetup] = None
@@ -3006,11 +3007,20 @@ class HLRSIController(DirectionalTradingControllerBase):
             health["reason"] = "out_of_order_timestamp"
             return health
 
+        interval_seconds = health["interval_seconds"]
+        if interval_seconds is not None:
+            timestamp_deltas = normalized_ts.diff().iloc[1:]
+            if timestamp_deltas.gt(float(interval_seconds)).any():
+                health["reason"] = "missing_interval"
+                return health
+            if timestamp_deltas.ne(float(interval_seconds)).any():
+                health["reason"] = "unexpected_interval"
+                return health
+
         last_ts = float(normalized_ts.iloc[-1])
         health["last_candle_ts"] = last_ts
         candle_age = float(now_ts) - last_ts
         health["candle_age_seconds"] = candle_age
-        interval_seconds = health["interval_seconds"]
         if interval_seconds is not None:
             max_age = float(interval_seconds) * float(self.config.max_candle_age_intervals)
             if candle_age > max_age:
@@ -3097,6 +3107,37 @@ class HLRSIController(DirectionalTradingControllerBase):
                 last_candle_ts = float(df["timestamp"].iloc[-1])
         except _INDICATOR_ERRORS:
             last_candle_ts = None
+
+        if (
+            last_candle_ts is not None
+            and self._last_evaluated_candle_timestamp is not None
+            and last_candle_ts <= self._last_evaluated_candle_timestamp
+        ):
+            suppression_reason = (
+                "same_candle"
+                if last_candle_ts == self._last_evaluated_candle_timestamp
+                else "non_advancing_candle"
+            )
+            previous_data = dict(self.processed_data or {})
+            previous_data.update(
+                {
+                    "signal": 0,
+                    "timestamp": now_ts,
+                    "candle_timestamp": last_candle_ts,
+                    "data_health": data_health,
+                    "signal_suppression_reason": suppression_reason,
+                }
+            )
+            self.processed_data = previous_data
+            self._log_signal_transition(
+                key="candle_identity",
+                signature=f"{suppression_reason}|{last_candle_ts}",
+                message=(
+                    f"Signal evaluation suppressed | {self._controller_pair_log_prefix()} "
+                    f"reason={suppression_reason} candle_timestamp={last_candle_ts}"
+                ),
+            )
+            return
 
         last_close: Optional[float] = None
         last_rsi: Optional[float] = None
@@ -3470,6 +3511,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             "signal_state": state.as_dict(),
             "recovery_trails": {key: trail.as_dict() for key, trail in self._recovery_trails.items()},
         }
+        self._last_evaluated_candle_timestamp = last_candle_ts
         if self._is_buy_log_zone(
             last_rsi=last_rsi,
             rsi_buy_eff=rsi_buy_eff,

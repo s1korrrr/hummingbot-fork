@@ -92,8 +92,28 @@ class OKXSpotCandles(CandlesBase):
         return params
 
     def _parse_rest_candles(self, data: dict, end_time: Optional[int] = None) -> List[List[float]]:
-        return [[self.ensure_timestamp_in_seconds(row[0]), row[1], row[2], row[3], row[4], row[5], row[6], 0., 0., 0.]
-                for row in data["data"]][::-1]
+        rows = data.get("data", [])
+        malformed_rows = sum(len(row) < 9 for row in rows)
+        if malformed_rows:
+            self.logger().warning(
+                f"Ignoring {malformed_rows} malformed OKX spot candle row(s) without confirmation state."
+            )
+        return [
+            [
+                self.ensure_timestamp_in_seconds(row[0]),
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                row[7],
+                0.,
+                0.,
+                0.,
+            ]
+            for row in rows
+            if len(row) >= 9 and str(row[8]) == "1"
+        ][::-1]
 
     def ws_subscription_payload(self):
         candle_args = [{"channel": f"candle{CONSTANTS.INTERVALS[self.interval]}", "instId": self._ex_trading_pair}]
@@ -106,13 +126,18 @@ class OKXSpotCandles(CandlesBase):
         candles_row_dict = {}
         if data is not None and "data" in data:  # data will be None when the websocket is disconnected
             candles = data["data"][0]
+            if len(candles) < 9:
+                self.logger().warning("Ignoring malformed OKX spot candle without confirmation state.")
+                return None
+            if str(candles[8]) != "1":
+                return None
             candles_row_dict["timestamp"] = self.ensure_timestamp_in_seconds(candles[0])
             candles_row_dict["open"] = candles[1]
             candles_row_dict["high"] = candles[2]
             candles_row_dict["low"] = candles[3]
             candles_row_dict["close"] = candles[4]
             candles_row_dict["volume"] = candles[5]
-            candles_row_dict["quote_asset_volume"] = candles[6]
+            candles_row_dict["quote_asset_volume"] = candles[7]
             candles_row_dict["n_trades"] = 0.
             candles_row_dict["taker_buy_base_volume"] = 0.
             candles_row_dict["taker_buy_quote_volume"] = 0.

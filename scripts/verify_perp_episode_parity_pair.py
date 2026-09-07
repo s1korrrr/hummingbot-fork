@@ -10,9 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from controllers.directional_trading.rsi_v5_core.perp_episode_accounting import (  # noqa: E402
-    ParityStatus,
-)
+from controllers.directional_trading.rsi_v5_core.perp_episode_accounting import ParityStatus  # noqa: E402
 from controllers.directional_trading.rsi_v5_core.perp_episode_parity_pair import (  # noqa: E402
     ParityPairVerificationError,
     verify_parity_pair,

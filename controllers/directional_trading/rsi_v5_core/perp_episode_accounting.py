@@ -490,10 +490,7 @@ def terminal_nav_evidence(snapshot: EpisodeAccountSnapshot) -> LiquidatableNavBr
 
 
 def liquidatable_nav(snapshot: EpisodeAccountSnapshot) -> LiquidatableNavBreakdown:
-    breakdown = terminal_nav_evidence(snapshot)
-    if breakdown.nav <= 0:
-        raise EpisodeAccountingError("liquidatable NAV must be positive")
-    return breakdown
+    return terminal_nav_evidence(snapshot)
 
 
 def settle_terminal(
@@ -564,8 +561,12 @@ def liquidatable_nav_reward(
         "reconciliation_tolerance",
         nonnegative=True,
     )
-    nav_before = liquidatable_nav(before).nav
-    nav_after = liquidatable_nav(after).nav
+    before_breakdown = liquidatable_nav(before)
+    after_breakdown = liquidatable_nav(after)
+    if before_breakdown.terminal_outcome is not TerminalOutcome.SOLVENT:
+        raise EpisodeAccountingError("episode must start with positive liquidatable NAV")
+    nav_before = before_breakdown.nav
+    nav_after = after_breakdown.nav
     with localcontext() as context:
         context.prec = 50
         expected_after = nav_before + attribution.total_nav_change

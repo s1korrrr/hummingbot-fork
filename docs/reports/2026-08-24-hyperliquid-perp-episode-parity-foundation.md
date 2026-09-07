@@ -1,8 +1,8 @@
 # Hyperliquid Perpetual Episode Parity Foundation
 
-**Date:** 2026-08-24  
-**Branch:** `feat/andrzej_hyperliquid_rl_episode_parity_v3`  
-**Status:** read-only implementation candidate; latest-head execution verification pending  
+**Date:** 2026-08-24
+**Branch:** `feat/andrzej_hyperliquid_rl_episode_parity_v3`
+**Status:** read-only implementation candidate; latest-head execution verification pending
 **Capital verdict:** `HOLD_FOR EVIDENCE`
 
 ## Delivered

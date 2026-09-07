@@ -12,6 +12,7 @@ from controllers.directional_trading.rsi_v5_core.perp_episode_accounting import 
     LinearPerpPositionSnapshot,
     ParityExpectation,
     ParityStatus,
+    TerminalOutcome,
     TerminalSettlementMode,
     liquidatable_nav,
     liquidatable_nav_reward,
@@ -193,17 +194,55 @@ def test_accounting_rejects_spot_style_cash_and_invalid_decimals() -> None:
         close_impact_rate=D("0"),
         contract_multiplier=D("1"),
     )
-    with pytest.raises(EpisodeAccountingError, match="positive"):
-        liquidatable_nav(
-            EpisodeAccountSnapshot(
-                "paper-account",
-                2,
-                D("0"),
-                D("0"),
-                (position,),
-            )
-        )
+    insolvent_snapshot = EpisodeAccountSnapshot(
+        "paper-account",
+        2,
+        D("0"),
+        D("0"),
+        (position,),
+    )
+    insolvent = liquidatable_nav(insolvent_snapshot)
+    assert insolvent.nav == D("-0.10")
+    assert insolvent.terminal_outcome is TerminalOutcome.INSOLVENT
+    settlement = settle_terminal(
+        insolvent_snapshot,
+        TerminalSettlementMode.MARK_TO_LIQUIDATION,
+    )
+    assert settlement.terminal_nav == D("-0.10")
+    parity = verify_quants_lab_parity(
+        insolvent_snapshot,
+        ParityExpectation(
+            close_notional=D("100"),
+            unrealized_pnl_at_close=D("0"),
+            close_fee_cost=D("0.10"),
+            close_impact_cost=D("0"),
+            liquidatable_nav=D("-0.10"),
+            quants_lab_artifact_hash="3" * 64,
+        ),
+        tolerance=D("0"),
+    )
+    assert parity.status is ParityStatus.MATCH
     with pytest.raises(EpisodeAccountingError, match="negative zero"):
         replace(position, quantity=D("-0"))
     with pytest.raises(TypeError, match="Decimal"):
         replace(position, entry_price=10000.0)  # type: ignore[arg-type]
+
+
+def test_legacy_reward_rejects_nonpositive_initial_nav_explicitly() -> None:
+    before = EpisodeAccountSnapshot("paper-account", 1, D("0"), D("0"), ())
+    after = EpisodeAccountSnapshot("paper-account", 2, D("1"), D("0"), ())
+    attribution = EpisodeTransitionAttribution(
+        gross_market_pnl=D("1"),
+        funding_cashflow=D("0"),
+        fee_cost=D("0"),
+        spread_cost=D("0"),
+        slippage_cost=D("0"),
+        impact_cost=D("0"),
+        borrow_cost=D("0"),
+        liquidation_penalty=D("0"),
+        close_cost_reserve_change=D("0"),
+        ending_external_cashflow=D("0"),
+    )
+
+    with pytest.raises(EpisodeAccountingError, match="start with positive"):
+        liquidatable_nav_reward(before, after, attribution)

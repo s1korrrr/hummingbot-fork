@@ -5,9 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from controllers.directional_trading.rsi_v5_core.perp_episode_parity_pair import (
-    verify_parity_pair,
-)
+from controllers.directional_trading.rsi_v5_core.perp_episode_parity_pair import verify_parity_pair
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "scripts/run_perp_episode_parity.py"

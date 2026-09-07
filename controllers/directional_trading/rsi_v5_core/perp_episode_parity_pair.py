@@ -8,9 +8,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from controllers.directional_trading.rsi_v5_core.perp_episode_accounting import (
-    ParityStatus,
-)
+from controllers.directional_trading.rsi_v5_core.perp_episode_accounting import ParityStatus
 from controllers.directional_trading.rsi_v5_core.perp_episode_parity_io import (
     ParityWireError,
     evaluate_parity_payload,

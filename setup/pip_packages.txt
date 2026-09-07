@@ -1,1 +1,1 @@
-eip712-structs
+eip712-structs==1.1.0

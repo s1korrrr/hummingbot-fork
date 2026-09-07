@@ -68,7 +68,19 @@ jobs:
       confirmed: ${{ steps.confirm.outputs.confirmed }}
       source_commit: ${{ steps.confirm.outputs.source_commit }}
       source_ref: ${{ steps.confirm.outputs.source_ref }}
+      evidence_set_sha256_amd64: ${{ steps.license_policy.outputs.evidence_set_sha256_amd64 }}
+      evidence_set_sha256_arm64: ${{ steps.license_policy.outputs.evidence_set_sha256_arm64 }}
     steps:
+      - name: Checkout exact workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Require current human-owned image license approval
+        id: license_policy
+        shell: bash
+        run: python3 scripts/validate_image_license_policy.py licenses/image-license-policy.json --github-output "${GITHUB_OUTPUT}"
+
       - name: Validate explicit release confirmation and source identity
         id: confirm
         env:
@@ -156,6 +168,9 @@ jobs:
             COMMIT=${{ needs.validate_release.outputs.source_commit }}
             BRANCH=manual-release
             BUILD_DATE=${{ steps.source_metadata.outputs.build_date }}
+            REQUIRE_APPROVED_LICENSE_EVIDENCE=true
+            EXPECTED_EVIDENCE_SET_SHA256_AMD64=${{ needs.validate_release.outputs.evidence_set_sha256_amd64 }}
+            EXPECTED_EVIDENCE_SET_SHA256_ARM64=${{ needs.validate_release.outputs.evidence_set_sha256_arm64 }}
 
       - name: Validate and record canonical image digest
         id: validate_digest

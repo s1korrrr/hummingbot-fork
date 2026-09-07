@@ -1,7 +1,7 @@
 name: hummingbot
 channels:
   - conda-forge
-  - defaults
+  - nodefaults
 dependencies:
   ### Packages needed for the build/install process
   - autopep8
@@ -30,6 +30,9 @@ dependencies:
   - commlib-py==0.11.5
   - cryptography>=41.0.2
   - eth-account>=0.13.0
+  - eth-utils>=5,<6
+  - eth-typing>=5,<6
+  - hexbytes>=1,<2
 #  - injective-py==1.12.*
   - libta-lib>=0.6.4
   - msgpack-python
@@ -68,4 +71,4 @@ dependencies:
   - yaml>=0.2.5
   - zlib>=1.2.13
   - pip:
-    - injective-py==1.13.*
+    - injective-py==1.13.0

@@ -1,9 +1,17 @@
-id: ok-rsi-eth-usdc-buy-sell
+id: ok-rsi-eth
+legacy_controller_ids:
+  - rsi-v5-eth-usdc-1m
 controller_name: ok_rsi
 controller_type: directional_trading
 connector_name: okx
 trading_pair: ETH-USDC
 trade_mode: buy_sell
+manual_kill_switch: false
+sell_only_if_profitable: true
+stop_loss: null
+take_profit: null
+time_limit: null
+early_stop_keep_position: true
 leverage: 1
 position_mode: ONEWAY
 strict_hmm_mode: false

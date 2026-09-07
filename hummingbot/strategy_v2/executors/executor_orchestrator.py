@@ -58,11 +58,17 @@ class PositionHold:
         if not order_id or order_id in self.order_ids:
             return
 
-        self.order_ids.add(order_id)
-
         executed_amount_base = Decimal(str(order.get("executed_amount_base", 0)))
         executed_amount_quote = Decimal(str(order.get("executed_amount_quote", 0)))
         is_buy = order.get("trade_type") == TradeType.BUY.name
+        if "actual_base_fee" in order:
+            # Opt-in native fee-currency receipt. Quote fees in this format
+            # exclude converted base fees, already represented in inventory.
+            base_fee = Decimal(str(order["actual_base_fee"]))
+            if not base_fee.is_finite() or base_fee < 0 or (is_buy and base_fee > executed_amount_base):
+                raise ValueError("invalid actual base fee in held-position receipt")
+            executed_amount_base += -base_fee if is_buy else base_fee
+        self.order_ids.add(order_id)
 
         self.volume_traded_quote += executed_amount_quote
 

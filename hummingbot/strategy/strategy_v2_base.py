@@ -1013,6 +1013,9 @@ class StrategyV2Base(StrategyPyBase):
 
     @staticmethod
     def _copy_controller_runtime_state(source_controller: ControllerBase, target_controller: ControllerBase):
+        transfer_guard = getattr(target_controller, "validate_runtime_state_transfer", None)
+        if callable(transfer_guard):
+            transfer_guard(source_controller)
         target_controller.executors_info = list(source_controller.executors_info)
         target_controller.positions_held = list(source_controller.positions_held)
         target_controller.performance_report = source_controller.performance_report

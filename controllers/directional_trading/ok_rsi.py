@@ -1,26 +1,28 @@
 """OKX spot specialization of the shared RSI v5 controller.
 
-The strategy, regime, inventory, recovery, DCA, and status logic lives in
-``hl_rsi``. This module deliberately contains only the venue contract,
-sell-only sizing, continuous trailing selection, and strict executor-boundary
-checks that differ for OKX spot.
+Legacy signal, inventory and DCA behavior remains in ``hl_rsi``. Configuration,
+candle aggregation and pure trailing calculations are re-exported from
+``ok_rsi_core``. The opt-in episode runtime owns its entire action path for both
+buy/sell and explicitly assigned sell-only inventory.
 """
 
 import logging
 import math
-from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
 
 import pandas as pd
-from pydantic import field_validator, model_validator
 
 from controllers.directional_trading import hl_rsi
-from hummingbot.client.config.config_data_types import ClientFieldData
+from controllers.directional_trading.ok_rsi_core.candles import derive_higher_timeframe_candles
+from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+from controllers.directional_trading.ok_rsi_core.trailing import (
+    ContinuousTrailingSelection,
+    calculate_continuous_adaptive_trailing,
+)
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
-from hummingbot.data_feed.candles_feed.okx_spot_candles.constants import INTERVALS as OKX_CANDLE_INTERVALS
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
@@ -32,318 +34,9 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
 _DECIMAL_CONVERSION_ERRORS = (ArithmeticError, TypeError, ValueError)
 _EXECUTION_INPUT_ERRORS = (ArithmeticError, AttributeError, KeyError, RuntimeError, TypeError, ValueError)
 
-_CANDLE_VALUE_COLUMNS = ("open", "high", "low", "close")
-_CANDLE_SUM_COLUMNS = (
-    "volume",
-    "quote_asset_volume",
-    "n_trades",
-    "taker_buy_base_volume",
-    "taker_buy_quote_volume",
-)
-
 
 class ExecutorInputUnavailable(ValueError):
     """Raised when an executor cannot be constructed from valid exchange inputs."""
-
-
-def derive_higher_timeframe_candles(
-    base_candles: pd.DataFrame,
-    *,
-    base_interval: str,
-    target_interval: str,
-    current_time: float,
-    max_records: int,
-) -> pd.DataFrame:
-    """Aggregate complete, consecutive base candles into UTC-aligned higher-timeframe bars."""
-    output_columns = [
-        "timestamp",
-        *[column for column in (*_CANDLE_VALUE_COLUMNS, *_CANDLE_SUM_COLUMNS) if column in base_candles.columns],
-    ]
-    if base_candles.empty or not {"timestamp", *_CANDLE_VALUE_COLUMNS}.issubset(base_candles.columns):
-        return pd.DataFrame(columns=output_columns)
-
-    base_seconds = CandlesBase.interval_to_seconds[base_interval]
-    target_seconds = CandlesBase.interval_to_seconds[target_interval]
-    if target_seconds <= base_seconds or target_seconds % base_seconds != 0:
-        raise ValueError("target interval must be a larger whole multiple of the base interval")
-
-    frame = base_candles[output_columns].copy()
-    frame["timestamp"] = pd.to_numeric(frame["timestamp"], errors="coerce")
-    numeric_columns = [column for column in output_columns if column != "timestamp"]
-    frame[numeric_columns] = frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
-    frame = frame.dropna(subset=["timestamp"]).sort_values("timestamp")
-    frame["timestamp"] = frame["timestamp"].astype("int64")
-    frame["bucket_timestamp"] = (frame["timestamp"] // target_seconds) * target_seconds
-    frame = frame[frame["bucket_timestamp"] + target_seconds <= int(current_time)]
-
-    expected_count = target_seconds // base_seconds
-    records = []
-    for bucket_timestamp, bucket in frame.groupby("bucket_timestamp", sort=True):
-        expected_timestamps = list(
-            range(int(bucket_timestamp), int(bucket_timestamp) + target_seconds, base_seconds)
-        )
-        if bucket["timestamp"].tolist() != expected_timestamps or len(bucket) != expected_count:
-            continue
-        if bucket[numeric_columns].isna().any().any():
-            continue
-        if not bucket[numeric_columns].map(math.isfinite).all().all():
-            continue
-        record = {
-            "timestamp": int(bucket_timestamp),
-            "open": bucket["open"].iloc[0],
-            "high": bucket["high"].max(),
-            "low": bucket["low"].min(),
-            "close": bucket["close"].iloc[-1],
-        }
-        for column in _CANDLE_SUM_COLUMNS:
-            if column in bucket.columns:
-                record[column] = bucket[column].sum()
-        else:
-            records.append(record)
-
-    return pd.DataFrame(records, columns=output_columns).tail(max_records).reset_index(drop=True)
-
-
-@dataclass(frozen=True)
-class ContinuousTrailingSelection:
-    activation: Decimal
-    delta: Decimal
-    volatility_ratio: Decimal
-    initial_locked_profit: Decimal
-    policy: str = "adaptive_continuous"
-
-
-def calculate_continuous_adaptive_trailing(
-    *,
-    atr_pct: float,
-    baseline_atr_pct: float,
-    base_activation: Decimal,
-    base_delta: Decimal,
-    activation_min: Decimal,
-    activation_max: Decimal,
-    delta_min: Decimal,
-    delta_max: Decimal,
-    min_locked_profit: Decimal,
-    activation_exponent: float,
-    delta_exponent: float,
-    min_multiplier: float,
-    max_multiplier: float,
-) -> ContinuousTrailingSelection:
-    numeric_values = (
-        atr_pct,
-        baseline_atr_pct,
-        activation_exponent,
-        delta_exponent,
-        min_multiplier,
-        max_multiplier,
-    )
-    decimal_values = (
-        base_activation,
-        base_delta,
-        activation_min,
-        activation_max,
-        delta_min,
-        delta_max,
-        min_locked_profit,
-    )
-    if not all(math.isfinite(float(value)) for value in numeric_values):
-        raise ValueError("continuous trailing inputs must be finite")
-    if not all(value.is_finite() for value in decimal_values):
-        raise ValueError("continuous trailing inputs must be finite")
-    if atr_pct <= 0 or baseline_atr_pct <= 0:
-        raise ValueError("continuous trailing ATR inputs must be positive")
-    if min_multiplier <= 0 or max_multiplier < min_multiplier:
-        raise ValueError("continuous trailing multiplier bounds are invalid")
-    if not (Decimal("0") < activation_min < activation_max):
-        raise ValueError("continuous trailing activation bounds are invalid")
-    if not (Decimal("0") < delta_min < delta_max):
-        raise ValueError("continuous trailing delta bounds are invalid")
-    if base_activation <= 0 or base_delta <= 0 or min_locked_profit <= 0:
-        raise ValueError("continuous trailing price distances must be positive")
-
-    ratio = atr_pct / baseline_atr_pct
-    activation_multiplier = max(min_multiplier, min(max_multiplier, ratio ** activation_exponent))
-    delta_multiplier = max(min_multiplier, min(max_multiplier, ratio ** delta_exponent))
-    activation = base_activation * Decimal(str(activation_multiplier))
-    delta = base_delta * Decimal(str(delta_multiplier))
-    activation = max(activation_min, min(activation_max, activation))
-    delta = max(delta_min, min(delta_max, delta))
-    activation = max(activation, delta + min_locked_profit)
-    if activation > activation_max or activation - delta < min_locked_profit:
-        raise ValueError("continuous trailing bounds cannot preserve minimum locked profit")
-    return ContinuousTrailingSelection(
-        activation=activation,
-        delta=delta,
-        volatility_ratio=Decimal(str(ratio)),
-        initial_locked_profit=activation - delta,
-    )
-
-
-class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
-    controller_name: str = "ok_rsi"
-    controller_type: str = "directional_trading"
-    connector_name: str = hl_rsi.Field(
-        default="okx",
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Connector:",
-            prompt_on_new=True,
-            is_updatable=False,
-        ),
-    )
-    trading_pair: str = hl_rsi.Field(
-        default="BTC-USDC",
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Trading pair:",
-            prompt_on_new=True,
-            is_updatable=False,
-        ),
-    )
-    leverage: int = 1
-    position_mode: PositionMode = PositionMode.ONEWAY
-
-    derived_higher_timeframe_max_records: int = hl_rsi.Field(
-        default=100,
-        ge=20,
-        le=2000,
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Derived higher-timeframe records:",
-            prompt_on_new=False,
-            is_updatable=True,
-        ),
-    )
-
-    sell_only_inventory_fraction: Decimal = hl_rsi.Field(
-        default=Decimal("0.10"),
-        gt=Decimal("0"),
-        le=Decimal("1"),
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Sell-only inventory fraction per signal:",
-            prompt_on_new=False,
-            is_updatable=True,
-        ),
-    )
-    sell_all_below_quote: Decimal = hl_rsi.Field(
-        default=Decimal("20"),
-        ge=Decimal("0"),
-        client_data=ClientFieldData(
-            prompt=lambda mi: "Sell all below quote value:",
-            prompt_on_new=False,
-            is_updatable=True,
-        ),
-    )
-
-    use_trailing_exit: bool = hl_rsi.Field(default=True)
-    trailing_activation_pct: float = hl_rsi.Field(default=0.015, gt=0.0)
-    trailing_delta_pct: float = hl_rsi.Field(default=0.0035, gt=0.0)
-    entry_limit_max_age_seconds: int = hl_rsi.Field(default=30, ge=1)
-    use_adaptive_trailing: bool = hl_rsi.Field(default=True)
-    trailing_activation_min_pct: float = hl_rsi.Field(default=0.003, gt=0.0)
-    trailing_activation_max_pct: float = hl_rsi.Field(default=0.05, gt=0.0)
-    trailing_delta_min_pct: float = hl_rsi.Field(default=0.001, gt=0.0)
-    trailing_delta_max_pct: float = hl_rsi.Field(default=0.02, gt=0.0)
-    trailing_min_locked_profit_pct: float = hl_rsi.Field(default=0.004, gt=0.0)
-    trailing_activation_volatility_exponent: float = hl_rsi.Field(default=0.70, gt=0.0, le=2.0)
-    trailing_delta_volatility_exponent: float = hl_rsi.Field(default=0.35, gt=0.0, le=2.0)
-    trailing_min_multiplier: float = hl_rsi.Field(default=0.5, gt=0.0)
-    trailing_max_multiplier: float = hl_rsi.Field(default=2.5, gt=0.0)
-
-    @field_validator("connector_name", mode="before")
-    @classmethod
-    def validate_hyperliquid_spot_connector(cls, value):
-        """Override the inherited validator under the same Pydantic field-validator key."""
-        connector_name = str(value or "okx").strip().lower()
-        if connector_name not in {"okx", "okx_paper_trade"}:
-            raise ValueError("OK RSI requires an OKX spot connector")
-        return connector_name
-
-    @field_validator("trading_pair", mode="before")
-    @classmethod
-    def validate_trading_pair(cls, value):
-        trading_pair = str(value or "").strip().upper()
-        parts = trading_pair.split("-")
-        if len(parts) != 2 or not all(parts):
-            raise ValueError("OK RSI trading_pair must use BASE-QUOTE format")
-        return trading_pair
-
-    @model_validator(mode="after")
-    def validate_okx_spot_contract(self):
-        candles_connector = str(self.candles_connector or "okx").strip().lower()
-        if candles_connector == "okx_paper_trade":
-            candles_connector = "okx"
-        if candles_connector != "okx":
-            raise ValueError("OK RSI requires OKX spot candles")
-        object.__setattr__(self, "candles_connector", candles_connector)
-
-        candles_trading_pair = str(self.candles_trading_pair or self.trading_pair).strip().upper()
-        if candles_trading_pair != self.trading_pair:
-            raise ValueError("OK RSI candles must use the same trading pair as execution")
-        object.__setattr__(self, "candles_trading_pair", candles_trading_pair)
-
-        for field_name in (
-            "interval",
-            "trend_confirmation_medium_interval",
-            "trend_confirmation_long_interval",
-        ):
-            interval = getattr(self, field_name)
-            if interval is not None and interval not in OKX_CANDLE_INTERVALS:
-                raise ValueError(f"unsupported OKX candle interval for {field_name}: {interval}")
-
-        if self.trend_confirmation_enabled:
-            base_seconds = CandlesBase.interval_to_seconds[self.interval]
-            for field_name in ("trend_confirmation_medium_interval", "trend_confirmation_long_interval"):
-                interval = getattr(self, field_name)
-                if interval is None:
-                    continue
-                target_seconds = CandlesBase.interval_to_seconds[interval]
-                if target_seconds <= base_seconds or target_seconds % base_seconds != 0:
-                    raise ValueError(f"{field_name} must be a larger whole multiple of the base interval")
-
-        for field_name in type(self).model_fields:
-            value = getattr(self, field_name, None)
-            if isinstance(value, Decimal) and not value.is_finite():
-                raise ValueError(f"{field_name} must be finite")
-            if isinstance(value, float) and not math.isfinite(value):
-                raise ValueError(f"{field_name} must be finite")
-
-        if self.leverage != 1 or self.position_mode != PositionMode.ONEWAY:
-            raise ValueError("OKX spot requires leverage=1 and position_mode=ONEWAY")
-        if self.trade_mode == "buy_sell" and not self.use_trailing_exit:
-            raise ValueError("buy_sell mode requires the trailing exit because no other ordinary exit is enabled")
-
-        unsupported_exit_settings = {
-            "stop_loss": self.stop_loss,
-            "take_profit": self.take_profit,
-            "time_limit": self.time_limit,
-            "take_profit_pct": self.take_profit_pct if self.take_profit_pct > 0 else None,
-            "max_hold_time_seconds": self.max_hold_time_seconds if self.max_hold_time_seconds > 0 else None,
-        }
-        configured_unsupported_exits = [
-            name for name, value in unsupported_exit_settings.items() if value is not None
-        ]
-        if configured_unsupported_exits:
-            raise ValueError(
-                "unsupported exit settings are not wired to OK RSI executors: "
-                + ", ".join(configured_unsupported_exits)
-            )
-
-        activation = Decimal(str(self.trailing_activation_pct))
-        delta = Decimal(str(self.trailing_delta_pct))
-        locked_profit = Decimal(str(self.trailing_min_locked_profit_pct))
-        if delta >= activation:
-            raise ValueError("trailing delta must be below trailing activation")
-        if activation - delta < locked_profit:
-            raise ValueError("trailing anchors must preserve the minimum locked profit")
-        if self.trailing_activation_min_pct >= self.trailing_activation_max_pct:
-            raise ValueError("trailing activation minimum must be below maximum")
-        if self.trailing_delta_min_pct >= self.trailing_delta_max_pct:
-            raise ValueError("trailing delta minimum must be below maximum")
-        if self.trailing_min_multiplier > self.trailing_max_multiplier:
-            raise ValueError("trailing minimum multiplier must not exceed maximum multiplier")
-        if Decimal(str(self.trailing_activation_max_pct)) - Decimal(str(self.trailing_delta_max_pct)) < locked_profit:
-            raise ValueError("trailing maximum bounds must preserve the minimum locked profit")
-        if self.trailing_stop_order_type == OrderType.MARKET and self.trailing_stop_limit_max_age_seconds != 0:
-            raise ValueError("MARKET trailing requires a zero limit fallback timeout")
-        return self
 
 
 class OKRSIController(hl_rsi.HLRSIController):
@@ -359,10 +52,108 @@ class OKRSIController(hl_rsi.HLRSIController):
         return cls._logger
 
     def __init__(self, config: OKRSIControllerConfig, *args, **kwargs):
+        episode_store = kwargs.pop("episode_store", None)
         super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
+        self._episode_runtime = None
+        if config.episode_enabled:
+            from controllers.directional_trading.ok_rsi_core.runtime import ClosedCandleProvider, EpisodeRuntime
+            self.market_data_provider = ClosedCandleProvider(self.market_data_provider)
+            self._episode_runtime = EpisodeRuntime(self, episode_store)
+        else:
+            from controllers.directional_trading.ok_rsi_core.runtime import guard_disabled_restore
+            guard_disabled_restore(config, episode_store)
+
+    def determine_executor_actions(self):
+        if self._episode_runtime is not None:
+            return self._episode_runtime.determine_actions()
+        return super().determine_executor_actions()
+
+    def stop_actions_proposal(self):
+        if self._episode_runtime is not None:
+            return []
+        return super().stop_actions_proposal()
+
+    def get_executor_class_for_config(self, config):
+        runtime = self._episode_runtime
+        if runtime is None:
+            return super().get_executor_class_for_config(config)
+        from controllers.directional_trading.ok_rsi_core.execution import (
+            EPISODE_LEVEL_PREFIX,
+            EpisodeOrderExecutor,
+            EpisodeOrderExecutorConfig,
+        )
+        if not isinstance(config, EpisodeOrderExecutorConfig):
+            raise ValueError("episode request requires its bounded native executor configuration")
+        progress = runtime.state.orders.get(config.id)
+        claimed = getattr(self, "_episode_factory_claimed_ids", set())
+        if progress is None or progress.done or progress.seen or config.id in claimed:
+            raise ValueError("episode request is unknown, settled, or already dispatched")
+        request = progress.request
+        if runtime.hold_reason or runtime.state.fault or self.config.manual_kill_switch:
+            raise ValueError("episode executor construction is on hold")
+        if request.side not in {"BUY", "SELL"} or (request.side == "BUY" and self.config.trade_mode == "sell_only"):
+            raise ValueError("episode mode forbids this executor side")
+        expected_timestamp = request.expires_at - runtime.config.setup_bars * runtime.config.interval_seconds
+        expected_action = PositionAction.OPEN if request.side == "BUY" else PositionAction.CLOSE
+        if (request.episode_id != runtime.state.episode_id
+                or config.type != "order_executor"
+                or config.execution_strategy is not ExecutionStrategy.LIMIT_MAKER
+                or config.chaser_config is not None
+                or config.amount != request.amount or config.price != request.price
+                or config.side is not TradeType[request.side] or config.position_action is not expected_action
+                or type(config.leverage) is not int or config.leverage != 1
+                or type(config.episode_level) is not int or type(config.episode_revision) is not int
+                or type(config.episode_expires_at) is not int
+                or config.episode_intent != request.intent
+                or config.episode_entry_parent_request_id != request.parent_request_id
+                or config.episode_setup_policy != request.setup_policy
+                or config.episode_setup_started_at != request.setup_started_at
+                or config.episode_setup_confirmation_started_at
+                != request.setup_confirmation_started_at
+                or config.episode_setup_low != request.setup_low
+                or config.episode_setup_rebound != request.setup_rebound
+                or config.episode_setup_no_new_low != request.setup_no_new_low
+                or config.episode_exit_policy != request.exit_policy
+                or config.episode_exit_hourly_recovered != request.exit_hourly_recovered
+                or config.episode_exit_risk_clear != request.exit_risk_clear
+                or config.episode_exit_trail_breach != request.exit_trail_breach
+                or config.episode_exit_target_base != request.exit_target_base
+                or config.episode_exit_target_revision != request.exit_target_revision
+                or config.timestamp != expected_timestamp
+                or config.controller_id != self.config.id
+                or config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair
+                or config.episode_id != request.episode_id or config.episode_level != request.level
+                or config.episode_revision != request.revision or config.episode_expires_at != request.expires_at
+                or config.level_id != f"{EPISODE_LEVEL_PREFIX}{request.episode_id}:{request.level}"):
+            raise ValueError("executor parameters differ from durable episode authorization")
+        # The orchestrator resolves immediately before constructing and starting
+        # the executor. A constructor failure remains reserved and is not retried
+        # implicitly. Restored unknown requests are never re-emitted by runtime.
+        self._episode_factory_claimed_ids = claimed | {config.id}
+        return EpisodeOrderExecutor
+
+    def validate_runtime_state_transfer(self, source):
+        previous = getattr(source, "_episode_runtime", None)
+        if previous is None:
+            return
+        unresolved = previous.state.base > 0 or any(not order.done for order in previous.state.orders.values())
+        if unresolved and (self._episode_runtime is None or self._episode_runtime.config.identity != previous.config.identity):
+            raise ValueError("cannot disable or reconfigure an unresolved OK RSI episode")
+        if self._episode_runtime is not None and self._episode_runtime.sequence < previous.sequence:
+            raise ValueError("episode reload checkpoint is older than current runtime")
+
+    def update_config(self, new_config):
+        if self._episode_runtime is not None:
+            from controllers.directional_trading.ok_rsi_core.runtime import policy_config
+            if not new_config.episode_enabled or policy_config(new_config).identity != self._episode_runtime.config.identity:
+                raise ValueError("episode policy changes require explicit reconciled restart")
+        super().update_config(new_config)
 
     def _derived_base_max_records(self) -> int:
+        if self.config.episode_enabled:
+            from controllers.directional_trading.ok_rsi_core.context import HISTORY_RECORDS
+            return max(self.max_records, HISTORY_RECORDS)
         if not self.config.trend_confirmation_enabled:
             return self.max_records
         base_seconds = CandlesBase.interval_to_seconds[self.config.interval]
@@ -438,14 +229,22 @@ class OKRSIController(hl_rsi.HLRSIController):
     def get_custom_info(self) -> dict:
         custom_info = super().get_custom_info()
         custom_info["trailing_policy"] = self._trailing_policy_snapshot()
+        if self._episode_runtime is not None:
+            custom_info["episode"] = self._episode_runtime.status()
         return custom_info
 
     def get_status_summary(self) -> Dict[str, object]:
         summary = super().get_status_summary()
         summary["trailing_policy"] = self._trailing_policy_snapshot()
+        if self._episode_runtime is not None:
+            summary["episode"] = self._episode_runtime.status()
         return summary
 
     def _trailing_policy_snapshot(self) -> Dict[str, object]:
+        if self._episode_runtime is not None:
+            state = self._episode_runtime.state
+            return {"policy": "episode_aggregate", "peak": str(state.peak),
+                    "floor": str(state.floor), "target_base": str(state.target_base)}
         selection = self._last_trailing_selection
         return {
             "policy": selection.policy if selection is not None else (
@@ -518,6 +317,8 @@ class OKRSIController(hl_rsi.HLRSIController):
         return price
 
     def can_create_executor(self, signal: int) -> bool:
+        if self._episode_runtime is not None:
+            return False  # Only the durable episode action path may reserve inventory.
         if signal == 0:
             return False
         target_side = TradeType.BUY if signal > 0 else TradeType.SELL
@@ -546,6 +347,8 @@ class OKRSIController(hl_rsi.HLRSIController):
         return position_amount * self.config.sell_only_inventory_fraction
 
     def get_executor_config(self, trade_type: TradeType, price: Decimal, amount: Decimal):
+        if self._episode_runtime is not None:
+            raise ExecutorInputUnavailable("episode orders require a durable episode authorization")
         if trade_type == TradeType.BUY and self.config.trade_mode == "sell_only":
             raise ValueError("BUY executor construction is forbidden when trade_mode='sell_only'")
         try:

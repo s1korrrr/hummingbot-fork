@@ -25,25 +25,9 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
-from pandas.errors import Pandas4Warning
-
-with warnings.catch_warnings():
-    warnings.filterwarnings(
-        "ignore",
-        category=Pandas4Warning,
-        message=".*mode.copy_on_write.*",
-    )
-    import pandas_ta as ta  # noqa: F401
 from pydantic import Field as PydanticField, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
-from controllers.directional_trading.rsi_signals import (
-    analyze_rsi_trend_confirmation,
-    calculate_rsi_mean_reversion_score,
-    calculate_signal_strength,
-    calculate_volume_ratio,
-    get_adaptive_trailing_params,
-)
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
@@ -73,6 +57,24 @@ from hummingbot.strategy_v2.utils.market_analysis import (
     StrictHMMRequiredError,
     TrendDirection,
 )
+
+from .pandas_compat import pandas_copy_on_write_warning_category
+from .rsi_signals import (
+    analyze_rsi_trend_confirmation,
+    calculate_rsi_mean_reversion_score,
+    calculate_signal_strength,
+    calculate_volume_ratio,
+    get_adaptive_trailing_params,
+)
+
+_PANDAS_COPY_ON_WRITE_WARNING = pandas_copy_on_write_warning_category(pd.errors)
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        category=_PANDAS_COPY_ON_WRITE_WARNING,
+        message=".*mode.copy_on_write.*",
+    )
+    import pandas_ta as ta  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Pydantic Field helper (same as rsi_v1 for prompt/client_data compat)

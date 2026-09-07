@@ -10,7 +10,8 @@ from shutil import move
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
-from sqlalchemy import func
+from sqlalchemy import func, inspect, update
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Query, Session
 
 from hummingbot import data_path
@@ -36,6 +37,14 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.chart_snapshot import ChartSnapshot
+from hummingbot.model.controller_candle_watermark import (
+    CONTROLLER_CANDLE_WATERMARK_SCHEMA_VERSION,
+    ControllerCandleWatermark,
+    ControllerCandleWatermarkNamespace,
+    ControllerCandleWatermarkOutcome,
+    ControllerCandleWatermarkResult,
+    ControllerCandleWatermarkState,
+)
 from hummingbot.model.controllers import Controllers
 from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
@@ -179,6 +188,290 @@ class MarketsRecorder:
     @property
     def db_timestamp(self) -> int:
         return int(time.time() * 1e3)
+
+    def _controller_candle_watermark_schema_result(self) -> Optional[ControllerCandleWatermarkResult]:
+        """Return a typed failure when a hot-loaded or incompatible store cannot honor v1."""
+        expected_columns = [
+            ("controller_id", "TEXT", False, 1),
+            ("connector_name", "TEXT", False, 2),
+            ("trading_pair", "TEXT", False, 3),
+            ("interval", "TEXT", False, 4),
+            ("candle_open_timestamp_s", "BIGINT", False, 0),
+            ("revision", "BIGINT", False, 0),
+            ("schema_version", "INTEGER", False, 0),
+            ("updated_at_ms", "BIGINT", False, 0),
+        ]
+        try:
+            inspector = inspect(self._sql_manager.engine)
+            if ControllerCandleWatermark.__tablename__ not in inspector.get_table_names():
+                return ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                    reason="watermark table unavailable; process restart required after model registration",
+                )
+            actual_columns = [
+                (column["name"], str(column["type"]), column["nullable"], column["primary_key"])
+                for column in inspector.get_columns(ControllerCandleWatermark.__tablename__)
+            ]
+            primary_key = inspector.get_pk_constraint(ControllerCandleWatermark.__tablename__).get(
+                "constrained_columns"
+            )
+        except (OperationalError, SQLAlchemyError, RuntimeError) as exc:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                reason=f"watermark schema inspection unavailable: {type(exc).__name__}",
+            )
+        if actual_columns != expected_columns or primary_key != [
+            "controller_id",
+            "connector_name",
+            "trading_pair",
+            "interval",
+        ]:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                reason="watermark table schema is incompatible with CONTROLLER_CANDLE_WATERMARK_V1",
+            )
+        return None
+
+    @staticmethod
+    def _controller_candle_watermark_filters(namespace: ControllerCandleWatermarkNamespace):
+        return (
+            ControllerCandleWatermark.controller_id == namespace.controller_id,
+            ControllerCandleWatermark.connector_name == namespace.connector_name,
+            ControllerCandleWatermark.trading_pair == namespace.trading_pair,
+            ControllerCandleWatermark.interval == namespace.interval,
+        )
+
+    def load_controller_candle_watermark(
+        self, namespace: ControllerCandleWatermarkNamespace
+    ) -> ControllerCandleWatermarkResult:
+        try:
+            if not isinstance(namespace, ControllerCandleWatermarkNamespace):
+                raise ValueError("namespace must be a ControllerCandleWatermarkNamespace")
+        except ValueError as exc:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                reason=str(exc),
+            )
+        schema_failure = self._controller_candle_watermark_schema_result()
+        if schema_failure is not None:
+            return schema_failure
+
+        session = None
+        try:
+            session = self._sql_manager.get_new_session()
+            record = session.query(ControllerCandleWatermark).filter(
+                *self._controller_candle_watermark_filters(namespace)
+            ).one_or_none()
+            if record is None:
+                return ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                    reason="watermark namespace row is missing; explicit research seed required",
+                )
+            try:
+                state = record.to_state()
+            except (TypeError, ValueError) as exc:
+                return ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                    reason=f"watermark row is corrupt: {exc}",
+                )
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+                state=state,
+            )
+        except (OperationalError, SQLAlchemyError, RuntimeError) as exc:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                reason=f"watermark load unavailable: {type(exc).__name__}",
+            )
+        finally:
+            if session is not None:
+                session.close()
+
+    def seed_controller_candle_watermark(
+        self, state: ControllerCandleWatermarkState
+    ) -> ControllerCandleWatermarkResult:
+        """Explicit research-harness bootstrap; live controllers must never call this method."""
+        if not isinstance(state, ControllerCandleWatermarkState):
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                reason="seed state must be a ControllerCandleWatermarkState",
+            )
+        schema_failure = self._controller_candle_watermark_schema_result()
+        if schema_failure is not None:
+            return schema_failure
+
+        existing = self.load_controller_candle_watermark(state.namespace)
+        if existing.state is not None:
+            if existing.state == state:
+                return existing
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=existing.state,
+                reason="watermark namespace is already seeded with different state",
+            )
+        if (
+            existing.outcome is not ControllerCandleWatermarkOutcome.INVALID_STATE
+            or existing.reason != "watermark namespace row is missing; explicit research seed required"
+        ):
+            return existing
+
+        session = None
+        try:
+            session = self._sql_manager.get_new_session()
+        except (OperationalError, SQLAlchemyError, RuntimeError) as exc:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                reason=f"watermark seed session unavailable: {type(exc).__name__}",
+            )
+        try:
+            session.add(ControllerCandleWatermark(
+                controller_id=state.namespace.controller_id,
+                connector_name=state.namespace.connector_name,
+                trading_pair=state.namespace.trading_pair,
+                interval=state.namespace.interval,
+                candle_open_timestamp_s=state.candle_open_timestamp_s,
+                revision=state.revision,
+                schema_version=state.schema_version,
+                updated_at_ms=state.updated_at_ms,
+            ))
+            session.flush()
+            session.commit()
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.SEEDED,
+                state=state,
+            )
+        except OperationalError as exc:
+            session.rollback()
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                reason=f"watermark seed unavailable: {type(exc).__name__}",
+            )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            session.rollback()
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.COMMIT_FAILED,
+                reason=f"watermark seed failed and rolled back: {type(exc).__name__}",
+            )
+        finally:
+            if session is not None:
+                session.close()
+
+    def compare_and_advance_controller_candle_watermark(
+        self,
+        prior_state: ControllerCandleWatermarkState,
+        *,
+        desired_candle_open_timestamp_s: int,
+        updated_at_ms: int,
+    ) -> ControllerCandleWatermarkResult:
+        if not isinstance(prior_state, ControllerCandleWatermarkState):
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                reason="prior state must be a ControllerCandleWatermarkState",
+            )
+        try:
+            desired_state = ControllerCandleWatermarkState(
+                namespace=prior_state.namespace,
+                candle_open_timestamp_s=desired_candle_open_timestamp_s,
+                revision=prior_state.revision + 1,
+                schema_version=CONTROLLER_CANDLE_WATERMARK_SCHEMA_VERSION,
+                updated_at_ms=updated_at_ms,
+            )
+        except (TypeError, ValueError) as exc:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=prior_state,
+                reason=f"desired watermark is invalid: {exc}",
+            )
+        if desired_candle_open_timestamp_s < prior_state.candle_open_timestamp_s:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.REGRESSION,
+                state=prior_state,
+                reason="desired candle regresses below loaded watermark",
+            )
+        if desired_candle_open_timestamp_s == prior_state.candle_open_timestamp_s:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+                state=prior_state,
+            )
+        schema_failure = self._controller_candle_watermark_schema_result()
+        if schema_failure is not None:
+            return schema_failure
+
+        session = None
+        try:
+            session = self._sql_manager.get_new_session()
+        except (OperationalError, SQLAlchemyError, RuntimeError) as exc:
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                state=prior_state,
+                reason=f"watermark compare-and-swap session unavailable: {type(exc).__name__}",
+            )
+        try:
+            statement = update(ControllerCandleWatermark).where(
+                *self._controller_candle_watermark_filters(prior_state.namespace),
+                ControllerCandleWatermark.candle_open_timestamp_s == prior_state.candle_open_timestamp_s,
+                ControllerCandleWatermark.revision == prior_state.revision,
+                ControllerCandleWatermark.schema_version == prior_state.schema_version,
+            ).values(
+                candle_open_timestamp_s=desired_state.candle_open_timestamp_s,
+                revision=desired_state.revision,
+                schema_version=desired_state.schema_version,
+                updated_at_ms=desired_state.updated_at_ms,
+            )
+            result = session.execute(statement)
+            session.flush()
+            if result.rowcount == 1:
+                try:
+                    session.commit()
+                except Exception as exc:
+                    session.rollback()
+                    return ControllerCandleWatermarkResult(
+                        outcome=ControllerCandleWatermarkOutcome.COMMIT_FAILED,
+                        state=prior_state,
+                        reason=f"watermark commit failed and rolled back: {type(exc).__name__}",
+                    )
+                return ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER,
+                    state=desired_state,
+                )
+
+            session.rollback()
+            persisted = self.load_controller_candle_watermark(prior_state.namespace)
+            if persisted.state is None:
+                return persisted
+            if persisted.state.candle_open_timestamp_s == desired_candle_open_timestamp_s:
+                return ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+                    state=persisted.state,
+                )
+            if persisted.state.candle_open_timestamp_s > desired_candle_open_timestamp_s:
+                return ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.REGRESSION,
+                    state=persisted.state,
+                    reason="persisted watermark is ahead of desired candle",
+                )
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.CAS_CONFLICT,
+                state=persisted.state,
+                reason="loaded timestamp or revision lost compare-and-swap",
+            )
+        except OperationalError as exc:
+            session.rollback()
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                state=prior_state,
+                reason=f"watermark compare-and-swap unavailable: {type(exc).__name__}",
+            )
+        except (SQLAlchemyError, RuntimeError) as exc:
+            session.rollback()
+            return ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.COMMIT_FAILED,
+                state=prior_state,
+                reason=f"watermark compare-and-swap failed and rolled back: {type(exc).__name__}",
+            )
+        finally:
+            if session is not None:
+                session.close()
 
     def start(self):
         for market in self._markets:

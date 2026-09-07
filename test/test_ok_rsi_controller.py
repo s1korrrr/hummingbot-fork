@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import math
 import sys
+import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -11,7 +12,17 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import yaml
 
+from hummingbot.client.config.client_config_map import ClientConfigMap
+from hummingbot.client.config.config_helpers import ClientConfigAdapter
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import TradeType
+from hummingbot.model.controller_candle_watermark import (
+    ControllerCandleWatermarkNamespace,
+    ControllerCandleWatermarkOutcome,
+    ControllerCandleWatermarkResult,
+    ControllerCandleWatermarkState,
+)
+from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
 ROOT_PATH_STR = str(ROOT_PATH)
@@ -99,6 +110,83 @@ class OKRSIControllerTest(unittest.TestCase):
         controller._latest_atr_pct = atr_pct
         return controller
 
+    def _install_temp_watermark(self, controller, *, timestamp: int) -> MarketsRecorder:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        manager = SQLConnectionManager(
+            ClientConfigAdapter(ClientConfigMap()),
+            SQLConnectionType.TRADE_FILLS,
+            db_path=str(Path(temp_dir.name) / "controller-watermark.sqlite"),
+        )
+        recorder = MarketsRecorder.__new__(MarketsRecorder)
+        recorder._sql_manager = manager
+        state = ControllerCandleWatermarkState(
+            namespace=ControllerCandleWatermarkNamespace(
+                controller_id=controller.config.id,
+                connector_name=controller.config.candles_connector or controller.config.connector_name,
+                trading_pair=controller.config.candles_trading_pair or controller.config.trading_pair,
+                interval=controller.config.interval,
+            ),
+            candle_open_timestamp_s=timestamp,
+            revision=0,
+            schema_version=1,
+            updated_at_ms=(timestamp + 60) * 1000,
+        )
+        self.assertEqual(
+            recorder.seed_controller_candle_watermark(state).outcome,
+            ControllerCandleWatermarkOutcome.SEEDED,
+        )
+        recorder_patcher = patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder)
+        recorder_patcher.start()
+        self.addCleanup(recorder_patcher.stop)
+        return recorder
+
+    @staticmethod
+    def _c01_4_causal_candles(*, first_timestamp: int, count: int = 263) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "timestamp": first_timestamp + (index * 60),
+                    "open": 50_000 + (index * 2) + (120 * math.sin(index / 9)) - 8,
+                    "high": 50_000 + (index * 2) + (120 * math.sin(index / 9)) + 25,
+                    "low": 50_000 + (index * 2) + (120 * math.sin(index / 9)) - 25,
+                    "close": 50_000 + (index * 2) + (120 * math.sin(index / 9)),
+                    "volume": 100 + (index % 11),
+                    "quote_asset_volume": (100 + (index % 11)) * (50_000 + (index * 2) + (120 * math.sin(index / 9))),
+                }
+                for index in range(count)
+            ]
+        )
+
+    def _configure_c01_4_causal_feed(
+        self,
+        controller,
+        *,
+        persisted_timestamp: int,
+        successor_count: int = 2,
+    ) -> pd.DataFrame:
+        candles = self._c01_4_causal_candles(
+            first_timestamp=persisted_timestamp - (259 * 60),
+            count=260 + successor_count,
+        )
+        controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            candles.tail(kwargs["max_records"]).copy()
+        )
+        return candles
+
+    def _complete_c01_4_owner_reconstruction(self, controller, *, persisted_timestamp: int) -> None:
+        asyncio.run(controller.update_processed_data())
+
+        self.assertFalse(controller._watermark_permanent_hold)
+        self.assertEqual(controller._last_evaluated_candle_timestamp, float(persisted_timestamp))
+        self.assertEqual(controller.processed_data["candle_timestamp"], float(persisted_timestamp))
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_owner_reconstruction",
+        )
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+
     def test_module_exposes_okx_spot_identity(self):
         from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
 
@@ -173,6 +261,65 @@ class OKRSIControllerTest(unittest.TestCase):
         )
 
         self.assertTrue(derived.empty)
+
+    def test_derived_higher_timeframe_matches_reference_on_mixed_complete_buckets(self):
+        from controllers.directional_trading.ok_rsi import derive_higher_timeframe_candles
+
+        start = 1_800_000_000
+        base = pd.DataFrame(
+            [
+                {
+                    "timestamp": start + minute * 60,
+                    "open": 100 + minute / 10,
+                    "high": 101 + minute / 10,
+                    "low": 99 + minute / 10,
+                    "close": 100.5 + minute / 10,
+                    "volume": 1 + (minute % 7),
+                    "quote_asset_volume": 100 + minute,
+                    "n_trades": 2 + (minute % 5),
+                }
+                for minute in range(180)
+            ]
+        )
+        base = base.drop(index=[31, 94]).reset_index(drop=True)
+        base = pd.concat([base, base.iloc[[60]]], ignore_index=True)
+        base.loc[base["timestamp"].eq(start + (125 * 60)), "volume"] = float("nan")
+
+        actual = derive_higher_timeframe_candles(
+            base,
+            base_interval="1m",
+            target_interval="15m",
+            current_time=start + (177 * 60),
+            max_records=7,
+        )
+
+        frame = base.copy()
+        numeric = [column for column in frame.columns if column != "timestamp"]
+        frame[numeric] = frame[numeric].apply(pd.to_numeric, errors="coerce")
+        frame = frame.sort_values("timestamp")
+        frame["bucket"] = (frame["timestamp"] // 900) * 900
+        frame = frame[frame["bucket"] + 900 <= start + (177 * 60)]
+        expected_records = []
+        for bucket_timestamp, bucket in frame.groupby("bucket", sort=True):
+            if bucket["timestamp"].tolist() != list(range(int(bucket_timestamp), int(bucket_timestamp) + 900, 60)):
+                continue
+            if bucket[numeric].isna().any().any():
+                continue
+            expected_records.append(
+                {
+                    "timestamp": int(bucket_timestamp),
+                    "open": bucket["open"].iloc[0],
+                    "high": bucket["high"].max(),
+                    "low": bucket["low"].min(),
+                    "close": bucket["close"].iloc[-1],
+                    "volume": bucket["volume"].sum(),
+                    "quote_asset_volume": bucket["quote_asset_volume"].sum(),
+                    "n_trades": bucket["n_trades"].sum(),
+                }
+            )
+        expected = pd.DataFrame(expected_records).tail(7).reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(actual, expected, check_dtype=False)
 
     def test_controller_creates_only_base_feed_with_history_for_derived_intervals(self):
         from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
@@ -497,6 +644,10 @@ class OKRSIControllerTest(unittest.TestCase):
 
     def test_create_actions_proposal_emits_validated_sell_executor(self):
         controller = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+        controller._watermark_proposal_grant = True
+        controller._watermark_result = ControllerCandleWatermarkResult(
+            outcome=ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER
+        )
 
         actions = controller.create_actions_proposal()
 
@@ -508,8 +659,903 @@ class OKRSIControllerTest(unittest.TestCase):
     def test_create_actions_proposal_emits_nothing_when_execution_inputs_are_missing(self):
         controller = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
         controller.market_data_provider.get_trading_rules.return_value = None
+        controller._watermark_proposal_grant = True
+        controller._watermark_result = ControllerCandleWatermarkResult(
+            outcome=ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER
+        )
 
         self.assertEqual(controller.create_actions_proposal(), [])
+
+    def test_durable_watermark_loads_before_evaluation_commits_before_one_shot_proposal(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+        recorder = self._install_temp_watermark(controller, timestamp=1_700_033_100)
+        self._configure_c01_4_causal_feed(controller, persisted_timestamp=1_700_033_100)
+        self._complete_c01_4_owner_reconstruction(controller, persisted_timestamp=1_700_033_100)
+
+        async def evaluate_after_load(instance):
+            self.assertEqual(instance._last_evaluated_candle_timestamp, 1_700_033_100)
+            self.assertEqual(instance._watermark_state.candle_open_timestamp_s, 1_700_033_100)
+            instance._last_evaluated_candle_timestamp = 1_700_033_160
+            instance.processed_data = {"signal": -1, "signal_state": {"condition_ok": True}}
+
+        with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=evaluate_after_load):
+            asyncio.run(controller.update_processed_data())
+
+        committed = recorder.load_controller_candle_watermark(controller._watermark_namespace)
+        self.assertEqual(committed.state.candle_open_timestamp_s, 1_700_033_160)
+        self.assertEqual(committed.state.revision, 1)
+        self.assertEqual(committed.state.updated_at_ms, 1_725_000_000_000)
+        self.assertEqual(controller._watermark_result.outcome, ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER)
+        self.assertTrue(controller._watermark_proposal_grant)
+
+        first_actions = controller.create_actions_proposal()
+        second_actions = controller.create_actions_proposal()
+        self.assertEqual(len(first_actions), 1)
+        self.assertEqual(second_actions, [])
+        self.assertFalse(controller._watermark_proposal_grant)
+        watermark_info = controller.get_custom_info()["durable_evaluation_watermark"]
+        self.assertEqual(watermark_info["outcome"], "ADVANCED_BY_CALLER")
+        self.assertFalse(watermark_info["permanent_hold"])
+        self.assertFalse(watermark_info["proposal_eligible"])
+
+        reconstructed = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+        self._configure_c01_4_causal_feed(reconstructed, persisted_timestamp=1_700_033_160)
+        self._complete_c01_4_owner_reconstruction(reconstructed, persisted_timestamp=1_700_033_160)
+        self.assertEqual(reconstructed.create_actions_proposal(), [])
+        self.assertEqual(
+            reconstructed._watermark_result.outcome,
+            ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+        )
+
+    def test_durable_watermark_absence_and_cas_failure_permanently_hold_without_retry(self):
+        from controllers.directional_trading import hl_rsi
+
+        absent = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=None):
+            asyncio.run(absent.update_processed_data())
+        self.assertTrue(absent._watermark_permanent_hold)
+        self.assertEqual(absent._watermark_result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+        self.assertEqual(absent.processed_data["signal"], 0)
+        absent.market_data_provider.get_candles_df.assert_not_called()
+
+        namespace = ControllerCandleWatermarkNamespace(
+            controller_id=absent.config.id,
+            connector_name="okx",
+            trading_pair="BTC-USDT",
+            interval="1m",
+        )
+        state = ControllerCandleWatermarkState(
+            namespace=namespace,
+            candle_open_timestamp_s=1_700_033_100,
+            revision=0,
+            schema_version=1,
+            updated_at_ms=1_700_033_160_000,
+        )
+        recorder = MagicMock()
+        recorder.load_controller_candle_watermark.return_value = ControllerCandleWatermarkResult(
+            outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+            state=state,
+        )
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            asyncio.run(absent.update_processed_data())
+        recorder.load_controller_candle_watermark.assert_not_called()
+
+        failed = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+        failed_recorder = MagicMock()
+        failed_recorder.load_controller_candle_watermark.return_value = ControllerCandleWatermarkResult(
+            outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+            state=state,
+        )
+        failed_recorder.compare_and_advance_controller_candle_watermark.return_value = (
+            ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.COMMIT_FAILED,
+                state=state,
+                reason="injected",
+            )
+        )
+
+        async def evaluate(instance):
+            instance._last_evaluated_candle_timestamp = 1_700_033_160
+            instance.processed_data = {"signal": 1, "signal_state": {"condition_ok": True}}
+
+        self._configure_c01_4_causal_feed(failed, persisted_timestamp=1_700_033_100)
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=failed_recorder):
+            self._complete_c01_4_owner_reconstruction(failed, persisted_timestamp=1_700_033_100)
+            # This test intentionally isolates the post-reconstruction CAS failure contract.
+            with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=evaluate):
+                asyncio.run(failed.update_processed_data())
+                asyncio.run(failed.update_processed_data())
+
+        self.assertTrue(failed._watermark_permanent_hold)
+        self.assertEqual(failed.processed_data["signal"], 0)
+        self.assertEqual(failed.create_actions_proposal(), [])
+        self.assertEqual(failed_recorder.load_controller_candle_watermark.call_count, 1)
+        self.assertEqual(failed_recorder.compare_and_advance_controller_candle_watermark.call_count, 1)
+        self.assertEqual(
+            failed_recorder.compare_and_advance_controller_candle_watermark.call_args.kwargs["updated_at_ms"],
+            1_725_000_000_000,
+        )
+        status = failed.get_status_summary()["durable_evaluation_watermark"]
+        self.assertEqual(status["outcome"], "COMMIT_FAILED")
+        self.assertTrue(status["permanent_hold"])
+
+    def test_durable_watermark_stale_writer_refreshes_already_committed_without_permanent_hold(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+        namespace = ControllerCandleWatermarkNamespace(
+            controller_id=controller.config.id,
+            connector_name="okx",
+            trading_pair="BTC-USDT",
+            interval="1m",
+        )
+        loaded = ControllerCandleWatermarkState(
+            namespace=namespace,
+            candle_open_timestamp_s=1_700_033_100,
+            revision=0,
+            schema_version=1,
+            updated_at_ms=1_700_033_160_000,
+        )
+        committed_by_peer = ControllerCandleWatermarkState(
+            namespace=namespace,
+            candle_open_timestamp_s=1_700_033_160,
+            revision=1,
+            schema_version=1,
+            updated_at_ms=1_700_033_220_000,
+        )
+        next_committed = ControllerCandleWatermarkState(
+            namespace=namespace,
+            candle_open_timestamp_s=1_700_033_220,
+            revision=2,
+            schema_version=1,
+            updated_at_ms=1_700_033_280_000,
+        )
+        recorder = MagicMock()
+        recorder.load_controller_candle_watermark.return_value = ControllerCandleWatermarkResult(
+            outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+            state=loaded,
+        )
+        recorder.compare_and_advance_controller_candle_watermark.side_effect = [
+            ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+                state=committed_by_peer,
+            ),
+            ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER,
+                state=next_committed,
+            ),
+        ]
+
+        async def evaluate(instance):
+            instance._last_evaluated_candle_timestamp = 1_700_033_160
+            instance.processed_data = {"signal": -1, "signal_state": {"condition_ok": True}}
+
+        self._configure_c01_4_causal_feed(controller, persisted_timestamp=1_700_033_100)
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            self._complete_c01_4_owner_reconstruction(controller, persisted_timestamp=1_700_033_100)
+            # This test intentionally isolates same-candle stale-writer CAS after reconstruction.
+            with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=evaluate):
+                asyncio.run(controller.update_processed_data())
+
+        self.assertFalse(controller._watermark_permanent_hold)
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller._watermark_state, committed_by_peer)
+        self.assertEqual(controller._watermark_result.outcome, ControllerCandleWatermarkOutcome.ALREADY_COMMITTED)
+        self.assertEqual(controller.processed_data["signal"], 0)
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_already_committed",
+        )
+        self.assertEqual(controller.create_actions_proposal(), [])
+
+        async def evaluate_next(instance):
+            self.assertEqual(instance._last_evaluated_candle_timestamp, 1_700_033_160)
+            instance._last_evaluated_candle_timestamp = 1_700_033_220
+            instance.processed_data = {"signal": -1, "signal_state": {"condition_ok": True}}
+
+        with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=evaluate_next):
+            asyncio.run(controller.update_processed_data())
+        self.assertFalse(controller._watermark_permanent_hold)
+        self.assertEqual(controller._watermark_state, next_committed)
+        self.assertTrue(controller._watermark_proposal_grant)
+        self.assertEqual(len(controller.create_actions_proposal()), 1)
+
+    def test_durable_watermark_non_advancing_owner_candle_is_a_permanent_regression_hold(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+        recorder = self._install_temp_watermark(controller, timestamp=1_700_033_160)
+        self._configure_c01_4_causal_feed(controller, persisted_timestamp=1_700_033_160)
+        self._complete_c01_4_owner_reconstruction(controller, persisted_timestamp=1_700_033_160)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+
+        async def observe_older_candle(instance):
+            self.assertEqual(instance._last_evaluated_candle_timestamp, 1_700_033_160)
+            instance.processed_data = {
+                "signal": 0,
+                "signal_suppression_reason": "non_advancing_candle",
+                "candle_timestamp": 1_700_033_100,
+            }
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=observe_older_candle):
+                asyncio.run(controller.update_processed_data())
+
+        cas.assert_not_called()
+        self.assertTrue(controller._watermark_permanent_hold)
+        self.assertEqual(controller._watermark_result.outcome, ControllerCandleWatermarkOutcome.REGRESSION)
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+        persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+        self.assertEqual(persisted.candle_open_timestamp_s, 1_700_033_160)
+        self.assertEqual(persisted.revision, 0)
+
+    def test_durable_watermark_reconstruction_covers_all_three_preregistered_crash_boundaries(self):
+        from controllers.directional_trading import hl_rsi
+
+        recorder = None
+
+        def new_controller(*, reconstruction_timestamp: int):
+            nonlocal recorder
+            instance = self._controller(base_balance=Decimal("0.01"), price=Decimal("50000"))
+            if recorder is None:
+                recorder = self._install_temp_watermark(instance, timestamp=1_700_033_100)
+            self._configure_c01_4_causal_feed(instance, persisted_timestamp=reconstruction_timestamp)
+            self._complete_c01_4_owner_reconstruction(
+                instance,
+                persisted_timestamp=reconstruction_timestamp,
+            )
+            return instance
+
+        async def evaluate_3160(instance):
+            instance._last_evaluated_candle_timestamp = 1_700_033_160
+            instance.processed_data = {"signal": -1, "signal_state": {"condition_ok": True}}
+
+        before_commit = new_controller(reconstruction_timestamp=1_700_033_100)
+        # Each crash boundary is intentionally injected after mandatory owner reconstruction.
+        with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=evaluate_3160):
+            with patch.object(
+                recorder,
+                "compare_and_advance_controller_candle_watermark",
+                side_effect=SystemExit("simulated process crash before commit"),
+            ):
+                with self.assertRaisesRegex(SystemExit, "before commit"):
+                    asyncio.run(before_commit.update_processed_data())
+        self.assertEqual(
+            recorder.load_controller_candle_watermark(before_commit._watermark_namespace).state.candle_open_timestamp_s,
+            1_700_033_100,
+        )
+
+        after_commit_before_proposal = new_controller(reconstruction_timestamp=1_700_033_100)
+        with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=evaluate_3160):
+            asyncio.run(after_commit_before_proposal.update_processed_data())
+        self.assertTrue(after_commit_before_proposal._watermark_proposal_grant)
+
+        reconstructed_after_commit = new_controller(reconstruction_timestamp=1_700_033_160)
+        self.assertEqual(reconstructed_after_commit.create_actions_proposal(), [])
+
+        after_proposal_before_queue = new_controller(reconstruction_timestamp=1_700_033_160)
+
+        async def evaluate_3220(instance):
+            self.assertEqual(instance._last_evaluated_candle_timestamp, 1_700_033_160)
+            instance._last_evaluated_candle_timestamp = 1_700_033_220
+            instance.processed_data = {"signal": -1, "signal_state": {"condition_ok": True}}
+
+        with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=evaluate_3220):
+            asyncio.run(after_proposal_before_queue.update_processed_data())
+        proposal_fingerprint = after_proposal_before_queue.create_actions_proposal()
+        self.assertEqual(len(proposal_fingerprint), 1)
+
+        reconstructed_after_fingerprint = new_controller(reconstruction_timestamp=1_700_033_220)
+        self.assertEqual(reconstructed_after_fingerprint.create_actions_proposal(), [])
+
+    def test_c01_4_reconstructs_persisted_candle_before_advancing_visible_successor(self):
+        controller = self._buy_controller(atr_pct=None)
+        candles = self._c01_4_causal_candles(first_timestamp=1_700_017_500)
+        persisted_timestamp = int(candles.iloc[259]["timestamp"])
+        successor_timestamp = int(candles.iloc[260]["timestamp"])
+        persisted_close = Decimal(str(candles.iloc[259]["close"]))
+        successor_close = Decimal(str(candles.iloc[260]["close"]))
+        visible = candles.iloc[:261].copy()
+        controller.market_data_provider.time.return_value = float(successor_timestamp + 60)
+        controller.market_data_provider.get_price_by_type.return_value = successor_close
+        controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            visible.tail(kwargs["max_records"]).copy()
+        )
+        cost_basis = Decimal("50000")
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="okx",
+                trading_pair="BTC-USDT",
+                side=TradeType.BUY,
+                amount=Decimal("1"),
+                breakeven_price=cost_basis,
+                cum_fees_quote=Decimal("0"),
+            )
+        ]
+        recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+        original_detect = controller._regime_detector.detect
+        controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            asyncio.run(controller.update_processed_data())
+
+            self.assertEqual(controller._last_evaluated_candle_timestamp, float(persisted_timestamp))
+            self.assertEqual(controller.processed_data["candle_timestamp"], float(persisted_timestamp))
+            self.assertEqual(
+                controller.processed_data["signal_suppression_reason"],
+                "durable_watermark_owner_reconstruction",
+            )
+            self.assertEqual(controller.processed_data["signal"], 0)
+            self.assertAlmostEqual(
+                controller.processed_data["signal_state"]["sell_pnl_pct"],
+                float((persisted_close - cost_basis) / cost_basis),
+            )
+            self.assertFalse(controller._watermark_proposal_grant)
+            self.assertEqual(controller.create_actions_proposal(), [])
+            self.assertEqual(controller._regime_detector.detect.call_count, 1)
+            cas.assert_not_called()
+            persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+            self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+            self.assertEqual(persisted.revision, 0)
+
+            asyncio.run(controller.update_processed_data())
+
+            self.assertEqual(controller._last_evaluated_candle_timestamp, float(successor_timestamp))
+            self.assertEqual(controller.processed_data["candle_timestamp"], float(successor_timestamp))
+            self.assertEqual(controller._regime_detector.detect.call_count, 2)
+            self.assertEqual(cas.call_count, 1)
+            committed = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+            self.assertEqual(committed.candle_open_timestamp_s, successor_timestamp)
+            self.assertEqual(committed.revision, 1)
+            self.assertEqual(
+                controller._watermark_result.outcome,
+                ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER,
+            )
+            self.assertTrue(controller._watermark_proposal_grant)
+
+    def test_c01_4_paper_execution_connector_reconstructs_with_normalized_candle_connector_price(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+
+        candles = self._c01_4_causal_candles(first_timestamp=1_700_017_500)
+        persisted_timestamp = int(candles.iloc[259]["timestamp"])
+        persisted_close = Decimal(str(candles.iloc[259]["close"]))
+        successor_timestamp = int(candles.iloc[260]["timestamp"])
+        successor_close = Decimal(str(candles.iloc[260]["close"]))
+        self.assertNotEqual(persisted_close, successor_close)
+        provider = self._provider(base_balance=Decimal("1"), price=successor_close)
+        provider.time.return_value = float(successor_timestamp + 60)
+        provider.get_candles_df.side_effect = lambda **kwargs: (
+            candles.iloc[:261].tail(kwargs["max_records"]).copy()
+        )
+        config = OKRSIControllerConfig(
+            id="ok-rsi-paper-reconstruction",
+            connector_name="okx_paper_trade",
+            trading_pair="BTC-USDT",
+            candles_connector="okx_paper_trade",
+            candles_trading_pair="BTC-USDT",
+            trade_mode="buy_sell",
+            strict_hmm_mode=False,
+        )
+        self.assertEqual(config.candles_connector, "okx")
+        controller = OKRSIController(
+            config=config,
+            market_data_provider=provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.executors_info = []
+        cost_basis = Decimal("50000")
+        controller.positions_held = [
+            SimpleNamespace(
+                connector_name="okx_paper_trade",
+                trading_pair="BTC-USDT",
+                side=TradeType.BUY,
+                amount=Decimal("1"),
+                breakeven_price=cost_basis,
+                cum_fees_quote=Decimal("0"),
+            )
+        ]
+        recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            asyncio.run(controller.update_processed_data())
+
+        self.assertFalse(controller._watermark_permanent_hold)
+        self.assertEqual(controller._last_evaluated_candle_timestamp, float(persisted_timestamp))
+        self.assertEqual(controller.processed_data["candle_timestamp"], float(persisted_timestamp))
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_owner_reconstruction",
+        )
+        self.assertTrue(controller.processed_data["signal_state"]["sell_has_inventory"])
+        reconstructed_pnl = controller.processed_data["signal_state"]["sell_pnl_pct"]
+        self.assertIsNotNone(reconstructed_pnl)
+        self.assertAlmostEqual(
+            reconstructed_pnl,
+            float((persisted_close - cost_basis) / cost_basis),
+        )
+        self.assertEqual(controller.processed_data["signal"], 0)
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+        cas.assert_not_called()
+        persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+        self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+        self.assertEqual(persisted.revision, 0)
+
+    def test_c01_4_reconstruction_rejects_causal_prefix_below_hmm_fit_threshold(self):
+        controller = self._buy_controller(atr_pct=None)
+        candles = self._c01_4_causal_candles(
+            first_timestamp=1_700_033_040 - (218 * 60),
+            count=219,
+        )
+        persisted_timestamp = int(candles.iloc[-1]["timestamp"])
+        controller.market_data_provider.time.return_value = float(persisted_timestamp + 60)
+        controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            candles.tail(kwargs["max_records"]).copy()
+        )
+        recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+        original_detect = controller._regime_detector.detect
+        controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            asyncio.run(controller.update_processed_data())
+
+        observed = {
+            "permanent_hold": controller._watermark_permanent_hold,
+            "outcome": controller._watermark_result.outcome.value,
+            "detect_count": controller._regime_detector.detect.call_count,
+            "cas_count": cas.call_count,
+            "proposal_eligible": controller._watermark_proposal_grant,
+            "action_count": len(controller.create_actions_proposal()),
+            "reconstruction_target": controller._watermark_reconstruction_target,
+        }
+        self.assertEqual(
+            observed,
+            {
+                "permanent_hold": True,
+                "outcome": "INVALID_STATE",
+                "detect_count": 0,
+                "cas_count": 0,
+                "proposal_eligible": False,
+                "action_count": 0,
+                "reconstruction_target": persisted_timestamp,
+            },
+        )
+
+    def test_c01_4_missing_or_behind_persisted_candle_holds_before_owner_admission(self):
+        candles = self._c01_4_causal_candles(first_timestamp=1_700_017_500)
+        persisted_timestamp = int(candles.iloc[259]["timestamp"])
+        successor_timestamp = int(candles.iloc[260]["timestamp"])
+        frames = {
+            "missing": candles.iloc[:261].drop(index=259).copy(),
+            "behind": candles.iloc[:259].copy(),
+        }
+
+        for case_id, frame in frames.items():
+            with self.subTest(case_id=case_id):
+                controller = self._buy_controller(atr_pct=None)
+                controller.market_data_provider.time.return_value = float(successor_timestamp + 60)
+                controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+                    frame.tail(kwargs["max_records"]).copy()
+                )
+                recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+                original_cas = recorder.compare_and_advance_controller_candle_watermark
+                original_detect = controller._regime_detector.detect
+                controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+                with patch.object(
+                    recorder,
+                    "compare_and_advance_controller_candle_watermark",
+                    wraps=original_cas,
+                ) as cas:
+                    asyncio.run(controller.update_processed_data())
+
+                self.assertTrue(controller._watermark_permanent_hold)
+                self.assertEqual(
+                    controller._watermark_result.outcome,
+                    ControllerCandleWatermarkOutcome.INVALID_STATE,
+                )
+                self.assertEqual(controller.processed_data["signal"], 0)
+                self.assertEqual(
+                    controller.processed_data["signal_suppression_reason"],
+                    "durable_watermark_invalid_state",
+                )
+                self.assertFalse(controller._watermark_proposal_grant)
+                self.assertEqual(controller.create_actions_proposal(), [])
+                self.assertEqual(controller._regime_detector.detect.call_count, 0)
+                cas.assert_not_called()
+                persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+                self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+                self.assertEqual(persisted.revision, 0)
+
+    def test_c01_4_reconstruction_neutralizes_owner_buy_without_discarding_decision_state(self):
+        controller = self._buy_controller(atr_pct=None)
+        candles = self._c01_4_causal_candles(first_timestamp=1_700_017_500)
+        persisted_timestamp = int(candles.iloc[259]["timestamp"])
+        successor_timestamp = int(candles.iloc[260]["timestamp"])
+        visible = candles.iloc[:261].copy()
+        controller.market_data_provider.time.return_value = float(successor_timestamp + 60)
+        controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            visible.tail(kwargs["max_records"]).copy()
+        )
+        controller._determine_signal = MagicMock(return_value=1)
+        recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            asyncio.run(controller.update_processed_data())
+
+        self.assertEqual(controller._last_evaluated_candle_timestamp, float(persisted_timestamp))
+        self.assertEqual(controller.processed_data["candle_timestamp"], float(persisted_timestamp))
+        self.assertEqual(controller.processed_data["signal_state"]["buy_decision"], "ready")
+        self.assertEqual(controller.processed_data["signal_state"]["buy_reason"], "signal-generated")
+        self.assertEqual(controller.processed_data["signal"], 0)
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_owner_reconstruction",
+        )
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+        self.assertEqual(controller.determine_executor_actions(), [])
+        cas.assert_not_called()
+
+    def test_c01_4_reconstruction_owner_exception_restores_provider_and_holds_without_cas(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller = self._buy_controller(atr_pct=None)
+        persisted_timestamp = 1_700_033_040
+        self._configure_c01_4_causal_feed(
+            controller,
+            persisted_timestamp=persisted_timestamp,
+        )
+        original_provider = controller.market_data_provider
+        recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+
+        async def fail_inside_owner(instance):
+            self.assertIsNot(instance.market_data_provider, original_provider)
+            self.assertEqual(instance.market_data_provider.time(), float(persisted_timestamp + 60))
+            visible = instance.market_data_provider.get_candles_df(
+                connector_name="okx",
+                trading_pair="BTC-USDT",
+                interval="1m",
+                max_records=500,
+            )
+            self.assertEqual(float(visible.iloc[-1]["timestamp"]), float(persisted_timestamp))
+            raise RuntimeError("injected reconstruction owner failure")
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            with patch.object(hl_rsi.HLRSIController, "update_processed_data", new=fail_inside_owner):
+                asyncio.run(controller.update_processed_data())
+
+        self.assertIs(controller.market_data_provider, original_provider)
+        self.assertTrue(controller._watermark_permanent_hold)
+        self.assertEqual(
+            controller._watermark_result.outcome,
+            ControllerCandleWatermarkOutcome.INVALID_STATE,
+        )
+        self.assertIn("RuntimeError", controller._watermark_result.reason)
+        self.assertEqual(controller.processed_data["signal"], 0)
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+        cas.assert_not_called()
+        persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+        self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+        self.assertEqual(persisted.revision, 0)
+
+    def test_c01_4_reconstruction_source_oserror_holds_once_before_owner_or_cas(self):
+        controller = self._buy_controller(atr_pct=None)
+        persisted_timestamp = 1_700_033_040
+        controller.market_data_provider.get_candles_df.side_effect = OSError("injected source failure")
+        recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+        original_detect = controller._regime_detector.detect
+        controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            asyncio.run(controller.update_processed_data())
+            asyncio.run(controller.update_processed_data())
+
+        self.assertTrue(controller._watermark_permanent_hold)
+        self.assertEqual(
+            controller._watermark_result.outcome,
+            ControllerCandleWatermarkOutcome.INVALID_STATE,
+        )
+        self.assertIn("OSError", controller._watermark_result.reason)
+        self.assertEqual(controller.market_data_provider.get_candles_df.call_count, 1)
+        self.assertEqual(controller._regime_detector.detect.call_count, 0)
+        self.assertEqual(controller._watermark_reconstruction_target, persisted_timestamp)
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+        cas.assert_not_called()
+        persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+        self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+        self.assertEqual(persisted.revision, 0)
+
+    def test_c01_4_reconstruction_validates_causal_geometry_before_owner_or_cas(self):
+        base = self._c01_4_causal_candles(
+            first_timestamp=1_700_017_500,
+            count=260,
+        )
+        persisted_timestamp = int(base.iloc[-1]["timestamp"])
+
+        duplicated = pd.concat([base, base.iloc[[-1]]], ignore_index=True)
+        out_of_order = base.copy()
+        out_of_order.iloc[[257, 258]] = out_of_order.iloc[[258, 257]].to_numpy()
+        gapped = base.drop(index=258).reset_index(drop=True)
+        non_finite_target = base.copy()
+        non_finite_target.loc[non_finite_target.index[-1], "close"] = float("nan")
+        defective_frames = {
+            "duplicate_persisted_candle": duplicated,
+            "out_of_order_prefix": out_of_order,
+            "gapped_prefix": gapped,
+            "non_finite_target_close": non_finite_target,
+        }
+
+        for case_id, frame in defective_frames.items():
+            with self.subTest(case_id=case_id):
+                controller = self._buy_controller(atr_pct=None)
+                controller.market_data_provider.time.return_value = float(persisted_timestamp + 60)
+                controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+                    frame.tail(kwargs["max_records"]).copy()
+                )
+                recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+                original_cas = recorder.compare_and_advance_controller_candle_watermark
+                original_detect = controller._regime_detector.detect
+                controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+                with patch.object(
+                    recorder,
+                    "compare_and_advance_controller_candle_watermark",
+                    wraps=original_cas,
+                ) as cas:
+                    asyncio.run(controller.update_processed_data())
+
+                self.assertTrue(controller._watermark_permanent_hold)
+                self.assertEqual(
+                    controller._watermark_result.outcome,
+                    ControllerCandleWatermarkOutcome.INVALID_STATE,
+                )
+                self.assertEqual(controller._regime_detector.detect.call_count, 0)
+                self.assertEqual(controller._watermark_reconstruction_target, persisted_timestamp)
+                self.assertFalse(controller._watermark_proposal_grant)
+                self.assertEqual(controller.create_actions_proposal(), [])
+                cas.assert_not_called()
+                persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+                self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+                self.assertEqual(persisted.revision, 0)
+
+        milliseconds = base.copy()
+        milliseconds["timestamp"] = milliseconds["timestamp"] * 1_000
+
+        seconds_controller = self._buy_controller(atr_pct=None)
+        seconds_controller.market_data_provider.time.return_value = float(persisted_timestamp + 60)
+        seconds_controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            base.tail(kwargs["max_records"]).copy()
+        )
+        self._install_temp_watermark(seconds_controller, timestamp=persisted_timestamp)
+        asyncio.run(seconds_controller.update_processed_data())
+        expected_trend_confirmation = seconds_controller.processed_data["trend_confirmation"]
+
+        controller = self._buy_controller(atr_pct=None)
+        controller.market_data_provider.time.return_value = float(persisted_timestamp + 60)
+        controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            milliseconds.tail(kwargs["max_records"]).copy()
+        )
+        recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+        original_detect = controller._regime_detector.detect
+        controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            asyncio.run(controller.update_processed_data())
+
+        self.assertFalse(controller._watermark_permanent_hold)
+        self.assertEqual(controller._last_evaluated_candle_timestamp, float(persisted_timestamp))
+        self.assertEqual(controller.processed_data["candle_timestamp"], float(persisted_timestamp))
+        self.assertEqual(
+            float(controller.processed_data["features"]["timestamp"].iloc[-1]),
+            float(persisted_timestamp),
+        )
+        self.assertEqual(controller.processed_data["trend_confirmation"], expected_trend_confirmation)
+        self.assertEqual(controller._regime_detector.detect.call_count, 1)
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_owner_reconstruction",
+        )
+        self.assertFalse(controller._watermark_proposal_grant)
+        self.assertEqual(controller.create_actions_proposal(), [])
+        cas.assert_not_called()
+        persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+        self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+        self.assertEqual(persisted.revision, 0)
+
+    def test_c01_4_two_real_controllers_share_one_first_writer_action(self):
+        candles = self._c01_4_causal_candles(
+            first_timestamp=1_700_017_500,
+            count=261,
+        )
+        persisted_timestamp = int(candles.iloc[259]["timestamp"])
+        successor_timestamp = int(candles.iloc[260]["timestamp"])
+        controllers = [
+            self._buy_controller(atr_pct=None),
+            self._buy_controller(atr_pct=None),
+        ]
+        for controller in controllers:
+            controller.market_data_provider.time.return_value = float(successor_timestamp + 60)
+            controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+                candles.tail(kwargs["max_records"]).copy()
+            )
+            controller._determine_signal = MagicMock(return_value=1)
+            original_detect = controller._regime_detector.detect
+            controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+        recorder = self._install_temp_watermark(controllers[0], timestamp=persisted_timestamp)
+        original_cas = recorder.compare_and_advance_controller_candle_watermark
+        with patch.object(
+            recorder,
+            "compare_and_advance_controller_candle_watermark",
+            wraps=original_cas,
+        ) as cas:
+            for controller in controllers:
+                asyncio.run(controller.update_processed_data())
+                self.assertEqual(controller._last_evaluated_candle_timestamp, float(persisted_timestamp))
+                self.assertEqual(
+                    controller.processed_data["signal_suppression_reason"],
+                    "durable_watermark_owner_reconstruction",
+                )
+                self.assertFalse(controller._watermark_proposal_grant)
+                self.assertEqual(controller.create_actions_proposal(), [])
+            cas.assert_not_called()
+
+            for controller in controllers:
+                asyncio.run(controller.update_processed_data())
+
+        outcomes = [controller._watermark_result.outcome for controller in controllers]
+        action_sets = [controller.create_actions_proposal() for controller in controllers]
+        self.assertEqual(
+            outcomes,
+            [
+                ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER,
+                ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+            ],
+        )
+        self.assertEqual([len(actions) for actions in action_sets], [1, 0])
+        self.assertEqual([controller._regime_detector.detect.call_count for controller in controllers], [2, 2])
+        self.assertEqual(cas.call_count, 2)
+        self.assertEqual(
+            [
+                call.kwargs["desired_candle_open_timestamp_s"]
+                for call in cas.call_args_list
+            ],
+            [successor_timestamp, successor_timestamp],
+        )
+        self.assertEqual(controllers[1].processed_data["signal"], 0)
+        self.assertEqual(
+            controllers[1].processed_data["signal_suppression_reason"],
+            "durable_watermark_already_committed",
+        )
+        self.assertEqual(controllers[0].create_actions_proposal(), [])
+        persisted = recorder.load_controller_candle_watermark(controllers[0]._watermark_namespace).state
+        self.assertEqual(persisted.candle_open_timestamp_s, successor_timestamp)
+        self.assertEqual(persisted.revision, 1)
+
+    def test_c01_4_higher_peer_commit_holds_before_later_owner_or_admission(self):
+        controller = self._buy_controller(atr_pct=None)
+        candles = self._c01_4_causal_candles(first_timestamp=1_700_017_500)
+        persisted_timestamp = int(candles.iloc[259]["timestamp"])
+        successor_timestamp = int(candles.iloc[260]["timestamp"])
+        peer_timestamp = int(candles.iloc[261]["timestamp"])
+        visible_rows = {"count": 261}
+        controller.market_data_provider.time.side_effect = lambda: float(
+            candles.iloc[visible_rows["count"] - 1]["timestamp"] + 60
+        )
+        controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            candles.iloc[: visible_rows["count"]].tail(kwargs["max_records"]).copy()
+        )
+
+        namespace = ControllerCandleWatermarkNamespace(
+            controller_id=controller.config.id,
+            connector_name="okx",
+            trading_pair="BTC-USDT",
+            interval="1m",
+        )
+        loaded = ControllerCandleWatermarkState(
+            namespace=namespace,
+            candle_open_timestamp_s=persisted_timestamp,
+            revision=0,
+            schema_version=1,
+            updated_at_ms=(persisted_timestamp + 60) * 1000,
+        )
+        committed_by_peer = ControllerCandleWatermarkState(
+            namespace=namespace,
+            candle_open_timestamp_s=peer_timestamp,
+            revision=1,
+            schema_version=1,
+            updated_at_ms=(peer_timestamp + 60) * 1000,
+        )
+        recorder = MagicMock()
+        recorder.load_controller_candle_watermark.return_value = ControllerCandleWatermarkResult(
+            outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+            state=loaded,
+        )
+        recorder.compare_and_advance_controller_candle_watermark.return_value = (
+            ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+                state=committed_by_peer,
+            )
+        )
+        original_detect = controller._regime_detector.detect
+        controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            asyncio.run(controller.update_processed_data())
+            self.assertEqual(controller._last_evaluated_candle_timestamp, float(persisted_timestamp))
+            self.assertEqual(recorder.compare_and_advance_controller_candle_watermark.call_count, 0)
+
+            asyncio.run(controller.update_processed_data())
+            self.assertEqual(controller._watermark_state, committed_by_peer)
+            self.assertTrue(controller._watermark_permanent_hold)
+            self.assertEqual(
+                controller._watermark_result.outcome,
+                ControllerCandleWatermarkOutcome.INVALID_STATE,
+            )
+            self.assertIn("ahead", controller._watermark_result.reason)
+            self.assertIsNone(controller._watermark_reconstruction_target)
+            self.assertFalse(controller._watermark_proposal_grant)
+            self.assertEqual(controller.create_actions_proposal(), [])
+            self.assertEqual(recorder.compare_and_advance_controller_candle_watermark.call_count, 1)
+            self.assertEqual(
+                recorder.compare_and_advance_controller_candle_watermark.call_args.kwargs[
+                    "desired_candle_open_timestamp_s"
+                ],
+                successor_timestamp,
+            )
+
+            detect_count_at_hold = controller._regime_detector.detect.call_count
+            visible_rows["count"] = 263
+            asyncio.run(controller.update_processed_data())
+            self.assertEqual(controller._regime_detector.detect.call_count, detect_count_at_hold)
+            self.assertFalse(controller._watermark_proposal_grant)
+            self.assertEqual(controller.create_actions_proposal(), [])
+            self.assertEqual(recorder.compare_and_advance_controller_candle_watermark.call_count, 1)
 
     def test_multi_timeframe_market_data_pipeline_produces_finite_causal_state(self):
         controller = self._buy_controller(atr_pct=None)
@@ -530,6 +1576,14 @@ class OKRSIControllerTest(unittest.TestCase):
             )
         candles = pd.DataFrame(rows)
         controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: candles.copy()
+        self._install_temp_watermark(controller, timestamp=int(candles.iloc[-2]["timestamp"]))
+
+        asyncio.run(controller.update_processed_data())
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_owner_reconstruction",
+        )
+        self.assertEqual(controller.processed_data["timestamp"], float(now - 60))
 
         asyncio.run(controller.update_processed_data())
 
@@ -541,19 +1595,71 @@ class OKRSIControllerTest(unittest.TestCase):
         self.assertEqual(controller.processed_data["timestamp"], float(now))
         self.assertLess(controller.processed_data["candle_timestamp"], controller.processed_data["timestamp"])
 
+    def test_market_data_pipeline_evaluates_each_confirmed_candle_only_once(self):
+        controller = self._buy_controller(atr_pct=None)
+        first_timestamp = 1_725_000_000 - (260 * 60)
+        rows = []
+        for index in range(261):
+            close = 50000 + (index * 2) + (120 * math.sin(index / 9))
+            rows.append(
+                {
+                    "timestamp": first_timestamp + (index * 60),
+                    "open": close - 8,
+                    "high": close + 25,
+                    "low": close - 25,
+                    "close": close,
+                    "volume": 100 + (index % 11),
+                    "quote_asset_volume": (100 + (index % 11)) * close,
+                }
+            )
+        candles = pd.DataFrame(rows)
+        visible_rows = {"count": 260}
+        controller.market_data_provider.time.side_effect = lambda: float(
+            candles.iloc[visible_rows["count"] - 1]["timestamp"] + 60
+        )
+        controller.market_data_provider.get_candles_df.side_effect = lambda **kwargs: (
+            candles.iloc[: visible_rows["count"]].tail(kwargs["max_records"]).copy()
+        )
+        self._install_temp_watermark(controller, timestamp=int(candles.iloc[visible_rows["count"] - 2]["timestamp"]))
+        original_detect = controller._regime_detector.detect
+        controller._regime_detector.detect = MagicMock(wraps=original_detect)
+
+        asyncio.run(controller.update_processed_data())
+        reconstructed_timestamp = controller.processed_data["candle_timestamp"]
+        self.assertEqual(controller._regime_detector.detect.call_count, 1)
+        self.assertEqual(
+            controller.processed_data["signal_suppression_reason"],
+            "durable_watermark_owner_reconstruction",
+        )
+
+        asyncio.run(controller.update_processed_data())
+        first_candle_timestamp = controller.processed_data["candle_timestamp"]
+        self.assertGreater(first_candle_timestamp, reconstructed_timestamp)
+        self.assertEqual(controller._regime_detector.detect.call_count, 2)
+        self.assertIsNone(controller.processed_data.get("signal_suppression_reason"))
+
+        controller.processed_data["signal"] = 1
+        asyncio.run(controller.update_processed_data())
+
+        self.assertEqual(controller._regime_detector.detect.call_count, 2)
+        self.assertEqual(controller.processed_data["signal"], 0)
+        self.assertEqual(controller.processed_data["signal_suppression_reason"], "same_candle")
+        self.assertEqual(controller.processed_data["candle_timestamp"], first_candle_timestamp)
+        self.assertNotIn("durable_watermark_hold", controller.processed_data)
+
+        visible_rows["count"] = 261
+        asyncio.run(controller.update_processed_data())
+
+        self.assertEqual(controller._regime_detector.detect.call_count, 3)
+        self.assertIsNone(controller.processed_data.get("signal_suppression_reason"))
+        self.assertGreater(controller.processed_data["candle_timestamp"], first_candle_timestamp)
+
     def test_market_data_pipeline_blocks_stale_duplicate_and_non_finite_candles(self):
         now = 1_725_000_000
-        healthy_rows = [
-            {
-                "timestamp": now - ((40 - index) * 60),
-                "open": 50000 + index,
-                "high": 50010 + index,
-                "low": 49990 + index,
-                "close": 50000 + index,
-                "volume": 100,
-            }
-            for index in range(40)
-        ]
+        healthy_rows = self._c01_4_causal_candles(
+            first_timestamp=now - (260 * 60),
+            count=260,
+        ).to_dict(orient="records")
         invalid_frames = {}
         stale = pd.DataFrame(healthy_rows)
         stale["timestamp"] = stale["timestamp"] - 3600
@@ -568,12 +1674,60 @@ class OKRSIControllerTest(unittest.TestCase):
         for expected_reason, candles in invalid_frames.items():
             with self.subTest(expected_reason=expected_reason):
                 controller = self._buy_controller(atr_pct=None)
+                healthy_frame = pd.DataFrame(healthy_rows)
+                persisted_timestamp = int(healthy_frame.iloc[-1]["timestamp"])
+                controller.market_data_provider.get_candles_df.return_value = healthy_frame
+                recorder = self._install_temp_watermark(controller, timestamp=persisted_timestamp)
+                self._complete_c01_4_owner_reconstruction(
+                    controller,
+                    persisted_timestamp=persisted_timestamp,
+                )
                 controller.market_data_provider.get_candles_df.return_value = candles
-                asyncio.run(controller.update_processed_data())
+                original_cas = recorder.compare_and_advance_controller_candle_watermark
+                with patch.object(
+                    recorder,
+                    "compare_and_advance_controller_candle_watermark",
+                    wraps=original_cas,
+                ) as cas:
+                    asyncio.run(controller.update_processed_data())
 
                 self.assertEqual(controller.processed_data["signal"], 0)
                 self.assertFalse(controller.processed_data["data_health"]["ready"])
                 self.assertEqual(controller.processed_data["data_health"]["reason"], expected_reason)
+                self.assertNotIn("signal_suppression_reason", controller.processed_data)
+                self.assertNotIn("durable_watermark_hold", controller.processed_data)
+                self.assertFalse(controller._watermark_permanent_hold)
+                self.assertFalse(controller._watermark_proposal_grant)
+                cas.assert_not_called()
+                persisted = recorder.load_controller_candle_watermark(controller._watermark_namespace).state
+                self.assertEqual(persisted.candle_open_timestamp_s, persisted_timestamp)
+                self.assertEqual(persisted.revision, 0)
+
+    def test_data_health_requires_exact_interval_after_timestamp_normalization(self):
+        controller = self._buy_controller(atr_pct=None)
+        now = 1_725_000_000.0
+        violations = (
+            ("missing", [now - 240, now - 180, now - 60], "missing_interval"),
+            ("subinterval", [now - 180, now - 150, now - 90], "unexpected_interval"),
+        )
+
+        for violation, timestamps, expected_reason in violations:
+            for unit, multiplier in (("seconds", 1), ("milliseconds", 1_000)):
+                with self.subTest(violation=violation, unit=unit):
+                    candles = pd.DataFrame(
+                        {
+                            "timestamp": [timestamp * multiplier for timestamp in timestamps],
+                            "open": [50_000, 50_001, 50_002],
+                            "high": [50_010, 50_011, 50_012],
+                            "low": [49_990, 49_991, 49_992],
+                            "close": [50_005, 50_006, 50_007],
+                        }
+                    )
+
+                    health = controller._build_data_health(candles, now_ts=now)
+
+                    self.assertFalse(health["ready"])
+                    self.assertEqual(health["reason"], expected_reason)
 
     def test_controller_lifecycle_restarts_cleanly_without_emitting_orders(self):
         from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig

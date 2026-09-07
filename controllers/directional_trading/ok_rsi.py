@@ -17,11 +17,18 @@ from pydantic import field_validator, model_validator
 
 from controllers.directional_trading import hl_rsi
 from hummingbot.client.config.config_data_types import ClientFieldData
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.okx_spot_candles.constants import INTERVALS as OKX_CANDLE_INTERVALS
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model.controller_candle_watermark import (
+    ControllerCandleWatermarkNamespace,
+    ControllerCandleWatermarkOutcome,
+    ControllerCandleWatermarkResult,
+    ControllerCandleWatermarkState,
+)
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
@@ -31,6 +38,9 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
 
 _DECIMAL_CONVERSION_ERRORS = (ArithmeticError, TypeError, ValueError)
 _EXECUTION_INPUT_ERRORS = (ArithmeticError, AttributeError, KeyError, RuntimeError, TypeError, ValueError)
+_RECONSTRUCTION_INPUT_ERRORS = (*_EXECUTION_INPUT_ERRORS, OSError)
+# The inherited owner does not attempt its initial HMM fit below 220 raw rows.
+_OWNER_RECONSTRUCTION_MIN_CANDLES = 220
 
 _CANDLE_VALUE_COLUMNS = ("open", "high", "low", "close")
 _CANDLE_SUM_COLUMNS = (
@@ -76,32 +86,51 @@ def derive_higher_timeframe_candles(
     frame["bucket_timestamp"] = (frame["timestamp"] // target_seconds) * target_seconds
     frame = frame[frame["bucket_timestamp"] + target_seconds <= int(current_time)]
 
-    expected_count = target_seconds // base_seconds
-    records = []
-    for bucket_timestamp, bucket in frame.groupby("bucket_timestamp", sort=True):
-        expected_timestamps = list(
-            range(int(bucket_timestamp), int(bucket_timestamp) + target_seconds, base_seconds)
-        )
-        if bucket["timestamp"].tolist() != expected_timestamps or len(bucket) != expected_count:
-            continue
-        if bucket[numeric_columns].isna().any().any():
-            continue
-        if not bucket[numeric_columns].map(math.isfinite).all().all():
-            continue
-        record = {
-            "timestamp": int(bucket_timestamp),
-            "open": bucket["open"].iloc[0],
-            "high": bucket["high"].max(),
-            "low": bucket["low"].min(),
-            "close": bucket["close"].iloc[-1],
-        }
-        for column in _CANDLE_SUM_COLUMNS:
-            if column in bucket.columns:
-                record[column] = bucket[column].sum()
-        else:
-            records.append(record)
+    if frame.empty:
+        return pd.DataFrame(columns=output_columns)
 
-    return pd.DataFrame(records, columns=output_columns).tail(max_records).reset_index(drop=True)
+    expected_count = target_seconds // base_seconds
+    frame["_offset"] = frame["timestamp"] - frame["bucket_timestamp"]
+    frame["_aligned"] = frame["_offset"].mod(base_seconds).eq(0)
+    frame["_finite"] = pd.Series(
+        pd.notna(frame[numeric_columns]).all(axis=1)
+        & pd.DataFrame(
+            {column: frame[column].map(math.isfinite) for column in numeric_columns},
+            index=frame.index,
+        ).all(axis=1),
+        index=frame.index,
+    )
+    grouped = frame.groupby("bucket_timestamp", sort=True)
+    coverage = grouped.agg(
+        row_count=("timestamp", "size"),
+        unique_timestamp_count=("timestamp", "nunique"),
+        minimum_offset=("_offset", "min"),
+        maximum_offset=("_offset", "max"),
+        aligned=("_aligned", "all"),
+        finite=("_finite", "all"),
+    )
+    complete_buckets = coverage.index[
+        coverage["row_count"].eq(expected_count)
+        & coverage["unique_timestamp_count"].eq(expected_count)
+        & coverage["minimum_offset"].eq(0)
+        & coverage["maximum_offset"].eq(target_seconds - base_seconds)
+        & coverage["aligned"]
+        & coverage["finite"]
+    ]
+    if complete_buckets.empty:
+        return pd.DataFrame(columns=output_columns)
+
+    complete = frame[frame["bucket_timestamp"].isin(complete_buckets)]
+    aggregations = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        **{column: "sum" for column in _CANDLE_SUM_COLUMNS if column in complete.columns},
+    }
+    derived = complete.groupby("bucket_timestamp", sort=True).agg(aggregations).reset_index()
+    derived = derived.rename(columns={"bucket_timestamp": "timestamp"})
+    return derived[output_columns].tail(max_records).reset_index(drop=True)
 
 
 @dataclass(frozen=True)
@@ -361,6 +390,59 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         return self
 
 
+class _ReconstructionMarketDataProvider:
+    """Controller-local causal view used only to reconstruct one persisted candle."""
+
+    def __init__(
+        self,
+        delegate: object,
+        *,
+        candle_connector_name: str,
+        price_connector_name: str,
+        trading_pair: str,
+        interval: str,
+        candles: pd.DataFrame,
+        current_time: float,
+        persisted_close: Decimal,
+    ) -> None:
+        self._delegate = delegate
+        self._candle_connector_name = candle_connector_name
+        self._price_connector_name = price_connector_name
+        self._trading_pair = trading_pair
+        self._interval = interval
+        self._candles = candles.copy(deep=True)
+        self._current_time = current_time
+        self._persisted_close = persisted_close
+
+    def time(self) -> float:
+        return self._current_time
+
+    def get_candles_df(
+        self,
+        connector_name: str,
+        trading_pair: str,
+        interval: str,
+        max_records: int,
+    ) -> pd.DataFrame:
+        if (
+            connector_name != self._candle_connector_name
+            or trading_pair != self._trading_pair
+            or interval != self._interval
+        ):
+            raise ValueError("owner reconstruction requested an unexpected candle namespace")
+        if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records <= 0:
+            raise ValueError("owner reconstruction max_records must be a positive integer")
+        return self._candles.tail(max_records).copy(deep=True)
+
+    def get_price_by_type(self, connector_name: str, trading_pair: str, price_type: PriceType) -> Decimal:
+        if connector_name != self._price_connector_name or trading_pair != self._trading_pair:
+            raise ValueError("owner reconstruction requested an unexpected price namespace")
+        return self._persisted_close
+
+    def __getattr__(self, name: str):
+        return getattr(self._delegate, name)
+
+
 class OKRSIController(hl_rsi.HLRSIController):
     """Shared RSI v5 behavior with OKX spot execution and trailing contracts."""
 
@@ -376,6 +458,370 @@ class OKRSIController(hl_rsi.HLRSIController):
     def __init__(self, config: OKRSIControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
+        self._watermark_namespace: Optional[ControllerCandleWatermarkNamespace] = None
+        self._watermark_state: Optional[ControllerCandleWatermarkState] = None
+        self._watermark_result: Optional[ControllerCandleWatermarkResult] = None
+        self._watermark_recorder: Optional[MarketsRecorder] = None
+        self._watermark_permanent_hold = False
+        self._watermark_proposal_grant = False
+        self._watermark_reconstruction_target: Optional[int] = None
+
+    def _durable_watermark_snapshot(self) -> Dict[str, object]:
+        result = self._watermark_result
+        state = self._watermark_state
+        return {
+            "schema": "CONTROLLER_CANDLE_WATERMARK_V1",
+            "guarantee": "AT_MOST_ONCE_COMPLETED_CANDLE_PROPOSAL_ADMISSION_WITH_OWNER_RECONSTRUCTION_V1",
+            "outcome": result.outcome.value if result is not None else None,
+            "reason": result.reason if result is not None else None,
+            "permanent_hold": self._watermark_permanent_hold,
+            "proposal_eligible": bool(
+                self._watermark_proposal_grant
+                and result is not None
+                and result.proposal_eligible
+            ),
+            "candle_open_timestamp_s": state.candle_open_timestamp_s if state is not None else None,
+            "revision": state.revision if state is not None else None,
+            "owner_reconstruction_pending": self._watermark_reconstruction_target is not None,
+            "restart_required_after_model_registration": True,
+        }
+
+    def _neutralize_for_watermark(self, reason: str) -> None:
+        previous = dict(self.processed_data or {})
+        previous.update(
+            {
+                "signal": 0,
+                "durable_watermark_hold": self._watermark_permanent_hold,
+                "signal_suppression_reason": reason,
+            }
+        )
+        self.processed_data = previous
+
+    def _enter_watermark_hold(self, result: ControllerCandleWatermarkResult) -> None:
+        self._watermark_result = result
+        self._watermark_permanent_hold = True
+        self._watermark_proposal_grant = False
+        self._neutralize_for_watermark(f"durable_watermark_{result.outcome.value.lower()}")
+        self.logger().error(
+            f"Durable candle watermark hold | {self._controller_pair_log_prefix()} "
+            f"outcome={result.outcome.value} reason={result.reason or 'n/a'}"
+        )
+
+    def _load_durable_watermark_before_evaluation(self) -> bool:
+        try:
+            namespace = ControllerCandleWatermarkNamespace(
+                controller_id=self.config.id,
+                connector_name=self.config.candles_connector or self.config.connector_name,
+                trading_pair=self.config.candles_trading_pair or self.config.trading_pair,
+                interval=self.config.interval,
+            )
+        except (TypeError, ValueError) as exc:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                reason=f"invalid controller watermark namespace: {exc}",
+            ))
+            return False
+
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is None:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                reason="MarketsRecorder is unavailable before first evaluation",
+            ))
+            return False
+        try:
+            result = recorder.load_controller_candle_watermark(namespace)
+        except Exception as exc:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                reason=f"watermark load raised {type(exc).__name__}",
+            ))
+            return False
+        if (
+            result.outcome is not ControllerCandleWatermarkOutcome.ALREADY_COMMITTED
+            or result.state is None
+            or result.state.namespace != namespace
+        ):
+            self._enter_watermark_hold(result)
+            return False
+
+        self._watermark_namespace = namespace
+        self._watermark_state = result.state
+        self._watermark_result = result
+        self._watermark_recorder = recorder
+        self._watermark_reconstruction_target = result.state.candle_open_timestamp_s
+        return True
+
+    def _persisted_candle_reconstruction_frame(
+        self,
+        target_timestamp: int,
+    ) -> Optional[tuple[pd.DataFrame, Decimal]]:
+        try:
+            frame = self.market_data_provider.get_candles_df(
+                connector_name=self.config.candles_connector or self.config.connector_name,
+                trading_pair=self.config.candles_trading_pair or self.config.trading_pair,
+                interval=self.config.interval,
+                max_records=self._derived_base_max_records(),
+            )
+        except _RECONSTRUCTION_INPUT_ERRORS as exc:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason=f"owner reconstruction candle read raised {type(exc).__name__}",
+            ))
+            return None
+        if not isinstance(frame, pd.DataFrame) or frame.empty or "timestamp" not in frame.columns:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason="owner reconstruction requires a nonempty timestamped candle frame",
+            ))
+            return None
+
+        frame = frame.copy(deep=True)
+        numeric_timestamps = pd.to_numeric(frame["timestamp"], errors="coerce")
+        if numeric_timestamps.isna().any():
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason="owner reconstruction candle timestamps must be finite integers",
+            ))
+            return None
+        normalized_timestamps = numeric_timestamps.map(
+            lambda value: self._timestamp_to_seconds(float(value))
+        )
+        if not normalized_timestamps.map(
+            lambda value: math.isfinite(float(value)) and float(value).is_integer()
+        ).all():
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason="owner reconstruction candle timestamps must be finite integers",
+            ))
+            return None
+
+        target_matches = normalized_timestamps.eq(float(target_timestamp))
+        if int(target_matches.sum()) != 1:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason="owner reconstruction requires exactly one persisted candle",
+            ))
+            return None
+        target_position = target_matches.tolist().index(True)
+        causal_frame = frame.iloc[: target_position + 1].copy(deep=True)
+        causal_frame["timestamp"] = (
+            normalized_timestamps.iloc[: target_position + 1].astype("int64").to_numpy()
+        )
+        if len(causal_frame) < _OWNER_RECONSTRUCTION_MIN_CANDLES:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason=(
+                    "owner reconstruction requires at least "
+                    f"{_OWNER_RECONSTRUCTION_MIN_CANDLES} causal candles"
+                ),
+            ))
+            return None
+        interval_seconds = self._watermark_state.namespace.interval_seconds
+        health = self._build_data_health(
+            causal_frame,
+            now_ts=float(target_timestamp + interval_seconds),
+        )
+        if (
+            not health.get("ready")
+            or health.get("last_candle_ts") != float(target_timestamp)
+        ):
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason=f"owner reconstruction causal frame is invalid: {health.get('reason')}",
+            ))
+            return None
+
+        try:
+            persisted_close = Decimal(str(causal_frame["close"].iloc[-1]))
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            persisted_close = Decimal("NaN")
+        if not persisted_close.is_finite() or persisted_close <= Decimal("0"):
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason="owner reconstruction persisted close must be positive and finite",
+            ))
+            return None
+        return causal_frame, persisted_close
+
+    async def _reconstruct_persisted_owner_candle(self, target_timestamp: int) -> bool:
+        reconstruction = self._persisted_candle_reconstruction_frame(target_timestamp)
+        if reconstruction is None:
+            return False
+        causal_frame, persisted_close = reconstruction
+        interval_seconds = self._watermark_state.namespace.interval_seconds
+        original_provider = self.market_data_provider
+        self.market_data_provider = _ReconstructionMarketDataProvider(
+            original_provider,
+            candle_connector_name=self.config.candles_connector or self.config.connector_name,
+            price_connector_name=self.config.connector_name,
+            trading_pair=self.config.candles_trading_pair or self.config.trading_pair,
+            interval=self.config.interval,
+            candles=causal_frame,
+            current_time=float(target_timestamp + interval_seconds),
+            persisted_close=persisted_close,
+        )
+        try:
+            await hl_rsi.HLRSIController.update_processed_data(self)
+        except Exception as exc:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason=f"owner reconstruction raised {type(exc).__name__}",
+            ))
+            return False
+        finally:
+            self.market_data_provider = original_provider
+
+        data_health = (self.processed_data or {}).get("data_health")
+        observed_timestamp = (self.processed_data or {}).get("candle_timestamp")
+        if (
+            not isinstance(data_health, dict)
+            or not data_health.get("ready")
+            or not getattr(self._regime_detector, "_is_fit", False)
+            or observed_timestamp != float(target_timestamp)
+            or self._last_evaluated_candle_timestamp != float(target_timestamp)
+        ):
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=self._watermark_state,
+                reason="owner reconstruction did not evaluate the persisted candle",
+            ))
+            return False
+
+        self._watermark_reconstruction_target = None
+        self._watermark_proposal_grant = False
+        self._neutralize_for_watermark("durable_watermark_owner_reconstruction")
+        return True
+
+    async def update_processed_data(self):
+        if self._watermark_permanent_hold:
+            self._neutralize_for_watermark("durable_watermark_permanent_hold")
+            return
+        if self._watermark_state is None and not self._load_durable_watermark_before_evaluation():
+            return
+        if self._watermark_reconstruction_target is not None:
+            await self._reconstruct_persisted_owner_candle(self._watermark_reconstruction_target)
+            return
+
+        prior_state = self._watermark_state
+        await super().update_processed_data()
+        candidate_timestamp = self._last_evaluated_candle_timestamp
+        data_health = (self.processed_data or {}).get("data_health")
+        inherited_suppression = (self.processed_data or {}).get("signal_suppression_reason")
+        if (
+            isinstance(data_health, dict)
+            and data_health.get("ready") is False
+        ) or (
+            candidate_timestamp == float(prior_state.candle_open_timestamp_s)
+            and inherited_suppression is None
+        ):
+            # The inherited owner returned before evaluation. Preserve its
+            # health ledger exactly; loading the row is not an evaluation.
+            self._watermark_proposal_grant = False
+            return
+        if inherited_suppression == "non_advancing_candle":
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.REGRESSION,
+                state=prior_state,
+                reason="owner observed a candle below the loaded durable watermark",
+            ))
+            return
+        if candidate_timestamp is None:
+            self._watermark_proposal_grant = False
+            return
+        if not math.isfinite(float(candidate_timestamp)) or not float(candidate_timestamp).is_integer():
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                state=prior_state,
+                reason="evaluated candle timestamp must be a finite integer",
+            ))
+            return
+
+        desired_timestamp = int(candidate_timestamp)
+        if desired_timestamp < prior_state.candle_open_timestamp_s:
+            self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.REGRESSION,
+                state=prior_state,
+                reason="evaluation regressed below loaded durable watermark",
+            ))
+            return
+        if desired_timestamp == prior_state.candle_open_timestamp_s:
+            self._watermark_result = ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.ALREADY_COMMITTED,
+                state=prior_state,
+            )
+            self._watermark_proposal_grant = False
+            return
+
+        try:
+            updated_at_ms = max(1, int(self.market_data_provider.time() * 1000))
+            result = self._watermark_recorder.compare_and_advance_controller_candle_watermark(
+                prior_state,
+                desired_candle_open_timestamp_s=desired_timestamp,
+                updated_at_ms=updated_at_ms,
+            )
+        except Exception as exc:
+            result = ControllerCandleWatermarkResult(
+                outcome=ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE,
+                state=prior_state,
+                reason=f"watermark compare-and-swap raised {type(exc).__name__}",
+            )
+        if (
+            result.outcome is ControllerCandleWatermarkOutcome.ALREADY_COMMITTED
+            and result.state is not None
+        ):
+            if (
+                result.state.namespace != prior_state.namespace
+                or result.state.candle_open_timestamp_s < desired_timestamp
+            ):
+                self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                    state=result.state,
+                    reason="already-committed watermark did not cover the evaluated candle",
+                ))
+                return
+            self._watermark_result = result
+            self._watermark_state = result.state
+            self._watermark_proposal_grant = False
+            if result.state.candle_open_timestamp_s > desired_timestamp:
+                self._enter_watermark_hold(ControllerCandleWatermarkResult(
+                    outcome=ControllerCandleWatermarkOutcome.INVALID_STATE,
+                    state=result.state,
+                    reason=(
+                        "already-committed watermark is ahead of the evaluated candle; "
+                        "owner state cannot be reconstructed safely"
+                    ),
+                ))
+            else:
+                self._last_evaluated_candle_timestamp = float(result.state.candle_open_timestamp_s)
+                self._neutralize_for_watermark("durable_watermark_already_committed")
+            return
+        if not result.proposal_eligible or result.state is None:
+            self._enter_watermark_hold(result)
+            return
+
+        self._watermark_result = result
+        self._watermark_state = result.state
+        self._watermark_proposal_grant = True
+
+    def create_actions_proposal(self):
+        if (
+            not self._watermark_proposal_grant
+            or self._watermark_result is None
+            or not self._watermark_result.proposal_eligible
+        ):
+            return []
+        self._watermark_proposal_grant = False
+        return super().create_actions_proposal()
 
     def _derived_base_max_records(self) -> int:
         if not self.config.trend_confirmation_enabled:
@@ -453,11 +899,13 @@ class OKRSIController(hl_rsi.HLRSIController):
     def get_custom_info(self) -> dict:
         custom_info = super().get_custom_info()
         custom_info["trailing_policy"] = self._trailing_policy_snapshot()
+        custom_info["durable_evaluation_watermark"] = self._durable_watermark_snapshot()
         return custom_info
 
     def get_status_summary(self) -> Dict[str, object]:
         summary = super().get_status_summary()
         summary["trailing_policy"] = self._trailing_policy_snapshot()
+        summary["durable_evaluation_watermark"] = self._durable_watermark_snapshot()
         return summary
 
     def _trailing_policy_snapshot(self) -> Dict[str, object]:

@@ -4,13 +4,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from controllers.directional_trading.ai_livestream import (
-    AILivestreamController,
-    AILivestreamControllerConfig,
-)
-from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
-    DirectionalTradingControllerBase,
-)
+from controllers.directional_trading.ai_livestream import AILivestreamController, AILivestreamControllerConfig
+from hummingbot.strategy_v2.controllers.directional_trading_controller_base import DirectionalTradingControllerBase
 
 
 @pytest.fixture

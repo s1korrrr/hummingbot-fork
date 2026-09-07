@@ -7,6 +7,7 @@ from controllers.directional_trading.rsi_v5_core.spot_decision_quality import (
     DeferredScaleIn,
     OneShotHarvestState,
     apply_x1_fill,
+    bind_x1_submission,
     evaluate_d1,
     evaluate_x1,
 )
@@ -103,9 +104,81 @@ def test_x1_is_one_shot_quantized_and_restart_safe():
     state = OneShotHarvestState("p")
     proposal = evaluate_x1(state=state, eligible_unreserved_inventory=Decimal("2.03"), activation_reached=True, net_profitable=True, lot_size=Decimal("0.01"))
     assert proposal.quantity == Decimal("0.50")
-    persisted = apply_x1_fill(state, Decimal("0.20"))
-    assert persisted.consumed and persisted.filled_quantity == Decimal("0.20")
-    assert evaluate_x1(state=persisted, eligible_unreserved_inventory=Decimal("1.83"), activation_reached=True, net_profitable=True, lot_size=Decimal("0.01")) is None
+    submitted = bind_x1_submission(state, proposal=proposal, submission_id="order-1")
+    assert submitted.consumed and submitted.filled_quantity == Decimal("0")
+    assert submitted.submission_id == "order-1"
+    assert submitted.submitted_quantity == Decimal("0.50")
+    assert evaluate_x1(state=submitted, eligible_unreserved_inventory=Decimal("1.83"), activation_reached=True, net_profitable=True, lot_size=Decimal("0.01")) is None
+
+
+def test_x1_accounts_two_partial_fills_for_bound_submission():
+    proposal = evaluate_x1(
+        state=OneShotHarvestState("p"),
+        eligible_unreserved_inventory=Decimal("2"),
+        activation_reached=True,
+        net_profitable=True,
+        lot_size=Decimal("0.01"),
+    )
+    state = bind_x1_submission(
+        OneShotHarvestState("p"), proposal=proposal, submission_id="order-1"
+    )
+
+    first = apply_x1_fill(
+        state,
+        submission_id="order-1",
+        fill_event_id="fill-1",
+        fill_quantity=Decimal("0.20"),
+    )
+    second = apply_x1_fill(
+        first,
+        submission_id="order-1",
+        fill_event_id="fill-2",
+        fill_quantity=Decimal("0.30"),
+    )
+
+    assert second.filled_quantity == Decimal("0.50")
+    assert second.processed_fill_event_ids == ("fill-1", "fill-2")
+
+
+def test_x1_rejects_duplicate_unrelated_and_excess_fills():
+    proposal = evaluate_x1(
+        state=OneShotHarvestState("p"),
+        eligible_unreserved_inventory=Decimal("2"),
+        activation_reached=True,
+        net_profitable=True,
+        lot_size=Decimal("0.01"),
+    )
+    state = bind_x1_submission(
+        OneShotHarvestState("p"), proposal=proposal, submission_id="order-1"
+    )
+    state = apply_x1_fill(
+        state,
+        submission_id="order-1",
+        fill_event_id="fill-1",
+        fill_quantity=Decimal("0.20"),
+    )
+
+    with pytest.raises(ValueError, match="already processed"):
+        apply_x1_fill(
+            state,
+            submission_id="order-1",
+            fill_event_id="fill-1",
+            fill_quantity=Decimal("0.20"),
+        )
+    with pytest.raises(ValueError, match="submission does not match"):
+        apply_x1_fill(
+            state,
+            submission_id="order-2",
+            fill_event_id="fill-2",
+            fill_quantity=Decimal("0.10"),
+        )
+    with pytest.raises(ValueError, match="exceeds submitted"):
+        apply_x1_fill(
+            state,
+            submission_id="order-1",
+            fill_event_id="fill-2",
+            fill_quantity=Decimal("0.31"),
+        )
 
 
 def test_x1_yields_to_protective_exit():
@@ -119,9 +192,47 @@ def test_x1_yields_to_protective_exit():
     ) is None
 
 
-def test_x1_zero_fill_does_not_consume_marker():
-    state = apply_x1_fill(OneShotHarvestState("p"), Decimal("0"))
-    assert not state.consumed
+def test_x1_rejects_fill_before_submission_binding():
+    with pytest.raises(ValueError, match="not bound"):
+        apply_x1_fill(
+            OneShotHarvestState("p"),
+            submission_id="order-1",
+            fill_event_id="fill-1",
+            fill_quantity=Decimal("0.1"),
+        )
+
+
+@pytest.mark.parametrize(
+    ("function", "overrides"),
+    [
+        (_evaluate, {"fresh_reference_intent": 1}),
+        (_evaluate, {"protective_exit_pending": "false"}),
+    ],
+)
+def test_d1_rejects_non_boolean_control_inputs(function, overrides):
+    with pytest.raises(ValueError, match="boolean"):
+        function(_deferred(), **overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"activation_reached": 1},
+        {"net_profitable": "true"},
+        {"protective_exit_pending": 0},
+    ],
+)
+def test_x1_rejects_non_boolean_control_inputs(overrides):
+    values = {
+        "state": OneShotHarvestState("p"),
+        "eligible_unreserved_inventory": Decimal("2"),
+        "activation_reached": True,
+        "net_profitable": True,
+        "lot_size": Decimal("0.01"),
+    }
+    values.update(overrides)
+    with pytest.raises(ValueError, match="boolean"):
+        evaluate_x1(**values)
 
 
 def test_non_finite_inputs_fail_closed():

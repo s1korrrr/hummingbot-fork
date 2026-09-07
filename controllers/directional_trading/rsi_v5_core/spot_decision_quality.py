@@ -27,6 +27,9 @@ class OneShotHarvestState:
     program_id: str
     consumed: bool = False
     filled_quantity: Decimal = _ZERO
+    submission_id: str | None = None
+    submitted_quantity: Decimal = _ZERO
+    processed_fill_event_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,10 @@ def evaluate_d1(
         raise ValueError("D1 evaluation bar close must be an integer millisecond value")
     if not isinstance(evaluation_bar_closed, bool):
         raise ValueError("D1 evaluation bar closed marker must be boolean")
+    if not isinstance(fresh_reference_intent, bool) or not isinstance(
+        protective_exit_pending, bool
+    ):
+        raise ValueError("D1 control inputs must be boolean")
     if deferred.resolved:
         return D1Resolution(deferred, D1ResolutionStatus.ALREADY_RESOLVED)
 
@@ -158,6 +165,12 @@ def evaluate_x1(
     tranche_fraction: Decimal = Decimal("0.25"),
     protective_exit_pending: bool = False,
 ) -> SpotDecisionQualityProposal | None:
+    _validate_x1_state(state)
+    if any(
+        not isinstance(value, bool)
+        for value in (activation_reached, net_profitable, protective_exit_pending)
+    ):
+        raise ValueError("X1 control inputs must be boolean")
     values = (eligible_unreserved_inventory, lot_size, tranche_fraction)
     if any(not value.is_finite() for value in values):
         raise ValueError("X1 inputs must be finite")
@@ -182,13 +195,92 @@ def evaluate_x1(
     )
 
 
-def apply_x1_fill(state: OneShotHarvestState, fill_quantity: Decimal) -> OneShotHarvestState:
-    if not fill_quantity.is_finite() or fill_quantity < _ZERO:
-        raise ValueError("fill quantity must be finite and non-negative")
-    if state.consumed and fill_quantity > _ZERO:
-        raise ValueError("X1 tranche already consumed")
-    return OneShotHarvestState(
-        program_id=state.program_id,
-        consumed=state.consumed or fill_quantity > _ZERO,
-        filled_quantity=state.filled_quantity + fill_quantity,
+def _validate_identity(value: str | None, *, name: str) -> str:
+    if value is None or not isinstance(value, str) or value != value.strip() or not value:
+        raise ValueError(f"X1 {name} must be a non-empty canonical string")
+    return value
+
+
+def _validate_x1_state(state: OneShotHarvestState) -> None:
+    _validate_identity(state.program_id, name="program identity")
+    if not isinstance(state.consumed, bool):
+        raise ValueError("X1 consumed marker must be boolean")
+    quantities = (state.filled_quantity, state.submitted_quantity)
+    if any(not isinstance(value, Decimal) or not value.is_finite() for value in quantities):
+        raise ValueError("X1 state quantities must be finite Decimals")
+    if state.filled_quantity < _ZERO or state.submitted_quantity < _ZERO:
+        raise ValueError("X1 state quantities must be non-negative")
+    if not state.consumed:
+        if (
+            state.submission_id is not None
+            or state.submitted_quantity != _ZERO
+            or state.filled_quantity != _ZERO
+            or state.processed_fill_event_ids
+        ):
+            raise ValueError("unconsumed X1 state cannot contain submission or fill state")
+        return
+    _validate_identity(state.submission_id, name="submission identity")
+    if state.submitted_quantity <= _ZERO:
+        raise ValueError("consumed X1 state requires positive submitted quantity")
+    if state.filled_quantity > state.submitted_quantity:
+        raise ValueError("X1 filled quantity exceeds submitted quantity")
+    if not isinstance(state.processed_fill_event_ids, tuple):
+        raise ValueError("X1 processed fill identities must be a tuple")
+    if len(set(state.processed_fill_event_ids)) != len(state.processed_fill_event_ids):
+        raise ValueError("X1 processed fill identities must be unique")
+    for event_id in state.processed_fill_event_ids:
+        _validate_identity(event_id, name="fill event identity")
+
+
+def bind_x1_submission(
+    state: OneShotHarvestState,
+    *,
+    proposal: SpotDecisionQualityProposal,
+    submission_id: str,
+) -> OneShotHarvestState:
+    _validate_x1_state(state)
+    _validate_identity(submission_id, name="submission identity")
+    if state.consumed:
+        raise ValueError("X1 tranche already has a bound submission")
+    if (
+        proposal.program_id != state.program_id
+        or proposal.side != "SELL"
+        or proposal.reason != "X1_ONE_SHOT_PROFIT_HARVEST"
+    ):
+        raise ValueError("X1 proposal does not match harvest state")
+    if not isinstance(proposal.quantity, Decimal) or not proposal.quantity.is_finite() or proposal.quantity <= _ZERO:
+        raise ValueError("X1 proposal quantity must be a finite positive Decimal")
+    return replace(
+        state,
+        consumed=True,
+        submission_id=submission_id,
+        submitted_quantity=proposal.quantity,
+    )
+
+
+def apply_x1_fill(
+    state: OneShotHarvestState,
+    *,
+    submission_id: str,
+    fill_event_id: str,
+    fill_quantity: Decimal,
+) -> OneShotHarvestState:
+    _validate_x1_state(state)
+    _validate_identity(submission_id, name="submission identity")
+    _validate_identity(fill_event_id, name="fill event identity")
+    if not isinstance(fill_quantity, Decimal) or not fill_quantity.is_finite() or fill_quantity <= _ZERO:
+        raise ValueError("fill quantity must be a finite positive Decimal")
+    if not state.consumed or state.submission_id is None:
+        raise ValueError("X1 fill is not bound to a submitted harvest order")
+    if submission_id != state.submission_id:
+        raise ValueError("X1 fill submission does not match bound order")
+    if fill_event_id in state.processed_fill_event_ids:
+        raise ValueError("X1 fill event was already processed")
+    filled_quantity = state.filled_quantity + fill_quantity
+    if filled_quantity > state.submitted_quantity:
+        raise ValueError("X1 accumulated fill exceeds submitted quantity")
+    return replace(
+        state,
+        filled_quantity=filled_quantity,
+        processed_fill_event_ids=state.processed_fill_event_ids + (fill_event_id,),
     )

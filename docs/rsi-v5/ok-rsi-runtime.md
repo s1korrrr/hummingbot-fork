@@ -16,7 +16,7 @@ pair in `conf/controllers/`, reference those filenames from a script YAML in
 `conf/scripts/`, and start it with:
 
 ```text
-start --v2 ok_rsi_buy_sell.yml
+start --v2 ok_rsi.yml
 ```
 
 The grouped inventory-only launcher uses `scripts/ok_rsi_sell_only.py`. Its
@@ -141,6 +141,50 @@ reuse or dynamically mutate the ordinary PositionExecutor trailing barrier.
 - In `sell_only`, inventory worth less than `sell_all_below_quote` is sold in
   full; otherwise `sell_only_inventory_fraction` is targeted. Trading-rule and
   available-balance bounds remain authoritative.
+
+## Legacy history and inventory migration
+
+The canonical buy/sell runtime identity is `ok_rsi.yml`, which creates
+`data/ok_rsi.sqlite`. Its controller IDs are `ok-rsi-btc`, `ok-rsi-eth`,
+`ok-rsi-sol`, `ok-rsi-xrp`, and `ok-rsi-bnb`. Each controller YAML records its
+corresponding `rsi-v5-*-usdc-1m` ID in `legacy_controller_ids`; this is a
+reporting/provenance mapping, not permission to mix legacy executors into
+current cooldown, position, or order decisions.
+
+Use `scripts/ok_rsi_wallet_snapshot.py` to capture authenticated balances
+without producing controller, executor, order, or cancel actions. The one-shot
+migration CLI is dry-run by default:
+
+```text
+conda run -n hummingbot python bin/ok_rsi_history_migration.py \
+  --source data/rsi_v5.sqlite \
+  --target data/ok_rsi.sqlite \
+  --wallet-snapshot data/ok_rsi_wallet_snapshot.json \
+  --receipt data/ok_rsi_migration_receipt.json \
+  --dry-run
+```
+
+The source database is immutable. Legacy rows retain their original Binance
+connector, pair, controller, and config provenance. Current OKX inventory is
+represented by separate deterministic `Position` and `PositionHoldLedger`
+seeds whose payload explicitly says that the seed is not an exchange fill.
+The planner rejects a wallet balance below the source tracked amount; it never
+creates a position for inventory that the authenticated wallet cannot prove.
+Excess wallet inventory is reported as untracked and is not assigned a
+fabricated average price.
+
+Reported minimum-signal and recovery-arm prices include migrated cumulative
+fees per tracked base unit because the controller gates both paths on net PnL,
+not gross price appreciation. They remain conditional eligibility levels: RSI,
+reversal/trailing state, exchange quantization, spread, and available balance
+still determine whether and where an order is eventually submitted or filled.
+
+Before `--apply`, make SQLite online backups, verify integrity, stop every
+writer, and review all five reconciliations. Apply requires the exact dry-run
+receipt and rechecks source, target, and wallet-snapshot checksums. Verification
+then requires the applied target checksum, integrity result, and deterministic
+seed counts. The tool never uses `INSERT OR REPLACE` and never relabels a
+legacy fill as OKX.
 
 ## Operational limits
 

@@ -53,6 +53,7 @@ class V2WithControllers(StrategyV2Base):
         self._risk_persistence_enabled = any(getattr(c.config, 'controller_name', '') == 'ok_rsi'
                                              for c in self.controllers.values())
         self._last_risk_state = None
+        self._risk_reconciliation_error: Optional[str] = None
         if self._risk_persistence_enabled:
             try:
                 recorder = MarketsRecorder.get_instance()
@@ -80,12 +81,16 @@ class V2WithControllers(StrategyV2Base):
                     for cid in self.drawdown_exited_controllers:
                         self.controllers[cid].stop()
                 self._persist_risk_state()
-            except Exception:
+            except Exception as error:
                 self._is_stop_triggered = True
+                self._risk_reconciliation_error = str(error) or type(error).__name__
                 self.logger().exception('Risk state unavailable; execution blocked pending reconciliation')
 
     def _persist_risk_state(self):
         if not getattr(self, '_risk_persistence_enabled', False):
+            return
+        if getattr(self, '_risk_reconciliation_error', None) is not None:
+            # Preserve missing/malformed evidence; defaults cannot reconstruct account peaks.
             return
         state = {'version': 1, 'controllers': sorted(self.controllers),
                  'max_global_pnl': str(self.max_global_pnl),
@@ -99,6 +104,9 @@ class V2WithControllers(StrategyV2Base):
 
     def validate_create_action(self, action):
         # Called after fresh reports and immediately before executor creation.
+        if getattr(self, '_risk_reconciliation_error', None) is not None:
+            self._is_stop_triggered = True
+            return False
         try:
             self.process_operator_events()
             self.check_manual_kill_switch()
@@ -109,6 +117,15 @@ class V2WithControllers(StrategyV2Base):
             self._is_stop_triggered = True
             self.logger().exception('Risk check or persistence failed; new execution blocked')
             return False
+
+    def format_status(self) -> str:
+        status = super().format_status()
+        error = getattr(self, '_risk_reconciliation_error', None)
+        if error is not None:
+            return f"EXECUTION BLOCKED: risk reconciliation required: {error}\n\n{status}"
+        if self._is_stop_triggered:
+            return f"EXECUTION BLOCKED: strategy stop is latched; verify durable risk state before restart.\n\n{status}"
+        return status
 
     def on_tick(self):
         super().on_tick()

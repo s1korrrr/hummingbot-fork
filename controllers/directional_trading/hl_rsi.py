@@ -3823,7 +3823,7 @@ class HLRSIController(DirectionalTradingControllerBase):
         Additional indicators each contribute 0 or 1:
         - bb_score: close <= lower Bollinger Band
         - macd_score: MACD histogram turning positive
-        - mean_reversion_score: high probability of mean reversion (RSI extreme)
+        - mean_reversion_score: uncalibrated symmetric RSI extremeness (0-1)
         """
         score_details = self._compute_signal_score_details(
             last_rsi=last_rsi,

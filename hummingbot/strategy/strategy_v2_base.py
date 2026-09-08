@@ -170,8 +170,9 @@ class StrategyV2ConfigBase(BaseClientModel):
         loaded_configs = []
         for config_path in self.controllers_config:
             full_path = os.path.join(settings.CONTROLLERS_CONF_DIR_PATH, config_path)
-            with open(full_path, 'r') as file:
-                config_data = yaml.safe_load(file)
+            from hummingbot.client.native_sources import read_config_text
+
+            config_data = yaml.safe_load(read_config_text(full_path))
 
             controller_type = config_data.get('controller_type')
             controller_name = config_data.get('controller_name')
@@ -404,7 +405,10 @@ class StrategyV2Base(StrategyPyBase):
         if self.controllers:
             self.update_executors_info()
             self._sync_runtime_state_to_db_if_due()
-            self._write_chart_snapshots_if_due()
+            try:
+                self._write_chart_snapshots_if_due()
+            except Exception:
+                self.logger().exception("Chart snapshot persistence failed; pending rows will retry")
             self._write_runtime_status_snapshot_if_due()
             self.update_controllers_configs()
             if self.market_data_provider.ready and not self._is_stop_triggered:
@@ -414,7 +418,7 @@ class StrategyV2Base(StrategyPyBase):
                         continue
                     self.executor_orchestrator.execute_action(action)
 
-    async def on_stop(self):
+    async def on_stop(self, strict: bool = False):
         """
         Called when the strategy is stopped. Shuts down controllers, executors, and market data provider.
         """
@@ -428,15 +432,27 @@ class StrategyV2Base(StrategyPyBase):
         if self.listen_to_executor_actions_task:
             self.listen_to_executor_actions_task.cancel()
         keep_position_by_controller = self._shutdown_keep_position_preferences()
-        await self.executor_orchestrator.stop(
-            self.max_executors_close_attempts,
-            keep_position_by_controller=keep_position_by_controller,
-        )
+        if strict:
+            result = await self.executor_orchestrator.stop(
+                self.max_executors_close_attempts,
+                keep_position_by_controller=keep_position_by_controller,
+                strict=True,
+            )
+            if not result.reconciliation_complete:
+                return result
+        else:
+            await self.executor_orchestrator.stop(
+                self.max_executors_close_attempts,
+                keep_position_by_controller=keep_position_by_controller,
+            )
         self.market_data_provider.stop()
-        self.executor_orchestrator.store_all_executors()
+        if not strict:
+            self.executor_orchestrator.store_all_executors()
         if self.mqtt_enabled:
             self._pub({controller_id: {} for controller_id in self.controllers.keys()})
             self._pub = None
+        if strict:
+            return result
 
     def _shutdown_keep_position_preferences(self) -> Dict[str, bool]:
         preferences: Dict[str, bool] = {}
@@ -712,9 +728,12 @@ class StrategyV2Base(StrategyPyBase):
             if not callable(build_fn):
                 continue
             rows = build_fn(bot_name=bot_name)
-            for row in rows:
-                recorder.store_or_update_chart_snapshot(row)
+            if rows:
+                recorder.store_or_update_chart_snapshots(rows)
                 wrote_rows = True
+            acknowledge = getattr(controller, "chart_snapshot_rows_persisted", None)
+            if callable(acknowledge):
+                acknowledge(rows)
             if prune_enabled:
                 prune_fn = getattr(controller, "chart_snapshot_prune_requests", None)
                 if callable(prune_fn):

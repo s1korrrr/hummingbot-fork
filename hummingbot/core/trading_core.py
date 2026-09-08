@@ -422,6 +422,7 @@ class TradingCore:
         """Load YAML configuration file for V2 strategies."""
         import yaml
 
+        from hummingbot.client.native_sources import NativeSourceMismatch, read_config_text
         from hummingbot.client.settings import SCRIPT_STRATEGY_CONF_DIR_PATH
 
         try:
@@ -432,8 +433,9 @@ class TradingCore:
                 # Assume it's in the V2 strategy config directory
                 config_path = SCRIPT_STRATEGY_CONF_DIR_PATH / config_file_path
 
-            with open(config_path, 'r') as file:
-                return yaml.safe_load(file)
+            return yaml.safe_load(read_config_text(config_path))
+        except NativeSourceMismatch:
+            raise
         except Exception as e:
             self.logger().warning(f"Failed to load config file {config_file_path}: {e}")
             return {}
@@ -601,8 +603,28 @@ class TradingCore:
             self.logger().error(f"Failed to stop strategy: {e}")
             return False
 
-    async def cancel_outstanding_orders(self) -> bool:
-        """Cancel all outstanding orders."""
+    async def cancel_outstanding_orders(self, strict: bool = False) -> bool:
+        """Cancel orders; strict native shutdown requires explicit outcomes and an empty tracker."""
+        if strict:
+            try:
+                for connector in self.connector_manager.connectors.values():
+                    expected = {order.client_order_id for order in connector.limit_orders}
+                    tracked = getattr(connector, "in_flight_orders", {})
+                    expected.update(order_id for order_id, order in tracked.items() if not order.is_done)
+                    if expected:
+                        results = await connector.cancel_all(self.KILL_TIMEOUT)
+                        successful = {result.order_id for result in results if result.success is True}
+                        if not expected.issubset(successful):
+                            return False
+                    if connector.limit_orders or any(not order.is_done for order in getattr(connector, "in_flight_orders", {}).values()):
+                        return False
+                    verify = getattr(connector, "native_orders_reconciled", None)
+                    if not callable(verify) or await verify() is not True:
+                        return False
+                return bool(self.connector_manager.connectors)
+            except Exception:
+                self.logger().exception("Strict native cancellation reconciliation failed")
+                return False
         try:
             cancellation_tasks = []
             for connector in self.connector_manager.connectors.values():

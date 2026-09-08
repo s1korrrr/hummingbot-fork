@@ -58,30 +58,32 @@ class RemoteIfaceMQTTTests(TestCase):
     def setUp(self) -> None:
         super().setUp()
 
-        self._original_async_loop = asyncio.get_event_loop()
+        try:
+            self._original_async_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._original_async_loop = None
         self.async_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.async_loop)
+        self.addCleanup(self._close_async_loop)
 
         self.client_config_map = ClientConfigAdapter(ClientConfigMap())
         self.client_config_map.instance_id = self.instance_id
-        self.hbapp = HummingbotApplication(client_config_map=self.client_config_map)
+        self.client_config_map.mqtt_bridge.mqtt_autostart = False
         self.client_config_map.mqtt_bridge.mqtt_port = 1888
         self.client_config_map.mqtt_bridge.mqtt_commands = 1
         self.client_config_map.mqtt_bridge.mqtt_events = 1
+        self.hbapp = HummingbotApplication(client_config_map=self.client_config_map, headless_mode=True)
+        main_app_patch = patch.object(HummingbotApplication, '_main_app', self.hbapp)
+        main_app_patch.start()
+        self.addCleanup(main_app_patch.stop)
 
         self.log_records = []
         # self.async_run_with_timeout(read_system_configs_from_yml())
-        self.gateway = MQTTGateway(self.hbapp)
-        self.test_market: MockPaperExchange = MockPaperExchange(
-            client_config_map=self.client_config_map)
-        self.hbapp.markets = {
-            "test_market_paper_trade": self.test_market
-        }
+        self.test_market: MockPaperExchange = MockPaperExchange()
+        self.hbapp.trading_core.connector_manager.connectors["test_market_paper_trade"] = self.test_market
         self.resume_test_event = asyncio.Event()
         self.hbapp.logger().setLevel(1)
         self.hbapp.logger().addHandler(self)
-        self.gateway.logger().setLevel(1)
-        self.gateway.logger().addHandler(self)
         # Restart interval Patcher
         self.restart_interval_patcher = patch(
             'hummingbot.remote_iface.mqtt.MQTTGateway._INTERVAL_RESTART_SHORT',
@@ -97,6 +99,9 @@ class RemoteIfaceMQTTTests(TestCase):
         self.addCleanup(self.mqtt_transport_patcher.stop)
         self.mqtt_transport_mock = self.mqtt_transport_patcher.start()
         self.mqtt_transport_mock.side_effect = self.fake_mqtt_broker.create_transport
+        self.gateway = MQTTGateway(self.hbapp)
+        self.gateway.logger().setLevel(1)
+        self.gateway.logger().addHandler(self)
         # MQTT Patch Loggers Patcher
         self.patch_loggers_patcher = patch(
             'hummingbot.remote_iface.mqtt.MQTTGateway.patch_loggers'
@@ -115,11 +120,16 @@ class RemoteIfaceMQTTTests(TestCase):
         self.mqtt_transport_patcher.stop()
         self.patch_loggers_patcher.stop()
 
-        self.async_loop.stop()
+        super().tearDown()
+
+    def _close_async_loop(self):
+        pending = asyncio.all_tasks(self.async_loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            self.async_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         self.async_loop.close()
         asyncio.set_event_loop(self._original_async_loop)
-
-        super().tearDown()
 
     def handle(self, record):
         self.log_records.append(record)
@@ -475,7 +485,7 @@ class RemoteIfaceMQTTTests(TestCase):
             strategy_status_mock: AsyncMock
     ):
         strategy_status_mock.side_effect = self._create_exception_and_unlock_test_with_event_async
-        self.hbapp.strategy = {}
+        self.hbapp.trading_core.strategy = {}
         self.start_mqtt()
         self.fake_mqtt_broker.publish_to_subscription(
             self.get_topic_for(self.STATUS_URI),
@@ -485,7 +495,7 @@ class RemoteIfaceMQTTTests(TestCase):
         msg = {'status': 200, 'msg': '', 'data': ''}
         self.async_run_with_timeout(self.wait_for_rcv(topic, msg, msg_key='data'), timeout=10)
         self.assertTrue(self.is_msg_received(topic, msg, msg_key='data'))
-        self.hbapp.strategy = None
+        self.hbapp.trading_core.strategy = None
 
     @patch("hummingbot.client.command.status_command.StatusCommand.strategy_status", new_callable=AsyncMock)
     def test_mqtt_command_status_sync(
@@ -493,7 +503,7 @@ class RemoteIfaceMQTTTests(TestCase):
             strategy_status_mock: AsyncMock
     ):
         strategy_status_mock.side_effect = self._create_exception_and_unlock_test_with_event_async
-        self.hbapp.strategy = {}
+        self.hbapp.trading_core.strategy = {}
         self.start_mqtt()
         self.fake_mqtt_broker.publish_to_subscription(
             self.get_topic_for(self.STATUS_URI),
@@ -503,7 +513,7 @@ class RemoteIfaceMQTTTests(TestCase):
         msg = {'status': 400, 'msg': 'Some error', 'data': ''}
         self.async_run_with_timeout(self.wait_for_rcv(topic, msg, msg_key='data'), timeout=10)
         self.assertTrue(self.is_msg_received(topic, msg, msg_key='data'))
-        self.hbapp.strategy = None
+        self.hbapp.trading_core.strategy = None
 
     @patch("hummingbot.client.command.status_command.StatusCommand.strategy_status", new_callable=AsyncMock)
     def test_mqtt_command_status_failure(
@@ -654,49 +664,115 @@ class RemoteIfaceMQTTTests(TestCase):
         self.gateway._subscribers = prev__sub
         self.gateway._start_health_monitoring_loop = tmp
 
-    @patch("hummingbot.remote_iface.mqtt.MQTTGateway.health", new_callable=PropertyMock)
-    def test_mqtt_gateway_check_health_restarts(
-            self,
-            health_mock: PropertyMock
-    ):
-        health_mock.return_value = True
+    def test_mqtt_gateway_check_health_restarts(self):
+        # Health debounce has a controlled-clock regression in test_native_mqtt_health.
+        # Exercise the actual reconnect boundary without wall-clock sleeps or logs.
+        self.gateway.start(with_health=False)
+        self.hbapp.trading_core.strategy = MagicMock()
         status_topic = f"hbot/{self.instance_id}/status_updates"
-        self.start_mqtt()
-        self.async_run_with_timeout(
-            self.wait_for_logged("DEBUG", f"Started Heartbeat Publisher <hbot/{self.instance_id}/hb>"), timeout=10)
-        self.async_run_with_timeout(self.wait_for_rcv(status_topic, 'online'), timeout=10)
-        self.async_run_with_timeout(self.wait_for_logged("DEBUG", "Monitoring MQTT Gateway health for disconnections."),
-                                    timeout=10)
-        self.log_records.clear()
-        health_mock.return_value = False
-        self.restart_interval_mock.return_value = None
-        self.async_run_with_timeout(
-            self.wait_for_logged("WARNING", "MQTT Gateway is disconnected, attempting to reconnect."), timeout=10)
-        fake_err = "'<=' not supported between instances of 'NoneType' and 'int'"
-        self.async_run_with_timeout(self.wait_for_logged("ERROR",
-                                                         f"MQTT Gateway failed to reconnect: TypeError: {fake_err}. Sleeping 10 seconds before retry."),
-                                    timeout=10)
-        self.assertFalse(
-            self._is_logged(
-                "WARNING",
-                "MQTT Gateway successfully reconnected.",
-            )
-        )
+        self.assertTrue(self.gateway._check_connections())
+        previous_services = list(self.gateway._rpc_services)
+        with patch("hummingbot.remote_iface.mqtt.asyncio.sleep", new_callable=AsyncMock):
+            self.async_run_with_timeout(self.gateway._restart_gateway())
+        self.assertTrue(self.gateway.health)
+        self.assertFalse(self.gateway._restarting)
         self.assertTrue(self.is_msg_received(status_topic, 'offline'))
-        self.log_records.clear()
-        self.restart_interval_mock.return_value = 0.0
-        self.hbapp.strategy = True
-        self.async_run_with_timeout(
-            self.wait_for_logged("WARNING", "MQTT Gateway is disconnected, attempting to reconnect."), timeout=10)
-        health_mock.return_value = True
-        self.async_run_with_timeout(self.wait_for_logged("WARNING", "MQTT Gateway successfully reconnected."),
-                                    timeout=10)
-        self.assertTrue(
-            self._is_logged(
-                "WARNING",
-                "MQTT Gateway successfully reconnected.",
-            )
-        )
+        self.assertTrue(self.is_msg_received(status_topic, 'online'))
+        self.assertTrue(self.gateway._rpc_services)
+        self.assertFalse(any(service in previous_services for service in self.gateway._rpc_services))
+        self.assertIn(self.test_market, self.gateway._market_events._markets)
+
+    def test_reconnect_preserves_retained_publishers_and_listeners_twice(self):
+        from hummingbot.remote_iface.mqtt import EMTopicPublisher, ETopicListener, ETopicPublisher
+        self.gateway.start(with_health=False)
+        publisher = ETopicPublisher('performance', use_bot_prefix=True)
+        multi = EMTopicPublisher(use_bot_prefix=True)
+        callback = MagicMock()
+        listener = ETopicListener('retained', callback)
+        external_callback = MagicMock()
+        self.gateway.add_external_event_listener('test', external_callback)
+        for generation in range(2):
+            old_publisher = publisher._pub
+            with patch("hummingbot.remote_iface.mqtt.asyncio.sleep", new_callable=AsyncMock):
+                self.async_run_with_timeout(self.gateway._restart_gateway())
+            self.assertIsNot(publisher._pub, old_publisher)
+            self.assertIn(publisher._pub, self.gateway._publishers)
+            self.assertTrue(publisher._pub._transport.is_connected)
+            self.assertIn(multi._pub, self.gateway._publishers)
+            self.assertIn(listener._sub, self.gateway._subscribers)
+            publisher.send({'generation': generation})
+            multi.send('other', {'generation': generation})
+            self.fake_mqtt_broker.publish_to_subscription(listener._topic, {'generation': generation})
+            self.assertEqual(callback.call_count, generation + 1)
+            self.assertIn(external_callback, self.gateway._external_events._listeners['test'])
+            from hummingbot.remote_iface.messages import ExternalEventMessage
+            self.gateway._external_events._on_event_arrived(ExternalEventMessage(), 'hbot/TEST_ID/event/test')
+            self.assertEqual(external_callback.call_count, generation + 1)
+            self.assertTrue(self.gateway.health)
+        listener.stop()
+
+    def test_reconnect_transport_teardown_is_responsive_and_cancellation_serialized(self):
+        import threading
+        self.gateway.start(with_health=False)
+        self.gateway._INTERVAL_RESTART_SHORT = 0
+        self.gateway._INTERVAL_RESTART_LONG = 0
+        entered = asyncio.Event()
+        release = threading.Event()
+
+        from commlib.node import Node
+        real_stop = Node.stop
+
+        def delayed_stop():
+            self.async_loop.call_soon_threadsafe(entered.set)
+            release.wait(0.5)
+            real_stop(self.gateway)
+
+        async def exercise():
+            with patch('hummingbot.remote_iface.mqtt.Node.stop', side_effect=delayed_stop) as stop:
+                first = asyncio.create_task(self.gateway._restart_gateway())
+                await asyncio.wait_for(entered.wait(), 1)
+                self.assertFalse(release.is_set())
+                first.cancel()
+                await asyncio.sleep(0)
+                self.assertFalse(first.done())
+                # A concurrent health probe must not publish recovery mid-rebind.
+                self.gateway._health = True
+                self.assertFalse(self.gateway.health)
+                with self.assertRaises(RuntimeError):
+                    self.gateway.start(with_health=False)
+                second = asyncio.create_task(self.gateway._restart_gateway())
+                await asyncio.sleep(0)
+                self.assertEqual(stop.call_count, 1)
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                await second
+                self.assertEqual(stop.call_count, 2)
+                self.assertTrue(self.gateway.health)
+        try:
+            self.async_run_with_timeout(exercise(), timeout=3)
+        finally:
+            release.set()
+
+    def test_reconnect_stops_disconnected_transport_before_replacing_it(self):
+        self.gateway.start(with_health=False)
+        endpoint = self.gateway._publishers[0]
+        endpoint._transport._connected = False
+        with patch.object(endpoint._transport, 'stop', wraps=endpoint._transport.stop) as stop, \
+                patch("hummingbot.remote_iface.mqtt.asyncio.sleep", new_callable=AsyncMock):
+            self.async_run_with_timeout(self.gateway._restart_gateway())
+        stop.assert_called()
+        self.assertTrue(self.gateway.health)
+
+    def test_reconnect_teardown_failure_does_not_start_new_transport(self):
+        self.gateway.start(with_health=False)
+        with patch.object(self.gateway, '_stop_node_transports', side_effect=RuntimeError('teardown failed')), \
+                patch.object(self.gateway, 'start') as start, \
+                patch("hummingbot.remote_iface.mqtt.asyncio.sleep", new_callable=AsyncMock):
+            self.async_run_with_timeout(self.gateway._restart_gateway())
+        start.assert_not_called()
+        self.assertFalse(self.gateway.health)
+        self.assertFalse(self.gateway._restarting)
 
     def test_mqtt_gateway_stop(self):
         self.start_mqtt()
@@ -994,9 +1070,15 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
         logger = MagicMock()
         hb_app = MagicMock()
         hb_app.logger.return_value = logger
-        hb_app.strategy = None
+        hb_app.trading_core.strategy = None
         gateway._hb_app = hb_app
         gateway._restarting = False
+        gateway._reconnect_lock = asyncio.Lock()
+        gateway._reconnect_owner = None
+        gateway._retained_publishers = set()
+        gateway._retained_listeners = set()
+        gateway._external_events = None
+        gateway._stop_transports_for_reconnect = AsyncMock()
         gateway._health = True
         gateway._publishers = ["old-publisher"]
         gateway._subscribers = ["old-subscriber"]
@@ -1014,7 +1096,7 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
 
         asyncio.run(run_restart())
 
-        gateway.stop.assert_called_once_with(False)
+        gateway._stop_transports_for_reconnect.assert_awaited_once_with()
         gateway._reset_node_executor_after_stop.assert_called_once()
         gateway.start.assert_called_once_with(False)
         self.assertEqual("new-params", gateway._params)
@@ -1032,9 +1114,15 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
         logger = MagicMock()
         hb_app = MagicMock()
         hb_app.logger.return_value = logger
-        hb_app.strategy = object()
+        hb_app.trading_core.strategy = object()
         gateway._hb_app = hb_app
         gateway._restarting = False
+        gateway._reconnect_lock = asyncio.Lock()
+        gateway._reconnect_owner = None
+        gateway._retained_publishers = set()
+        gateway._retained_listeners = set()
+        gateway._external_events = None
+        gateway._stop_transports_for_reconnect = AsyncMock()
         gateway._health = False
         gateway._publishers = ["old-publisher"]
         gateway._subscribers = ["old-subscriber"]
@@ -1054,7 +1142,7 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
 
         asyncio.run(run_restart())
 
-        gateway.stop.assert_called_once_with(False)
+        gateway._stop_transports_for_reconnect.assert_awaited_once_with()
         gateway._reset_node_executor_after_stop.assert_called_once()
         gateway.start.assert_called_once_with(False)
         gateway.start_market_events_fw.assert_called_once()
@@ -1074,6 +1162,12 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
         )
         gateway._hb_app = hb_app
         gateway._restarting = False
+        gateway._reconnect_lock = asyncio.Lock()
+        gateway._reconnect_owner = None
+        gateway._retained_publishers = set()
+        gateway._retained_listeners = set()
+        gateway._external_events = None
+        gateway._stop_transports_for_reconnect = AsyncMock()
         gateway._health = False
         gateway._publishers = ["old-publisher"]
         gateway._subscribers = ["old-subscriber"]

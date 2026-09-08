@@ -5,6 +5,7 @@ from collections import deque
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
+from hummingbot.client.native_lifecycle import ShutdownResult
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.logger import HummingbotLogger
@@ -982,11 +983,30 @@ class ExecutorOrchestrator:
 
     async def stop(self,
                    max_executors_close_attempts: int = 3,
-                   keep_position_by_controller: Optional[Dict[str, bool]] = None):
+                   keep_position_by_controller: Optional[Dict[str, bool]] = None,
+                   strict: bool = False):
         """
         Stop the orchestrator task and all active executors.
         """
         keep_position_by_controller = keep_position_by_controller or {}
+        if strict:
+            try:
+                for controller_id, executors in self.active_executors.items():
+                    for executor in executors:
+                        if not executor.is_closed:
+                            executor.early_stop(keep_position=keep_position_by_controller.get(controller_id, False))
+                for _ in range(max_executors_close_attempts):
+                    if all(executor.executor_info.is_done for executors in self.active_executors.values() for executor in executors):
+                        break
+                    await asyncio.sleep(2.0)
+                if any(not executor.executor_info.is_done for executors in self.active_executors.values() for executor in executors):
+                    return ShutdownResult(False, "Executor shutdown timed out; runtime collections retained")
+                self.store_all_positions(clear=False, strict=True)
+                self.store_all_executors(clear=False)
+                return ShutdownResult(True)
+            except Exception as error:
+                self.logger().exception("Strict executor shutdown failed; runtime collections retained")
+                return ShutdownResult(False, f"Executor persistence/shutdown failed: {type(error).__name__}")
         # first we stop all active executors
         for controller_id, executors_list in self.active_executors.items():
             keep_position = keep_position_by_controller.get(controller_id, False)
@@ -1013,7 +1033,7 @@ class ExecutorOrchestrator:
         # Clear executors and trigger garbage collection
         self.active_executors.clear()
 
-    def store_all_positions(self):
+    def store_all_positions(self, *, clear: bool = True, strict: bool = False):
         """
         Store or update all positions in the database.
         """
@@ -1021,12 +1041,16 @@ class ExecutorOrchestrator:
         markets_recorder = MarketsRecorder.get_instance()
         for controller_id, positions_list in self.positions_held.items():
             if controller_id is None:
+                if strict and positions_list:
+                    raise ValueError("Cannot reconcile held positions without controller identity")
                 self.logger().warning(f"Skipping {len(positions_list)} position(s) with no controller_id")
                 continue
             for position in positions_list:
                 # Skip if the connector/trading pair is not in the current strategy markets
                 if (position.connector_name not in self.strategy.markets or
                         position.trading_pair not in self.strategy.markets.get(position.connector_name, set())):
+                    if strict:
+                        raise ValueError("Cannot reconcile held positions outside current strategy markets")
                     self.logger().warning(f"Skipping position storage for {position.connector_name}.{position.trading_pair} - "
                                           f"not available in current strategy markets")
                     continue
@@ -1064,7 +1088,8 @@ class ExecutorOrchestrator:
                     )
 
         # Clear all positions after storing (avoid modifying list while iterating)
-        self.positions_held.clear()
+        if clear:
+            self.positions_held.clear()
 
     def sync_live_positions_to_db(self):
         """
@@ -1141,16 +1166,18 @@ class ExecutorOrchestrator:
                     )
                 )
 
-    def store_all_executors(self):
+    def store_all_executors(self, *, clear: bool = True):
         for controller_id, executors_list in self.active_executors.items():
             for executor in executors_list:
                 # Store the executor in the database
                 MarketsRecorder.get_instance().store_or_update_executor(executor)
                 self._persist_position_hold_entries_from_executor_info(executor.executor_info)
-                self._update_cached_performance(controller_id, executor.executor_info)
-                self._record_stored_executor(controller_id, executor.executor_info)
+                if clear:
+                    self._update_cached_performance(controller_id, executor.executor_info)
+                    self._record_stored_executor(controller_id, executor.executor_info)
         # Remove the executors from the list
-        self.active_executors = {}
+        if clear:
+            self.active_executors = {}
 
     def sync_live_executors_to_db(self):
         """

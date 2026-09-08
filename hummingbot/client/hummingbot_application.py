@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from collections import deque
 from typing import Deque, Dict, List, Optional, Union
@@ -17,6 +18,8 @@ from hummingbot.client.config.config_helpers import (
 )
 from hummingbot.client.config.gateway_ssl_config_map import SSLConfigMap
 from hummingbot.client.config.strategy_config_data_types import BaseStrategyConfigMap
+from hummingbot.client.native_commands import NativeCommands
+from hummingbot.client.native_lifecycle import NativeLifecycle
 from hummingbot.client.settings import CLIENT_CONFIG_PATH
 from hummingbot.client.tab import __all__ as tab_classes
 from hummingbot.client.tab.data_types import CommandTab
@@ -37,6 +40,13 @@ from hummingbot.remote_iface.mqtt import MQTTGateway
 s_logger = None
 
 
+def validate_runtime_instance_id(value: Optional[str]) -> Optional[str]:
+    """Validate an opt-in transport identity without changing persisted configuration."""
+    if value is not None and (not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value) is None):
+        raise ValueError("instance ID must be 1-128 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit")
+    return value
+
+
 class HummingbotApplication(*commands):
     KILL_TIMEOUT = 20.0
     APP_WARNING_EXPIRY_DURATION = 3600.0
@@ -52,15 +62,21 @@ class HummingbotApplication(*commands):
         return s_logger
 
     @classmethod
-    def main_application(cls, client_config_map: Optional[ClientConfigAdapter] = None, headless_mode: bool = False) -> "HummingbotApplication":
+    def main_application(cls, client_config_map: Optional[ClientConfigAdapter] = None, headless_mode: bool = False, instance_id: Optional[str] = None) -> "HummingbotApplication":
+        validate_runtime_instance_id(instance_id)
+        if cls._main_app is not None and instance_id is not None and cls._main_app.instance_id != instance_id:
+            raise ValueError("Cannot change the instance ID of an existing application")
         if cls._main_app is None:
-            cls._main_app = HummingbotApplication(client_config_map=client_config_map, headless_mode=headless_mode)
+            cls._main_app = HummingbotApplication(client_config_map=client_config_map, headless_mode=headless_mode, instance_id=instance_id)
         return cls._main_app
 
-    def __init__(self, client_config_map: Optional[ClientConfigAdapter] = None, headless_mode: bool = False):
+    def __init__(self, client_config_map: Optional[ClientConfigAdapter] = None, headless_mode: bool = False, instance_id: Optional[str] = None):
+        self._runtime_instance_id = validate_runtime_instance_id(instance_id)
         self.client_config_map: Union[ClientConfigMap, ClientConfigAdapter] = (  # type-hint enables IDE auto-complete
             client_config_map or load_client_config_map_from_file()
         )
+        self.native_lifecycle = NativeLifecycle(self.instance_id) if instance_id is not None else None
+        self.native_commands = NativeCommands(self) if self.native_lifecycle is not None else None
         self.headless_mode = headless_mode
         self.ssl_config_map: SSLConfigMap = (  # type-hint enables IDE auto-complete
             load_ssl_config_map_from_file()
@@ -92,7 +108,7 @@ class HummingbotApplication(*commands):
 
         # MQTT Bridge (always available in both modes)
         self._init_telegram_notifier()
-        if self.client_config_map.mqtt_bridge.mqtt_autostart:
+        if self.client_config_map.mqtt_bridge.mqtt_autostart and not headless_mode:
             self.mqtt_start()
 
     def _init_ui_components(self):
@@ -109,7 +125,7 @@ class HummingbotApplication(*commands):
 
     @property
     def instance_id(self) -> str:
-        return self.client_config_map.instance_id
+        return self._runtime_instance_id if self._runtime_instance_id is not None else self.client_config_map.instance_id
 
     @property
     def fetch_pairs_from_all_exchanges(self) -> bool:
@@ -210,6 +226,22 @@ class HummingbotApplication(*commands):
             self.notify("Command not yet implemented. This feature is currently under development.")
         except Exception as e:
             self.logger().error(e, exc_info=True)
+
+    async def prepare_headless_startup(self, timeout: float = 35.0):
+        """Require our healthy MQTT gateway before constructing any strategy."""
+        try:
+            async with asyncio.timeout(timeout):
+                await self.start_mqtt_async(timeout=timeout)
+            if (self._mqtt is None or not self._mqtt.health
+                    or getattr(self._mqtt, '_hb_app', None) is not self
+                    or MQTTGateway.main() is not self._mqtt):
+                raise RuntimeError('MQTT gateway is not ready for this owner')
+        except asyncio.CancelledError:
+            await self.stop_mqtt_async()
+            raise
+        except Exception:
+            await self.stop_mqtt_async()
+            raise RuntimeError('MQTT readiness failed before headless strategy startup') from None
 
     async def run(self):
         """Run the application - either UI mode or headless mode."""

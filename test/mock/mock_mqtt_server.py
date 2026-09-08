@@ -22,10 +22,13 @@ class FakeMQTTMessage(object):
 class FakeMQTTBroker:
     def __init__(self):
         self._transport = None
+        self._subscriptions = {}
+        self._received_msgs = {}
 
     def create_transport(self, *args, **kwargs):
-        if not self._transport:
-            self._transport = FakeMQTTTransport(*args, **kwargs)
+        self._transport = FakeMQTTTransport(*args, **kwargs)
+        self._transport._subscriptions = self._subscriptions
+        self._transport._received_msgs = self._received_msgs
         return self._transport
 
     def publish_to_subscription(self, topic, payload):
@@ -57,8 +60,8 @@ class FakeMQTTBroker:
 
     def clear(self):
         if self._transport is not None:
-            self._transport._received_msgs = {}
-            self._transport._subscriptions = {}
+            self._received_msgs.clear()
+            self._subscriptions.clear()
 
 
 class FakeMQTTTransport:
@@ -96,7 +99,8 @@ class FakeMQTTTransport:
         self._connected = True
 
     def connect(self):
-        self._connected = True
+        # Real MQTT connect initiates the handshake; the network loop confirms it.
+        self._connected = False
 
     def stop(self):
         self._connected = False

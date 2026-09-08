@@ -11,6 +11,7 @@ from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.core.data_type.common import OrderType, PositionMode
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.okx_spot_candles.constants import INTERVALS as OKX_CANDLE_INTERVALS
+from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
 
 
 class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
@@ -105,7 +106,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         client_data=ClientFieldData(
             prompt=lambda mi: "Derived higher-timeframe records:",
             prompt_on_new=False,
-            is_updatable=True,
+            is_updatable=False,
         ),
     )
 
@@ -129,20 +130,20 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         ),
     )
 
-    use_trailing_exit: bool = hl_rsi.Field(default=True)
-    trailing_activation_pct: float = hl_rsi.Field(default=0.015, gt=0.0)
-    trailing_delta_pct: float = hl_rsi.Field(default=0.0035, gt=0.0)
-    entry_limit_max_age_seconds: int = hl_rsi.Field(default=30, ge=1)
-    use_adaptive_trailing: bool = hl_rsi.Field(default=True)
-    trailing_activation_min_pct: float = hl_rsi.Field(default=0.003, gt=0.0)
-    trailing_activation_max_pct: float = hl_rsi.Field(default=0.05, gt=0.0)
-    trailing_delta_min_pct: float = hl_rsi.Field(default=0.001, gt=0.0)
-    trailing_delta_max_pct: float = hl_rsi.Field(default=0.02, gt=0.0)
-    trailing_min_locked_profit_pct: float = hl_rsi.Field(default=0.004, gt=0.0)
-    trailing_activation_volatility_exponent: float = hl_rsi.Field(default=0.70, gt=0.0, le=2.0)
-    trailing_delta_volatility_exponent: float = hl_rsi.Field(default=0.35, gt=0.0, le=2.0)
-    trailing_min_multiplier: float = hl_rsi.Field(default=0.5, gt=0.0)
-    trailing_max_multiplier: float = hl_rsi.Field(default=2.5, gt=0.0)
+    use_trailing_exit: bool = hl_rsi.Field(default=True, json_schema_extra={"is_updatable": True})
+    trailing_activation_pct: float = hl_rsi.Field(default=0.015, gt=0.0, json_schema_extra={"is_updatable": True})
+    trailing_delta_pct: float = hl_rsi.Field(default=0.0035, gt=0.0, json_schema_extra={"is_updatable": True})
+    entry_limit_max_age_seconds: int = hl_rsi.Field(default=30, ge=1, json_schema_extra={"is_updatable": True})
+    use_adaptive_trailing: bool = hl_rsi.Field(default=True, json_schema_extra={"is_updatable": True})
+    trailing_activation_min_pct: float = hl_rsi.Field(default=0.003, gt=0.0, json_schema_extra={"is_updatable": True})
+    trailing_activation_max_pct: float = hl_rsi.Field(default=0.05, gt=0.0, json_schema_extra={"is_updatable": True})
+    trailing_delta_min_pct: float = hl_rsi.Field(default=0.001, gt=0.0, json_schema_extra={"is_updatable": True})
+    trailing_delta_max_pct: float = hl_rsi.Field(default=0.02, gt=0.0, json_schema_extra={"is_updatable": True})
+    trailing_min_locked_profit_pct: float = hl_rsi.Field(default=0.004, gt=0.0, json_schema_extra={"is_updatable": True})
+    trailing_activation_volatility_exponent: float = hl_rsi.Field(default=0.70, gt=0.0, le=2.0, json_schema_extra={"is_updatable": True})
+    trailing_delta_volatility_exponent: float = hl_rsi.Field(default=0.35, gt=0.0, le=2.0, json_schema_extra={"is_updatable": True})
+    trailing_min_multiplier: float = hl_rsi.Field(default=0.5, gt=0.0, json_schema_extra={"is_updatable": True})
+    trailing_max_multiplier: float = hl_rsi.Field(default=2.5, gt=0.0, json_schema_extra={"is_updatable": True})
 
     @field_validator("connector_name", mode="before")
     @classmethod
@@ -220,6 +221,9 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             if isinstance(value, float) and not math.isfinite(value):
                 raise ValueError(f"{field_name} must be finite")
 
+        if (not self.episode_enabled and self.sell_only_if_profitable
+                and self.recovery_sell_execution_strategy == ExecutionStrategy.MARKET):
+            raise ValueError('Profitable-only recovery requires a limit execution strategy')
         if self.leverage != 1 or self.position_mode != PositionMode.ONEWAY:
             raise ValueError("OKX spot requires leverage=1 and position_mode=ONEWAY")
         if self.episode_enabled and self.interval != "1m":

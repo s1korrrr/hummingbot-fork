@@ -110,7 +110,9 @@ class ExecutorBase(RunnableBase):
         """
         def _safe_decimal(value) -> Decimal:
             d = Decimal(str(value))
-            return d if d.is_finite() else Decimal("0")
+            if not d.is_finite():
+                raise ValueError(f"Non-finite executor performance: {self.config.id}")
+            return d
 
         ei = ExecutorInfo(
             id=self.config.id,

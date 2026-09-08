@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.remote_iface.mqtt import ExternalEventFactory
@@ -49,6 +50,65 @@ class V2WithControllers(StrategyV2Base):
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self._operator_event_queue = ExternalEventFactory.create_queue("rsibot.operator")
+        self._risk_persistence_enabled = any(getattr(c.config, 'controller_name', '') == 'ok_rsi'
+                                             for c in self.controllers.values())
+        self._last_risk_state = None
+        if self._risk_persistence_enabled:
+            try:
+                recorder = MarketsRecorder.get_instance()
+                state = recorder.load_strategy_risk_state()
+                if state is None:
+                    if recorder.get_all_executors():
+                        raise RuntimeError('Existing execution history has no durable risk state; reconcile before restart')
+                else:
+                    if state.get('version') != 1 or set(state['controllers']) != set(self.controllers):
+                        raise ValueError('Risk state version or controller scope mismatch')
+                    if (set(state['max_pnl_by_controller']) != set(self.controllers)
+                            or set(state['operator_paused']) != set(self.controllers)
+                            or not set(state['drawdown_exited_controllers']).issubset(self.controllers)
+                            or type(state['stopped']) is not bool
+                            or any(type(paused) is not bool for paused in state['operator_paused'].values())):
+                        raise ValueError('Incomplete or invalid durable risk state')
+                    self.max_global_pnl = Decimal(state['max_global_pnl'])
+                    self.max_pnl_by_controller = {key: Decimal(value) for key, value in state['max_pnl_by_controller'].items()}
+                    if not self.max_global_pnl.is_finite() or any(not x.is_finite() for x in self.max_pnl_by_controller.values()):
+                        raise ValueError('Non-finite persisted risk peak')
+                    self.drawdown_exited_controllers = state['drawdown_exited_controllers']
+                    self._is_stop_triggered = state['stopped']
+                    for cid, paused in state['operator_paused'].items():
+                        self.controllers[cid].set_operator_entry_pause(paused, reason='restored', scope='bot')
+                    for cid in self.drawdown_exited_controllers:
+                        self.controllers[cid].stop()
+                self._persist_risk_state()
+            except Exception:
+                self._is_stop_triggered = True
+                self.logger().exception('Risk state unavailable; execution blocked pending reconciliation')
+
+    def _persist_risk_state(self):
+        if not getattr(self, '_risk_persistence_enabled', False):
+            return
+        state = {'version': 1, 'controllers': sorted(self.controllers),
+                 'max_global_pnl': str(self.max_global_pnl),
+                 'max_pnl_by_controller': {cid: str(self.max_pnl_by_controller.get(cid, Decimal('0'))) for cid in self.controllers},
+                 'drawdown_exited_controllers': sorted(set(self.drawdown_exited_controllers)),
+                 'stopped': self._is_stop_triggered,
+                 'operator_paused': {cid: bool(getattr(c, '_operator_entry_paused', False)) for cid, c in self.controllers.items()}}
+        if state != self._last_risk_state:
+            MarketsRecorder.get_instance().store_strategy_risk_state(state)
+            self._last_risk_state = state
+
+    def validate_create_action(self, action):
+        # Called after fresh reports and immediately before executor creation.
+        try:
+            self.process_operator_events()
+            self.check_manual_kill_switch()
+            self.control_max_drawdown()
+            self._persist_risk_state()
+            return not self._is_stop_triggered and action.controller_id not in self.drawdown_exited_controllers
+        except Exception:
+            self._is_stop_triggered = True
+            self.logger().exception('Risk check or persistence failed; new execution blocked')
+            return False
 
     def on_tick(self):
         super().on_tick()
@@ -57,6 +117,11 @@ class V2WithControllers(StrategyV2Base):
             self.check_manual_kill_switch()
             self.control_max_drawdown()
             self.send_performance_report()
+        try:
+            self._persist_risk_state()
+        except Exception:
+            self._is_stop_triggered = True
+            self.logger().exception('Unable to persist risk state; new execution blocked')
 
     def process_operator_events(self):
         while len(self._operator_event_queue) > 0:
@@ -122,7 +187,7 @@ class V2WithControllers(StrategyV2Base):
             if controller.status != RunnableStatus.RUNNING:
                 continue
             controller_pnl = self.get_performance_report(controller_id).global_pnl_quote
-            last_max_pnl = self.max_pnl_by_controller[controller_id]
+            last_max_pnl = self.max_pnl_by_controller.get(controller_id, Decimal("0"))
             if controller_pnl > last_max_pnl:
                 self.max_pnl_by_controller[controller_id] = controller_pnl
             else:
@@ -212,7 +277,7 @@ class V2WithControllers(StrategyV2Base):
     def apply_initial_setting(self):
         connectors_position_mode = {}
         for controller_id, controller in self.controllers.items():
-            self.max_pnl_by_controller[controller_id] = Decimal("0")
+            self.max_pnl_by_controller.setdefault(controller_id, Decimal("0"))
             config_dict = controller.config.model_dump()
             if "connector_name" in config_dict:
                 if self.is_perpetual(config_dict["connector_name"]):

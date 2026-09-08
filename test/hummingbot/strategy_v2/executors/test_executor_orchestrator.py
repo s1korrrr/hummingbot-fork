@@ -874,7 +874,7 @@ class TestExecutorOrchestrator(unittest.TestCase):
             cum_fees_quote=Decimal("0"),
             is_trading=True,
             is_active=True,
-            custom_info={},
+            custom_info={"order_ids": ["active-entry"]},
             controller_id="controller1",
         )
         orchestrator.active_executors = {"controller1": [active_executor]}
@@ -884,7 +884,7 @@ class TestExecutorOrchestrator(unittest.TestCase):
 
         self.assertEqual(len(report["controller1"]["positions"]), 1)
         position = report["controller1"]["positions"][0]
-        self.assertEqual(position.amount, Decimal("0.00485"))
+        self.assertEqual(position.amount, Decimal("0.00985"))
         self.assertEqual(position.breakeven_price, Decimal("80000"))
 
     @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")

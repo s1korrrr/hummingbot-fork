@@ -60,6 +60,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
     INVENTORY_TITLE = "🎒 INVENTORY"
 
     def setUp(self):
+        application_patch = patch("hummingbot.client.hummingbot_application.HummingbotApplication.main_application",
+                                  return_value=MagicMock(_mqtt=None))
+        application_patch.start()
+        self.addCleanup(application_patch.stop)
         self.start: pd.Timestamp = pd.Timestamp("2021-01-01", tz="UTC")
         self.end: pd.Timestamp = pd.Timestamp("2021-01-01 01:00:00", tz="UTC")
         self.start_timestamp: float = self.start.timestamp()
@@ -70,7 +74,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.connector_name: str = "mock_paper_exchange"
         self.trading_pair: str = "HBOT-USDT"
         self.strategy_config = StrategyV2ConfigBase()
-        with patch('asyncio.create_task', return_value=MagicMock()):
+        with patch('asyncio.create_task', side_effect=lambda coro: (coro.close(), MagicMock())[1]):
             # Initialize the strategy with mock components
             with patch("hummingbot.strategy.strategy_v2_base.StrategyV2Base.listen_to_executor_actions", return_value=AsyncMock()):
                 with patch('hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator') as MockExecutorOrchestrator:
@@ -964,6 +968,20 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("frees$", plans_block)
         self.assertNotIn("managed$", plans_block)
 
+    async def test_queued_create_is_rejected_after_controller_kill(self):
+        action = CreateExecutorAction(controller_id="killed", executor_config=self.get_position_config_market_short())
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[action], asyncio.CancelledError])
+        killed = MagicMock()
+        killed.status = RunnableStatus.TERMINATED
+        killed.config.manual_kill_switch = True
+        self.strategy.controllers = {"killed": killed}
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()
         # Simulate some actions being returned, followed by an exception to break the loop.
@@ -975,6 +993,8 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         ])
         self.strategy.executor_orchestrator.execute_actions = MagicMock()
         controller_mock = MagicMock()
+        controller_mock.status = RunnableStatus.RUNNING
+        controller_mock.config.manual_kill_switch = False
         self.strategy.controllers = {"controller_1": controller_mock}
 
         # Test for exception handling inside the method.
@@ -1005,6 +1025,10 @@ class StrategyV2BaseBasicTest(unittest.TestCase):
                    for record in self.log_records)
 
     def setUp(self):
+        application_patch = patch("hummingbot.client.hummingbot_application.HummingbotApplication.main_application",
+                                  return_value=MagicMock(_mqtt=None))
+        application_patch.start()
+        self.addCleanup(application_patch.stop)
         self.log_records = []
         self.start: pd.Timestamp = pd.Timestamp("2019-01-01", tz="UTC")
         self.end: pd.Timestamp = pd.Timestamp("2019-01-01 01:00:00", tz="UTC")
@@ -1034,7 +1058,7 @@ class StrategyV2BaseBasicTest(unittest.TestCase):
         )
         self.clock.add_iterator(self.connector)
         StrategyV2Base.markets = {self.connector_name: {self.trading_pair}}
-        with patch('asyncio.create_task', return_value=MagicMock()):
+        with patch('asyncio.create_task', side_effect=lambda coro: (coro.close(), MagicMock())[1]):
             with patch("hummingbot.strategy.strategy_v2_base.StrategyV2Base.listen_to_executor_actions", return_value=AsyncMock()):
                 with patch('hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator'):
                     with patch('hummingbot.strategy.strategy_v2_base.MarketDataProvider'):

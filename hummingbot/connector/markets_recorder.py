@@ -50,6 +50,7 @@ from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
 from hummingbot.model.market_data import MarketData
 from hummingbot.model.market_state import MarketState
+from hummingbot.model.metadata import Metadata
 from hummingbot.model.order import Order
 from hummingbot.model.order_status import OrderStatus
 from hummingbot.model.position import Position
@@ -875,6 +876,22 @@ class MarketsRecorder:
                 return query.all()
             else:
                 return query.limit(number_of_rows).all()
+
+    def load_strategy_risk_state(self) -> Optional[dict]:
+        with self._sql_manager.get_new_session() as session:
+            row = session.get(Metadata, f"strategy-risk:{self._config_file_path}")
+            return json.loads(row.value) if row is not None else None
+
+    def store_strategy_risk_state(self, state: dict):
+        payload = json.dumps(state, allow_nan=False, sort_keys=True)
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                key = f"strategy-risk:{self._config_file_path}"
+                row = session.get(Metadata, key)
+                if row is None:
+                    session.add(Metadata(key=key, value=payload))
+                else:
+                    row.value = payload
 
     def save_market_states(self, config_file_path: str, market: ConnectorBase, session: Session):
         market_states: Optional[MarketState] = self.get_market_states(config_file_path, market, session=session)

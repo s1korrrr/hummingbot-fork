@@ -110,6 +110,7 @@ class _ReconstructionMarketDataProvider:
 class OKRSIController(hl_rsi.HLRSIController):
     """Shared RSI v5 behavior with OKX spot execution and trailing contracts."""
 
+    allow_implementation_hot_reload = False
     _logger: Optional[HummingbotLogger] = None
 
     @classmethod
@@ -754,6 +755,24 @@ class OKRSIController(hl_rsi.HLRSIController):
             return []
         self._watermark_proposal_grant = False
         return super().create_actions_proposal()
+
+    def _select_signal_candles(self, df: pd.DataFrame, now_ts: float) -> pd.DataFrame:
+        if not self._build_data_health(df, now_ts)["ready"]:
+            return df
+        seconds = CandlesBase.interval_to_seconds[self.config.interval]
+        timestamps = pd.to_numeric(df["timestamp"]).map(self._timestamp_to_seconds)
+        return df.loc[timestamps + seconds <= now_ts].copy()
+
+    def validate_executor_config(self, config) -> bool:
+        if self._episode_runtime is None:
+            return super().validate_executor_config(config)
+        # Episode timing, sizing and authorization belong to the bounded native factory below.
+        from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
+        return (ControllerBase.validate_executor_config(self, config)
+                and config.connector_name == self.config.connector_name
+                and config.trading_pair == self.config.trading_pair
+                and not (config.side == TradeType.BUY and self._operator_entry_paused)
+                and not self._episode_runtime.hold_reason and not self._episode_runtime.state.fault)
 
     def _derived_base_max_records(self) -> int:
         if self.config.episode_enabled:

@@ -22,6 +22,10 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
+class OkxOrderRejectedError(IOError):
+    """The exchange explicitly rejected this submission (distinct from transport uncertainty)."""
+
+
 class OkxExchange(ExchangePyBase):
 
     web_utils = web_utils
@@ -108,18 +112,11 @@ class OkxExchange(ExchangePyBase):
         return is_time_synchronizer_related
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        # TODO: implement this method correctly for the connector
-        # The default implementation was added when the functionality to detect not found orders was introduced in the
-        # ExchangePyBase class. Also fix the unit test test_lost_order_removed_if_not_found_during_order_status_update
-        # when replacing the dummy implementation
+        # Missing history is not a terminal order acknowledgement. Keep ownership until an explicit final state.
         return False
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        # TODO: implement this method correctly for the connector
-        # The default implementation was added when the functionality to detect not found orders was introduced in the
-        # ExchangePyBase class. Also fix the unit test test_cancel_order_not_found_in_the_exchange when replacing the
-        # dummy implementation
-        # _place_cancel already takes care of all expected exceptions.
+        # Cancellation acceptance / missing-order replies are asynchronous and require final status reconciliation.
         return False
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
@@ -213,8 +210,17 @@ class OkxExchange(ExchangePyBase):
         )
         data = exchange_order_id["data"][0]
         if data["sCode"] != "0":
-            raise IOError(f"Error submitting order {order_id}: {data['sMsg']}")
+            raise OkxOrderRejectedError(f"Error submitting order {order_id}: {data['sCode']}: {data['sMsg']}")
         return str(data["ordId"]), self.current_timestamp
+
+    def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
+                          order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):
+        if isinstance(exception, OkxOrderRejectedError):
+            return super()._on_order_failure(order_id, trading_pair, amount, trade_type, order_type, price, exception, **kwargs)
+        self.logger().error(
+            f"Submission status unknown for {order_id}: {type(exception).__name__}: {exception}. "
+            "Keeping the client order identity reserved; polling order details before any retry."
+        )
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         """
@@ -385,6 +391,8 @@ class OkxExchange(ExchangePyBase):
 
         order_data = updated_order_data["data"][0]
         new_state = CONSTANTS.ORDER_STATE[order_data["state"]]
+        if new_state in {OrderState.CANCELED, OrderState.FILLED}:
+            await self._reconcile_terminal_order_fills(tracked_order, order_data)
 
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
@@ -394,6 +402,23 @@ class OkxExchange(ExchangePyBase):
             new_state=new_state,
         )
         return order_update
+
+    async def _reconcile_terminal_order_fills(self, order: InFlightOrder, data: Dict[str, Any]):
+        try:
+            expected = Decimal(str(data["accFillSz"]))
+            exchange_id = str(data["ordId"])
+        except (KeyError, ValueError, ArithmeticError) as exc:
+            raise IOError("Terminal order fill total is unavailable") from exc
+        if not expected.is_finite() or expected < 0 or expected > order.amount:
+            raise IOError("Terminal order fill total is invalid")
+        if not exchange_id or (order.exchange_order_id is not None and exchange_id != order.exchange_order_id):
+            raise IOError("Terminal order identity differs from the tracked order")
+        order.update_exchange_order_id(exchange_id)
+        if order.executed_amount_base < expected:
+            for trade_update in await self._all_trade_updates_for_order(order):
+                self._order_tracker.process_trade_update(trade_update)
+        if order.executed_amount_base != expected:
+            raise IOError(f"Terminal fill reconciliation pending: expected={expected}, observed={order.executed_amount_base}")
 
     async def _user_stream_event_listener(self):
         async for stream_message in self._iter_user_event_queue():
@@ -432,6 +457,8 @@ class OkxExchange(ExchangePyBase):
                             self._order_tracker.process_trade_update(trade_update)
 
                         if updatable_order is not None:
+                            if order_status in {OrderState.CANCELED, OrderState.FILLED}:
+                                await self._reconcile_terminal_order_fills(updatable_order, data)
                             order_update = OrderUpdate(
                                 trading_pair=updatable_order.trading_pair,
                                 update_timestamp=int(data["uTime"]) * 1e-3,

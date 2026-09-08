@@ -312,6 +312,7 @@ class StrategyV2Base(StrategyPyBase):
         self.controller_reports: Dict[str, Dict] = {}
         self.market_data_provider = MarketDataProvider(connectors)
         self._is_stop_triggered = False
+        self._controller_reports_valid = False
         self._controllers_started = False
         self._last_controller_reload_error: Optional[str] = None
         self._last_runtime_db_sync_ts: float = 0
@@ -1032,6 +1033,8 @@ class StrategyV2Base(StrategyPyBase):
             self.add_controller(controller_config)
             return
 
+        if getattr(current_controller, "allow_implementation_hot_reload", True) is False:
+            raise RuntimeError("Controller implementation changed; restart with ownership reconciliation is required")
         replacement_class = controller_config.get_controller_class()
         replacement_controller = replacement_class(controller_config, self.market_data_provider, self.actions_queue)
         self._copy_controller_runtime_state(current_controller, replacement_controller)
@@ -1078,6 +1081,9 @@ class StrategyV2Base(StrategyPyBase):
                     self.logger().error(f"Controller config reload failed: {error_label}", exc_info=True)
                     self._last_controller_reload_error = error_label
 
+    def validate_create_action(self, action: CreateExecutorAction) -> bool:
+        return not self._is_stop_triggered
+
     async def listen_to_executor_actions(self):
         """
         Asynchronously listen to actions from the controllers and execute them.
@@ -1085,12 +1091,23 @@ class StrategyV2Base(StrategyPyBase):
         while True:
             try:
                 actions = await self.actions_queue.get()
-                self.executor_orchestrator.execute_actions(actions)
                 self.update_executors_info()
-                controller_id = actions[0].controller_id
-                controller = self.controllers.get(controller_id)
-                controller.executors_info = self.get_executors_by_controller(controller_id)
-                controller.executors_update_event.set()
+                for action in actions:
+                    controller = self.controllers.get(action.controller_id)
+                    if isinstance(action, CreateExecutorAction):
+                        if not self.validate_create_action(action):
+                            continue
+                        if (self._is_stop_triggered or not self._controller_reports_valid or controller is None
+                                or controller.status != RunnableStatus.RUNNING or controller.config.manual_kill_switch):
+                            self.logger().warning(f"Rejected queued create for stopped or unavailable controller {action.controller_id}")
+                            continue
+                    self.executor_orchestrator.execute_actions([action])
+                    self.update_executors_info()
+                for controller_id in {action.controller_id for action in actions}:
+                    controller = self.controllers.get(controller_id)
+                    if controller is not None:
+                        controller.executors_info = self.get_executors_by_controller(controller_id)
+                        controller.executors_update_event.set()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1101,6 +1118,7 @@ class StrategyV2Base(StrategyPyBase):
         Update the unified controller reports and publish the updates to the active controllers.
         """
         try:
+            self._controller_reports_valid = False
             # Get all reports in a single call and store them
             self.controller_reports = self.executor_orchestrator.get_all_reports()
 
@@ -1111,7 +1129,9 @@ class StrategyV2Base(StrategyPyBase):
                 controller.positions_held = controller_report.get("positions", [])
                 controller.performance_report = controller_report.get("performance", [])
                 controller.executors_update_event.set()
+            self._controller_reports_valid = True
         except Exception as e:
+            self._controller_reports_valid = False
             self.logger().error(f"Error updating controller reports: {e}", exc_info=True)
 
     @staticmethod

@@ -72,6 +72,7 @@ class PositionSummary(BaseModel):
     unrealized_pnl_quote: Decimal
     realized_pnl_quote: Decimal
     cum_fees_quote: Decimal
+    remaining_fees_quote: Optional[Decimal] = None
 
     @property
     def amount_quote(self) -> Decimal:

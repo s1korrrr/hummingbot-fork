@@ -18,6 +18,7 @@ from hummingbot.core.event.events import (
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TrailingStop
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
@@ -116,8 +117,6 @@ class PositionExecutor(ExecutorBase):
             return False
         if self._open_order.is_filled or not self._open_order.order.is_open:
             return False
-        if self.open_filled_amount > Decimal("0"):
-            return False
 
         max_age_seconds = max(0, int(self.config.triple_barrier_config.open_order_limit_max_age_seconds))
         if max_age_seconds <= 0:
@@ -160,6 +159,7 @@ class PositionExecutor(ExecutorBase):
         self._open_order: Optional[TrackedOrder] = None
         self._close_order: Optional[TrackedOrder] = None
         self._take_profit_limit_order: Optional[TrackedOrder] = None
+        self._completed_open_orders: List[TrackedOrder] = []
         self._completed_close_orders: List[TrackedOrder] = []
         self._failed_orders: List[TrackedOrder] = []
         self._trailing_stop_trigger_pct: Optional[Decimal] = None
@@ -198,16 +198,21 @@ class PositionExecutor(ExecutorBase):
 
         :return: The filled amount of the open order if it exists, otherwise 0.
         """
-        if self._open_order:
-            if self._open_order.fee_asset == self.config.trading_pair.split("-")[0]:
-                open_filled_amount = self._open_order.executed_amount_base - self._open_order.cum_fees_base
-            else:
-                open_filled_amount = self._open_order.executed_amount_base
-            return self.connectors[self.config.connector_name].quantize_order_amount(
-                trading_pair=self.config.trading_pair,
-                amount=open_filled_amount)
-        else:
-            return Decimal("0")
+        base_asset = self.config.trading_pair.split("-")[0]
+        amount = sum((order.executed_amount_base - (
+            base_fee_amount(order.order.to_json(), base_asset) if order.order is not None and self.config.side == TradeType.BUY else Decimal("0")
+        ) for order in self._entry_orders()), Decimal("0"))
+        return amount
+
+    @staticmethod
+    def _unique_orders(orders):
+        return list({order.order_id: order for order in orders if order is not None}.values())
+
+    def _entry_orders(self):
+        return self._unique_orders([*self._completed_open_orders, self._open_order])
+
+    def _exit_orders(self):
+        return self._unique_orders([*self._completed_close_orders, self._close_order, self._take_profit_limit_order])
 
     @property
     def amount_to_close(self) -> Decimal:
@@ -262,20 +267,11 @@ class PositionExecutor(ExecutorBase):
 
         :return: The filled amount of the close order if it exists, otherwise 0.
         """
-        completed_close_amount = sum(order.executed_amount_base for order in self._completed_close_orders)
-        current_close_amount = self._close_order.executed_amount_base if self._close_order else Decimal("0")
-        return completed_close_amount + current_close_amount
+        return sum((order.executed_amount_base for order in self._exit_orders()), Decimal("0"))
 
     @property
     def close_filled_amount_quote(self) -> Decimal:
-        """
-        Get the filled amount of the close order in quote currency.
-
-        :return: The filled amount of the close order in quote currency.
-        """
-        completed_close_quote = sum(order.executed_amount_quote for order in self._completed_close_orders)
-        current_close_quote = self._close_order.executed_amount_quote if self._close_order else Decimal("0")
-        return completed_close_quote + current_close_quote
+        return sum((order.executed_amount_quote for order in self._exit_orders()), Decimal("0"))
 
     @property
     def filled_amount(self) -> Decimal:
@@ -319,8 +315,9 @@ class PositionExecutor(ExecutorBase):
 
         :return: The entry price.
         """
-        if self._open_order and self._open_order.is_done:
-            return self._open_order.average_executed_price
+        filled = sum((order.executed_amount_base for order in self._entry_orders()), Decimal("0"))
+        if filled > Decimal("0"):
+            return sum((order.executed_amount_quote for order in self._entry_orders()), Decimal("0")) / filled
         elif self.config.triple_barrier_config.open_order_type == OrderType.LIMIT_MAKER:
             if self.config.side == TradeType.BUY:
                 best_bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
@@ -342,7 +339,8 @@ class PositionExecutor(ExecutorBase):
         :return: The close price.
         """
         if self.close_filled_amount > Decimal("0"):
-            return self.close_filled_amount_quote / self.close_filled_amount
+            remaining = max(self.amount_to_close, Decimal("0"))
+            return (self.close_filled_amount_quote + remaining * self.current_market_price) / (self.close_filled_amount + remaining)
         elif self._close_order and self._close_order.is_done:
             return self._close_order.average_executed_price
         else:
@@ -485,7 +483,7 @@ class PositionExecutor(ExecutorBase):
 
         :return: The cumulative fees in quote asset.
         """
-        orders = [self._open_order, self._close_order, *self._completed_close_orders]
+        orders = self._unique_orders([*self._entry_orders(), *self._exit_orders()])
         return sum([order.cum_fees_quote for order in orders if order])
 
     def get_net_pnl_pct(self) -> Decimal:
@@ -558,30 +556,31 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
-        self.close_timestamp = self._strategy.current_timestamp
-        if self.all_orders_completed():
-            if self.close_type == CloseType.POSITION_HOLD:
-                if self._open_order and self._open_order.is_filled:
-                    self._held_position_orders.append(self._open_order.order.to_json())
-                if self._close_order and self._close_order.is_filled:
-                    self._held_position_orders.append(self._close_order.order.to_json())
-                if len(self._held_position_orders) == 0:
+        if self.close_timestamp is None:
+            self.close_timestamp = self._strategy.current_timestamp
+        entry_done = not self._open_order or self._open_order.is_done
+        tp_done = not self._take_profit_limit_order or self._take_profit_limit_order.is_done
+        if not entry_done or not tp_done:
+            self.cancel_open_orders()
+        elif self.close_type == CloseType.POSITION_HOLD:
+            if self._close_order and not self._close_order.is_done:
+                self._strategy.cancel(connector_name=self.config.connector_name,
+                                      trading_pair=self.config.trading_pair, order_id=self._close_order.order_id)
+            else:
+                self._held_position_orders = [order.order.to_json() for order in
+                                              self._unique_orders([*self._entry_orders(), *self._exit_orders()])
+                                              if order.order and order.executed_amount_base > Decimal("0")]
+                if not self._held_position_orders:
                     self.close_type = CloseType.EARLY_STOP
                 self.stop()
-            elif self.open_and_close_volume_match():
-                self.stop()
-            else:
-                await self.control_close_order()
-                self._current_retries += 1
+        elif self.open_and_close_volume_match():
+            self.stop()
         else:
-            self.cancel_open_orders()
-        await self._sleep(5.0)
+            await self.control_close_order()
+        await self._sleep(1.0)
 
     def open_and_close_volume_match(self):
-        if self.open_filled_amount == Decimal("0"):
-            return True
-        else:
-            return self._close_order and self._close_order.is_filled and self.amount_to_close <= Decimal("0")
+        return self.amount_to_close <= Decimal("0") and self.all_orders_completed()
 
     async def control_close_order(self):
         """
@@ -625,9 +624,15 @@ class PositionExecutor(ExecutorBase):
                     )
                 )
             else:
-                self._failed_orders.append(self._close_order)
-                self._close_order = None
+                self.logger().error(self._log_message("Close order state unavailable; retaining reservation until reconciled"))
         else:
+            remaining = self.amount_to_close
+            if (not self.is_perpetual and remaining > 0 and self.all_orders_completed()
+                    and (remaining < self.trading_rules.min_order_size
+                         or remaining * self.current_market_price < self.trading_rules.min_notional_size)):
+                self.logger().warning(self._log_message('Untradeable residual retained as held inventory'))
+                self.early_stop(keep_position=True)
+                return
             self.place_close_order_and_cancel_open_orders(close_type=self.close_type)
 
     def evaluate_max_retries(self):
@@ -637,7 +642,7 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
-        if self._current_retries > self._max_retries:
+        if self._current_retries > self._max_retries and self.open_filled_amount == Decimal("0") and self.all_orders_completed():
             self.close_type = CloseType.FAILED
             self.stop()
 
@@ -722,7 +727,8 @@ class PositionExecutor(ExecutorBase):
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             order_type=self.config.triple_barrier_config.open_order_type,
-            amount=self.config.amount,
+            amount=max(Decimal("0"), self.config.amount - sum(
+                (order.executed_amount_base for order in self._entry_orders()), Decimal("0"))),
             price=self.entry_price,
             side=self.config.side,
             position_action=PositionAction.OPEN,
@@ -737,11 +743,13 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
-        if self._open_order and self._open_order.is_filled and self.open_filled_amount >= self.trading_rules.min_order_size \
+        if self.status == RunnableStatus.RUNNING and self.open_filled_amount >= self.trading_rules.min_order_size \
                 and self.open_filled_amount_quote >= self.trading_rules.min_notional_size:
             self.control_stop_loss()
-            self.control_trailing_stop()
-            self.control_take_profit()
+            if self.status == RunnableStatus.RUNNING:
+                self.control_trailing_stop()
+            if self.status == RunnableStatus.RUNNING:
+                self.control_take_profit()
         self.control_time_limit()
 
     def place_close_order_and_cancel_open_orders(self, close_type: CloseType, price: Decimal = Decimal("NaN")):
@@ -754,7 +762,14 @@ class PositionExecutor(ExecutorBase):
         :param price: The price to be used in the close order.
         :return: None
         """
+        self.close_type = close_type
+        if self.close_timestamp is None:
+            self.close_timestamp = self._strategy.current_timestamp
+        self._status = RunnableStatus.SHUTTING_DOWN
         self.cancel_open_orders()
+        if self._close_order or (self._open_order and not self._open_order.is_done) or (
+                self._take_profit_limit_order and not self._take_profit_limit_order.is_done):
+            return
         close_amount = self._close_order_amount()
         if close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
             order_type = self._close_order_type_for(close_type)
@@ -926,12 +941,10 @@ class PositionExecutor(ExecutorBase):
         :return: None
         """
         in_flight_order = self.get_in_flight_order(self.config.connector_name, order_id)
-        if self._open_order and self._open_order.order_id == order_id:
-            self._open_order.order = in_flight_order
-        elif self._close_order and self._close_order.order_id == order_id:
-            self._close_order.order = in_flight_order
-        elif self._take_profit_limit_order and self._take_profit_limit_order.order_id == order_id:
-            self._take_profit_limit_order.order = in_flight_order
+        if in_flight_order is not None:
+            for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()]):
+                if order.order_id == order_id:
+                    order.order = in_flight_order
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         """
@@ -968,15 +981,19 @@ class PositionExecutor(ExecutorBase):
         """
         This method is responsible for processing the order canceled event
         """
+        self.update_tracked_orders_with_order_id(event.order_id)
         if self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order)
+            self._completed_close_orders.append(self._close_order)
             self._close_order = None
             self._close_order_type = None
         if self._open_order and event.order_id == self._open_order.order_id:
             self._failed_orders.append(self._open_order)
+            self._completed_open_orders.append(self._open_order)
             self._open_order = None
         if self._take_profit_limit_order and event.order_id == self._take_profit_limit_order.order_id:
             self._failed_orders.append(self._take_profit_limit_order)
+            self._completed_close_orders.append(self._take_profit_limit_order)
             self._take_profit_limit_order = None
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
@@ -984,8 +1001,10 @@ class PositionExecutor(ExecutorBase):
         This method is responsible for processing the order failed event. Here we will add the InFlightOrder to the
         failed orders list.
         """
+        self.update_tracked_orders_with_order_id(event.order_id)
         if self._open_order and event.order_id == self._open_order.order_id:
             self._failed_orders.append(self._open_order)
+            self._completed_open_orders.append(self._open_order)
             self._open_order = None
             if self._is_permanent_validation_failure(event):
                 self.logger().error(
@@ -995,8 +1014,11 @@ class PositionExecutor(ExecutorBase):
                         f"error_message={getattr(event, 'error_message', 'n/a')}"
                     )
                 )
-                self.close_type = CloseType.FAILED
-                self.stop()
+                if self.open_filled_amount > 0:
+                    self.early_stop(keep_position=True)
+                else:
+                    self.close_type = CloseType.FAILED
+                    self.stop()
                 return
             self.logger().error(
                 self._log_message(
@@ -1007,6 +1029,7 @@ class PositionExecutor(ExecutorBase):
             self._current_retries += 1
         elif self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order)
+            self._completed_close_orders.append(self._close_order)
             self._close_order = None
             if self.close_type == CloseType.TRAILING_STOP and self._close_order_type == OrderType.LIMIT:
                 self._trailing_limit_fallback_pending = True
@@ -1020,6 +1043,7 @@ class PositionExecutor(ExecutorBase):
             self._current_retries += 1
         elif self._take_profit_limit_order and event.order_id == self._take_profit_limit_order.order_id:
             self._failed_orders.append(self._take_profit_limit_order)
+            self._completed_close_orders.append(self._take_profit_limit_order)
             self._take_profit_limit_order = None
             self.logger().error(
                 self._log_message(
@@ -1064,7 +1088,9 @@ class PositionExecutor(ExecutorBase):
             "open_order_age_seconds": self._open_order_age_seconds(),
             "open_order_filled_amount_base": self.open_filled_amount,
             "open_order_filled_amount_quote": self.open_filled_amount_quote,
-            "order_ids": [order.order_id for order in [self._open_order, self._close_order, self._take_profit_limit_order] if order],
+            "order_ids": [order.order_id for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()])],
+            "close_order_filled_amount_base": self.close_filled_amount,
+            "remaining_position_amount_base": self.amount_to_close,
             "held_position_orders": self._held_position_orders,
         }
         custom_info.update(trailing_snapshot)

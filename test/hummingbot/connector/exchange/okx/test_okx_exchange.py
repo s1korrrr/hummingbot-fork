@@ -787,7 +787,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "fillSz": "0",
                     "fillPx": "0",
                     "tradeId": "0",
-                    "accFillSz": "323",
+                    "accFillSz": str(order.executed_amount_base),
                     "fillNotionalUsd": "",
                     "fillTime": "0",
                     "fillFee": "0",
@@ -847,7 +847,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "fillSz": "",
                     "fillPx": "",
                     "tradeId": "",
-                    "accFillSz": "323",
+                    "accFillSz": str(order.amount),
                     "fillNotionalUsd": "",
                     "fillTime": "0",
                     "fillFee": str(-self.expected_fill_fee.flat_fees[0].amount),
@@ -907,7 +907,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "fillSz": str(order.amount),
                     "fillPx": str(order.price),
                     "tradeId": self.expected_fill_trade_id,
-                    "accFillSz": "323",
+                    "accFillSz": str(order.amount),
                     "fillNotionalUsd": "",
                     "fillTime": "0",
                     "fillFee": str(-self.expected_fill_fee.flat_fees[0].amount),
@@ -1028,7 +1028,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "side": order.trade_type.name.lower(),
                     "posSide": "long",
                     "tdMode": "isolated",
-                    "accFillSz": "0",
+                    "accFillSz": str(order.amount),
                     "fillPx": "0",
                     "tradeId": "1",
                     "fillSz": str(order.amount),
@@ -1350,3 +1350,57 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 f"{Decimal('100.000000')} {self.trading_pair} at {Decimal('10000')}."
             )
         )
+
+    @aioresponses()
+    async def test_create_order_fails_and_raises_failure_event(self, mock_api):
+        # A transport rejection without an OKX order acknowledgement is uncertain, not permission to retry.
+        self._simulate_trading_rules_initialized()
+        sent = asyncio.Event()
+        mock_api.post(self.order_creation_url, status=400, callback=lambda *args, **kwargs: sent.set())
+        order_id = self.place_buy_order()
+        await asyncio.wait_for(sent.wait(), timeout=3)
+        await asyncio.sleep(0.1)
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+        self.assertFalse(self.exchange.in_flight_orders[order_id].is_failure)
+        self.assertEqual([], self.order_failure_logger.event_log)
+
+    @aioresponses()
+    async def test_create_order_fails_when_trading_rule_error_and_raises_failure_event(self, mock_api):
+        self._simulate_trading_rules_initialized()
+        sent = asyncio.Event()
+        mock_api.post(self.order_creation_url, status=400, callback=lambda *args, **kwargs: sent.set())
+        invalid_id = self.place_buy_order(amount=Decimal("0.0001"), price=Decimal("0.0001"))
+        uncertain_id = self.place_buy_order()
+        await asyncio.wait_for(sent.wait(), timeout=3)
+        await asyncio.sleep(0.1)
+        self.assertNotIn(invalid_id, self.exchange.in_flight_orders)
+        self.assertIn(uncertain_id, self.exchange.in_flight_orders)
+        self.assertEqual([invalid_id], [event.order_id for event in self.order_failure_logger.event_log])
+
+    @aioresponses()
+    async def test_update_order_status_when_request_fails_marks_order_as_not_found(self, mock_api):
+        self.exchange.start_tracking_order(order_id="uncertain", exchange_order_id="venue",
+                                           trading_pair=self.trading_pair, trade_type=TradeType.BUY,
+                                           price=Decimal("10000"), amount=Decimal("1"), order_type=OrderType.LIMIT)
+        order = self.exchange.in_flight_orders["uncertain"]
+        self.configure_http_error_order_status_response(order, mock_api)
+        await self.exchange._update_order_status()
+        self.assertIn("uncertain", self.exchange.in_flight_orders)
+        self.assertFalse(order.is_done)
+        self.assertEqual(0, self.exchange._order_tracker._order_not_found_records.get("uncertain", 0))
+
+    @aioresponses()
+    async def test_update_order_status_when_filled_correctly_processed_even_when_trade_fill_update_fails(self, mock_api):
+        # OKX terminal status is withheld until its reported fills are accounted for.
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + '1', exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair, order_type=OrderType.LIMIT, trade_type=TradeType.BUY,
+            price=Decimal('10000'), amount=Decimal('1'))
+        order = self.exchange.in_flight_orders[self.client_order_id_prefix + '1']
+        self.configure_erroneous_http_fill_trade_response(order=order, mock_api=mock_api)
+        self.configure_completely_filled_order_status_response(order=order, mock_api=mock_api)
+        await self.exchange._update_order_status()
+        await asyncio.sleep(0)
+        self.assertFalse(order.is_done)
+        self.assertIn(order.client_order_id, self.exchange.in_flight_orders)
+        self.assertEqual(Decimal('0'), order.executed_amount_base)

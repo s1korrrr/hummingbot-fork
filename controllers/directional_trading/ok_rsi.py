@@ -806,6 +806,62 @@ class OKRSIController(hl_rsi.HLRSIController):
             )
         ]
 
+    def build_chart_snapshot_rows(self, bot_name: str):
+        from controllers.directional_trading.ok_rsi_core.chart_snapshots import (
+            MAX_BATCH_ROWS,
+            MAX_CACHED_CANDLES,
+            build_chart_rows,
+            chart_projection_signature,
+            pending_chart_rows,
+        )
+
+        intervals = [self.config.interval]
+        if self.config.trend_confirmation_enabled:
+            for interval in (self.config.trend_confirmation_medium_interval, self.config.trend_confirmation_long_interval):
+                if interval and interval not in intervals:
+                    intervals.append(interval)
+        processed = self.processed_data or {}
+        rows = []
+        now = self.market_data_provider.time()
+        raw = self._get_interval_candles_df(self.config.interval)
+        projections = getattr(self, "_chart_projection_cache", {})
+        for interval in intervals:
+            frame = raw
+            features = processed.get("features") if interval == self.config.interval else None
+            if isinstance(features, pd.DataFrame) and not features.empty:
+                frame = pd.concat([frame, features], ignore_index=True) if isinstance(frame, pd.DataFrame) else features
+            seconds = self._interval_to_seconds(interval)
+            if not isinstance(frame, pd.DataFrame) or "timestamp" not in frame or not seconds:
+                continue
+            timestamps = pd.to_numeric(frame["timestamp"], errors="coerce")
+            # Higher-frame cache keys include only fully closed target buckets.
+            closed_at = timestamps + seconds if interval == self.config.interval else (timestamps // seconds + 1) * seconds
+            frame = frame[closed_at <= now].sort_values("timestamp", kind="stable")
+            if interval == self.config.interval:
+                frame = frame.drop_duplicates("timestamp", keep="last")
+            frame = frame.tail(MAX_CACHED_CANDLES)
+            signature = chart_projection_signature(self.config, bot_name, interval, frame, processed, now, seconds)
+            cached = projections.get(interval)
+            if cached is None or cached[0] != signature:
+                if interval != self.config.interval:
+                    frame = derive_higher_timeframe_candles(
+                        frame, base_interval=self.config.interval, target_interval=interval,
+                        current_time=now, max_records=self.config.derived_higher_timeframe_max_records,
+                    )
+                projected_rows = build_chart_rows(self.config, bot_name, interval, frame, processed,
+                                                  now=now, interval_seconds=seconds)
+                projections[interval] = (signature, projected_rows)
+            rows.extend(projections[interval][1])
+        self._chart_projection_cache = {interval: projections[interval] for interval in intervals if interval in projections}
+        return pending_chart_rows(rows, getattr(self, "_chart_snapshot_cache", {}), MAX_BATCH_ROWS)
+
+    def chart_snapshot_rows_persisted(self, rows):
+        from controllers.directional_trading.ok_rsi_core.chart_snapshots import acknowledge_chart_rows
+
+        cache = getattr(self, "_chart_snapshot_cache", {})
+        acknowledge_chart_rows(cache, rows)
+        self._chart_snapshot_cache = cache
+
     def _get_interval_candles_df(self, interval: Optional[str]) -> Optional[pd.DataFrame]:
         if not interval:
             return None

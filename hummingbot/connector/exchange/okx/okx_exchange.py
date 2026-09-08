@@ -59,6 +59,11 @@ class OkxExchange(ExchangePyBase):
             passphrase=self.okx_passphrase,
             time_provider=self._time_synchronizer)
 
+    async def native_orders_reconciled(self) -> bool:
+        from hummingbot.connector.exchange.okx.native_reconciliation import verify_no_open_orders
+
+        return await verify_no_open_orders(self)
+
     @property
     def name(self) -> str:
         return "okx"

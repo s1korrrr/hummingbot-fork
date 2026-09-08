@@ -25,7 +25,7 @@ from hummingbot.client.config.config_helpers import (
     read_system_configs_from_yml,
 )
 from hummingbot.client.config.security import Security
-from hummingbot.client.hummingbot_application import HummingbotApplication
+from hummingbot.client.hummingbot_application import HummingbotApplication, validate_runtime_instance_id
 from hummingbot.client.settings import SCRIPT_STRATEGY_CONF_DIR_PATH, STRATEGIES_CONF_DIR_PATH, AllConnectorSettings
 from hummingbot.client.ui import login_prompt
 from hummingbot.client.ui.style import load_style
@@ -41,6 +41,10 @@ class CmdlineParser(argparse.ArgumentParser):
                           type=str,
                           required=False,
                           help="Specify a file in `conf/` to load as the strategy config file.")
+        self.add_argument("--instance-id",
+                          type=validate_runtime_instance_id,
+                          default=None,
+                          help="Override this process MQTT identity without changing conf_client.yml.")
         self.add_argument("--v2",
                           type=str,
                           required=False,
@@ -90,6 +94,7 @@ def autofix_permissions(user_group_spec: str):
 
 async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsManager):
     """Start Hummingbot using unified HummingbotApplication in either UI or headless mode."""
+    instance_id = validate_runtime_instance_id(getattr(args, "instance_id", None))
     client_config_map = load_client_config_map_from_file()
 
     if args.auto_set_permissions is not None:
@@ -113,7 +118,12 @@ async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsMana
     AllConnectorSettings.initialize_paper_trade_settings(client_config_map.paper_trade.paper_trade_exchanges)
 
     # Create unified application that handles both headless and UI modes
-    hb = HummingbotApplication.main_application(client_config_map=client_config_map, headless_mode=args.headless)
+    hb = HummingbotApplication.main_application(
+        client_config_map=client_config_map, headless_mode=args.headless, instance_id=instance_id
+    )
+
+    if args.headless:
+        await hb.prepare_headless_startup()
 
     # Load and start strategy if provided
     if args.v2_conf is not None or args.config_file_name is not None:
@@ -170,11 +180,25 @@ async def load_and_start_strategy(hb: HummingbotApplication, args: argparse.Name
 
         if args.headless:
             logging.getLogger().info(f"Starting V2 script strategy: {strategy_name}")
-            success = await hb.trading_core.start_strategy(
-                strategy_name,
-                args.v2_conf,
-                args.v2_conf
-            )
+            from hummingbot.client.native_lifecycle import NativeLifecycle
+            from hummingbot.client.native_sources import NativeSourceGuard, capture_sources, native_sources
+            observer = getattr(hb, 'native_lifecycle', None)
+            sources = capture_sources(args.v2_conf, script_file, None) if isinstance(observer, NativeLifecycle) else None
+            guard = NativeSourceGuard(sources) if sources is not None else None
+            token = native_sources.set(guard) if guard is not None else None
+            try:
+                success = await hb.trading_core.start_strategy(
+                    strategy_name,
+                    args.v2_conf,
+                    args.v2_conf
+                )
+                if success and guard is not None:
+                    observer.capture(hb.trading_core)
+                    observer.loaded_sources = dict(sources)
+            finally:
+                if guard is not None:
+                    guard.active = False
+                    native_sources.reset(token)
             if not success:
                 logging.getLogger().error("Failed to start strategy")
                 return False

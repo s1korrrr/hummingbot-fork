@@ -615,20 +615,27 @@ class MarketsRecorder:
         return rows
 
     def store_or_update_chart_snapshot(self, snapshot: Dict[str, Any]):
-        identity = {
-            "controller_id": snapshot["controller_id"],
-            "pair": snapshot["pair"],
-            "interval": snapshot["interval"],
-            "candle_timestamp": snapshot["candle_timestamp"],
-        }
+        self.store_or_update_chart_snapshots([snapshot])
+
+    def store_or_update_chart_snapshots(self, snapshots: List[Dict[str, Any]]):
+        """Commit a bounded chart batch atomically; omitted fields retain their values."""
+        if not snapshots:
+            return
         with self._sql_manager.get_new_session() as session:
-            existing_snapshot = session.query(ChartSnapshot).filter_by(**identity).one_or_none()
-            if existing_snapshot:
-                for attr, value in snapshot.items():
-                    if attr != "id":
-                        setattr(existing_snapshot, attr, value)
-            else:
-                session.add(ChartSnapshot(**snapshot))
+            for snapshot in snapshots:
+                identity = {
+                    "controller_id": snapshot["controller_id"],
+                    "pair": snapshot["pair"],
+                    "interval": snapshot["interval"],
+                    "candle_timestamp": snapshot["candle_timestamp"],
+                }
+                existing_snapshot = session.query(ChartSnapshot).filter_by(**identity).one_or_none()
+                if existing_snapshot:
+                    for attr, value in snapshot.items():
+                        if attr != "id":
+                            setattr(existing_snapshot, attr, value)
+                else:
+                    session.add(ChartSnapshot(**snapshot))
             session.commit()
 
     def prune_chart_snapshots(self, *, controller_id: str, pair: str, interval: str, keep_after_timestamp: int):

@@ -76,6 +76,7 @@ class HummingbotQuickstartTest(unittest.IsolatedAsyncioTestCase):
         all_connector_settings_mock.initialize_paper_trade_settings = Mock()
 
         args = SimpleNamespace(
+            instance_id="ok-rsi-main",
             auto_set_permissions=None,
             headless=False,
             v2_conf=None,
@@ -85,6 +86,9 @@ class HummingbotQuickstartTest(unittest.IsolatedAsyncioTestCase):
         await quick_start(args, Mock())
 
         client_config_map.decrypt_all_secure_data.assert_called_once()
+        hummingbot_application_mock.main_application.assert_called_once_with(
+            client_config_map=client_config_map, headless_mode=False, instance_id="ok-rsi-main"
+        )
 
 
 if __name__ == "__main__":

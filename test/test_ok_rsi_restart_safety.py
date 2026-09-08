@@ -181,3 +181,47 @@ def test_unowned_native_order_blocks_new_execution_before_persistence():
     with pytest.raises(RuntimeError, match='Unowned OKX orders'):
         orchestrator.create_executor(CreateExecutorAction(controller_id='controller', executor_config=make_executor().config))
     assert orchestrator.active_executors['controller'] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('invalid_state', [None, {'version': 999}])
+async def test_failed_risk_restore_preserves_original_evidence_after_tick(recorder, invalid_state):
+    import asyncio
+    from collections import deque
+
+    from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+    from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    from scripts.v2_with_controllers import V2WithControllersConfig
+
+    executor = make_executor()
+    executor._status = RunnableStatus.TERMINATED
+    recorder.store_or_update_executor(executor)
+    if invalid_state is not None:
+        recorder.store_strategy_risk_state(invalid_state)
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+
+    def initialize(strategy):
+        config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT')
+        strategy.controllers = {'controller': OKRSIController(config, strategy.market_data_provider, strategy.actions_queue)}
+
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig())
+        try:
+            assert strategy._is_stop_triggered
+            with patch.object(StrategyV2Base, 'on_tick'), \
+                    patch.object(strategy, 'process_operator_events'), \
+                    patch.object(strategy, 'control_max_drawdown'):
+                strategy.on_tick()
+                assert not strategy.validate_create_action(SimpleNamespace(controller_id='controller'))
+            assert recorder.load_strategy_risk_state() == invalid_state
+            assert 'EXECUTION BLOCKED' in strategy.format_status()
+            assert 'reconciliation' in strategy.format_status()
+            assert not connector.in_flight_orders
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)

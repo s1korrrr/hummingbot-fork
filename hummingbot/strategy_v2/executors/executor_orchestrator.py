@@ -1200,6 +1200,8 @@ class ExecutorOrchestrator:
         """
         controller_id = action.controller_id
         executor_config = action.executor_config
+        if controller_id in getattr(self.strategy, "_controller_restart_required", {}):
+            raise RuntimeError(f"Controller {controller_id} requires a process restart; new execution is blocked")
         if self.recovery_required.get(controller_id):
             raise RuntimeError(
                 f"Controller {controller_id} requires startup reconciliation of executors "

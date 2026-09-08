@@ -214,3 +214,65 @@ conda run -n hummingbot python -m unittest test.hummingbot.data_feed.test_market
 The committed YAMLs under `test/fixtures/ok_rsi/` are loader fixtures, not
 recommended capital allocations. Runtime YAMLs under `conf/` are operator-owned
 and intentionally ignored by Git.
+
+## Protected source updates and restart status
+
+OK RSI implementation updates require a full process restart with ownership
+reconciliation. The config loader fingerprints `ok_rsi.py`, `hl_rsi.py`, and
+Python sources under `ok_rsi_core/` before reloading any controller in its
+config batch. A changed, added, deleted, or unreadable protected source raises
+a restart requirement before the protected module can be reloaded. A file
+timestamp change with identical contents preserves the current class.
+
+Once observed, the restart requirement stays latched for the affected
+controllers for the lifetime of that strategy instance. Reverting a file or
+loading valid YAML does not clear it. A new config object in the same Python
+interpreter cannot accept changed files as a baseline for already loaded
+protected code. Valid configuration-only updates remain supported until a
+source-change latch is set. This is a config-check guard, not a continuous
+filesystem monitor or a seal of every imported engine dependency.
+
+Status displays `RESTART REQUIRED`, the affected controller IDs, and `BLOCKED`
+in their signal rows. New executor creation is rejected at the strategy queue,
+tick dispatch, and orchestrator creation boundary. Existing executor management
+and explicit stop actions remain available; this guard does not flatten a
+position or reset risk state. A protected-source failure can prevent the whole
+configuration batch from updating until the process is restarted.
+
+For a separately authorized rollout, preserve the exact runtime database,
+controller IDs and account/config identity; reconcile active orders, executors
+and held inventory through the existing lifecycle procedure before restarting.
+Do not clear database metadata or risk state to make the banner disappear.
+Review any concurrent source edits before installing the change. No running
+process receives this engine change merely because its files were edited.
+
+## Conversion-price health and balance notes
+
+Direct non-gateway rate requests have an individual timeout per pair. A slow
+or failed pair does not discard successful peer results. Boolean, zero,
+negative, non-finite and malformed prices are excluded. A failure never becomes
+a synthetic zero price. Request cancellation propagates and drains the pending
+pair requests.
+
+For managed direct pairs, `MarketDataProvider.get_rate()` accepts the newest
+successful sample for up to two configured refresh intervals (120 seconds at
+the default interval). Freshness starts when that pair's response arrives,
+not when a slower batch finishes. Missing, expired, or clock-rollback samples
+raise an unavailable/stale error. Inverse and indirect conversions use a provider-local copy of oracle prices
+with managed direct/reverse rates removed and only fresh managed samples
+restored, so expired managed legs cannot return through an indirect lookup.
+Unmanaged and gateway legs retain their existing oracle freshness assumptions;
+this change does not mutate the shared oracle or impose a global freshness
+policy on every RateOracle consumer or on candle/order-book data.
+
+Status exposes `DEGRADED` (recent sample with a failed refresh), `STALE`
+(expired sample), or `UNAVAILABLE` (no valid sample), with age and error type.
+Unchanged failures log once; changed failure sets and recovery are logged.
+Provider health remains available even when repeated log messages are suppressed.
+These measures contain exchange timeouts; they cannot prevent exchange or
+network outages.
+
+Spot balance notes distinguish no available base to sell from no quote funds
+for new buys. Zero BTC with available USDC is not presented as an inability to
+place any order. These notes do not replace minimum-notional, reserve, risk or
+ownership admission checks. Derivatives retain their existing balance warnings.

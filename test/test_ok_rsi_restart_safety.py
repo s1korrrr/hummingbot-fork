@@ -225,3 +225,19 @@ async def test_failed_risk_restore_preserves_original_evidence_after_tick(record
         finally:
             strategy.listen_to_executor_actions_task.cancel()
             await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+def test_direct_orchestrator_create_cannot_bypass_source_restart_guard():
+    orchestrator = make_orchestrator()
+    executor = make_executor()
+    orchestrator.strategy.controllers = {}
+    orchestrator.strategy._controller_restart_required = {'controller': 'source changed'}
+    orchestrator.strategy.connectors['okx'].in_flight_orders = {}
+    orchestrator._validate_okx_wallet_reservation = MagicMock()
+    created = MagicMock()
+    orchestrator._resolve_executor_class = MagicMock(return_value=MagicMock(return_value=created))
+    with patch.object(MarketsRecorder, 'get_instance', return_value=MagicMock()):
+        with pytest.raises(RuntimeError, match='process restart'):
+            orchestrator.create_executor(CreateExecutorAction(controller_id='controller', executor_config=executor.config))
+    created.start.assert_not_called()
+    assert orchestrator.active_executors['controller'] == []

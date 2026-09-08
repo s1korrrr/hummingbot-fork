@@ -372,6 +372,68 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(replacement_controller.performance_report, current_controller.performance_report)
         self.assertEqual(replacement_controller.processed_data, current_controller.processed_data)
 
+    def test_source_change_latches_admission_block_and_preserves_controller(self):
+        from hummingbot.strategy.strategy_v2_base import ControllerImplementationChanged
+        current = DummyReloadControllerV1(
+            config=MagicMock(id='controller_1'),
+            market_data_provider=self.strategy.market_data_provider,
+            actions_queue=self.strategy.actions_queue)
+        self.strategy.controllers = {'controller_1': current}
+        self.strategy.config_update_interval = 0
+        error = ControllerImplementationChanged(current.__class__.__module__)
+        with patch.object(StrategyV2ConfigBase, 'load_controller_configs', side_effect=error), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock, return_value=100):
+            self.strategy.update_controllers_configs()
+        assert self.strategy.controllers['controller_1'] is current
+        assert current.stop_calls == 0
+        assert not self.strategy.validate_create_action(SimpleNamespace(controller_id='controller_1'))
+        assert self.strategy.validate_create_action(SimpleNamespace(controller_id='other'))
+        assert 'RESTART REQUIRED' in self.strategy.format_status()
+        assert not self.strategy._is_stop_triggered
+        with patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[]), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock, return_value=101):
+            self.strategy.update_controllers_configs()
+        assert not self.strategy.validate_create_action(SimpleNamespace(controller_id='controller_1'))
+
+    def test_zero_spot_base_is_a_sell_note_not_a_blanket_order_failure(self):
+        self.strategy.markets = {self.connector_name: {self.trading_pair}}
+        self.strategy.ready_to_trade = True
+        self.strategy.controllers = {}
+        self.connector.set_balance('HBOT', Decimal('0'))
+        self.connector.set_balance('USDT', Decimal('1000'))
+        market = MarketTradingPairTuple(self.connector, self.trading_pair, 'HBOT', 'USDT')
+        with patch.object(self.strategy, 'get_market_trading_pair_tuples', return_value=[market]):
+            status = self.strategy.format_status()
+        assert 'Cannot place order' not in status
+        assert 'BALANCE NOTES' in status
+        assert 'no available HBOT to sell' in status
+        assert 'buys require USDT' in status
+
+    def test_status_surfaces_stale_conversion_prices(self):
+        self.strategy.markets = {self.connector_name: {self.trading_pair}}
+        self.strategy.ready_to_trade = True
+        self.strategy.controllers = {}
+        self.strategy.market_data_provider.get_rate_health.return_value = [
+            {'connector': 'okx', 'trading_pair': 'BTC-USDT', 'state': 'stale',
+             'age_seconds': 180, 'error': 'TimeoutError', 'consecutive_failures': 3}]
+        status = self.strategy.format_status()
+        assert 'BTC-USDT' in status
+        assert 'STALE' in status
+        assert '180s' in status
+
+    async def test_source_restart_blocks_queued_creates_but_preserves_stop_actions(self):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+        create = CreateExecutorAction(controller_id='controller_1', executor_config=self.get_position_config_market_short())
+        stop = StopExecutorAction(controller_id='controller_1', executor_id='existing', keep_position=True)
+        self.strategy._controller_restart_required = {'controller_1': 'source changed'}
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+        self.strategy.executor_orchestrator.execute_actions.assert_called_once_with([stop])
+
     def create_mock_executor_config(self):
         return MagicMock(
             timestamp=1234567890,

@@ -9,6 +9,7 @@ buy/sell and explicitly assigned sell-only inventory.
 import logging
 import math
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -111,6 +112,11 @@ class OKRSIController(hl_rsi.HLRSIController):
     """Shared RSI v5 behavior with OKX spot execution and trailing contracts."""
 
     allow_implementation_hot_reload = False
+
+    @classmethod
+    def implementation_source_files(cls):
+        directory = Path(__file__).parent
+        return [Path(__file__), Path(hl_rsi.__file__), *(directory / "ok_rsi_core").rglob("*.py")]
     _logger: Optional[HummingbotLogger] = None
 
     @classmethod

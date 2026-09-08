@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import importlib
 import inspect
 import json
@@ -17,6 +18,7 @@ from hummingbot.client import settings
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.derivative_base import DerivativeBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.utils import combine_to_hb_trading_pair, split_hb_trading_pair
 from hummingbot.core.clock import Clock
@@ -62,6 +64,12 @@ def _get_executor_orchestrator_class():
     return ExecutorOrchestrator
 
 
+class ControllerImplementationChanged(RuntimeError):
+    def __init__(self, module_path: str):
+        self.module_path = module_path
+        super().__init__(f"Controller source changed or is unreadable: {module_path}; process restart with ownership reconciliation is required")
+
+
 class StrategyV2ConfigBase(BaseClientModel):
     """
     Base class for version 2 strategy configurations.
@@ -87,6 +95,7 @@ class StrategyV2ConfigBase(BaseClientModel):
         }
     )
     _controller_module_mtimes: Dict[str, float] = PrivateAttr(default_factory=dict)
+    _controller_source_fingerprints: Dict[str, tuple] = PrivateAttr(default_factory=dict)
 
     @field_validator("controllers_config", mode="before")
     @classmethod
@@ -110,6 +119,32 @@ class StrategyV2ConfigBase(BaseClientModel):
         if module_file is not None and module_file.endswith(".pyc"):
             module_file = module_file[:-1]
 
+        protected_classes = [member for member in vars(module).values()
+                             if inspect.isclass(member) and issubclass(member, ControllerBase)
+                             and getattr(member, "allow_implementation_hot_reload", True) is False]
+        if protected_classes:
+            # importlib.reload mutates a module's globals even when its old instances survive.
+            # Check all declared sources before any reload and never replace the protected module.
+            if module_file is None:
+                raise ControllerImplementationChanged(module_path)
+            sources = {str(Path(module_file).resolve())}
+            for controller_class in protected_classes:
+                source_files = getattr(controller_class, "implementation_source_files", None)
+                if callable(source_files):
+                    sources.update(str(Path(path).resolve()) for path in source_files())
+            try:
+                fingerprint = tuple((path, hashlib.sha256(Path(path).read_bytes()).hexdigest()) for path in sorted(sources))
+            except OSError as error:
+                raise ControllerImplementationChanged(module_path) from error
+            previous = self._controller_source_fingerprints.get(
+                module_path, getattr(module, "__hummingbot_protected_source_fingerprint__", None))
+            if previous is not None and previous != fingerprint:
+                raise ControllerImplementationChanged(module_path)
+            # A new strategy config in the same interpreter must not bless old loaded code.
+            module.__dict__.setdefault("__hummingbot_protected_source_fingerprint__", fingerprint)
+            self._controller_source_fingerprints.setdefault(module_path, fingerprint)
+            return module
+
         current_mtime = None
         if module_file is not None and os.path.exists(module_file):
             current_mtime = os.path.getmtime(module_file)
@@ -127,6 +162,11 @@ class StrategyV2ConfigBase(BaseClientModel):
         return module
 
     def load_controller_configs(self, reload_changed_modules: bool = False):
+        if reload_changed_modules:
+            # A shared helper may also be used by a reload-enabled controller later in this batch.
+            # Preflight protected sources before any module in the batch can be reloaded.
+            for module_path in self._controller_source_fingerprints:
+                self._load_controller_module(module_path)
         loaded_configs = []
         for config_path in self.controllers_config:
             full_path = os.path.join(settings.CONTROLLERS_CONF_DIR_PATH, config_path)
@@ -315,6 +355,7 @@ class StrategyV2Base(StrategyPyBase):
         self._controller_reports_valid = False
         self._controllers_started = False
         self._last_controller_reload_error: Optional[str] = None
+        self._controller_restart_required: Dict[str, str] = {}
         self._last_runtime_db_sync_ts: float = 0
         self._last_runtime_status_snapshot_ts: float = 0
         self._last_chart_snapshot_prune_ts: float = 0
@@ -369,6 +410,8 @@ class StrategyV2Base(StrategyPyBase):
             if self.market_data_provider.ready and not self._is_stop_triggered:
                 executor_actions: List[ExecutorAction] = self.determine_executor_actions()
                 for action in executor_actions:
+                    if isinstance(action, CreateExecutorAction) and action.controller_id in self._controller_restart_required:
+                        continue
                     self.executor_orchestrator.execute_action(action)
 
     async def on_stop(self):
@@ -826,11 +869,18 @@ class StrategyV2Base(StrategyPyBase):
         Returns status of the current strategy on user balances and current active orders.
         In V2 mode, also shows controller reports and performance summary.
         """
-        if not self.ready_to_trade:
-            return "Market connectors are not ready."
         lines = []
+        if self._controller_restart_required:
+            lines.append("RESTART REQUIRED: new executors blocked.")
+            lines.append("Controllers: " + ', '.join(sorted(self._controller_restart_required)))
+            lines.append("Existing executors continue. Reconcile ownership before restarting the process.")
+        elif self._last_controller_reload_error:
+            lines.append("CONFIG UPDATE FAILED: " + self._last_controller_reload_error)
+        if not self.ready_to_trade:
+            return "\n".join(lines + ["Market connectors are not ready."])
         warning_lines = []
         warning_lines.extend(self.network_warning(self.get_market_trading_pair_tuples()))
+        warning_lines.extend(self._price_refresh_warnings())
 
         balance_df = self.get_balance_df()
         lines.extend(["", "  Balances:"] + ["    " + line for line in balance_df.to_string(index=False).split("\n")])
@@ -917,17 +967,51 @@ class StrategyV2Base(StrategyPyBase):
 
                 performance_df = pd.DataFrame(performance_data)
                 lines.append(format_df_for_printout(performance_df, table_format="psql", index=False))
-        else:
-            # Simple mode: just warnings
-            warning_lines.extend(self.balance_warning(self.get_market_trading_pair_tuples()))
-            if len(warning_lines) > 0:
-                lines.extend(["", "*** WARNINGS ***"] + warning_lines)
-            return "\n".join(lines)
-
-        warning_lines.extend(self.balance_warning(self.get_market_trading_pair_tuples()))
-        if len(warning_lines) > 0:
+        lines.extend(self._balance_status_lines())
+        if warning_lines:
             lines.extend(["", "*** WARNINGS ***"] + warning_lines)
         return "\n".join(lines)
+
+    def _price_refresh_warnings(self) -> List[str]:
+        lines = []
+        for health in self.market_data_provider.get_rate_health():
+            if health['state'] == 'ready':
+                continue
+            age = health['age_seconds']
+            age_text = 'no valid sample yet' if age is None else f"last valid sample {age:.0f}s ago"
+            if age is not None and age < 0:
+                age_text = 'clock moved backwards; cached sample rejected'
+            error = health['error'] or 'no recent refresh'
+            lines.append(f"{health['connector']} {health['trading_pair']}: {health['state'].upper()} conversion price "
+                         f"({error}); {age_text}.")
+        return lines
+
+    def _balance_status_lines(self) -> List[str]:
+        notes = []
+        derivatives = []
+        for market_pair in self.get_market_trading_pair_tuples():
+            market = market_pair.market
+            if isinstance(market, DerivativeBase):
+                derivatives.append(market_pair)
+                continue
+            base, quote = market_pair.base_asset, market_pair.quote_asset
+            try:
+                base_available = Decimal(str(market.get_available_balance(base)))
+                quote_available = Decimal(str(market.get_available_balance(quote)))
+                if not base_available.is_finite() or not quote_available.is_finite():
+                    raise ValueError('Non-finite balance')
+            except (ArithmeticError, TypeError, ValueError):
+                notes.append(f"{market_pair.trading_pair}: available balances are unavailable.")
+                continue
+            if base_available <= 0:
+                notes.append(f"{market_pair.trading_pair}: no available {base} to sell; buys require {quote}.")
+            if quote_available <= 0:
+                notes.append(f"{market_pair.trading_pair}: no available {quote} for new buys.")
+        lines = ["", "*** BALANCE NOTES ***", *dict.fromkeys(notes)] if notes else []
+        derivative_warnings = self.balance_warning(derivatives)
+        if derivative_warnings:
+            lines.extend(["", "*** WARNINGS ***", *derivative_warnings])
+        return lines
 
     def _market_trading_pair_tuple(self,
                                    connector_name: str,
@@ -1034,7 +1118,7 @@ class StrategyV2Base(StrategyPyBase):
             return
 
         if getattr(current_controller, "allow_implementation_hot_reload", True) is False:
-            raise RuntimeError("Controller implementation changed; restart with ownership reconciliation is required")
+            raise ControllerImplementationChanged(current_controller.__class__.__module__)
         replacement_class = controller_config.get_controller_class()
         replacement_controller = replacement_class(controller_config, self.market_data_provider, self.actions_queue)
         self._copy_controller_runtime_state(current_controller, replacement_controller)
@@ -1062,6 +1146,8 @@ class StrategyV2Base(StrategyPyBase):
             try:
                 controllers_configs = self.config.load_controller_configs(reload_changed_modules=True)
                 for controller_config in controllers_configs:
+                    if controller_config.id in self._controller_restart_required:
+                        continue
                     current_controller = self.controllers.get(controller_config.id)
                     if current_controller is None:
                         self.add_controller(controller_config)
@@ -1072,9 +1158,17 @@ class StrategyV2Base(StrategyPyBase):
                     else:
                         current_controller.update_config(controller_config)
 
-                if self._last_controller_reload_error is not None:
+                if self._last_controller_reload_error is not None and not self._controller_restart_required:
                     self.logger().info("Controller config reload recovered.")
                     self._last_controller_reload_error = None
+            except ControllerImplementationChanged as error:
+                affected = [cid for cid, controller in self.controllers.items()
+                            if controller.__class__.__module__ == error.module_path]
+                self._controller_restart_required.update({cid: str(error) for cid in affected})
+                error_label = str(error)
+                if error_label != self._last_controller_reload_error:
+                    self.logger().warning(f"RESTART REQUIRED: new executors blocked for {', '.join(affected)}. {error}")
+                    self._last_controller_reload_error = error_label
             except Exception as e:
                 error_label = f"{type(e).__name__}: {e}"
                 if error_label != self._last_controller_reload_error:
@@ -1082,7 +1176,7 @@ class StrategyV2Base(StrategyPyBase):
                     self._last_controller_reload_error = error_label
 
     def validate_create_action(self, action: CreateExecutorAction) -> bool:
-        return not self._is_stop_triggered
+        return not self._is_stop_triggered and action.controller_id not in self._controller_restart_required
 
     async def listen_to_executor_actions(self):
         """
@@ -1095,6 +1189,8 @@ class StrategyV2Base(StrategyPyBase):
                 for action in actions:
                     controller = self.controllers.get(action.controller_id)
                     if isinstance(action, CreateExecutorAction):
+                        if action.controller_id in self._controller_restart_required:
+                            continue
                         if not self.validate_create_action(action):
                             continue
                         if (self._is_stop_triggered or not self._controller_reports_valid or controller is None
@@ -1265,6 +1361,9 @@ class StrategyV2Base(StrategyPyBase):
                 positions=positions,
                 performance=performance,
             )
+            if self._is_stop_triggered or controller_id in self._controller_restart_required:
+                summary = dict(summary, gates_mask="BLOCKED",
+                               focus="strategy stopped" if self._is_stop_triggered else "restart required")
             entries.append({
                 "controller_id": controller_id,
                 "controller": controller,

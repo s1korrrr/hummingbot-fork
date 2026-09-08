@@ -18,6 +18,7 @@ from hummingbot.core.data_type.common import GroupedSetDict, LazyDict, PriceType
 from hummingbot.core.data_type.order_book_query_result import OrderBookQueryResult
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -47,6 +48,8 @@ class MarketDataProvider:
         self._rates_update_task = None
         self._rates_update_interval = rates_update_interval
         self._rates = {}
+        self._rate_refresh_state: Dict[Tuple[str, str], Dict] = {}
+        self._last_rate_refresh_errors: Dict[str, str] = {}
         self._non_trading_connectors = LazyDict[str, ConnectorBase](self._create_non_trading_connector)
         self._non_trading_connectors_started: Dict[str, bool] = {}  # Track which connectors have been started
         self._rates_required = GroupedSetDict[str, ConnectorPair]()
@@ -61,6 +64,8 @@ class MarketDataProvider:
         self.candles_feeds.clear()
         self._candle_throttlers.clear()
         self._rates_required.clear()
+        self._rate_refresh_state.clear()
+        self._last_rate_refresh_errors.clear()
         # Stop non-trading connectors that were started for public data access
         for connector in self._non_trading_connectors.values():
             safe_ensure_future(connector.stop_network())
@@ -93,6 +98,7 @@ class MarketDataProvider:
         """
         for connector_pair in connector_pairs:
             self._rates_required.remove(connector_pair.connector_name, connector_pair)
+            self._rate_refresh_state.pop((connector_pair.connector_name, connector_pair.trading_pair), None)
 
         # Stop the rates update task if no more rates are required
         if len(self._rates_required) == 0 and self._rates_update_task:
@@ -794,29 +800,97 @@ class MarketDataProvider:
         :param pair: A trading pair, e.g. BTC-USDT
         :return A conversion rate
         """
-        return RateOracle.get_instance().get_pair_rate(pair)
+        managed_pairs = {trading_pair for _, trading_pair in self._rate_refresh_state}
+        managed_pairs.update(
+            entry.trading_pair
+            for connector, entries in self._rates_required.items()
+            if '/' not in connector and 'gateway' not in connector
+            for entry in entries
+        )
+        oracle = RateOracle.get_instance()
+        if not managed_pairs:
+            return oracle.get_pair_rate(pair)
+
+        # Resolve inverses and intermediate legs from the same freshness-filtered
+        # map. Falling back to the shared oracle would resurrect expired samples.
+        prices = dict(oracle.prices)
+        fresh_prices = {}
+        now = self.time()
+        for managed_pair in managed_pairs:
+            base, quote = managed_pair.split('-')
+            prices.pop(managed_pair, None)
+            prices.pop(f"{quote}-{base}", None)
+            states = [entry for (_, trading_pair), entry in self._rate_refresh_state.items()
+                      if trading_pair == managed_pair and entry.get('last_success') is not None
+                      and 0 <= now - entry['last_success'] <= self._rates_update_interval * 2]
+            if states:
+                fresh_prices[managed_pair] = max(states, key=lambda entry: entry['last_success'])['price']
+            elif pair in (managed_pair, f"{quote}-{base}"):
+                raise ValueError(f"Conversion rate {pair} unavailable or stale; awaiting a successful price refresh")
+        prices.update(fresh_prices)
+        rate = find_rate(prices, pair)
+        if rate is None:
+            raise ValueError(f"Conversion rate {pair} unavailable or stale; awaiting a successful price refresh")
+        return rate
+
+    def get_rate_health(self) -> List[Dict]:
+        """Expose failed and expired refreshes without claiming cached rates are current."""
+        now = self.time()
+        health = []
+        for (connector, pair), entry in sorted(self._rate_refresh_state.items()):
+            age = None if entry.get('last_success') is None else now - entry['last_success']
+            if age is None:
+                state = 'unavailable'
+            elif not 0 <= age <= self._rates_update_interval * 2:
+                state = 'stale'
+            else:
+                state = 'degraded' if entry['error'] is not None else 'ready'
+            health.append({'connector': connector, 'trading_pair': pair, 'state': state,
+                           'age_seconds': age, 'error': entry['error'], 'consecutive_failures': entry['failures']})
+        return health
 
     async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=5):
-        try:
-            tasks = [self._safe_get_last_traded_price(connector, trading_pair) for trading_pair in trading_pairs]
-            prices = await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
-            return {pair: Decimal(rate) for pair, rate in zip(trading_pairs, prices)}
-        except Exception as e:
-            error_detail = f"{type(e).__name__}: {e}" if str(e).strip() else type(e).__name__
-            logging.error(
-                f"Error getting last traded prices in connector {connector} for trading pairs {trading_pairs}: "
-                f"{error_detail}"
-            )
-            return {}
+        pairs = list(dict.fromkeys(trading_pairs))
+
+        async def fetch(pair):
+            price = await asyncio.wait_for(self._safe_get_last_traded_price(connector, pair), timeout=timeout)
+            return price, self.time()
+
+        results = await asyncio.gather(*(fetch(pair) for pair in pairs), return_exceptions=True)
+        prices = {}
+        failures = []
+        connector_name = getattr(connector, 'name', None)
+        if not isinstance(connector_name, str):
+            connector_name = type(connector).__name__
+        for pair, result in zip(pairs, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            entry = self._rate_refresh_state.setdefault((connector_name, pair), {'last_success': None})
+            if isinstance(result, Exception):
+                entry.update(error=type(result).__name__, failures=entry.get('failures', 0) + 1)
+                failures.append(f"{pair} ({type(result).__name__})")
+            else:
+                price, received_at = result
+                prices[pair] = price
+                entry.update(last_success=received_at, price=price, error=None, failures=0)
+        error_label = ', '.join(sorted(failures))
+        previous_error = self._last_rate_refresh_errors.get(connector_name, '')
+        if error_label != previous_error:
+            if error_label:
+                self.logger().warning(
+                    f"Price refresh incomplete for {connector_name}: {error_label}; retrying on the next refresh. "
+                    f"Cached conversion rates expire after {self._rates_update_interval * 2}s."
+                )
+            else:
+                self.logger().info(f"Price refresh recovered for {connector_name}.")
+            self._last_rate_refresh_errors[connector_name] = error_label
+        return prices
 
     async def _safe_get_last_traded_price(self, connector, trading_pair):
-        try:
-            last_traded = await connector._get_last_traded_price(trading_pair=trading_pair)
-            return Decimal(last_traded)
-        except Exception as e:
-            error_detail = f"{type(e).__name__}: {e}" if str(e).strip() else type(e).__name__
-            logging.error(
-                f"Error getting last traded price in connector {connector} for trading pair {trading_pair}: "
-                f"{error_detail}"
-            )
-            return Decimal(0)
+        last_traded = await connector._get_last_traded_price(trading_pair=trading_pair)
+        if isinstance(last_traded, bool):
+            raise ValueError("Boolean price is invalid")
+        price = Decimal(str(last_traded))
+        if not price.is_finite() or price <= 0:
+            raise ValueError("Price must be finite and positive")
+        return price

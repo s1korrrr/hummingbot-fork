@@ -214,7 +214,7 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(result, {"BTC-USDT": 100})
         connector._get_last_traded_price.side_effect = Exception("Error")
         result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT"])
-        self.assertEqual(result, {"BTC-USDT": Decimal("0")})
+        self.assertEqual(result, {})
 
     async def test_safe_get_last_traded_prices_logs_exception_class_for_empty_timeout_message(self):
         connector = AsyncMock()
@@ -225,7 +225,7 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
 
         connector._get_last_traded_price.side_effect = slow_last_trade_price
 
-        with patch("hummingbot.data_feed.market_data_provider.logging.error") as mock_log_error:
+        with patch.object(self.provider.logger(), "warning") as mock_log_error:
             result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT"], timeout=0.001)
 
         self.assertEqual(result, {})

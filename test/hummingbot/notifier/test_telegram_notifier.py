@@ -356,3 +356,35 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(2, len(attempts))
         self.assertEqual([notifier.COMMAND_LOOP_RETRY_DELAY], sleep_delays)
+
+    async def test_conflict_suspends_polling_without_stopping_notifications(self):
+        from unittest.mock import AsyncMock
+
+        from hummingbot.notifier.telegram_polling import TelegramPollingConflict
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._run_command_cycle = AsyncMock(side_effect=TelegramPollingConflict('conflict'))
+        notifier._send_telegram_text = AsyncMock()
+        task = asyncio.create_task(notifier._run_owned_command_loop())
+        try:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            notifier._run_command_cycle.assert_awaited_once()
+            await notifier._send_message('notification')
+            notifier._send_telegram_text.assert_awaited_once_with('notification')
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def test_http_conflict_becomes_typed_error_without_token(self):
+        import io
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+
+        from hummingbot.notifier.telegram_polling import TelegramPollingConflict
+        notifier = TelegramNotifier(self.hb_app)
+        error = HTTPError('https://example.invalid/secret-token', 409, 'Conflict', {}, io.BytesIO(b'conflict'))
+        with patch('hummingbot.notifier.telegram_notifier.request.urlopen', side_effect=error):
+            with self.assertRaises(TelegramPollingConflict) as raised:
+                notifier._fetch_updates()
+        self.assertNotIn('secret-token', str(raised.exception))

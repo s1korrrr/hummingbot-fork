@@ -17,6 +17,7 @@ from hummingbot.core.pubsub import PubSub
 from hummingbot.model.order import Order
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.notifier.notifier_base import NotifierBase
+from hummingbot.notifier.telegram_polling import TelegramPollingConflict, TelegramPollingLease, wait_for_poll
 
 if TYPE_CHECKING:
     from hummingbot.client.hummingbot_application import HummingbotApplication
@@ -227,11 +228,35 @@ class TelegramNotifier(NotifierBase):
         return datetime.fromtimestamp(float(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
 
     async def _run_command_loop(self):
+        lease = TelegramPollingLease(self._config.telegram_bot_token.get_secret_value())
+        try:
+            waiting_logged = False
+            while not lease.acquire():
+                if not waiting_logged:
+                    self.logger().info('Another local bot owns Telegram commands; notifications remain enabled.')
+                    waiting_logged = True
+                await self._sleep(self.COMMAND_LOOP_RETRY_DELAY)
+            await self._run_owned_command_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception('Telegram command ownership failed; polling disabled, notifications remain enabled.')
+        finally:
+            lease.close()
+
+    async def _run_owned_command_loop(self):
         while True:
             try:
                 await self._run_command_cycle()
             except asyncio.CancelledError:
                 raise
+            except TelegramPollingConflict:
+                self.logger().warning(
+                    'Telegram command polling suspended: another consumer or webhook uses this token. '
+                    'Notifications remain enabled. Stop the competing poller before restarting this notifier.'
+                )
+                # Keep the local lease so standby bots do not repeat the same conflict.
+                await asyncio.Future()
             except Exception as e:
                 self.logger().warning(
                     f"Telegram command loop iteration failed; retrying in {self.COMMAND_LOOP_RETRY_DELAY:.0f}s: {e}",
@@ -244,14 +269,14 @@ class TelegramNotifier(NotifierBase):
             await self._initialize_command_state()
         if self._config.telegram_set_my_commands and not self._command_menu_published:
             self._command_menu_published = await self._publish_command_menu()
-        updates = await self._ev_loop.run_in_executor(None, self._fetch_updates)
+        updates = await wait_for_poll(self._ev_loop, self._fetch_updates)
         for update in updates:
             await self._handle_update(update)
 
     async def _initialize_command_state(self):
         if self._last_update_id is not None:
             return
-        updates = await self._ev_loop.run_in_executor(None, self._fetch_updates_once)
+        updates = await wait_for_poll(self._ev_loop, self._fetch_updates_once)
         if updates:
             self._last_update_id = max(int(update["update_id"]) for update in updates) + 1
         else:
@@ -981,12 +1006,17 @@ class TelegramNotifier(NotifierBase):
             with request.urlopen(req, timeout=self.REQUEST_TIMEOUT + self.LONG_POLL_TIMEOUT) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as e:
+            if method == 'getUpdates' and e.code == 409:
+                e.close()
+                raise TelegramPollingConflict('Telegram updates already have a consumer') from None
             body = e.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"Telegram API {method} failed: {e.code} {body}")
         except URLError as e:
             raise RuntimeError(f"Telegram API {method} failed: {e}")
 
         if not payload.get("ok"):
+            if method == "getUpdates" and payload.get("error_code") == 409:
+                raise TelegramPollingConflict("Telegram updates already have a consumer")
             raise RuntimeError(f"Telegram API {method} failed: {payload}")
         return payload.get("result", [])
 

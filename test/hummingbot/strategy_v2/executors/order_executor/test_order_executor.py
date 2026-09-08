@@ -6,8 +6,9 @@ from unittest.mock import MagicMock, PropertyMock, patch
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
@@ -206,6 +207,11 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             creation_timestamp=1640001112.223,
             initial_state=OrderState.COMPLETED
         )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id="fill", client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair, fill_timestamp=123, fill_price=Decimal("100"),
+            fill_base_amount=Decimal("1"), fill_quote_amount=Decimal("1") * 100,
+            fee=AddedToCostTradeFee()))
         in_flight_order_mock.return_value = order
 
         # Setup executor
@@ -455,7 +461,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         executor._order.order = order
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.strategy.cancel.assert_called_once_with(
             connector_name=config.connector_name,
             trading_pair=config.trading_pair,
@@ -488,11 +494,16 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             creation_timestamp=1640001112.223,
             initial_state=OrderState.FILLED
         )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id="fill", client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair, fill_timestamp=123, fill_price=Decimal("100"),
+            fill_base_amount=Decimal("1"), fill_quote_amount=Decimal("1") * 100,
+            fee=AddedToCostTradeFee()))
         executor._order = TrackedOrder("OID-FILLED")
         executor._order.order = order
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(len(executor._held_position_orders), 1)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
@@ -523,12 +534,17 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             creation_timestamp=1640001112.223,
             initial_state=OrderState.PARTIALLY_FILLED
         )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id="fill", client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair, fill_timestamp=123, fill_price=Decimal("100"),
+            fill_base_amount=Decimal(".4"), fill_quote_amount=Decimal(".4") * 100,
+            fee=AddedToCostTradeFee()))
         tracked_order = TrackedOrder("OID-PARTIAL")
         tracked_order.order = order
         executor._partial_filled_orders = [tracked_order]
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(len(executor._held_position_orders), 1)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
@@ -549,7 +565,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         executor._status = RunnableStatus.SHUTTING_DOWN
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
 
     @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
@@ -804,7 +820,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         # Second control task call - should refresh as price moved beyond threshold
         await executor.control_task()
         mock_cancel_order.assert_called_once()
-        mock_place_open_order.assert_called_once()
+        mock_place_open_order.assert_not_called()
 
         # Verify the new order price calculation
         new_price = executor.get_order_price()

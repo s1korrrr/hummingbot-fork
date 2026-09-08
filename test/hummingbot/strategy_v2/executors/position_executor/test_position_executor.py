@@ -42,6 +42,10 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         strategy.connectors = {
             "binance": MagicMock(spec=ExchangePyBase),
         }
+        strategy.connectors["binance"].get_price_by_type.return_value = Decimal("100")
+        strategy.connectors["binance"].trading_rules = {"ETH-USDT": TradingRule("ETH-USDT", min_order_size=Decimal("0.01"), min_notional_size=Decimal("1"))}
+        strategy.connectors["binance"]._order_tracker = MagicMock()
+        strategy.connectors["binance"]._order_tracker.fetch_order.return_value = None
         return strategy
 
     def get_position_config_market_long(self):
@@ -211,7 +215,7 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(position_executor.status, RunnableStatus.SHUTTING_DOWN)
 
     @patch.object(PositionExecutor, "get_trading_rules")
-    async def test_control_open_order_does_not_cancel_partially_filled_stale_limit_entry(self, trading_rules_mock):
+    async def test_control_open_order_cancels_partially_filled_stale_limit_entry(self, trading_rules_mock):
         trading_rules = MagicMock(spec=TradingRule)
         trading_rules.min_order_size = Decimal("0.1")
         trading_rules.min_notional_size = Decimal("1")
@@ -250,8 +254,8 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
 
         await position_executor.control_task()
 
-        position_executor._strategy.cancel.assert_not_called()
-        self.assertEqual(position_executor.status, RunnableStatus.RUNNING)
+        position_executor._strategy.cancel.assert_called_once()
+        self.assertEqual(position_executor.status, RunnableStatus.SHUTTING_DOWN)
 
     @patch.object(PositionExecutor, "get_trading_rules")
     async def test_control_position_order_placed_not_cancel_open_order(self, trading_rules_mock):
@@ -428,6 +432,10 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         )
         self.strategy.connectors["binance"].quantize_order_amount.return_value = position_config.amount
 
+        await position_executor.control_task()
+        self.assertIsNone(position_executor._close_order)
+        position_executor.process_order_canceled_event(
+            0, None, OrderCancelledEvent(self.strategy.current_timestamp, "OID-SELL-1"))
         await position_executor.control_task()
         self.assertEqual(position_executor._close_order.order_id, "OID-SELL-2")
         self.assertEqual(position_executor.close_type, CloseType.TIME_LIMIT)
@@ -1208,6 +1216,7 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
                 fill_timestamp=10,
             )
         )
+        self.strategy.connectors["binance"].quantize_order_amount.side_effect = lambda trading_pair, amount: amount
         position_executor._status = RunnableStatus.SHUTTING_DOWN
         await position_executor.control_task()
         place_order_mock.assert_called_once()

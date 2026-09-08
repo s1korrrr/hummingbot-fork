@@ -206,6 +206,10 @@ class ControllerBase(RunnableBase):
         self.executors_update_event = asyncio.Event()
         self.executors_info_queue = asyncio.Queue()
 
+    def validate_executor_config(self, config: "ExecutorConfigBase") -> bool:
+        """Recheck the current controller stop state at the execution boundary."""
+        return self.status == RunnableStatus.RUNNING and not self.config.manual_kill_switch
+
     def get_executor_class_for_config(
         self,
         config: "ExecutorConfigBase",
@@ -264,10 +268,18 @@ class ControllerBase(RunnableBase):
         Update the controller configuration. With the variables that in the client_data have the is_updatable flag set
         to True. This will be only available for those variables that don't interrupt the bot operation.
         """
-        for name, field_info in self.config.__class__.model_fields.items():
-            json_schema_extra = field_info.json_schema_extra or {}
-            if json_schema_extra.get("is_updatable", False):
-                setattr(self.config, name, getattr(new_config, name))
+        current = self.config.model_dump()
+        requested = new_config.model_dump()
+        restart_fields = []
+        for name, field_info in type(self.config).model_fields.items():
+            if current[name] != requested[name] and not (field_info.json_schema_extra or {}).get("is_updatable", False):
+                restart_fields.append(name)
+        if restart_fields:
+            raise ValueError("restart required for config fields: " + ", ".join(restart_fields))
+        # Validate a complete snapshot, then swap it. Assignment validation on individual fields can mutate
+        # the original object before a coupled-field validator raises.
+        validated = type(self.config).model_validate(requested)
+        self.config = validated
 
     def build_chart_snapshot_rows(self, bot_name: str) -> List[Dict[str, object]]:
         """

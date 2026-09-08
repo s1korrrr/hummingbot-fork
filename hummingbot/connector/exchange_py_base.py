@@ -530,12 +530,9 @@ class ExchangePyBase(ExchangeBase, ABC):
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            # some exchanges do not allow cancels with the client/user order id
-            # so log a warning and wait for the creation of the order to complete
             self.logger().warning(
-                f"Failed to cancel the order {order.client_order_id} because it does not have an exchange order id yet"
+                f"Cancellation status unknown for order {order.client_order_id}; retaining it for reconciliation"
             )
-            await self._order_tracker.process_order_not_found(order.client_order_id)
         except Exception as ex:
             if self._is_order_not_found_during_cancelation_error(cancelation_exception=ex):
                 self.logger().warning(f"Failed to cancel order {order.client_order_id} (order not found)")
@@ -995,22 +992,15 @@ class ExchangePyBase(ExchangeBase, ABC):
                 )
 
     async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
-        try:
+        if isinstance(error, asyncio.CancelledError):
             raise error
-        except asyncio.TimeoutError:
-            self.logger().debug(
-                f"Tracked order {order.client_order_id} does not have an exchange id. "
-                f"Attempting fetch in next polling interval."
-            )
+        if self._is_order_not_found_during_status_update_error(status_update_exception=error):
             await self._order_tracker.process_order_not_found(order.client_order_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as request_error:
+        else:
             self.logger().warning(
-                f"Error fetching status update for the active order {order.client_order_id}: {request_error}.",
+                f"Status unavailable for active order {order.client_order_id}: {type(error).__name__}: {error}. "
+                "Retaining order and reservation until the exchange confirms its state."
             )
-            self.logger().debug(f"Order {order.client_order_id} not found counter: {self._order_tracker._order_not_found_records.get(order.client_order_id, 0)}")
-            await self._order_tracker.process_order_not_found(order.client_order_id)
 
     async def _handle_update_error_for_lost_order(self, order: InFlightOrder, error: Exception):
         is_not_found = self._is_order_not_found_during_status_update_error(status_update_exception=error)

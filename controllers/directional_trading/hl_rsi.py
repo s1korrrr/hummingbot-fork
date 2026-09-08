@@ -17,6 +17,7 @@ Key Features:
 - No time limit on executors - hold until trailing stop or bag freeze
 """
 import logging
+import math
 import time as _time
 import warnings
 from dataclasses import dataclass
@@ -265,9 +266,9 @@ class HLRSIControllerConfig(DirectionalTradingControllerConfigBase):
     interval: str = Field(default="1m", client_data=ClientFieldData(prompt=lambda mi: "Candle interval:", prompt_on_new=True, is_updatable=False))
     max_candle_age_intervals: float = Field(default=2.5, gt=0.0, client_data=ClientFieldData(prompt=lambda mi: "Max candle age in intervals:", prompt_on_new=False, is_updatable=True))
     strict_hmm_mode: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Require real HMM regime detector?:", prompt_on_new=False, is_updatable=False))
-    trend_confirmation_enabled: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Use multi-timeframe trend confirmation?:", prompt_on_new=False, is_updatable=True))
-    trend_confirmation_medium_interval: Optional[str] = Field(default="5m", client_data=ClientFieldData(prompt=lambda mi: "Trend medium interval:", prompt_on_new=False, is_updatable=True))
-    trend_confirmation_long_interval: Optional[str] = Field(default="15m", client_data=ClientFieldData(prompt=lambda mi: "Trend long interval:", prompt_on_new=False, is_updatable=True))
+    trend_confirmation_enabled: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Use multi-timeframe trend confirmation?:", prompt_on_new=False, is_updatable=False))
+    trend_confirmation_medium_interval: Optional[str] = Field(default="5m", client_data=ClientFieldData(prompt=lambda mi: "Trend medium interval:", prompt_on_new=False, is_updatable=False))
+    trend_confirmation_long_interval: Optional[str] = Field(default="15m", client_data=ClientFieldData(prompt=lambda mi: "Trend long interval:", prompt_on_new=False, is_updatable=False))
     trend_confirmation_adx_threshold: float = Field(default=18.0, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Trend confirmation ADX threshold:", prompt_on_new=False, is_updatable=True))
     sell_trend_hold_min_confidence: float = Field(default=0.20, ge=0.0, le=1.0, client_data=ClientFieldData(prompt=lambda mi: "Sell trend-hold confidence:", prompt_on_new=False, is_updatable=True))
     trend_sell_threshold_boost: float = Field(default=4.0, ge=0.0, le=10.0, client_data=ClientFieldData(prompt=lambda mi: "HTF uptrend sell-threshold boost:", prompt_on_new=False, is_updatable=True))
@@ -536,6 +537,12 @@ class HLRSIController(DirectionalTradingControllerBase):
 
         super().__init__(config, *args, **kwargs)
 
+    def update_config(self, new_config):
+        # File defaults omit constructor-derived candle feeds. Normalize that omission before the atomic comparison.
+        if not new_config.candles_config:
+            new_config = new_config.model_copy(update={'candles_config': self.config.candles_config})
+        super().update_config(new_config)
+
     # -----------------------------------------------------------------------
     # Small helpers
     # -----------------------------------------------------------------------
@@ -566,7 +573,7 @@ class HLRSIController(DirectionalTradingControllerBase):
         return self.filter_executors(
             executors=self.executors_info,
             filter_func=lambda x, s=side, a=active_only: (
-                (x.is_active if a else True)
+                (not getattr(x, "is_done", not x.is_active) if a else True)
                 and x.connector_name == self.config.connector_name
                 and x.trading_pair == self.config.trading_pair
                 and x.side == s
@@ -1249,7 +1256,7 @@ class HLRSIController(DirectionalTradingControllerBase):
                 complete_cost_basis = False
                 continue
             weighted_cost_quote += amount * breakeven
-            position_fees = self._decimal_or_none(getattr(position, "cum_fees_quote", Decimal("0")))
+            position_fees = self._decimal_or_none(self._remaining_position_fees(position))
             if position_fees is not None and position_fees > 0:
                 cum_fees_quote += position_fees
 
@@ -1365,6 +1372,11 @@ class HLRSIController(DirectionalTradingControllerBase):
         gross_pnl_quote = (current_price - inventory.cost_basis) * inventory.total_amount
         return (gross_pnl_quote - inventory.cum_fees_quote) / cost_quote
 
+    @staticmethod
+    def _remaining_position_fees(position) -> Decimal:
+        fees = getattr(position, 'remaining_fees_quote', None)
+        return Decimal(str(fees if fees is not None else getattr(position, 'cum_fees_quote', 0)))
+
     def _position_net_pnl_pct(self, position: object, current_price: Decimal) -> Optional[Decimal]:
         if current_price <= 0:
             return None
@@ -1375,7 +1387,7 @@ class HLRSIController(DirectionalTradingControllerBase):
         cost_quote = amount * breakeven
         if cost_quote <= 0:
             return None
-        fees_quote = self._decimal_or_none(getattr(position, "cum_fees_quote", Decimal("0"))) or Decimal("0")
+        fees_quote = self._decimal_or_none(self._remaining_position_fees(position)) or Decimal("0")
         gross_pnl_quote = (current_price - breakeven) * amount
         return (gross_pnl_quote - fees_quote) / cost_quote
 
@@ -1407,35 +1419,43 @@ class HLRSIController(DirectionalTradingControllerBase):
 
     def _get_active_buy_executor_position_value_usd(self) -> Decimal:
         total_value = Decimal("0")
-        mid_price = self._get_mid_price()
+        mid_price = self._decimal_or_none(self._get_mid_price())
         for executor in self._filter_same_side(TradeType.BUY, active_only=True):
-            try:
-                filled_quote = Decimal(str(getattr(executor, "filled_amount_quote", Decimal("0")) or Decimal("0")))
-                if filled_quote <= 0:
-                    continue
-                ref_price = self._executor_ref_price(executor)
-                if mid_price is not None and mid_price > 0 and ref_price is not None and ref_price > 0:
-                    base_amount = filled_quote / ref_price
-                    total_value += base_amount * mid_price
-                else:
-                    total_value += filled_quote
-            except (InvalidOperation, ValueError, TypeError, AttributeError):
-                continue
+            config = getattr(executor, "config", None)
+            amount = self._decimal_or_none(getattr(config, "amount", None))
+            entry_price = self._decimal_or_none(getattr(config, "entry_price", None))
+            custom = getattr(executor, "custom_info", {}) or {}
+            closed = self._decimal_or_none(custom.get("close_order_filled_amount_base", 0))
+            if amount is None or amount < 0 or closed is None or closed < 0 or mid_price is None or mid_price <= 0:
+                return Decimal("Infinity")
+            if getattr(config, "type", None) == "order_executor":
+                # OrderExecutor fills are already owned by the held-position ledger.
+                closed = self._decimal_or_none(custom.get("executed_amount_base", 0))
+                if closed is None:
+                    return Decimal("Infinity")
+            reservation_price = max(mid_price, entry_price or mid_price)
+            total_value += max(Decimal("0"), amount - closed) * reservation_price
         return total_value
 
     def _get_total_position_value_usd(self) -> Decimal:
         try:
-            amount = self._position_amount(TradeType.BUY)
+            amount = Decimal("0")
+            for position in self.positions_held:
+                if (position.connector_name == self.config.connector_name and
+                        position.trading_pair == self.config.trading_pair and position.side == TradeType.BUY):
+                    held_amount = self._decimal_or_none(position.amount)
+                    if held_amount is None or held_amount < 0:
+                        return Decimal("Infinity")
+                    amount += held_amount
             held_value = Decimal("0")
             if amount > 0:
-                price = self.market_data_provider.get_price_by_type(
-                    self.config.connector_name, self.config.trading_pair, PriceType.MidPrice,
-                )
-                if price is not None and price > 0:
-                    held_value = amount * Decimal(str(price))
+                price = self._decimal_or_none(self._get_mid_price())
+                if price is None or price <= 0:
+                    return Decimal("Infinity")
+                held_value = amount * price
             return held_value + self._get_active_buy_executor_position_value_usd()
         except (InvalidOperation, ValueError, TypeError, AttributeError):
-            return Decimal("0")
+            return Decimal("Infinity")
 
     def _get_position_utilization(self) -> float:
         max_pos = getattr(self.config, "max_total_position_usd", Decimal("0"))
@@ -2312,6 +2332,22 @@ class HLRSIController(DirectionalTradingControllerBase):
                     self._last_loss_timestamp = None
         return False
 
+    def _ingest_closed_executor_results(self, executor_infos=None):
+        results = self.executors_info if executor_infos is None else executor_infos
+        for executor in sorted(results, key=lambda item: getattr(item, "close_timestamp", None) or item.timestamp):
+            if not getattr(executor, "is_done", not executor.is_active):
+                continue
+            executor_id = getattr(executor, "id", None)
+            if executor_id is None or executor_id in self._tracked_executor_result_ids:
+                continue
+            if getattr(executor, "close_type", None) != CloseType.POSITION_HOLD:
+                self._track_executor_result(executor)
+            self._tracked_executor_result_ids.add(executor_id)
+
+    def determine_executor_actions(self) -> List[ExecutorAction]:
+        self._ingest_closed_executor_results()
+        return super().determine_executor_actions()
+
     def _track_executor_result(self, executor) -> None:
         if not hasattr(executor, "net_pnl_quote") or executor.net_pnl_quote is None:
             return
@@ -2321,7 +2357,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             return
         if net_pnl_quote < Decimal("0"):
             self._consecutive_losses += 1
-            self._last_loss_timestamp = self.market_data_provider.time()
+            self._last_loss_timestamp = getattr(executor, "close_timestamp", None) or self.market_data_provider.time()
         elif net_pnl_quote > Decimal("0"):
             self._consecutive_losses = 0
             self._last_loss_timestamp = None
@@ -2998,7 +3034,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             return health
 
         timestamps = pd.to_numeric(df["timestamp"], errors="coerce")
-        if timestamps.isna().any():
+        if not self._finite_numeric_series(timestamps):
             health["reason"] = "invalid_timestamp"
             return health
         normalized_ts = timestamps.map(lambda value: self._timestamp_to_seconds(float(value)))
@@ -3021,15 +3057,24 @@ class HLRSIController(DirectionalTradingControllerBase):
 
         last_ts = float(normalized_ts.iloc[-1])
         health["last_candle_ts"] = last_ts
+        if not math.isfinite(float(now_ts)):
+            health["reason"] = "invalid_clock"
+            return health
         candle_age = float(now_ts) - last_ts
+        if candle_age < 0:
+            health["reason"] = "future_candle"
+            return health
         health["candle_age_seconds"] = candle_age
         if interval_seconds is not None:
+            if not ((normalized_ts.diff().dropna() - float(interval_seconds)).abs() < 1e-6).all():
+                health["reason"] = "candle_gap"
+                return health
             max_age = float(interval_seconds) * float(self.config.max_candle_age_intervals)
             if candle_age > max_age:
                 health["reason"] = "stale_candle"
                 return health
 
-        required_cols = ("open", "high", "low", "close")
+        required_cols = ("open", "high", "low", "close", "volume")
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             health["reason"] = f"missing_{missing_cols[0]}"
@@ -3039,9 +3084,23 @@ class HLRSIController(DirectionalTradingControllerBase):
                 health["reason"] = f"invalid_{col}"
                 return health
 
+        numeric = df[list(required_cols)].apply(pd.to_numeric)
+        if (numeric[["open", "high", "low", "close"]] <= 0).any().any():
+            health["reason"] = "non_positive_price"
+            return health
+        if (numeric["volume"] < 0).any():
+            health["reason"] = "negative_volume"
+            return health
+        if ((numeric["high"] < numeric[["open", "close", "low"]].max(axis=1)).any()
+                or (numeric["low"] > numeric[["open", "close", "high"]].min(axis=1)).any()):
+            health["reason"] = "invalid_ohlc_range"
+            return health
         health["ready"] = True
         health["reason"] = "ok"
         return health
+
+    def _select_signal_candles(self, df: pd.DataFrame, now_ts: float) -> pd.DataFrame:
+        return df
 
     async def update_processed_data(self):
         if not self.market_data_provider:
@@ -3073,7 +3132,7 @@ class HLRSIController(DirectionalTradingControllerBase):
                 },
             }
             return
-        df = df.copy()
+        df = self._select_signal_candles(df.copy(), now_ts)
         signal_series: Optional[pd.Series] = None
         last_candle_ts: Optional[float] = None
         data_health = self._build_data_health(df, now_ts)
@@ -3141,6 +3200,8 @@ class HLRSIController(DirectionalTradingControllerBase):
             )
             return
 
+        for column in ("timestamp", "open", "high", "low", "close", "volume"):
+            df[column] = pd.to_numeric(df[column])
         last_close: Optional[float] = None
         last_rsi: Optional[float] = None
         rsi_prev: Optional[float] = None
@@ -3196,7 +3257,13 @@ class HLRSIController(DirectionalTradingControllerBase):
 
         # --- Bollinger Bands ---
         try:
-            df.ta.bbands(length=self.config.bb_length, std=self.config.bb_std, append=True)
+            # Explicit population standard deviation avoids version-dependent pandas-ta argument and column names.
+            rolling_close = df["close"].rolling(self.config.bb_length)
+            middle = rolling_close.mean()
+            width = rolling_close.std(ddof=0) * self.config.bb_std
+            df[f"BBL_{self.config.bb_length}_{self.config.bb_std}"] = middle - width
+            df[f"BBU_{self.config.bb_length}_{self.config.bb_std}"] = middle + width
+            df[f"BBM_{self.config.bb_length}_{self.config.bb_std}"] = middle
             bbl_col = f"BBL_{self.config.bb_length}_{self.config.bb_std}"
             bbu_col = f"BBU_{self.config.bb_length}_{self.config.bb_std}"
             bbm_col = f"BBM_{self.config.bb_length}_{self.config.bb_std}"
@@ -3221,6 +3288,21 @@ class HLRSIController(DirectionalTradingControllerBase):
             pass
 
         self._latest_atr_pct = atr_pct
+        indicator_inputs = {"rsi": last_rsi, "atr": last_atr, "ema_fast": ema_fast, "ema_slow": ema_slow,
+                            "bb_lower": bb_lower, "bb_upper": bb_upper, "bb_mid": bb_mid, "macd": macd_hist}
+        missing_indicators = [name for name, value in indicator_inputs.items()
+                              if value is None or not math.isfinite(float(value))]
+        if missing_indicators:
+            reason = "indicator_unavailable:" + ",".join(missing_indicators)
+            self.processed_data = {
+                "signal": 0, "features": df, "timestamp": now_ts, "candle_timestamp": last_candle_ts,
+                "data_health": dict(data_health, ready=False, reason=reason),
+                "signal_state": {"condition_ok": False, "condition_reason": reason},
+            }
+            self._log_signal_transition(key="data_health", signature=reason,
+                                        message=f"Signal inputs unavailable | {self._controller_pair_log_prefix()} {reason}",
+                                        level=logging.WARNING)
+            return
 
         # --- Flash crash detection ---
         if self._detect_flash_crash(df):
@@ -4068,8 +4150,47 @@ class HLRSIController(DirectionalTradingControllerBase):
     # Executor gating
     # -----------------------------------------------------------------------
 
+    def validate_executor_config(self, config) -> bool:
+        if not super().validate_executor_config(config):
+            return False
+        if config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair:
+            return False
+        now = self.market_data_provider.time()
+        if config.timestamp is None or not 0 <= now - config.timestamp <= max(5.0, 2 * self.update_interval):
+            self._record_gate_reason(config.side, "stale_action")
+            return False
+        if not (self.processed_data or {}).get("data_health", {}).get("ready", False):
+            self._record_gate_reason(config.side, "data_unavailable")
+            return False
+        amount = self._decimal_or_none(config.amount)
+        mid_price = self._decimal_or_none(self._get_mid_price())
+        if amount is None or amount <= 0 or mid_price is None or mid_price <= 0:
+            return False
+        if config.side == TradeType.BUY:
+            if not self.can_create_executor(1):
+                return False
+            entry = self._decimal_or_none(getattr(config, "entry_price", None))
+            if entry is None or entry <= 0:
+                return False
+            if self._get_total_position_value_usd() + amount * max(entry, mid_price) > self.config.max_total_position_usd:
+                self._record_gate_reason(TradeType.BUY, "max_position")
+                return False
+        else:
+            if self.config.strict_hmm_mode and (self.processed_data or {}).get("regime_error"):
+                return False
+            if self._filter_same_side(TradeType.SELL, active_only=True):
+                return False
+            if amount > self._get_sellable_inventory_amount():
+                self._record_gate_reason(TradeType.SELL, "inventory_unavailable")
+                return False
+        return True
+
     def can_create_executor(self, signal: int) -> bool:
         if signal == 0:
+            return False
+        self._ingest_closed_executor_results()
+        if signal > 0 and not self._get_total_position_value_usd().is_finite():
+            self._record_gate_reason(TradeType.BUY, "exposure_unavailable")
             return False
         state = (self.processed_data or {}).get("signal_state", {})
         target_side = TradeType.BUY if signal > 0 else TradeType.SELL
@@ -4365,20 +4486,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             )
             actions.extend(recovery_actions)
 
-        # --- Track closed executors for consecutive loss counting ---
-        for ex in self.executors_info:
-            if not ex.is_active:
-                executor_id = getattr(ex, "id", None)
-                if executor_id is not None:
-                    if executor_id in self._tracked_executor_result_ids:
-                        continue
-                    self._track_executor_result(ex)
-                    self._tracked_executor_result_ids.add(executor_id)
-                    continue
-                if hasattr(ex, "_v5_tracked"):
-                    continue
-                self._track_executor_result(ex)
-                ex._v5_tracked = True  # type: ignore[attr-defined]
+        self._ingest_closed_executor_results()
 
         # --- Early stop on active executor deep drawdown ---
         existing_stop_ids = {
@@ -4602,6 +4710,9 @@ class HLRSIController(DirectionalTradingControllerBase):
                 position_action=PositionAction.CLOSE,
                 leverage=self.config.leverage,
                 level_id=f"recovery_exit:{position_key}",
+                min_sell_price=(breakeven * (Decimal("1") + Decimal(str(self.config.min_profit_pct_for_sell)))
+                                + self._remaining_position_fees(pos) / Decimal(str(pos.amount))
+                                if self.config.sell_only_if_profitable and recovery_execution_strategy != ExecutionStrategy.MARKET else None),
             )
             actions.append(CreateExecutorAction(
                 executor_config=sell_config,

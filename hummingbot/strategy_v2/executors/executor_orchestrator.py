@@ -10,6 +10,7 @@ from hummingbot.core.data_type.common import PositionAction, PositionMode, Price
 from hummingbot.logger import HummingbotLogger
 from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 
 if TYPE_CHECKING:
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -42,6 +43,8 @@ class PositionHold:
         self.side = side
         # Store only client order IDs
         self.order_ids = set()
+        self._order_records: Dict[str, Dict[str, Any]] = {}
+        self._initial_totals = None
 
         # Pre-calculated metrics
         self.volume_traded_quote = Decimal("0")
@@ -55,31 +58,53 @@ class PositionHold:
 
     def add_order_record(self, order: Dict[str, Any]):
         order_id = order.get("client_order_id") or order.get("order_id")
-        if not order_id or order_id in self.order_ids:
-            return
-
-        executed_amount_base = Decimal(str(order.get("executed_amount_base", 0)))
-        executed_amount_quote = Decimal(str(order.get("executed_amount_quote", 0)))
-        is_buy = order.get("trade_type") == TradeType.BUY.name
-        if "actual_base_fee" in order:
-            # Opt-in native fee-currency receipt. Quote fees in this format
-            # exclude converted base fees, already represented in inventory.
-            base_fee = Decimal(str(order["actual_base_fee"]))
-            if not base_fee.is_finite() or base_fee < 0 or (is_buy and base_fee > executed_amount_base):
-                raise ValueError("invalid actual base fee in held-position receipt")
-            executed_amount_base += -base_fee if is_buy else base_fee
+        if not order_id:
+            raise ValueError("Held order requires a stable order identity")
+        trade_type = order.get("trade_type")
+        if trade_type not in (TradeType.BUY.name, TradeType.SELL.name):
+            raise ValueError(f"Invalid held order side: {trade_type}")
+        base = Decimal(str(order.get("executed_amount_base", 0)))
+        quote = Decimal(str(order.get("executed_amount_quote", 0)))
+        fees = Decimal(str(order.get("cumulative_fee_paid_quote", 0)))
+        if not all(value.is_finite() for value in (base, quote, fees)) or base < 0 or quote < 0:
+            raise ValueError(f"Invalid held order amounts: {order_id}")
+        explicit_base_fee = "actual_base_fee" in order
+        base_fee = Decimal(str(order["actual_base_fee"])) if explicit_base_fee else base_fee_amount(order, self.trading_pair.split('-')[0])
+        if not base_fee.is_finite() or (explicit_base_fee and base_fee < 0):
+            raise ValueError("invalid actual base fee in held-position receipt")
+        gross_base = base
+        gross_quote = quote
+        if base > 0:
+            direction = Decimal('1') if trade_type == 'BUY' else Decimal('-1')
+            if not explicit_base_fee:
+                # Explicit episode quote fees exclude base fees; their gross cost must remain intact.
+                quote -= direction * base_fee * (quote / base)
+            base -= direction * base_fee
+        if base < 0:
+            raise ValueError(f'Base fees exceed acquired quantity: {order_id}')
+        previous = self._order_records.get(order_id)
+        if previous is not None and gross_base < previous["gross_executed_amount_base"]:
+            return  # A stale cumulative update must not roll back an observed fill.
+        if self._initial_totals is None:
+            self._initial_totals = (self.buy_amount_base, self.buy_amount_quote, self.sell_amount_base,
+                                    self.sell_amount_quote, self.cum_fees_quote)
+        old_base = previous["executed_amount_base"] if previous else Decimal("0")
+        old_quote = previous["executed_amount_quote"] if previous else Decimal("0")
+        old_volume = previous["gross_executed_amount_quote"] if previous else Decimal("0")
+        old_fees = previous["cumulative_fee_paid_quote"] if previous else Decimal("0")
+        if previous is not None and previous["trade_type"] != trade_type:
+            raise ValueError(f"Order side changed for {order_id}")
+        self._order_records[order_id] = dict(order, gross_executed_amount_base=gross_base, gross_executed_amount_quote=gross_quote, executed_amount_base=base,
+                                             executed_amount_quote=quote, cumulative_fee_paid_quote=fees)
         self.order_ids.add(order_id)
-
-        self.volume_traded_quote += executed_amount_quote
-
-        if is_buy:
-            self.buy_amount_base += executed_amount_base
-            self.buy_amount_quote += executed_amount_quote
+        self.volume_traded_quote += gross_quote - old_volume
+        if trade_type == TradeType.BUY.name:
+            self.buy_amount_base += base - old_base
+            self.buy_amount_quote += quote - old_quote
         else:
-            self.sell_amount_base += executed_amount_base
-            self.sell_amount_quote += executed_amount_quote
-
-        self.cum_fees_quote += Decimal(str(order.get("cumulative_fee_paid_quote", 0)))
+            self.sell_amount_base += base - old_base
+            self.sell_amount_quote += quote - old_quote
+        self.cum_fees_quote += fees - old_fees
 
     def add_orders_from_executor(self, executor: ExecutorInfo):
         held_position_orders = (executor.custom_info or {}).get("held_position_orders") or []
@@ -124,6 +149,44 @@ class PositionHold:
                 breakeven_price = remaining_quote / remaining_base
                 unrealized_pnl_quote = (breakeven_price - mid_price) * remaining_base
 
+        remaining_fees_quote = self.cum_fees_quote if net_amount_base else Decimal("0")
+        if self._order_records:
+            initial_buy, initial_buy_quote, initial_sell, initial_sell_quote, _ = self._initial_totals
+            net_amount_base = initial_buy - initial_sell
+            initial_buy_price = initial_buy_quote / initial_buy if initial_buy else Decimal("0")
+            initial_sell_price = initial_sell_quote / initial_sell if initial_sell else Decimal("0")
+            if initial_buy_price.is_nan():
+                initial_buy_price = mid_price
+            if initial_sell_price.is_nan():
+                initial_sell_price = mid_price
+            breakeven_price = initial_buy_price if net_amount_base > 0 else initial_sell_price
+            realized_pnl_quote = (initial_sell_price - initial_buy_price) * min(initial_buy, initial_sell)
+            remaining_fees_quote = self._initial_totals[4] if net_amount_base else Decimal("0")
+            for record in self._order_records.values():
+                amount = record["executed_amount_base"]
+                if amount <= 0:
+                    continue
+                price = record["executed_amount_quote"] / amount
+                signed_amount = amount if record["trade_type"] == TradeType.BUY.name else -amount
+                if net_amount_base == 0 or net_amount_base * signed_amount > 0:
+                    remaining_fees_quote += record["cumulative_fee_paid_quote"]
+                    total_amount = abs(net_amount_base) + amount
+                    breakeven_price = (abs(net_amount_base) * breakeven_price + amount * price) / total_amount
+                else:
+                    matched = min(abs(net_amount_base), amount)
+                    remaining_fees_quote *= (abs(net_amount_base) - matched) / abs(net_amount_base)
+                    if amount > abs(net_amount_base):
+                        remaining_fees_quote = record["cumulative_fee_paid_quote"] * (amount - matched) / amount
+                    direction = Decimal("1") if net_amount_base > 0 else Decimal("-1")
+                    realized_pnl_quote += (price - breakeven_price) * matched * direction
+                    if amount > abs(net_amount_base):
+                        breakeven_price = price
+                net_amount_base += signed_amount
+                if net_amount_base == 0:
+                    breakeven_price = Decimal("0")
+            is_net_long = net_amount_base >= 0
+            unrealized_pnl_quote = (mid_price - breakeven_price) * net_amount_base
+
         return PositionSummary(
             connector_name=self.connector_name,
             trading_pair=self.trading_pair,
@@ -133,7 +196,7 @@ class PositionHold:
             breakeven_price=breakeven_price,
             unrealized_pnl_quote=unrealized_pnl_quote,
             realized_pnl_quote=realized_pnl_quote,
-            cum_fees_quote=self.cum_fees_quote)
+            cum_fees_quote=self.cum_fees_quote, remaining_fees_quote=remaining_fees_quote)
 
 
 class ExecutorOrchestrator:
@@ -171,6 +234,8 @@ class ExecutorOrchestrator:
         self.positions_held = {}
         self.executors_ids_position_held = deque(maxlen=50)
         self.cached_performance = {}
+        self._non_hold_order_ids: Set[Tuple[str, str, str]] = set()
+        self.recovery_required: Dict[str, List[str]] = {}
         self.initial_positions_by_controller = initial_positions_by_controller or {}
         self._initialize_cached_performance()
 
@@ -191,9 +256,20 @@ class ExecutorOrchestrator:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
                 continue
-            if not executor.is_active:
+            if not executor.is_done:
+                self.recovery_required.setdefault(controller_id, []).append(executor.id)
+                self.logger().error(
+                    f"Startup reconciliation required | controller={controller_id} executor={executor.id} "
+                    "Persisted execution is unfinished. New execution is blocked until order ownership is reconciled."
+                )
+            else:
                 self._update_cached_performance(controller_id, executor)
             self._record_stored_executor(controller_id, executor)
+
+        for controller_id, controller in self.strategy.controllers.items():
+            ingest = getattr(controller, '_ingest_closed_executor_results', None)
+            if ingest is not None:
+                ingest([info for info in db_executors if info.controller_id == controller_id])
 
         # Create initial positions from config overrides first
         self._create_initial_positions()
@@ -252,6 +328,8 @@ class ExecutorOrchestrator:
         if controller_id not in self.cached_performance:
             self.cached_performance[controller_id] = PerformanceReport()
         report = self.cached_performance[controller_id]
+        if executor_info.close_type != CloseType.POSITION_HOLD and executor_info.type != "order_executor":
+            self._non_hold_order_ids.update(self._owned_order_keys(executor_info))
         # Only add to realized PnL if not a position hold (consistent with generate_performance_report)
         if executor_info.close_type != CloseType.POSITION_HOLD:
             report.realized_pnl_quote += executor_info.net_pnl_quote
@@ -309,6 +387,8 @@ class ExecutorOrchestrator:
         position_scopes: Set[PositionScope] = set()
         for controller_id, positions in self.positions_held.items():
             for position in positions:
+                if self._position_hold_amount(position) == Decimal("0"):
+                    continue
                 position_scopes.add(
                     self._position_scope(
                         controller_id=controller_id,
@@ -442,7 +522,7 @@ class ExecutorOrchestrator:
         self.positions_held[controller_id] = [
             position
             for position in positions
-            if self._position_hold_amount(position) > Decimal("0")
+            if self._position_hold_amount(position) > Decimal("0") or position.volume_traded_quote > Decimal("0") or position.cum_fees_quote != Decimal("0")
         ]
 
     def _restore_positions_from_ledger(
@@ -631,6 +711,7 @@ class ExecutorOrchestrator:
                     "order_id": trade_fill.order_id,
                     "exchange_order_id": trade_fill.order_id,
                     "trade_type": trade_type,
+                    "order_fills": {},
                     "price_quote_times_base": Decimal("0"),
                     "executed_amount_base": Decimal("0"),
                     "executed_amount_quote": Decimal("0"),
@@ -645,6 +726,8 @@ class ExecutorOrchestrator:
             aggregated["executed_amount_base"] += executed_amount_base
             aggregated["executed_amount_quote"] += executed_amount_quote
             aggregated["cumulative_fee_paid_quote"] += Decimal(str(trade_fill.trade_fee_in_quote or 0))
+            aggregated["order_fills"][str(trade_fill.exchange_trade_id)] = {
+                "fill_base_amount": str(executed_amount_base), "fee": trade_fill.trade_fee or {}}
             aggregated["amount"] += executed_amount_base
             aggregated["last_update_timestamp"] = max(aggregated["last_update_timestamp"], int(trade_fill.timestamp))
 
@@ -697,50 +780,30 @@ class ExecutorOrchestrator:
             "executed_amount_quote": executed_amount_quote,
             "cumulative_fee_paid_quote": Decimal(str(trade_fill.trade_fee_in_quote or 0)),
             "amount": executed_amount_base,
+            "order_fills": {str(trade_fill.exchange_trade_id): {
+                "fill_base_amount": str(executed_amount_base), "fee": trade_fill.trade_fee or {}}},
             "last_update_timestamp": int(trade_fill.timestamp),
         }
 
     @staticmethod
-    def _subtract_active_buy_inventory(position: PositionHold, active_base: Decimal, active_quote: Decimal):
-        if active_base <= Decimal("0") or position.buy_amount_base <= position.sell_amount_base:
-            return
-        reducible_base = min(active_base, position.buy_amount_base - position.sell_amount_base, position.buy_amount_base)
-        if reducible_base <= Decimal("0"):
-            return
-        if active_quote > Decimal("0"):
-            quote_reduction = active_quote * (reducible_base / active_base)
-        elif position.buy_amount_base > Decimal("0"):
-            quote_reduction = reducible_base * (position.buy_amount_quote / position.buy_amount_base)
-        else:
-            quote_reduction = Decimal("0")
-        quote_reduction = min(quote_reduction, position.buy_amount_quote)
-        position.buy_amount_base -= reducible_base
-        position.buy_amount_quote -= quote_reduction
-        position.volume_traded_quote = max(Decimal("0"), position.volume_traded_quote - quote_reduction)
+    def _owned_order_keys(executor_info: ExecutorInfo) -> Set[Tuple[str, str, str]]:
+        custom = executor_info.custom_info or {}
+        order_ids = custom.get("order_ids") or []
+        return {(executor_info.connector_name, executor_info.trading_pair, str(order_id))
+                for order_id in order_ids if order_id}
 
-    def _active_buy_inventory_by_market_pair(self) -> Dict[Tuple[str, str, str], Tuple[Decimal, Decimal]]:
-        active_inventory: Dict[Tuple[str, str, str], Tuple[Decimal, Decimal]] = {}
-        for controller_id, executors in self.active_executors.items():
+    def _executor_owned_order_keys(self) -> Set[Tuple[str, str, str]]:
+        owned = set(self._non_hold_order_ids)
+        for executors in self.active_executors.values():
             for executor in executors:
-                executor_info = getattr(executor, "executor_info", None)
-                if executor_info is None or executor_info.is_done:
+                info = executor.executor_info
+                if info.type == "order_executor" or (info.is_done and info.close_type == CloseType.POSITION_HOLD):
                     continue
-                config = executor_info.config
-                if getattr(config, "side", None) != TradeType.BUY:
-                    continue
-                connector_name = getattr(config, "connector_name", executor_info.connector_name)
-                trading_pair = getattr(config, "trading_pair", executor_info.trading_pair)
-                try:
-                    filled_quote = Decimal(str(executor_info.filled_amount_quote or 0))
-                    entry_price = Decimal(str(getattr(config, "entry_price", Decimal("0")) or Decimal("0")))
-                except Exception:
-                    continue
-                if filled_quote <= Decimal("0") or entry_price <= Decimal("0"):
-                    continue
-                key = (controller_id, connector_name, trading_pair)
-                current_base, current_quote = active_inventory.get(key, (Decimal("0"), Decimal("0")))
-                active_inventory[key] = (current_base + (filled_quote / entry_price), current_quote + filled_quote)
-        return active_inventory
+                keys = self._owned_order_keys(info)
+                if info.filled_amount_quote > 0 and not keys:
+                    raise RuntimeError(f"Cannot reconcile executor {info.id}: filled execution has no order identities")
+                owned.update(keys)
+        return owned
 
     def _build_reconciled_positions_from_trade_fills(
         self,
@@ -750,6 +813,7 @@ class ExecutorOrchestrator:
         if len(controller_by_market_pair) == 0 and len(ambiguous_market_pairs) == 0:
             return set(), {}
 
+        owned_orders = self._executor_owned_order_keys()
         positions_by_market_pair: Dict[Tuple[str, str, str], PositionHold] = {}
         seen_market_pairs: Set[Tuple[str, str, str]] = set()
         for trade_fill in sorted(
@@ -771,6 +835,10 @@ class ExecutorOrchestrator:
                 continue
             if "_perpetual" in connector_name:
                 continue
+            key = (controller_id, connector_name, trading_pair)
+            seen_market_pairs.add(key)
+            if (connector_name, trading_pair, trade_fill.order_id) in owned_orders:
+                continue
             order_record = self._trade_fill_order_record(trade_fill)
             if order_record["trade_type"] not in {TradeType.BUY.name, TradeType.SELL.name}:
                 continue
@@ -783,21 +851,7 @@ class ExecutorOrchestrator:
                 positions_by_market_pair[key] = position
             position.add_order_record(order_record)
 
-        active_inventory = self._active_buy_inventory_by_market_pair()
-        reconciled_positions: Dict[Tuple[str, str, str], PositionHold] = {}
-        for key, position in positions_by_market_pair.items():
-            active_base, active_quote = active_inventory.get(key, (Decimal("0"), Decimal("0")))
-            self._subtract_active_buy_inventory(position, active_base, active_quote)
-            try:
-                mid_price = self.strategy.market_data_provider.get_price_by_type(
-                    position.connector_name, position.trading_pair, PriceType.MidPrice
-                )
-            except Exception:
-                mid_price = Decimal("0")
-            position_summary = position.get_position_summary(mid_price or Decimal("0"))
-            if position_summary.amount > Decimal("0"):
-                reconciled_positions[key] = position
-        return seen_market_pairs, reconciled_positions
+        return seen_market_pairs, positions_by_market_pair
 
     def _reconcile_positions_from_trade_fills(self):
         try:
@@ -1146,9 +1200,33 @@ class ExecutorOrchestrator:
         """
         controller_id = action.controller_id
         executor_config = action.executor_config
+        if self.recovery_required.get(controller_id):
+            raise RuntimeError(
+                f"Controller {controller_id} requires startup reconciliation of executors "
+                f"{self.recovery_required[controller_id]}; execution remains blocked"
+            )
+        if any(executor.config.id == executor_config.id for executor in self.active_executors.get(controller_id, [])):
+            raise ValueError(f"Duplicate executor id: {executor_config.id}")
 
-        # For now, we replace the controller ID in the executor config with the actual controller object to mantain
-        # compa
+        if getattr(self.strategy, "_is_stop_triggered", False) is True:
+            raise RuntimeError("Strategy is stopping; new execution is blocked")
+        controller = self.strategy.controllers.get(controller_id)
+        if controller is not None:
+            if getattr(self.strategy, "_controller_reports_valid", None) is False:
+                raise RuntimeError("Current execution reports are unavailable")
+            controller.executors_info = self.get_executors_report().get(controller_id, [])
+            validator = getattr(controller, "validate_executor_config", None)
+            if validator is not None and not validator(executor_config):
+                self.logger().warning(f"Rejected executor {executor_config.id}: current controller gates do not permit execution")
+                return
+        if getattr(executor_config, 'connector_name', None) == 'okx':
+            owned = {key[2] for executors in self.active_executors.values() for executor in executors
+                     for key in self._owned_order_keys(executor.executor_info)}
+            unknown = [oid for oid, order in self.strategy.connectors['okx'].in_flight_orders.items()
+                       if order.trading_pair == executor_config.trading_pair and oid not in owned]
+            if unknown:
+                raise RuntimeError(f'Unowned OKX orders require reconciliation: {unknown}')
+        self._validate_okx_wallet_reservation(executor_config)
         executor_config.controller_id = controller_id
 
         executor_class = self._resolve_executor_class(controller_id, executor_config)
@@ -1162,10 +1240,52 @@ class ExecutorOrchestrator:
         else:
             raise ValueError("Unsupported executor config type")
 
-        executor.start()
+        # Persist intent before starting anything that can submit an order. A failed write must not start execution.
+        MarketsRecorder.get_instance().store_or_update_executor(executor)
         self.active_executors[controller_id].append(executor)
-        # MarketsRecorder.get_instance().store_or_update_executor(executor)
+        executor.start()
         self.logger().debug(f"Created {type(executor).__name__} for controller {controller_id}")
+
+    def _validate_okx_wallet_reservation(self, config):
+        if getattr(config, "connector_name", None) != "okx" or config.type not in {"position_executor", "order_executor"}:
+            return
+        base, quote = config.trading_pair.split("-")
+        asset = quote if config.side == TradeType.BUY else base
+        connector = self.strategy.connectors[config.connector_name]
+        available = Decimal(str(connector.get_available_balance(asset)))
+        pending = Decimal("0")
+        for executors in self.active_executors.values():
+            for executor in executors:
+                other = executor.config
+                if executor.is_closed or getattr(other, "connector_name", None) != config.connector_name:
+                    continue
+                if other.type not in {"position_executor", "order_executor"} or other.side != config.side:
+                    continue
+                other_base, other_quote = other.trading_pair.split("-")
+                if (other_quote if other.side == TradeType.BUY else other_base) != asset:
+                    continue
+                order = getattr(executor, "_open_order", None) if other.type == "position_executor" else getattr(executor, "_order", None)
+                if order is not None and order.order is not None and order.order.exchange_order_id is not None:
+                    continue  # The connector/exchange balance now owns the reservation.
+                remaining = Decimal(str(other.amount))
+                if other.type == "position_executor":
+                    remaining -= executor.open_filled_amount
+                else:
+                    remaining -= sum((item.executed_amount_base for item in executor._all_orders()), Decimal("0"))
+                if other.side == TradeType.BUY:
+                    price = getattr(other, "entry_price", None) or getattr(other, "price", None)
+                    if price is None:
+                        raise RuntimeError("Pending order has no reservable price")
+                    remaining *= Decimal(str(price))
+                pending += max(Decimal("0"), remaining)
+        required = Decimal(str(config.amount))
+        if config.side == TradeType.BUY:
+            price = getattr(config, "entry_price", None) or getattr(config, "price", None)
+            if price is None:
+                raise RuntimeError("New order has no reservable price")
+            required *= Decimal(str(price))
+        if not all(value.is_finite() for value in (available, pending, required)) or required <= 0 or required + pending > available:
+            raise RuntimeError(f"Insufficient unreserved {asset}: required={required}, pending={pending}, available={available}")
 
     def _resolve_executor_class(self, controller_id: str, executor_config):
         controller = self.strategy.controllers.get(controller_id)
@@ -1282,6 +1402,7 @@ class ExecutorOrchestrator:
         except Exception as e:
             self.logger().error(f"Error storing executor id {executor_id}: {str(e)}.")
             self.logger().error(f"Executor info: {executor.executor_info} | Config: {executor.config}")
+            return
 
         self.active_executors[controller_id].remove(executor)
         del executor
@@ -1314,7 +1435,9 @@ class ExecutorOrchestrator:
             for position in positions_list:
                 mid_price = self.strategy.market_data_provider.get_price_by_type(
                     position.connector_name, position.trading_pair, PriceType.MidPrice)
-                positions_summary.append(position.get_position_summary(mid_price))
+                summary = position.get_position_summary(mid_price)
+                if summary.amount > Decimal("0"):
+                    positions_summary.append(summary)
             report[controller_id] = positions_summary
         return report
 
@@ -1388,11 +1511,12 @@ class ExecutorOrchestrator:
             position_summary = position.get_position_summary(mid_price if not mid_price.is_nan() else Decimal("0"))
 
             # Update report with position data
-            # Position summary realized_pnl_quote is already net of fees (calculated correctly in position logic)
-            report.realized_pnl_quote += position_summary.realized_pnl_quote
+            # PositionSummary exposes gross components; charge paid fees exactly once.
+            report.realized_pnl_quote += position_summary.realized_pnl_quote - position_summary.cum_fees_quote
             report.volume_traded += position_summary.volume_traded_quote
             report.unrealized_pnl_quote += position_summary.unrealized_pnl_quote
-            positions_summary.append(position_summary)
+            if position_summary.amount > Decimal("0"):
+                positions_summary.append(position_summary)
 
         # Set the positions summary (don't use dynamic attribute)
         report.positions_summary = positions_summary

@@ -2,7 +2,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
 from hummingbot.core.data_type.common import PositionAction, TradeType
@@ -33,6 +33,13 @@ class OrderExecutorConfig(ExecutorConfigBase):
     execution_strategy: ExecutionStrategy
     leverage: int = 1
     level_id: Optional[str] = None
+    min_sell_price: Optional[Decimal] = Field(default=None, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_price_floor(self):
+        if self.min_sell_price is not None and (self.side != TradeType.SELL or self.execution_strategy == ExecutionStrategy.MARKET):
+            raise ValueError("A minimum sell price requires a limit sell order")
+        return self
 
     @field_validator("execution_strategy", mode="before")
     @classmethod

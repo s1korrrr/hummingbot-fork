@@ -72,15 +72,25 @@ def test_native_orchestrator_constructs_once_and_rejects_duplicate_before_start(
     from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
     controller, _ = setup_controller()
     action = actions(controller)[0]
-    orchestrator = object.__new__(ExecutorOrchestrator)
-    orchestrator.strategy = SimpleNamespace(
-        controllers={controller.config.id: controller}, connectors={"okx": MagicMock()}, current_timestamp=10020)
-    orchestrator.active_executors = {controller.config.id: []}
-    orchestrator.executors_update_interval = 1
-    orchestrator.executors_max_retries = 0
-    with patch.object(EpisodeOrderExecutor, "start", autospec=True) as start:
+    from hummingbot.connector.markets_recorder import MarketsRecorder
+    from hummingbot.strategy_v2.models.base import RunnableStatus
+    controller._status = RunnableStatus.RUNNING
+    connector = MagicMock()
+    connector.get_available_balance.return_value = Decimal('1000')
+    connector.in_flight_orders = {}
+    strategy = SimpleNamespace(controllers={controller.config.id: controller}, connectors={"okx": connector},
+                               current_timestamp=10020, markets={'okx': {controller.config.trading_pair}},
+                               market_data_provider=controller.market_data_provider)
+    recorder = MagicMock()
+    recorder.get_all_executors.return_value = []
+    recorder.get_all_positions.return_value = []
+    recorder.get_all_position_hold_ledger_entries.return_value = []
+    recorder.get_trades_for_config.return_value = []
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(EpisodeOrderExecutor, "start", autospec=True) as start:
+        orchestrator = ExecutorOrchestrator(strategy, executors_max_retries=0)
         orchestrator.create_executor(action)
-        with pytest.raises(ValueError, match="episode"):
+        with pytest.raises(ValueError, match="Duplicate executor"):
             orchestrator.create_executor(action)
     assert len(orchestrator.active_executors[controller.config.id]) == 1
     assert isinstance(orchestrator.active_executors[controller.config.id][0], EpisodeOrderExecutor)

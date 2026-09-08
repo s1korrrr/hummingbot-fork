@@ -1,0 +1,188 @@
+# OK RSI BTC-USDC 1m — heuristic profile update, 2026-09-08
+# User-authorized settings; no backtest or live-performance validation.
+# Prior file and rationale: output/config_changes/20260908_ok_rsi_full_profile/
+# Trailing distances are ATR-adapted anchors, not guaranteed net profit.
+
+# -----------------------------------------------------------------------------
+# CONTROLLER IDENTITY
+# -----------------------------------------------------------------------------
+controller_name: ok_rsi
+controller_type: directional_trading
+id: ok-rsi-btc
+legacy_controller_ids:
+  - rsi-v5-btc-usdc-1m
+
+# -----------------------------------------------------------------------------
+# MARKET CONFIGURATION
+# -----------------------------------------------------------------------------
+connector_name: okx
+trading_pair: BTC-USDC
+trade_mode: buy_sell
+leverage: 1
+position_mode: ONEWAY
+
+# -----------------------------------------------------------------------------
+# POSITION SIZING & RISK LIMITS
+# -----------------------------------------------------------------------------
+total_amount_quote: '500'
+usd_per_entry: '25'
+signal_sell_inventory_slice_multiplier: '2'
+max_total_position_usd: '900'
+max_executors_per_side: 6
+
+# -----------------------------------------------------------------------------
+# RSI SIGNAL THRESHOLDS
+# -----------------------------------------------------------------------------
+rsi_length: 14
+rsi_buy_threshold: 31.0
+rsi_sell_threshold: 76.0
+
+# -----------------------------------------------------------------------------
+# MULTI-INDICATOR SIGNAL SCORING
+# -----------------------------------------------------------------------------
+min_signal_score: 2
+dca_score_boost: 0
+buy_confirmation_mode: none
+buy_confirmation_rsi_delta: 0.25
+buy_confirmation_max_wait_seconds: 45
+use_split_entries: true
+scout_entry_fraction: 0.4
+hostile_trend_scout_fraction: 0.5
+
+# -----------------------------------------------------------------------------
+# BOLLINGER BANDS
+# -----------------------------------------------------------------------------
+bb_length: 17
+bb_std: 2.25
+
+# -----------------------------------------------------------------------------
+# MACD
+# -----------------------------------------------------------------------------
+macd_fast: 14
+macd_slow: 26
+macd_signal: 11
+
+# -----------------------------------------------------------------------------
+# SELLING RULES
+# -----------------------------------------------------------------------------
+sell_only_if_profitable: true
+sell_rsi_overbought: 76.0
+min_profit_pct_for_sell: '0.026'  # 2.60%
+recent_trades_lookback: 15
+
+# -----------------------------------------------------------------------------
+# TRAILING TAKE PROFIT (Primary Exit)
+# -----------------------------------------------------------------------------
+use_trailing_exit: true
+trailing_activation_pct: 0.012  # 1.2%
+trailing_delta_pct: 0.003  # 0.3%
+trailing_stop_order_type: LIMIT
+entry_limit_max_age_seconds: 30
+trailing_stop_limit_max_age_seconds: 3
+use_adaptive_trailing: true
+trailing_atr_baseline: 0.002
+trailing_activation_min_pct: 0.003
+trailing_activation_max_pct: 0.05
+trailing_delta_min_pct: 0.001
+trailing_delta_max_pct: 0.02
+trailing_min_locked_profit_pct: 0.004
+trailing_activation_volatility_exponent: 0.70
+trailing_delta_volatility_exponent: 0.35
+trailing_min_multiplier: 0.5
+trailing_max_multiplier: 2.5
+
+# Fixed targets (disabled — trailing only)
+take_profit_pct: 0.0
+max_hold_time_seconds: 0
+stop_loss: null
+take_profit: null
+time_limit: null
+
+# -----------------------------------------------------------------------------
+# ENTRY SPACING (DCA Ladder)
+# -----------------------------------------------------------------------------
+cooldown_time: 60
+executor_price_gap_threshold: '0.015'  # 1.50%
+sell_executor_price_gap_threshold: '0.01'  # 1.00%
+
+# -----------------------------------------------------------------------------
+# CANDLE & INDICATOR SETTINGS
+# -----------------------------------------------------------------------------
+interval: 1m
+strict_hmm_mode: true
+trend_confirmation_enabled: true
+trend_confirmation_medium_interval: 5m
+trend_confirmation_long_interval: 15m
+derived_higher_timeframe_max_records: 100
+trend_confirmation_adx_threshold: 18.0
+sell_trend_hold_min_confidence: 0.2
+trend_sell_threshold_boost: 4.0
+sell_rsi_rollover_delta: 0.5
+candles_connector: null
+candles_trading_pair: null
+candles_config: []
+atr_length: 14
+ema_fast_length: 9
+ema_slow_length: 21
+
+# -----------------------------------------------------------------------------
+# ADAPTIVE VOLATILITY CONTROLS
+# -----------------------------------------------------------------------------
+use_adaptive_filters: true
+min_cooldown_time: 35
+cooldown_atr_low_pct: 0.0012
+cooldown_atr_high_pct: 0.0045
+min_executor_price_gap_threshold: '0.004'  # 0.40%
+max_executor_price_gap_threshold: '0.015'  # 1.5%
+price_gap_atr_multiplier: 2.5
+
+# -----------------------------------------------------------------------------
+# MARKET CONDITION FILTERS
+# -----------------------------------------------------------------------------
+min_atr_pct_to_trade: 0.0002
+max_atr_pct_to_trade: 0.008
+
+# -----------------------------------------------------------------------------
+# BAG FREEZE AND HELD-INVENTORY RECOVERY
+# -----------------------------------------------------------------------------
+use_bag_freeze: false
+bag_freeze_distance_pct: 0.04  # 4.00%
+bag_freeze_min_age_seconds: 600
+bag_freeze_require_full_slots: true
+bag_recovery_target_pct: 0.07  # 7.00%
+recovery_trail_pullback_pct: 0.0075  # 0.75%
+recovery_rsi_rollover_delta: 1.5
+recovery_cancel_stale_order_pct: 0.005  # 0.50%
+recovery_sell_execution_strategy: LIMIT_CHASER
+recovery_limit_chaser_distance_pct: '0.002'  # 0.20%
+recovery_limit_chaser_refresh_threshold_pct: '0.003'  # 0.30%
+recovery_partial_exit_fraction: 0.20  # 20.00%
+bag_max_concurrent_holds: 2
+
+# -----------------------------------------------------------------------------
+# FLASH CRASH PROTECTION
+# -----------------------------------------------------------------------------
+flash_crash_lookback: 5
+flash_crash_drop_pct: 0.04
+flash_crash_cooldown: 300
+
+# -----------------------------------------------------------------------------
+# DYNAMIC POSITION SIZING
+# -----------------------------------------------------------------------------
+dynamic_position_sizing: true
+min_position_size_multiplier: 0.25
+max_position_size_multiplier: 1.5
+
+# -----------------------------------------------------------------------------
+# RISK MANAGEMENT
+# -----------------------------------------------------------------------------
+early_stop_drawdown_pct: 0.035  # -3.50% drawdown -> hold bag
+early_stop_keep_position: true
+max_consecutive_losses: 3
+consecutive_loss_cooldown: 1800
+
+# -----------------------------------------------------------------------------
+# RUNTIME STATE (Do not modify)
+# -----------------------------------------------------------------------------
+manual_kill_switch: false
+initial_positions: []

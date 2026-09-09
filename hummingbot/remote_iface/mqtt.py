@@ -611,6 +611,7 @@ class MQTTGateway(Node):
                  ):
         self._health = False
         self._initial_connection_succeeded = False
+        self._construction_complete = False
         self._unhealthy_since = None
         self._restarting = False
         self._reconnect_lock = asyncio.Lock()
@@ -857,7 +858,9 @@ class MQTTGateway(Node):
         return conn_params
 
     def _check_connections(self) -> bool:
-        if self._restarting:
+        # A failed first publisher leaves empty endpoint lists. Empty lists do
+        # not establish a working gateway or permit the monitor to stop retrying.
+        if self._restarting or not self._construction_complete or not self._publishers:
             return False
         for c in self._publishers:
             if not c._transport.is_connected:
@@ -952,6 +955,7 @@ class MQTTGateway(Node):
         try:
             self._restarting = True
             self._health = False
+            self._construction_complete = False
             external_listeners = self._external_events._listeners if self._external_events is not None else None
             await self._stop_transports_for_reconnect()
             await asyncio.sleep(self._INTERVAL_RESTART_SHORT)
@@ -984,6 +988,7 @@ class MQTTGateway(Node):
 
         except Exception as e:
             self._health = False
+            self._construction_complete = False
             self._hb_app.logger().error(
                 f'MQTT Gateway failed to reconnect: {type(e).__name__}: {e}. Sleeping 10 seconds before retry.',
                 exc_info=True,
@@ -999,6 +1004,8 @@ class MQTTGateway(Node):
     def start(self, with_health: bool = True) -> None:
         if self._restarting and asyncio.current_task() is not self._reconnect_owner:
             raise RuntimeError("MQTT reconnect teardown is still in progress")
+        self._construction_complete = False
+        self._health = False
         self._init_logger()
         self._init_notifier()
         self._init_status_updates()
@@ -1018,10 +1025,13 @@ class MQTTGateway(Node):
                 loop=self._ev_loop,
             )
         self.broadcast_status_update("online", msg_type="availability")
+        self._construction_complete = True
 
     def stop(self, with_health: bool = True):
         if self._restarting:
             raise RuntimeError("MQTT reconnect teardown is still in progress")
+        self._construction_complete = False
+        self._health = False
         if self._native_lifecycle_task is not None:
             self._native_lifecycle_task.cancel()
             self._native_lifecycle_task = None

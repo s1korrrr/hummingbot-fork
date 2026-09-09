@@ -246,6 +246,9 @@ class HummingbotApplication(*commands):
     async def run(self):
         """Run the application - either UI mode or headless mode."""
         if self.headless_mode:
+            # Quickstart starts TradingCore directly, bypassing StartCommand's notifier setup.
+            self._initialize_notifiers()
+            self.start_market_event_notifiers()
             # Start MQTT market events forwarding if MQTT is available
             if self._mqtt is not None:
                 self._mqtt.start_market_events_fw()

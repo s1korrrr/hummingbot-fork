@@ -1,13 +1,20 @@
 """Headless MQTT readiness precedes owner strategy construction; no external I/O."""
 import asyncio
 from contextlib import ExitStack
+from decimal import Decimal
 from test.test_hummingbot_quickstart import quickstart_module
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from hummingbot.client.config.client_config_map import ClientConfigMap
+from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.client.hummingbot_application import HummingbotApplication
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.event import events
+from hummingbot.core.pubsub import PubSub
 from hummingbot.remote_iface.mqtt import EEventQueueFactory
 
 
@@ -74,3 +81,84 @@ async def test_headless_readiness_accepts_only_gateway_owned_by_this_application
         with pytest.raises(RuntimeError, match='MQTT'):
             await HummingbotApplication.prepare_headless_startup(app)
     app.stop_mqtt_async.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commands_enabled", [True, False])
+async def test_headless_run_delivers_owner_events_and_starts_configured_commands_once(commands_enabled):
+    """Headless quickstart bypasses StartCommand but must still wire Telegram."""
+    app = HummingbotApplication.__new__(HummingbotApplication)
+    app.headless_mode = True
+    app.ev_loop = asyncio.get_running_loop()
+    app.client_config_map = ClientConfigAdapter(ClientConfigMap())
+    config = app.client_config_map.telegram_notifications
+    config.telegram_bot_token = "fixture-token"
+    config.telegram_chat_id = "fixture-chat"
+    config.telegram_enabled = True
+    config.telegram_commands_enabled = commands_enabled
+    market = PubSub()
+    app.trading_core = SimpleNamespace(markets={"okx": market}, notifiers=[])
+    app._mqtt = None
+    app.run_headless = AsyncMock()
+    app._init_telegram_notifier()
+    notifier = app._telegram_notifier
+    delivered = asyncio.Queue()
+    polling_started = asyncio.Event()
+
+    async def capture_message(message):
+        delivered.put_nowait(message)
+
+    async def command_loop():
+        polling_started.set()
+        await asyncio.Event().wait()
+
+    with patch.object(notifier, "_send_message", side_effect=capture_message), patch.object(
+        notifier, "_run_command_loop", side_effect=command_loop
+    ):
+        try:
+            await app.run()
+            send_task = notifier._send_message_task
+            command_task = notifier._command_task
+            assert send_task is not None
+            assert (command_task is not None) == commands_enabled
+            await app.run()
+            assert notifier._send_message_task is send_task
+            assert notifier._command_task is command_task
+            assert len(market.get_listeners(events.MarketEvent.OrderFilled)) == 1
+            assert len(market.get_listeners(events.MarketEvent.OrderFailure)) == 1
+            market.trigger_event(events.MarketEvent.OrderFilled, events.OrderFilledEvent(
+                timestamp=1712745600,
+                order_id="fixture-order",
+                trading_pair="ETH-USDC",
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("2000"),
+                amount=Decimal("0.01"),
+                trade_fee=AddedToCostTradeFee(),
+            ))
+            message = await asyncio.wait_for(delivered.get(), timeout=1)
+            assert "BUY FILLED" in message
+            assert "ETH-USDC" in message
+            assert polling_started.is_set() == commands_enabled
+        finally:
+            tasks = [task for task in [notifier._send_message_task, notifier._command_task] if task is not None]
+            notifier.stop()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    assert market.get_listeners(events.MarketEvent.OrderFilled) == []
+
+
+@pytest.mark.asyncio
+async def test_headless_run_keeps_disabled_telegram_without_event_listeners():
+    app = HummingbotApplication.__new__(HummingbotApplication)
+    app.headless_mode = True
+    app.client_config_map = ClientConfigAdapter(ClientConfigMap())
+    market = PubSub()
+    app.trading_core = SimpleNamespace(markets={"okx": market}, notifiers=[])
+    app._mqtt = None
+    app._telegram_notifier = None
+    app.run_headless = AsyncMock()
+    app._init_telegram_notifier()
+    await app.run()
+    assert app._telegram_notifier is None
+    assert market.get_listeners(events.MarketEvent.OrderFilled) == []
+    assert market.get_listeners(events.MarketEvent.OrderFailure) == []

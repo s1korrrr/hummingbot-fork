@@ -1,11 +1,12 @@
 import asyncio
 import logging
+import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
-from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -116,7 +117,9 @@ class PositionExecutor(ExecutorBase):
             return False
         if not self.config.triple_barrier_config.open_order_type.is_limit_type():
             return False
-        if self._open_order.is_filled or not self._open_order.order.is_open:
+        if not self._open_order.order.is_open:
+            return False
+        if self.config.entry_order_policy != "single_attempt" and self._open_order.is_filled:
             return False
 
         max_age_seconds = max(0, int(self.config.triple_barrier_config.open_order_limit_max_age_seconds))
@@ -172,10 +175,27 @@ class PositionExecutor(ExecutorBase):
         self._trailing_stop_last_update_timestamp: Optional[float] = None
         self._close_order_type: Optional[OrderType] = None
         self._trailing_limit_fallback_pending: bool = False
+        self._entry_submitted: bool = False
+        self._entry_stop_reason: Optional[str] = None
+        self._entry_cancel_last_attempt_at: Optional[float] = None
+        self._entry_failure_is_final: bool = False
+        self._entry_lifecycle: Dict = {"state": "awaiting_submission", "stop_reason": None}
+        self._close_quantity: Dict = {}
+        self._exit_trigger_reason: Optional[str] = None
 
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._current_retries = 0
         self._max_retries = max_retries
+
+    def stop(self):
+        self._cancel_entry_expiry_reconciliation()
+        if self.config.entry_order_policy == "single_attempt" and not self.is_closed:
+            # Detach the terminal receipt from mutable connector cache objects.
+            # Later fills belong to recorder/held reconciliation after listeners stop.
+            for tracked in self._unique_orders([*self._entry_orders(), *self._exit_orders()]):
+                if tracked.order is not None:
+                    tracked.order = InFlightOrder.from_json(tracked.order.to_json())
+        super().stop()
 
     @property
     def is_perpetual(self) -> bool:
@@ -231,6 +251,8 @@ class PositionExecutor(ExecutorBase):
         close_amount = self.amount_to_close
         if close_amount <= Decimal("0") or self.is_perpetual or self.close_order_side != TradeType.SELL:
             return close_amount
+        if self.config.entry_order_policy == "single_attempt":
+            return self._single_attempt_spot_close_amount()
 
         base_asset = self.config.trading_pair.split("-")[0]
         available_base = self._to_decimal(self.get_available_balance(self.config.connector_name, base_asset))
@@ -257,6 +279,56 @@ class PositionExecutor(ExecutorBase):
             self.logger().debug(self._log_message(
                 f"Quantizing close order amount amount_to_close={close_amount} order_amount={capped_amount}"))
         return capped_amount
+
+    def _single_attempt_spot_close_amount(self) -> Decimal:
+        """Sell the largest valid owned lot; never borrow unrelated wallet inventory."""
+        owned = self._to_decimal(self.amount_to_close)
+        quantum = self._to_decimal(self.trading_rules.min_base_amount_increment)
+        minimum = self._to_decimal(self.trading_rules.min_order_size)
+        notional = self._to_decimal(self.trading_rules.min_notional_size)
+        price = self._to_decimal(self.current_market_price)
+        previous_reason = self._close_quantity.get("blocked_reason")
+        receipt = {"owned_base": owned, "quantity_increment": quantum, "order_amount": Decimal("0"),
+                   "residual_base": owned, "blocked_reason": None}
+
+        def blocked(reason):
+            receipt["blocked_reason"] = reason
+            self._close_quantity = receipt
+            if reason != previous_reason:
+                self.logger().warning(self._log_message(
+                    f"Spot close quantity blocked reason={reason} owned_base={owned} quantum={quantum}"
+                ))
+            return Decimal("0")
+
+        if (owned is None or quantum is None or minimum is None or notional is None or price is None
+                or owned < 0 or quantum <= 0 or minimum < 0 or notional < 0 or price <= 0):
+            return blocked("quantity_rules_or_price_unavailable")
+        owned_lot = (owned / quantum).to_integral_value(rounding=ROUND_FLOOR) * quantum
+        if owned_lot <= 0 or owned_lot < minimum or owned_lot * price < notional:
+            return blocked("owned_residual_below_exchange_minimum")
+        base = self.config.trading_pair.split("-")[0]
+        try:
+            available = self._to_decimal(self.get_available_balance(self.config.connector_name, base))
+        except Exception:
+            return blocked("available_balance_unavailable")
+        receipt["available_base"] = available
+        if available is None or available < 0:
+            return blocked("available_balance_unavailable")
+        capped = (min(owned, available) / quantum).to_integral_value(rounding=ROUND_FLOOR) * quantum
+        if capped <= 0 or capped < minimum or capped * price < notional:
+            return blocked("available_balance_below_minimum")
+        try:
+            quantity = self._to_decimal(self.connectors[self.config.connector_name].quantize_order_amount(
+                trading_pair=self.config.trading_pair, amount=capped,
+            ))
+        except Exception:
+            return blocked("quantity_quantization_failed")
+        if (quantity is None or quantity <= 0 or quantity > capped or quantity % quantum != 0
+                or quantity < minimum or quantity * price < notional):
+            return blocked("quantity_quantization_invalid")
+        receipt.update(order_amount=quantity, residual_base=owned - quantity)
+        self._close_quantity = receipt
+        return quantity
 
     @property
     def open_filled_amount_quote(self) -> Decimal:
@@ -542,8 +614,9 @@ class PositionExecutor(ExecutorBase):
         if self.status == RunnableStatus.RUNNING:
             self.control_open_order()
             await self._reconcile_expired_entry()
-            if self.status == RunnableStatus.RUNNING and (
-                    not self._open_order_entry_expired or self.open_filled_amount > Decimal("0")):
+            if (self.status == RunnableStatus.RUNNING
+                    and self._entry_lifecycle["state"] != "reconciliation_required"
+                    and (not self._open_order_entry_expired or self.open_filled_amount > Decimal("0"))):
                 self.control_barriers()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
@@ -555,7 +628,7 @@ class PositionExecutor(ExecutorBase):
 
         :return: True if the open orders are completed, False otherwise.
         """
-        open_order_condition = not self._open_order or self._open_order.is_done
+        open_order_condition = self._entry_terminal_confirmed()
         take_profit_condition = not self._take_profit_limit_order or self._take_profit_limit_order.is_done
         close_order_condition = not self._close_order or self._close_order.is_done
         return open_order_condition and take_profit_condition and close_order_condition
@@ -576,7 +649,7 @@ class PositionExecutor(ExecutorBase):
             self.cancel_open_orders()
             await self._sleep(1.0)
             return
-        entry_done = not self._open_order or self._open_order.is_done
+        entry_done = self._entry_terminal_confirmed()
         tp_done = not self._take_profit_limit_order or self._take_profit_limit_order.is_done
         if not entry_done or not tp_done:
             self.cancel_open_orders()
@@ -685,6 +758,9 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self.config.entry_order_policy == "single_attempt":
+            self._control_single_attempt_entry()
+            return
         if self._open_order_entry_expired:
             if self._open_order and self._open_order.order and self._open_order.order.is_open:
                 self.cancel_open_order()
@@ -711,6 +787,109 @@ class PositionExecutor(ExecutorBase):
                                                           self.config.triple_barrier_config.open_order_type):
                 self.cancel_open_order()
 
+    def _end_entry_acquisition(self, reason: str):
+        """Latch an entry decision closed without authorizing a position exit."""
+        if self._entry_stop_reason is None:
+            self._entry_stop_reason = reason
+            self._entry_lifecycle.update({
+                "stop_reason": reason,
+                "stop_requested_timestamp": self._strategy.current_timestamp,
+                "stop_observed_wall_timestamp": time.time(),
+            })
+            self.logger().info(self._log_message(
+                f"Entry acquisition stopped reason={reason} policy=single_attempt "
+                f"filled_base={self.open_filled_amount} replacement_allowed=False"
+            ))
+
+    def _entry_terminal_confirmed(self) -> bool:
+        if self.config.entry_order_policy != "single_attempt":
+            return not self._open_order or self._open_order.is_done
+        if self._open_order is None:
+            return not self._entry_submitted
+        order = self._open_order.order
+        return order is not None and (
+            order.current_state == OrderState.CANCELED
+            or (order.current_state == OrderState.FILLED and order.executed_amount_base == order.amount)
+            or (order.is_failure and self._entry_failure_is_final)
+        )
+
+    def _control_single_attempt_entry(self):
+        if self.is_closed:
+            return
+        tracked = self._open_order
+        if tracked is None:
+            if self._entry_submitted or self._entry_stop_reason is not None:
+                self._entry_lifecycle["state"] = "reconciliation_required"
+            elif self._is_within_activation_bounds(
+                    self.config.entry_price, self.config.side,
+                    self.config.triple_barrier_config.open_order_type):
+                self.place_open_order()
+            return
+
+        self._entry_submitted = True
+        self.update_tracked_orders_with_order_id(tracked.order_id)
+        order = tracked.order
+        if order is None:
+            self._entry_lifecycle["state"] = "reconciliation_required"
+            return
+        created = order.creation_timestamp
+        max_age = self.config.triple_barrier_config.open_order_limit_max_age_seconds
+        self._entry_lifecycle.update({
+            "order_id": tracked.order_id,
+            "creation_timestamp": created,
+            "deadline_timestamp": created + max_age if max_age > 0 else None,
+            "max_age_seconds": max_age,
+        })
+        if ((order.is_failure and not self._entry_failure_is_final)
+                or (order.current_state == OrderState.FILLED and order.executed_amount_base != order.amount)):
+            self._end_entry_acquisition("entry_failure")
+            self._entry_lifecycle["state"] = "reconciliation_required"
+            return
+        if not self._entry_terminal_confirmed():
+            if self._should_cancel_stale_unfilled_open_limit_order():
+                self._end_entry_acquisition("entry_deadline")
+            elif not self._is_within_activation_bounds(
+                    self.config.entry_price, self.config.side,
+                    self.config.triple_barrier_config.open_order_type):
+                self._end_entry_acquisition("outside_activation_bounds")
+            if self._entry_stop_reason is not None:
+                self._entry_lifecycle["state"] = "cancel_pending"
+                now = self._strategy.current_timestamp
+                if self._entry_cancel_last_attempt_at is None or now - self._entry_cancel_last_attempt_at >= 5:
+                    self._entry_cancel_last_attempt_at = now
+                    self._entry_lifecycle.setdefault("cancel_requested_timestamp", now)
+                    self.cancel_open_order()
+            else:
+                self._entry_lifecycle["state"] = "open"
+            return
+
+        # A transport/lost-order failure is not proof the exchange accepted no fill.
+        # Retain ownership and reservation until a terminal exchange event reconciles it.
+        if order.is_cancelled:
+            self._end_entry_acquisition("exchange_canceled")
+        self._entry_lifecycle.setdefault("terminal_exchange_timestamp", order.last_update_timestamp)
+        self._entry_lifecycle.setdefault("terminal_observed_timestamp", self._strategy.current_timestamp)
+        if self.open_filled_amount > Decimal("0"):
+            self._entry_lifecycle["state"] = "managing_fill"
+            if not self.is_perpetual and self.config.side == TradeType.BUY:
+                quantum = self._to_decimal(self.trading_rules.min_base_amount_increment)
+                price = self._to_decimal(self.current_market_price)
+                if quantum is not None and quantum > 0 and price is not None and price > 0:
+                    lot = (self.amount_to_close / quantum).to_integral_value(rounding=ROUND_FLOOR) * quantum
+                    if (lot <= 0 or lot < self.trading_rules.min_order_size
+                            or lot * price < self.trading_rules.min_notional_size):
+                        self._close_quantity = {
+                            "owned_base": self.amount_to_close, "quantity_increment": quantum,
+                            "order_amount": Decimal("0"), "residual_base": self.amount_to_close,
+                            "blocked_reason": "owned_residual_below_exchange_minimum",
+                        }
+                        self._entry_lifecycle["state"] = "held_residual"
+                        self.early_stop(keep_position=True)
+            return
+        self._entry_lifecycle["state"] = "ended_no_fill"
+        self.close_type = CloseType.FAILED if self._entry_failure_is_final else CloseType.EXPIRED
+        self.stop()
+
     def _cancel_entry_expiry_reconciliation(self):
         task = self._entry_expiry_reconciliation_task
         self._entry_expiry_reconciliation_task = None
@@ -720,10 +899,6 @@ class PositionExecutor(ExecutorBase):
                     task.exception()  # Consume any obsolete result after a fill or stop.
             else:
                 task.cancel()
-
-    def stop(self):
-        self._cancel_entry_expiry_reconciliation()
-        super().stop()
 
     async def _reconcile_expired_entry(self):
         if not self._open_order_entry_expired or self._open_order_expiry_reconciled:
@@ -808,6 +983,12 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self.config.entry_order_policy == "single_attempt":
+            if self.is_closed or self._entry_submitted or self._entry_stop_reason is not None or self._open_order:
+                return
+            # Latch before calling the connector boundary: an exception must not cause a resubmission.
+            self._entry_submitted = True
+            self._entry_lifecycle["submission_timestamp"] = self._strategy.current_timestamp
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
@@ -847,15 +1028,25 @@ class PositionExecutor(ExecutorBase):
         :param price: The price to be used in the close order.
         :return: None
         """
+        if self.config.entry_order_policy == "single_attempt" and close_type == CloseType.EXPIRED:
+            # Defense in depth: an entry deadline is never an exit authorization.
+            self._end_entry_acquisition("entry_deadline")
+            return
+        if self._exit_trigger_reason is None and close_type != CloseType.POSITION_HOLD:
+            self._exit_trigger_reason = close_type.name
         self.close_type = close_type
         if self.close_timestamp is None:
             self.close_timestamp = self._strategy.current_timestamp
         self._status = RunnableStatus.SHUTTING_DOWN
         self.cancel_open_orders()
-        if self._close_order or (self._open_order and not self._open_order.is_done) or (
+        if self._close_order or not self._entry_terminal_confirmed() or (
                 self._take_profit_limit_order and not self._take_profit_limit_order.is_done):
             return
         close_amount = self._close_order_amount()
+        if (self._close_quantity.get("blocked_reason") == "owned_residual_below_exchange_minimum"
+                and self.all_orders_completed()):
+            self.early_stop(keep_position=True)
+            return
         if close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
             order_type = self._close_order_type_for(close_type)
             if order_type.is_limit_type() and not price.is_finite():
@@ -1073,6 +1264,16 @@ class PositionExecutor(ExecutorBase):
             self._close_order = None
             self._close_order_type = None
         if self._open_order and event.order_id == self._open_order.order_id:
+            if self.config.entry_order_policy == "single_attempt":
+                self._end_entry_acquisition("exchange_canceled")
+                self._entry_lifecycle.update({
+                    "cancel_event_timestamp": event.timestamp,
+                    "cancel_event_observed_timestamp": self._strategy.current_timestamp,
+                    "cancel_event_observed_wall_timestamp": time.time(),
+                })
+                # Keep the exact tracked object: terminal reconciliation and late fills
+                # must update the same owner rather than enabling a replacement order.
+                return
             self._failed_orders.append(self._open_order)
             self._completed_open_orders.append(self._open_order)
             self._open_order = None
@@ -1088,6 +1289,11 @@ class PositionExecutor(ExecutorBase):
         """
         self.update_tracked_orders_with_order_id(event.order_id)
         if self._open_order and event.order_id == self._open_order.order_id:
+            if self.config.entry_order_policy == "single_attempt":
+                self._entry_failure_is_final = self._is_permanent_validation_failure(event)
+                self._end_entry_acquisition("entry_rejected" if self._entry_failure_is_final else "entry_failure")
+                self._entry_lifecycle["failure_event_timestamp"] = event.timestamp
+                return
             self._failed_orders.append(self._open_order)
             self._completed_open_orders.append(self._open_order)
             self._open_order = None
@@ -1183,6 +1389,26 @@ class PositionExecutor(ExecutorBase):
             "close_order_filled_amount_base": self.close_filled_amount,
             "remaining_position_amount_base": self.amount_to_close,
             "held_position_orders": self._held_position_orders,
+            "entry_lifecycle": {"policy": self.config.entry_order_policy, **self._entry_lifecycle},
+            "exit_trigger_reason": self._exit_trigger_reason,
+            "close_quantity": self._close_quantity,
+            # Execution receipts remain meaningful after accounting transfers to PositionHold.
+            # Do not change scalar PnL/volume semantics: that would double-count the held ledger.
+            "execution_receipt": {
+                "entry_gross_base": sum((o.executed_amount_base for o in self._entry_orders()), Decimal("0")),
+                "entry_gross_quote": sum((o.executed_amount_quote for o in self._entry_orders()), Decimal("0")),
+                "exit_gross_base": self.close_filled_amount,
+                "exit_gross_quote": self.close_filled_amount_quote,
+                "fees_quote": self.cum_fees_quote,
+                "remaining_owned_base": self.amount_to_close,
+                "accounting_owner": "held_position" if self.close_type == CloseType.POSITION_HOLD else "executor",
+            },
+            "entry_order_snapshot": self._open_order.order.to_json()
+            if self.config.entry_order_policy == "single_attempt" and self._open_order and self._open_order.order else None,
+            "execution_order_snapshots": [o.order.to_json() for o in
+                                          self._unique_orders([*self._entry_orders(), *self._exit_orders()])
+                                          if o.order is not None]
+            if self.config.entry_order_policy == "single_attempt" else None,
         }
         custom_info.update(trailing_snapshot)
         return custom_info

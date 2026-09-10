@@ -236,6 +236,7 @@ class ExecutorOrchestrator:
         self.executors_ids_position_held = deque(maxlen=50)
         self.cached_performance = {}
         self._non_hold_order_ids: Set[Tuple[str, str, str]] = set()
+        self._non_hold_fill_ids: Set[Tuple[str, str, str, str]] = set()
         self.recovery_required: Dict[str, List[str]] = {}
         self.initial_positions_by_controller = initial_positions_by_controller or {}
         self._initialize_cached_performance()
@@ -329,8 +330,12 @@ class ExecutorOrchestrator:
         if controller_id not in self.cached_performance:
             self.cached_performance[controller_id] = PerformanceReport()
         report = self.cached_performance[controller_id]
-        if executor_info.close_type != CloseType.POSITION_HOLD and executor_info.type != "order_executor":
-            self._non_hold_order_ids.update(self._owned_order_keys(executor_info))
+        if (executor_info.close_type != CloseType.POSITION_HOLD and executor_info.type != "order_executor"
+                and not self._entry_without_fill_handed_off(executor_info)):
+            if self._has_single_attempt_receipts(executor_info):
+                self._non_hold_fill_ids.update(self._accounted_fill_keys(executor_info))
+            else:
+                self._non_hold_order_ids.update(self._owned_order_keys(executor_info))
         # Only add to realized PnL if not a position hold (consistent with generate_performance_report)
         if executor_info.close_type != CloseType.POSITION_HOLD:
             report.realized_pnl_quote += executor_info.net_pnl_quote
@@ -689,6 +694,7 @@ class ExecutorOrchestrator:
             "executed_amount_base": executed_amount_base,
             "executed_amount_quote": executed_amount_quote,
             "cumulative_fee_paid_quote": quote_fee,
+            "precision": "event_exact",
             "amount": executed_amount_base,
             "order_fills": {str(trade_fill.exchange_trade_id): {
                 "fill_base_amount": str(executed_amount_base), "fill_price": str(price),
@@ -696,6 +702,41 @@ class ExecutorOrchestrator:
                 "fee_in_quote": str(quote_fee)}},
             "last_update_timestamp": int(trade_fill.timestamp),
         }
+
+    @staticmethod
+    def _has_single_attempt_receipts(executor_info: ExecutorInfo) -> bool:
+        custom = executor_info.custom_info or {}
+        return ((custom.get("entry_lifecycle") or {}).get("policy") == "single_attempt"
+                and isinstance(custom.get("execution_order_snapshots"), list))
+
+    @staticmethod
+    def _accounted_fill_keys(executor_info: ExecutorInfo) -> Set[Tuple[str, str, str, str]]:
+        if executor_info.close_type == CloseType.POSITION_HOLD:
+            return set()
+        return {(executor_info.connector_name, executor_info.trading_pair,
+                 str(order["client_order_id"]), str(trade_id))
+                for order in (executor_info.custom_info or {}).get("execution_order_snapshots", [])
+                for trade_id in order.get("order_fills", {})}
+
+    def _executor_accounted_fill_keys(self) -> Set[Tuple[str, str, str, str]]:
+        keys = set(self._non_hold_fill_ids)
+        for executors in self.active_executors.values():
+            for executor in executors:
+                info = executor.executor_info
+                if info.is_done and self._has_single_attempt_receipts(info):
+                    keys.update(self._accounted_fill_keys(info))
+        return keys
+
+    @staticmethod
+    def _entry_without_fill_handed_off(executor_info: ExecutorInfo) -> bool:
+        """A terminal empty entry must not hide a subsequently recorded late fill.
+
+        Its decision remains consumed, but late inventory belongs to the durable
+        held-position reconciliation rather than a terminated executor listener.
+        """
+        lifecycle = (executor_info.custom_info or {}).get("entry_lifecycle") or {}
+        return (executor_info.is_done and lifecycle.get("policy") == "single_attempt"
+                and lifecycle.get("state") == "ended_no_fill")
 
     @staticmethod
     def _owned_order_keys(executor_info: ExecutorInfo) -> Set[Tuple[str, str, str]]:
@@ -709,7 +750,9 @@ class ExecutorOrchestrator:
         for executors in self.active_executors.values():
             for executor in executors:
                 info = executor.executor_info
-                if info.type == "order_executor" or (info.is_done and info.close_type == CloseType.POSITION_HOLD):
+                if (info.type == "order_executor" or (info.is_done and info.close_type == CloseType.POSITION_HOLD)
+                        or self._entry_without_fill_handed_off(info)
+                        or (info.is_done and self._has_single_attempt_receipts(info))):
                     continue
                 keys = self._owned_order_keys(info)
                 if info.filled_amount_quote > 0 and not keys:
@@ -789,6 +832,7 @@ class ExecutorOrchestrator:
         """Build atomically from exact receipts; legacy rows can only corroborate ledger truth."""
         controller_by_pair, ambiguous = self._controller_ids_by_market_pair()
         owned_orders = self._executor_owned_order_keys()
+        accounted_fills = self._executor_accounted_fill_keys()
         groups, ledger_by_order, positions = {}, {}, {}
         try:
             for fill in sorted(trade_fills, key=lambda fill: (fill.timestamp, fill.order_id, str(fill.exchange_trade_id))):
@@ -807,7 +851,8 @@ class ExecutorOrchestrator:
                     raise ValueError("Native fill attribution conflicts with spot scope")
                 if not fill.order_id or not fill.exchange_trade_id or fill.trade_type not in {"BUY", "SELL"}:
                     raise ValueError("Invalid native fill identity")
-                if (fill.market, fill.symbol, fill.order_id) in owned_orders:
+                order_key = (fill.market, fill.symbol, str(fill.order_id))
+                if order_key in owned_orders or (*order_key, str(fill.exchange_trade_id)) in accounted_fills:
                     continue
                 group = groups.setdefault(key, {})
                 if group and any(existing.trade_type != fill.trade_type for existing in group.values()):

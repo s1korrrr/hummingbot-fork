@@ -1,11 +1,12 @@
+import asyncio
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import BuyOrderCompletedEvent, MarketOrderFailureEvent, OrderCancelledEvent
@@ -211,8 +212,8 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
             trading_pair="ETH-USDT",
             order_id="OID-BUY-1",
         )
-        self.assertEqual(position_executor.close_type, CloseType.EXPIRED)
-        self.assertEqual(position_executor.status, RunnableStatus.SHUTTING_DOWN)
+        self.assertIsNone(position_executor.close_type)
+        self.assertEqual(position_executor.status, RunnableStatus.RUNNING)
 
     @patch.object(PositionExecutor, "get_trading_rules")
     async def test_control_open_order_cancels_partially_filled_stale_limit_entry(self, trading_rules_mock):
@@ -255,7 +256,7 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         await position_executor.control_task()
 
         position_executor._strategy.cancel.assert_called_once()
-        self.assertEqual(position_executor.status, RunnableStatus.SHUTTING_DOWN)
+        self.assertEqual(position_executor.status, RunnableStatus.RUNNING)
 
     @patch.object(PositionExecutor, "get_trading_rules")
     async def test_control_position_order_placed_not_cancel_open_order(self, trading_rules_mock):
@@ -1017,9 +1018,9 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
                 fill_timestamp=10,
             )
         )
-        type(position_executor).close_price = PropertyMock(return_value=Decimal(101))
         self.strategy.connectors["binance"].quantize_order_amount.return_value = position_config.amount
-        status = position_executor.to_format_status()
+        with patch.object(type(position_executor), "close_price", new_callable=PropertyMock, return_value=Decimal(101)):
+            status = position_executor.to_format_status()
         self.assertIn("🎯 Trading Pair: ETH-USDT", status[0])
         self.assertIn("PNL (%): 0.80%", status[0])
 
@@ -1262,8 +1263,9 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         position_config = self.get_position_config_market_short()
         position_executor = self.get_position_executor_running_from_config(position_config)
         position_executor.close_type = CloseType.FAILED
-        type(position_executor).filled_amount_quote = PropertyMock(return_value=Decimal("0"))
-        executor_info = position_executor.executor_info
+        with patch.object(type(position_executor), "filled_amount_quote", new_callable=PropertyMock,
+                          return_value=Decimal("0")):
+            executor_info = position_executor.executor_info
         self.assertEqual(executor_info.close_type, CloseType.FAILED)
         self.assertEqual(executor_info.net_pnl_pct, Decimal("0"))
 
@@ -1284,3 +1286,414 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         position_executor.early_stop(keep_position=True)
         self.assertEqual(position_executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(position_executor.status, RunnableStatus.SHUTTING_DOWN)
+
+    def expired_entry_fixture(self, filled=Decimal("0")):
+        config = self.get_position_config_market_long_with_trailing()
+        config.triple_barrier_config.open_order_type = OrderType.LIMIT
+        config.triple_barrier_config.open_order_limit_max_age_seconds = 30
+        executor = self.get_position_executor_running_from_config(config)
+        order = InFlightOrder(
+            client_order_id="OID-BUY-1", exchange_order_id="EOID4", trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890, initial_state=OrderState.OPEN)
+        executor._open_order = TrackedOrder(order_id=order.client_order_id)
+        executor._open_order.order = order
+        connector = self.strategy.connectors["binance"]
+        connector._order_tracker.fetch_order.side_effect = lambda client_order_id: order if client_order_id == order.client_order_id else None
+        connector.get_available_balance.return_value = Decimal("10")
+        connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+        connector.supports_terminal_fill_reconciliation = True
+        connector._request_order_status = AsyncMock(return_value=OrderUpdate(
+            trading_pair=order.trading_pair, update_timestamp=1234567921,
+            new_state=OrderState.CANCELED, client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id))
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567920)
+        if filled:
+            order.update_with_trade_update(self.entry_trade(order, filled))
+        return executor, order, connector
+
+    def entry_trade(self, order, amount, trade_id="entry-fill"):
+        return TradeUpdate(
+            trade_id=trade_id, client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair, fill_timestamp=1234567920, fill_price=Decimal("100"),
+            fill_base_amount=amount, fill_quote_amount=amount * 100,
+            fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="ETH", amount=amount * Decimal("0.001"))]))
+
+    def acknowledge_entry_cancel(self, executor, order):
+        order.update_with_order_update(OrderUpdate(
+            trading_pair=order.trading_pair, update_timestamp=1234567921,
+            new_state=OrderState.CANCELED, client_order_id=order.client_order_id))
+        event = OrderCancelledEvent(timestamp=1234567921, order_id=order.client_order_id)
+        executor.process_order_canceled_event(None, None, event)
+        executor.process_order_canceled_event(None, None, event)
+
+    async def test_expired_entry_keeps_partial_fill_and_original_trailing_owner(self):
+        executor, order, connector = self.expired_entry_fixture(Decimal("0.2"))
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.acknowledge_entry_cancel(executor, order)
+        await self.settle_expiry_reconciliation(executor)
+        await self.settle_expiry_reconciliation(executor)
+        self.assertTrue(executor.is_trading)
+        connector._request_order_status.assert_not_awaited()
+        self.assertIsNone(executor.close_type)
+        self.assertEqual(executor.open_filled_amount, Decimal("0.1998"))
+        self.assertEqual(executor.get_custom_info()["order_ids"], [order.client_order_id])
+        self.assertTrue(executor.get_custom_info()["open_order_entry_expired"])
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+        connector.get_price_by_type.return_value = Decimal("110")
+        await self.settle_expiry_reconciliation(executor)
+        self.assertIsNotNone(executor._trailing_stop_trigger_pct)
+        connector.get_price_by_type.return_value = Decimal("106")
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.close_type, CloseType.TRAILING_STOP)
+        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("0.1998"))
+        self.assertEqual(self.strategy.sell.call_args.args[3], OrderType.LIMIT)
+
+    async def test_expired_entry_reconciles_fill_delivered_after_cancel_ack(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await self.settle_expiry_reconciliation(executor)
+        self.acknowledge_entry_cancel(executor, order)
+        status = connector._request_order_status.return_value
+
+        async def reconcile(tracked_order):
+            fill = self.entry_trade(order, Decimal("1"))
+            order.update_with_trade_update(fill)
+            order.update_with_trade_update(fill)
+            return status
+        connector._request_order_status.side_effect = reconcile
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertEqual(executor.open_filled_amount, Decimal("0.999"))
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+
+    async def test_expired_empty_entry_terminates_only_after_terminal_reconciliation(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        connector._request_order_status.assert_not_awaited()
+        self.acknowledge_entry_cancel(executor, order)
+        await self.settle_expiry_reconciliation(executor)
+        connector._request_order_status.assert_awaited_once()
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual(executor.close_type, CloseType.EXPIRED)
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+
+    async def test_expired_entry_reconciliation_failure_retains_ownership(self):
+        for response in [IOError("fill total unavailable"), TimeoutError("status timed out"), None, OrderUpdate(
+                trading_pair="ETH-USDT", update_timestamp=1234567921, new_state=OrderState.OPEN,
+                client_order_id="OID-BUY-1", exchange_order_id="EOID4")]:
+            with self.subTest(response=response):
+                executor, order, connector = self.expired_entry_fixture()
+                await self.settle_expiry_reconciliation(executor)
+                self.acknowledge_entry_cancel(executor, order)
+                if isinstance(response, Exception):
+                    connector._request_order_status.side_effect = response
+                else:
+                    connector._request_order_status.return_value = response
+                await self.settle_expiry_reconciliation(executor)
+                self.assertEqual(executor.status, RunnableStatus.RUNNING)
+                self.assertIsNone(executor.close_type)
+                self.strategy.buy.assert_not_called()
+                self.strategy.sell.assert_not_called()
+
+    async def test_expired_partial_entry_still_obeys_early_stop(self):
+        executor, order, connector = self.expired_entry_fixture(Decimal("0.2"))
+        await self.settle_expiry_reconciliation(executor)
+        executor.early_stop()
+        self.acknowledge_entry_cancel(executor, order)
+        with patch.object(executor, "_sleep", new_callable=AsyncMock):
+            await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("0.1998"))
+
+    async def test_expired_entry_fill_crossing_cancel_keeps_owner(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await self.settle_expiry_reconciliation(executor)
+        order.update_with_trade_update(self.entry_trade(order, Decimal("1")))
+        order.update_with_order_update(OrderUpdate(
+            trading_pair=order.trading_pair, update_timestamp=1234567921,
+            new_state=OrderState.FILLED, client_order_id=order.client_order_id))
+        connector._request_order_status.return_value = OrderUpdate(
+            trading_pair=order.trading_pair, update_timestamp=1234567921,
+            new_state=OrderState.FILLED, client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id)
+        await self.settle_expiry_reconciliation(executor)
+        self.assertTrue(executor.is_trading)
+        self.assertIsNone(executor.close_type)
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+
+    async def test_expired_partial_entry_obeys_stop_loss_and_time_limit(self):
+        for barrier in ["stop_loss", "time_limit"]:
+            with self.subTest(barrier=barrier):
+                self.strategy = self.create_mock_strategy
+                executor, order, connector = self.expired_entry_fixture(Decimal("0.2"))
+                await self.settle_expiry_reconciliation(executor)
+                self.acknowledge_entry_cancel(executor, order)
+                await self.settle_expiry_reconciliation(executor)
+                if barrier == "stop_loss":
+                    executor.config.triple_barrier_config.stop_loss = Decimal("0.05")
+                    connector.get_price_by_type.return_value = Decimal("90")
+                else:
+                    executor.config.triple_barrier_config.time_limit = 30
+                await self.settle_expiry_reconciliation(executor)
+                self.assertEqual(executor.close_type, CloseType.STOP_LOSS if barrier == "stop_loss" else CloseType.TIME_LIMIT)
+                self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("0.1998"))
+                self.assertEqual(self.strategy.sell.call_args.args[3], OrderType.MARKET)
+
+    def test_close_quantity_rounding_does_not_report_balance_shortage(self):
+        executor, order, connector = self.expired_entry_fixture(Decimal("0.2"))
+        connector.quantize_order_amount.side_effect = None
+        connector.quantize_order_amount.return_value = Decimal("0.199")
+        with patch.object(executor.logger(), "warning") as warning:
+            self.assertEqual(executor._close_order_amount(), Decimal("0.199"))
+            warning.assert_not_called()
+        connector.get_available_balance.return_value = Decimal("0.1")
+        connector.quantize_order_amount.return_value = Decimal("0.1")
+        with patch.object(executor.logger(), "warning") as warning:
+            self.assertEqual(executor._close_order_amount(), Decimal("0.1"))
+            warning.assert_called_once()
+            self.assertIn("available base balance", warning.call_args.args[0])
+
+    async def test_okx_terminal_reconciliation_restores_missing_fill_before_expiry(self):
+        from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+
+        executor, order, _ = self.expired_entry_fixture()
+        okx = OkxExchange(
+            okx_api_key="test-key", okx_secret_key="test-secret", okx_passphrase="test-passphrase",
+            trading_pairs=["ETH-USDT"], trading_required=False)
+        self.assertTrue(okx.supports_terminal_fill_reconciliation)
+        okx._order_tracker.start_tracking_order(order)
+        executor.connectors["binance"] = okx
+        executor.register_events()
+        terminal = {"code": "0", "data": [{
+            "ordId": order.exchange_order_id, "clOrdId": order.client_order_id,
+            "state": "canceled", "accFillSz": "0.2", "uTime": "1234567921000"}]}
+        fills = {"code": "0", "data": [{
+            "tradeId": "late-trade", "ordId": order.exchange_order_id,
+            "fillSz": "0.2", "fillPx": "100", "fee": "-0.0002", "feeCcy": "ETH", "ts": "1234567920000"}]}
+        with patch.object(okx, "get_price_by_type", return_value=Decimal("100")), \
+                patch.object(okx, "_request_order_update", new_callable=AsyncMock, return_value=terminal), \
+                patch.object(okx, "_request_order_fills", new_callable=AsyncMock, return_value=fills):
+            await self.settle_expiry_reconciliation(executor)
+            # Exercise the native tracker cancellation event before its missing fill is visible.
+            await okx._order_tracker.process_order_update(OrderUpdate(
+                trading_pair=order.trading_pair, update_timestamp=1234567921,
+                new_state=OrderState.CANCELED, client_order_id=order.client_order_id,
+                exchange_order_id=order.exchange_order_id))
+            self.assertIsNone(executor._open_order)
+            self.assertEqual(executor.open_filled_amount, Decimal("0"))
+            await self.settle_expiry_reconciliation(executor)
+            self.assertEqual(executor.open_filled_amount, Decimal("0.1998"))
+            self.assertEqual(executor.status, RunnableStatus.RUNNING)
+            self.assertIsNone(executor.close_type)
+            self.assertEqual(executor.get_custom_info()["order_ids"], [order.client_order_id])
+            # Duplicate exchange receipts are deduplicated by the native tracker.
+            await okx._request_order_status(tracked_order=order)
+            self.assertEqual(executor.open_filled_amount, Decimal("0.1998"))
+            self.strategy.buy.assert_not_called()
+            self.strategy.sell.assert_not_called()
+        executor.unregister_events()
+        missing_order = InFlightOrder(
+            client_order_id="OID-MISSING", exchange_order_id="EO-MISSING", trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890, initial_state=OrderState.OPEN)
+        okx._order_tracker.start_tracking_order(missing_order)
+        terminal["data"][0].update(ordId="EO-MISSING", clOrdId="OID-MISSING")
+        with patch.object(okx, "_request_order_update", new_callable=AsyncMock, return_value=terminal), \
+                patch.object(okx, "_request_order_fills", new_callable=AsyncMock, return_value={"code": "0", "data": []}):
+            with self.assertRaisesRegex(IOError, "Terminal fill reconciliation pending"):
+                await okx._request_order_status(tracked_order=missing_order)
+        self.assertEqual(missing_order.executed_amount_base, Decimal("0"))
+
+    async def test_empty_expiry_cannot_bypass_reconciliation_via_time_or_retry_limit(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await self.settle_expiry_reconciliation(executor)
+        self.acknowledge_entry_cancel(executor, order)
+        connector._request_order_status.side_effect = IOError("fill total unavailable")
+        executor.config.triple_barrier_config.time_limit = 30
+        executor._current_retries = executor._max_retries + 1
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertIsNone(executor.close_type)
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+
+    async def test_entry_failure_after_expiry_does_not_release_unknown_inventory(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await self.settle_expiry_reconciliation(executor)
+        order.update_with_order_update(OrderUpdate(
+            trading_pair=order.trading_pair, update_timestamp=1234567921,
+            new_state=OrderState.FAILED, client_order_id=order.client_order_id))
+        event = MarketOrderFailureEvent(timestamp=1234567921, order_id=order.client_order_id, order_type=OrderType.LIMIT)
+        executor.process_order_failed_event(None, None, event)
+        connector._request_order_status.side_effect = IOError("terminal state unavailable")
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertIsNone(executor.close_type)
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+
+    async def test_expiry_status_request_does_not_delay_new_fill_barriers(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await executor.control_task()
+        self.acknowledge_entry_cancel(executor, order)
+        started = asyncio.Event()
+        blocked = asyncio.Event()
+
+        async def delayed_status(tracked_order):
+            started.set()
+            await blocked.wait()
+
+        connector._request_order_status.side_effect = delayed_status
+        await asyncio.wait_for(executor.control_task(), timeout=0.1)
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        pending_task = executor._entry_expiry_reconciliation_task
+        order.update_with_trade_update(self.entry_trade(order, Decimal("0.2")))
+        connector.get_price_by_type.return_value = Decimal("110")
+        await asyncio.wait_for(executor.control_task(), timeout=0.1)
+        await asyncio.gather(pending_task, return_exceptions=True)
+        self.assertTrue(pending_task.cancelled())
+        self.assertIsNotNone(executor._trailing_stop_trigger_pct)
+        self.assertTrue(executor.is_trading)
+        self.assertIsNone(executor._entry_expiry_reconciliation_task)
+
+    async def test_expiry_terminal_release_requires_connector_fill_proof_capability(self):
+        executor, order, connector = self.expired_entry_fixture()
+        connector.supports_terminal_fill_reconciliation = False
+        await self.settle_expiry_reconciliation(executor)
+        self.acknowledge_entry_cancel(executor, order)
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertIsNone(executor.close_type)
+        connector._request_order_status.assert_not_awaited()
+
+    async def settle_expiry_reconciliation(self, executor):
+        await executor.control_task()
+        task = executor._entry_expiry_reconciliation_task
+        if task is not None:
+            await asyncio.gather(task, return_exceptions=True)
+            await executor.control_task()
+
+    async def test_stop_cancels_pending_expiry_reconciliation(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await executor.control_task()
+        self.acknowledge_entry_cancel(executor, order)
+        started = asyncio.Event()
+
+        async def pending_status(tracked_order):
+            started.set()
+            await asyncio.Event().wait()
+
+        connector._request_order_status.side_effect = pending_status
+        await executor.control_task()
+        task = executor._entry_expiry_reconciliation_task
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        executor.stop()
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(executor._entry_expiry_reconciliation_task)
+
+    async def test_expired_filled_owner_persists_and_blocks_fresh_execution_after_restart(self):
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+
+        from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
+        from hummingbot.client.config.config_helpers import ClientConfigAdapter
+        from hummingbot.connector.markets_recorder import MarketsRecorder
+        from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+        from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+        from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+
+        executor, order, connector = self.expired_entry_fixture(Decimal("0.2"))
+        executor.config.controller_id = "expiry-controller"
+        await executor.control_task()
+        self.acknowledge_entry_cancel(executor, order)
+        await executor.control_task()
+        self.strategy.controllers = {"expiry-controller": SimpleNamespace(config=SimpleNamespace(
+            connector_name="binance", trading_pair="ETH-USDT"))}
+        self.strategy.markets = {"binance": {"ETH-USDT"}}
+        with TemporaryDirectory() as directory:
+            manager = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                                           db_path=directory + "/expiry.sqlite")
+            previous_recorder = MarketsRecorder._shared_instance
+            recorder = MarketsRecorder(manager, [], "expiry.yml", "v2_with_controllers",
+                                       market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+            try:
+                recorder.store_or_update_executor(executor)
+                stored = recorder.get_all_executors()[0]
+                self.assertFalse(stored.is_done)
+                self.assertTrue(stored.custom_info["open_order_entry_expired"])
+                self.assertEqual(Decimal(stored.custom_info["open_order_filled_amount_base"]), Decimal("0.1998"))
+                self.assertEqual(stored.custom_info["order_ids"], [order.client_order_id])
+                with patch.object(MarketsRecorder, "get_instance", return_value=recorder):
+                    restarted = ExecutorOrchestrator(self.strategy)
+                    self.assertEqual(restarted.recovery_required, {"expiry-controller": [executor.config.id]})
+                    with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+                        restarted.create_executor(CreateExecutorAction(
+                            controller_id="expiry-controller", executor_config=executor.config))
+                self.strategy.buy.assert_not_called()
+                self.strategy.sell.assert_not_called()
+            finally:
+                MarketsRecorder._shared_instance = previous_recorder
+                manager.engine.dispose()
+
+    async def test_early_stop_cannot_release_empty_expiry_without_terminal_reconciliation(self):
+        for keep_position in (False, True):
+            with self.subTest(keep_position=keep_position):
+                self.strategy = self.create_mock_strategy
+                executor, order, connector = self.expired_entry_fixture()
+                await executor.control_task()
+                self.acknowledge_entry_cancel(executor, order)
+                connector.supports_terminal_fill_reconciliation = False
+                executor.early_stop(keep_position=keep_position)
+                with patch.object(executor, "_sleep", new_callable=AsyncMock):
+                    await self.settle_expiry_reconciliation(executor)
+                self.assertEqual(executor.status, RunnableStatus.SHUTTING_DOWN)
+                self.assertFalse(executor.executor_info.is_done)
+                self.assertFalse(executor._open_order_expiry_reconciled)
+                self.strategy.buy.assert_not_called()
+                self.strategy.sell.assert_not_called()
+
+    async def test_early_stop_empty_expiry_completes_after_authoritative_reconciliation(self):
+        for keep_position in (False, True):
+            with self.subTest(keep_position=keep_position):
+                self.strategy = self.create_mock_strategy
+                executor, order, connector = self.expired_entry_fixture()
+                await executor.control_task()
+                self.acknowledge_entry_cancel(executor, order)
+                executor.early_stop(keep_position=keep_position)
+                with patch.object(executor, "_sleep", new_callable=AsyncMock):
+                    await self.settle_expiry_reconciliation(executor)
+                self.assertTrue(executor._open_order_expiry_reconciled)
+                self.assertTrue(executor.executor_info.is_done)
+                self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+                self.strategy.buy.assert_not_called()
+                self.strategy.sell.assert_not_called()
+
+    async def test_late_fill_during_early_stop_reconciliation_still_closes_requested_inventory(self):
+        executor, order, connector = self.expired_entry_fixture()
+        await executor.control_task()
+        self.acknowledge_entry_cancel(executor, order)
+        started = asyncio.Event()
+
+        async def pending_status(tracked_order):
+            started.set()
+            await asyncio.Event().wait()
+
+        connector._request_order_status.side_effect = pending_status
+        executor.early_stop()
+        with patch.object(executor, "_sleep", new_callable=AsyncMock):
+            await executor.control_task()
+            await asyncio.wait_for(started.wait(), timeout=.1)
+            task = executor._entry_expiry_reconciliation_task
+            order.update_with_trade_update(self.entry_trade(order, Decimal("0.2")))
+            await asyncio.wait_for(executor.control_task(), timeout=.1)
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(executor.status, RunnableStatus.SHUTTING_DOWN)
+        self.assertEqual(executor.close_type, CloseType.EARLY_STOP)
+        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("0.1998"))
+        self.assertEqual(self.strategy.sell.call_args.args[3], OrderType.MARKET)

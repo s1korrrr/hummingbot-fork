@@ -28,6 +28,8 @@ class OkxOrderRejectedError(IOError):
 
 class OkxExchange(ExchangePyBase):
 
+    supports_terminal_fill_reconciliation = True
+
     web_utils = web_utils
 
     def __init__(self,
@@ -49,6 +51,7 @@ class OkxExchange(ExchangePyBase):
         self.okx_registration_sub_domain = okx_registration_sub_domain or "www"
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self._last_traded_price_source_timestamps = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -275,7 +278,20 @@ class OkxExchange(ExchangePyBase):
         )
 
         ticker_data, *_ = resp_json["data"]
+        # Preserve the source event time for observation only; it is not a rate
+        # or order decision input. Missing source evidence must not become "now".
+        try:
+            source_timestamp = Decimal(str(ticker_data.get("ts"))) / Decimal("1000")
+            source_timestamp = float(source_timestamp) if source_timestamp.is_finite() and source_timestamp > 0 else None
+        except (ArithmeticError, TypeError, ValueError):
+            source_timestamp = None
+        if not hasattr(self, "_last_traded_price_source_timestamps"):
+            self._last_traded_price_source_timestamps = {}
+        self._last_traded_price_source_timestamps[trading_pair] = source_timestamp
         return float(ticker_data["last"])
+
+    def last_traded_price_source_timestamp(self, trading_pair: str) -> Optional[float]:
+        return self._last_traded_price_source_timestamps.get(trading_pair)
 
     async def _update_balances(self):
         msg = await self._api_request(

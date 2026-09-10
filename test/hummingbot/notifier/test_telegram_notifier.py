@@ -9,10 +9,194 @@ from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event import events
+from hummingbot.model.order_status import OrderStatus  # noqa: F401 - register ORM relationship target
+from hummingbot.model.trade_fill import TradeFill
 from hummingbot.notifier.telegram_notifier import TelegramMarketEventForwarder, TelegramNotifier
 
 
 class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
+    @staticmethod
+    def exact_fill(side, amount, price, fee, *, base_fee="0", order_id="order", timestamp=1):
+        return TradeFill(market="okx", order_id=order_id, exchange_trade_id=order_id, symbol="BTC-USDC",
+                         base_asset="BTC", quote_asset="USDC", trade_type=side, timestamp=timestamp,
+                         amount=Decimal(amount).quantize(Decimal("0.000001")), price=Decimal(price),
+                         trade_fee_in_quote=Decimal("0"), exact_amount=amount, exact_price=price,
+                         exact_trade_fee_in_quote=fee, exact_receipt_source="order_filled_event_v1",
+                         trade_fee={"fee_type": "DeductedFromReturns", "percent": "0", "percent_token": None,
+                                    "flat_fees": [{"token": "BTC", "amount": base_fee}]})
+
+    def test_unavailable_fee_conversion_never_formats_as_zero_or_nan(self):
+        for result in [ValueError("missing conversion"), Decimal("NaN"), Decimal("Infinity")]:
+            with self.subTest(result=result):
+                fee = AddedToCostTradeFee()
+                fee.fee_amount_in_token = Mock(side_effect=result) if isinstance(result, Exception) else Mock(return_value=result)
+                self.assertEqual("UNAVAILABLE", TelegramNotifier._format_fee(
+                    fee, "BTC-USDC", Decimal("100"), Decimal("1"), "USDC"))
+        fee = AddedToCostTradeFee(flat_fees=[TokenAmount("BTC", Decimal("0.01"))])
+        fee.fee_amount_in_token = Mock(side_effect=ValueError("missing conversion"))
+        self.assertEqual("0.01 BTC", TelegramNotifier._format_fee(
+            fee, "BTC-USDC", Decimal("100"), Decimal("1"), "USDC"))
+
+    def test_unknown_event_fee_does_not_create_realized_profit(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._order_record = Mock(return_value=SimpleNamespace(market="okx"))
+        notifier._fills_for_pair = Mock(return_value=[self.exact_fill("BUY", "1", "100", "0")])
+        fee = AddedToCostTradeFee()
+        fee.fee_amount_in_token = Mock(side_effect=ValueError("conversion unavailable"))
+        event = events.OrderFilledEvent(timestamp=2, order_id="sell", trading_pair="BTC-USDC",
+                                        trade_type=TradeType.SELL, order_type=OrderType.LIMIT,
+                                        price=Decimal("110"), amount=Decimal("1"), trade_fee=fee,
+                                        exchange_trade_id="sell")
+        self.assertIsNone(notifier._sell_fill_realized_pnl_quote(event))
+
+    def test_invalid_accounting_timestamp_does_not_invent_fifo_order(self):
+        notifier = TelegramNotifier(self.hb_app)
+        sell = self.exact_fill("SELL", "1", "110", "0", order_id="sell", timestamp=2)
+        for timestamp in ["bad", None, 0, -1, "NaN", "Infinity"]:
+            with self.subTest(timestamp=timestamp):
+                buy = self.exact_fill("BUY", "1", "100", "0", timestamp=timestamp)
+                self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(
+                    sell_fills=[sell], inventory_fills=[buy]))
+
+    def test_tied_target_and_historical_partials_cannot_assign_fifo_basis(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buys = [self.exact_fill("BUY", "1", "100", "0", order_id="buy1", timestamp=1),
+                self.exact_fill("BUY", "1", "200", "0", order_id="buy2", timestamp=2)]
+        prior = self.exact_fill("SELL", "1", "150", "0", order_id="sell", timestamp=3)
+        prior.exchange_trade_id = "prior"
+        target = self.exact_fill("SELL", "1", "150", "0", order_id="sell", timestamp=3)
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[target], inventory_fills=[*buys, prior]))
+        self.assertEqual(Decimal("0"), notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[target, prior], inventory_fills=buys))
+
+    def test_sell_pnl_uses_exact_net_inventory_and_does_not_double_charge_base_fee(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buy = self.exact_fill("BUY", "1", "100", "1", base_fee="0.01", order_id="buy")
+        sell = self.exact_fill("SELL", "0.99", "110", "0.1089", order_id="sell", timestamp=2)
+        self.assertEqual(Decimal("8.7911"), notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[sell], inventory_fills=[buy]))
+
+    def test_btc_incident_receipts_preserve_sub_micro_fill_and_dust_cost_basis(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buy = self.exact_fill("BUY", "0.00013824", "78207.5", "0.00864912384",
+                              base_fee="0.000000110592", order_id="buy")
+        sell = self.exact_fill("SELL", "0.00013812", "78187.8", "0.010799298936", order_id="sell", timestamp=2)
+        pnl = notifier._trade_realized_pnl_from_sell_fills(sell_fills=[sell], inventory_fills=[buy])
+        self.assertEqual(Decimal("-0.02216879768"), pnl.quantize(Decimal("0.00000000001")))
+
+    def test_split_exits_conserve_full_lot_cost(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buy = self.exact_fill("BUY", "1", "100", "1", base_fee="0.01", order_id="buy")
+        sells = [self.exact_fill("SELL", "0.4", "110", "0.044", order_id="sell1", timestamp=2),
+                 self.exact_fill("SELL", "0.59", "110", "0.0649", order_id="sell2", timestamp=3)]
+        self.assertEqual(Decimal("8.7911"), notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=sells, inventory_fills=[buy]))
+
+    def test_interleaved_target_partials_receive_chronological_fifo_basis(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buy1 = self.exact_fill("BUY", "1", "100", "0", order_id="buy1", timestamp=1)
+        first = self.exact_fill("SELL", "0.5", "110", "0", order_id="target", timestamp=2)
+        buy2 = self.exact_fill("BUY", "1", "200", "0", order_id="buy2", timestamp=3)
+        other = self.exact_fill("SELL", "0.75", "210", "0", order_id="other", timestamp=4)
+        last = self.exact_fill("SELL", "0.5", "220", "0", order_id="target", timestamp=5)
+        first.exchange_trade_id = "partial1"
+        last.exchange_trade_id = "partial2"
+        pnl = notifier._trade_realized_pnl_from_sell_fills(sell_fills=[first, last],
+                                                           inventory_fills=[buy1, first, buy2, other, last], current_order_id="target")
+        self.assertEqual(Decimal("15"), pnl)
+
+    def test_legacy_or_missing_fee_basis_is_unavailable_for_trade_pnl(self):
+        notifier = TelegramNotifier(self.hb_app)
+        legacy = TradeFill(amount=Decimal("1"), price=Decimal("100"), trade_fee_in_quote=Decimal("0"),
+                           trade_type="BUY", timestamp=1)
+        sell = self.exact_fill("SELL", "1", "110", "0", order_id="sell", timestamp=2)
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(sell_fills=[sell], inventory_fills=[legacy]))
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(sell_fills=[sell], inventory_fills=[
+            {"trade_type": "BUY", "amount": "1", "price": "100", "timestamp": 1}]))
+
+    def test_ambiguous_same_timestamp_fifo_order_does_not_invent_basis(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buys = [self.exact_fill("BUY", "1", "100", "0", order_id="buy1", timestamp=1),
+                self.exact_fill("BUY", "1", "200", "0", order_id="buy2", timestamp=1)]
+        sell = self.exact_fill("SELL", "1", "150", "0", order_id="sell", timestamp=2)
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(sell_fills=[sell], inventory_fills=buys))
+
+    def test_exact_fill_missing_asset_fee_receipt_cannot_claim_pnl(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buy = self.exact_fill("BUY", "1", "100", "1", order_id="buy")
+        buy.trade_fee = None
+        sell = self.exact_fill("SELL", "1", "110", "0", order_id="sell", timestamp=2)
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(sell_fills=[sell], inventory_fills=[buy]))
+
+    def test_reused_trade_id_on_other_order_retains_its_inventory_consumption(self):
+        notifier = TelegramNotifier(self.hb_app)
+        history = [self.exact_fill("BUY", "1", "100", "0", order_id="buy1", timestamp=1),
+                   self.exact_fill("BUY", "1", "200", "0", order_id="buy2", timestamp=2),
+                   self.exact_fill("SELL", "1.5", "210", "0", order_id="other", timestamp=3)]
+        target = self.exact_fill("SELL", "0.5", "220", "0", order_id="target", timestamp=4)
+        history[-1].exchange_trade_id = target.exchange_trade_id = "reused"
+        self.assertEqual(Decimal("10"), notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[target], inventory_fills=history, current_trade_id="reused"))
+
+    def test_duplicate_target_receipt_is_counted_once_and_conflicts_are_unavailable(self):
+        notifier = TelegramNotifier(self.hb_app)
+        history = [self.exact_fill("BUY", "1", "100", "0", order_id="buy1", timestamp=1),
+                   self.exact_fill("BUY", "1", "200", "0", order_id="buy2", timestamp=2)]
+        target = self.exact_fill("SELL", "1", "220", "0", order_id="target", timestamp=3)
+        self.assertEqual(Decimal("120"), notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[target, target], inventory_fills=history))
+        conflict = self.exact_fill("SELL", "0.5", "220", "0", order_id="target", timestamp=3)
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(
+            sell_fills=[target, conflict], inventory_fills=history))
+
+    def test_missing_exact_fee_prevents_trade_pnl_and_completion_fee_claim(self):
+        notifier = TelegramNotifier(self.hb_app)
+        buy = self.exact_fill("BUY", "1", "100", None, order_id="buy")
+        sell = self.exact_fill("SELL", "1", "110", "0.1", order_id="sell", timestamp=2)
+        self.assertIsNone(notifier._trade_realized_pnl_from_sell_fills(sell_fills=[sell], inventory_fills=[buy]))
+        notifier._order_record = lambda order_id: None
+        notifier._fills_for_order = lambda order_id: [buy]
+        self.assertIsNone(notifier._order_completion_context("buy", "BTC", "USDC")["fee_quote"])
+
+    async def test_recent_fills_preserve_sub_micro_amount_and_show_receipt_precision(self):
+        notifier = TelegramNotifier(self.hb_app)
+        fill = self.exact_fill("SELL", "0.00013812", "78187.8", "0.010799298936")
+        notifier._recent_fills = lambda limit: [fill]
+        message = await notifier._command_fills([])
+        self.assertIn("0.00013812", message)
+        self.assertIn("exact receipt", message)
+
+    def test_order_message_preserves_integer_magnitude(self):
+        for value, expected in [("100", "100"), ("10.50", "10.5"), ("0.0000100", "0.00001"), ("-20", "-20")]:
+            with self.subTest(value=value):
+                self.assertEqual(expected, TelegramNotifier._format_decimal(Decimal(value)))
+
+    async def test_command_poll_reports_recovery_only_after_success(self):
+        notifier = TelegramNotifier(self.hb_app)
+        attempts = 0
+
+        async def cycle():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise ConnectionResetError("connection reset")
+            if attempts == 4:
+                raise asyncio.CancelledError()
+
+        async def sleep(delay):
+            pass
+
+        notifier._run_command_cycle = cycle
+        notifier._sleep = sleep
+        with self.assertLogs(notifier.logger(), level="INFO") as logs:
+            with self.assertRaises(asyncio.CancelledError):
+                await notifier._run_command_loop()
+        recovery = [record for record in logs.records if "polling recovered" in record.getMessage()]
+        self.assertEqual(1, len(recovery))
+        self.assertEqual("INFO", recovery[0].levelname)
+        self.assertIn("2 failed attempts", recovery[0].getMessage())
+
     def setUp(self):
         super().setUp()
         client_config = ClientConfigAdapter(ClientConfigMap())

@@ -429,3 +429,16 @@ class TestCandlesBase(IsolatedAsyncioWrapperTestCase, ABC):
             result = await self.data_feed.get_historical_candles(config)
             self.assertIsInstance(result, pd.DataFrame)
             mock_fetch_candles.assert_called_once()
+
+    async def test_disconnect_and_resubscription_identify_exact_candle_feed(self):
+        ws = AsyncMock()
+        with patch.object(self.data_feed, '_connected_websocket_assistant', return_value=ws), \
+                patch.object(self.data_feed, '_subscribe_channels', new_callable=AsyncMock), \
+                patch.object(self.data_feed, '_process_websocket_messages', side_effect=[ConnectionError('closed'), asyncio.CancelledError()]), \
+                patch.object(self.data_feed, '_on_order_stream_interruption', new_callable=AsyncMock):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.data_feed.listen_for_subscriptions()
+        self.assertTrue(self.is_logged(
+            'WARNING', f'The websocket connection was closed (closed) | feed={self.data_feed.name} interval={self.data_feed.interval}'))
+        self.assertTrue(self.is_logged(
+            'INFO', f'Candle websocket resubscribed | feed={self.data_feed.name} interval={self.data_feed.interval} ready={self.data_feed.ready}'))

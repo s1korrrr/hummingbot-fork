@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal
+from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from hummingbot import get_logging_conf
@@ -667,19 +668,11 @@ class MQTTGateway(Node):
         return list([logging.getLogger(name) for name in log_keys])
 
     def _remove_log_handlers(self):  # pragma: no cover
-        loggers = self._safe_get_log_handlers()
-        log_conf = get_logging_conf()
-
-        if 'loggers' not in log_conf:
+        if self._logh is None:
             return
-
-        logs = [key for key, val in log_conf.get('loggers').items()]
-        for logger in loggers:
-            if 'hummingbot' in logger.name:
-                for log in logs:
-                    if log in logger.name:
-                        self.remove_log_handler(logger)
-
+        for logger in self._safe_get_log_handlers() + [self._get_root_logger()]:
+            logger.removeHandler(self._logh)
+        self._logh.close()
         self._logh = None
 
     def _init_logger(self):
@@ -984,7 +977,7 @@ class MQTTGateway(Node):
                 None, self._check_connections)
 
             if self._health:
-                self._hb_app.logger().warning('MQTT Gateway successfully reconnected.')
+                self._hb_app.logger().info('MQTT Gateway successfully reconnected.')
 
         except Exception as e:
             self._health = False
@@ -1074,13 +1067,45 @@ class MQTTLogHandler(logging.Handler):
         self.log_pub = self._node.create_publisher(topic=self._topic,
                                                    msg_type=LogMessage)
         self.dropped_log_count = 0
+        self._pending = Queue(maxsize=256)
+        self._stopping = threading.Event()
+        self._queue_lock = threading.Lock()
+        self._worker = threading.Thread(target=self._publish_pending, name="mqtt-log-publisher", daemon=True)
+        self._worker.start()
 
-    def emit(self, record: logging.LogRecord):
-        if threading.current_thread() != threading.main_thread():  # pragma: no cover
+    def _publish_pending(self):
+        while not self._stopping.is_set():
             try:
-                self._ev_loop.call_soon_threadsafe(self.emit, record)
+                message = self._pending.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                if self._stopping.is_set():
+                    self.dropped_log_count += 1
+                else:
+                    self.log_pub.publish(message)
             except Exception:
                 self.dropped_log_count += 1
+            finally:
+                self._pending.task_done()
+
+    def close(self):
+        # Do not join a potentially blocked transport on the strategy thread.
+        # At most one publish is in flight; queued observations are retired.
+        with self._queue_lock:
+            self._stopping.set()
+            while True:
+                try:
+                    self._pending.get_nowait()
+                except Empty:
+                    break
+                self.dropped_log_count += 1
+                self._pending.task_done()
+        super().close()
+
+    def emit(self, record: logging.LogRecord):
+        if self._stopping.is_set():
+            self.dropped_log_count += 1
             return
         msg_str = self.format(record)
         msg = LogMessage(
@@ -1091,10 +1116,14 @@ class MQTTLogHandler(logging.Handler):
             logger_name=record.name
 
         )
-        try:
-            self.log_pub.publish(msg)
-        except Exception:
-            self.dropped_log_count += 1
+        with self._queue_lock:
+            if self._stopping.is_set():
+                self.dropped_log_count += 1
+                return
+            try:
+                self._pending.put_nowait(msg)
+            except Full:
+                self.dropped_log_count += 1
 
 
 class MQTTExternalEvents:

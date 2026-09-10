@@ -359,16 +359,24 @@ class CandlesBase(NetworkBase):
         exchange.
         """
         ws: Optional[WSAssistant] = None
+        interrupted = False
         while True:
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
                 await self._subscribe_channels(ws)
+                if interrupted:
+                    self.logger().info(
+                        f"Candle websocket resubscribed | feed={self.name} interval={self.interval} ready={self.ready}")
+                    interrupted = False
                 await self._process_websocket_messages(websocket_assistant=ws)
             except asyncio.CancelledError:
                 raise
             except ConnectionError as connection_exception:
-                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
+                interrupted = True
+                self.logger().warning(
+                    f"The websocket connection was closed ({connection_exception}) | feed={self.name} interval={self.interval}")
             except Exception:
+                interrupted = True
                 self.logger().exception(
                     "Unexpected error occurred when listening to public klines. Retrying in 1 seconds...",
                 )

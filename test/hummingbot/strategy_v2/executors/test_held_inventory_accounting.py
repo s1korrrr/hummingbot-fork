@@ -31,7 +31,10 @@ def make_orchestrator():
 def fill(oid, side, amount, fee='0'):
     return TradeFill(market='okx', symbol='ETH-USDT', order_id=oid, exchange_trade_id=oid,
                      timestamp=1, trade_type=side, price=D('100'), amount=D(amount),
-                     trade_fee_in_quote=D(fee), trade_fee={})
+                     trade_fee_in_quote=D(fee), trade_fee={'percent': '0', 'flat_fees': []},
+                     exact_amount=amount, exact_price='100', exact_trade_fee_in_quote=fee,
+                     exact_receipt_source='order_filled_event_v1', base_asset='ETH', quote_asset='USDT',
+                     leverage=1, position='NIL')
 
 
 def test_partial_exit_does_not_consume_an_unrelated_held_bag():

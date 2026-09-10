@@ -59,7 +59,8 @@ def _format_total_pnls_by_quote(pnls_by_quote: Dict[str, Decimal]) -> str:
         return "0.00"
 
     return ", ".join(
-        f"{PerformanceMetrics.smart_round(pnls_by_quote[quote])} {quote}"
+        (f"{PerformanceMetrics.smart_round(pnls_by_quote[quote])} {quote}"
+         if pnls_by_quote[quote].is_finite() else f"UNAVAILABLE {quote}")
         for quote in sorted(pnls_by_quote)
     )
 
@@ -104,8 +105,13 @@ async def start_trade_monitor(trade_monitor):
                                 pnls_by_quote[_trade_quote_asset(cur_trades[0])] += perf.total_pnl
                             avg_return = sum(return_pcts) / len(return_pcts) if len(return_pcts) > 0 else s_decimal_0
                             total_pnls = _format_total_pnls_by_quote(pnls_by_quote)
+                            return_text = f"{avg_return:.2%}" if avg_return.is_finite() else "UNAVAILABLE"
+                            legacy_precision = any(isinstance(trade, TradeFill)
+                                                   and "legacy_6dp" in trade.receipt_precision.values()
+                                                   for trade in trades)
+                            precision_text = " [legacy fill precision: 6 decimals]" if legacy_precision else ""
                             trade_monitor.log(f"Trades: {len(trades)}, Total P&L: {total_pnls}, "
-                                              f"Return %: {avg_return:.2%}")
+                                              f"Return %: {return_text}{precision_text}")
             await _sleep(2.0)  # sleeping for longer to manage resources
         except asyncio.CancelledError:
             raise

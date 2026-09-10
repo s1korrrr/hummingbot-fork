@@ -34,6 +34,8 @@ class TradeFillTests(TestCase):
             "leverage",
             "trade_fee",
             "trade_fee_in_quote",
-            "position", ]
+            "position",
+            "exact_receipt_source",
+            "receipt_precision", ]
 
         self.assertEqual(expected_attributes, TradeFill.attribute_names_for_file_export())

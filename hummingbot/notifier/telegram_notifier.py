@@ -17,7 +17,15 @@ from hummingbot.core.pubsub import PubSub
 from hummingbot.model.order import Order
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.notifier.notifier_base import NotifierBase
-from hummingbot.notifier.telegram_polling import TelegramPollingConflict, TelegramPollingLease, wait_for_poll
+from hummingbot.notifier.telegram_polling import (
+    TelegramPollingAdmissionDenied,
+    TelegramPollingConflict,
+    TelegramPollingLease,
+    polling_admitted,
+    require_polling_admission,
+    wait_for_poll,
+)
+from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 
 if TYPE_CHECKING:
     from hummingbot.client.hummingbot_application import HummingbotApplication
@@ -198,30 +206,27 @@ class TelegramNotifier(NotifierBase):
         amount: Decimal,
         quote_asset: str,
     ) -> str:
+        fee_value = cls._fee_quote_from_trade_fee(trade_fee, trading_pair, price, amount)
+        if fee_value is not None:
+            return f"{cls._format_decimal(fee_value)} {quote_asset}" if fee_value else "0"
         try:
-            fee_value = trade_fee.fee_amount_in_token(
-                trading_pair=trading_pair,
-                price=price,
-                order_amount=amount,
-                token=quote_asset,
-            )
-            if fee_value != Decimal("0"):
-                return f"{cls._format_decimal(fee_value)} {quote_asset}"
-        except Exception:
+            raw_fees = [(Decimal(str(fee.amount)), fee.token) for fee in trade_fee.flat_fees]
+            if any(not fee.is_finite() for fee, _ in raw_fees):
+                return "UNAVAILABLE"
+            if raw_fees:
+                return ", ".join(f"{cls._format_decimal(fee)} {token}" for fee, token in raw_fees)
+            percent = Decimal(str(trade_fee.percent))
+            if percent.is_finite() and percent:
+                return f"{cls._format_decimal(percent * Decimal('100'))}%"
+        except (ValueError, TypeError, ArithmeticError):
             pass
-
-        flat_fees = ", ".join(f"{cls._format_decimal(fee.amount)} {fee.token}" for fee in trade_fee.flat_fees)
-        if flat_fees:
-            return flat_fees
-        if trade_fee.percent != Decimal("0"):
-            percent_value = trade_fee.percent * Decimal("100")
-            return f"{cls._format_decimal(percent_value)}%"
-        return "0"
+        return "UNAVAILABLE"
 
     @staticmethod
     def _format_decimal(value: Decimal) -> str:
         normalized = value.normalize() if isinstance(value, Decimal) else Decimal(str(value)).normalize()
-        return format(normalized, "f").rstrip("0").rstrip(".") or "0"
+        formatted = format(normalized, "f")
+        return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
 
     @staticmethod
     def _format_timestamp(timestamp: float) -> str:
@@ -231,12 +236,23 @@ class TelegramNotifier(NotifierBase):
         lease = TelegramPollingLease(self._config.telegram_bot_token.get_secret_value())
         try:
             waiting_logged = False
-            while not lease.acquire():
-                if not waiting_logged:
-                    self.logger().info('Another local bot owns Telegram commands; notifications remain enabled.')
-                    waiting_logged = True
-                await self._sleep(self.COMMAND_LOOP_RETRY_DELAY)
-            await self._run_owned_command_loop()
+            while True:
+                if not polling_admitted():
+                    lease.close()
+                    if not waiting_logged:
+                        self.logger().info('Telegram commands await operator admission; notifications remain enabled.')
+                        waiting_logged = True
+                    await self._sleep(self.COMMAND_LOOP_RETRY_DELAY)
+                    continue
+                if not lease.acquire():
+                    if not waiting_logged:
+                        self.logger().info('Another local bot owns Telegram commands; notifications remain enabled.')
+                        waiting_logged = True
+                    await self._sleep(self.COMMAND_LOOP_RETRY_DELAY)
+                    continue
+                waiting_logged = False
+                await self._run_owned_command_loop()
+                lease.close()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -245,19 +261,37 @@ class TelegramNotifier(NotifierBase):
             lease.close()
 
     async def _run_owned_command_loop(self):
+        outage_started = None
+        failed_attempts = 0
         while True:
             try:
+                require_polling_admission()
                 await self._run_command_cycle()
+                if outage_started is not None:
+                    self.logger().info(
+                        "Telegram command polling recovered after %.1fs and %d failed attempts.",
+                        self._ev_loop.time() - outage_started,
+                        failed_attempts,
+                    )
+                    outage_started = None
+                    failed_attempts = 0
             except asyncio.CancelledError:
                 raise
+            except TelegramPollingAdmissionDenied:
+                return
             except TelegramPollingConflict:
                 self.logger().warning(
                     'Telegram command polling suspended: another consumer or webhook uses this token. '
                     'Notifications remain enabled. Stop the competing poller before restarting this notifier.'
                 )
                 # Keep the local lease so standby bots do not repeat the same conflict.
-                await asyncio.Future()
+                while polling_admitted():
+                    await self._sleep(self.COMMAND_LOOP_RETRY_DELAY)
+                return
             except Exception as e:
+                if outage_started is None:
+                    outage_started = self._ev_loop.time()
+                failed_attempts += 1
                 self.logger().warning(
                     f"Telegram command loop iteration failed; retrying in {self.COMMAND_LOOP_RETRY_DELAY:.0f}s: {e}",
                     exc_info=True,
@@ -265,18 +299,24 @@ class TelegramNotifier(NotifierBase):
                 await self._sleep(self.COMMAND_LOOP_RETRY_DELAY)
 
     async def _run_command_cycle(self):
+        require_polling_admission()
         if self._last_update_id is None:
             await self._initialize_command_state()
         if self._config.telegram_set_my_commands and not self._command_menu_published:
+            require_polling_admission()
             self._command_menu_published = await self._publish_command_menu()
+        require_polling_admission()
         updates = await wait_for_poll(self._ev_loop, self._fetch_updates)
         for update in updates:
+            require_polling_admission()
             await self._handle_update(update)
 
     async def _initialize_command_state(self):
         if self._last_update_id is not None:
             return
+        require_polling_admission()
         updates = await wait_for_poll(self._ev_loop, self._fetch_updates_once)
+        require_polling_admission()
         if updates:
             self._last_update_id = max(int(update["update_id"]) for update in updates) + 1
         else:
@@ -284,13 +324,14 @@ class TelegramNotifier(NotifierBase):
 
     async def _publish_command_menu(self) -> bool:
         try:
-            await self._ev_loop.run_in_executor(
-                None,
-                self._telegram_request,
-                "setMyCommands",
-                {"commands": json.dumps([{"command": c, "description": d} for c, d in self.COMMAND_SPECS])},
-            )
+            require_polling_admission()
+            await wait_for_poll(self._ev_loop, lambda: self._telegram_request(
+                "setMyCommands", {"commands": json.dumps([
+                    {"command": c, "description": d} for c, d in self.COMMAND_SPECS])}))
+            require_polling_admission()
             return True
+        except TelegramPollingAdmissionDenied:
+            raise
         except Exception as e:
             self.logger().warning(f"Failed to publish Telegram command menu: {e}")
             return False
@@ -311,11 +352,13 @@ class TelegramNotifier(NotifierBase):
         if self._last_update_id is not None:
             params["offset"] = self._last_update_id
         updates = self._telegram_request("getUpdates", params)
+        require_polling_admission()
         if updates:
             self._last_update_id = max(int(update["update_id"]) for update in updates) + 1
         return updates
 
     async def _handle_update(self, update: Dict[str, Any]):
+        require_polling_admission()
         message = update.get("message") or {}
         text = str(message.get("text") or "").strip()
         if not text.startswith("/"):
@@ -332,6 +375,7 @@ class TelegramNotifier(NotifierBase):
         args = text.split()[1:]
         response = await self._dispatch_command(command_name, args)
         if response:
+            require_polling_admission()
             await self._send_telegram_text(response)
 
     def _bind_or_validate_chat(self, chat_id: str) -> bool:
@@ -585,14 +629,66 @@ class TelegramNotifier(NotifierBase):
             return "No fills found in SQLite for the current config."
         lines = [self._title("🧾", "RECENT FILLS")]
         for fill in fills:
-            notional = Decimal(str(fill.price)) * Decimal(str(fill.amount))
-            fee_quote = Decimal(str(fill.trade_fee_in_quote or 0))
+            try:
+                price = self._fill_decimal(fill, "price")
+                amount = self._fill_decimal(fill, "amount")
+                fee_quote = self._fill_decimal(fill, "trade_fee_in_quote")
+                notional = price * amount
+            except (ValueError, TypeError, ArithmeticError):
+                lines.append(f"{self.BULLET} {fill.symbol} | receipt unavailable: invalid stored values")
+                continue
+            precision = "exact receipt" if isinstance(fill, TradeFill) and fill.has_exact_receipt else "legacy receipt (6 decimals)"
+            fee_text = self._format_decimal(fee_quote) if fee_quote is not None else "UNAVAILABLE"
             lines.append(
                 f"{self.BULLET} {self._format_db_timestamp(fill.timestamp)} | {fill.symbol} | {fill.trade_type} | "
-                f"price {self._format_number(fill.price, 6)} | amount {self._format_number(fill.amount, 6)} | "
-                f"notional ${self._format_number(notional, 2)} | fee ${self._format_number(fee_quote, 2)}"
+                f"price {self._format_decimal(price)} | amount {self._format_decimal(amount)} | "
+                f"notional ${self._format_number(notional, 2)} | fee {fee_text} {fill.quote_asset} | {precision}"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _fill_decimal(fill: Any, field: str) -> Optional[Decimal]:
+        if isinstance(fill, TradeFill):
+            return getattr(fill, f"{field}_decimal")
+        value = fill.get(field) if isinstance(fill, dict) else getattr(fill, field, None)
+        if value is None:
+            return None
+        result = Decimal(str(value))
+        if not result.is_finite():
+            raise ValueError("Non-finite fill value")
+        return result
+
+    def _accounting_fill(self, fill: Any) -> Dict[str, Any]:
+        def value(name, default=None):
+            return fill.get(name, default) if isinstance(fill, dict) else getattr(fill, name, default)
+
+        if isinstance(fill, TradeFill) and not fill.has_exact_receipt:
+            raise ValueError("Legacy fill precision cannot establish exact inventory basis")
+        amount = self._fill_decimal(fill, "amount")
+        price = self._fill_decimal(fill, "price")
+        fee_quote = self._fill_decimal(fill, "trade_fee_in_quote")
+        if amount is None or price is None or fee_quote is None or amount <= 0 or price <= 0:
+            raise ValueError("Incomplete fill economics")
+        side = self._trade_fill_side(fill)
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("Unknown fill side")
+        base_asset = value("base_asset") or str(value("symbol", "")).split("-")[0]
+        raw_fee = value("trade_fee")
+        if isinstance(fill, TradeFill) and raw_fee is None:
+            raise ValueError("Missing asset-denominated fee receipt")
+        fee = raw_fee if raw_fee is not None else {}
+        if not isinstance(fee, dict):
+            raise ValueError("Invalid stored fill fee")
+        base_fee = base_fee_amount({"trade_type": side, "order_fills": {
+            "fill": {"fill_base_amount": str(amount), "fee": fee}}}, base_asset)
+        inventory_amount = amount - base_fee if side == "BUY" else amount + base_fee
+        if inventory_amount <= 0:
+            raise ValueError("Invalid fee-adjusted fill quantity")
+        return {"order_id": value("order_id"), "exchange_trade_id": value("exchange_trade_id"),
+                "timestamp": self._accounting_fill_timestamp(value("timestamp")),
+                "market": value("market"), "symbol": value("symbol"),
+                "trade_type": side, "amount": inventory_amount,
+                "quote_amount": price * amount, "trade_fee_in_quote": fee_quote - base_fee * price}
 
     def _fallback_status_message(self) -> str:
         return (
@@ -736,12 +832,22 @@ class TelegramNotifier(NotifierBase):
             return Decimal("0")
         return value * Decimal("1000") if value and value < Decimal("100000000000") else value
 
+    @classmethod
+    def _accounting_fill_timestamp(cls, timestamp: Any) -> Decimal:
+        value = Decimal(str(timestamp))
+        if not value.is_finite() or value <= 0:
+            raise ValueError("Invalid accounting timestamp")
+        return cls._normalized_fill_timestamp(value)
+
     def _sell_fill_realized_pnl_quote(self, event: events.OrderFilledEvent) -> Optional[Decimal]:
         order = self._order_record(event.order_id)
         market = getattr(order, "market", None)
         if not market or not event.exchange_trade_id:
             return None
-        event_timestamp = self._normalized_fill_timestamp(event.timestamp)
+        try:
+            event_timestamp = self._accounting_fill_timestamp(event.timestamp)
+        except (ValueError, TypeError, ArithmeticError):
+            return None
         fee_quote = self._fee_quote_from_trade_fee(
             event.trade_fee,
             event.trading_pair,
@@ -749,11 +855,15 @@ class TelegramNotifier(NotifierBase):
             event.amount,
         )
         current_fill = {
+            "market": market,
+            "symbol": event.trading_pair,
             "order_id": event.order_id,
             "exchange_trade_id": event.exchange_trade_id,
             "trade_type": "SELL",
             "price": event.price,
             "amount": event.amount,
+            "base_asset": event.trading_pair.split("-")[0],
+            "trade_fee": event.trade_fee.to_json(),
             "trade_fee_in_quote": fee_quote,
             "timestamp": event_timestamp,
         }
@@ -771,7 +881,10 @@ class TelegramNotifier(NotifierBase):
         ]
         if not sell_fills or not market:
             return None
-        end_timestamp = max(self._normalized_fill_timestamp(getattr(fill, "timestamp", 0)) for fill in sell_fills)
+        try:
+            end_timestamp = max(self._accounting_fill_timestamp(getattr(fill, "timestamp", None)) for fill in sell_fills)
+        except (ValueError, TypeError, ArithmeticError):
+            return None
         return self._trade_realized_pnl_from_sell_fills(
             sell_fills=sell_fills,
             inventory_fills=self._fills_for_pair(trading_pair, market=market, end_timestamp=end_timestamp),
@@ -794,21 +907,13 @@ class TelegramNotifier(NotifierBase):
         current_trade_id: Optional[str] = None,
     ) -> Optional[Decimal]:
         lots: List[Dict[str, Decimal]] = []
-
-        def decimal_attr(fill: Any, name: str, default: Decimal = Decimal("0")) -> Decimal:
-            value = fill.get(name, default) if isinstance(fill, dict) else getattr(fill, name, default)
-            if value is None:
-                return default
-            try:
-                return Decimal(str(value))
-            except Exception:
-                return default
-
-        def string_attr(fill: Any, name: str) -> str:
-            value = fill.get(name) if isinstance(fill, dict) else getattr(fill, name, None)
-            if hasattr(value, "name"):
-                return str(value.name)
-            return str(value or "")
+        try:
+            sell_fills = [self._accounting_fill(fill) for fill in sell_fills]
+            inventory_fills = [self._accounting_fill(fill) for fill in inventory_fills]
+            if any(fill["trade_type"] != "SELL" for fill in sell_fills):
+                return None
+        except (ValueError, TypeError, KeyError, ArithmeticError):
+            return None
 
         def consume(amount: Decimal) -> Optional[Decimal]:
             remaining = amount
@@ -816,7 +921,9 @@ class TelegramNotifier(NotifierBase):
             while remaining > 0 and lots:
                 lot = lots[0]
                 matched = min(remaining, lot["amount"])
-                cost += matched * lot["cost_per_base"]
+                matched_cost = lot["cost_quote"] if matched == lot["amount"] else lot["cost_quote"] * matched / lot["amount"]
+                cost += matched_cost
+                lot["cost_quote"] -= matched_cost
                 lot["amount"] -= matched
                 remaining -= matched
                 if lot["amount"] <= 0:
@@ -825,39 +932,47 @@ class TelegramNotifier(NotifierBase):
                 return None
             return cost
 
-        for fill in sorted(inventory_fills, key=lambda item: decimal_attr(item, "timestamp")):
-            order_id = string_attr(fill, "order_id")
-            trade_id = string_attr(fill, "exchange_trade_id")
-            if current_order_id is not None and order_id == current_order_id:
+        events = []
+        keyed_events = {}
+        for fill, is_target in [(fill, True) for fill in sell_fills] + [(fill, False) for fill in inventory_fills]:
+            key = (fill["market"], fill["order_id"], fill["exchange_trade_id"])
+            if all(key):
+                previous = keyed_events.get(key)
+                if previous is not None:
+                    if previous[0] != fill:
+                        return None
+                    continue
+                keyed_events[key] = (fill, is_target)
+            elif not is_target and current_order_id is not None and fill["order_id"] == current_order_id:
+                # Compatibility for in-memory callers without a persisted composite key.
                 continue
-            if current_trade_id is not None and trade_id == current_trade_id:
-                continue
-
-            amount = decimal_attr(fill, "amount")
-            price = decimal_attr(fill, "price")
-            if amount <= 0 or price <= 0:
-                continue
-
-            trade_type = string_attr(fill, "trade_type").upper()
-            if trade_type == "BUY":
-                fee_quote = decimal_attr(fill, "trade_fee_in_quote")
-                lots.append({"amount": amount, "cost_per_base": ((price * amount) + fee_quote) / amount})
-            elif trade_type == "SELL" and consume(amount) is None:
+            events.append((fill, is_target))
+        scopes = {(fill["market"], fill["symbol"]) for fill, _ in events if fill["market"] and fill["symbol"]}
+        if len(scopes) > 1:
+            return None
+        timestamp_owners = {}
+        for fill, is_target in events:
+            owners = timestamp_owners.setdefault(fill["timestamp"], set())
+            owners.add((fill["trade_type"], fill["order_id"], is_target))
+            if len(owners) > 1:
+                # The event clock cannot order different orders or assign tied partials to a target.
                 return None
-
         realized_pnl = Decimal("0")
         matched_any = False
-        for fill in sorted(sell_fills, key=lambda item: decimal_attr(item, "timestamp")):
-            amount = decimal_attr(fill, "amount")
-            price = decimal_attr(fill, "price")
-            if amount <= 0 or price <= 0:
+        # Target partial fills must consume basis at their own event time, alongside other orders.
+        for fill, is_target in sorted(events, key=lambda item: item[0]["timestamp"]):
+            amount = fill["amount"]
+            quote_amount = fill["quote_amount"]
+            fee_quote = fill["trade_fee_in_quote"]
+            if fill["trade_type"] == "BUY":
+                lots.append({"amount": amount, "cost_quote": quote_amount + fee_quote})
                 continue
             cost = consume(amount)
             if cost is None:
                 return None
-            sell_fee_quote = decimal_attr(fill, "trade_fee_in_quote")
-            realized_pnl += (price * amount) - cost - sell_fee_quote
-            matched_any = True
+            if is_target:
+                realized_pnl += quote_amount - cost - fee_quote
+                matched_any = True
 
         return realized_pnl if matched_any else None
 
@@ -874,7 +989,11 @@ class TelegramNotifier(NotifierBase):
         if order is not None and getattr(order, "symbol", None):
             trading_pair = str(order.symbol)
         fills = self._fills_for_order(order_id)
-        fee_quote = sum((Decimal(str(fill.trade_fee_in_quote or 0)) for fill in fills), Decimal("0")) if fills else None
+        try:
+            fees = [self._fill_decimal(fill, "trade_fee_in_quote") for fill in fills]
+            fee_quote = sum(fees, Decimal("0")) if fees and all(fee is not None for fee in fees) else None
+        except (ValueError, TypeError, ArithmeticError):
+            fee_quote = None
         context = {
             "trading_pair": trading_pair,
             "fee_quote": fee_quote,
@@ -926,17 +1045,18 @@ class TelegramNotifier(NotifierBase):
         trading_pair: str,
         price: Decimal,
         amount: Decimal,
-    ) -> Decimal:
-        _, quote_asset = split_hb_trading_pair(trading_pair)
+    ) -> Optional[Decimal]:
         try:
-            return Decimal(str(trade_fee.fee_amount_in_token(
+            _, quote_asset = split_hb_trading_pair(trading_pair)
+            fee = Decimal(str(trade_fee.fee_amount_in_token(
                 trading_pair=trading_pair,
                 price=price,
                 order_amount=amount,
                 token=quote_asset,
             )))
+            return fee if fee.is_finite() else None
         except Exception:
-            return Decimal("0")
+            return None
 
     @classmethod
     def _format_number(cls, value: Any, decimals: int) -> str:
@@ -1003,6 +1123,8 @@ class TelegramNotifier(NotifierBase):
             method="POST",
         )
         try:
+            if method in {'getUpdates', 'setMyCommands'}:
+                require_polling_admission()
             with request.urlopen(req, timeout=self.REQUEST_TIMEOUT + self.LONG_POLL_TIMEOUT) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as e:

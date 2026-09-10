@@ -8,6 +8,9 @@ from hummingbot.logger import HummingbotLogger
 
 
 class OKXSpotCandles(CandlesBase):
+    # Both REST and websocket parsers below admit only exchange confirm=1 rows.
+    closed_candles_only = True
+
     _logger: Optional[HummingbotLogger] = None
 
     @classmethod

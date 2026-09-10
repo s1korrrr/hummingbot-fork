@@ -985,6 +985,21 @@ class MarketsRecorder:
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
+                existing_fill = session.query(TradeFill).filter_by(
+                    market=market.display_name, order_id=order_id, exchange_trade_id=evt.exchange_trade_id
+                ).one_or_none()
+                if existing_fill is not None:
+                    amount = Decimal(TradeFill.decimal_text(evt.amount))
+                    price = Decimal(TradeFill.decimal_text(evt.price))
+                    if existing_fill.exact_amount is None:
+                        amount = Decimal(int(amount * 10 ** 6)) / 10 ** 6
+                    if existing_fill.exact_price is None:
+                        price = Decimal(int(price * 10 ** 6)) / 10 ** 6
+                    if (existing_fill.amount_decimal != amount or existing_fill.price_decimal != price
+                            or existing_fill.symbol != evt.trading_pair or existing_fill.trade_type != evt.trade_type.name
+                            or existing_fill.trade_fee != evt.trade_fee.to_json()):
+                        raise ValueError(f"Conflicting duplicate fill receipt for {order_id}/{evt.exchange_trade_id}")
+                    return  # Stable venue/order/fill identity: redelivery must not duplicate receipts or status.
                 # Try to find the order record, and update it if necessary.
                 order_record: Optional[Order] = session.query(Order).filter(Order.id == order_id).one_or_none()
                 if order_record is not None:
@@ -1004,9 +1019,11 @@ class MarketsRecorder:
                         token=quote_asset,
                         exchange=market
                     )
+                    exact_fee_in_quote = TradeFill.decimal_text(fee_in_quote)
                 except Exception as e:
-                    self.logger().error(f"Error calculating fee in quote: {e}, will be stored in the DB as 0.")
-                    fee_in_quote = 0
+                    self.logger().error(f"Error calculating fee in quote: {e}; fee remains unavailable.")
+                    fee_in_quote = None
+                    exact_fee_in_quote = None
                 trade_fill_record: TradeFill = TradeFill(
                     config_file_path=self.config_file_path,
                     strategy=self.strategy_name,
@@ -1023,6 +1040,10 @@ class MarketsRecorder:
                     leverage=evt.leverage if evt.leverage else 1,
                     trade_fee=evt.trade_fee.to_json(),
                     trade_fee_in_quote=fee_in_quote,
+                    exact_amount=TradeFill.decimal_text(evt.amount),
+                    exact_price=TradeFill.decimal_text(evt.price),
+                    exact_trade_fee_in_quote=exact_fee_in_quote,
+                    exact_receipt_source="order_filled_event_v1",
                     exchange_trade_id=evt.exchange_trade_id,
                     position=evt.position if evt.position else PositionAction.NIL.value,
                 )
@@ -1068,7 +1089,7 @@ class MarketsRecorder:
         csv_path = os.path.join(data_path(), csv_filename)
 
         field_names = tuple(trade.attribute_names_for_file_export())
-        field_data = tuple(getattr(trade, attr) for attr in field_names)
+        field_data = tuple(trade.value_for_file_export(attr) for attr in field_names)
 
         # adding extra field "age"
         # // indicates order is a paper order so 'n/a'. For real orders, calculate age.

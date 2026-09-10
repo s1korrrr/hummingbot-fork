@@ -27,7 +27,7 @@ class SQLConnectionManager(TransactionBase):
     _scm_trade_fills_instance: Optional["SQLConnectionManager"] = None
 
     LOCAL_DB_VERSION_KEY = "local_db_version"
-    LOCAL_DB_VERSION_VALUE = "20260327"
+    LOCAL_DB_VERSION_VALUE = "20260910"
     SQLITE_BUSY_TIMEOUT_MS = 2_000
 
     @classmethod
@@ -142,9 +142,11 @@ class SQLConnectionManager(TransactionBase):
                 else:
                     local_db_version_value = local_db_version.value
 
-        # The migration swaps the database file and reinitializes this connection manager,
-        # so it must not reuse the pre-migration session above.
+        # End the version-read transaction before the migration acquires its writer reservation.
+        # Schema changes and the version update then commit together in the same database file.
         if local_db_version_value is not None and local_db_version_value < self.LOCAL_DB_VERSION_VALUE:
-            Migrator().migrate_db_to_version(
+            migrated = Migrator().migrate_db_to_version(
                 client_config_map, self, int(local_db_version_value), int(self.LOCAL_DB_VERSION_VALUE)
             )
+            if not migrated:
+                raise RuntimeError("Database migration failed; startup cannot use an outdated schema")

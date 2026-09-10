@@ -15,6 +15,15 @@ s_decimal_0 = Decimal("0")
 s_decimal_nan = Decimal("NaN")
 
 
+@dataclass(frozen=True)
+class _AggregatedPositionOrder:
+    """Calculation values only; never persisted or presented as a fill receipt."""
+    order_id: str
+    position: str
+    price: Decimal
+    amount: Decimal
+
+
 @dataclass
 class PerformanceMetrics:
     _logger = None
@@ -72,6 +81,12 @@ class PerformanceMetrics:
         return performance
 
     @staticmethod
+    def _trade_decimal(trade, field: str) -> Decimal:
+        if isinstance(trade, TradeFill):
+            return getattr(trade, f"{field}_decimal")
+        return Decimal(str(getattr(trade, field)))
+
+    @staticmethod
     def position_order(open: list, close: list) -> Tuple[Any, Any]:
         """
         Pair open position order with close position orders
@@ -105,11 +120,16 @@ class PerformanceMetrics:
             aggregated_prices = 0
             aggregated_amounts = 0
             for order in group:
-                aggregated_prices += order.price
-                aggregated_amounts += order.amount
+                aggregated_prices += PerformanceMetrics._trade_decimal(order, "price")
+                aggregated_amounts += PerformanceMetrics._trade_decimal(order, "amount")
             aggregated = group[0]
-            aggregated.price = aggregated_prices / len(group)
-            aggregated.amount = aggregated_amounts
+            if isinstance(aggregated, TradeFill):
+                aggregated = _AggregatedPositionOrder(
+                    order_id=aggregated.order_id, position=aggregated.position,
+                    price=aggregated_prices / len(group), amount=aggregated_amounts)
+            else:
+                aggregated.price = aggregated_prices / len(group)
+                aggregated.amount = aggregated_amounts
             aggregated_orders.append(aggregated)
 
         return aggregated_orders
@@ -138,9 +158,11 @@ class PerformanceMetrics:
         """
         pnls = []
         for lg in long:
-            pnls.append((lg[1].price - lg[0].price) * lg[1].amount)
+            pnls.append((PerformanceMetrics._trade_decimal(lg[1], "price") - PerformanceMetrics._trade_decimal(lg[0], "price"))
+                        * PerformanceMetrics._trade_decimal(lg[1], "amount"))
         for st in short:
-            pnls.append((st[0].price - st[1].price) * st[1].amount)
+            pnls.append((PerformanceMetrics._trade_decimal(st[0], "price") - PerformanceMetrics._trade_decimal(st[1], "price"))
+                        * PerformanceMetrics._trade_decimal(st[1], "amount"))
         return pnls
 
     @staticmethod
@@ -187,12 +209,12 @@ class PerformanceMetrics:
         for trade in trades:
             if trade.trade_type.upper() == TradeType.BUY.name.upper():
                 buys.append(trade)
-                self.b_vol_base += Decimal(str(trade.amount))
-                self.b_vol_quote += Decimal(str(trade.amount)) * Decimal(str(trade.price)) * Decimal("-1")
+                self.b_vol_base += self._trade_decimal(trade, "amount")
+                self.b_vol_quote += self._trade_decimal(trade, "amount") * self._trade_decimal(trade, "price") * Decimal("-1")
             elif trade.trade_type.upper() == TradeType.SELL.name.upper():
                 sells.append(trade)
-                self.s_vol_base += Decimal(str(trade.amount)) * Decimal("-1")
-                self.s_vol_quote += Decimal(str(trade.amount)) * Decimal(str(trade.price))
+                self.s_vol_base += self._trade_decimal(trade, "amount") * Decimal("-1")
+                self.s_vol_quote += self._trade_decimal(trade, "amount") * self._trade_decimal(trade, "price")
 
             self.s_vol_quote += self._process_deducted_fees_impact_in_quote_vol(trade)
 
@@ -221,18 +243,23 @@ class PerformanceMetrics:
                 fee_percent = Decimal(trade.trade_fee.percent)
                 fee_type = trade.trade_fee.type_descriptor_for_json()
         if (fee_percent is not None) and (fee_type == DeductedFromReturnsTradeFee.type_descriptor_for_json()):
-            impact = Decimal(str(trade.amount)) * Decimal(str(trade.price)) * fee_percent * Decimal("-1")
+            impact = self._trade_decimal(trade, "amount") * self._trade_decimal(trade, "price") * fee_percent * Decimal("-1")
         return impact
 
     async def _calculate_fees(self, quote: str, trades: List[Any]):
+        fees_to_convert = defaultdict(lambda: s_decimal_0)
         for trade in trades:
+            recorded_fee = isinstance(trade, TradeFill) and trade.has_exact_receipt
+            if recorded_fee:
+                fee = trade.trade_fee_in_quote_decimal
+                self.fee_in_quote += fee if fee is not None else s_decimal_nan
             fee_percent = None
             trade_price = None
             trade_amount = None
             if self._is_trade_fill(trade):
                 if trade.trade_fee.get("percent") is not None:
-                    trade_price = Decimal(str(trade.price))
-                    trade_amount = Decimal(str(trade.amount))
+                    trade_price = self._trade_decimal(trade, "price")
+                    trade_amount = self._trade_decimal(trade, "amount")
                     fee_percent = Decimal(str(trade.trade_fee["percent"]))
                 flat_fees = [TokenAmount(token=flat_fee["token"], amount=Decimal(flat_fee["amount"]))
                              for flat_fee in trade.trade_fee.get("flat_fees", [])]
@@ -244,11 +271,16 @@ class PerformanceMetrics:
                 flat_fees = trade.trade_fee.flat_fees
 
             if fee_percent is not None:
-                self.fees[quote] += trade_price * trade_amount * fee_percent
+                percent_amount = trade_price * trade_amount * fee_percent
+                self.fees[quote] += percent_amount
+                if not recorded_fee:
+                    fees_to_convert[quote] += percent_amount
             for flat_fee in flat_fees:
                 self.fees[flat_fee.token] += flat_fee.amount
+                if not recorded_fee:
+                    fees_to_convert[flat_fee.token] += flat_fee.amount
 
-        for fee_token, fee_amount in self.fees.items():
+        for fee_token, fee_amount in fees_to_convert.items():
             if fee_token == quote:
                 self.fee_in_quote += fee_amount
             else:
@@ -307,10 +339,10 @@ class PerformanceMetrics:
         self.start_base_bal = self.cur_base_bal - self.tot_vol_base
         self.start_quote_bal = self.cur_quote_bal - self.tot_vol_quote
 
-        self.start_price = Decimal(str(trades[0].price))
+        self.start_price = self._trade_decimal(trades[0], "price")
         self.cur_price = await RateOracle.get_instance().stored_or_live_rate(trading_pair)
         if self.cur_price is None:
-            self.cur_price = Decimal(str(trades[-1].price))
+            self.cur_price = self._trade_decimal(trades[-1], "price")
         self.start_base_ratio_pct = self.divide(self.start_base_bal * self.start_price,
                                                 (self.start_base_bal * self.start_price) + self.start_quote_bal)
         self.cur_base_ratio_pct = self.divide(self.cur_base_bal * self.cur_price,

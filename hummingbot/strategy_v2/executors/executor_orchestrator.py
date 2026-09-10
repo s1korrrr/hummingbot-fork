@@ -644,145 +644,56 @@ class ExecutorOrchestrator:
         protected_position_scopes: Optional[Set[PositionScope]] = None,
     ):
         protected_position_scopes = protected_position_scopes or set()
-        if len(trade_fills) == 0:
+        controller_by_pair, _ = self._controller_ids_by_market_pair()
+        candidates = [fill for fill in trade_fills if not self._is_protected_position_scope(
+            protected_position_scopes, self._position_scope(
+                controller_by_pair.get((fill.market, fill.symbol)), fill.market, fill.symbol, None))]
+        if not candidates:
             return
-
-        controller_by_market_pair, ambiguous_market_pairs = self._controller_ids_by_market_pair()
-        if len(controller_by_market_pair) == 0 and len(ambiguous_market_pairs) == 0:
-            return
-
-        for connector_name, trading_pair in ambiguous_market_pairs:
-            self.logger().warning(
-                f"Skipping TradeFill recovery for {connector_name}.{trading_pair} due to ambiguous controller mapping"
-            )
-
-        aggregated_order_records: Dict[Tuple[str, str, str, Optional[TradeType], str], Dict[str, Any]] = {}
-        skipped_scopes: Set[Tuple[str, str]] = set()
-        for trade_fill in sorted(
-            trade_fills,
-            key=lambda fill: (
-                fill.timestamp,
-                fill.order_id,
-                fill.exchange_trade_id,
-            ),
-        ):
-            connector_name = trade_fill.market
-            trading_pair = trade_fill.symbol
-            market_pair = (connector_name, trading_pair)
-            controller_id = controller_by_market_pair.get(market_pair)
-            if controller_id is None:
-                continue
-            if controller_id in self.initial_positions_by_controller:
-                continue
-            if connector_name not in self.strategy.markets or trading_pair not in self.strategy.markets.get(connector_name, set()):
-                continue
-            if "_perpetual" in connector_name:
-                if market_pair not in skipped_scopes:
-                    self.logger().warning(
-                        f"Skipping TradeFill recovery for {connector_name}.{trading_pair} because perpetual fills "
-                        "need explicit position-side attribution"
-                    )
-                    skipped_scopes.add(market_pair)
-                continue
-
-            position_scope = self._position_scope(
-                controller_id=controller_id,
-                connector_name=connector_name,
-                trading_pair=trading_pair,
-                side=None,
-            )
-            if self._is_protected_position_scope(protected_position_scopes, position_scope):
-                continue
-
-            trade_type = str(trade_fill.trade_type or "").upper()
-            if trade_type not in {TradeType.BUY.name, TradeType.SELL.name}:
-                continue
-
-            aggregate_key = (
-                controller_id,
-                connector_name,
-                trading_pair,
-                None,
-                trade_fill.order_id,
-            )
-            aggregated = aggregated_order_records.setdefault(
-                aggregate_key,
-                {
-                    "client_order_id": trade_fill.order_id,
-                    "order_id": trade_fill.order_id,
-                    "exchange_order_id": trade_fill.order_id,
-                    "trade_type": trade_type,
-                    "order_fills": {},
-                    "price_quote_times_base": Decimal("0"),
-                    "executed_amount_base": Decimal("0"),
-                    "executed_amount_quote": Decimal("0"),
-                    "cumulative_fee_paid_quote": Decimal("0"),
-                    "amount": Decimal("0"),
-                    "last_update_timestamp": int(trade_fill.timestamp),
-                },
-            )
-            executed_amount_base = Decimal(str(trade_fill.amount or 0))
-            executed_amount_quote = Decimal(str(trade_fill.price or 0)) * executed_amount_base
-            aggregated["price_quote_times_base"] += executed_amount_quote
-            aggregated["executed_amount_base"] += executed_amount_base
-            aggregated["executed_amount_quote"] += executed_amount_quote
-            aggregated["cumulative_fee_paid_quote"] += Decimal(str(trade_fill.trade_fee_in_quote or 0))
-            aggregated["order_fills"][str(trade_fill.exchange_trade_id)] = {
-                "fill_base_amount": str(executed_amount_base), "fee": trade_fill.trade_fee or {}}
-            aggregated["amount"] += executed_amount_base
-            aggregated["last_update_timestamp"] = max(aggregated["last_update_timestamp"], int(trade_fill.timestamp))
-
-        restored_controller_ids: Set[str] = set()
-        for (controller_id, connector_name, trading_pair, position_side, _), order_record in aggregated_order_records.items():
-            if order_record["executed_amount_base"] <= Decimal("0"):
-                continue
-            order_record["price"] = (
-                order_record["price_quote_times_base"] / order_record["executed_amount_base"]
-            )
-            order_record.pop("price_quote_times_base", None)
-            self._apply_order_record_to_positions(
-                controller_id=controller_id,
-                connector_name=connector_name,
-                trading_pair=trading_pair,
-                position_side=position_side,
-                default_side=TradeType.BUY if order_record["trade_type"] == TradeType.BUY.name else TradeType.SELL,
-                order_record=order_record,
-            )
-            restored_controller_ids.add(controller_id)
-
-        for controller_id in restored_controller_ids:
-            self._prune_flat_positions(controller_id)
-            for position in self.positions_held.get(controller_id, []):
-                try:
-                    mid_price = self.strategy.market_data_provider.get_price_by_type(
-                        position.connector_name, position.trading_pair, PriceType.MidPrice
-                    )
-                except Exception:
-                    mid_price = Decimal("0")
-                position_summary = position.get_position_summary(mid_price or Decimal("0"))
-                self.logger().info(
-                    f"Recovered held position from TradeFill | controller={controller_id} "
-                    f"pair={position_summary.trading_pair} side={position_summary.side.name} "
-                    f"amount={position_summary.amount} breakeven={position_summary.breakeven_price}"
-                )
+        try:
+            _, positions = self._build_reconciled_positions_from_trade_fills(candidates, check_existing=False)
+        except RuntimeError as error:
+            self.logger().warning(str(error))
+            return  # Report refresh will retain the unavailable state and block new execution.
+        for (controller_id, connector, pair), position in positions.items():
+            for record in position._order_records.values():
+                self._apply_order_record_to_positions(
+                    controller_id, connector, pair, None, position.side,
+                    dict(record, executed_amount_base=record["gross_executed_amount_base"],
+                         executed_amount_quote=record["gross_executed_amount_quote"]))
 
     @staticmethod
     def _trade_fill_order_record(trade_fill: TradeFill) -> Dict[str, Any]:
-        executed_amount_base = Decimal(str(trade_fill.amount or 0))
-        executed_amount_quote = Decimal(str(trade_fill.price or 0)) * executed_amount_base
+        if trade_fill.has_exact_receipt is not True:
+            raise ValueError("Legacy TradeFill has no exact inventory receipt")
+        executed_amount_base = trade_fill.amount_decimal
+        price = trade_fill.price_decimal
+        quote_fee = trade_fill.trade_fee_in_quote_decimal
+        if any(Decimal(str(stored)) != Decimal(int(exact * 1000000)) / 1000000
+               for stored, exact in ((trade_fill.amount, executed_amount_base), (trade_fill.price, price))):
+            raise ValueError("Native encoding conflicts with exact receipt")
+        if quote_fee is None:
+            raise ValueError("Exact TradeFill quote fee is unavailable")
+        if (trade_fill.trade_fee_in_quote is None or
+                Decimal(str(trade_fill.trade_fee_in_quote)) != Decimal(int(quote_fee * 1000000)) / 1000000):
+            raise ValueError("Native quote fee encoding conflicts with exact receipt")
+        ExecutorOrchestrator._validate_reconciliation_fee(trade_fill.trade_fee)
+        executed_amount_quote = price * executed_amount_base
         client_order_id = f"{trade_fill.order_id}:{trade_fill.exchange_trade_id}"
         return {
             "client_order_id": client_order_id,
             "order_id": trade_fill.order_id,
             "exchange_order_id": trade_fill.order_id,
             "trade_type": str(trade_fill.trade_type or "").upper(),
-            "price": Decimal(str(trade_fill.price or 0)),
+            "price": price,
             "executed_amount_base": executed_amount_base,
             "executed_amount_quote": executed_amount_quote,
-            "cumulative_fee_paid_quote": Decimal(str(trade_fill.trade_fee_in_quote or 0)),
+            "cumulative_fee_paid_quote": quote_fee,
             "amount": executed_amount_base,
             "order_fills": {str(trade_fill.exchange_trade_id): {
-                "fill_base_amount": str(executed_amount_base), "fee": trade_fill.trade_fee or {}}},
+                "fill_base_amount": str(executed_amount_base), "fill_price": str(price),
+                "fill_quote_amount": str(executed_amount_quote), "fee": trade_fill.trade_fee,
+                "fee_in_quote": str(quote_fee)}},
             "last_update_timestamp": int(trade_fill.timestamp),
         }
 
@@ -806,53 +717,175 @@ class ExecutorOrchestrator:
                 owned.update(keys)
         return owned
 
+    @staticmethod
+    def _validate_reconciliation_fee(fee):
+        if not isinstance(fee, dict) or not {"percent", "flat_fees"} <= fee.keys():
+            raise ValueError("Fill fee receipt is incomplete")
+        percent = Decimal(str(fee["percent"]))
+        if not percent.is_finite() or percent != 0 or not isinstance(fee["flat_fees"], list):
+            raise ValueError("Exact actual-currency fill fees required")
+        for flat in fee["flat_fees"]:
+            if not isinstance(flat.get("token"), str) or not flat["token"] or not Decimal(str(flat["amount"])).is_finite():
+                raise ValueError("Invalid actual-currency fill fee")
+
+    @classmethod
+    def _corroborated_ledger_order(cls, entry, fills):
+        payload = entry.order_payload
+        required = {"client_order_id", "exchange_order_id", "trade_type", "executed_amount_base",
+                    "executed_amount_quote", "cumulative_fee_paid_quote", "order_fills"}
+        if not isinstance(payload, dict) or not required <= payload.keys():
+            raise ValueError("Exact ledger order receipt is incomplete")
+        if (payload["client_order_id"] != entry.client_order_id
+                or payload["exchange_order_id"] != entry.exchange_order_id
+                or payload["trade_type"] != entry.order_side):
+            raise ValueError("Ledger order identity conflict")
+        receipts = payload["order_fills"]
+        if not isinstance(receipts, dict) or not receipts or set(receipts) != {str(fill.exchange_trade_id) for fill in fills}:
+            raise ValueError("Ledger and native fill coverage differs")
+        base, quote = Decimal("0"), Decimal("0")
+        for fill in fills:
+            receipt = receipts[str(fill.exchange_trade_id)]
+            if any(receipt.get(field) != expected for field, expected in (
+                    ("trade_id", str(fill.exchange_trade_id)), ("client_order_id", entry.client_order_id),
+                    ("exchange_order_id", entry.exchange_order_id), ("trading_pair", entry.trading_pair))):
+                raise ValueError("Ledger fill identity conflict")
+            amount = Decimal(str(receipt["fill_base_amount"]))
+            price = Decimal(str(receipt["fill_price"]))
+            quote_amount = Decimal(str(receipt["fill_quote_amount"]))
+            if (not all(value.is_finite() and value > 0 for value in (amount, price, quote_amount))
+                    or amount * price != quote_amount or fill.trade_type != entry.order_side):
+                raise ValueError("Ledger fill amounts conflict")
+            cls._validate_reconciliation_fee(receipt["fee"])
+            if receipt["fee"] != fill.trade_fee:
+                raise ValueError("Native and ledger fill fee conflict")
+            for stored, exact in ((fill.amount, amount), (fill.price, price)):
+                if stored is None or Decimal(str(stored)) != Decimal(int(exact * 1000000)) / 1000000:
+                    raise ValueError("Native legacy encoding conflicts with exact ledger")
+            if fill.has_exact_receipt:
+                if fill.amount_decimal != amount or fill.price_decimal != price:
+                    raise ValueError("Native exact receipt conflicts with ledger")
+                # Validate optional exact quote-fee metadata without manufacturing missing valuation.
+                exact_fee = fill.trade_fee_in_quote_decimal
+                if exact_fee is not None and (fill.trade_fee_in_quote is None or
+                                              Decimal(str(fill.trade_fee_in_quote)) != Decimal(int(exact_fee * 1000000)) / 1000000):
+                    raise ValueError("Native quote fee encoding conflicts with exact receipt")
+            base += amount
+            quote += quote_amount
+        if base != Decimal(str(payload["executed_amount_base"])) or quote != Decimal(str(payload["executed_amount_quote"])):
+            raise ValueError("Ledger aggregate and fill totals conflict")
+        if "actual_base_fee" in payload and Decimal(str(payload["actual_base_fee"])) != base_fee_amount(
+                payload, entry.trading_pair.split("-")[0]):
+            raise ValueError("Explicit base fee conflicts with ledger fills")
+        return dict(payload)
+
     def _build_reconciled_positions_from_trade_fills(
         self,
         trade_fills: List[TradeFill],
+        ledger_entries=None,
+        *,
+        check_existing=True,
+        config_file_path=None,
     ) -> Tuple[Set[Tuple[str, str, str]], Dict[Tuple[str, str, str], PositionHold]]:
-        controller_by_market_pair, ambiguous_market_pairs = self._controller_ids_by_market_pair()
-        if len(controller_by_market_pair) == 0 and len(ambiguous_market_pairs) == 0:
-            return set(), {}
-
+        """Build atomically from exact receipts; legacy rows can only corroborate ledger truth."""
+        controller_by_pair, ambiguous = self._controller_ids_by_market_pair()
         owned_orders = self._executor_owned_order_keys()
-        positions_by_market_pair: Dict[Tuple[str, str, str], PositionHold] = {}
-        seen_market_pairs: Set[Tuple[str, str, str]] = set()
-        for trade_fill in sorted(
-            trade_fills,
-            key=lambda fill: (
-                fill.timestamp,
-                fill.order_id,
-                fill.exchange_trade_id,
-            ),
-        ):
-            connector_name = trade_fill.market
-            trading_pair = trade_fill.symbol
-            if (connector_name, trading_pair) in ambiguous_market_pairs:
-                continue
-            controller_id = controller_by_market_pair.get((connector_name, trading_pair))
-            if controller_id is None or controller_id in self.initial_positions_by_controller:
-                continue
-            if connector_name not in self.strategy.markets or trading_pair not in self.strategy.markets.get(connector_name, set()):
-                continue
-            if "_perpetual" in connector_name:
-                continue
-            key = (controller_id, connector_name, trading_pair)
-            seen_market_pairs.add(key)
-            if (connector_name, trading_pair, trade_fill.order_id) in owned_orders:
-                continue
-            order_record = self._trade_fill_order_record(trade_fill)
-            if order_record["trade_type"] not in {TradeType.BUY.name, TradeType.SELL.name}:
-                continue
-            key = (controller_id, connector_name, trading_pair)
-            seen_market_pairs.add(key)
-            position = positions_by_market_pair.get(key)
-            if position is None:
-                default_side = TradeType.BUY if order_record["trade_type"] == TradeType.BUY.name else TradeType.SELL
-                position = PositionHold(connector_name, trading_pair, default_side)
-                positions_by_market_pair[key] = position
-            position.add_order_record(order_record)
-
-        return seen_market_pairs, positions_by_market_pair
+        groups, ledger_by_order, positions = {}, {}, {}
+        try:
+            for fill in sorted(trade_fills, key=lambda fill: (fill.timestamp, fill.order_id, str(fill.exchange_trade_id))):
+                pair = (fill.market, fill.symbol)
+                if pair in ambiguous:
+                    raise ValueError("Ambiguous fill ownership")
+                controller = controller_by_pair.get(pair)
+                if (controller is None or controller in self.initial_positions_by_controller
+                        or "_perpetual" in fill.market or fill.symbol not in self.strategy.markets.get(fill.market, set())):
+                    continue
+                key = (controller, fill.market, fill.symbol, fill.order_id)
+                if (config_file_path is not None and fill.config_file_path != config_file_path
+                        or fill.base_asset != fill.symbol.split("-")[0]
+                        or fill.quote_asset != fill.symbol.split("-")[1]
+                        or fill.leverage != 1 or fill.position not in (None, "NIL")):
+                    raise ValueError("Native fill attribution conflicts with spot scope")
+                if not fill.order_id or not fill.exchange_trade_id or fill.trade_type not in {"BUY", "SELL"}:
+                    raise ValueError("Invalid native fill identity")
+                if (fill.market, fill.symbol, fill.order_id) in owned_orders:
+                    continue
+                group = groups.setdefault(key, {})
+                if group and any(existing.trade_type != fill.trade_type for existing in group.values()):
+                    raise ValueError("Native fills disagree on immutable order side")
+                identity = str(fill.exchange_trade_id)
+                if identity in group:
+                    raise ValueError("Duplicate native fill identity")
+                group[identity] = fill
+            for entry in ledger_entries or []:
+                pair = (entry.connector_name, entry.trading_pair)
+                controller = controller_by_pair.get(pair)
+                if (controller is None or controller in self.initial_positions_by_controller
+                        or "_perpetual" in entry.connector_name):
+                    continue
+                if controller != entry.controller_id or entry.position_side not in (None, "", "None"):
+                    raise ValueError("Ledger ownership conflict")
+                key = (controller, *pair, entry.client_order_id)
+                if (*pair, entry.client_order_id) in owned_orders:
+                    continue
+                if key in ledger_by_order:
+                    raise ValueError("Duplicate ledger order identity")
+                ledger_by_order[key] = entry
+            if not set(ledger_by_order) <= set(groups):
+                raise ValueError("Native fills omit exact ledger orders")
+            # Include flat histories: absence of a position summary is not proof of no prior fills.
+            for controller, held in (self.positions_held.items() if check_existing else []):
+                if controller in self.initial_positions_by_controller:
+                    continue
+                for position in held:
+                    if "_perpetual" in position.connector_name:
+                        continue
+                    if not position._order_records and self._position_hold_amount(position) != 0:
+                        raise ValueError("Stored position has no exact order history")
+                    for record in position._order_records.values():
+                        order_id = record.get("order_id") or record.get("client_order_id")
+                        if (position.connector_name, position.trading_pair, order_id) in owned_orders:
+                            continue
+                        key = (controller, position.connector_name, position.trading_pair, order_id)
+                        if key not in groups or not set(record.get("order_fills", {})) <= set(groups[key]):
+                            raise ValueError("Native fills omit existing exact held history")
+                        entry = ledger_by_order.get(key)
+                        if (entry is not None and set(record.get("order_fills", {})) == set(entry.order_payload["order_fills"])
+                                and Decimal(str(record["cumulative_fee_paid_quote"])) !=
+                                Decimal(str(entry.order_payload["cumulative_fee_paid_quote"]))):
+                            raise ValueError("Existing exact ledger quote fee changed under the same fill coverage")
+                        for trade_id, previous in record.get("order_fills", {}).items():
+                            fill = groups[key][trade_id]
+                            entry = ledger_by_order.get(key)
+                            current = (entry.order_payload["order_fills"][trade_id] if entry is not None else
+                                       self._trade_fill_order_record(fill)["order_fills"][trade_id])
+                            if "fee_in_quote" in previous and Decimal(str(previous["fee_in_quote"])) != fill.trade_fee_in_quote_decimal:
+                                raise ValueError("Existing exact quote fee changed under the same identity")
+                            if (record["trade_type"] != fill.trade_type or previous.get("fee") != current.get("fee")
+                                    or any(Decimal(str(previous[field])) != Decimal(str(current[field])) for field in
+                                           ("fill_base_amount", "fill_price", "fill_quote_amount"))):
+                                raise ValueError("Existing exact fill changed under the same identity")
+            replay = []
+            for key, native in groups.items():
+                entry = ledger_by_order.get(key)
+                fills = list(native.values())
+                if entry is not None:
+                    replay.append((entry.timestamp, entry.client_order_id, "", key[:3],
+                                   self._corroborated_ledger_order(entry, fills)))
+                else:
+                    for fill in fills:
+                        replay.append((fill.timestamp, fill.order_id, str(fill.exchange_trade_id), key[:3],
+                                       self._trade_fill_order_record(fill)))
+            # Replay ledger orders in the recorder's authoritative timestamp/client-ID order.
+            # Native fills for other orders retain their own event sequence, including interleaving.
+            for _, _, _, key, record in sorted(replay, key=lambda item: item[:3]):
+                controller, connector, pair = key
+                position = positions.setdefault(key, PositionHold(connector, pair, TradeType.BUY))
+                position.add_order_record(record)
+            if any(position.buy_amount_base < position.sell_amount_base for position in positions.values()):
+                raise ValueError("Spot fill history produces unowned negative inventory")
+        except (ValueError, TypeError, KeyError, ArithmeticError) as error:
+            raise RuntimeError(f"Held inventory reconciliation unavailable: {error}") from error
+        return set(positions), positions
 
     def _reconcile_positions_from_trade_fills(self):
         try:
@@ -865,11 +898,10 @@ class ExecutorOrchestrator:
         try:
             trade_fills = markets_recorder.get_trades_for_config(config_file_path)
         except Exception as e:
-            self.logger().warning(f"Failed to reconcile positions from TradeFill: {e}")
-            return
-        if len(trade_fills) == 0:
-            return
-        seen_market_pairs, reconciled_positions = self._build_reconciled_positions_from_trade_fills(trade_fills)
+            raise RuntimeError("Held inventory reconciliation unavailable: native fill read failed") from e
+        ledger_entries = markets_recorder.get_all_position_hold_ledger_entries()
+        seen_market_pairs, reconciled_positions = self._build_reconciled_positions_from_trade_fills(
+            trade_fills, ledger_entries, config_file_path=config_file_path)
         for controller_id, connector_name, trading_pair in seen_market_pairs:
             positions = self.positions_held.setdefault(controller_id, [])
             existing_position = self._find_existing_position(

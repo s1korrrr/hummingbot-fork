@@ -23,6 +23,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
+from types import SimpleNamespace
 from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
@@ -38,6 +39,7 @@ from hummingbot.strategy_v2.controllers.directional_trading_controller_base impo
     DirectionalTradingControllerBase,
     DirectionalTradingControllerConfigBase,
 )
+from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
     ExecutionStrategy,
     LimitChaserConfig,
@@ -518,6 +520,9 @@ class HLRSIController(DirectionalTradingControllerBase):
         self._consecutive_losses: int = 0
         self._last_loss_timestamp: Optional[float] = None
         self._tracked_executor_result_ids: set = set()
+        self._unresolved_executor_result_ids: set = set()
+        self._accounted_executor_results: dict = {}
+        self._executor_result_baseline = None
         self._operator_entry_paused: bool = False
         self._operator_pause_reason: Optional[str] = None
         self._operator_pause_scope: Optional[str] = None
@@ -2317,6 +2322,8 @@ class HLRSIController(DirectionalTradingControllerBase):
     # -----------------------------------------------------------------------
 
     def _check_consecutive_loss_pause(self) -> bool:
+        if self._unresolved_executor_result_ids:
+            return True
         max_losses = self.config.max_consecutive_losses
         if max_losses <= 0:
             return False
@@ -2332,6 +2339,102 @@ class HLRSIController(DirectionalTradingControllerBase):
                     self._last_loss_timestamp = None
         return False
 
+    def _held_position_realized_pnl(self, executor) -> Optional[Decimal]:
+        """Match persisted fills, allocating fees only to the realized inventory share."""
+        custom = executor.custom_info or {}
+        orders = custom.get("held_position_orders") or []
+        if not orders and Decimal(str(custom.get("close_order_filled_amount_base", 0))) > 0:
+            raise ValueError("Held closure is missing its fill receipts")
+        records = {}
+        base_asset = self.config.trading_pair.split("-")[0]
+        for order in orders:
+            order_id = order.get("client_order_id") or order.get("order_id")
+            side = order.get("trade_type")
+            if not order_id or side not in ("BUY", "SELL"):
+                raise ValueError("Held fill requires an order identity and side")
+            base = Decimal(str(order["executed_amount_base"]))
+            quote = Decimal(str(order["executed_amount_quote"]))
+            fees = Decimal(str(order["cumulative_fee_paid_quote"]))
+            explicit_base_fee = "actual_base_fee" in order
+            if not base.is_finite() or not quote.is_finite() or base < 0 or (base > 0 and quote <= 0):
+                raise ValueError("Executed held quantity requires a positive finite quote cost")
+            fills = order.get("order_fills") or {}
+            if base > 0 and not fills and not explicit_base_fee:
+                raise ValueError("Held fill is missing asset-fee evidence")
+            fill_base = Decimal(0)
+            fill_quote = Decimal(0)
+            complete_quote_receipts = bool(fills)
+            for fill in fills.values():
+                amount = Decimal(str(fill["fill_base_amount"]))
+                if not amount.is_finite() or amount <= 0:
+                    raise ValueError("Invalid executed held fill quantity")
+                fill_base += amount
+                for field in ("fill_price", "fill_quote_amount"):
+                    if field in fill:
+                        value = Decimal(str(fill[field]))
+                        if not value.is_finite() or value <= 0:
+                            raise ValueError(f"Invalid executed held {field}")
+                if "fill_quote_amount" in fill:
+                    fill_quote += Decimal(str(fill["fill_quote_amount"]))
+                else:
+                    complete_quote_receipts = False
+            if fills and fill_base != base:
+                raise ValueError("Held fill quantities do not reconcile with the order")
+            if complete_quote_receipts and fill_quote != quote:
+                raise ValueError("Held fill quote costs do not reconcile with the order")
+            base_fee = (Decimal(str(order["actual_base_fee"])) if explicit_base_fee
+                        else base_fee_amount(order, base_asset))
+            if (not all(value.is_finite() for value in (base, quote, fees, base_fee))
+                    or base < 0 or quote < 0 or (explicit_base_fee and base_fee < 0)):
+                raise ValueError("Invalid held fill amounts")
+            previous = records.get(order_id)
+            if previous is not None:
+                if previous[0] != side:
+                    raise ValueError("Held fill order changed side")
+                if previous[1] > base:
+                    continue
+            gross_base = base
+            if base > 0:
+                direction = Decimal(1) if side == "BUY" else Decimal(-1)
+                if not explicit_base_fee:
+                    # Match the held ledger: converted base fees are charged through fees.
+                    quote -= direction * base_fee * quote / base
+                base -= direction * base_fee
+            if base < 0 or (base == 0 and (quote != 0 or fees != 0)):
+                raise ValueError("Held fill has cost without acquired inventory")
+            records[order_id] = (side, gross_base, base, quote, fees)
+        totals = {side: [Decimal(0), Decimal(0), Decimal(0)] for side in ("BUY", "SELL")}
+        for side, _, base, quote, fees in records.values():
+            totals[side][0] += base
+            totals[side][1] += quote
+            totals[side][2] += fees
+        side = getattr(executor, "side", None) or custom.get("side", TradeType.BUY)
+        entry_side = TradeType(side).name if not isinstance(side, str) else side
+        if entry_side not in ("BUY", "SELL"):
+            raise ValueError("Invalid held executor side")
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+        declared_close = Decimal(str(custom.get("close_order_filled_amount_base", 0)))
+        if not declared_close.is_finite() or declared_close < 0:
+            raise ValueError("Invalid held close quantity")
+        receipt_close = sum((record[1] for record in records.values() if record[0] == exit_side), Decimal(0))
+        if "close_order_filled_amount_base" in custom and receipt_close != declared_close:
+            raise ValueError("Held close quantity does not reconcile with fill receipts")
+        if receipt_close > 0 and (totals[entry_side][0] <= 0 or totals[exit_side][0] > totals[entry_side][0]):
+            raise ValueError("Held close has no sufficient matching entry basis")
+        if "open_order_filled_amount_base" in custom:
+            declared_open = Decimal(str(custom["open_order_filled_amount_base"]))
+            receipt_open = (totals[entry_side][0] if entry_side == "BUY" else
+                            sum((record[1] for record in records.values() if record[0] == entry_side), Decimal(0)))
+            if not declared_open.is_finite() or declared_open != receipt_open:
+                raise ValueError("Held entry quantity does not reconcile with fill receipts")
+        buy_base, buy_quote, buy_fees = totals["BUY"]
+        sell_base, sell_quote, sell_fees = totals["SELL"]
+        matched = min(buy_base, sell_base)
+        if matched == 0:
+            return None  # A pure inventory transfer has no realized trade result.
+        return ((sell_quote - sell_fees) * (matched / sell_base)
+                - (buy_quote + buy_fees) * (matched / buy_base))
+
     def _ingest_closed_executor_results(self, executor_infos=None):
         results = self.executors_info if executor_infos is None else executor_infos
         for executor in sorted(results, key=lambda item: getattr(item, "close_timestamp", None) or item.timestamp):
@@ -2340,19 +2443,62 @@ class HLRSIController(DirectionalTradingControllerBase):
             executor_id = getattr(executor, "id", None)
             if executor_id is None or executor_id in self._tracked_executor_result_ids:
                 continue
-            if getattr(executor, "close_type", None) != CloseType.POSITION_HOLD:
-                self._track_executor_result(executor)
+            if getattr(executor, "close_type", None) == CloseType.POSITION_HOLD:
+                try:
+                    realized_pnl = self._held_position_realized_pnl(executor)
+                except (ValueError, TypeError, KeyError, AttributeError, InvalidOperation) as error:
+                    if executor_id not in self._unresolved_executor_result_ids:
+                        self.logger().error(f"Cannot account for held executor {executor_id}; new buys paused: {error}")
+                    self._unresolved_executor_result_ids.add(executor_id)
+                    continue
+                self._unresolved_executor_result_ids.discard(executor_id)
+                if realized_pnl is not None:
+                    self._record_executor_result(executor, realized_pnl)
+            else:
+                self._record_executor_result(executor)
             self._tracked_executor_result_ids.add(executor_id)
+
+    def _record_executor_result(self, executor, realized_pnl: Optional[Decimal] = None):
+        result = realized_pnl if realized_pnl is not None else getattr(executor, "net_pnl_quote", None)
+        if result is None:
+            return
+        try:
+            result = Decimal(str(result))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+        if not result.is_finite():
+            return
+        timestamp = getattr(executor, "close_timestamp", None) or executor.timestamp
+        key = (timestamp, executor.id)
+        out_of_order = any(key < (when, result_id) for result_id, (when, _) in self._accounted_executor_results.items())
+        if self._executor_result_baseline is None:
+            self._executor_result_baseline = (self._consecutive_losses, self._last_loss_timestamp)
+        self._accounted_executor_results[executor.id] = (timestamp, result)
+        if not out_of_order:
+            self._track_executor_result(executor, result)
+            return
+        # A repaired older receipt must be applied before already accepted later results.
+        self._consecutive_losses, self._last_loss_timestamp = self._executor_result_baseline
+        ordered = sorted(self._accounted_executor_results.items(), key=lambda item: (item[1][0], item[0]))
+        for _, (when, pnl) in ordered:
+            if (self.config.max_consecutive_losses > 0
+                    and self._consecutive_losses >= self.config.max_consecutive_losses
+                    and self._last_loss_timestamp is not None
+                    and when - self._last_loss_timestamp >= self.config.consecutive_loss_cooldown):
+                self._consecutive_losses = 0
+                self._last_loss_timestamp = None
+            self._track_executor_result(SimpleNamespace(close_timestamp=when), pnl)
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         self._ingest_closed_executor_results()
         return super().determine_executor_actions()
 
-    def _track_executor_result(self, executor) -> None:
-        if not hasattr(executor, "net_pnl_quote") or executor.net_pnl_quote is None:
+    def _track_executor_result(self, executor, realized_pnl: Optional[Decimal] = None) -> None:
+        result = realized_pnl if realized_pnl is not None else getattr(executor, "net_pnl_quote", None)
+        if result is None:
             return
         try:
-            net_pnl_quote = Decimal(str(executor.net_pnl_quote))
+            net_pnl_quote = Decimal(str(result))
         except (InvalidOperation, TypeError, ValueError):
             return
         if net_pnl_quote < Decimal("0"):

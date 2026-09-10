@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -156,6 +157,9 @@ class PositionExecutor(ExecutorBase):
         self.trading_rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
 
         # Order tracking
+        self._open_order_entry_expired = False
+        self._open_order_expiry_reconciled = False
+        self._entry_expiry_reconciliation_task: Optional[asyncio.Task] = None
         self._open_order: Optional[TrackedOrder] = None
         self._close_order: Optional[TrackedOrder] = None
         self._take_profit_limit_order: Optional[TrackedOrder] = None
@@ -241,7 +245,7 @@ class PositionExecutor(ExecutorBase):
             )
         except Exception:
             pass
-        if capped_amount < close_amount:
+        if available_base < close_amount:
             self.logger().warning(
                 self._log_message(
                     f"Capping close order amount to available base balance "
@@ -249,6 +253,9 @@ class PositionExecutor(ExecutorBase):
                     f"order_amount={capped_amount}"
                 )
             )
+        elif capped_amount < close_amount:
+            self.logger().debug(self._log_message(
+                f"Quantizing close order amount amount_to_close={close_amount} order_amount={capped_amount}"))
         return capped_amount
 
     @property
@@ -534,7 +541,10 @@ class PositionExecutor(ExecutorBase):
         """
         if self.status == RunnableStatus.RUNNING:
             self.control_open_order()
-            self.control_barriers()
+            await self._reconcile_expired_entry()
+            if self.status == RunnableStatus.RUNNING and (
+                    not self._open_order_entry_expired or self.open_filled_amount > Decimal("0")):
+                self.control_barriers()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
         self.evaluate_max_retries()
@@ -558,6 +568,14 @@ class PositionExecutor(ExecutorBase):
         """
         if self.close_timestamp is None:
             self.close_timestamp = self._strategy.current_timestamp
+        await self._reconcile_expired_entry()
+        if (self._open_order_entry_expired and not self._open_order_expiry_reconciled
+                and self.open_filled_amount == Decimal("0")):
+            # An early-stop request changes exit intent, not proof that entry fills
+            # are absent. Keep the executor pending for strict shutdown/restart.
+            self.cancel_open_orders()
+            await self._sleep(1.0)
+            return
         entry_done = not self._open_order or self._open_order.is_done
         tp_done = not self._take_profit_limit_order or self._take_profit_limit_order.is_done
         if not entry_done or not tp_done:
@@ -642,7 +660,9 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
-        if self._current_retries > self._max_retries and self.open_filled_amount == Decimal("0") and self.all_orders_completed():
+        if (self._current_retries > self._max_retries and self.open_filled_amount == Decimal("0")
+                and self.all_orders_completed()
+                and (not self._open_order_entry_expired or self._open_order_expiry_reconciled)):
             self.close_type = CloseType.FAILED
             self.stop()
 
@@ -665,6 +685,10 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._open_order_entry_expired:
+            if self._open_order and self._open_order.order and self._open_order.order.is_open:
+                self.cancel_open_order()
+            return
         if not self._open_order:
             if self._is_within_activation_bounds(self.config.entry_price, self.config.side,
                                                  self.config.triple_barrier_config.open_order_type):
@@ -679,15 +703,76 @@ class PositionExecutor(ExecutorBase):
                         f"filled_amount={self.open_filled_amount}"
                     )
                 )
+                self._open_order_entry_expired = True
                 self.cancel_open_order()
-                self.close_type = CloseType.EXPIRED
-                self.close_timestamp = self._strategy.current_timestamp
-                self._status = RunnableStatus.SHUTTING_DOWN
                 return
             if self._open_order.order and not self._open_order.is_filled and \
                     not self._is_within_activation_bounds(self.config.entry_price, self.config.side,
                                                           self.config.triple_barrier_config.open_order_type):
                 self.cancel_open_order()
+
+    def _cancel_entry_expiry_reconciliation(self):
+        task = self._entry_expiry_reconciliation_task
+        self._entry_expiry_reconciliation_task = None
+        if task is not None:
+            if task.done():
+                if not task.cancelled():
+                    task.exception()  # Consume any obsolete result after a fill or stop.
+            else:
+                task.cancel()
+
+    def stop(self):
+        self._cancel_entry_expiry_reconciliation()
+        super().stop()
+
+    async def _reconcile_expired_entry(self):
+        if not self._open_order_entry_expired or self._open_order_expiry_reconciled:
+            return
+        # A fill can arrive while REST is pending. Never block its exit barriers.
+        if self.open_filled_amount > Decimal("0"):
+            self._cancel_entry_expiry_reconciliation()
+            return
+        task = self._entry_expiry_reconciliation_task
+        if task is None:
+            orders = self._entry_orders()
+            if orders and all(tracked.is_done for tracked in orders):
+                self._entry_expiry_reconciliation_task = asyncio.create_task(
+                    self._request_expired_entry_reconciliation(orders))
+            return
+        if not task.done():
+            return
+        self._entry_expiry_reconciliation_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self.logger().warning(self._log_message(
+                f"Expired entry reconciliation pending; retaining ownership: {type(exc).__name__}: {exc}"))
+            return
+        self._open_order_expiry_reconciled = True
+        if self.status == RunnableStatus.RUNNING and self.open_filled_amount == Decimal("0"):
+            self.close_type = CloseType.EXPIRED
+            self.close_timestamp = self._strategy.current_timestamp
+            self.stop()
+
+    async def _request_expired_entry_reconciliation(self, orders: List[TrackedOrder]):
+        connector = self.connectors[self.config.connector_name]
+        # A generic terminal OrderUpdate does not prove that all fills arrived.
+        # Opt-in connectors must reconcile authoritative cumulative fill totals.
+        if getattr(connector, "supports_terminal_fill_reconciliation", False) is not True:
+            raise ValueError("Connector does not support authoritative terminal fill reconciliation")
+        for tracked in orders:
+            order = tracked.order
+            if order is None or order.exchange_order_id is None:
+                raise ValueError("Expired entry order identity is unavailable")
+            update = await asyncio.wait_for(connector._request_order_status(tracked_order=order), timeout=10.0)
+            if (not isinstance(update, OrderUpdate)
+                    or update.new_state not in {OrderState.CANCELED, OrderState.FILLED}
+                    or update.client_order_id != order.client_order_id
+                    or update.exchange_order_id != order.exchange_order_id):
+                raise ValueError("Expired entry terminal order state is unavailable or mismatched")
+            self.update_tracked_orders_with_order_id(order.client_order_id)
 
     def _is_within_activation_bounds(self, order_price: Decimal, side: TradeType, order_type: OrderType) -> bool:
         """
@@ -1006,6 +1091,10 @@ class PositionExecutor(ExecutorBase):
             self._failed_orders.append(self._open_order)
             self._completed_open_orders.append(self._open_order)
             self._open_order = None
+            if self._open_order_entry_expired:
+                self.logger().warning(self._log_message(
+                    f"Expired entry failed order_id={event.order_id}; retaining ownership pending reconciliation"))
+                return
             if self._is_permanent_validation_failure(event):
                 self.logger().error(
                     self._log_message(
@@ -1086,6 +1175,8 @@ class PositionExecutor(ExecutorBase):
             "open_order_type": self.config.triple_barrier_config.open_order_type.name,
             "open_order_limit_max_age_seconds": self.config.triple_barrier_config.open_order_limit_max_age_seconds,
             "open_order_age_seconds": self._open_order_age_seconds(),
+            "open_order_entry_expired": self._open_order_entry_expired,
+            "open_order_expiry_reconciled": self._open_order_expiry_reconciled,
             "open_order_filled_amount_base": self.open_filled_amount,
             "open_order_filled_amount_quote": self.open_filled_amount_quote,
             "order_ids": [order.order_id for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()])],

@@ -33,8 +33,10 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo, Performan
 
 class TestExecutorOrchestrator(unittest.TestCase):
 
-    @patch.object(MarketsRecorder, "get_instance")
-    def setUp(self, markets_recorder: MagicMock):
+    def setUp(self):
+        recorder_patch = patch.object(MarketsRecorder, "get_instance")
+        markets_recorder = recorder_patch.start()
+        self.addCleanup(recorder_patch.stop)
         markets_recorder.return_value = MagicMock(spec=MarketsRecorder)
         markets_recorder.return_value.get_all_executors = MagicMock(return_value=[])
         markets_recorder.return_value.get_all_positions = MagicMock(return_value=[])
@@ -650,8 +652,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
             price=Decimal("100"),
             amount=Decimal("0.4"),
             leverage=1,
-            trade_fee={},
+            trade_fee={"percent": "0", "flat_fees": []},
             trade_fee_in_quote=Decimal("0.4"),
+            exact_amount="0.4", exact_price="100",
+            exact_trade_fee_in_quote="0.4", exact_receipt_source="order_filled_event_v1",
             exchange_trade_id="buy-fill-1",
             position="NIL",
         )
@@ -669,8 +673,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
             price=Decimal("100"),
             amount=Decimal("0.6"),
             leverage=1,
-            trade_fee={},
+            trade_fee={"percent": "0", "flat_fees": []},
             trade_fee_in_quote=Decimal("0.6"),
+            exact_amount="0.6", exact_price="100",
+            exact_trade_fee_in_quote="0.6", exact_receipt_source="order_filled_event_v1",
             exchange_trade_id="buy-fill-2",
             position="NIL",
         )
@@ -688,8 +694,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
             price=Decimal("120"),
             amount=Decimal("0.4"),
             leverage=1,
-            trade_fee={},
+            trade_fee={"percent": "0", "flat_fees": []},
             trade_fee_in_quote=Decimal("0.5"),
+            exact_amount="0.4", exact_price="120",
+            exact_trade_fee_in_quote="0.5", exact_receipt_source="order_filled_event_v1",
             exchange_trade_id="sell-fill-1",
             position="NIL",
         )
@@ -787,8 +795,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
             price=Decimal("80000"),
             amount=Decimal("0.00985"),
             leverage=1,
-            trade_fee={},
+            trade_fee={"percent": "0", "flat_fees": []},
             trade_fee_in_quote=Decimal("0.8"),
+            exact_amount="0.00985", exact_price="80000",
+            exact_trade_fee_in_quote="0.8", exact_receipt_source="order_filled_event_v1",
             exchange_trade_id="live-buy-fill",
             position="NIL",
         )
@@ -838,8 +848,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
                 price=Decimal("80000"),
                 amount=Decimal("0.00985"),
                 leverage=1,
-                trade_fee={},
+                trade_fee={"percent": "0", "flat_fees": []},
                 trade_fee_in_quote=Decimal("0.8"),
+                exact_amount="0.00985", exact_price="80000",
+                exact_trade_fee_in_quote="0.8", exact_receipt_source="order_filled_event_v1",
                 exchange_trade_id="historical-buy-fill",
                 position="NIL",
             )
@@ -1240,6 +1252,8 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(btc_position.sell_amount_quote, Decimal("0.1") * Decimal("230"))  # Now calculated
         self.assertEqual(btc_summary.breakeven_price, Decimal("230"))
 
+    # This fixture exercises aggregation; exact receipt reconciliation has its own public-path tests.
+    @patch.object(ExecutorOrchestrator, "_reconcile_positions_from_trade_fills", lambda self: None)
     def test_get_all_reports_with_done_position_hold_executors(self):
         """Test get_all_reports with executors that need position updates"""
         # This tests the high-level functionality that exercises lines 413,415,423-424,426,428-430,433,436,438-439,442,447-448
@@ -1338,7 +1352,8 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.orchestrator.executors_ids_position_held = []
         self.orchestrator.cached_performance = {"test_controller": PerformanceReport()}
 
-        self.orchestrator.get_all_reports()
+        with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            self.orchestrator.get_all_reports()
 
         markets_recorder_mock.return_value.store_or_update_position_hold_ledger_entries.assert_called_once()
 
@@ -1396,6 +1411,8 @@ class TestExecutorOrchestrator(unittest.TestCase):
         position = self.orchestrator.positions_held["perp_controller"][0]
         self.assertEqual(position.side, TradeType.SELL)  # Opposite of BUY due to CLOSE action
 
+    # This fixture exercises aggregation; exact receipt reconciliation has its own public-path tests.
+    @patch.object(ExecutorOrchestrator, "_reconcile_positions_from_trade_fills", lambda self: None)
     def test_get_all_reports_with_existing_positions(self):
         """Test get_all_reports with existing positions to exercise find_existing_position logic"""
         # This tests lines 475-476,480-482,485,487 through high-level functionality
@@ -1451,6 +1468,8 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(len(positions_in_report), 1)
         self.assertEqual(positions_in_report[0].amount, Decimal("5"))
 
+    # This fixture exercises aggregation; exact receipt reconciliation has its own public-path tests.
+    @patch.object(ExecutorOrchestrator, "_reconcile_positions_from_trade_fills", lambda self: None)
     def test_get_all_reports_comprehensive_controller_aggregation(self):
         """Test get_all_reports aggregating controllers from different sources"""
         # This tests lines 545,548-549,552,557 comprehensively

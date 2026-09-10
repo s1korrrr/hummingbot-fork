@@ -1,15 +1,14 @@
 import logging
+import sqlite3
+from contextlib import closing
 from inspect import getmembers, isabstract, isclass
-from pathlib import Path
-from shutil import copyfile, move
 
 import pandas as pd
 from sqlalchemy.exc import SQLAlchemyError
 
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.model.db_migration.base_transformation import DatabaseTransformation
-from hummingbot.model.metadata import Metadata as LocalMetadata
-from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+from hummingbot.model.sql_connection_manager import SQLConnectionManager
 
 
 class Migrator:
@@ -25,56 +24,40 @@ class Migrator:
         self.transformations = [t(self) for t in self._get_transformations()]
 
     def migrate_db_to_version(self, client_config_map: ClientConfigAdapter, db_handle, from_version, to_version):
-        original_db_path = db_handle.db_path
-        original_db_name = Path(original_db_path).stem
-        backup_db_path = original_db_path + '.backup_' + pd.Timestamp.utcnow().strftime("%Y%m%d-%H%M%S")
-        new_db_path = original_db_path + '.new'
-        copyfile(original_db_path, new_db_path)
-        copyfile(original_db_path, backup_db_path)
-
-        db_handle.engine.dispose()
-        new_db_handle = SQLConnectionManager(
-            client_config_map, SQLConnectionType.TRADE_FILLS, new_db_path, original_db_name, True
-        )
-
-        relevant_transformations = [t for t in self.transformations
-                                    if t.does_apply_to_version(from_version, to_version)]
-        if relevant_transformations:
-            logging.getLogger().info(
-                f"Will run DB migration from {from_version} to {to_version}")
-
-        migration_successful = False
+        transformations = sorted(t for t in self.transformations
+                                 if t.does_apply_to_version(from_version, to_version))
+        if db_handle.engine.dialect.name != "sqlite" or any(
+                not callable(getattr(t, "apply_sqlite_transaction", None)) for t in transformations):
+            raise RuntimeError("Automatic database migration requires supported transactional transformations; "
+                               "legacy copy/swap migration is disabled")
+        backup_db_path = db_handle.db_path + '.backup_' + pd.Timestamp.now("UTC").strftime("%Y%m%d-%H%M%S-%f")
         try:
-            for transformation in sorted(relevant_transformations):
-                logging.getLogger().info(f"Applying {transformation.name} to DB...")
-                new_db_handle = transformation.apply(new_db_handle)
-                logging.getLogger().info(f"DONE with {transformation.name}")
-            with new_db_handle.get_new_session() as session:
-                with session.begin():
-                    local_db_version = new_db_handle.get_local_db_version(session=session)
-                    if local_db_version is None:
-                        session.add(LocalMetadata(
-                            key=SQLConnectionManager.LOCAL_DB_VERSION_KEY,
-                            value=str(to_version),
-                        ))
-                    else:
-                        local_db_version.value = str(to_version)
-            migration_successful = True
-        except SQLAlchemyError:
-            logging.getLogger().error("Unexpected error while checking and upgrading the local database.",
-                                      exc_info=True)
-        finally:
-            try:
-                new_db_handle.engine.dispose()
-                if migration_successful:
-                    move(new_db_path, original_db_path)
-                db_handle.__init__(
-                    client_config_map,
-                    SQLConnectionType.TRADE_FILLS,
-                    db_path=original_db_path,
-                    called_from_migrator=True,
+            with db_handle.engine.connect() as connection:
+                # Reserve the writer before snapshotting. Other writers wait and then write to the same file.
+                # Explicit BEGIN also makes SQLite DDL participate in rollback alongside the version update.
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                current = connection.exec_driver_sql(
+                    'SELECT value FROM "Metadata" WHERE key = ?',
+                    (SQLConnectionManager.LOCAL_DB_VERSION_KEY,),
+                ).scalar_one_or_none()
+                if current == str(to_version):
+                    connection.rollback()
+                    return True
+                if current != str(from_version):
+                    raise RuntimeError("Database version changed before transactional migration")
+                with closing(sqlite3.connect(db_handle.db_path, timeout=2)) as source:
+                    with closing(sqlite3.connect(backup_db_path)) as backup:
+                        source.backup(backup)
+                for transformation in transformations:
+                    logging.getLogger().info(f"Applying {transformation.name} transactionally...")
+                    transformation.apply_sqlite_transaction(connection)
+                connection.exec_driver_sql(
+                    'UPDATE "Metadata" SET value = ? WHERE key = ?',
+                    (str(to_version), SQLConnectionManager.LOCAL_DB_VERSION_KEY),
                 )
-            except Exception as e:
-                logging.getLogger().error(f"Fatal error migrating DB {original_db_path}")
-                raise e
-        return migration_successful
+                connection.commit()
+        except SQLAlchemyError:
+            logging.getLogger().error("Database migration rolled back; schema and version were not advanced.",
+                                      exc_info=True)
+            return False
+        return True

@@ -858,6 +858,8 @@ class RemoteIfaceMQTTTests(TestCase):
 
         handler = MQTTLogHandler(self.hbapp, self.gateway)
         handler.emit(logging.LogRecord('', 1, '', '', '', '', ''))
+        handler._pending.join()
+        handler.close()
         self.assertTrue(1)
 
         logger = HummingbotLogger('testlogger')
@@ -1030,6 +1032,8 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
         handler.log_pub.publish = MagicMock(side_effect=ConnectionError("offline"))
 
         handler.emit(logging.LogRecord('', 1, '', '', '', '', ''))
+        handler._pending.join()
+        handler.close()
 
         self.assertEqual(1, handler.dropped_log_count)
 
@@ -1151,7 +1155,7 @@ class MQTTGatewayRuntimeBoundaryTests(TestCase):
         self.assertEqual("new-params", gateway._conn_params)
         self.assertTrue(gateway.health)
         self.assertFalse(gateway._restarting)
-        logger.warning.assert_any_call("MQTT Gateway successfully reconnected.")
+        logger.info.assert_any_call("MQTT Gateway successfully reconnected.")
 
     def test_mqtt_gateway_reconnect_uses_trading_core_strategy(self):
         gateway = object.__new__(MQTTGateway)

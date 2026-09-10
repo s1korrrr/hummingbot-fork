@@ -786,6 +786,76 @@ class StrategyV2Base(StrategyPyBase):
         except Exception as e:
             self.logger().warning(f"Failed to write runtime status snapshot: {e}")
 
+    def _runtime_reconciliation_observation(self) -> Dict[str, Any]:
+        """Known owner records only; an empty partial view cannot prove clearance."""
+        pending = {}
+        complete_view = True
+
+        def add(controller_id, executor_id, reason):
+            nonlocal complete_view
+            if not isinstance(controller_id, str) or not isinstance(executor_id, str) or not executor_id:
+                complete_view = False
+                return
+            pending.setdefault((controller_id, executor_id), set()).add(reason)
+
+        orchestrator = getattr(self, "executor_orchestrator", None)
+        recovery = getattr(orchestrator, "recovery_required", None)
+        active = getattr(orchestrator, "active_executors", None)
+        if isinstance(recovery, dict):
+            for controller_id, ids in recovery.items():
+                if not isinstance(ids, (list, tuple, set)):
+                    complete_view = False
+                    continue
+                for executor_id in ids:
+                    add(controller_id, executor_id, "startup_recovery")
+        else:
+            complete_view = False
+        if isinstance(active, dict):
+            for controller_id, executors in active.items():
+                if not isinstance(executors, (list, tuple)):
+                    complete_view = False
+                    continue
+                for executor in executors:
+                    if (getattr(executor, "_open_order_entry_expired", False) is True
+                            and getattr(executor, "_open_order_expiry_reconciled", None) is False):
+                        try:
+                            if executor.open_filled_amount == Decimal("0"):
+                                add(controller_id, executor.config.id, "expired_entry_terminal_fill_proof")
+                        except (ArithmeticError, AttributeError, TypeError, ValueError):
+                            complete_view = False
+        else:
+            complete_view = False
+        for controller_id, controller in self.controllers.items():
+            ids = getattr(controller, "_unresolved_executor_result_ids", ())
+            if not isinstance(ids, (list, tuple, set)):
+                complete_view = False
+                continue
+            for executor_id in ids:
+                add(controller_id, executor_id, "unresolved_result_receipts")
+        records = [{"controller_id": controller_id, "executor_id": executor_id, "reasons": sorted(reasons)}
+                   for (controller_id, executor_id), reasons in sorted(pending.items())]
+        return {"state": "pending" if records else "unavailable", "coverage": "partial",
+                "pending_count": len(records) if complete_view else None, "pending": records,
+                "coverage_note": "Known startup, expired-entry and result-receipt records; exchange-wide reconciliation is not observed."}
+
+    def _build_runtime_operations_snapshot(self) -> Dict[str, Any]:
+        pairs = []
+        for controller_id, controller in self.controllers.items():
+            config = controller.config
+            connector = getattr(config, "connector_name", None)
+            pair = getattr(config, "trading_pair", None)
+            if not isinstance(connector, str) or not isinstance(pair, str):
+                continue
+            observation = self.market_data_provider.get_market_data_health(
+                connector, pair, getattr(config, "interval", None), observed_at=float(self.current_timestamp),
+                candle_connector=getattr(config, "candles_connector", None),
+                candle_pair=getattr(config, "candles_trading_pair", None))
+            observation["controller_id"] = controller_id
+            pairs.append(observation)
+        return {"schema_version": 1,
+                "observed_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
+                "pairs": pairs, "reconciliation": self._runtime_reconciliation_observation()}
+
     def _build_runtime_status_snapshot(self) -> Dict[str, Any]:
         controller_entries = self._build_controller_status_entries()
         balances = self._get_balances_snapshot()
@@ -864,6 +934,7 @@ class StrategyV2Base(StrategyPyBase):
             "schema_version": 1,
             "bot_name": self._runtime_status_snapshot_bot_name(),
             "updated_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
+            "operations": self._build_runtime_operations_snapshot(),
             "active_orders_count": active_orders_count,
             "balances": balances,
             "controllers": controllers,

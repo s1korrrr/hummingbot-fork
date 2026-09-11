@@ -30,7 +30,7 @@ def make_orchestrator():
 
 def fill(oid, side, amount, fee='0'):
     return TradeFill(market='okx', symbol='ETH-USDT', order_id=oid, exchange_trade_id=oid,
-                     timestamp=1, trade_type=side, price=D('100'), amount=D(amount),
+                     timestamp=1, trade_type=side, price=D('100'), amount=D(int(D(amount) * 1000000)) / 1000000,
                      trade_fee_in_quote=D(fee), trade_fee={'percent': '0', 'flat_fees': []},
                      exact_amount=amount, exact_price='100', exact_trade_fee_in_quote=fee,
                      exact_receipt_source='order_filled_event_v1', base_asset='ETH', quote_asset='USDT',
@@ -63,6 +63,46 @@ def test_closed_executor_roundtrip_is_not_counted_again_as_held_pnl():
     _, positions = orchestrator._build_reconciled_positions_from_trade_fills([
         fill('entry', 'BUY', '1', '1'), fill('exit', 'SELL', '1', '1'), fill('held', 'BUY', '1')])
     assert positions[('controller', 'okx', 'ETH-USDT')].cum_fees_quote == D('0')
+
+
+def test_late_fill_after_zero_fill_entry_termination_is_not_excluded_from_inventory():
+    from test.hummingbot.strategy_v2.executors.position_executor.test_entry_expiry_policy import single_attempt
+
+    orchestrator = make_orchestrator()
+    executor = single_attempt()
+    executor.config.controller_id = 'controller'
+    executor._open_order = tracked('expired-entry', TradeType.BUY, '0', OrderState.CANCELED)
+    executor.control_open_order()
+    assert executor.is_closed
+    # Cover both cached historical ownership and the interval before archival.
+    orchestrator._update_cached_performance('controller', executor.executor_info)
+    orchestrator.active_executors = {'controller': [executor]}
+    _, positions = orchestrator._build_reconciled_positions_from_trade_fills([
+        fill('expired-entry', 'BUY', '.00013824'),
+    ])
+    assert positions[('controller', 'okx', 'ETH-USDT')].get_position_summary(D('100')).amount == D('.00013824')
+
+
+def test_new_fill_after_closed_partial_position_is_adopted_without_recounting_old_fills():
+    from test.hummingbot.strategy_v2.executors.position_executor.test_entry_expiry_policy import single_attempt
+
+    orchestrator = make_orchestrator()
+    executor = single_attempt()
+    executor.config.controller_id = 'controller'
+    executor._open_order = tracked('entry', TradeType.BUY, '.4', OrderState.CANCELED)
+    executor._close_order = tracked('exit', TradeType.SELL, '.4', OrderState.FILLED)
+    executor._status = RunnableStatus.TERMINATED
+    executor.close_type = CloseType.TRAILING_STOP
+    orchestrator._update_cached_performance('controller', executor.executor_info)
+    orchestrator.active_executors = {'controller': [executor]}
+    late = fill('entry', 'BUY', '.6', '.06')
+    late.exchange_trade_id = 'late-fill'
+    _, positions = orchestrator._build_reconciled_positions_from_trade_fills([
+        fill('entry', 'BUY', '.4'), fill('exit', 'SELL', '.4'), late,
+    ])
+    position = positions[('controller', 'okx', 'ETH-USDT')]
+    assert position.get_position_summary(D('100')).amount == D('.6')
+    assert position.cum_fees_quote == D('.06')
 
 
 def test_flat_held_roundtrip_keeps_realized_fees_in_performance():

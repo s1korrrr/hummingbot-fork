@@ -46,6 +46,7 @@ from hummingbot.model.controller_candle_watermark import (
     ControllerCandleWatermarkState,
 )
 from hummingbot.model.controllers import Controllers
+from hummingbot.model.exact_order_values import OrderExact, TradeFillExact, decimal_text, recorded_values
 from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
 from hummingbot.model.market_data import MarketData
@@ -875,14 +876,27 @@ class MarketsRecorder:
 
     def get_trades_for_config(self, config_file_path: str, number_of_rows: Optional[int] = None) -> List[TradeFill]:
         with self._sql_manager.get_new_session() as session:
+            has_exact = inspect(session.connection()).has_table(TradeFillExact.__tablename__)
             query: Query = (session
                             .query(TradeFill)
                             .filter(TradeFill.config_file_path == config_file_path)
                             .order_by(TradeFill.timestamp.desc()))
-            if number_of_rows is None:
-                return query.all()
-            else:
-                return query.limit(number_of_rows).all()
+            if has_exact:
+                query = query.add_entity(TradeFillExact).outerjoin(TradeFillExact, (
+                    (TradeFill.market == TradeFillExact.market)
+                    & (TradeFill.order_id == TradeFillExact.order_id)
+                    & (TradeFill.exchange_trade_id == TradeFillExact.exchange_trade_id)
+                ))
+            if number_of_rows is not None:
+                query = query.limit(number_of_rows)
+            rows = query.all()
+            trades = []
+            for result in rows:
+                trade, receipt = result if has_exact else (result, None)
+                # Attach immutable exact values; never rewrite mapped legacy columns.
+                trade.recorded_values = recorded_values(trade, receipt)
+                trades.append(trade)
+            return trades
 
     def load_strategy_risk_state(self) -> Optional[dict]:
         with self._sql_manager.get_new_session() as session:
@@ -946,6 +960,17 @@ class MarketsRecorder:
 
         with self._sql_manager.get_new_session() as session:
             with session.begin():
+                existing_order = session.get(Order, evt.order_id)
+                if existing_order is not None:
+                    exact_order = session.get(OrderExact, evt.order_id)
+                    if (existing_order.market != market.display_name or existing_order.symbol != evt.trading_pair
+                            or (exact_order is not None and (
+                                Decimal(exact_order.amount) != evt.amount
+                                or Decimal(exact_order.price) != (evt.price if evt.price == evt.price else 0)))):
+                        raise ValueError(f"Conflicting order creation event: {evt.order_id}")
+                    return  # Replayed creation event; preserve the original receipt and latest status.
+                session.add(OrderExact(order_id=evt.order_id, amount=decimal_text(evt.amount),
+                                       price=decimal_text(evt.price if evt.price == evt.price else 0)))
                 order_record: Order = Order(id=evt.order_id,
                                             config_file_path=self._config_file_path,
                                             strategy=self._strategy_name,
@@ -989,6 +1014,10 @@ class MarketsRecorder:
                     market=market.display_name, order_id=order_id, exchange_trade_id=evt.exchange_trade_id
                 ).one_or_none()
                 if existing_fill is not None:
+                    exact_fill = session.get(TradeFillExact, (market.display_name, order_id, evt.exchange_trade_id))
+                    if exact_fill is not None and (
+                            Decimal(exact_fill.amount) != evt.amount or Decimal(exact_fill.price) != evt.price):
+                        raise ValueError(f"Conflicting exact duplicate fill receipt for {order_id}/{evt.exchange_trade_id}")
                     amount = Decimal(TradeFill.decimal_text(evt.amount))
                     price = Decimal(TradeFill.decimal_text(evt.price))
                     if existing_fill.exact_amount is None:
@@ -1011,6 +1040,7 @@ class MarketsRecorder:
                 order_status: OrderStatus = OrderStatus(order_id=order_id,
                                                         timestamp=timestamp,
                                                         status=event_type.name)
+                exact_fee_in_quote = None
                 try:
                     fee_in_quote = evt.trade_fee.fee_amount_in_token(
                         trading_pair=evt.trading_pair,
@@ -1049,6 +1079,10 @@ class MarketsRecorder:
                 )
                 session.add(order_status)
                 session.add(trade_fill_record)
+                session.add(TradeFillExact(market=market.display_name, order_id=order_id,
+                                           exchange_trade_id=evt.exchange_trade_id,
+                                           amount=decimal_text(evt.amount), price=decimal_text(evt.price),
+                                           fee_in_quote=exact_fee_in_quote))
                 self.save_market_states(self._config_file_path, market, session=session)
 
                 market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(trade_fill_record.market,

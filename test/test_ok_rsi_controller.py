@@ -1494,6 +1494,24 @@ class OKRSIControllerTest(unittest.TestCase):
             controller._regime_detector.detect = MagicMock(wraps=original_detect)
 
         recorder = self._install_temp_watermark(controllers[0], timestamp=persisted_timestamp)
+        # This test exercises watermark first-writer admission after a completed
+        # clear setup. Entry admission uses an explicit shared durable test store.
+        from controllers.directional_trading.ok_rsi_core.entry_decisions import (
+            EntryDecisionGate,
+            MetadataEntryDecisionStore,
+        )
+        store = MetadataEntryDecisionStore(
+            recorder._sql_manager, "test-ok-rsi.yml", controllers[0].config.id,
+            "okx", "BTC-USDT", "1m",
+        )
+        EntryDecisionGate(store).observe({
+            "candle_timestamp": persisted_timestamp,
+            "signal": 0,
+            "data_health": {"ready": True},
+            "signal_state": {"raw_buy_candidate": False, "condition_ok": True},
+        })
+        for controller in controllers:
+            controller._entry_decision_store = store
         original_cas = recorder.compare_and_advance_controller_candle_watermark
         with patch.object(
             recorder,

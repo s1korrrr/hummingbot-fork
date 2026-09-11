@@ -62,4 +62,7 @@ class PositionExecutorConfig(ExecutorConfigBase):
     leverage: int = 1
     activation_bounds: Optional[List[Decimal]] = None
     level_id: Optional[str] = None
+    # Single-attempt entries cancel only the remainder and keep acquired inventory managed.
+    # Other strategies retain their existing retry/expiry semantics unless they opt in.
+    entry_order_policy: Literal["retry", "single_attempt"] = "retry"
     model_config = ConfigDict(arbitrary_types_allowed=True)

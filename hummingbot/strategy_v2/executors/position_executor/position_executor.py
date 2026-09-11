@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import time
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
+from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
@@ -17,6 +18,7 @@ from hummingbot.core.event.events import (
     SellOrderCompletedEvent,
     SellOrderCreatedEvent,
 )
+from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
@@ -175,6 +177,7 @@ class PositionExecutor(ExecutorBase):
         self._trailing_stop_last_update_timestamp: Optional[float] = None
         self._close_order_type: Optional[OrderType] = None
         self._trailing_limit_fallback_pending: bool = False
+        self._trailing_floor_hold: bool = False
         self._entry_submitted: bool = False
         self._entry_stop_reason: Optional[str] = None
         self._entry_cancel_last_attempt_at: Optional[float] = None
@@ -435,6 +438,100 @@ class PositionExecutor(ExecutorBase):
 
     def _known_fee_pct(self) -> Decimal:
         return self.cum_fees_quote / self.open_filled_amount_quote if self.open_filled_amount_quote != Decimal("0") else Decimal("0")
+
+    def _trailing_requires_no_loss_floor(self) -> bool:
+        return (
+            not self.is_perpetual
+            and self.config.side == TradeType.BUY
+            and self.open_filled_amount > Decimal("0")
+        )
+
+    def _expected_close_fee_rate(self) -> Optional[Decimal]:
+        assets = self.config.trading_pair.split("-")
+        if len(assets) < 2:
+            return None
+        close_order_type = self._close_order_type_for(CloseType.TRAILING_STOP)
+        max_age = max(0, int(self.config.triple_barrier_config.trailing_stop_limit_max_age_seconds or 0))
+        is_maker = (
+            close_order_type.is_limit_type()
+            and max_age <= 0
+            and not getattr(self, "_trailing_limit_fallback_pending", False)
+        )
+        order_type = close_order_type if is_maker else OrderType.MARKET
+        fee = None
+        connector = self.connectors.get(self.config.connector_name)
+        get_fee = getattr(connector, "get_fee", None) if connector is not None else None
+        if callable(get_fee):
+            candidate = get_fee(
+                base_currency=assets[0],
+                quote_currency=assets[1],
+                order_type=order_type,
+                order_side=self.close_order_side,
+                amount=self.open_filled_amount,
+                price=self.entry_price,
+                is_maker=is_maker,
+            )
+            if isinstance(candidate, TradeFeeBase):
+                fee = candidate
+        if fee is None:
+            try:
+                fee = build_trade_fee(
+                    self.config.connector_name,
+                    is_maker,
+                    assets[0],
+                    assets[1],
+                    order_type,
+                    self.close_order_side,
+                    self.open_filled_amount,
+                    self.entry_price,
+                )
+            except Exception:
+                # ponytail: TradeFeeSchemaLoader raises Exception for unknown connectors; hold rather than sell
+                return None
+        percent = getattr(fee, "percent", None)
+        if percent is None:
+            return None
+        try:
+            rate = percent if isinstance(percent, Decimal) else Decimal(str(percent))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+        if rate < Decimal("0") or rate >= Decimal("1"):
+            return None
+        return rate
+
+    def _min_no_loss_sell_price(self) -> Optional[Decimal]:
+        sell_fee_rate = self._expected_close_fee_rate()
+        if sell_fee_rate is None:
+            return None
+        entry = self.entry_price
+        fee_pct = self._known_fee_pct()
+        if not isinstance(entry, Decimal) or not isinstance(fee_pct, Decimal) or entry <= Decimal("0"):
+            return None
+        net_entry = entry * (Decimal("1") + fee_pct)
+        return net_entry / (Decimal("1") - sell_fee_rate)
+
+    def _min_no_loss_trigger_pct(self) -> Optional[Decimal]:
+        min_sell = self._min_no_loss_sell_price()
+        if min_sell is None or not isinstance(self.entry_price, Decimal) or self.entry_price <= Decimal("0"):
+            return None
+        return min_sell / self.entry_price - Decimal("1") - self._known_fee_pct()
+
+    def _floored_trailing_trigger_pct(self, trigger_pct: Decimal) -> Decimal:
+        if not self._trailing_requires_no_loss_floor():
+            return trigger_pct
+        floor_pct = self._min_no_loss_trigger_pct()
+        if floor_pct is None:
+            return trigger_pct
+        return max(trigger_pct, floor_pct)
+
+    def _should_hold_trailing_close(self) -> bool:
+        if not self._trailing_requires_no_loss_floor():
+            return False
+        min_sell = self._min_no_loss_sell_price()
+        current = self._current_trailing_reference_price()
+        if min_sell is None or current is None:
+            return True
+        return current < min_sell
 
     def _price_for_net_pnl_pct(self, target_net_pnl_pct: Optional[Decimal]) -> Optional[Decimal]:
         if target_net_pnl_pct is None:
@@ -1049,7 +1146,24 @@ class PositionExecutor(ExecutorBase):
             return
         if close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
             order_type = self._close_order_type_for(close_type)
-            if order_type.is_limit_type() and not price.is_finite():
+            if close_type == CloseType.TRAILING_STOP and self._trailing_requires_no_loss_floor():
+                min_sell = self._min_no_loss_sell_price()
+                current = self._current_trailing_reference_price()
+                if min_sell is None or current is None or current < min_sell:
+                    self.logger().warning(
+                        self._log_message(
+                            f"Trailing close blocked below fee floor "
+                            f"min_sell={self._fmt_decimal(min_sell)} "
+                            f"current_price={self._fmt_decimal(current)}"
+                        )
+                    )
+                    self.early_stop(keep_position=True)
+                    return
+                if order_type.is_limit_type():
+                    if not price.is_finite():
+                        price = self._marketable_limit_close_price()
+                    price = max(price, min_sell)
+            elif order_type.is_limit_type() and not price.is_finite():
                 price = self._marketable_limit_close_price()
             order_id = self.place_order(
                 connector_name=self.config.connector_name,
@@ -1493,8 +1607,11 @@ class PositionExecutor(ExecutorBase):
             net_pnl_pct = self.get_net_pnl_pct()
             if self._trailing_stop_trigger_pct is None:
                 if net_pnl_pct > self.config.triple_barrier_config.trailing_stop.activation_price:
-                    self._trailing_stop_trigger_pct = net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
+                    self._trailing_stop_trigger_pct = self._floored_trailing_trigger_pct(
+                        net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
+                    )
                     self._trailing_stop_move_count = 0
+                    self._trailing_floor_hold = False
                     self._trailing_stop_armed_timestamp = self._strategy.current_timestamp
                     self._trailing_stop_last_update_timestamp = self._strategy.current_timestamp
                     trailing_snapshot = self._trailing_status_snapshot()
@@ -1512,16 +1629,33 @@ class PositionExecutor(ExecutorBase):
             else:
                 if net_pnl_pct < self._trailing_stop_trigger_pct:
                     trailing_snapshot = self._trailing_status_snapshot()
-                    self.logger().info(
-                        self._log_message(
-                            f"Trailing stop triggered trigger={self._trailing_stop_trigger_pct:.5f} "
-                            f"trigger_price={self._fmt_decimal(trailing_snapshot.get('trailing_trigger_price'))} "
-                            f"current_price={self._fmt_decimal(trailing_snapshot.get('trailing_current_price'))} "
-                            f"net_pnl={net_pnl_pct:.5f}"
+                    if self._should_hold_trailing_close():
+                        if not self._trailing_floor_hold:
+                            self.logger().info(
+                                self._log_message(
+                                    f"Trailing stop hold below fee floor "
+                                    f"trigger={self._trailing_stop_trigger_pct:.5f} "
+                                    f"trigger_price={self._fmt_decimal(trailing_snapshot.get('trailing_trigger_price'))} "
+                                    f"min_sell={self._fmt_decimal(self._min_no_loss_sell_price())} "
+                                    f"current_price={self._fmt_decimal(trailing_snapshot.get('trailing_current_price'))} "
+                                    f"net_pnl={net_pnl_pct:.5f}"
+                                )
+                            )
+                            self._trailing_floor_hold = True
+                    else:
+                        self._trailing_floor_hold = False
+                        self.logger().info(
+                            self._log_message(
+                                f"Trailing stop triggered trigger={self._trailing_stop_trigger_pct:.5f} "
+                                f"trigger_price={self._fmt_decimal(trailing_snapshot.get('trailing_trigger_price'))} "
+                                f"current_price={self._fmt_decimal(trailing_snapshot.get('trailing_current_price'))} "
+                                f"net_pnl={net_pnl_pct:.5f}"
+                            )
                         )
-                    )
-                    self.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
-                new_trigger = net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
+                        self.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
+                new_trigger = self._floored_trailing_trigger_pct(
+                    net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
+                )
                 if new_trigger > self._trailing_stop_trigger_pct:
                     previous_trigger = self._trailing_stop_trigger_pct
                     previous_trigger_price = self._price_for_net_pnl_pct(previous_trigger)

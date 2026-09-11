@@ -209,6 +209,7 @@ async def test_sell_uses_largest_owned_lot_not_whole_dollars_or_wallet_inventory
     executor._open_order = tracked("entry", TradeType.BUY, ".419", OrderState.CANCELED)
     # The fixture wallet contains 10 ETH, but this position owns only .419 ETH.
     executor.connectors["okx"].quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+    executor.get_price.return_value = D("101")
     executor.place_close_order_and_cancel_open_orders(CloseType.TRAILING_STOP)
     assert executor.place_order.call_args.kwargs["amount"] == D(".41")
     assert executor.get_custom_info()["close_quantity"]["residual_base"] == D(".009")

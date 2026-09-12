@@ -108,6 +108,7 @@ async def test_shutdown_drives_stale_limit_cancellation_then_remaining_market_cl
     executor.close_type = CloseType.TRAILING_STOP
     executor._status = RunnableStatus.SHUTTING_DOWN
     executor.close_timestamp = 3
+    executor.get_price.return_value = D('101')
     executor.place_order = MagicMock(return_value='market-close')
     await executor.control_task()
     executor._strategy.cancel.assert_called_once()

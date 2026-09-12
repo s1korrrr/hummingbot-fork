@@ -128,6 +128,9 @@ class OKRSIController(hl_rsi.HLRSIController):
 
     def __init__(self, config: OKRSIControllerConfig, *args, **kwargs):
         episode_store = kwargs.pop("episode_store", None)
+        self._entry_decision_store = kwargs.pop("entry_decision_store", None)
+        self._entry_decision_gate = None
+        self._entry_decision_error = None
         super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
         self._watermark_namespace: Optional[ControllerCandleWatermarkNamespace] = None
@@ -149,7 +152,17 @@ class OKRSIController(hl_rsi.HLRSIController):
 
     def determine_executor_actions(self):
         if self._episode_runtime is not None:
-            return self._episode_runtime.determine_actions()
+            from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+
+            # The episode runtime must continue reconciliation and exit/stop work.
+            # Its BUY requests have not yet adopted the normal entry decision gate.
+            actions = self._episode_runtime.determine_actions()
+            permitted = [action for action in actions if not (
+                isinstance(action, CreateExecutorAction) and action.executor_config.side == TradeType.BUY
+            )]
+            if len(permitted) != len(actions):
+                self._entry_admission_failed("Episode BUY requires explicit single-attempt decision support")
+            return permitted
         return super().determine_executor_actions()
 
     def stop_actions_proposal(self):
@@ -750,17 +763,70 @@ class OKRSIController(hl_rsi.HLRSIController):
         self._watermark_state = result.state
         self._watermark_proposal_grant = True
 
+    def _entry_admission_failed(self, reason):
+        if reason != self._entry_decision_error:
+            self.logger().error(f"Entry decision admission blocked | {self.config.id} | {reason}")
+        self._entry_decision_error = reason
+
+    def _get_entry_decision_gate(self):
+        from controllers.directional_trading.ok_rsi_core.entry_decisions import (
+            EntryDecisionGate,
+            MetadataEntryDecisionStore,
+        )
+        if self._entry_decision_gate is None:
+            store = self._entry_decision_store
+            if store is None:
+                recorder = MarketsRecorder.get_existing_instance()
+                if recorder is None:
+                    raise RuntimeError("Production recorder unavailable for durable entry decisions")
+                store = MetadataEntryDecisionStore(
+                    recorder._sql_manager, recorder._config_file_path, self.config.id,
+                    self.config.connector_name, self.config.trading_pair, self.config.interval,
+                )
+            self._entry_decision_gate = EntryDecisionGate(store)
+        return self._entry_decision_gate
+
     def create_actions_proposal(self):
-        if not self.config.durable_candle_watermark_enabled:
-            return super().create_actions_proposal()
-        if (
-            not self._watermark_proposal_grant
-            or self._watermark_result is None
-            or not self._watermark_result.proposal_eligible
-        ):
+        if self._episode_runtime is not None:
+            self._entry_admission_failed("Episode execution requires explicit single-attempt decision support")
             return []
-        self._watermark_proposal_grant = False
-        return super().create_actions_proposal()
+        if self.config.durable_candle_watermark_enabled:
+            if (not self._watermark_proposal_grant or self._watermark_result is None
+                    or not self._watermark_result.proposal_eligible):
+                return []
+            self._watermark_proposal_grant = False
+        data = self.processed_data or {}
+        signal = data.get("signal", 0)
+        # Only the owner's completed-candle evaluation may clear or consume a setup.
+        candle = data.get("candle_timestamp")
+        try:
+            now = self.market_data_provider.time()
+            seconds = CandlesBase.interval_to_seconds[self.config.interval]
+            evaluated = (isinstance(candle, (int, float)) and not isinstance(candle, bool)
+                         and math.isfinite(candle) and candle == self._last_evaluated_candle_timestamp
+                         and isinstance(now, (int, float)) and math.isfinite(now)
+                         and candle + seconds <= now)
+            gate = self._get_entry_decision_gate()
+            eligible = gate.observe(data) if evaluated else False
+            # SELL management remains independent of BUY admission storage.
+            if signal < 0:
+                return super().create_actions_proposal()
+            if not eligible:
+                return []
+            actions = super().create_actions_proposal()
+            from controllers.directional_trading.ok_rsi_core.entry_decisions import executor_fingerprint
+            admitted = []
+            for action in actions:
+                config = action.executor_config
+                if config.side != TradeType.BUY:
+                    admitted.append(action)
+                elif gate.reserve(config.id, executor_fingerprint(config), int(data["candle_timestamp"])):
+                    admitted.append(action)
+            self._entry_decision_error = None
+            return admitted
+        except Exception as exc:
+            self._entry_admission_failed(f"{type(exc).__name__}: {exc}")
+            return super().create_actions_proposal() if signal < 0 else []
 
     def _select_signal_candles(self, df: pd.DataFrame, now_ts: float) -> pd.DataFrame:
         if not self._build_data_health(df, now_ts)["ready"]:
@@ -770,15 +836,28 @@ class OKRSIController(hl_rsi.HLRSIController):
         return df.loc[timestamps + seconds <= now_ts].copy()
 
     def validate_executor_config(self, config) -> bool:
-        if self._episode_runtime is None:
-            return super().validate_executor_config(config)
-        # Episode timing, sizing and authorization belong to the bounded native factory below.
-        from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
-        return (ControllerBase.validate_executor_config(self, config)
-                and config.connector_name == self.config.connector_name
-                and config.trading_pair == self.config.trading_pair
-                and not (config.side == TradeType.BUY and self._operator_entry_paused)
-                and not self._episode_runtime.hold_reason and not self._episode_runtime.state.fault)
+        if self._episode_runtime is not None:
+            if config.side != TradeType.SELL:
+                self._entry_admission_failed("Episode BUY requires explicit single-attempt decision support")
+                return False
+            # Restore the episode's own boundary validation for queued exits.
+            from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
+            return (ControllerBase.validate_executor_config(self, config)
+                    and config.connector_name == self.config.connector_name
+                    and config.trading_pair == self.config.trading_pair
+                    and not self._episode_runtime.hold_reason
+                    and not self._episode_runtime.state.fault)
+        if not super().validate_executor_config(config):
+            return False
+        if config.side != TradeType.BUY:
+            return True
+        try:
+            from controllers.directional_trading.ok_rsi_core.entry_decisions import executor_fingerprint
+            candle = (self.processed_data or {}).get("candle_timestamp")
+            return self._get_entry_decision_gate().dispatch(config.id, executor_fingerprint(config), candle)
+        except Exception as exc:
+            self._entry_admission_failed(f"{type(exc).__name__}: {exc}")
+            return False
 
     def _derived_base_max_records(self) -> int:
         if self.config.episode_enabled:
@@ -915,6 +994,10 @@ class OKRSIController(hl_rsi.HLRSIController):
     def get_custom_info(self) -> dict:
         custom_info = super().get_custom_info()
         custom_info["trailing_policy"] = self._trailing_policy_snapshot()
+        custom_info["entry_decision_admission"] = {
+            "policy": "single_attempt_after_clear", "error": self._entry_decision_error,
+            "episode_buy_supported": False,
+        }
         custom_info["durable_evaluation_watermark"] = (
             self._durable_watermark_snapshot()
         )
@@ -925,6 +1008,10 @@ class OKRSIController(hl_rsi.HLRSIController):
     def get_status_summary(self) -> Dict[str, object]:
         summary = super().get_status_summary()
         summary["trailing_policy"] = self._trailing_policy_snapshot()
+        summary["entry_decision_admission"] = {
+            "policy": "single_attempt_after_clear", "error": self._entry_decision_error,
+            "episode_buy_supported": False,
+        }
         summary["durable_evaluation_watermark"] = (
             self._durable_watermark_snapshot()
         )
@@ -1165,6 +1252,7 @@ class OKRSIController(hl_rsi.HLRSIController):
             time_limit_order_type=OrderType.MARKET,
         )
         return PositionExecutorConfig(
+            entry_order_policy="single_attempt",
             timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,

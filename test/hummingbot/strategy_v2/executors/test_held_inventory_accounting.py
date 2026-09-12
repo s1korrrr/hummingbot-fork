@@ -3,6 +3,8 @@ from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_l
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
@@ -65,14 +67,15 @@ def test_closed_executor_roundtrip_is_not_counted_again_as_held_pnl():
     assert positions[('controller', 'okx', 'ETH-USDT')].cum_fees_quote == D('0')
 
 
-def test_late_fill_after_zero_fill_entry_termination_is_not_excluded_from_inventory():
-    from test.hummingbot.strategy_v2.executors.position_executor.test_entry_expiry_policy import single_attempt
+@pytest.mark.asyncio
+async def test_late_fill_after_zero_fill_entry_termination_is_not_excluded_from_inventory():
+    from test.hummingbot.strategy_v2.executors.position_executor.test_entry_expiry_policy import cycle, single_attempt
 
     orchestrator = make_orchestrator()
     executor = single_attempt()
     executor.config.controller_id = 'controller'
     executor._open_order = tracked('expired-entry', TradeType.BUY, '0', OrderState.CANCELED)
-    executor.control_open_order()
+    await cycle(executor)
     assert executor.is_closed
     # Cover both cached historical ownership and the interval before archival.
     orchestrator._update_cached_performance('controller', executor.executor_info)

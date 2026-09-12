@@ -3,6 +3,7 @@ import logging
 import uuid
 from collections import deque
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 from hummingbot.client.native_lifecycle import ShutdownResult
@@ -12,6 +13,8 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
+from hummingbot.strategy_v2.executors.planned_position_resume import claim, pending_manifest
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
 
 if TYPE_CHECKING:
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -238,10 +241,14 @@ class ExecutorOrchestrator:
         self._non_hold_order_ids: Set[Tuple[str, str, str]] = set()
         self._non_hold_fill_ids: Set[Tuple[str, str, str, str]] = set()
         self.recovery_required: Dict[str, List[str]] = {}
+        self._resume_owned_order_keys = set()
+        self._resume_position_scopes = set()
+        self._planned_resume_pending = False
+        self._planned_resume_failure = None
         self.initial_positions_by_controller = initial_positions_by_controller or {}
         self._initialize_cached_performance()
 
-    def _initialize_cached_performance(self):
+    def _initialize_cached_performance(self, allow_planned_resume=False):
         """
         Initialize cached performance by querying the database for stored executors and positions.
         If initial positions are provided for a controller, skip loading database positions for that controller.
@@ -253,10 +260,17 @@ class ExecutorOrchestrator:
                 self.stored_executors[controller_id] = []
                 self.positions_held[controller_id] = []
         markets_recorder = MarketsRecorder.get_instance()
+        db_path = getattr(getattr(markets_recorder, "sql_manager", None), "db_path", None)
+        if not allow_planned_resume and isinstance(db_path, (str, Path)) and pending_manifest(db_path) is not None:
+            self._planned_resume_pending = True
+            return  # No held reconstruction or ownership mutation before connectors are ready.
+        resumed = self._claim_planned_positions(markets_recorder)
         db_executors = markets_recorder.get_all_executors()
         for executor in db_executors:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
+                continue
+            if executor.id in resumed:
                 continue
             if not executor.is_done:
                 self.recovery_required.setdefault(controller_id, []).append(executor.id)
@@ -306,7 +320,7 @@ class ExecutorOrchestrator:
                 trading_pair=position.trading_pair,
                 side=TradeType.BUY if position.side == TradeType.BUY.name else TradeType.SELL,
             )
-            if self._is_protected_position_scope(restored_position_scopes, position_scope):
+            if self._is_protected_position_scope(restored_position_scopes | self._resume_position_scopes, position_scope):
                 continue
             self._load_position_from_db(controller_id, position)
             restored_position_scopes.add(position_scope)
@@ -322,6 +336,82 @@ class ExecutorOrchestrator:
             trade_fills=trade_fills,
             protected_position_scopes=self._current_position_scopes(),
         )
+        for executors in self.active_executors.values():
+            for executor in executors:
+                if executor.config.id in resumed:
+                    executor.start()
+
+    def resume_planned_positions_if_ready(self):
+        if not self._planned_resume_pending:
+            return True
+        if self._planned_resume_failure is not None:
+            return False
+        if not self.strategy.ready_to_trade or not self.strategy.market_data_provider.ready:
+            return False
+        try:
+            self._initialize_cached_performance(allow_planned_resume=True)
+        except Exception as error:
+            self._planned_resume_failure = f"{type(error).__name__}: {error}"
+            for controller_id, executors in self.active_executors.items():
+                for executor in executors:
+                    executor.stop()
+                    unresolved = self.recovery_required.setdefault(controller_id, [])
+                    if executor.config.id not in unresolved:
+                        unresolved.append(executor.config.id)
+                # The claim already persisted unfinished ownership. Quiesced
+                # objects must never overwrite that row as a completed exit.
+                executors.clear()
+            self.logger().exception("Planned resume failed; restart reconciliation required; execution blocked")
+            return False
+        self._planned_resume_pending = False
+        return True
+
+    def _claim_planned_positions(self, recorder):
+        db_path = getattr(getattr(recorder, "sql_manager", None), "db_path", None)
+        if not isinstance(db_path, (str, Path)):
+            return set()
+        manifest = pending_manifest(db_path)
+        if manifest is None:
+            return set()
+        instances = []
+        required_base = {}
+        for position in manifest["positions"]:
+            config = PositionExecutorConfig.model_validate(position["config"])
+            controller = self.strategy.controllers.get(position["controller_id"])
+            if (controller is None or position["controller_id"] in self.initial_positions_by_controller
+                    or config.connector_name not in self.strategy.connectors
+                    or config.trading_pair not in self.strategy.markets.get(config.connector_name, set())):
+                raise ValueError("Planned position owner/market is unavailable or overridden")
+            if (controller.config.connector_name != config.connector_name
+                    or controller.config.trading_pair != config.trading_pair):
+                raise ValueError("Planned position controller identity differs")
+            connector = self.strategy.connectors[config.connector_name]
+            if any(order.trading_pair == config.trading_pair for order in connector.in_flight_orders.values()):
+                raise ValueError("Planned resume has unreconciled open orders")
+            for price_type in (PriceType.BestBid, PriceType.BestAsk):
+                price = Decimal(str(connector.get_price_by_type(config.trading_pair, price_type)))
+                if not price.is_finite() or price <= 0:
+                    raise ValueError("Planned resume price is unavailable")
+            base = config.trading_pair.split('-')[0]
+            key = config.connector_name, base
+            required_base[key] = required_base.get(key, Decimal(0)) + Decimal(position["net_base"])
+            executor = PositionExecutor(self.strategy, config, self.executors_update_interval, self.executors_max_retries)
+            executor.hydrate_planned_position(position, manifest["id"])
+            instances.append(executor)
+        for (connector_name, base), amount in required_base.items():
+            available = Decimal(str(self.strategy.connectors[connector_name].get_available_balance(base)))
+            if not available.is_finite() or available < amount:
+                raise ValueError("Planned resume inventory is not available")
+        # No listener/control loop starts before all preconditions and the durable
+        # transaction succeed. A crash after this claim requires reconciliation.
+        claim(db_path, manifest)
+        for executor in instances:
+            config = executor.config
+            self.active_executors[config.controller_id].append(executor)
+            self._resume_owned_order_keys.add((config.connector_name, config.trading_pair, executor._open_order.order_id))
+            self._resume_position_scopes.add(self._position_scope(
+                config.controller_id, config.connector_name, config.trading_pair, None))
+        return {executor.config.id for executor in instances}
 
     def _update_cached_performance(self, controller_id: str, executor_info: ExecutorInfo):
         """
@@ -539,6 +629,8 @@ class ExecutorOrchestrator:
         restored_controller_ids: Set[str] = set()
 
         for entry in ledger_entries:
+            if (entry.connector_name, entry.trading_pair, entry.client_order_id) in self._resume_owned_order_keys:
+                continue
             controller_id = entry.controller_id
             if controller_id in self.initial_positions_by_controller or controller_id not in self.strategy.controllers:
                 continue
@@ -597,6 +689,7 @@ class ExecutorOrchestrator:
                 executor_info
                 for executor_info in executor_infos
                 if self._has_held_position_orders(executor_info)
+                and not (self._owned_order_keys(executor_info) & self._resume_owned_order_keys)
             ),
             key=lambda info: (
                 info.close_timestamp if info.close_timestamp is not None else info.timestamp,
@@ -1065,6 +1158,8 @@ class ExecutorOrchestrator:
         """
         Stop the orchestrator task and all active executors.
         """
+        if self._planned_resume_pending:
+            return ShutdownResult(False, "Planned position resume unresolved; durable ownership requires reconciliation")
         keep_position_by_controller = keep_position_by_controller or {}
         if strict:
             try:
@@ -1302,6 +1397,8 @@ class ExecutorOrchestrator:
         """
         Create an executor based on the configuration in the action.
         """
+        if self._planned_resume_pending:
+            raise RuntimeError("Planned position ownership transfer is pending; execution is blocked")
         controller_id = action.controller_id
         executor_config = action.executor_config
         if controller_id in getattr(self.strategy, "_controller_restart_required", {}):
@@ -1552,6 +1649,8 @@ class ExecutorOrchestrator:
         Generate a unified report containing executors, positions, and performance for all controllers.
         Returns a dictionary with controller_id as key and a dict containing all reports as value.
         """
+        if self._planned_resume_pending:
+            raise RuntimeError("Planned position resume pending; reports unavailable until ownership is established")
         # Update any pending position holds from done executors
         self._update_positions_from_done_executors()
         self._reconcile_positions_from_trade_fills()

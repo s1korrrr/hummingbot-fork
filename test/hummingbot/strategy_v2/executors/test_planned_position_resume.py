@@ -1,0 +1,413 @@
+import json
+import sqlite3
+from decimal import Decimal
+from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_lifecycle import make_executor, tracked
+from types import SimpleNamespace
+from unittest import TestCase
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
+from hummingbot.client.config.config_helpers import ClientConfigAdapter
+from hummingbot.connector.markets_recorder import MarketsRecorder
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.event.events import MarketOrderFailureEvent, OrderCancelledEvent
+from hummingbot.model.order import Order
+from hummingbot.model.position import Position
+from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+from hummingbot.model.trade_fill import TradeFill
+from hummingbot.strategy_v2.executors import planned_position_resume as resume
+from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+from hummingbot.strategy_v2.executors.planned_position_resume import validate_position
+from hummingbot.strategy_v2.executors.position_executor.data_types import (
+    PositionExecutorConfig,
+    TrailingStop,
+    TripleBarrierConfig,
+)
+from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType
+
+
+class ResumeValidationTests(TestCase):
+    def setUp(self):
+        self.config = PositionExecutorConfig(id='resume-1', controller_id='owner', timestamp=100,
+                                             connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+                                             amount=Decimal('1'), entry_price=Decimal('100'),
+                                             triple_barrier_config=TripleBarrierConfig(
+                                                trailing_stop=TrailingStop(activation_price=Decimal('.05'),
+                                                                           trailing_delta=Decimal('.02'))))
+        order = InFlightOrder('entry-1', 'ETH-USDT', OrderType.LIMIT, TradeType.BUY,
+                              Decimal('1'), 100, Decimal('100'), exchange_order_id='venue-1')
+        order.update_with_trade_update(TradeUpdate('fill-1', 'entry-1', 'venue-1', 'ETH-USDT', 101,
+                                                   Decimal('100'), Decimal('1'), Decimal('100'), AddedToCostTradeFee()))
+        order.current_state = OrderState.FILLED
+        self.order = order.to_json()
+        self.custom = {'held_position_orders': [self.order], 'order_ids': ['entry-1'],
+                       'open_order_filled_amount_base': '1', 'open_order_filled_amount_quote': '100',
+                       'close_order_filled_amount_base': '0', 'remaining_position_amount_base': '1',
+                       'trailing_state': 'waiting', 'trailing_stop_trigger_pct': None, 'trailing_move_count': 0,
+                       'trailing_armed_timestamp': None, 'trailing_last_update_timestamp': None,
+                       'exit_trigger_reason': None}
+        self.row = {'id': self.config.id, 'controller_id': 'owner', 'type': 'position_executor',
+                    'timestamp': 100, 'config': json.loads(self.config.model_dump_json()), 'custom_info': self.custom,
+                    'status': 4, 'close_type': CloseType.POSITION_HOLD.value, 'is_active': 0}
+        self.preflight = {**self.row, 'status': 2, 'close_type': None, 'is_active': 1,
+                          'custom_info': {**self.custom, 'held_position_orders': []}}
+
+    def test_valid_terminal_receipt_preserves_original_config(self):
+        result = validate_position(self.preflight, self.row)
+        self.assertEqual(result['config']['timestamp'], 100)
+        self.assertEqual(result['entry']['client_order_id'], 'entry-1')
+        self.assertEqual(result['net_base'], '1')
+
+    def test_zero_fill_exit_identity_is_rejected(self):
+        self.custom['order_ids'].append('unreported-exit')
+        with self.assertRaisesRegex(ValueError, 'singleton'):
+            validate_position(self.preflight, self.row)
+
+    def test_preflight_configuration_change_is_rejected(self):
+        self.preflight = {**self.preflight, 'config': {**self.row['config'], 'timestamp': 99}}
+        with self.assertRaisesRegex(ValueError, 'configuration'):
+            validate_position(self.preflight, self.row)
+
+    def test_non_terminal_entry_is_rejected(self):
+        self.order['last_state'] = str(OrderState.OPEN.value)
+        with self.assertRaisesRegex(ValueError, 'FILLED'):
+            validate_position(self.preflight, self.row)
+
+    def test_armed_state_requires_all_original_timestamps(self):
+        self.custom.update(trailing_state='armed', trailing_stop_trigger_pct='.04', trailing_move_count=3,
+                           trailing_armed_timestamp=110, trailing_last_update_timestamp=120)
+        result = validate_position(self.preflight, self.row)
+        self.assertEqual(result['trailing']['trailing_move_count'], 3)
+        self.custom['trailing_armed_timestamp'] = None
+        with self.assertRaisesRegex(ValueError, 'trailing'):
+            validate_position(self.preflight, self.row)
+
+
+async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2'):
+    db = tmp_path / 'stopped.sqlite'
+    preflight = tmp_path / 'preflight.sqlite'
+    root = tmp_path / 'runtime'
+    for file in (*resume.SOURCES, 'conf/scripts/owner.yml', 'conf/controllers/owner.yml', 'conf/conf_client.yml', 'conf/connectors/okx.yml'):
+        path = root / file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text((resume.ROOT / file).read_text() if file in resume.SOURCES else 'id: owner\n')
+    (root / 'conf/scripts/owner.yml').write_text('script_file_name: v2_with_controllers.py\ncontrollers_config: [owner.yml]\n')
+    (root / 'conf/controllers/owner.yml').write_text('id: owner\nconnector_name: okx\ntrading_pair: ETH-USDT\n')
+    manager = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS, db_path=str(db))
+    recorder = MarketsRecorder(manager, [], 'owner.yml', 'v2_with_controllers',
+                               market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+    executor = make_executor()
+    executor.config.controller_id = 'owner'
+    executor._open_order = tracked('entry', TradeType.BUY, '1', OrderState.FILLED)
+    if armed:
+        executor._trailing_stop_trigger_pct = Decimal('.035')
+        executor._trailing_stop_move_count = 4
+        executor._trailing_stop_armed_timestamp = 100
+        executor._trailing_stop_last_update_timestamp = 120
+    recorder.store_or_update_executor(executor)
+    with sqlite3.connect(db) as source, sqlite3.connect(preflight) as destination:
+        source.backup(destination)
+    executor.early_stop(keep_position=True)
+    await executor.control_task()
+    assert executor.is_closed
+    recorder.store_or_update_executor(executor)
+    recorder.store_or_update_position_hold_ledger_entries('owner', executor.config.id, 'okx', 'ETH-USDT',
+                                                          executor._held_position_orders)
+    # An independent held receipt in the SAME pair must survive ownership transfer.
+    unrelated = tracked('unrelated', TradeType.BUY, unrelated_amount, OrderState.FILLED).order.to_json()
+    if Decimal(unrelated_amount):
+        recorder.store_or_update_position_hold_ledger_entries('owner', 'other-executor', 'okx', 'ETH-USDT', [unrelated])
+    with manager.get_new_session() as session:
+        receipts = [executor._held_position_orders[0]] + ([unrelated] if Decimal(unrelated_amount) else [])
+        for receipt in receipts:
+            oid = receipt['client_order_id']
+            session.add(Order(id=oid, config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
+                              symbol='ETH-USDT', base_asset='ETH', quote_asset='USDT', creation_timestamp=1000,
+                              order_type='LIMIT', amount=Decimal(receipt['amount']), leverage=1, price=Decimal('100'),
+                              last_status='BuyOrderCompleted', last_update_timestamp=2000, exchange_order_id=oid,
+                              position='NIL'))
+            for tid, fill in receipt['order_fills'].items():
+                session.add(TradeFill(config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
+                                      symbol='ETH-USDT', base_asset='ETH', quote_asset='USDT', timestamp=2000,
+                                      order_id=oid, trade_type='BUY', order_type='LIMIT', price=Decimal(fill['fill_price']),
+                                      amount=Decimal(fill['fill_base_amount']), leverage=1, trade_fee=fill['fee'],
+                                      trade_fee_in_quote=Decimal(0), exchange_trade_id=tid, position='NIL'))
+        session.add(Position(id='aggregate', controller_id='owner', connector_name='okx', side='BUY',
+                             trading_pair='ETH-USDT', timestamp=1000, volume_traded_quote=Decimal('120'),
+                             amount=Decimal('1') + Decimal(unrelated_amount), breakeven_price=Decimal('100'),
+                             unrealized_pnl_quote=Decimal('0'), realized_pnl_quote=Decimal('0'), cum_fees_quote=Decimal('0')))
+        session.commit()
+    entry = executor._held_position_orders[0]
+    evidence = {'schema': 1, 'owner': 'test-owner', 'script_config': 'owner.yml', 'owner_stopped': True, 'venue_open_orders': [], 'observed_at': 1000,
+                'expires_at': 1800, 'config_paths': ['conf/scripts/owner.yml', 'conf/controllers/owner.yml', 'conf/conf_client.yml', 'conf/connectors/okx.yml'],
+                'executors': [{'executor_id': executor.config.id, 'client_order_id': 'entry',
+                               'exchange_order_id': 'entry', 'trading_pair': 'ETH-USDT', 'state': 'filled',
+                               'filled_base': '1', 'filled_quote': '100', 'net_base': '1',
+                               'fills': {tid: {'fill_base_amount': f['fill_base_amount'], 'fill_price': f['fill_price'],
+                                               'fee': f['fee']} for tid, f in entry['order_fills'].items()}}]}
+    import hashlib
+    from datetime import datetime, timezone
+    with sqlite3.connect(db) as checkpoint:
+        checkpoint.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    sha = hashlib.sha256(db.read_bytes()).hexdigest()
+    pending = [{'pair': 'ETH-USDT', 'regular': [], 'regular_count': 0, 'algo_count': 0, 'algos': {kind: [] for kind in resume.SPOT_ALGO_TYPES}}]
+    evidence['reconciliation'] = {
+        'schema_version': 1, 'kind': 'okx_stopped_owner_get_reconciliation', 'venue_queried': True,
+        'read_only': True, 'result': 'EVIDENCE_COMPLETE', 'blockers': [], 'owner': 'test-owner',
+        'database': {'sha256': sha, 'sha256_after': sha},
+        'started_at': datetime.fromtimestamp(990, timezone.utc).isoformat(),
+        'finished_at': datetime.fromtimestamp(1000, timezone.utc).isoformat(),
+        'controller_pairs': {'owner': 'ETH-USDT'}, 'selected_executor_ids': [executor.config.id],
+        'pending_before': pending, 'pending_after': pending,
+        'balance_coverage': [{'asset': 'ETH', 'owned_residual': '1', 'cash_balance': '10',
+                              'available_balance': '10', 'covered': True}],
+        'selected_executors': [{'executor_id': executor.config.id, 'controller_id': 'owner', 'pair': 'ETH-USDT',
+                               'venue_orders': [{'raw_order': {'clOrdId': 'entry', 'ordId': 'entry',
+                                                               'instId': 'ETH-USDT', 'side': 'buy',
+                                                               'state': 'filled', 'tdMode': 'cash',
+                                                               'sz': '1', 'accFillSz': '1'},
+                                                 'raw_fills': [{'tradeId': 'entry', 'ordId': 'entry',
+                                                                'instId': 'ETH-USDT', 'side': 'buy',
+                                                                'fillSz': '1', 'fillPx': '100',
+                                                                'fee': '0', 'feeCcy': 'ETH'}],
+                                                 'receipt': {'blockers': []},
+                                                 'local_fill_comparisons': [{'matched': True}]}]}]}
+    return db, preflight, root, recorder, executor, evidence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('armed', [False, True])
+@pytest.mark.parametrize('unrelated_amount', ['0', '.2'])
+async def test_old_stop_sqlite_prepare_native_resume_no_buy_and_one_trailing_sell(tmp_path, armed, unrelated_amount):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path, armed, unrelated_amount)
+    manifest = resume.prepare(db, before, evidence, now=1000, root=root)
+    assert recorder.get_all_executors()[0].is_done
+    strategy = old._strategy
+    strategy.controllers = {'owner': SimpleNamespace(config=SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT'))}
+    strategy.markets = {'okx': {'ETH-USDT'}}
+    strategy.ready_to_trade = False
+    strategy.market_data_provider = MagicMock()
+    strategy.market_data_provider.ready = True
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    connector = strategy.connectors['okx']
+    connector.in_flight_orders = {}
+    connector.get_price_by_type.return_value = Decimal('100')
+    connector._order_tracker.fetch_order.return_value = None
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+                  side_effect=lambda path: resume.pending_manifest(path, now=1001, root=root)), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+                  side_effect=lambda path, value: resume.claim(path, value, now=1001)), \
+            patch.object(PositionExecutor, 'get_trading_rules', return_value=old.trading_rules), \
+            patch.object(PositionExecutor, 'start') as start:
+        orchestrator = ExecutorOrchestrator(strategy)
+        assert not orchestrator.resume_planned_positions_if_ready()
+        start.assert_not_called()
+        with pytest.raises(RuntimeError, match='pending'):
+            orchestrator.create_executor(CreateExecutorAction(controller_id='owner', executor_config=old.config))
+        # Reports may be requested by queued controller actions before readiness.
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="pending"):
+                orchestrator.get_all_reports()
+        strategy.ready_to_trade = True
+        assert orchestrator.resume_planned_positions_if_ready()
+        start.assert_called_once()
+        recovered = orchestrator.active_executors['owner'][0]
+        assert recovered.config == old.config
+        assert recovered.config.timestamp == 1
+        assert recovered._planned_resume_id == manifest['id']
+        assert recovered.amount_to_close == Decimal('1')
+        assert recovered._trailing_stop_trigger_pct == old._trailing_stop_trigger_pct
+        assert recovered._trailing_stop_move_count == old._trailing_stop_move_count
+        assert recovered._trailing_stop_armed_timestamp == old._trailing_stop_armed_timestamp
+        assert sum(p.buy_amount_base - p.sell_amount_base for p in orchestrator.positions_held['owner']) == Decimal(unrelated_amount)
+        report = orchestrator.get_all_reports()['owner']
+        assert len(report['executors']) == 1
+        assert sum(p.amount for p in report['positions']) == Decimal(unrelated_amount)
+        recovered._status = RunnableStatus.RUNNING
+        recovered.place_order = MagicMock(return_value='exit-1')
+        recovered._sleep = AsyncMock()
+        with patch.object(recovered, 'validate_sufficient_balance', new=AsyncMock()) as validate:
+            await recovered.on_start()
+            validate.assert_not_called()
+        recovered.process_order_canceled_event(0, connector, OrderCancelledEvent(1002, 'entry'))
+        recovered.process_order_failed_event(0, connector, MarketOrderFailureEvent(1002, 'entry', OrderType.LIMIT))
+        recovered.place_open_order()
+        recovered.control_open_order()
+        recovered.place_order.assert_not_called()
+        if not armed:
+            connector.get_price_by_type.return_value = Decimal('105')
+            await recovered.control_task()
+        connector.get_price_by_type.return_value = Decimal('103')
+        await recovered.control_task()
+        await recovered.control_task()
+        assert recovered.close_type == CloseType.TRAILING_STOP
+        recovered.place_order.assert_called_once()
+        assert recovered.place_order.call_args.kwargs['side'] == TradeType.SELL
+        assert recovered.place_order.call_args.kwargs['amount'] == Decimal('1')
+        with pytest.raises(ValueError, match='consumed'):
+            resume.claim(db, manifest, now=1002)
+        assert resume.pending_manifest(db, now=1002, root=root) is None
+        # Complete the native exit and restart from persisted state. No original
+        # BUY receipt may reappear as held inventory after the new process starts.
+        recovered._close_order = tracked('exit-1', TradeType.SELL, '1', OrderState.FILLED)
+        await recovered.control_task()
+        assert recovered.is_closed
+        assert recovered.amount_to_close == 0
+        recorder.store_or_update_executor(recovered)
+        with recorder.sql_manager.get_new_session() as session:
+            session.add(Order(id='exit-1', config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
+                              symbol='ETH-USDT', base_asset='ETH', quote_asset='USDT', creation_timestamp=1001000,
+                              order_type='LIMIT', amount=Decimal('1'), leverage=1, price=Decimal('100'),
+                              last_status='SellOrderCompleted', last_update_timestamp=1002000, exchange_order_id='exit-1',
+                              position='NIL'))
+            session.add(TradeFill(config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
+                                  symbol='ETH-USDT', base_asset='ETH', quote_asset='USDT', timestamp=1002000,
+                                  order_id='exit-1', trade_type='SELL', order_type='LIMIT', price=Decimal('100'),
+                                  amount=Decimal('1'), leverage=1, trade_fee=AddedToCostTradeFee().to_json(),
+                                  trade_fee_in_quote=Decimal(0), exchange_trade_id='exit-1', position='NIL'))
+            session.commit()
+        restarted = ExecutorOrchestrator(strategy)
+        assert restarted.recovery_required == {}
+        assert restarted.active_executors['owner'] == []
+        assert sum(p.buy_amount_base - p.sell_amount_base for p in restarted.positions_held['owner']) == Decimal(unrelated_amount)
+        assert sum(p.amount for p in restarted.get_all_reports()['owner']['positions']) == Decimal(unrelated_amount)
+        assert {row.client_order_id for row in recorder.get_all_position_hold_ledger_entries()} == (
+            {'unrelated'} if Decimal(unrelated_amount) else set())
+        assert recorder.get_all_positions() == []
+        strategy.buy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_venue_mismatch_without_mutating_owner(tmp_path):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    evidence['executors'][0]['net_base'] = '.9'
+    with pytest.raises(ValueError, match='raw venue net'):
+        resume.prepare(db, before, evidence, now=1000, root=root)
+    assert resume.inspect_manifest(db) == []
+    assert recorder.get_all_executors()[0].is_done
+
+
+@pytest.mark.asyncio
+async def test_stale_configuration_database_and_reuse_are_blocked(tmp_path):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    manifest = resume.prepare(db, before, evidence, now=1000, root=root)
+    with pytest.raises(ValueError, match='expired'):
+        resume.pending_manifest(db, now=1800, root=root)
+    config = root / 'conf/controllers/owner.yml'
+    original = config.read_text()
+    config.write_text('changed')
+    with pytest.raises(ValueError, match='binding'):
+        resume.pending_manifest(db, now=1001, root=root)
+    config.write_text(original)
+    with resume.connect(db, writable=True) as connection:
+        connection.execute('UPDATE Executors SET timestamp=timestamp+1')
+    with pytest.raises(ValueError, match='database'):
+        resume.claim(db, manifest, now=1001)
+    assert recorder.get_all_executors()[0].is_done
+    with pytest.raises(ValueError, match='already exists|database bytes|checkpoint'):
+        resume.prepare(db, before, evidence, now=1001, root=root)
+
+
+@pytest.mark.asyncio
+async def test_old_database_missing_empty_sidecars_survives_new_schema_creation(tmp_path):
+    import hashlib
+
+    from hummingbot.model.exact_order_values import OrderExact, TradeFillExact
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    with resume.connect(db, writable=True) as connection:
+        connection.execute('DROP TABLE OrderExact')
+        connection.execute('DROP TABLE TradeFillExact')
+    with sqlite3.connect(db) as checkpoint:
+        checkpoint.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    sha = hashlib.sha256(db.read_bytes()).hexdigest()
+    evidence['reconciliation']['database'].update(sha256=sha, sha256_after=sha)
+    manifest = resume.prepare(db, before, evidence, now=1000, root=root)
+    OrderExact.__table__.create(recorder.sql_manager.engine)
+    TradeFillExact.__table__.create(recorder.sql_manager.engine)
+    assert resume.pending_manifest(db, now=1001, root=root) == manifest
+    resume.claim(db, manifest, now=1001)
+    assert not recorder.get_all_executors()[0].is_done
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['start', 'restore'])
+async def test_post_claim_failure_is_latched_and_never_retried(tmp_path, failure):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    resume.prepare(db, before, evidence, now=1000, root=root)
+    strategy = old._strategy
+    strategy.controllers = {'owner': SimpleNamespace(config=SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT'))}
+    strategy.markets = {'okx': {'ETH-USDT'}}
+    strategy.ready_to_trade = True
+    strategy.market_data_provider = MagicMock()
+    strategy.market_data_provider.ready = True
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    connector = strategy.connectors['okx']
+    connector.in_flight_orders = {}
+    connector.get_price_by_type.return_value = Decimal('100')
+    target = PositionExecutor if failure == 'start' else ExecutorOrchestrator
+    method = 'start' if failure == 'start' else '_restore_positions_from_ledger'
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+                  side_effect=lambda path: resume.pending_manifest(path, now=1001, root=root)), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+                  side_effect=lambda path, value: resume.claim(path, value, now=1001)), \
+            patch.object(PositionExecutor, 'get_trading_rules', return_value=old.trading_rules), \
+            patch.object(target, method, side_effect=RuntimeError('injected after claim')) as broken:
+        orchestrator = ExecutorOrchestrator(strategy)
+        assert not orchestrator.resume_planned_positions_if_ready()
+        assert broken.call_count == 1
+        assert not orchestrator.resume_planned_positions_if_ready()
+        assert broken.call_count == 1
+        assert 'injected after claim' in orchestrator._planned_resume_failure
+        assert resume.inspect_manifest(db)[0]['state'] == 'claimed'
+        orchestrator.store_all_executors(clear=False)
+        orchestrator.sync_live_executors_to_db()
+        assert not recorder.get_all_executors()[0].is_done
+        stopped = await orchestrator.stop(strict=True)
+        assert not stopped.reconciliation_complete
+        assert not recorder.get_all_executors()[0].is_done
+        with pytest.raises(RuntimeError, match='pending'):
+            orchestrator.create_executor(CreateExecutorAction(controller_id='owner', executor_config=old.config))
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        after_crash = ExecutorOrchestrator(strategy)
+        assert after_crash.active_executors['owner'] == []
+        assert after_crash.recovery_required['owner'] == [old.config.id]
+    strategy.buy.assert_not_called()
+    strategy.sell.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sealed_entry_duplicate_fill_ignored_but_extra_fill_blocks_exit(tmp_path):
+    from hummingbot.core.event.events import OrderFilledEvent
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    with resume.connect(before) as connection:
+        preflight = connection.execute('SELECT * FROM Executors').fetchone()
+    with resume.connect(db) as connection:
+        stopped = connection.execute('SELECT * FROM Executors').fetchone()
+    position = resume.validate_position(preflight, stopped)
+    with patch.object(PositionExecutor, 'get_trading_rules', return_value=old.trading_rules):
+        recovered = PositionExecutor(old._strategy, old.config)
+    recovered.hydrate_planned_position(position, 'sealed')
+    recovered._status = RunnableStatus.RUNNING
+    recovered.place_order = MagicMock()
+    recovered._strategy.executor_orchestrator = SimpleNamespace(recovery_required={})
+    event = OrderFilledEvent(1000, 'entry', 'ETH-USDT', TradeType.BUY, OrderType.LIMIT,
+                             Decimal('100'), Decimal('1'), AddedToCostTradeFee(), 'entry', 'entry')
+    recovered.process_order_filled_event(0, None, event)
+    assert recovered._resume_conflicting_fill is None
+    recovered.process_order_filled_event(0, None, event._replace(exchange_trade_id='unexpected', amount=Decimal('.1')))
+    assert recovered.get_custom_info()['entry_lifecycle']['state'] == 'reconciliation_required'
+    assert recovered._strategy.executor_orchestrator.recovery_required == {'owner': [old.config.id]}
+    recovered.place_open_order()
+    recovered.place_close_order_and_cancel_open_orders(CloseType.TRAILING_STOP)
+    await recovered.control_task()
+    recovered.place_order.assert_not_called()
+    assert recovered.amount_to_close == Decimal('1')

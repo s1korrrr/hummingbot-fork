@@ -178,6 +178,9 @@ class PositionExecutor(ExecutorBase):
         self._close_order_type: Optional[OrderType] = None
         self._trailing_limit_fallback_pending: bool = False
         self._trailing_floor_hold: bool = False
+        self._resume_entry_sealed = False
+        self._planned_resume_id = None
+        self._resume_conflicting_fill = None
         self._entry_submitted: bool = False
         self._entry_stop_reason: Optional[str] = None
         self._entry_cancel_last_attempt_at: Optional[float] = None
@@ -189,6 +192,30 @@ class PositionExecutor(ExecutorBase):
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._current_retries = 0
         self._max_retries = max_retries
+
+    def hydrate_planned_position(self, position: Dict, manifest_id: str):
+        """Restore the original terminal receipt; caller must atomically claim before start."""
+        if self.status != RunnableStatus.NOT_STARTED or self._open_order is not None:
+            raise ValueError("Position must be new and unstarted before hydration")
+        if self.config != PositionExecutorConfig.model_validate(position["config"]):
+            raise ValueError("Planned position configuration differs")
+        order = InFlightOrder.from_json(position["entry"])
+        if order.current_state != OrderState.FILLED or order.executed_amount_base != order.amount:
+            raise ValueError("Planned position entry must be fully filled")
+        self._open_order = TrackedOrder(order_id=order.client_order_id)
+        self._open_order.order = order
+        self._resume_entry_sealed = True
+        self._planned_resume_id = manifest_id
+        self._entry_submitted = True
+        self._entry_lifecycle = {"state": "managing_fill", "stop_reason": "planned_resume_sealed_entry"}
+        trailing = position["trailing"]
+        trigger = trailing["trailing_stop_trigger_pct"]
+        self._trailing_stop_trigger_pct = Decimal(str(trigger)) if trigger is not None else None
+        self._trailing_stop_move_count = trailing["trailing_move_count"]
+        self._trailing_stop_armed_timestamp = trailing["trailing_armed_timestamp"]
+        self._trailing_stop_last_update_timestamp = trailing["trailing_last_update_timestamp"]
+        if self.amount_to_close != Decimal(position["net_base"]):
+            raise ValueError("Hydrated owned inventory differs from sealed receipt")
 
     def stop(self):
         self._cancel_entry_expiry_reconciliation()
@@ -254,7 +281,7 @@ class PositionExecutor(ExecutorBase):
         close_amount = self.amount_to_close
         if close_amount <= Decimal("0") or self.is_perpetual or self.close_order_side != TradeType.SELL:
             return close_amount
-        if self.config.entry_order_policy == "single_attempt":
+        if self.config.entry_order_policy == "single_attempt" or self._resume_entry_sealed:
             return self._single_attempt_spot_close_amount()
 
         base_asset = self.config.trading_pair.split("-")[0]
@@ -708,6 +735,8 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._resume_conflicting_fill is not None:
+            return  # Keep ownership; only explicit reconciliation can resolve a sealed receipt conflict.
         if self.status == RunnableStatus.RUNNING:
             self.control_open_order()
             await self._reconcile_expired_entry()
@@ -843,6 +872,8 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._resume_entry_sealed:
+            return  # Native barriers retain original end_time; entry balance/expiry checks do not apply.
         await super().on_start()
         if self.is_expired:
             self.close_type = CloseType.EXPIRED
@@ -855,6 +886,8 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._resume_entry_sealed:
+            return
         if self.config.entry_order_policy == "single_attempt":
             self._control_single_attempt_entry()
             return
@@ -905,7 +938,7 @@ class PositionExecutor(ExecutorBase):
             return not self._entry_submitted
         order = self._open_order.order
         return order is not None and (
-            order.current_state == OrderState.CANCELED
+            (order.current_state == OrderState.CANCELED and self._open_order_expiry_reconciled)
             or (order.current_state == OrderState.FILLED and order.executed_amount_base == order.amount)
             or (order.is_failure and self._entry_failure_is_final)
         )
@@ -940,6 +973,11 @@ class PositionExecutor(ExecutorBase):
         if ((order.is_failure and not self._entry_failure_is_final)
                 or (order.current_state == OrderState.FILLED and order.executed_amount_base != order.amount)):
             self._end_entry_acquisition("entry_failure")
+            self._entry_lifecycle["state"] = "reconciliation_required"
+            return
+        if order.is_cancelled and not self._open_order_expiry_reconciled:
+            self._open_order_entry_expired = True
+            self._end_entry_acquisition("exchange_canceled")
             self._entry_lifecycle["state"] = "reconciliation_required"
             return
         if not self._entry_terminal_confirmed():
@@ -998,10 +1036,15 @@ class PositionExecutor(ExecutorBase):
                 task.cancel()
 
     async def _reconcile_expired_entry(self):
+        if (self.config.entry_order_policy == "single_attempt" and self._open_order
+                and self._open_order.order and self._open_order.order.is_cancelled
+                and not self._open_order_expiry_reconciled):
+            self._open_order_entry_expired = True
+            self._end_entry_acquisition("exchange_canceled")
         if not self._open_order_entry_expired or self._open_order_expiry_reconciled:
             return
         # A fill can arrive while REST is pending. Never block its exit barriers.
-        if self.open_filled_amount > Decimal("0"):
+        if self.open_filled_amount > Decimal("0") and self.config.entry_order_policy != "single_attempt":
             self._cancel_entry_expiry_reconciliation()
             return
         task = self._entry_expiry_reconciliation_task
@@ -1023,6 +1066,9 @@ class PositionExecutor(ExecutorBase):
                 f"Expired entry reconciliation pending; retaining ownership: {type(exc).__name__}: {exc}"))
             return
         self._open_order_expiry_reconciled = True
+        if self.config.entry_order_policy == "single_attempt" and self.status == RunnableStatus.RUNNING:
+            self._control_single_attempt_entry()
+            return
         if self.status == RunnableStatus.RUNNING and self.open_filled_amount == Decimal("0"):
             self.close_type = CloseType.EXPIRED
             self.close_timestamp = self._strategy.current_timestamp
@@ -1080,6 +1126,8 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._resume_entry_sealed:
+            return
         if self.config.entry_order_policy == "single_attempt":
             if self.is_closed or self._entry_submitted or self._entry_stop_reason is not None or self._open_order:
                 return
@@ -1125,6 +1173,8 @@ class PositionExecutor(ExecutorBase):
         :param price: The price to be used in the close order.
         :return: None
         """
+        if self._resume_conflicting_fill is not None:
+            return
         if self.config.entry_order_policy == "single_attempt" and close_type == CloseType.EXPIRED:
             # Defense in depth: an entry deadline is never an exit authorization.
             self._end_entry_acquisition("entry_deadline")
@@ -1330,6 +1380,8 @@ class PositionExecutor(ExecutorBase):
         :param order_id: The order_id to be used as a reference.
         :return: None
         """
+        if self._resume_entry_sealed and self._open_order and order_id == self._open_order.order_id:
+            return
         in_flight_order = self.get_in_flight_order(self.config.connector_name, order_id)
         if in_flight_order is not None:
             for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()]):
@@ -1341,6 +1393,8 @@ class PositionExecutor(ExecutorBase):
         This method is responsible for processing the order created event. Here we will update the TrackedOrder with the
         order_id.
         """
+        if self._resume_entry_sealed and self._open_order and event.order_id == self._open_order.order_id:
+            return
         self.update_tracked_orders_with_order_id(event.order_id)
 
     def process_order_filled_event(self, _, market, event: OrderFilledEvent):
@@ -1349,6 +1403,22 @@ class PositionExecutor(ExecutorBase):
         _total_executed_amount_backup, that can be used if the InFlightOrder
         is not available.
         """
+        if self._resume_entry_sealed and self._open_order and event.order_id == self._open_order.order_id:
+            known = self._open_order.order.order_fills.get(event.exchange_trade_id)
+            if (known is None or event.trading_pair != self.config.trading_pair or event.trade_type != TradeType.BUY
+                    or event.amount != known.fill_base_amount or event.price != known.fill_price
+                    or event.trade_fee.to_json() != known.fee.to_json()
+                    or event.exchange_order_id not in ("", self._open_order.order.exchange_order_id)):
+                self._resume_conflicting_fill = {"trade_id": event.exchange_trade_id,
+                                                 "amount": str(event.amount), "price": str(event.price)}
+                self._entry_lifecycle["state"] = "reconciliation_required"
+                recovery = getattr(getattr(self._strategy, "executor_orchestrator", None), "recovery_required", None)
+                if isinstance(recovery, dict):
+                    identities = recovery.setdefault(self.config.controller_id, [])
+                    if self.config.id not in identities:
+                        identities.append(self.config.id)
+                self.logger().error(self._log_message("Sealed entry fill conflict; execution requires reconciliation"))
+            return
         self.update_tracked_orders_with_order_id(event.order_id)
 
     def process_order_completed_event(self, _, market, event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]):
@@ -1356,6 +1426,8 @@ class PositionExecutor(ExecutorBase):
         This method is responsible for processing the order completed event. Here we will check if the id is one of the
         tracked orders and update the state
         """
+        if self._resume_entry_sealed and self._open_order and event.order_id == self._open_order.order_id:
+            return
         self._total_executed_amount_backup += event.base_asset_amount
         self.update_tracked_orders_with_order_id(event.order_id)
 
@@ -1371,6 +1443,8 @@ class PositionExecutor(ExecutorBase):
         """
         This method is responsible for processing the order canceled event
         """
+        if self._resume_entry_sealed and self._open_order and event.order_id == self._open_order.order_id:
+            return
         self.update_tracked_orders_with_order_id(event.order_id)
         if self._close_order and event.order_id == self._close_order.order_id:
             self._failed_orders.append(self._close_order)
@@ -1401,6 +1475,8 @@ class PositionExecutor(ExecutorBase):
         This method is responsible for processing the order failed event. Here we will add the InFlightOrder to the
         failed orders list.
         """
+        if self._resume_entry_sealed and self._open_order and event.order_id == self._open_order.order_id:
+            return
         self.update_tracked_orders_with_order_id(event.order_id)
         if self._open_order and event.order_id == self._open_order.order_id:
             if self.config.entry_order_policy == "single_attempt":
@@ -1482,6 +1558,9 @@ class PositionExecutor(ExecutorBase):
         role = level_id if level_id in {"scout", "runner"} else None
         trailing_snapshot = self._trailing_status_snapshot()
         custom_info = {
+            "planned_position_resume": self._planned_resume_id,
+            "resume_entry_sealed": self._resume_entry_sealed,
+            "resume_conflicting_fill": self._resume_conflicting_fill,
             "level_id": level_id,
             "role": role,
             "current_position_average_price": self.entry_price,

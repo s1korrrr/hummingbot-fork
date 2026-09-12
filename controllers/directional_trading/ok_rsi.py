@@ -850,6 +850,11 @@ class OKRSIController(hl_rsi.HLRSIController):
         if not super().validate_executor_config(config):
             return False
         if config.side != TradeType.BUY:
+            if self.config.trade_mode == "sell_only" and self.config.sell_only_strict_fraction:
+                ceiling = self._get_sellable_inventory_amount() * self.config.sell_only_inventory_fraction
+                if config.amount > ceiling:
+                    self._record_gate_reason(TradeType.SELL, "sell_fraction_exceeded")
+                    return False
             return True
         try:
             from controllers.directional_trading.ok_rsi_core.entry_decisions import executor_fingerprint
@@ -1113,7 +1118,15 @@ class OKRSIController(hl_rsi.HLRSIController):
             self._record_gate_reason(target_side, "trading_rule_unavailable")
             return False
         try:
-            return super().can_create_executor(signal)
+            allowed = super().can_create_executor(signal)
+            if allowed and signal < 0 and self.config.trade_mode == "sell_only" and self.config.sell_only_strict_fraction:
+                inventory = self._get_sellable_inventory_amount()
+                price = self._shade_limit_maker_price(trade_type=TradeType.SELL, fallback_price=self._get_mid_price())
+                return self._resolve_recovery_sell_amount(
+                    position_amount=inventory, target_amount=self._sell_only_target_amount(inventory, price),
+                    price=price, available_base=inventory,
+                ) > 0
+            return allowed
         except ExecutorInputUnavailable:
             self._record_gate_reason(target_side, "execution_input_unavailable")
             return False
@@ -1121,9 +1134,34 @@ class OKRSIController(hl_rsi.HLRSIController):
     def _sell_only_target_amount(self, position_amount: Decimal, price: Decimal) -> Decimal:
         if position_amount <= 0 or price <= 0:
             return Decimal("0")
-        if position_amount * price < self.config.sell_all_below_quote:
+        if not self.config.sell_only_strict_fraction and position_amount * price < self.config.sell_all_below_quote:
             return position_amount
         return position_amount * self.config.sell_only_inventory_fraction
+
+    def _resolve_recovery_sell_amount(
+        self, *, position_amount: Decimal, target_amount: Decimal, price: Decimal,
+        available_base: Optional[Decimal] = None,
+    ) -> Decimal:
+        if self.config.trade_mode != "sell_only" or not self.config.sell_only_strict_fraction:
+            return super()._resolve_recovery_sell_amount(
+                position_amount=position_amount, target_amount=target_amount, price=price,
+                available_base=available_base,
+            )
+        ceiling = min(position_amount, target_amount)
+        if available_base is not None:
+            ceiling = min(ceiling, available_base)
+        if ceiling <= 0 or price <= 0:
+            return Decimal("0")
+        rule = self._require_trading_rule()
+        minimum = self._minimum_entry_amount(price, rule)
+        if ceiling < minimum:
+            self._record_gate_reason(TradeType.SELL, "sell_fraction_below_minimum")
+            return Decimal("0")
+        amount = self._quantize_amount(ceiling)
+        if amount > ceiling or amount < minimum or amount * price < self._minimum_entry_quote(price, rule):
+            self._record_gate_reason(TradeType.SELL, "sell_fraction_below_minimum")
+            return Decimal("0")
+        return amount
 
     def _signal_sell_target_amount(self, position_amount: Decimal, price: Decimal) -> Decimal:
         if self.config.trade_mode == "sell_only":

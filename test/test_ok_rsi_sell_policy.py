@@ -165,3 +165,99 @@ def test_signal_sell_rejects_incomplete_mixed_owned_basis():
     bot.positions_held = [position(bot, amount="50"), position(bot, amount="50", basis=None)]
     with pytest.raises(ValueError, match="cost basis"):
         bot.get_executor_config(TradeType.SELL, Decimal("10"), Decimal("999"))
+
+
+def strict_wallet_controller(*, balance="100", minimum="0.01"):
+    bot = controller("sell_only", balance=balance, minimum=minimum)
+    bot.config = OKRSIControllerConfig(**{
+        **bot.config.model_dump(), 'sell_only_if_profitable': False,
+        'sell_only_strict_fraction': True,
+    })
+    return bot
+
+
+@pytest.mark.parametrize('balance', ['100', '1'])
+def test_strict_wallet_signal_sells_ten_percent_without_basis_or_small_wallet_sweep(balance):
+    bot = strict_wallet_controller(balance=balance)
+    assert not bot.positions_held
+    config = bot.get_executor_config(TradeType.SELL, Decimal('10'), Decimal('999'))
+    assert config.amount == Decimal(balance) * Decimal('0.1')
+    assert config.min_sell_price is None
+    assert bot._check_held_bag_recovery(current_price=Decimal('10'), now_ts=1725000000, current_signal=-1) == []
+    with pytest.raises(ValueError, match='BUY executor construction is forbidden'):
+        bot.get_executor_config(TradeType.BUY, Decimal('10'), Decimal('999'))
+
+
+@pytest.mark.parametrize('balance,minimum', [('1', '5'), ('0.7', '5')])
+def test_strict_wallet_signal_skips_below_minimum_instead_of_uplift_or_sweep(balance, minimum):
+    bot = strict_wallet_controller(balance=balance, minimum=minimum)
+    with pytest.raises(ValueError, match='valid sell amount'):
+        bot.get_executor_config(TradeType.SELL, Decimal('10'), Decimal('999'))
+
+
+def test_strict_wallet_keeps_fraction_even_when_remainder_would_be_dust():
+    bot = strict_wallet_controller(balance='1', minimum='5')
+    bot.config.sell_only_inventory_fraction = Decimal('.8')
+    config = bot.get_executor_config(TradeType.SELL, Decimal('10'), Decimal('999'))
+    assert config.amount == Decimal('.8')
+
+
+@pytest.mark.parametrize('balance,minimum,expected', [('100', '0.01', '10'), ('1', '0.01', '.1'), ('1', '5', None)])
+def test_strict_recovery_obeys_wallet_fraction_and_skips_venue_minimum(balance, minimum, expected):
+    bot = strict_wallet_controller(balance=balance, minimum=minimum)
+    bot.positions_held = [position(bot, amount=balance, fees='0')]
+    actions = recovery(bot)
+    if expected is None:
+        assert actions == []
+    else:
+        assert len(actions) == 1
+        assert actions[0].executor_config.amount == Decimal(expected)
+
+
+def test_strict_fraction_policy_cannot_be_disabled_by_hot_reload():
+    bot = strict_wallet_controller()
+    assert bot.config.sell_only_strict_fraction is True
+    requested = OKRSIControllerConfig(**{**bot.config.model_dump(), 'sell_only_strict_fraction': False})
+    with pytest.raises(ValueError, match='restart required.*sell_only_strict_fraction'):
+        bot.update_config(requested)
+    assert bot.config.sell_only_strict_fraction is True
+
+
+def test_strict_fraction_does_not_change_main_minimum_and_dust_policy():
+    bot = controller(minimum='120')
+    bot.config = OKRSIControllerConfig(**{**bot.config.model_dump(), 'sell_only_strict_fraction': True})
+    bot.positions_held = [position(bot, fees='0')]
+    config = bot.get_executor_config(TradeType.SELL, Decimal('10'), Decimal('999'))
+    assert config.amount * config.price >= Decimal('120')
+
+
+@pytest.mark.parametrize('recovery_exit', [False, True])
+def test_strict_wallet_admission_rechecks_fraction_after_available_balance_drops(recovery_exit):
+    from hummingbot.strategy_v2.models.base import RunnableStatus
+    bot = strict_wallet_controller()
+    bot._status = RunnableStatus.RUNNING
+    if recovery_exit:
+        bot.positions_held = [position(bot, fees='0')]
+        config = recovery(bot)[0].executor_config
+    else:
+        config = bot.get_executor_config(TradeType.SELL, Decimal('10'), Decimal('999'))
+    bot.processed_data['data_health'] = {'ready': True}
+    assert bot.validate_executor_config(config)
+    bot.market_data_provider.get_available_balance.return_value = Decimal('50')
+    assert not bot.validate_executor_config(config)
+    assert bot._last_gate_reason[TradeType.SELL] == 'sell_fraction_exceeded'
+
+
+def test_strict_wallet_never_accepts_quantization_above_fraction():
+    bot = strict_wallet_controller()
+    bot.market_data_provider.quantize_order_amount.side_effect = lambda connector, pair, amount: amount + Decimal('1')
+    with pytest.raises(ValueError, match='valid sell amount'):
+        bot.get_executor_config(TradeType.SELL, Decimal('10'), Decimal('999'))
+
+
+def test_strict_wallet_below_minimum_produces_no_action_or_construction_error():
+    bot = strict_wallet_controller(balance='1', minimum='5')
+    bot.config.durable_candle_watermark_enabled = False
+    bot._entry_decision_gate = MagicMock()  # BUY admission storage is unrelated to this SELL proposal.
+    assert bot.create_actions_proposal() == []
+    assert bot._last_gate_reason[TradeType.SELL] == 'sell_fraction_below_minimum'

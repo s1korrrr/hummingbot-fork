@@ -110,6 +110,11 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         ),
     )
 
+    sell_only_strict_fraction: bool = hl_rsi.Field(
+        default=False,
+        description="Never uplift a sell-only fraction or sweep its dust remainder; skip below venue minimums.",
+        json_schema_extra={"is_updatable": False},
+    )
     sell_only_inventory_fraction: Decimal = hl_rsi.Field(
         default=Decimal("0.10"),
         gt=Decimal("0"),

@@ -101,6 +101,14 @@ executors require explicit reconciliation. Keep all prepared database copies
 stopped: a local SQLite transaction does not provide exclusivity across copied
 databases or different machines.
 
+A later explicitly authorized handover requires a new running preflight, strict
+stopped-owner receipts and fresh venue reconciliation through the same procedure.
+Preparation appends a new manifest only when every existing manifest is a valid
+consumed claim. Prior rows and payloads remain unchanged; the new manifest binds
+that history and rejects changes before claim. An unconsumed, unknown or malformed
+history blocks preparation. This never replays a prior claim or bypasses current
+ownership, source, configuration, expiry or reconciliation checks.
+
 Before claim, rollback is the original stopped database and runtime backup. After
 claim or any resumed exit, stop and reconcile orders/fills first; do not restore
 an old database over new execution. Inspect the archived selected ledger and

@@ -130,7 +130,8 @@ class V2WithControllers(StrategyV2Base):
     def on_tick(self):
         super().on_tick()
         self.process_operator_events()
-        if not self._is_stop_triggered:
+        # The parent defers report initialization until planned ownership is restored.
+        if not self._is_stop_triggered and not self.executor_orchestrator._planned_resume_pending:
             self.check_manual_kill_switch()
             self.control_max_drawdown()
             self.send_performance_report()

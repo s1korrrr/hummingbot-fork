@@ -411,3 +411,221 @@ async def test_sealed_entry_duplicate_fill_ignored_but_extra_fill_blocks_exit(tm
     await recovered.control_task()
     recovered.place_order.assert_not_called()
     assert recovered.amount_to_close == Decimal('1')
+
+
+def refresh_stopped_evidence(db, evidence, now):
+    import copy
+    import hashlib
+    from datetime import datetime, timezone
+
+    fresh = copy.deepcopy(evidence)
+    with sqlite3.connect(db) as connection:
+        connection.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    sha = hashlib.sha256(db.read_bytes()).hexdigest()
+    fresh.update(observed_at=now, expires_at=now + 800)
+    fresh['reconciliation']['database'].update(sha256=sha, sha256_after=sha)
+    fresh['reconciliation']['started_at'] = datetime.fromtimestamp(now - 10, timezone.utc).isoformat()
+    fresh['reconciliation']['finished_at'] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    return fresh
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('history_change', ['payload', 'delete'])
+async def test_second_explicit_handover_preserves_consumed_manifest_and_same_position(tmp_path, history_change):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path, armed=True)
+    first = resume.prepare(db, before, evidence, now=1000, root=root)
+    strategy = old._strategy
+    strategy.controllers = {'owner': SimpleNamespace(config=SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT'))}
+    strategy.markets = {'okx': {'ETH-USDT'}}
+    strategy.ready_to_trade = True
+    strategy.market_data_provider = MagicMock(ready=True)
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    strategy.connectors['okx'].in_flight_orders = {}
+    strategy.connectors['okx'].get_price_by_type.return_value = Decimal('100')
+    strategy.connectors['okx']._order_tracker.fetch_order.return_value = None
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+                  side_effect=lambda path: resume.pending_manifest(path, now=1001, root=root)), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+                  side_effect=lambda path, value: resume.claim(path, value, now=1001)), \
+            patch.object(PositionExecutor, 'get_trading_rules', return_value=old.trading_rules), \
+            patch.object(PositionExecutor, 'start'):
+        orchestrator = ExecutorOrchestrator(strategy)
+        assert orchestrator.resume_planned_positions_if_ready()
+        recovered = orchestrator.active_executors['owner'][0]
+        assert recovered.config == old.config
+        assert recovered._planned_resume_id == first['id']
+        consumed = resume.inspect_manifest(db)[0]
+        assert consumed['state'] == 'claimed'
+        recovered._status = RunnableStatus.RUNNING
+        recovered._sleep = AsyncMock()
+        recovered.place_order = MagicMock()
+        recorder.store_or_update_executor(recovered)
+        second_preflight = tmp_path / 'second-preflight.sqlite'
+        with sqlite3.connect(db) as source, sqlite3.connect(second_preflight) as destination:
+            source.backup(destination)
+        recovered.early_stop(keep_position=True)
+        await recovered.control_task()
+        assert recovered.is_closed
+        result = await orchestrator.stop(0, keep_position_by_controller={'owner': True}, strict=True)
+        assert result.reconciliation_complete
+        recovered.place_order.assert_not_called()
+        fresh = refresh_stopped_evidence(db, evidence, 1100)
+        second = resume.prepare(db, second_preflight, fresh, now=1100, root=root)
+        assert second['id'] != first['id']
+        assert second['positions'][0]['executor_id'] == first['positions'][0]['executor_id']
+        assert second['positions'][0]['trailing'] == first['positions'][0]['trailing']
+        assert second['positions'][0]['net_base'] == '1'
+        assert resume.inspect_manifest(db)[0] == consumed
+        assert resume.pending_manifest(db, now=1101, root=root) == second
+        # A later handover binds the old immutable receipts, including their exact payload bytes.
+        with resume.connect(db, writable=True) as connection:
+            if history_change == 'delete':
+                connection.execute(f'DELETE FROM {resume.TABLE} WHERE id=?', (first['id'],))
+            else:
+                changed = json.loads(consumed['payload'])
+                changed['evidence']['owner'] = 'tampered-history'
+                connection.execute(f'UPDATE {resume.TABLE} SET payload=? WHERE id=?',
+                                   (resume.canonical(changed), first['id']))
+        with pytest.raises(ValueError, match='history'):
+            resume.pending_manifest(db, now=1101, root=root)
+        with pytest.raises(ValueError, match='history'):
+            resume.claim(db, second, now=1101)
+        with resume.connect(db, writable=True) as connection:
+            if history_change == 'delete':
+                connection.execute(f'INSERT INTO {resume.TABLE} VALUES (?, ?, ?, ?)',
+                                   (consumed['id'], consumed['state'], consumed['payload'], consumed['claimed_at']))
+            else:
+                connection.execute(f'UPDATE {resume.TABLE} SET payload=? WHERE id=?',
+                                   (consumed['payload'], first['id']))
+        with pytest.raises(ValueError, match='consumed'):
+            resume.claim(db, first, now=1101)
+        resume.claim(db, second, now=1101)
+        rows = resume.inspect_manifest(db)
+        assert next(row for row in rows if row['id'] == first['id']) == consumed
+        assert len(rows) == 2 and all(row['state'] == 'claimed' for row in rows)
+        assert resume.pending_manifest(db, now=1102, root=root) is None
+        with pytest.raises(ValueError, match='consumed'):
+            resume.claim(db, second, now=1102)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('history_state', ['prepared', 'unknown', 'claimed-without-time', 'claimed-malformed-payload'])
+async def test_new_prepare_rejects_unconsumed_or_invalid_history(tmp_path, history_state):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    manifest = resume.prepare(db, before, evidence, now=1000, root=root)
+    with resume.connect(db, writable=True) as connection:
+        if history_state == 'unknown':
+            connection.execute(f'UPDATE {resume.TABLE} SET state=?', ('unknown',))
+        elif history_state.startswith('claimed'):
+            connection.execute(f'UPDATE {resume.TABLE} SET state=?', ('claimed',))
+            if history_state == 'claimed-malformed-payload':
+                connection.execute(f'UPDATE {resume.TABLE} SET claimed_at=1001, payload=?', ('{}',))
+    original = resume.inspect_manifest(db)
+    fresh = refresh_stopped_evidence(db, evidence, 1100)
+    with pytest.raises(ValueError, match='manifest|history'):
+        resume.prepare(db, before, fresh, now=1100, root=root)
+    assert resume.inspect_manifest(db) == original
+    assert len(original) == 1 and original[0]['id'] == manifest['id']
+
+
+@pytest.mark.asyncio
+async def test_pending_and_claim_reject_unknown_manifest_history(tmp_path):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    manifest = resume.prepare(db, before, evidence, now=1000, root=root)
+    with resume.connect(db, writable=True) as connection:
+        connection.execute(f'INSERT INTO {resume.TABLE} VALUES (?, ?, ?, ?)', ('unknown', 'unknown', '{}', None))
+    with pytest.raises(ValueError, match='history|manifest'):
+        resume.pending_manifest(db, now=1001, root=root)
+    with pytest.raises(ValueError, match='history|manifest'):
+        resume.claim(db, manifest, now=1001)
+    assert recorder.get_all_executors()[0].is_done
+
+
+async def stop_resumed_owner_again(db, root, recorder, old, now, before):
+    strategy = old._strategy
+    strategy.controllers = {'owner': SimpleNamespace(config=SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT'))}
+    strategy.markets = {'okx': {'ETH-USDT'}}
+    strategy.ready_to_trade = True
+    strategy.market_data_provider = MagicMock(ready=True)
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    strategy.connectors['okx'].in_flight_orders = {}
+    strategy.connectors['okx'].get_price_by_type.return_value = Decimal('100')
+    strategy.connectors['okx']._order_tracker.fetch_order.return_value = None
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+                  side_effect=lambda path: resume.pending_manifest(path, now=now, root=root)), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+                  side_effect=lambda path, value: resume.claim(path, value, now=now)), \
+            patch.object(PositionExecutor, 'get_trading_rules', return_value=old.trading_rules), \
+            patch.object(PositionExecutor, 'start'):
+        orchestrator = ExecutorOrchestrator(strategy)
+        assert orchestrator.resume_planned_positions_if_ready()
+        recovered = orchestrator.active_executors['owner'][0]
+        assert recovered.config == old.config
+        recovered._status = RunnableStatus.RUNNING
+        recovered._sleep = AsyncMock()
+        recovered.place_order = MagicMock()
+        recorder.store_or_update_executor(recovered)
+        with sqlite3.connect(db) as source, sqlite3.connect(before) as destination:
+            source.backup(destination)
+        recovered.early_stop(keep_position=True)
+        await recovered.control_task()
+        assert (await orchestrator.stop(0, keep_position_by_controller={'owner': True}, strict=True)).reconciliation_complete
+        recovered.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('rounds,damage', [(2, 'payload'), (2, 'first'), (2, 'all'), (1, 'all'), (1, 'table'), (2, 'legacy-later')])
+async def test_consumed_history_cannot_be_changed_before_later_prepare_or_startup(tmp_path, rounds, damage):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path, armed=True)
+    first = None
+    for index in range(rounds):
+        now = 1000 + index * 100
+        fresh = refresh_stopped_evidence(db, evidence, now)
+        manifest = resume.prepare(db, before, fresh, now=now, root=root)
+        first = first or manifest['id']
+        before = tmp_path / f'next-preflight-{index}.sqlite'
+        await stop_resumed_owner_again(db, root, recorder, old, now + 1, before)
+    with resume.connect(db, writable=True) as connection:
+        if damage == 'payload':
+            row = connection.execute(f'SELECT payload FROM {resume.TABLE} WHERE id=?', (first,)).fetchone()
+            changed = json.loads(row[0])
+            changed['evidence']['owner'] = 'tampered-before-prepare'
+            connection.execute(f'UPDATE {resume.TABLE} SET payload=? WHERE id=?', (resume.canonical(changed), first))
+        elif damage == 'legacy-later':
+            row = connection.execute(f'SELECT id, payload FROM {resume.TABLE} WHERE id!=?', (first,)).fetchone()
+            changed = json.loads(row['payload'])
+            changed.pop('claimed_history_digest')
+            connection.execute(f'UPDATE {resume.TABLE} SET payload=? WHERE id=?', (resume.canonical(changed), row['id']))
+        elif damage == 'first':
+            connection.execute(f'DELETE FROM {resume.TABLE} WHERE id=?', (first,))
+        elif damage == 'all':
+            connection.execute(f'DELETE FROM {resume.TABLE}')
+        else:
+            connection.execute(f'DROP TABLE {resume.TABLE}')
+    damaged = resume.inspect_manifest(db)
+    now = 1000 + rounds * 100
+    with pytest.raises(ValueError, match='history|manifest'):
+        resume.pending_manifest(db, now=now, root=root)
+    with pytest.raises(ValueError, match='history|manifest'):
+        resume.prepare(db, before, refresh_stopped_evidence(db, evidence, now), now=now, root=root)
+    assert resume.inspect_manifest(db) == damaged
+
+
+@pytest.mark.asyncio
+async def test_legacy_first_claim_remains_valid_history_for_next_explicit_handover(tmp_path):
+    db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
+    first = resume.prepare(db, before, evidence, now=1000, root=root)
+    # Reproduce the original released schema, before predecessor digests existed.
+    first.pop('claimed_history_digest')
+    with resume.connect(db, writable=True) as connection:
+        connection.execute(f'UPDATE {resume.TABLE} SET payload=? WHERE id=?', (resume.canonical(first), first['id']))
+    before = tmp_path / 'legacy-next-preflight.sqlite'
+    await stop_resumed_owner_again(db, root, recorder, old, 1001, before)
+    retained = resume.inspect_manifest(db)
+    second = resume.prepare(db, before, refresh_stopped_evidence(db, evidence, 1100), now=1100, root=root)
+    assert second['claimed_history_digest'] == resume.digest(retained)
+    assert resume.pending_manifest(db, now=1101, root=root) == second
+    resume.claim(db, second, now=1101)
+    assert resume.inspect_manifest(db)[0] == retained[0]

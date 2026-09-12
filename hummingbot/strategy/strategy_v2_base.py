@@ -857,6 +857,11 @@ class StrategyV2Base(StrategyPyBase):
                 "pairs": pairs, "reconciliation": self._runtime_reconciliation_observation()}
 
     def _build_runtime_status_snapshot(self) -> Dict[str, Any]:
+        from hummingbot.strategy.native_observability import (
+            active_order_observations,
+            controller_observation,
+            executor_observation,
+        )
         controller_entries = self._build_controller_status_entries()
         balances = self._get_balances_snapshot()
         focus_queue = [
@@ -878,6 +883,7 @@ class StrategyV2Base(StrategyPyBase):
             pair = summary.get("pair", entry["controller_id"])
             controllers.append(
                 {
+                    **controller_observation(entry),
                     "pair": pair,
                     "price_quote": float(self._safe_decimal(summary.get("price", 0))) if str(summary.get("price", "n/a")) != "n/a" else None,
                     "state": summary.get("state", "n/a"),
@@ -897,6 +903,7 @@ class StrategyV2Base(StrategyPyBase):
                 side = self._compact_side_label(executor.side or getattr(executor.config, "side", None))
                 active_executors.append(
                     {
+                        **executor_observation(executor, entry["controller_id"]),
                         "pair": pair,
                         "side": side.lower() if side else None,
                         "executor_type": self._compact_executor_type(executor.type),
@@ -923,6 +930,7 @@ class StrategyV2Base(StrategyPyBase):
                     }
                 )
 
+        active_orders, active_orders_status = active_order_observations(self.connectors, controller_entries)
         active_orders_count = sum(len(self.get_active_orders(connector_name)) for connector_name in self.connectors)
         balance_value_quote = round(sum(row["value_quote"] for row in balances), 6)
         positions_value_quote = round(sum(row["value_quote"] for row in positions_held), 6)
@@ -936,6 +944,8 @@ class StrategyV2Base(StrategyPyBase):
             "updated_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
             "operations": self._build_runtime_operations_snapshot(),
             "active_orders_count": active_orders_count,
+            "active_orders": active_orders,
+            "active_orders_status": active_orders_status,
             "balances": balances,
             "controllers": controllers,
             "focus_queue": focus_queue,

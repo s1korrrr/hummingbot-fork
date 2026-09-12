@@ -29,8 +29,8 @@ fallback. Local tests must explicitly inject an entry-decision store.
 SELL management remains independent of BUY admission storage. Episode runtime
 reconciliation, stop actions and SELL exits continue through their existing gates.
 Only new episode BUY actions are filtered and rejected at queued validation until
-that separate authorization path supports this contract. There is no activation
-or restart in this change.
+that separate authorization path supports this contract. Repository validation
+does not activate or restart a strategy.
 
 Dispatch consumes the exact authorized executor identity and configuration once,
 after existing controller risk checks. A crash between durable dispatch and actual
@@ -42,3 +42,15 @@ exchange submission guarantees.
 Validation: `python -m pytest test/test_ok_rsi_entry_decisions.py -q` in the native
 Hummingbot environment. Tests use local SQLite and mocked market inputs; they do
 not connect to an exchange or grant deployment/trading authority.
+
+A canceled entry, including one with a known partial fill, retains ownership until
+an opted-in native connector has reconciled the terminal cumulative fill total.
+A cancellation event alone is insufficient. Missing or failed authoritative proof
+also blocks strict shutdown; cancellation never authorizes a replacement BUY.
+
+Generic restart remains blocked for unfinished executors. The separate
+[planned position resume procedure](planned-position-resume.md) supports an
+explicit stopped-owner handover for a fully filled singleton OKX spot BUY with
+trailing-only exit settings. It retains the original executor and terminal entry
+receipt, seals entry placement, and transfers held ownership atomically. It does
+not replay controller BUY decisions or automatically recover a subsequent crash.

@@ -69,7 +69,7 @@ python -m pytest test/hummingbot/strategy_v2/executors/test_executor_orchestrato
 
 ## Remaining boundaries
 
-- Restart preserves consumed-entry decisions and existing `recovery_required` blocking. This change does not automatically restore management of existing live positions after a process restart.
+- Restart preserves consumed-entry decisions and existing `recovery_required` blocking. Generic restart does not automatically restore management of existing live positions. The subsequent explicit, stopped-owner trailing-only handover is documented in `docs/controllers/planned-position-resume.md`; it does not replay an entry decision or provide generic crash recovery.
 - Cold first use requires a completed clear candle before a subsequent qualified BUY. A crash after durable dispatch can miss an entry; no replacement is inferred.
 - Episode BUY admission is blocked until that separate path supports durable authorization; episode reconciliation, stops and SELL management remain available.
 - Exact receipts apply to new recorded events. Historical six-decimal data remains precision-limited; unrelated compatibility readers are not globally migrated.

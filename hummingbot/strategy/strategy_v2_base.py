@@ -403,6 +403,8 @@ class StrategyV2Base(StrategyPyBase):
         Simple scripts override this method for custom logic.
         """
         if self.controllers:
+            if not self.executor_orchestrator.resume_planned_positions_if_ready():
+                return
             self.update_executors_info()
             self._sync_runtime_state_to_db_if_due()
             try:

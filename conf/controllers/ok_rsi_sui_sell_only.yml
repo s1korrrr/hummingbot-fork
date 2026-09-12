@@ -1,4 +1,4 @@
-# SUI-only OKX EEA spot profile. Prepared locally; disabled pending activation.
+# SUI-only OKX EEA spot profile. Disabled pending verified acquisition basis and activation.
 id: ok-rsi-sui-usdc-sell-only
 controller_name: ok_rsi
 controller_type: directional_trading
@@ -21,8 +21,8 @@ usd_per_entry: '25'
 max_total_position_usd: '500'
 max_executors_per_side: 1
 
-# Sell signals may realize a loss; no profitability gate and no buying.
-sell_only_if_profitable: false
+# Sell only with verified owned cost basis, historical fees and exit-fee protection; no buying.
+sell_only_if_profitable: true
 sell_rsi_overbought: 76.0
 sell_only_inventory_fraction: '0.10'
 sell_all_below_quote: '20'

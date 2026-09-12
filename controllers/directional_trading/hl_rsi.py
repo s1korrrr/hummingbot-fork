@@ -4705,6 +4705,12 @@ class HLRSIController(DirectionalTradingControllerBase):
         )
         return actions
 
+    def _recovery_sell_target_amount(self, position_amount: Decimal, price: Decimal) -> Decimal:
+        return position_amount * Decimal(str(self.config.recovery_partial_exit_fraction))
+
+    def _recovery_sell_proposal_limit(self) -> Optional[int]:
+        return None
+
     def _check_held_bag_recovery(
         self,
         *,
@@ -4823,10 +4829,8 @@ class HLRSIController(DirectionalTradingControllerBase):
             recovery_execution_strategy = self.config.recovery_sell_execution_strategy
             chaser_config = self._recovery_sell_chaser_config()
             sell_price = current_price if recovery_execution_strategy == ExecutionStrategy.MARKET else ref_price
-            target_amount = Decimal(str(pos.amount))
-            partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
-            if Decimal("0") < partial_fraction < Decimal("1"):
-                target_amount = target_amount * partial_fraction
+            target_amount = self._recovery_sell_target_amount(Decimal(str(pos.amount)), sell_price)
+            if target_amount < Decimal(str(pos.amount)):
                 reversal_reason = f"partial-{reversal_reason}"
             sell_amount = self._resolve_recovery_sell_amount(
                 position_amount=Decimal(str(pos.amount)),
@@ -4875,6 +4879,9 @@ class HLRSIController(DirectionalTradingControllerBase):
             trail.peak_price = current_price
             trail.peak_rsi = current_rsi
             trail.last_reason = reversal_reason
+            proposal_limit = self._recovery_sell_proposal_limit()
+            if proposal_limit is not None and len(actions) >= proposal_limit:
+                break
             if available_base is not None:
                 available_base -= sell_amount
                 if available_base <= Decimal("0"):

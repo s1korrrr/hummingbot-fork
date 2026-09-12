@@ -241,3 +241,67 @@ def test_direct_orchestrator_create_cannot_bypass_source_restart_guard():
             orchestrator.create_executor(CreateExecutorAction(controller_id='controller', executor_config=executor.config))
     created.start.assert_not_called()
     assert orchestrator.active_executors['controller'] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('resume_failure', [None, 'claim failed; reconciliation required'])
+async def test_pending_resume_tick_preserves_operator_pause_without_uninitialized_reports(recorder, resume_failure):
+    import asyncio
+    from collections import deque
+
+    from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+    from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    from scripts.v2_with_controllers import V2WithControllersConfig
+
+    recorder.store_strategy_risk_state({
+        'version': 1, 'controllers': ['controller'], 'max_global_pnl': '100',
+        'max_pnl_by_controller': {'controller': '75'}, 'drawdown_exited_controllers': [],
+        'stopped': False, 'operator_paused': {'controller': False}})
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+    events = deque([('rsibot.operator', SimpleNamespace(data={'action': 'bot_pause_entries'}))])
+
+    def initialize(strategy):
+        config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT')
+        strategy.controllers = {'controller': OKRSIController(config, strategy.market_data_provider, strategy.actions_queue)}
+
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=events):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            max_global_drawdown_quote=10, runtime_db_sync_enabled=False,
+            runtime_status_snapshot_enabled=False, chart_snapshots_enabled=False))
+        orchestrator = strategy.executor_orchestrator
+        orchestrator._planned_resume_pending = True
+        orchestrator._planned_resume_failure = resume_failure
+        try:
+            assert not strategy.ready_to_trade
+            assert strategy.get_performance_report('controller') is None
+            with patch.object(strategy, 'send_performance_report') as publish:
+                strategy.on_tick()  # Actual subclass, parent, resume gate and operator/risk methods.
+                strategy.on_tick()
+                publish.assert_not_called()
+            assert orchestrator._planned_resume_pending
+            assert not strategy._is_stop_triggered
+            assert strategy.max_global_pnl == D('100')
+            assert strategy.max_pnl_by_controller == {'controller': D('75')}
+            assert strategy.controllers['controller']._operator_entry_paused
+            assert recorder.load_strategy_risk_state()['operator_paused'] == {'controller': True}
+            assert not connector.in_flight_orders
+
+            # Once ownership is resolved, normal reporting and the existing loss rail must run.
+            orchestrator._planned_resume_pending = False
+            orchestrator._planned_resume_failure = None
+            with patch('scripts.v2_with_controllers.HummingbotApplication.main_application') as application, \
+                    patch.object(strategy, 'send_performance_report') as publish:
+                strategy.on_tick()
+                assert strategy.get_performance_report('controller') is not None
+                assert strategy._is_stop_triggered  # 100 peak minus zero report exceeds the 10 quote rail.
+                application.return_value.stop.assert_called_once()
+                publish.assert_called_once()
+            assert recorder.load_strategy_risk_state()['stopped'] is True
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)

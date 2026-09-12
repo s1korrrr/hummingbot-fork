@@ -31,6 +31,7 @@ SOURCES = (
     'hummingbot/strategy_v2/executors/executor_orchestrator.py',
     'hummingbot/strategy_v2/executors/order_accounting.py',
     'hummingbot/strategy/strategy_v2_base.py',
+    'scripts/v2_with_controllers.py',
     'hummingbot/connector/markets_recorder.py',
     'hummingbot/connector/exchange/okx/okx_exchange.py',
     'hummingbot/connector/exchange/okx/native_reconciliation.py',
@@ -88,6 +89,8 @@ def validate_position(preflight, stopped):
     require(barriers.trailing_stop is not None and barriers.time_limit is None
             and barriers.stop_loss is None and barriers.take_profit is None, 'only trailing-only positions are supported')
     custom = stopped['custom_info']
+    require(preflight['custom_info'].get('planned_position_resume') == custom.get('planned_position_resume'),
+            'preflight consumed manifest reference differs from stopped owner')
     entries = custom.get('held_position_orders', [])
     require(len(entries) == 1, 'one singleton terminal entry receipt required')
     entry = entries[0]
@@ -337,6 +340,57 @@ def validate_reconciliation(db_path, evidence, now):
                 'raw available balance does not cover selected inventory')
 
 
+def consumed_history(connection, pending_id=None):
+    """Read immutable consumed receipts; another prepared or unknown row blocks reuse."""
+    rows = ([dict(row) for row in connection.execute(f'SELECT * FROM {TABLE} ORDER BY id')
+             if row['id'] != pending_id] if TABLE in tables(connection) else [])
+    payloads = {}
+    for row in rows:
+        require(row['state'] == 'claimed', 'manifest history contains an unconsumed or unknown state')
+        try:
+            payload = json.loads(row['payload'])
+            payloads[row['id']] = payload
+            require(payload['schema'] == 1 and payload['id'] == row['id']
+                    and isinstance(payload['positions'], list) and payload['positions']
+                    and isinstance(payload['evidence'], dict) and isinstance(payload['files'], dict)
+                    and payload['database_digest'] and payload['preflight_digest'],
+                    'invalid consumed manifest payload')
+            require(decimal(payload['created_at']) <= decimal(row['claimed_at']) < decimal(payload['expires_at']),
+                    'invalid consumed manifest timestamp')
+        except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise ValueError('invalid consumed manifest history') from error
+    # Follow bound predecessor history, not UUID order or potentially tied timestamps.
+    prefix = []
+    remaining = list(rows)
+    while remaining:
+        expected = digest(sorted(prefix, key=lambda row: row['id']))
+        successors = [row for row in remaining
+                      if payloads[row['id']].get('claimed_history_digest', digest([])) == expected]
+        require(len(successors) == 1, 'consumed manifest history chain is incomplete or ambiguous')
+        successor = successors[0]
+        require(not prefix or decimal(payloads[successor['id']]['created_at']) >= decimal(prefix[-1]['claimed_at']),
+                'consumed manifest history chronology differs')
+        prefix.append(successor)
+        remaining.remove(successor)
+    # A deleted sole receipt or whole table must not turn an already-resumed owner into a first handover.
+    if 'Executors' in tables(connection):
+        for executor in connection.execute('SELECT id, custom_info FROM Executors'):
+            custom = json.loads(executor['custom_info'] or '{}')
+            reference = custom.get('planned_position_resume') if isinstance(custom, dict) else None
+            if reference is not None:
+                require(reference in payloads and any(position.get('executor_id') == executor['id']
+                        for position in payloads[reference]['positions']),
+                        'executor references missing or mismatched consumed manifest history')
+    return rows
+
+
+def validate_history_binding(connection, manifest):
+    history = consumed_history(connection, pending_id=manifest['id'])
+    # Legacy first manifests had no history. Never infer missing history for a later handover.
+    require(manifest.get('claimed_history_digest', digest([])) == digest(history),
+            'consumed manifest history binding changed')
+
+
 def prepare(db_path, preflight_path, evidence, now=None, root=ROOT):
     """Register only; caller must stop the owner and reconcile the venue first."""
     now = time.time() if now is None else now
@@ -365,8 +419,9 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT):
         connection.execute('BEGIN IMMEDIATE')
         require(not connection.execute('SELECT id FROM Executors WHERE status != 4').fetchone(),
                 'database still has unfinished executors')
-        if TABLE in tables(connection):
-            require(not connection.execute(f'SELECT 1 FROM {TABLE}').fetchone(), 'a manifest already exists; no automatic reuse')
+        history = consumed_history(connection)
+        require(all(decimal(now) >= decimal(row['claimed_at']) for row in history),
+                'new manifest predates consumed history')
         positions = []
         for proof in evidence['executors']:
             identity = (proof['executor_id'],)
@@ -382,6 +437,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT):
             positions.append(position)
         manifest = {'schema': 1, 'id': str(uuid.uuid4()), 'created_at': now, 'expires_at': evidence['expires_at'],
                     'database_digest': database_digest(connection), 'preflight_digest': database_digest(preflight),
+                    'claimed_history_digest': digest(history),
                     'files': files, 'evidence': evidence, 'positions': positions}
         connection.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} (id TEXT PRIMARY KEY, state TEXT NOT NULL, '
                            'payload TEXT NOT NULL, claimed_at REAL)')
@@ -401,12 +457,15 @@ def pending_manifest(db_path, now=None, root=ROOT):
     rows = inspect_manifest(db_path)
     pending = [row for row in rows if row['state'] == 'prepared']
     if not pending:
+        with connect(db_path) as connection:
+            consumed_history(connection)
         return None
     require(len(pending) == 1, 'multiple pending resume manifests')
     manifest = json.loads(pending[0]['payload'])
     require(manifest['created_at'] <= now < manifest['expires_at'], 'resume manifest expired')
     require(bound_files(manifest['evidence']['config_paths'], root) == manifest['files'], 'source/config binding changed')
     with connect(db_path) as connection:
+        validate_history_binding(connection, manifest)
         require(database_digest(connection) == manifest['database_digest'], 'database binding changed')
         proofs = {proof['executor_id']: proof for proof in manifest['evidence']['executors']}
         for position in manifest['positions']:
@@ -427,6 +486,7 @@ def claim(db_path, manifest, now=None):
         row = connection.execute(f'SELECT * FROM {TABLE} WHERE id=?', (manifest['id'],)).fetchone()
         require(row is not None and row['state'] == 'prepared' and json.loads(row['payload']) == manifest,
                 'resume claim already consumed or changed')
+        validate_history_binding(connection, manifest)
         require(database_digest(connection) == manifest['database_digest'], 'database changed before claim')
         for position in manifest['positions']:
             record = connection.execute('SELECT * FROM Executors WHERE id=?', (position['executor_id'],)).fetchone()

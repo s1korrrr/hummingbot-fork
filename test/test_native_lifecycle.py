@@ -45,10 +45,12 @@ async def test_strict_executor_timeout_retains_collections_and_skips_persistence
     from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
     executor = SimpleNamespace(is_closed=False, early_stop=Mock(), config=SimpleNamespace(id='pending'),
                                executor_info=SimpleNamespace(is_done=False))
-    owner = SimpleNamespace(active_executors={'a': [executor]}, logger=Mock(),
+    owner = SimpleNamespace(active_executors={'a': [executor]}, _planned_resume_pending=False, logger=Mock(),
                             store_all_positions=Mock(), store_all_executors=Mock())
     result = await ExecutorOrchestrator.stop(owner, 0, strict=True)
     assert result.reconciliation_complete is False
+    assert result.error == 'Executor shutdown timed out; runtime collections retained'
+    executor.early_stop.assert_called_once_with(keep_position=False)
     assert owner.active_executors['a'] == [executor]
     owner.store_all_positions.assert_not_called()
     owner.store_all_executors.assert_not_called()
@@ -58,11 +60,29 @@ async def test_strict_executor_timeout_retains_collections_and_skips_persistence
 async def test_strict_executor_persistence_failure_retains_runtime_state():
     from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
     executor = SimpleNamespace(is_closed=True, executor_info=SimpleNamespace(is_done=True))
-    owner = SimpleNamespace(active_executors={'a': [executor]}, logger=Mock(),
+    owner = SimpleNamespace(active_executors={'a': [executor]}, _planned_resume_pending=False, logger=Mock(),
                             store_all_positions=Mock(side_effect=RuntimeError('database failed')), store_all_executors=Mock())
     result = await ExecutorOrchestrator.stop(owner, 1, strict=True)
     assert result.reconciliation_complete is False
+    assert result.error == 'Executor persistence/shutdown failed: RuntimeError'
+    owner.store_all_positions.assert_called_once_with(clear=False, strict=True)
     assert owner.active_executors['a'] == [executor]
+    owner.store_all_executors.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_strict_stop_preserves_pending_resume_without_stopping_or_persisting():
+    from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+    executor = SimpleNamespace(is_closed=False, early_stop=Mock(), executor_info=SimpleNamespace(is_done=False))
+    owner = SimpleNamespace(active_executors={'a': [executor]}, _planned_resume_pending=True,
+                            store_all_positions=Mock(), store_all_executors=Mock())
+    result = await ExecutorOrchestrator.stop(owner, 0, strict=True)
+    assert result.reconciliation_complete is False
+    assert result.error == 'Planned position resume unresolved; durable ownership requires reconciliation'
+    assert owner._planned_resume_pending is True
+    assert owner.active_executors['a'] == [executor]
+    executor.early_stop.assert_not_called()
+    owner.store_all_positions.assert_not_called()
     owner.store_all_executors.assert_not_called()
 
 
@@ -123,10 +143,11 @@ async def test_native_start_cannot_infer_reconciliation_from_no_strategy():
 async def test_strict_success_receipts_retain_collections_until_outer_reconciliation():
     from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
     executor = SimpleNamespace(is_closed=True, executor_info=SimpleNamespace(is_done=True))
-    owner = SimpleNamespace(active_executors={'a': [executor]}, logger=Mock(),
+    owner = SimpleNamespace(active_executors={'a': [executor]}, _planned_resume_pending=False, logger=Mock(),
                             store_all_positions=Mock(), store_all_executors=Mock())
     result = await ExecutorOrchestrator.stop(owner, 1, strict=True)
     assert result.reconciliation_complete is True
+    assert result.error is None
     assert owner.active_executors['a'] == [executor]
     owner.store_all_positions.assert_called_once_with(clear=False, strict=True)
     owner.store_all_executors.assert_called_once_with(clear=False)

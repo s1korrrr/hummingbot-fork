@@ -1125,6 +1125,49 @@ class OKRSIController(hl_rsi.HLRSIController):
             return position_amount
         return position_amount * self.config.sell_only_inventory_fraction
 
+    def _signal_sell_target_amount(self, position_amount: Decimal, price: Decimal) -> Decimal:
+        if self.config.trade_mode == "sell_only":
+            return self._sell_only_target_amount(position_amount, price)
+        multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
+        if multiplier > 0:
+            return min(position_amount, self.config.usd_per_entry * multiplier / price)
+        return position_amount
+
+    def _recovery_sell_target_amount(self, position_amount: Decimal, price: Decimal) -> Decimal:
+        # The pair-wide configured target also bounds each owned recovery position.
+        return min(position_amount, self._signal_sell_target_amount(self._get_sellable_inventory_amount(), price))
+
+    def _recovery_sell_proposal_limit(self) -> Optional[int]:
+        return 1
+
+    def _owned_sell_cost_floor(self) -> tuple[Decimal, Decimal]:
+        """Return cost-covered quantity and the aggregate floor before estimated exit fees."""
+        total_amount = Decimal("0")
+        cost_quote = Decimal("0")
+        fees_quote = Decimal("0")
+        for position in self._held_positions(TradeType.BUY):
+            amount = self._decimal_or_none(position.amount)
+            basis = self._decimal_or_none(getattr(position, "breakeven_price", None))
+            if amount is None or amount <= 0 or basis is None or basis <= 0:
+                raise ExecutorInputUnavailable("SELL owned cost basis is unavailable")
+            if (getattr(position, "remaining_fees_quote", None) is None
+                    and getattr(position, "cum_fees_quote", None) is None):
+                raise ExecutorInputUnavailable("SELL owned position fees are unavailable")
+            try:
+                fees = self._decimal_or_none(self._remaining_position_fees(position))
+            except _DECIMAL_CONVERSION_ERRORS as exc:
+                raise ExecutorInputUnavailable("SELL owned position fees are unavailable") from exc
+            if fees is None or fees < 0:
+                raise ExecutorInputUnavailable("SELL owned position fees are unavailable")
+            total_amount += amount
+            cost_quote += amount * basis
+            fees_quote += fees
+        if total_amount <= 0:
+            raise ExecutorInputUnavailable("SELL owned cost basis is unavailable")
+        return total_amount, (
+            cost_quote * (Decimal("1") + Decimal(str(self.config.min_profit_pct_for_sell))) + fees_quote
+        ) / total_amount
+
     def get_executor_config(self, trade_type: TradeType, price: Decimal, amount: Decimal):
         if self._episode_runtime is not None:
             raise ExecutorInputUnavailable("episode orders require a durable episode authorization")
@@ -1149,14 +1192,11 @@ class OKRSIController(hl_rsi.HLRSIController):
                 raise ExecutorInputUnavailable(
                     "SELL executor construction requires positive sellable inventory"
                 )
-            if self.config.trade_mode == "sell_only":
-                target_amount = self._sell_only_target_amount(position_amount, ref_price)
-            else:
-                target_amount = position_amount
-                slice_multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
-                if slice_multiplier > 0:
-                    target_quote = self.config.usd_per_entry * slice_multiplier
-                    target_amount = min(position_amount, target_quote / ref_price)
+            min_sell_price = None
+            if self.config.sell_only_if_profitable:
+                owned_amount, min_sell_price = self._owned_sell_cost_floor()
+                position_amount = min(position_amount, owned_amount)
+            target_amount = self._signal_sell_target_amount(position_amount, ref_price)
             sell_amount = self._resolve_recovery_sell_amount(
                 position_amount=position_amount,
                 target_amount=target_amount,
@@ -1178,6 +1218,7 @@ class OKRSIController(hl_rsi.HLRSIController):
                 position_action=PositionAction.CLOSE,
                 leverage=self.config.leverage,
                 level_id="signal_exit",
+                min_sell_price=min_sell_price,
             )
 
         planned_usd, effective_usd, entry_price, entry_amount_base, uplifted = self._resolve_buy_entry_plan(

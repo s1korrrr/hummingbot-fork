@@ -2,11 +2,12 @@
 
 import math
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import field_validator, model_validator
 
 from controllers.directional_trading import hl_rsi
+from controllers.directional_trading.ok_rsi_core.down_only_entry import DownOnlyMakerParameters
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.core.data_type.common import OrderType, PositionMode
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
@@ -138,7 +139,19 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     use_trailing_exit: bool = hl_rsi.Field(default=True, json_schema_extra={"is_updatable": True})
     trailing_activation_pct: float = hl_rsi.Field(default=0.015, gt=0.0, json_schema_extra={"is_updatable": True})
     trailing_delta_pct: float = hl_rsi.Field(default=0.0035, gt=0.0, json_schema_extra={"is_updatable": True})
-    entry_limit_max_age_seconds: int = hl_rsi.Field(default=30, ge=1, json_schema_extra={"is_updatable": True})
+    entry_acquisition_policy: Literal[
+        "legacy_single_attempt", "down_only_maker_v1"
+    ] = "legacy_single_attempt"
+    entry_acquisition_shadow_policy: Optional[Literal["down_only_maker_v1"]] = None
+    entry_limit_max_age_seconds: int = hl_rsi.Field(
+        default=30, ge=1, le=300, json_schema_extra={"is_updatable": True}
+    )
+    entry_total_max_age_seconds: int = hl_rsi.Field(default=300, ge=30, le=900)
+    entry_max_downward_reprices: int = hl_rsi.Field(default=3, ge=1, le=10)
+    entry_reprice_cooldown_seconds: int = hl_rsi.Field(default=5, ge=1, le=30)
+    entry_reprice_min_ticks: int = hl_rsi.Field(default=3, ge=1, le=100)
+    entry_reprice_atr_fraction: Decimal = hl_rsi.Field(default=Decimal("0.05"), gt=0, le=1)
+    entry_max_downward_atr: Decimal = hl_rsi.Field(default=Decimal("1.0"), gt=0, le=10)
     use_adaptive_trailing: bool = hl_rsi.Field(default=True, json_schema_extra={"is_updatable": True})
     trailing_activation_min_pct: float = hl_rsi.Field(default=0.003, gt=0.0, json_schema_extra={"is_updatable": True})
     trailing_activation_max_pct: float = hl_rsi.Field(default=0.05, gt=0.0, json_schema_extra={"is_updatable": True})
@@ -184,6 +197,16 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
 
     @model_validator(mode="after")
     def validate_okx_spot_contract(self):
+        down_only_active = self.entry_acquisition_policy == "down_only_maker_v1"
+        down_only_shadow = self.entry_acquisition_shadow_policy == "down_only_maker_v1"
+        if down_only_active and down_only_shadow:
+            raise ValueError("active and shadow entry acquisition policies are mutually exclusive")
+        if self.episode_enabled and (down_only_active or down_only_shadow):
+            raise ValueError("down-only maker entry is incompatible with episode mode")
+        if down_only_active and self.trade_mode == "sell_only":
+            raise ValueError("active down-only maker entry is unavailable in sell_only mode")
+        if self.entry_total_max_age_seconds < self.entry_limit_max_age_seconds:
+            raise ValueError("entry total age must not be shorter than the rest lease")
         if self.durable_candle_watermark_enabled and self.episode_enabled:
             raise ValueError(
                 "durable candle watermark currently guards only the legacy action path"
@@ -334,3 +357,14 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         if self.trailing_stop_order_type == OrderType.MARKET and self.trailing_stop_limit_max_age_seconds != 0:
             raise ValueError("MARKET trailing requires a zero limit fallback timeout")
         return self
+
+    def down_only_maker_parameters(self) -> DownOnlyMakerParameters:
+        return DownOnlyMakerParameters(
+            rest_seconds=self.entry_limit_max_age_seconds,
+            total_max_age_seconds=self.entry_total_max_age_seconds,
+            max_reprices=self.entry_max_downward_reprices,
+            cooldown_seconds=self.entry_reprice_cooldown_seconds,
+            min_ticks=self.entry_reprice_min_ticks,
+            atr_fraction=self.entry_reprice_atr_fraction,
+            max_downward_atr=self.entry_max_downward_atr,
+        )

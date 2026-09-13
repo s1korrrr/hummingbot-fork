@@ -64,6 +64,8 @@ def test_candidate_configuration_is_opt_in_and_sell_only_assignment_explicit():
     assert legacy.episode_earned_stage_risk_skim_fraction == Decimal("0.1")
     assert legacy.episode_scout_rebound_confirmation is False
     assert legacy.episode_recovery_aware_scout is False
+    assert legacy.entry_acquisition_policy == "legacy_single_attempt"
+    assert legacy.entry_acquisition_shadow_policy is None
     with pytest.raises(ValueError, match="assignment"):
         OKRSIControllerConfig(id="candidate", episode_enabled=True, trade_mode="sell_only")
 

@@ -2019,6 +2019,21 @@ class OKRSIControllerTest(unittest.TestCase):
         self.assertTrue(all(controller.sell_only_if_profitable for controller in loaded))
         self.assertEqual(len({controller.id for controller in loaded}), 5)
 
+    def test_production_loader_keeps_down_only_policy_inactive_by_default(self):
+        with patch(
+            "hummingbot.client.settings.CONTROLLERS_CONF_DIR_PATH",
+            str(FIXTURES_PATH / "controllers"),
+        ):
+            _, config = self._load_script_through_trading_core("v2_with_controllers", "ok_rsi.yml")
+            loaded = config.load_controller_configs()
+
+        self.assertEqual(len(loaded), 5)
+        for controller in loaded:
+            self.assertEqual(controller.entry_acquisition_policy, "legacy_single_attempt")
+            self.assertIsNone(controller.entry_acquisition_shadow_policy)
+            self.assertEqual(controller.entry_limit_max_age_seconds, 30)
+            self.assertFalse(controller.episode_enabled)
+
     def test_buy_sell_profiles_never_force_sell(self):
         from scripts.v2_with_controllers import V2WithControllersConfig
 

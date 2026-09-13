@@ -1044,6 +1044,23 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             pass
         self.strategy.executor_orchestrator.execute_actions.assert_not_called()
 
+    async def test_queued_actions_do_not_read_reports_while_planned_resume_is_pending(self):
+        action = CreateExecutorAction(controller_id="controller_1",
+                                      executor_config=self.get_position_config_market_short())
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[action], asyncio.CancelledError])
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+        self.strategy.update_executors_info = MagicMock()
+
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+
+        self.strategy.update_executors_info.assert_not_called()
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()
         # Simulate some actions being returned, followed by an exception to break the loop.

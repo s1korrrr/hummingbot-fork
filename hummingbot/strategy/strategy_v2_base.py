@@ -1309,6 +1309,8 @@ class StrategyV2Base(StrategyPyBase):
         while True:
             try:
                 actions = await self.actions_queue.get()
+                if getattr(self.executor_orchestrator, "_planned_resume_pending", False) is True:
+                    continue
                 self.update_executors_info()
                 for action in actions:
                     controller = self.controllers.get(action.controller_id)

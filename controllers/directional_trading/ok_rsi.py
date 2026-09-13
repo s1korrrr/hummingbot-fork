@@ -17,6 +17,10 @@ import pandas as pd
 from controllers.directional_trading import hl_rsi
 from controllers.directional_trading.ok_rsi_core.candles import derive_higher_timeframe_candles
 from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+    DownOnlyMakerPositionExecutor,
+    DownOnlyMakerPositionExecutorConfig,
+)
 from controllers.directional_trading.ok_rsi_core.down_only_entry_shadow import DownOnlyMakerShadowTracker
 from controllers.directional_trading.ok_rsi_core.trailing import (
     ContinuousTrailingSelection,
@@ -40,6 +44,7 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
     TrailingStop,
     TripleBarrierConfig,
 )
+from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
 
 _DECIMAL_CONVERSION_ERRORS = (ArithmeticError, TypeError, ValueError)
 _EXECUTION_INPUT_ERRORS = (ArithmeticError, AttributeError, KeyError, RuntimeError, TypeError, ValueError)
@@ -139,6 +144,8 @@ class OKRSIController(hl_rsi.HLRSIController):
             if config.entry_acquisition_shadow_policy == "down_only_maker_v1"
             else None
         )
+        self._down_only_pending_configs = {}
+        self._down_only_claimed_ids = set()
         super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
         self._watermark_namespace: Optional[ControllerCandleWatermarkNamespace] = None
@@ -268,10 +275,45 @@ class OKRSIController(hl_rsi.HLRSIController):
     def stop_actions_proposal(self):
         if self._episode_runtime is not None:
             return []
-        return super().stop_actions_proposal()
+        actions = super().stop_actions_proposal()
+        if self._entry_acquisition_policy != "down_only_maker_v1":
+            return actions
+        invalidated = (
+            (self.processed_data or {}).get("signal", 0) < 0
+            or bool(getattr(self.config, "manual_kill_switch", False))
+            or bool(getattr(self, "_operator_entry_paused", False))
+        )
+        if not invalidated:
+            try:
+                self._entry_acquisition_shadow_inputs()
+            except _EXECUTION_INPUT_ERRORS:
+                invalidated = True
+        if not invalidated:
+            return actions
+        existing_ids = {
+            action.executor_id for action in actions if isinstance(action, StopExecutorAction)
+        }
+        for executor in self.executors_info:
+            executor_config = getattr(executor, "config", None)
+            if (
+                getattr(executor, "is_active", False)
+                and isinstance(executor_config, DownOnlyMakerPositionExecutorConfig)
+                and executor.id not in existing_ids
+            ):
+                actions.append(StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=executor.id,
+                    keep_position=True,
+                ))
+        return actions
 
     def get_executor_class_for_config(self, config):
         runtime = self._episode_runtime
+        if isinstance(config, DownOnlyMakerPositionExecutorConfig):
+            if runtime is not None:
+                raise ValueError("down-only maker entry is incompatible with episode runtime")
+            self._validate_down_only_executor_authorization(config)
+            return DownOnlyMakerPositionExecutor
         if runtime is None:
             return super().get_executor_class_for_config(config)
         from controllers.directional_trading.ok_rsi_core.execution import (
@@ -328,6 +370,16 @@ class OKRSIController(hl_rsi.HLRSIController):
         # implicitly. Restored unknown requests are never re-emitted by runtime.
         self._episode_factory_claimed_ids = claimed | {config.id}
         return EpisodeOrderExecutor
+
+    def _validate_down_only_executor_authorization(self, config) -> None:
+        if self._entry_acquisition_policy != "down_only_maker_v1":
+            raise ValueError("down-only executor has no active controller authorization")
+        if config.id in self._down_only_claimed_ids:
+            raise ValueError("down-only executor authorization was already claimed")
+        expected = self._down_only_pending_configs.get(config.id)
+        if expected is None or config.model_dump(mode="python") != expected.model_dump(mode="python"):
+            raise ValueError("down-only executor parameters differ from controller authorization")
+        self._down_only_claimed_ids.add(config.id)
 
     def validate_runtime_state_transfer(self, source):
         previous = getattr(source, "_episode_runtime", None)
@@ -1448,7 +1500,7 @@ class OKRSIController(hl_rsi.HLRSIController):
             stop_loss_order_type=OrderType.MARKET,
             time_limit_order_type=OrderType.MARKET,
         )
-        return PositionExecutorConfig(
+        position_config_kwargs = dict(
             entry_order_policy="single_attempt",
             timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
@@ -1465,3 +1517,27 @@ class OKRSIController(hl_rsi.HLRSIController):
                 else None
             ),
         )
+        if self._entry_acquisition_policy != "down_only_maker_v1":
+            return PositionExecutorConfig(**position_config_kwargs)
+
+        _, decision_best_bid, decision_best_ask, decision_price_step, decision_atr_1m = (
+            self._entry_acquisition_shadow_inputs()
+        )
+        config = DownOnlyMakerPositionExecutorConfig(
+            **position_config_kwargs,
+            controller_id=self.config.id,
+            decision_best_bid=decision_best_bid,
+            decision_best_ask=decision_best_ask,
+            decision_atr_1m=decision_atr_1m,
+            decision_price_step=decision_price_step,
+            maximum_acceptable_price=entry_price,
+            entry_rest_seconds=self.config.entry_limit_max_age_seconds,
+            entry_total_max_age_seconds=self.config.entry_total_max_age_seconds,
+            entry_max_downward_reprices=self.config.entry_max_downward_reprices,
+            entry_reprice_cooldown_seconds=self.config.entry_reprice_cooldown_seconds,
+            entry_reprice_min_ticks=self.config.entry_reprice_min_ticks,
+            entry_reprice_atr_fraction=self.config.entry_reprice_atr_fraction,
+            entry_max_downward_atr=self.config.entry_max_downward_atr,
+        )
+        self._down_only_pending_configs[config.id] = config.model_copy(deep=True)
+        return config

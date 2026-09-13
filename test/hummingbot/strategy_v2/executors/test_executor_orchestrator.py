@@ -3,10 +3,14 @@ import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, PropertyMock, patch
 
+from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+    DownOnlyMakerPositionExecutor,
+    DownOnlyMakerPositionExecutorConfig,
+)
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.model.position import Position
 from hummingbot.model.position_hold_ledger import PositionHoldLedger
@@ -105,6 +109,72 @@ class TestExecutorOrchestrator(unittest.TestCase):
             self.orchestrator._resolve_executor_class("plain", config),
             PositionExecutor,
         )
+
+    @patch.object(DownOnlyMakerPositionExecutor, "start")
+    def test_down_only_executor_persists_before_start_and_duplicate_is_rejected(self, start_mock):
+        connector = MagicMock(spec=ExchangePyBase)
+        connector.get_available_balance.return_value = Decimal("1000")
+        connector.in_flight_orders = {}
+        connector.trading_rules = {
+            "ETH-USDC": TradingRule(
+                "ETH-USDC",
+                min_order_size=Decimal("0.01"),
+                min_price_increment=Decimal("0.01"),
+                min_base_amount_increment=Decimal("0.01"),
+                min_notional_size=Decimal("1"),
+            )
+        }
+        self.mock_strategy.connectors["okx"] = connector
+        self.mock_strategy.markets["okx"] = {"ETH-USDC"}
+        controller = MagicMock()
+        controller.validate_executor_config.return_value = True
+        controller.get_executor_class_for_config.return_value = DownOnlyMakerPositionExecutor
+        self.mock_strategy.controllers["ok-rsi"] = controller
+        config = DownOnlyMakerPositionExecutorConfig(
+            id="down-only-intent",
+            timestamp=1_000,
+            controller_id="ok-rsi",
+            connector_name="okx",
+            trading_pair="ETH-USDC",
+            side=TradeType.BUY,
+            entry_price=Decimal("100"),
+            amount=Decimal("1"),
+            leverage=1,
+            triple_barrier_config=TripleBarrierConfig(
+                open_order_type=OrderType.LIMIT_MAKER,
+                open_order_limit_max_age_seconds=30,
+            ),
+            entry_order_policy="single_attempt",
+            decision_best_bid=Decimal("100"),
+            decision_best_ask=Decimal("100.01"),
+            decision_atr_1m=Decimal("1"),
+            decision_price_step=Decimal("0.01"),
+            maximum_acceptable_price=Decimal("100"),
+            entry_rest_seconds=30,
+            entry_total_max_age_seconds=300,
+            entry_max_downward_reprices=3,
+            entry_reprice_cooldown_seconds=5,
+            entry_reprice_min_ticks=3,
+            entry_reprice_atr_fraction=Decimal("0.05"),
+            entry_max_downward_atr=Decimal("1"),
+        )
+        action = CreateExecutorAction(controller_id="ok-rsi", executor_config=config)
+        self.orchestrator.active_executors["ok-rsi"] = []
+        self.orchestrator.stored_executors["ok-rsi"] = []
+        self.orchestrator.positions_held["ok-rsi"] = []
+        self.orchestrator.cached_performance["ok-rsi"] = PerformanceReport()
+        recorder = MarketsRecorder.get_instance()
+        calls = MagicMock()
+        calls.attach_mock(recorder.store_or_update_executor, "persist")
+        calls.attach_mock(start_mock, "start")
+
+        self.orchestrator.create_executor(action)
+
+        self.assertEqual([call[0] for call in calls.mock_calls], ["persist", "start"])
+        self.assertIsInstance(self.orchestrator.active_executors["ok-rsi"][0], DownOnlyMakerPositionExecutor)
+        with self.assertRaisesRegex(ValueError, "Duplicate executor id"):
+            self.orchestrator.create_executor(action)
+        self.assertEqual(start_mock.call_count, 1)
 
     @patch.object(PositionExecutor, "start")
     @patch.object(DCAExecutor, "start")

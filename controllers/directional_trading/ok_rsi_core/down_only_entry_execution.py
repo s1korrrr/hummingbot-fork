@@ -192,6 +192,15 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         else:
             self._entry_lifecycle["state"] = decision.reason.value
 
+    def early_stop(self, keep_position: bool = False):
+        if keep_position and not self.is_closed:
+            self._entry_pending_target = None
+            self._entry_child_submission_authorized = False
+            self._entry_terminal_reason = self._entry_terminal_reason or "external_invalidation"
+            self._entry_cancel_reason = self._entry_cancel_reason or "external_invalidation"
+            self._end_entry_acquisition(self._entry_terminal_reason)
+        super().early_stop(keep_position=keep_position)
+
     def _request_current_cancel(self) -> None:
         if self._open_order is None:
             self._entry_lifecycle["state"] = "reconciliation_required"

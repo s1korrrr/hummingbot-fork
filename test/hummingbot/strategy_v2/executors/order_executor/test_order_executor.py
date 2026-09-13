@@ -469,7 +469,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         )
 
     @patch.object(OrderExecutor, '_sleep')
-    async def test_control_shutdown_process_with_filled_order(self, mock_sleep):
+    async def test_control_shutdown_process_with_filled_order_and_late_early_stop(self, mock_sleep):
         config = OrderExecutorConfig(
             id="test",
             timestamp=123,
@@ -507,6 +507,22 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(len(executor._held_position_orders), 1)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertTrue(executor.terminated.is_set())
+        held_orders = list(executor._held_position_orders)
+        closed_at = executor.close_timestamp
+        removed_listeners = self.strategy.connectors["binance"].remove_listener.call_count
+
+        # A stale controller stop action can arrive after this loop has terminated.
+        executor.early_stop(keep_position=True)
+        executor.early_stop(keep_position=False)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertTrue(executor.executor_info.is_done)
+        self.assertTrue(executor.terminated.is_set())
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+        self.assertEqual(executor.close_timestamp, closed_at)
+        self.assertEqual(executor._held_position_orders, held_orders)
+        self.assertEqual(self.strategy.connectors["binance"].remove_listener.call_count, removed_listeners)
+        self.strategy.cancel.assert_not_called()
 
     @patch.object(OrderExecutor, '_sleep')
     async def test_control_shutdown_process_with_partial_filled_orders(self, mock_sleep):

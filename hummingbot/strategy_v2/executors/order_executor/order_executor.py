@@ -107,6 +107,8 @@ class OrderExecutor(ExecutorBase):
 
         :return: None
         """
+        if self.is_closed:
+            return
         self._status = RunnableStatus.SHUTTING_DOWN
 
     async def control_shutdown_process(self):

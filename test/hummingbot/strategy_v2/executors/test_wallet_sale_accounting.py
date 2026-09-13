@@ -227,6 +227,36 @@ def test_exact_completed_wallet_sale_recovers_stale_shutdown_and_synthetic_sell_
         recorder.store_or_update_executor.assert_not_called()
 
 
+@pytest.mark.parametrize('price_change', [D('-0.01'), D('0.01')])
+def test_wallet_sale_recovers_native_stop_summary_at_changed_market_price(price_change):
+    from hummingbot.strategy_v2.executors.executor_orchestrator import PositionHold
+    orchestrator, recorder, original, ledger, summary, _, _ = incomplete_saved_wallet_sale()
+    # The deployed pre-repair strict stop persists this native projection using
+    # the then-current midpoint, even though wallet acquisition cost is unknown.
+    held = PositionHold('okx', 'SUI-USDT', TradeType.SELL)
+    held.add_order_record(ledger.order_payload)
+    projection = held.get_position_summary(PRICE + price_change)
+    summary.unrealized_pnl_quote = D(int(projection.unrealized_pnl_quote * 1000000)) / 1000000
+    assert summary.unrealized_pnl_quote != 0
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        restored = ExecutorOrchestrator(orchestrator.strategy)
+        assert_unknown_sale(restored.get_all_reports()['controller'])
+        assert restored.get_executors_report()['controller'][0].is_done
+        assert original.status == RunnableStatus.SHUTTING_DOWN
+        assert not restored.recovery_required.get('controller')
+        recorder.store_or_update_executor.assert_not_called()
+
+
+@pytest.mark.parametrize('unrealized', [None, D('NaN'), D('Infinity'), D('-Infinity'), 'invalid'])
+def test_wallet_sale_rejects_invalid_synthetic_mark_to_market(unrealized):
+    orchestrator, recorder, _, _, summary, _, _ = incomplete_saved_wallet_sale()
+    summary.unrealized_pnl_quote = unrealized
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        restored = ExecutorOrchestrator(orchestrator.strategy)
+        with pytest.raises(RuntimeError, match='reconciliation unavailable'):
+            restored.get_all_reports()
+
+
 @pytest.mark.parametrize('defect', ['open', 'missing_order', 'missing_exact', 'wrong_exchange',
                                     'partial', 'missing_ledger', 'summary_amount', 'summary_fees'])
 def test_terminal_wallet_recovery_rejects_incomplete_or_conflicting_proof(defect):

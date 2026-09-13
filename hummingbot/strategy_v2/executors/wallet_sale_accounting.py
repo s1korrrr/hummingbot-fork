@@ -12,11 +12,14 @@ def validate_wallet_sale_summary(summary, sales):
     amount = sum((sale['amount_base'] for sale in sales), Decimal('0'))
     quote = sum((sale['proceeds_quote'] for sale in sales), Decimal('0'))
     fees = sum((sale['fees_quote'] for sale in sales), Decimal('0'))
-    if (amount <= 0 or summary.side != 'SELL'
+    # The pre-repair owner marks its synthetic SELL summary at the shutdown
+    # midpoint. This finite historical projection is not wallet economic PnL.
+    unrealized = Decimal(str(summary.unrealized_pnl_quote))
+    if (amount <= 0 or summary.side != 'SELL' or not unrealized.is_finite()
             or any(Decimal(str(getattr(summary, field))) != legacy_value(value) for field, value in (
                 ('amount', amount), ('breakeven_price', quote / amount),
                 ('volume_traded_quote', quote), ('cum_fees_quote', fees),
-                ('realized_pnl_quote', Decimal('0')), ('unrealized_pnl_quote', Decimal('0'))))):
+                ('realized_pnl_quote', Decimal('0'))))):
         raise ValueError('Stored wallet sale summary conflicts with exact sale receipts')
 
 

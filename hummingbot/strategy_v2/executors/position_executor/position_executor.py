@@ -1134,18 +1134,27 @@ class PositionExecutor(ExecutorBase):
             # Latch before calling the connector boundary: an exception must not cause a resubmission.
             self._entry_submitted = True
             self._entry_lifecycle["submission_timestamp"] = self._strategy.current_timestamp
+        self._submit_open_order(self.entry_price)
+        self.logger().debug(self._log_message(f"Placing open order order_id={self._open_order.order_id}"))
+
+    def _submit_open_order(self, price: Decimal) -> None:
+        remaining = max(
+            Decimal("0"),
+            self.config.amount - sum(
+                (order.executed_amount_base for order in self._entry_orders()),
+                Decimal("0"),
+            ),
+        )
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             order_type=self.config.triple_barrier_config.open_order_type,
-            amount=max(Decimal("0"), self.config.amount - sum(
-                (order.executed_amount_base for order in self._entry_orders()), Decimal("0"))),
-            price=self.entry_price,
+            amount=remaining,
+            price=price,
             side=self.config.side,
             position_action=PositionAction.OPEN,
         )
         self._open_order = TrackedOrder(order_id=order_id)
-        self.logger().debug(self._log_message(f"Placing open order order_id={order_id}"))
 
     def control_barriers(self):
         """

@@ -1,0 +1,274 @@
+import asyncio
+from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+    DownOnlyMakerPositionExecutor,
+    DownOnlyMakerPositionExecutorConfig,
+)
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.event.events import OrderCancelledEvent
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+
+def make_config(**changes) -> DownOnlyMakerPositionExecutorConfig:
+    values = {
+        "id": "entry-intent",
+        "timestamp": 0.0,
+        "controller_id": "ok-rsi",
+        "connector_name": "okx",
+        "trading_pair": "ETH-USDC",
+        "side": TradeType.BUY,
+        "entry_price": Decimal("100"),
+        "amount": Decimal("1"),
+        "leverage": 1,
+        "triple_barrier_config": TripleBarrierConfig(
+            open_order_type=OrderType.LIMIT_MAKER,
+            open_order_limit_max_age_seconds=30,
+        ),
+        "entry_order_policy": "single_attempt",
+        "decision_best_bid": Decimal("100"),
+        "decision_best_ask": Decimal("100.01"),
+        "decision_atr_1m": Decimal("1"),
+        "decision_price_step": Decimal("0.01"),
+        "maximum_acceptable_price": Decimal("100"),
+        "entry_rest_seconds": 30,
+        "entry_total_max_age_seconds": 300,
+        "entry_max_downward_reprices": 3,
+        "entry_reprice_cooldown_seconds": 5,
+        "entry_reprice_min_ticks": 3,
+        "entry_reprice_atr_fraction": Decimal("0.05"),
+        "entry_max_downward_atr": Decimal("1"),
+    }
+    values.update(changes)
+    return DownOnlyMakerPositionExecutorConfig(**values)
+
+
+def make_executor(*, bid=Decimal("100"), ask=Decimal("100.01"), config=None):
+    strategy = MagicMock(spec=StrategyV2Base)
+    strategy.current_timestamp = 0.0
+    connector = MagicMock()
+    connector.supports_terminal_fill_reconciliation = True
+    connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+    strategy.connectors = {"okx": connector}
+    rule = TradingRule(
+        "ETH-USDC",
+        min_order_size=Decimal("0.01"),
+        min_price_increment=Decimal("0.01"),
+        min_base_amount_increment=Decimal("0.01"),
+        min_notional_size=Decimal("1"),
+    )
+    prices = {PriceType.BestBid: bid, PriceType.BestAsk: ask, PriceType.MidPrice: (bid + ask) / 2}
+    with patch.object(DownOnlyMakerPositionExecutor, "get_trading_rules", return_value=rule):
+        executor = DownOnlyMakerPositionExecutor(strategy, config or make_config())
+    executor._status = RunnableStatus.RUNNING
+    executor.get_price = MagicMock(side_effect=lambda connector_name, trading_pair, price_type: prices[price_type])
+    executor.get_in_flight_order = MagicMock(return_value=None)
+    executor.place_order = MagicMock(side_effect=["parent", "child-1", "child-2", "child-3"])
+    return executor, connector, prices
+
+
+def tracked_order(order_id="parent", *, price="100", fill="0", state=OrderState.OPEN, amount="1"):
+    order = InFlightOrder(
+        client_order_id=order_id,
+        exchange_order_id=f"exchange-{order_id}",
+        trading_pair="ETH-USDC",
+        order_type=OrderType.LIMIT_MAKER,
+        trade_type=TradeType.BUY,
+        amount=Decimal(amount),
+        price=Decimal(price),
+        creation_timestamp=0,
+        initial_state=state,
+    )
+    if Decimal(fill) > 0:
+        order.update_with_trade_update(TradeUpdate(
+            trade_id=f"fill-{order_id}",
+            client_order_id=order_id,
+            exchange_order_id=f"exchange-{order_id}",
+            trading_pair="ETH-USDC",
+            fill_price=Decimal(price),
+            fill_base_amount=Decimal(fill),
+            fill_quote_amount=Decimal(fill) * Decimal(price),
+            fee=AddedToCostTradeFee(),
+            fill_timestamp=1,
+        ))
+    tracked = TrackedOrder(order_id=order_id)
+    tracked.order = order
+    return tracked
+
+
+def install_terminal_reconciliation(connector, tracked):
+    async def terminal_status(tracked_order):
+        return OrderUpdate(
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=12,
+            new_state=OrderState.CANCELED,
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=tracked_order.exchange_order_id,
+        )
+
+    connector._request_order_status = AsyncMock(side_effect=terminal_status)
+
+
+async def finish_reconciliation(executor):
+    await executor._reconcile_expired_entry()
+    await asyncio.sleep(0)
+    await executor._reconcile_expired_entry()
+
+
+def request_reprice(executor, prices):
+    executor._open_order = tracked_order()
+    executor._entry_submitted = True
+    executor._strategy.current_timestamp = 10
+    prices[PriceType.BestBid] = Decimal("99.90")
+    prices[PriceType.BestAsk] = Decimal("100.01")
+    executor.control_open_order()
+
+
+def test_initial_submission_is_one_maker_buy() -> None:
+    executor, _, _ = make_executor()
+    executor.control_open_order()
+    executor.control_open_order()
+    executor.place_order.assert_called_once_with(
+        connector_name="okx",
+        trading_pair="ETH-USDC",
+        order_type=OrderType.LIMIT_MAKER,
+        amount=Decimal("1"),
+        price=Decimal("100"),
+        side=TradeType.BUY,
+        position_action=PositionAction.OPEN,
+    )
+
+
+def test_rising_price_never_requests_cancel_or_upward_reprice() -> None:
+    executor, _, prices = make_executor()
+    executor._open_order = tracked_order()
+    executor._entry_submitted = True
+    executor._strategy.current_timestamp = 10
+    prices[PriceType.BestBid] = Decimal("100.20")
+    prices[PriceType.BestAsk] = Decimal("100.21")
+    executor.control_open_order()
+    executor._strategy.cancel.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["pending_target"] is None
+
+
+def test_qualified_lower_target_requests_cancel_exactly_once() -> None:
+    executor, _, prices = make_executor()
+    request_reprice(executor, prices)
+    executor.control_open_order()
+    executor._strategy.cancel.assert_called_once_with(
+        connector_name="okx", trading_pair="ETH-USDC", order_id="parent"
+    )
+    assert executor.get_custom_info()["entry_acquisition"]["pending_target"] == "99.90"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_zero_fill_cancel_waits_for_reconciliation_then_places_one_child() -> None:
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.control_open_order()
+    executor.place_order.assert_called_once()
+    assert executor.place_order.call_args.kwargs["price"] == Decimal("99.90")
+    assert executor.place_order.call_args.kwargs["amount"] == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_fill_during_cancel_suppresses_child_and_retains_inventory() -> None:
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = tracked_order(fill="0.4", state=OrderState.CANCELED)
+    executor._open_order = parent
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.open_filled_amount == Decimal("0.4")
+    assert executor.status is RunnableStatus.RUNNING
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "partial_fill"
+
+
+def test_cancel_uncertainty_blocks_replacement() -> None:
+    executor, _, prices = make_executor()
+    request_reprice(executor, prices)
+    executor.process_order_canceled_event(0, executor.connectors["okx"], OrderCancelledEvent(12, "unknown"))
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor._open_order.order_id == "parent"
+
+
+@pytest.mark.parametrize(
+    "timestamp,bid,expected",
+    [
+        (300, Decimal("99.90"), "total_age_expired"),
+        (10, Decimal("98.99"), "downward_bound_breached"),
+    ],
+)
+def test_hard_rails_cancel_terminally(timestamp, bid, expected) -> None:
+    executor, _, prices = make_executor()
+    executor._open_order = tracked_order()
+    executor._entry_submitted = True
+    executor._strategy.current_timestamp = timestamp
+    prices[PriceType.BestBid] = bid
+    prices[PriceType.BestAsk] = Decimal("100.01")
+    executor.control_open_order()
+    executor._strategy.cancel.assert_called_once()
+    state = executor.get_custom_info()["entry_acquisition"]
+    assert state["terminal_reason"] == expected
+    assert state["pending_target"] is None
+
+
+def test_reprice_budget_exhaustion_is_terminal() -> None:
+    executor, _, prices = make_executor()
+    executor._entry_reprice_count = 3
+    request_reprice(executor, prices)
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "reprice_budget_exhausted"
+    executor._strategy.cancel.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_below_minimum_amount_ends_without_child() -> None:
+    executor, connector, prices = make_executor(config=make_config(amount=Decimal("0.005")))
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.amount = Decimal("0.005")
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "remaining_below_minimum"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_terminal_events_never_dispatch_second_child_or_sell() -> None:
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    event = OrderCancelledEvent(12, "parent")
+    executor.process_order_canceled_event(0, connector, event)
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.process_order_canceled_event(0, connector, event)
+    executor.control_open_order()
+    assert executor.place_order.call_count == 1
+    executor._strategy.sell.assert_not_called()

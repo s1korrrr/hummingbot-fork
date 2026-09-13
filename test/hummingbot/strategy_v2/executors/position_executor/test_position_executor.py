@@ -124,6 +124,36 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         return position_executor
 
     @patch.object(PositionExecutor, "get_trading_rules")
+    def test_place_open_order_preserves_single_attempt_dispatch_contract(self, trading_rules_mock):
+        trading_rules_mock.return_value = TradingRule(
+            "ETH-USDT",
+            min_order_size=Decimal("0.01"),
+            min_price_increment=Decimal("0.01"),
+            min_base_amount_increment=Decimal("0.01"),
+            min_notional_size=Decimal("1"),
+        )
+        config = self.get_position_config_market_long()
+        config.entry_order_policy = "single_attempt"
+        config.triple_barrier_config.open_order_type = OrderType.LIMIT_MAKER
+        executor = self.get_position_executor_running_from_config(config)
+        executor.place_order = MagicMock(return_value="entry-order")
+
+        executor.place_open_order()
+        executor.place_open_order()
+
+        executor.place_order.assert_called_once_with(
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT_MAKER,
+            amount=Decimal("1"),
+            price=Decimal("99.99"),
+            side=TradeType.BUY,
+            position_action=PositionAction.OPEN,
+        )
+        self.assertTrue(executor._entry_submitted)
+        self.assertEqual(executor._open_order.order_id, "entry-order")
+
+    @patch.object(PositionExecutor, "get_trading_rules")
     @patch.object(PositionExecutor, "get_price")
     async def test_control_position_create_open_order(self, mock_price, trading_rules_mock):
         mock_price.return_value = Decimal("100")

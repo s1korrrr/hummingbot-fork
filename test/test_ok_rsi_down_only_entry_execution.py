@@ -310,6 +310,25 @@ async def test_confirmed_zero_fill_cancel_waits_for_reconciliation_then_places_o
 
 
 @pytest.mark.asyncio
+async def test_reprice_child_uses_the_quantized_remaining_authorization() -> None:
+    executor, connector, prices = make_executor(config=make_config(amount=Decimal("1.003")))
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    executor._open_order = parent
+    connector.quantize_order_amount.side_effect = (
+        lambda trading_pair, amount: (amount / Decimal("0.01")).to_integral_value(rounding="ROUND_FLOOR")
+        * Decimal("0.01")
+    )
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+
+    assert executor.place_order.call_args.kwargs["amount"] == Decimal("1.00")
+
+
+@pytest.mark.asyncio
 async def test_fill_during_cancel_suppresses_child_and_retains_inventory() -> None:
     executor, connector, prices = make_executor()
     request_reprice(executor, prices)

@@ -1137,8 +1137,8 @@ class PositionExecutor(ExecutorBase):
         self._submit_open_order(self.entry_price)
         self.logger().debug(self._log_message(f"Placing open order order_id={self._open_order.order_id}"))
 
-    def _submit_open_order(self, price: Decimal) -> None:
-        remaining = max(
+    def _submit_open_order(self, price: Decimal, amount: Optional[Decimal] = None) -> None:
+        remaining = amount if amount is not None else max(
             Decimal("0"),
             self.config.amount - sum(
                 (order.executed_amount_base for order in self._entry_orders()),

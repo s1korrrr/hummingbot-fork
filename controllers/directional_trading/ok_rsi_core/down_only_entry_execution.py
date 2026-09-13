@@ -350,7 +350,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
 
         try:
-            self._submit_open_order(target)
+            self._submit_open_order(target, amount=remaining)
         except Exception as exc:
             self.logger().error(self._log_message(
                 f"Down-only child submission failed without retry: {type(exc).__name__}: {exc}"

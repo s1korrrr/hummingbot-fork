@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,7 +13,7 @@ from controllers.directional_trading.ok_rsi_core.down_only_entry_execution impor
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
-from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import OrderCancelledEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
@@ -76,7 +78,15 @@ def make_executor(*, bid=Decimal("100"), ask=Decimal("100.01"), config=None):
     return executor, connector, prices
 
 
-def tracked_order(order_id="parent", *, price="100", fill="0", state=OrderState.OPEN, amount="1"):
+def tracked_order(
+    order_id="parent",
+    *,
+    price="100",
+    fill="0",
+    state=OrderState.OPEN,
+    amount="1",
+    fee=None,
+):
     order = InFlightOrder(
         client_order_id=order_id,
         exchange_order_id=f"exchange-{order_id}",
@@ -97,7 +107,7 @@ def tracked_order(order_id="parent", *, price="100", fill="0", state=OrderState.
             fill_price=Decimal(price),
             fill_base_amount=Decimal(fill),
             fill_quote_amount=Decimal(fill) * Decimal(price),
-            fee=AddedToCostTradeFee(),
+            fee=fee or AddedToCostTradeFee(),
             fill_timestamp=1,
         ))
     tracked = TrackedOrder(order_id=order_id)
@@ -148,6 +158,117 @@ def test_initial_submission_is_one_maker_buy() -> None:
     )
 
 
+def test_entry_acquisition_snapshot_is_stable_and_json_native() -> None:
+    executor, _, _ = make_executor()
+    executor._open_order = tracked_order()
+    executor._entry_submitted = True
+    executor.control_open_order()
+    snapshot = executor.get_custom_info()["entry_acquisition"]
+    assert {
+        key: snapshot[key]
+        for key in (
+            "policy",
+            "intent_id",
+            "state",
+            "terminal_reason",
+            "initial_price",
+            "current_order_price",
+            "maximum_acceptable_price",
+            "decision_atr_1m",
+            "authorized_base",
+            "cumulative_filled_base",
+            "remaining_base",
+            "reprice_count",
+            "rest_seconds",
+            "total_max_age_seconds",
+            "order_ids",
+            "queue_fill_status",
+        )
+    } == {
+        "policy": "down_only_maker_v1",
+        "intent_id": "entry-intent",
+        "state": "resting",
+        "terminal_reason": None,
+        "initial_price": "100",
+        "current_order_price": "100",
+        "maximum_acceptable_price": "100",
+        "decision_atr_1m": "1",
+        "authorized_base": "1",
+        "cumulative_filled_base": "0",
+        "remaining_base": "1",
+        "reprice_count": 0,
+        "rest_seconds": 30,
+        "total_max_age_seconds": 300,
+        "order_ids": ["parent"],
+        "queue_fill_status": "UNAVAILABLE",
+    }
+    json.dumps(snapshot)
+
+
+def test_cumulative_child_fills_are_monotonic_and_duplicate_trade_ids_are_idempotent() -> None:
+    executor, _, _ = make_executor()
+    parent = tracked_order(fill="0.4", state=OrderState.CANCELED)
+    child = tracked_order("child-1", price="99.90", fill="0.3", state=OrderState.PARTIALLY_FILLED, amount="0.6")
+    executor._completed_open_orders = [parent]
+    executor._open_order = child
+
+    first = executor.get_custom_info()["entry_acquisition"]
+    assert first["cumulative_filled_base"] == "0.7"
+    assert first["remaining_base"] == "0.3"
+    duplicate = next(iter(child.order.order_fills.values()))
+    assert child.order.update_with_trade_update(duplicate) is False
+    assert executor.get_custom_info()["entry_acquisition"]["cumulative_filled_base"] == "0.7"
+
+    child.order.update_with_trade_update(TradeUpdate(
+        trade_id="fill-child-1-later",
+        client_order_id="child-1",
+        exchange_order_id="exchange-child-1",
+        trading_pair="ETH-USDC",
+        fill_price=Decimal("99.90"),
+        fill_base_amount=Decimal("0.2"),
+        fill_quote_amount=Decimal("19.98"),
+        fee=AddedToCostTradeFee(),
+        fill_timestamp=2,
+    ))
+    second = executor.get_custom_info()["entry_acquisition"]
+    assert second["cumulative_filled_base"] == "0.9"
+    assert second["remaining_base"] == "0.1"
+
+
+def test_base_fee_reduces_managed_inventory_once_and_unknown_fee_marks_economics_unavailable() -> None:
+    executor, _, _ = make_executor()
+    executor._open_order = tracked_order(
+        fill="0.4",
+        fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="ETH", amount=Decimal("0.001"))]),
+    )
+    first = executor.get_custom_info()["entry_acquisition"]
+    second = executor.get_custom_info()["entry_acquisition"]
+    assert executor.open_filled_amount == Decimal("0.399")
+    assert first["cumulative_filled_base"] == second["cumulative_filled_base"] == "0.4"
+    assert first["fee_economics_status"] == "AVAILABLE"
+
+    executor._open_order = tracked_order(
+        fill="0.4",
+        fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="BNB", amount=Decimal("0.001"))]),
+    )
+    unavailable = executor.get_custom_info()["entry_acquisition"]
+    assert unavailable["fee_economics_status"] == "UNAVAILABLE"
+    assert unavailable["fee_errors"] == ["unsupported_fee_asset:BNB"]
+
+
+def test_active_decision_log_has_parseable_bounded_schema(caplog) -> None:
+    executor, _, prices = make_executor()
+    with caplog.at_level(logging.INFO):
+        request_reprice(executor, prices)
+    messages = [record.message for record in caplog.records if "ENTRY_ACQUISITION_DECISION" in record.message]
+    assert len(messages) == 1
+    payload = json.loads(messages[0].split("ENTRY_ACQUISITION_DECISION ", 1)[1])
+    assert payload["action"] == "cancel_for_reprice"
+    assert payload["candidate_price"] == "99.90"
+    assert payload["queue_fill_status"] == "UNAVAILABLE"
+    assert "connectors" not in payload
+
+
 def test_rising_price_never_requests_cancel_or_upward_reprice() -> None:
     executor, _, prices = make_executor()
     executor._open_order = tracked_order()
@@ -157,7 +278,7 @@ def test_rising_price_never_requests_cancel_or_upward_reprice() -> None:
     prices[PriceType.BestAsk] = Decimal("100.21")
     executor.control_open_order()
     executor._strategy.cancel.assert_not_called()
-    assert executor.get_custom_info()["entry_acquisition"]["pending_target"] is None
+    assert executor._entry_pending_target is None
 
 
 def test_qualified_lower_target_requests_cancel_exactly_once() -> None:
@@ -167,7 +288,7 @@ def test_qualified_lower_target_requests_cancel_exactly_once() -> None:
     executor._strategy.cancel.assert_called_once_with(
         connector_name="okx", trading_pair="ETH-USDC", order_id="parent"
     )
-    assert executor.get_custom_info()["entry_acquisition"]["pending_target"] == "99.90"
+    assert executor._entry_pending_target == Decimal("99.90")
 
 
 @pytest.mark.asyncio
@@ -231,7 +352,7 @@ def test_hard_rails_cancel_terminally(timestamp, bid, expected) -> None:
     executor._strategy.cancel.assert_called_once()
     state = executor.get_custom_info()["entry_acquisition"]
     assert state["terminal_reason"] == expected
-    assert state["pending_target"] is None
+    assert executor._entry_pending_target is None
 
 
 def test_reprice_budget_exhaustion_is_terminal() -> None:

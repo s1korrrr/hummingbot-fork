@@ -1,4 +1,5 @@
 import asyncio
+import json
 from decimal import Decimal
 from typing import Literal
 
@@ -10,6 +11,7 @@ from controllers.directional_trading.ok_rsi_core.down_only_entry import (
     DownOnlyMakerSnapshot,
     decide_down_only_maker,
 )
+from controllers.directional_trading.ok_rsi_core.execution import actual_fees
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
@@ -86,6 +88,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         self._entry_child_submission_authorized = False
         self._entry_cancel_order_id = None
         self._entry_reprice_cancel_confirmed = False
+        self._entry_last_event_signature = None
 
     @property
     def _down_only_parameters(self) -> DownOnlyMakerParameters:
@@ -183,6 +186,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._request_terminal_cancel("input_unavailable")
             return
 
+        state_before = self._entry_lifecycle.get("state")
         if decision.action is DownOnlyMakerAction.CANCEL_FOR_REPRICE:
             self._entry_pending_target = decision.target_price
             self._entry_cancel_reason = decision.reason.value
@@ -191,6 +195,14 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._request_terminal_cancel(decision.reason.value)
         else:
             self._entry_lifecycle["state"] = decision.reason.value
+        self._emit_entry_decision(
+            decision=decision,
+            state_before=state_before,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            now=now,
+            order_id=tracked.order_id,
+        )
 
     def early_stop(self, keep_position: bool = False):
         if keep_position and not self.is_closed:
@@ -365,18 +377,82 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
 
     def get_custom_info(self):
         custom_info = super().get_custom_info()
+        cumulative_filled = self._cumulative_entry_filled_base()
+        remaining = max(self.config.amount - cumulative_filled, Decimal("0"))
+        fee_errors = self._entry_fee_errors()
         custom_info["entry_acquisition"] = {
             "policy": self.config.entry_acquisition_policy,
-            "entry_intent_id": self.config.id,
-            "intent_created_at": self._entry_intent_created_at,
-            "current_order_price": str(self._entry_current_price),
-            "order_created_at": self._entry_order_created_at,
-            "last_reprice_at": self._entry_last_reprice_at,
-            "reprice_count": self._entry_reprice_count,
-            "pending_target": str(self._entry_pending_target) if self._entry_pending_target is not None else None,
-            "cancel_reason": self._entry_cancel_reason,
+            "intent_id": self.config.id,
+            "state": self._entry_lifecycle.get("state"),
             "terminal_reason": self._entry_terminal_reason,
-            "child_submission_authorized": self._entry_child_submission_authorized,
-            "lifecycle_state": self._entry_lifecycle.get("state"),
+            "initial_price": str(self.config.entry_price),
+            "current_order_price": str(self._entry_current_price),
+            "maximum_acceptable_price": str(self.config.maximum_acceptable_price),
+            "decision_atr_1m": str(self.config.decision_atr_1m),
+            "authorized_base": str(self.config.amount),
+            "cumulative_filled_base": str(cumulative_filled),
+            "remaining_base": str(remaining),
+            "reprice_count": self._entry_reprice_count,
+            "rest_seconds": self.config.entry_rest_seconds,
+            "total_max_age_seconds": self.config.entry_total_max_age_seconds,
+            "order_ids": [order.order_id for order in self._entry_orders()],
+            "queue_fill_status": "UNAVAILABLE",
+            "fee_economics_status": "UNAVAILABLE" if fee_errors else "AVAILABLE",
+            "fee_errors": fee_errors,
         }
         return custom_info
+
+    def _cumulative_entry_filled_base(self) -> Decimal:
+        return sum((order.executed_amount_base for order in self._entry_orders()), Decimal("0"))
+
+    def _entry_fee_errors(self) -> list[str]:
+        errors = []
+        for tracked in self._entry_orders():
+            if tracked.order is not None:
+                _, _, order_errors = actual_fees(tracked.order)
+                errors.extend(order_errors)
+        return sorted(set(errors))
+
+    def _emit_entry_decision(self, *, decision, state_before, best_bid, best_ask, now, order_id) -> None:
+        state_after = self._entry_lifecycle.get("state")
+        signature = (
+            decision.action.value,
+            decision.reason.value,
+            state_after,
+            str(decision.target_price),
+            order_id,
+            self._entry_reprice_count,
+        )
+        if signature == self._entry_last_event_signature:
+            return
+        self._entry_last_event_signature = signature
+        cumulative_filled = self._cumulative_entry_filled_base()
+        remaining = max(self.config.amount - cumulative_filled, Decimal("0"))
+        payload = {
+            "action": decision.action.value,
+            "authorized_base": str(self.config.amount),
+            "best_ask": str(best_ask),
+            "best_bid": str(best_bid),
+            "candidate_price": str(decision.target_price) if decision.target_price is not None else None,
+            "connector": self.config.connector_name,
+            "controller": self.config.controller_id,
+            "cooldown_seconds": self.config.entry_reprice_cooldown_seconds,
+            "cumulative_filled_base": str(cumulative_filled),
+            "current_order_price": str(self._entry_current_price),
+            "decision_atr_1m": str(self.config.decision_atr_1m),
+            "intent_age_seconds": str(now - Decimal(str(self._entry_intent_created_at))),
+            "intent_id": self.config.id,
+            "order_age_seconds": str(now - Decimal(str(self._entry_order_created_at))),
+            "order_id": order_id,
+            "queue_fill_status": "UNAVAILABLE",
+            "reason": decision.reason.value,
+            "remaining_base": str(remaining),
+            "reprice_count": self._entry_reprice_count,
+            "spread": str(best_ask - best_bid),
+            "state_after": state_after,
+            "state_before": state_before,
+            "trading_pair": self.config.trading_pair,
+        }
+        self.logger().info(
+            "ENTRY_ACQUISITION_DECISION " + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        )

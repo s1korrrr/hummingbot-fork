@@ -1,3 +1,5 @@
+import json
+import logging
 from decimal import Decimal
 
 import pytest
@@ -160,3 +162,21 @@ def test_all_emitted_decimals_are_strings() -> None:
     assert event["at"] == "0"
     assert event["current_order_price"] == "100"
     assert event["queue_fill_status"] == "UNAVAILABLE"
+
+
+def test_shadow_log_suffix_is_parseable_json_and_not_repeated_for_same_transition(caplog) -> None:
+    with caplog.at_level(logging.INFO):
+        tracker = started_tracker()
+        tracker.advance(
+            now=Decimal("10"),
+            best_bid=Decimal("99.90"),
+            best_ask=Decimal("100.01"),
+            opposing_signal=False,
+            risk_allowed=True,
+        )
+    messages = [record.message for record in caplog.records if "ENTRY_ACQUISITION_SHADOW" in record.message]
+    assert len(messages) == 2
+    payload = json.loads(messages[-1].split("ENTRY_ACQUISITION_SHADOW ", 1)[1])
+    assert payload["action"] == "replace_lower"
+    assert payload["current_order_price"] == "99.90"
+    assert payload["queue_fill_status"] == "UNAVAILABLE"

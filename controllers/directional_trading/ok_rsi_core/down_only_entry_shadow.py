@@ -1,3 +1,5 @@
+import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
@@ -30,10 +32,21 @@ class _ShadowState:
 class DownOnlyMakerShadowTracker:
     """Virtual entry tracker that never receives a strategy or connector."""
 
-    def __init__(self, parameters: DownOnlyMakerParameters):
+    def __init__(
+        self,
+        parameters: DownOnlyMakerParameters,
+        *,
+        controller_id: Optional[str] = None,
+        connector_name: Optional[str] = None,
+        trading_pair: Optional[str] = None,
+    ):
         self._parameters = parameters
+        self._controller_id = controller_id
+        self._connector_name = connector_name
+        self._trading_pair = trading_pair
         self._state: Optional[_ShadowState] = None
         self._last_event: Optional[dict] = None
+        self._last_log_signature = None
         self._event_count = 0
 
     @property
@@ -142,6 +155,7 @@ class DownOnlyMakerShadowTracker:
         }
         self._last_event = event
         self._event_count += 1
+        self._emit_event(event)
         return event
 
     def snapshot(self) -> dict:
@@ -226,4 +240,26 @@ class DownOnlyMakerShadowTracker:
         }
         self._last_event = event
         self._event_count += 1
+        self._emit_event(event)
         return event
+
+    def _emit_event(self, event: dict) -> None:
+        signature = (
+            event["action"],
+            event["reason"],
+            event["current_order_price"],
+            event["target_price"],
+            event["reprice_count"],
+        )
+        if signature == self._last_log_signature:
+            return
+        self._last_log_signature = signature
+        payload = {
+            **event,
+            "controller": self._controller_id,
+            "connector": self._connector_name,
+            "trading_pair": self._trading_pair,
+        }
+        logging.getLogger(__name__).info(
+            "ENTRY_ACQUISITION_SHADOW " + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        )

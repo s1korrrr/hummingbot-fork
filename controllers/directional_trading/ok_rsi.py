@@ -140,7 +140,12 @@ class OKRSIController(hl_rsi.HLRSIController):
         self._entry_acquisition_policy = config.entry_acquisition_policy
         self._entry_acquisition_shadow_policy = config.entry_acquisition_shadow_policy
         self._entry_acquisition_shadow = (
-            DownOnlyMakerShadowTracker(config.down_only_maker_parameters())
+            DownOnlyMakerShadowTracker(
+                config.down_only_maker_parameters(),
+                controller_id=config.id,
+                connector_name=config.connector_name,
+                trading_pair=config.trading_pair,
+            )
             if config.entry_acquisition_shadow_policy == "down_only_maker_v1"
             else None
         )

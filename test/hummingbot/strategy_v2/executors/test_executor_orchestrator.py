@@ -176,6 +176,81 @@ class TestExecutorOrchestrator(unittest.TestCase):
             self.orchestrator.create_executor(action)
         self.assertEqual(start_mock.call_count, 1)
 
+    def test_unfinished_down_only_executor_blocks_restart_and_retains_receipt(self):
+        config = DownOnlyMakerPositionExecutorConfig(
+            id="intent-1",
+            timestamp=1_000,
+            controller_id="ok-rsi-eth",
+            connector_name="okx",
+            trading_pair="ETH-USDC",
+            side=TradeType.BUY,
+            entry_price=Decimal("100"),
+            amount=Decimal("1"),
+            leverage=1,
+            triple_barrier_config=TripleBarrierConfig(
+                open_order_type=OrderType.LIMIT_MAKER,
+                open_order_limit_max_age_seconds=30,
+            ),
+            entry_order_policy="single_attempt",
+            decision_best_bid=Decimal("100"),
+            decision_best_ask=Decimal("100.01"),
+            decision_atr_1m=Decimal("1"),
+            decision_price_step=Decimal("0.01"),
+            maximum_acceptable_price=Decimal("100"),
+            entry_rest_seconds=30,
+            entry_total_max_age_seconds=300,
+            entry_max_downward_reprices=3,
+            entry_reprice_cooldown_seconds=5,
+            entry_reprice_min_ticks=3,
+            entry_reprice_atr_fraction=Decimal("0.05"),
+            entry_max_downward_atr=Decimal("1"),
+        )
+        receipt = {
+            "policy": "down_only_maker_v1",
+            "intent_id": "intent-1",
+            "state": "cancel_pending_reprice",
+            "terminal_reason": None,
+            "initial_price": "100",
+            "current_order_price": "99.90",
+            "maximum_acceptable_price": "100",
+            "decision_atr_1m": "1",
+            "authorized_base": "1",
+            "cumulative_filled_base": "0",
+            "remaining_base": "1",
+            "reprice_count": 1,
+            "rest_seconds": 30,
+            "total_max_age_seconds": 300,
+            "order_ids": ["parent", "child-1"],
+            "queue_fill_status": "UNAVAILABLE",
+        }
+        info = ExecutorInfo(
+            id=config.id,
+            timestamp=config.timestamp,
+            type=config.type,
+            status=RunnableStatus.RUNNING,
+            config=config,
+            net_pnl_pct=Decimal("0"),
+            net_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            filled_amount_quote=Decimal("0"),
+            is_active=True,
+            is_trading=False,
+            custom_info={"side": TradeType.BUY, "entry_acquisition": receipt},
+            controller_id="ok-rsi-eth",
+        )
+        recorder = MarketsRecorder.get_instance()
+        recorder.get_all_executors.return_value = [info]
+        self.mock_strategy.controllers = {"ok-rsi-eth": MagicMock()}
+        self.mock_strategy.connectors["okx"] = MagicMock(spec=ExchangePyBase)
+        restarted = ExecutorOrchestrator(strategy=self.mock_strategy)
+
+        self.assertEqual(restarted.recovery_required["ok-rsi-eth"], ["intent-1"])
+        self.assertEqual(restarted.stored_executors["ok-rsi-eth"], [])
+        persisted = recorder.get_all_executors.return_value[0]
+        self.assertEqual(persisted.custom_info["entry_acquisition"], receipt)
+        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+            restarted.create_executor(CreateExecutorAction(controller_id="ok-rsi-eth", executor_config=config))
+
     @patch.object(PositionExecutor, "start")
     @patch.object(DCAExecutor, "start")
     @patch.object(ArbitrageExecutor, "start")

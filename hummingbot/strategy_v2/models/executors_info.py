@@ -24,8 +24,8 @@ class ExecutorInfo(BaseModel):
     type: str
     status: RunnableStatus
     config: AnyExecutorConfig = Field(..., discriminator="type")
-    net_pnl_pct: Decimal
-    net_pnl_quote: Decimal
+    net_pnl_pct: Optional[Decimal]
+    net_pnl_quote: Optional[Decimal]
     cum_fees_quote: Decimal
     filled_amount_quote: Decimal
     is_active: bool
@@ -59,12 +59,15 @@ class ExecutorInfo(BaseModel):
 
 
 class PerformanceReport(BaseModel):
-    realized_pnl_quote: Decimal = Decimal("0")
-    unrealized_pnl_quote: Decimal = Decimal("0")
-    unrealized_pnl_pct: Decimal = Decimal("0")
-    realized_pnl_pct: Decimal = Decimal("0")
-    global_pnl_quote: Decimal = Decimal("0")
-    global_pnl_pct: Decimal = Decimal("0")
+    pnl_available: bool = True
+    pnl_unavailable_reason: Optional[str] = None
+    wallet_sales: List[Dict] = Field(default_factory=list)
+    realized_pnl_quote: Optional[Decimal] = Decimal("0")
+    unrealized_pnl_quote: Optional[Decimal] = Decimal("0")
+    unrealized_pnl_pct: Optional[Decimal] = Decimal("0")
+    realized_pnl_pct: Optional[Decimal] = Decimal("0")
+    global_pnl_quote: Optional[Decimal] = Decimal("0")
+    global_pnl_pct: Optional[Decimal] = Decimal("0")
     volume_traded: Decimal = Decimal("0")
     positions_summary: List = []
     close_type_counts: Dict[CloseType, int] = {}

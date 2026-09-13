@@ -354,6 +354,8 @@ class StrategyV2Base(StrategyPyBase):
         self.market_data_provider = MarketDataProvider(connectors)
         self._is_stop_triggered = False
         self._controller_reports_valid = False
+        self._controller_report_error = None
+        self._last_controller_report_error_log_ts = None
         self._controllers_started = False
         self._last_controller_reload_error: Optional[str] = None
         self._controller_restart_required: Dict[str, str] = {}
@@ -772,7 +774,8 @@ class StrategyV2Base(StrategyPyBase):
         return config_name or script_name or "strategy_v2"
 
     def _write_runtime_status_snapshot_if_due(self):
-        if not self._runtime_status_snapshot_enabled() or not self.ready_to_trade:
+        if (not self._runtime_status_snapshot_enabled() or not self.ready_to_trade
+                or not self._controller_reports_valid):
             return
         if self.current_timestamp - self._last_runtime_status_snapshot_ts < self._runtime_status_snapshot_interval():
             return
@@ -911,8 +914,8 @@ class StrategyV2Base(StrategyPyBase):
                         "executor_type": self._compact_executor_type(executor.type),
                         "status": (self._compact_enum_label(executor.status) or "unknown").lower(),
                         "age": self._format_executor_age_short(executor.timestamp),
-                        "net_pnl_quote": float(self._safe_decimal(executor.net_pnl_quote)),
-                        "net_pnl_pct": float(self._safe_decimal(executor.net_pnl_pct) * Decimal("100")),
+                        "net_pnl_quote": float(executor.net_pnl_quote) if executor.net_pnl_quote is not None else None,
+                        "net_pnl_pct": float(executor.net_pnl_pct * Decimal("100")) if executor.net_pnl_pct is not None else None,
                         "filled_amount_quote": float(self._safe_decimal(executor.filled_amount_quote)),
                     }
                 )
@@ -934,15 +937,20 @@ class StrategyV2Base(StrategyPyBase):
 
         active_orders, active_orders_status = active_order_observations(self.connectors, controller_entries)
         active_orders_count = sum(len(self.get_active_orders(connector_name)) for connector_name in self.connectors)
+        pnl_available = all(getattr(entry.get("performance"), "pnl_available", True) for entry in controller_entries)
+        wallet_sales = [sale for entry in controller_entries
+                        for sale in getattr(entry.get("performance"), "wallet_sales", [])]
         balance_value_quote = round(sum(row["value_quote"] for row in balances), 6)
         positions_value_quote = round(sum(row["value_quote"] for row in positions_held), 6)
         realized_pnl_quote = round(sum(row["realized_pnl_quote"] for row in positions_held), 6)
         unrealized_pnl_quote = round(sum(row["unrealized_pnl_quote"] for row in positions_held), 6)
-        fees_quote = round(sum(row["fees_quote"] for row in positions_held), 6)
+        fees_quote = round(sum(row["fees_quote"] for row in positions_held)
+                           + float(sum((Decimal(sale["fees_quote"]) for sale in wallet_sales), Decimal("0"))), 6)
 
         return {
             "schema_version": 1,
             "bot_name": self._runtime_status_snapshot_bot_name(),
+            "controller_reports_valid": self._controller_reports_valid,
             "updated_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
             "operations": self._build_runtime_operations_snapshot(),
             "active_orders_count": active_orders_count,
@@ -953,16 +961,18 @@ class StrategyV2Base(StrategyPyBase):
             "focus_queue": focus_queue,
             "active_executors": active_executors,
             "positions_held": positions_held,
+            "wallet_sales": wallet_sales,
             "summary": {
+                "pnl_available": pnl_available,
                 "balance_value_quote": balance_value_quote,
                 "active_executor_count": len(active_executors),
                 "positions_held_count": len(positions_held),
                 "controller_count": len(controllers),
                 "positions_value_quote": positions_value_quote,
-                "realized_pnl_quote": realized_pnl_quote,
-                "unrealized_pnl_quote": unrealized_pnl_quote,
+                "realized_pnl_quote": realized_pnl_quote if pnl_available else None,
+                "unrealized_pnl_quote": unrealized_pnl_quote if pnl_available else None,
                 "fees_quote": fees_quote,
-                "net_pnl_quote": round(realized_pnl_quote + unrealized_pnl_quote - fees_quote, 6),
+                "net_pnl_quote": round(realized_pnl_quote + unrealized_pnl_quote - fees_quote, 6) if pnl_available else None,
             },
         }
 
@@ -1000,6 +1010,9 @@ class StrategyV2Base(StrategyPyBase):
             global_unrealized = Decimal("0")
             global_total = Decimal("0")
             global_volume = Decimal("0")
+            global_pnl_available = True
+            if not self._controller_reports_valid:
+                lines.append("CONTROLLER REPORTS UNAVAILABLE: retained values below are stale; reconciliation failed.")
             controller_entries = self._build_controller_status_entries()
             # Operator console: shared summary layout (SIGNALS / PLANS / runtime tables).
             # Per-controller sections are suppressed entirely when ``to_format_status()`` returns an empty body;
@@ -1033,7 +1046,14 @@ class StrategyV2Base(StrategyPyBase):
                         lines.append(exec_stats_line)
 
                 # Collect performance data for summary table
-                if performance_report:
+                if performance_report and not getattr(performance_report, "pnl_available", True):
+                    global_pnl_available = False
+                    volume_traded = self._safe_decimal(getattr(performance_report, "volume_traded", 0))
+                    global_volume += volume_traded
+                    performance_data.append({"Controller": controller_id, "Realized PnL": "n/a",
+                                             "Unrealized PnL": "n/a", "Global PnL": "n/a",
+                                             "Global PnL %": "n/a", "Volume Traded": f"${volume_traded:.2f}"})
+                elif performance_report:
                     realized_pnl_quote = self._safe_decimal(getattr(performance_report, "realized_pnl_quote", 0))
                     unrealized_pnl_quote = self._safe_decimal(getattr(performance_report, "unrealized_pnl_quote", 0))
                     global_pnl_quote = self._safe_decimal(getattr(performance_report, "global_pnl_quote", 0))
@@ -1060,10 +1080,10 @@ class StrategyV2Base(StrategyPyBase):
                 # Add global row
                 performance_data.append({
                     "Controller": "GLOBAL TOTAL",
-                    "Realized PnL": f"${global_realized:.2f}",
-                    "Unrealized PnL": f"${global_unrealized:.2f}",
-                    "Global PnL": f"${global_total:.2f}",
-                    "Global PnL %": f"{global_pnl_pct:.2f}%",
+                    "Realized PnL": f"${global_realized:.2f}" if global_pnl_available else "n/a",
+                    "Unrealized PnL": f"${global_unrealized:.2f}" if global_pnl_available else "n/a",
+                    "Global PnL": f"${global_total:.2f}" if global_pnl_available else "n/a",
+                    "Global PnL %": f"{global_pnl_pct:.2f}%" if global_pnl_available else "n/a",
                     "Volume Traded": f"${global_volume:.2f}"
                 })
 
@@ -1328,9 +1348,19 @@ class StrategyV2Base(StrategyPyBase):
                 controller.performance_report = controller_report.get("performance", [])
                 controller.executors_update_event.set()
             self._controller_reports_valid = True
+            if self._controller_report_error is not None:
+                self.logger().info("Controller report reconciliation recovered; current reporting resumed")
+            self._controller_report_error = None
+            self._last_controller_report_error_log_ts = None
         except Exception as e:
             self._controller_reports_valid = False
-            self.logger().error(f"Error updating controller reports: {e}", exc_info=True)
+            error = (type(e).__name__, str(e))
+            last_log = self._last_controller_report_error_log_ts
+            if (error != self._controller_report_error or last_log is None
+                    or not 0 <= self.current_timestamp - last_log < 60):
+                self.logger().error(f"Error updating controller reports: {e}", exc_info=True)
+                self._last_controller_report_error_log_ts = self.current_timestamp
+            self._controller_report_error = error
 
     @staticmethod
     def is_perpetual(connector: str) -> bool:
@@ -1491,13 +1521,13 @@ class StrategyV2Base(StrategyPyBase):
 
     @classmethod
     def _format_summary_quote(cls, value: Any) -> str:
-        return f"${cls._safe_decimal(value):.2f}"
+        return "n/a" if value is None else f"${cls._safe_decimal(value):.2f}"
 
     @classmethod
     def _format_summary_quote_pct(cls, quote_value: Any, pct_value: Any) -> str:
         quote = cls._format_summary_quote(quote_value)
         try:
-            pct = f"{cls._safe_decimal(pct_value):.2f}%"
+            pct = "n/a" if pct_value is None else f"{cls._safe_decimal(pct_value):.2f}%"
         except Exception:
             pct = "n/a"
         return f"{quote} / {pct}"
@@ -1525,6 +1555,11 @@ class StrategyV2Base(StrategyPyBase):
         )
         held_positions = sum(1 for position in positions if getattr(position, "amount", Decimal("0")) > 0)
 
+        if performance is not None and not getattr(performance, "pnl_available", True):
+            enriched.update(focus=enriched.get("note", ""),
+                            execs=f"A{len(active_executors)} | B{active_buy_execs} S{active_sell_execs} H{held_positions}",
+                            r_pnl="n/a", u_pnl="n/a", u_pnl_pct="n/a", g_pnl="n/a")
+            return enriched
         if performance is not None:
             realized_pnl_quote = cls._safe_decimal(getattr(performance, "realized_pnl_quote", 0))
             unrealized_pnl_quote = cls._safe_decimal(getattr(performance, "unrealized_pnl_quote", 0))
@@ -1800,7 +1835,7 @@ class StrategyV2Base(StrategyPyBase):
                     "age": self._format_executor_age_short(executor.timestamp),
                     "PnL": self._format_summary_quote_pct(
                         executor.net_pnl_quote,
-                        self._safe_decimal(executor.net_pnl_pct) * Decimal("100"),
+                        executor.net_pnl_pct * Decimal("100") if executor.net_pnl_pct is not None else None,
                     ),
                     "Fill": self._format_summary_quote(executor.filled_amount_quote),
                 })
@@ -1858,14 +1893,17 @@ class StrategyV2Base(StrategyPyBase):
                 trail_label = str(trailing_state)
                 trail_counts[trail_label] = trail_counts.get(trail_label, 0) + 1
 
+        pnl_available = all(executor.net_pnl_quote is not None and executor.net_pnl_pct is not None
+                            for executor in active_executors)
         avg_pnl_pct = total_pnl_pct / Decimal(len(active_executors))
+        pnl_label = self._format_summary_quote_pct(total_pnl_quote, avg_pnl_pct * Decimal("100")) if pnl_available else "n/a"
         oldest_age = self._format_executor_age_short(oldest_timestamp) if oldest_timestamp is not None else "n/a"
         trail_summary = ", ".join(f"{state}:{count}" for state, count in sorted(trail_counts.items())) or "none"
         return (
             "   active_exec "
             f"total={len(active_executors)} | "
             f"buy={buy_count} sell={sell_count} | "
-            f"pnl={self._format_summary_quote_pct(total_pnl_quote, avg_pnl_pct * Decimal('100'))} | "
+            f"pnl={pnl_label} | "
             f"fill={self._format_summary_quote(total_fill_quote)} | "
             f"oldest={oldest_age} | "
             f"trail={trail_summary}"

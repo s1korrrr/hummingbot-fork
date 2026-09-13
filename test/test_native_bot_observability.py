@@ -84,7 +84,7 @@ def test_actual_snapshot_function_emits_enrichment_and_preserves_legacy_count():
     strategy = Obj(_build_controller_status_entries=lambda: [entry], _get_balances_snapshot=lambda: [],
                    connectors={'okx': Obj(in_flight_orders={})}, get_active_orders=lambda name: [],
                    _runtime_status_snapshot_bot_name=lambda: 'test-bot', _build_runtime_operations_snapshot=lambda: {},
-                   current_timestamp=100, _safe_decimal=lambda value: Decimal(str(value)))
+                   current_timestamp=100, _controller_reports_valid=True, _safe_decimal=lambda value: Decimal(str(value)))
     result = namespace['_build_runtime_status_snapshot'](strategy)
     assert result['active_orders_count'] == 0
     assert result['active_orders'] == []

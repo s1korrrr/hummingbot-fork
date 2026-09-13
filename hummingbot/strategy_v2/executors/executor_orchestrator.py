@@ -2,6 +2,7 @@ import asyncio
 import logging
 import uuid
 from collections import deque
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -10,6 +11,8 @@ from hummingbot.client.native_lifecycle import ShutdownResult
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model.exact_order_values import OrderExact
+from hummingbot.model.order import Order
 from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
@@ -27,7 +30,12 @@ from hummingbot.strategy_v2.executors.lp_executor.lp_executor import LPExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
+from hummingbot.strategy_v2.executors.wallet_sale_accounting import (
+    validate_completed_wallet_order,
+    validate_wallet_sale_summary,
+)
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
     ExecutorAction,
@@ -238,6 +246,8 @@ class ExecutorOrchestrator:
         self.positions_held = {}
         self.executors_ids_position_held = deque(maxlen=50)
         self.cached_performance = {}
+        self._wallet_sale_receipts = {}
+        self._wallet_sale_position_summaries = []
         self._non_hold_order_ids: Set[Tuple[str, str, str]] = set()
         self._non_hold_fill_ids: Set[Tuple[str, str, str, str]] = set()
         self.recovery_required: Dict[str, List[str]] = {}
@@ -296,6 +306,7 @@ class ExecutorOrchestrator:
 
         # Load positions from database only for controllers without initial position overrides
         db_positions = markets_recorder.get_all_positions()
+        wallet_scopes = {key[:3] for key in self._wallet_sale_owners()}
         for position in db_positions:
             controller_id = position.controller_id
             # Skip if this controller has initial position overrides
@@ -307,6 +318,10 @@ class ExecutorOrchestrator:
                 self.logger().warning(f"Skipping position for {position.connector_name}.{position.trading_pair} - "
                                       f"not available in current strategy markets")
                 continue
+            if (position.side == "SELL" and
+                    (controller_id, position.connector_name, position.trading_pair) in wallet_scopes):
+                self._wallet_sale_position_summaries.append(position)
+                continue  # Validate this historical synthetic summary against exact receipts before any report.
             if not self._is_valid_stored_position(position):
                 self.logger().warning(
                     f"Skipping invalid stored position | controller={controller_id} "
@@ -427,7 +442,7 @@ class ExecutorOrchestrator:
             else:
                 self._non_hold_order_ids.update(self._owned_order_keys(executor_info))
         # Only add to realized PnL if not a position hold (consistent with generate_performance_report)
-        if executor_info.close_type != CloseType.POSITION_HOLD:
+        if executor_info.close_type != CloseType.POSITION_HOLD and not self._is_unknown_wallet_sale(executor_info):
             report.realized_pnl_quote += executor_info.net_pnl_quote
             report.volume_traded += executor_info.filled_amount_quote
         if executor_info.close_type:
@@ -579,6 +594,8 @@ class ExecutorOrchestrator:
             positions.append(position)
 
     def _apply_executor_info_to_positions(self, controller_id: str, executor_info: ExecutorInfo):
+        if self._is_unknown_wallet_sale(executor_info):
+            return  # Wallet disposals have no acquired position or cost to reconstruct.
         held_position_orders = (executor_info.custom_info or {}).get("held_position_orders") or []
         if len(held_position_orders) == 0:
             return
@@ -595,6 +612,8 @@ class ExecutorOrchestrator:
             )
 
     def _persist_position_hold_entries_from_executor_info(self, executor_info: ExecutorInfo):
+        if self._is_unknown_wallet_sale(executor_info):
+            return  # Exact native fills and executor identity retain the sale receipt.
         if not self._has_held_position_orders(executor_info) or executor_info.controller_id is None:
             return
         position_side = self._determine_position_side(executor_info)
@@ -627,6 +646,7 @@ class ExecutorOrchestrator:
     ) -> Set[PositionScope]:
         restored_position_scopes: Set[PositionScope] = set()
         restored_controller_ids: Set[str] = set()
+        wallet_owners = self._wallet_sale_owners()
 
         for entry in ledger_entries:
             if (entry.connector_name, entry.trading_pair, entry.client_order_id) in self._resume_owned_order_keys:
@@ -640,6 +660,9 @@ class ExecutorOrchestrator:
             ):
                 continue
 
+            key = (controller_id, entry.connector_name, entry.trading_pair, entry.client_order_id)
+            if self._wallet_sale_ledger_matches(entry, wallet_owners.get(key)):
+                continue  # Corroborate against native fills at report refresh; retain the original row.
             position_side = self._position_side_from_name(entry.position_side)
             self._apply_order_record_to_positions(
                 controller_id=controller_id,
@@ -914,6 +937,41 @@ class ExecutorOrchestrator:
             raise ValueError("Explicit base fee conflicts with ledger fills")
         return dict(payload)
 
+    def _is_unknown_wallet_sale(self, info: ExecutorInfo) -> bool:
+        """Recognize only the explicit OK RSI spot-wallet disposal policy."""
+        controller = self.strategy.controllers.get(info.controller_id)
+        policy = getattr(controller, "config", None)
+        config = info.config
+        return (getattr(policy, "controller_name", None) == "ok_rsi"
+                and getattr(policy, "trade_mode", None) == "sell_only"
+                and getattr(policy, "sell_only_strict_fraction", False) is True
+                and getattr(policy, "sell_only_if_profitable", True) is False
+                and info.type == "order_executor" and config.connector_name == "okx"
+                and config.side == TradeType.SELL and config.position_action == PositionAction.CLOSE
+                and config.level_id == "signal_exit" and config.min_sell_price is None
+                and config.leverage == 1)
+
+    @staticmethod
+    def _wallet_sale_ledger_matches(entry, owner) -> bool:
+        return (owner is not None and entry.executor_id == owner.id and entry.order_side == "SELL"
+                and entry.position_side in (None, "", "None"))
+
+    def _wallet_sale_owners(self):
+        owners = {}
+        for controller in self.strategy.controllers:
+            infos = {info.id: info for info in self.stored_executors.get(controller, [])}
+            infos.update({executor.executor_info.id: executor.executor_info
+                          for executor in self.active_executors.get(controller, [])})
+            for info in infos.values():
+                if not self._is_unknown_wallet_sale(info):
+                    continue
+                for connector, pair, order_id in self._owned_order_keys(info):
+                    key = (controller, connector, pair, order_id)
+                    if key in owners:
+                        raise ValueError("Wallet sale order has ambiguous executor ownership")
+                    owners[key] = info
+        return owners
+
     def _build_reconciled_positions_from_trade_fills(
         self,
         trade_fills: List[TradeFill],
@@ -927,7 +985,11 @@ class ExecutorOrchestrator:
         owned_orders = self._executor_owned_order_keys()
         accounted_fills = self._executor_accounted_fill_keys()
         groups, ledger_by_order, positions = {}, {}, {}
+        wallet_sales, wallet_amounts = {}, {}
+        owned_scopes = {(controller, position.connector_name, position.trading_pair)
+                        for controller, held in self.positions_held.items() for position in held}
         try:
+            wallet_owners = self._wallet_sale_owners()
             for fill in sorted(trade_fills, key=lambda fill: (fill.timestamp, fill.order_id, str(fill.exchange_trade_id))):
                 pair = (fill.market, fill.symbol)
                 if pair in ambiguous:
@@ -944,6 +1006,8 @@ class ExecutorOrchestrator:
                     raise ValueError("Native fill attribution conflicts with spot scope")
                 if not fill.order_id or not fill.exchange_trade_id or fill.trade_type not in {"BUY", "SELL"}:
                     raise ValueError("Invalid native fill identity")
+                if fill.trade_type == "BUY":
+                    owned_scopes.add(key[:3])
                 order_key = (fill.market, fill.symbol, str(fill.order_id))
                 if order_key in owned_orders or (*order_key, str(fill.exchange_trade_id)) in accounted_fills:
                     continue
@@ -963,6 +1027,8 @@ class ExecutorOrchestrator:
                 if controller != entry.controller_id or entry.position_side not in (None, "", "None"):
                     raise ValueError("Ledger ownership conflict")
                 key = (controller, *pair, entry.client_order_id)
+                if not self._wallet_sale_ledger_matches(entry, wallet_owners.get(key)):
+                    owned_scopes.add(key[:3])
                 if (*pair, entry.client_order_id) in owned_orders:
                     continue
                 if key in ledger_by_order:
@@ -1006,6 +1072,26 @@ class ExecutorOrchestrator:
             for key, native in groups.items():
                 entry = ledger_by_order.get(key)
                 fills = list(native.values())
+                owner = wallet_owners.get(key) if key[:3] not in owned_scopes else None
+                if owner is not None and all(fill.trade_type == "SELL" for fill in fills):
+                    if entry is not None:
+                        payload = self._corroborated_ledger_order(entry, fills)
+                        native_fees = sum((self._trade_fill_order_record(fill)["cumulative_fee_paid_quote"]
+                                           for fill in fills), Decimal("0"))
+                        if Decimal(str(payload["cumulative_fee_paid_quote"])) != native_fees:
+                            raise ValueError("Wallet sale ledger quote fee conflicts with exact native fees")
+                    for fill in fills:
+                        record = self._trade_fill_order_record(fill)
+                        amount = record["executed_amount_base"]
+                        wallet_amounts[owner.id] = wallet_amounts.get(owner.id, Decimal("0")) + amount
+                        if not owner.config.amount.is_finite() or wallet_amounts[owner.id] > owner.config.amount:
+                            raise ValueError("Wallet sale fills exceed the owning executor amount")
+                        wallet_sales.setdefault(key[:3], []).append({
+                            "connector_name": fill.market, "trading_pair": fill.symbol,
+                            "order_id": fill.order_id, "trade_id": str(fill.exchange_trade_id), "timestamp": fill.timestamp,
+                            "amount_base": amount, "proceeds_quote": record["executed_amount_quote"],
+                            "fees_quote": record["cumulative_fee_paid_quote"], "fee": fill.trade_fee})
+                    continue
                 if entry is not None:
                     replay.append((entry.timestamp, entry.client_order_id, "", key[:3],
                                    self._corroborated_ledger_order(entry, fills)))
@@ -1019,11 +1105,26 @@ class ExecutorOrchestrator:
                 controller, connector, pair = key
                 position = positions.setdefault(key, PositionHold(connector, pair, TradeType.BUY))
                 position.add_order_record(record)
+            for owner in {info.id: info for info in wallet_owners.values()}.values():
+                if owner.is_done or owner.status == RunnableStatus.SHUTTING_DOWN:
+                    scope = (owner.controller_id, owner.connector_name, owner.trading_pair)
+                    if scope not in owned_scopes:
+                        observed = Decimal(str(owner.custom_info.get("executed_amount_base")))
+                        if not observed.is_finite() or observed != wallet_amounts.get(owner.id, Decimal("0")):
+                            raise ValueError("Wallet sale native fills omit recorded execution")
+            for scope, previous_sales in self._wallet_sale_receipts.items():
+                current = {(sale["order_id"], sale["trade_id"]): sale for sale in wallet_sales.get(scope, [])}
+                if any(current.get((sale["order_id"], sale["trade_id"])) != sale for sale in previous_sales):
+                    raise ValueError("Previously observed wallet sale receipts changed or disappeared")
+            for summary in self._wallet_sale_position_summaries:
+                scope = (summary.controller_id, summary.connector_name, summary.trading_pair)
+                validate_wallet_sale_summary(summary, wallet_sales.get(scope, []))
             if any(position.buy_amount_base < position.sell_amount_base for position in positions.values()):
                 raise ValueError("Spot fill history produces unowned negative inventory")
         except (ValueError, TypeError, KeyError, ArithmeticError) as error:
             raise RuntimeError(f"Held inventory reconciliation unavailable: {error}") from error
-        return set(positions), positions
+        self._wallet_sale_receipts = deepcopy(wallet_sales)
+        return set(positions) | set(wallet_sales), positions
 
     def _reconcile_positions_from_trade_fills(self):
         try:
@@ -1040,6 +1141,7 @@ class ExecutorOrchestrator:
         ledger_entries = markets_recorder.get_all_position_hold_ledger_entries()
         seen_market_pairs, reconciled_positions = self._build_reconciled_positions_from_trade_fills(
             trade_fills, ledger_entries, config_file_path=config_file_path)
+        self._recover_completed_wallet_sales(markets_recorder, ledger_entries)
         for controller_id, connector_name, trading_pair in seen_market_pairs:
             positions = self.positions_held.setdefault(controller_id, [])
             existing_position = self._find_existing_position(
@@ -1072,6 +1174,50 @@ class ExecutorOrchestrator:
                         f"breakeven={replacement_summary.breakeven_price}"
                     )
             self.positions_held[controller_id] = positions
+
+    def _recover_completed_wallet_sales(self, recorder, ledger_entries):
+        """Resolve only fully filled saved wallet sellers using immutable local execution receipts."""
+        recovered = []
+        ledger = {(entry.controller_id, entry.connector_name, entry.trading_pair, entry.client_order_id): entry
+                  for entry in ledger_entries}
+        try:
+            for controller_id, infos in self.stored_executors.items():
+                for info in infos:
+                    if info.is_done or not self._is_unknown_wallet_sale(info):
+                        continue
+                    scope = (controller_id, info.connector_name, info.trading_pair)
+                    sales = self._wallet_sale_receipts.get(scope, [])
+                    order_ids = {key[2] for key in self._owned_order_keys(info)}
+                    payloads = info.custom_info.get("held_position_orders", [])
+                    if (info.status != RunnableStatus.SHUTTING_DOWN or info.close_type != CloseType.POSITION_HOLD
+                            or not order_ids or len(payloads) != len(order_ids)
+                            or {order.get("client_order_id") for order in payloads} != order_ids
+                            or {sale["order_id"] for sale in sales if sale["order_id"] in order_ids} != order_ids):
+                        raise ValueError("Saved wallet seller lacks complete terminal receipt coverage")
+                    total = Decimal("0")
+                    with recorder._sql_manager.get_new_session() as session:
+                        for payload in payloads:
+                            oid = payload["client_order_id"]
+                            total += validate_completed_wallet_order(
+                                info, payload, ledger.get((*scope, oid)), session.get(Order, oid),
+                                session.get(OrderExact, oid), recorder.config_file_path)
+                    if (total != info.config.amount or total != Decimal(str(info.custom_info.get("executed_amount_base")))):
+                        raise ValueError("Saved wallet seller was not completely filled")
+                    recovered.append((controller_id, info))
+        except Exception as error:
+            raise RuntimeError(f"Held inventory reconciliation unavailable: wallet sale terminal proof: {error}") from error
+        for controller_id, info in recovered:
+            replacement = info.model_copy(update={
+                "status": RunnableStatus.TERMINATED, "is_active": False, "is_trading": False,
+                "custom_info": dict(info.custom_info, wallet_sale_terminal_recovery="exact_completed_order_receipts")})
+            self._record_stored_executor(controller_id, replacement)
+            self._update_cached_performance(controller_id, replacement)
+            pending = self.recovery_required.get(controller_id, [])
+            remaining = [item for item in pending if item != info.id]
+            if remaining:
+                self.recovery_required[controller_id] = remaining
+            else:
+                self.recovery_required.pop(controller_id, None)
 
     def _load_position_from_db(self, controller_id: str, db_position: Position):
         """
@@ -1625,7 +1771,19 @@ class ExecutorOrchestrator:
                 for executor in self.stored_executors.get(controller_id, [])
                 if executor.id not in active_executor_ids
             ]
-            report[controller_id] = active_executors + stored_executors
+            report[controller_id] = []
+            for info in active_executors + stored_executors:
+                scope = (controller_id, info.connector_name, info.trading_pair)
+                orders = {key[2] for key in self._owned_order_keys(info)}
+                sales = [sale for sale in self._wallet_sale_receipts.get(scope, []) if sale["order_id"] in orders]
+                if sales:
+                    info = info.model_copy(update={
+                        "net_pnl_quote": None, "net_pnl_pct": None,
+                        "cum_fees_quote": sum((sale["fees_quote"] for sale in sales), Decimal("0")),
+                        "filled_amount_quote": sum((sale["proceeds_quote"] for sale in sales), Decimal("0")),
+                        "custom_info": dict(info.custom_info, pnl_available=False,
+                                            pnl_unavailable_reason="unknown_wallet_acquisition_cost")})
+                report[controller_id].append(info)
         return report
 
     def get_positions_report(self) -> Dict[str, List[PositionSummary]]:
@@ -1691,12 +1849,13 @@ class ExecutorOrchestrator:
         for executor in active_executors:
             executor_info = executor.executor_info
             if not executor_info.is_done:
-                report.unrealized_pnl_quote += executor_info.net_pnl_quote
-                report.volume_traded += executor_info.filled_amount_quote
+                if not self._is_unknown_wallet_sale(executor_info):
+                    report.unrealized_pnl_quote += executor_info.net_pnl_quote
+                    report.volume_traded += executor_info.filled_amount_quote
             else:
                 # For done executors, only add to realized PnL if they're not already in position holds
                 # Position holds will be counted separately to avoid double counting
-                if executor_info.close_type != CloseType.POSITION_HOLD:
+                if executor_info.close_type != CloseType.POSITION_HOLD and not self._is_unknown_wallet_sale(executor_info):
                     report.realized_pnl_quote += executor_info.net_pnl_quote
                     report.volume_traded += executor_info.filled_amount_quote
                 if executor_info.close_type:
@@ -1734,4 +1893,14 @@ class ExecutorOrchestrator:
         report.unrealized_pnl_pct = (report.unrealized_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
         report.realized_pnl_pct = (report.realized_pnl_quote / report.volume_traded) * 100 if report.volume_traded != 0 else Decimal(0)
 
+        report.wallet_sales = [sale for scope, sales in self._wallet_sale_receipts.items()
+                               if scope[0] == controller_id for sale in sales]
+        if report.wallet_sales:
+            report.pnl_available = False
+            report.pnl_unavailable_reason = "unknown_wallet_acquisition_cost"
+            for field in ("realized_pnl_quote", "realized_pnl_pct", "unrealized_pnl_quote",
+                          "unrealized_pnl_pct", "global_pnl_quote", "global_pnl_pct"):
+                setattr(report, field, None)
+            # These scopes have no held position; native receipts are the sale volume truth.
+            report.volume_traded += sum((sale["proceeds_quote"] for sale in report.wallet_sales), Decimal("0"))
         return report

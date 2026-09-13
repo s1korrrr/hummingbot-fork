@@ -114,3 +114,50 @@ def test_unknown_pnl_survives_native_snapshot_and_money_formatting():
     assert snapshot['wallet_sales'] == report.wallet_sales
     assert StrategyV2Base._format_summary_quote(None) == 'n/a'
     assert StrategyV2Base._format_summary_quote_pct(None, None) == 'n/a / n/a'
+
+
+def test_wallet_sale_report_writes_exact_json_and_refreshes_atomically(tmp_path):
+    from decimal import Decimal
+    from test.hummingbot.strategy_v2.executors.test_wallet_sale_accounting import wallet_sale
+    from unittest.mock import patch
+
+    from hummingbot.connector.markets_recorder import MarketsRecorder
+
+    orchestrator, executor, recorder, _ = wallet_sale()
+    executor._finish_with_fills()
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        report = orchestrator.get_all_reports()['controller']
+    sale = report['performance'].wallet_sales[0]
+    assert sale['fees_quote'] == Decimal('0.02286991736')
+    controller = SimpleNamespace(config=SimpleNamespace(connector_name='okx'), get_custom_info=lambda: {})
+    entry = dict(report, controller_id='controller', controller=controller, summary={'pair': 'SUI-USDT'})
+    logger = Mock()
+    strategy = SimpleNamespace(
+        _build_controller_status_entries=lambda: [entry], _get_balances_snapshot=lambda: [],
+        connectors={}, get_active_orders=lambda _: [], _runtime_status_snapshot_bot_name=lambda: 'sui',
+        _build_runtime_operations_snapshot=lambda: {}, current_timestamp=100, _controller_reports_valid=True,
+        _safe_decimal=StrategyV2Base._safe_decimal, ready_to_trade=True, logger=lambda: logger,
+        _runtime_status_snapshot_enabled=lambda: True, _last_runtime_status_snapshot_ts=0,
+        _runtime_status_snapshot_interval=lambda: 10, _runtime_status_snapshot_dir=lambda: tmp_path,
+    )
+    strategy._build_runtime_status_snapshot = lambda: StrategyV2Base._build_runtime_status_snapshot(strategy)
+    path = tmp_path / 'sui.status.json'
+    path.write_text('{"updated_at":"old"}')
+    StrategyV2Base._write_runtime_status_snapshot_if_due(strategy)
+    logger.warning.assert_not_called()
+    snapshot = json.loads(path.read_text())
+    assert snapshot['updated_at'] != 'old'
+    assert snapshot['wallet_sales'][0]['amount_base'] == '39.469'
+    assert snapshot['wallet_sales'][0]['proceeds_quote'] == '28.5873967'
+    assert snapshot['wallet_sales'][0]['fees_quote'] == '0.02286991736'
+    assert snapshot['summary']['pnl_available'] is False
+    assert all(snapshot['summary'][field] is None for field in ('realized_pnl_quote', 'unrealized_pnl_quote', 'net_pnl_quote'))
+    assert snapshot['summary']['fees_quote'] == 0.02287
+    assert strategy._last_runtime_status_snapshot_ts == 100
+    assert not list(tmp_path.glob('*.tmp'))
+    assert isinstance(sale['amount_base'], Decimal)  # Export cannot alter accounting inputs.
+    strategy.current_timestamp = 111
+    StrategyV2Base._write_runtime_status_snapshot_if_due(strategy)
+    assert json.loads(path.read_text())['updated_at'] != snapshot['updated_at']
+    assert strategy._last_runtime_status_snapshot_ts == 111
+    logger.warning.assert_not_called()

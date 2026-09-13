@@ -938,7 +938,9 @@ class StrategyV2Base(StrategyPyBase):
         active_orders, active_orders_status = active_order_observations(self.connectors, controller_entries)
         active_orders_count = sum(len(self.get_active_orders(connector_name)) for connector_name in self.connectors)
         pnl_available = all(getattr(entry.get("performance"), "pnl_available", True) for entry in controller_entries)
-        wallet_sales = [sale for entry in controller_entries
+        # Preserve exact receipt quantities without mutating the Decimal accounting report.
+        wallet_sales = [{key: str(value) if isinstance(value, Decimal) else value for key, value in sale.items()}
+                        for entry in controller_entries
                         for sale in getattr(entry.get("performance"), "wallet_sales", [])]
         balance_value_quote = round(sum(row["value_quote"] for row in balances), 6)
         positions_value_quote = round(sum(row["value_quote"] for row in positions_held), 6)

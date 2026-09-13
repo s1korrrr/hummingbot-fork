@@ -62,6 +62,8 @@ class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
                 raise ValueError(f"{name} must be positive and finite")
         if self.decision_best_bid > self.decision_best_ask:
             raise ValueError("down-only maker entry rejects a crossed decision book")
+        if self.decision_best_bid == self.decision_best_ask:
+            raise ValueError("down-only maker entry rejects a crossed or locked decision book")
         if self.entry_price > self.maximum_acceptable_price:
             raise ValueError("entry_price exceeds the maximum acceptable price")
         if self.entry_total_max_age_seconds < self.entry_rest_seconds:
@@ -288,7 +290,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
 
         self._open_order_expiry_reconciled = True
-        if self.open_filled_amount > Decimal("0"):
+        if self._cumulative_entry_filled_base() > Decimal("0"):
             self._entry_pending_target = None
             self._entry_terminal_reason = "partial_fill"
             self._entry_cancel_reason = "partial_fill"

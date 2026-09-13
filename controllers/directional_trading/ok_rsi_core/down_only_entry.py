@@ -104,8 +104,12 @@ def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapsh
         _non_negative_finite(snapshot.last_reprice_at, "last_reprice_at")
     if snapshot.best_bid > snapshot.best_ask:
         raise DownOnlyMakerInputError("crossed book: best_bid exceeds best_ask")
+    if snapshot.best_bid == snapshot.best_ask:
+        raise DownOnlyMakerInputError("crossed or locked book cannot produce a maker-safe bid")
     if snapshot.initial_best_bid > snapshot.initial_best_ask:
         raise DownOnlyMakerInputError("crossed book: initial_best_bid exceeds initial_best_ask")
+    if snapshot.initial_best_bid == snapshot.initial_best_ask:
+        raise DownOnlyMakerInputError("crossed or locked initial book cannot authorize a maker entry")
     if snapshot.now < snapshot.intent_created_at:
         raise DownOnlyMakerInputError("intent age cannot be negative")
     if snapshot.order_created_at < snapshot.intent_created_at or snapshot.now < snapshot.order_created_at:

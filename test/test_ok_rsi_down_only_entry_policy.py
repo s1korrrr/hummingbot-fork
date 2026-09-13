@@ -94,6 +94,11 @@ def test_rejects_crossed_book() -> None:
         decide_down_only_maker(parameters(), snapshot(best_bid="100.01", best_ask="100.00"))
 
 
+def test_rejects_locked_book_that_cannot_produce_a_maker_safe_bid() -> None:
+    with pytest.raises(DownOnlyMakerInputError, match="crossed or locked"):
+        decide_down_only_maker(parameters(), snapshot(best_bid="99.90", best_ask="99.90"))
+
+
 def test_risk_block_has_highest_terminal_precedence() -> None:
     result = decide_down_only_maker(
         parameters(),

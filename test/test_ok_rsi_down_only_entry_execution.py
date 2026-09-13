@@ -344,6 +344,26 @@ async def test_fill_during_cancel_suppresses_child_and_retains_inventory() -> No
     assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "partial_fill"
 
 
+@pytest.mark.asyncio
+async def test_any_gross_fill_suppresses_child_even_if_base_fee_consumes_the_net_inventory() -> None:
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = tracked_order(
+        fill="0.001",
+        state=OrderState.CANCELED,
+        fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="ETH", amount=Decimal("0.001"))]),
+    )
+    executor._open_order = parent
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+
+    executor.place_order.assert_not_called()
+    assert executor.open_filled_amount == Decimal("0")
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "partial_fill"
+
+
 def test_cancel_uncertainty_blocks_replacement() -> None:
     executor, _, prices = make_executor()
     request_reprice(executor, prices)

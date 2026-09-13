@@ -131,6 +131,7 @@ def test_executor_config_retains_exact_frozen_envelope_and_identity() -> None:
             "LIMIT_MAKER",
         ),
         ({"decision_best_bid": Decimal("100.02")}, "crossed"),
+        ({"decision_best_bid": Decimal("100.01")}, "crossed or locked"),
         ({"entry_price": Decimal("100.01")}, "maximum acceptable"),
         ({"decision_atr_1m": Decimal("NaN")}, "decision_atr_1m"),
         ({"entry_total_max_age_seconds": 30, "entry_rest_seconds": 31}, "total age"),

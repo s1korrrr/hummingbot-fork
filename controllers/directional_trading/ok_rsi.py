@@ -17,6 +17,7 @@ import pandas as pd
 from controllers.directional_trading import hl_rsi
 from controllers.directional_trading.ok_rsi_core.candles import derive_higher_timeframe_candles
 from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+from controllers.directional_trading.ok_rsi_core.down_only_entry_shadow import DownOnlyMakerShadowTracker
 from controllers.directional_trading.ok_rsi_core.trailing import (
     ContinuousTrailingSelection,
     calculate_continuous_adaptive_trailing,
@@ -131,6 +132,13 @@ class OKRSIController(hl_rsi.HLRSIController):
         self._entry_decision_store = kwargs.pop("entry_decision_store", None)
         self._entry_decision_gate = None
         self._entry_decision_error = None
+        self._entry_acquisition_policy = config.entry_acquisition_policy
+        self._entry_acquisition_shadow_policy = config.entry_acquisition_shadow_policy
+        self._entry_acquisition_shadow = (
+            DownOnlyMakerShadowTracker(config.down_only_maker_parameters())
+            if config.entry_acquisition_shadow_policy == "down_only_maker_v1"
+            else None
+        )
         super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
         self._watermark_namespace: Optional[ControllerCandleWatermarkNamespace] = None
@@ -163,7 +171,99 @@ class OKRSIController(hl_rsi.HLRSIController):
             if len(permitted) != len(actions):
                 self._entry_admission_failed("Episode BUY requires explicit single-attempt decision support")
             return permitted
-        return super().determine_executor_actions()
+        self._advance_entry_acquisition_shadow()
+        actions = super().determine_executor_actions()
+        self._observe_entry_acquisition_shadow(actions)
+        return actions
+
+    def _entry_acquisition_shadow_inputs(self):
+        now = Decimal(str(self.market_data_provider.time()))
+        best_bid = Decimal(str(self.market_data_provider.get_price_by_type(
+            self.config.connector_name,
+            self.config.trading_pair,
+            PriceType.BestBid,
+        )))
+        best_ask = Decimal(str(self.market_data_provider.get_price_by_type(
+            self.config.connector_name,
+            self.config.trading_pair,
+            PriceType.BestAsk,
+        )))
+        trading_rule = self.market_data_provider.get_trading_rules(
+            self.config.connector_name,
+            self.config.trading_pair,
+        )
+        price_step = Decimal(str(trading_rule.min_price_increment))
+        atr_pct = Decimal(str(self._latest_atr_pct))
+        atr_1m = atr_pct * best_bid
+        values = (now, best_bid, best_ask, price_step, atr_1m)
+        if any(not value.is_finite() for value in values):
+            raise ValueError("shadow inputs must be finite")
+        if now < 0 or any(value <= 0 for value in (best_bid, best_ask, price_step, atr_1m)):
+            raise ValueError("shadow market inputs must be positive")
+        if best_bid > best_ask:
+            raise ValueError("shadow market book is crossed")
+        return now, best_bid, best_ask, price_step, atr_1m
+
+    def _shadow_configuration_changed(self) -> bool:
+        return (
+            self.config.entry_acquisition_policy != self._entry_acquisition_policy
+            or self.config.entry_acquisition_shadow_policy != self._entry_acquisition_shadow_policy
+        )
+
+    def _advance_entry_acquisition_shadow(self) -> None:
+        tracker = self._entry_acquisition_shadow
+        if tracker is None or not tracker.is_active:
+            return
+        try:
+            now = Decimal(str(self.market_data_provider.time()))
+        except _EXECUTION_INPUT_ERRORS:
+            now = Decimal("0")
+        if self._shadow_configuration_changed():
+            tracker.terminate(now=now, reason="configuration_changed")
+            return
+        try:
+            now, best_bid, best_ask, _, _ = self._entry_acquisition_shadow_inputs()
+            signal = (self.processed_data or {}).get("signal", 0)
+            tracker.advance(
+                now=now,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                opposing_signal=bool(signal < 0),
+                risk_allowed=not bool(getattr(self.config, "manual_kill_switch", False)),
+            )
+        except _EXECUTION_INPUT_ERRORS:
+            tracker.terminate(now=now, reason="input_unavailable")
+
+    def _observe_entry_acquisition_shadow(self, actions) -> None:
+        tracker = self._entry_acquisition_shadow
+        if tracker is None or tracker.is_active or self._shadow_configuration_changed():
+            return
+        buy_actions = [
+            action for action in actions
+            if getattr(getattr(action, "executor_config", None), "side", None) is TradeType.BUY
+        ]
+        if not buy_actions:
+            return
+        action = buy_actions[0]
+        config = action.executor_config
+        try:
+            now, best_bid, best_ask, price_step, atr_1m = self._entry_acquisition_shadow_inputs()
+            tracker.start(
+                intent_id=f"shadow:{config.id}",
+                now=now,
+                initial_price=Decimal(str(config.entry_price)),
+                best_bid=best_bid,
+                best_ask=best_ask,
+                atr_1m=atr_1m,
+                price_step=price_step,
+                authorized_base=Decimal(str(config.amount)),
+            )
+        except _EXECUTION_INPUT_ERRORS:
+            try:
+                now = Decimal(str(self.market_data_provider.time()))
+            except _EXECUTION_INPUT_ERRORS:
+                now = Decimal("0")
+            tracker.record_unavailable(now=now)
 
     def stop_actions_proposal(self):
         if self._episode_runtime is not None:
@@ -1006,6 +1106,8 @@ class OKRSIController(hl_rsi.HLRSIController):
         custom_info["durable_evaluation_watermark"] = (
             self._durable_watermark_snapshot()
         )
+        if self._entry_acquisition_shadow is not None:
+            custom_info["entry_acquisition_shadow"] = self._entry_acquisition_shadow.snapshot()
         if self._episode_runtime is not None:
             custom_info["episode"] = self._episode_runtime.status()
         return custom_info

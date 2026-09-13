@@ -43,6 +43,7 @@ class DownOnlyMakerSnapshot:
     order_created_at: Decimal
     last_reprice_at: Decimal | None
     initial_best_bid: Decimal
+    initial_best_ask: Decimal
     best_bid: Decimal
     best_ask: Decimal
     current_order_price: Decimal
@@ -87,6 +88,7 @@ def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapsh
 
     for name in (
         "initial_best_bid",
+        "initial_best_ask",
         "best_bid",
         "best_ask",
         "current_order_price",
@@ -102,6 +104,8 @@ def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapsh
         _non_negative_finite(snapshot.last_reprice_at, "last_reprice_at")
     if snapshot.best_bid > snapshot.best_ask:
         raise DownOnlyMakerInputError("crossed book: best_bid exceeds best_ask")
+    if snapshot.initial_best_bid > snapshot.initial_best_ask:
+        raise DownOnlyMakerInputError("crossed book: initial_best_bid exceeds initial_best_ask")
     if snapshot.now < snapshot.intent_created_at:
         raise DownOnlyMakerInputError("intent age cannot be negative")
     if snapshot.order_created_at < snapshot.intent_created_at or snapshot.now < snapshot.order_created_at:
@@ -151,10 +155,10 @@ def decide_down_only_maker(
             )
         return DownOnlyMakerDecision(DownOnlyMakerAction.HOLD, DownOnlyMakerReason.PARTIAL_FILL_RESTING)
 
-    spread = snapshot.best_ask - snapshot.best_bid
+    decision_spread = snapshot.initial_best_ask - snapshot.initial_best_bid
     trigger = max(
         Decimal(parameters.min_ticks) * snapshot.price_step,
-        spread,
+        decision_spread,
         parameters.atr_fraction * snapshot.decision_atr_1m,
     )
     target = min(snapshot.best_bid, snapshot.maximum_acceptable_price)

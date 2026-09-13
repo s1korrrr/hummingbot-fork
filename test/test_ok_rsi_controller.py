@@ -15,7 +15,7 @@ import yaml
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.markets_recorder import MarketsRecorder
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.model.controller_candle_watermark import (
     ControllerCandleWatermarkNamespace,
     ControllerCandleWatermarkOutcome,
@@ -23,6 +23,8 @@ from hummingbot.model.controller_candle_watermark import (
     ControllerCandleWatermarkState,
 )
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
 ROOT_PATH_STR = str(ROOT_PATH)
@@ -111,6 +113,130 @@ class OKRSIControllerTest(unittest.TestCase):
         }
         controller._latest_atr_pct = atr_pct
         return controller
+
+    def _shadow_controller(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+
+        prices = {
+            PriceType.MidPrice: Decimal("100.005"),
+            PriceType.BestBid: Decimal("100"),
+            PriceType.BestAsk: Decimal("100.01"),
+        }
+        provider = self._provider(base_balance=Decimal("0"), price=Decimal("100.005"))
+        provider.get_price_by_type.side_effect = lambda connector, pair, price_type: prices[price_type]
+        controller = OKRSIController(
+            config=OKRSIControllerConfig(
+                id="ok-rsi-shadow",
+                connector_name="okx",
+                trading_pair="BTC-USDT",
+                trade_mode="buy_sell",
+                strict_hmm_mode=False,
+                entry_acquisition_shadow_policy="down_only_maker_v1",
+            ),
+            market_data_provider=provider,
+            actions_queue=asyncio.Queue(),
+        )
+        controller.positions_held = []
+        controller.executors_info = []
+        controller.processed_data = {"signal": 1, "signal_state": {"condition_ok": True}}
+        controller._latest_atr_pct = 0.01
+        return controller, provider, prices
+
+    @staticmethod
+    def _entry_action(*, side: TradeType = TradeType.BUY):
+        return CreateExecutorAction(
+            controller_id="ok-rsi-shadow",
+            executor_config=PositionExecutorConfig(
+                id="executor-1",
+                timestamp=1_000,
+                controller_id="ok-rsi-shadow",
+                connector_name="okx",
+                trading_pair="BTC-USDT",
+                side=side,
+                entry_price=Decimal("100"),
+                amount=Decimal("1"),
+                leverage=1,
+                triple_barrier_config=TripleBarrierConfig(
+                    open_order_type=OrderType.LIMIT_MAKER,
+                    open_order_limit_max_age_seconds=30,
+                ),
+                entry_order_policy="single_attempt",
+            ),
+        )
+
+    def test_shadow_observes_buy_without_changing_executor_actions(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller, _, _ = self._shadow_controller()
+        action = self._entry_action()
+        proposed = [action]
+        with patch.object(hl_rsi.HLRSIController, "determine_executor_actions", return_value=proposed) as parent:
+            result = controller.determine_executor_actions()
+
+        self.assertIs(result, proposed)
+        parent.assert_called_once_with()
+        self.assertEqual(controller._entry_acquisition_shadow.snapshot()["intent_id"], "shadow:executor-1")
+        self.assertTrue(controller.actions_queue.empty())
+
+    def test_shadow_ignores_sell_and_advances_after_real_action_disappears(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller, provider, prices = self._shadow_controller()
+        with patch.object(
+            hl_rsi.HLRSIController,
+            "determine_executor_actions",
+            return_value=[self._entry_action(side=TradeType.SELL)],
+        ):
+            controller.determine_executor_actions()
+        self.assertFalse(controller._entry_acquisition_shadow.is_active)
+
+        with patch.object(
+            hl_rsi.HLRSIController,
+            "determine_executor_actions",
+            return_value=[self._entry_action()],
+        ):
+            controller.determine_executor_actions()
+        provider.time.return_value += 10
+        prices[PriceType.BestBid] = Decimal("99.90")
+        prices[PriceType.BestAsk] = Decimal("100.01")
+        empty_actions = []
+        with patch.object(hl_rsi.HLRSIController, "determine_executor_actions", return_value=empty_actions):
+            result = controller.determine_executor_actions()
+        self.assertIs(result, empty_actions)
+        self.assertEqual(controller._entry_acquisition_shadow.snapshot()["reprice_count"], 1)
+
+    def test_shadow_input_failure_does_not_block_legacy_buy(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller, _, prices = self._shadow_controller()
+        prices[PriceType.BestAsk] = None
+        action = self._entry_action()
+        with patch.object(hl_rsi.HLRSIController, "determine_executor_actions", return_value=[action]):
+            result = controller.determine_executor_actions()
+        self.assertEqual(result, [action])
+        shadow = controller.get_custom_info()["entry_acquisition_shadow"]
+        self.assertEqual(shadow["last_event"]["reason"], "input_unavailable")
+        self.assertFalse(shadow["active"])
+
+    def test_unresolved_shadow_cannot_hot_reload_to_active(self):
+        from controllers.directional_trading import hl_rsi
+
+        controller, _, _ = self._shadow_controller()
+        with patch.object(
+            hl_rsi.HLRSIController,
+            "determine_executor_actions",
+            return_value=[self._entry_action()],
+        ):
+            controller.determine_executor_actions()
+        controller.config.entry_acquisition_shadow_policy = None
+        controller.config.entry_acquisition_policy = "down_only_maker_v1"
+        with patch.object(hl_rsi.HLRSIController, "determine_executor_actions", return_value=[]):
+            controller.determine_executor_actions()
+        self.assertEqual(controller._entry_acquisition_policy, "legacy_single_attempt")
+        self.assertEqual(
+            controller._entry_acquisition_shadow.snapshot()["terminal_reason"],
+            "configuration_changed",
+        )
 
     def _install_temp_watermark(self, controller, *, timestamp: int) -> MarketsRecorder:
         controller.config.durable_candle_watermark_enabled = True

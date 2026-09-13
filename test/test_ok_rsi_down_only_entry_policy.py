@@ -35,6 +35,7 @@ def snapshot(**changes) -> DownOnlyMakerSnapshot:
         "order_created_at": Decimal("0"),
         "last_reprice_at": None,
         "initial_best_bid": Decimal("100.00"),
+        "initial_best_ask": Decimal("100.01"),
         "best_bid": Decimal("100.00"),
         "best_ask": Decimal("100.01"),
         "current_order_price": Decimal("100.00"),
@@ -149,7 +150,7 @@ def test_qualifying_decline_selects_strictly_lower_quantized_bid() -> None:
         snapshot(
             now="12",
             best_bid="99.905",
-            best_ask="99.915",
+            best_ask="100.01",
             current_order_price="100.00",
             decision_atr_1m="1.00",
             price_step="0.01",
@@ -160,6 +161,15 @@ def test_qualifying_decline_selects_strictly_lower_quantized_bid() -> None:
         reason=DownOnlyMakerReason.DOWNWARD_REPRICE,
         target_price=Decimal("99.90"),
     )
+
+
+def test_wider_current_spread_does_not_deadlock_a_no_touch_reprice() -> None:
+    result = decide_down_only_maker(
+        parameters(),
+        snapshot(now="12", best_bid="99.90", best_ask="100.02"),
+    )
+    assert result.action is DownOnlyMakerAction.CANCEL_FOR_REPRICE
+    assert result.target_price == Decimal("99.90")
 
 
 def test_rising_price_never_produces_an_upward_target() -> None:

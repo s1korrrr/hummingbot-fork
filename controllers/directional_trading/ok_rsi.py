@@ -1010,6 +1010,22 @@ class OKRSIController(hl_rsi.HLRSIController):
             custom_info["episode"] = self._episode_runtime.status()
         return custom_info
 
+    def _compute_plan_fields(self) -> Dict[str, str]:
+        fields = super()._compute_plan_fields()
+        base, quote = self._base_quote_assets()
+        if self.config.trade_mode == "sell_only" and self.config.sell_only_strict_fraction:
+            threshold = (self.processed_data or {}).get("thresholds", {}).get("rsi_sell", self.config.sell_rsi_overbought)
+            fields.update(
+                plan_mode="EXITS", plan_target=f"rsi≥{float(threshold):.2f}",
+                plan_anchor="profit check off" if not self.config.sell_only_if_profitable else "profitable only",
+                plan_next="RSI and reversal checks",
+                plan_slice=f"{(self.config.sell_only_inventory_fraction * 100).normalize():f}% of available {base}",
+            )
+        elif self.config.trade_mode == "buy_sell" and fields.get("plan_mode") in {"EXITS", "TRAIL"}:
+            target = self.config.usd_per_entry * self.config.signal_sell_inventory_slice_multiplier
+            fields["plan_slice"] = f"target {target:g} {quote}, limited to sellable inventory"
+        return fields
+
     def get_status_summary(self) -> Dict[str, object]:
         summary = super().get_status_summary()
         summary["trailing_policy"] = self._trailing_policy_snapshot()

@@ -200,11 +200,29 @@ class V2WithControllers(StrategyV2Base):
         if self.config.max_global_drawdown_quote:
             self.check_max_global_drawdown()
 
+    def _drawdown_pnl(self, controller_id):
+        report = self.get_performance_report(controller_id)
+        value = getattr(report, "global_pnl_quote", None)
+        if getattr(report, "pnl_available", True) and value is not None:
+            if not value.is_finite():
+                raise ValueError("PnL unavailable: non-finite native report")
+            return value
+        config = self.controllers[controller_id].config
+        if (getattr(report, "pnl_unavailable_reason", None) == "unknown_wallet_acquisition_cost"
+                and getattr(config, "controller_name", None) == "ok_rsi"
+                and getattr(config, "trade_mode", None) == "sell_only"
+                and getattr(config, "sell_only_strict_fraction", False)
+                and not getattr(config, "sell_only_if_profitable", True)):
+            return None
+        raise ValueError("PnL unavailable: cannot evaluate drawdown")
+
     def check_max_controller_drawdown(self):
         for controller_id, controller in self.controllers.items():
             if controller.status != RunnableStatus.RUNNING:
                 continue
-            controller_pnl = self.get_performance_report(controller_id).global_pnl_quote
+            controller_pnl = self._drawdown_pnl(controller_id)
+            if controller_pnl is None:
+                continue
             last_max_pnl = self.max_pnl_by_controller.get(controller_id, Decimal("0"))
             if controller_pnl > last_max_pnl:
                 self.max_pnl_by_controller[controller_id] = controller_pnl
@@ -223,7 +241,10 @@ class V2WithControllers(StrategyV2Base):
                     self.drawdown_exited_controllers.append(controller_id)
 
     def check_max_global_drawdown(self):
-        current_global_pnl = sum([self.get_performance_report(controller_id).global_pnl_quote for controller_id in self.controllers.keys()])
+        values = [self._drawdown_pnl(controller_id) for controller_id in self.controllers]
+        if any(value is None for value in values):
+            return  # Global drawdown is unavailable when any acquisition basis is unknown.
+        current_global_pnl = sum(values)
         if current_global_pnl > self.max_global_pnl:
             self.max_global_pnl = current_global_pnl
         else:
@@ -241,10 +262,16 @@ class V2WithControllers(StrategyV2Base):
         performance_report = self.controller_reports.get(controller_id, {}).get("performance")
         return {
             "performance": performance_report.dict() if performance_report else {},
-            "custom_info": self.controllers[controller_id].get_custom_info()
+            "custom_info": {
+                **self.controllers[controller_id].get_custom_info(),
+                "drawdown": {"available": getattr(performance_report, "pnl_available", True),
+                             "unavailable_reason": getattr(performance_report, "pnl_unavailable_reason", None)},
+            }
         }
 
     def send_performance_report(self):
+        if not self._controller_reports_valid:
+            return
         if self.current_timestamp - self._last_performance_report_timestamp >= self.performance_report_interval and self._pub:
             controller_reports = {controller_id: self.get_controller_report(controller_id) for controller_id in self.controllers.keys()}
             self._pub(controller_reports)

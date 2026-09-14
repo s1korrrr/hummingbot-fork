@@ -3,7 +3,8 @@
 The normal RSI sale and held-position recovery sale use the same configured
 pair target. In `buy_sell` mode this is `usd_per_entry` multiplied by
 `signal_sell_inventory_slice_multiplier`, divided by the maker reference price.
-The Main profile's 25 × 2 therefore targets 50 quote currency per sale.
+The Main profile's 200 × 2 therefore targets 400 quote currency per sale,
+capped by the selected owned position and available wallet inventory.
 In `sell_only` mode the target is `sell_only_inventory_fraction` of sellable
 inventory. The SUI profile uses 10% with `sell_only_strict_fraction: true`: each
 sale stays at or below that fraction, including recovery proposals. Quantization
@@ -32,8 +33,10 @@ adds estimated exit fees and rounds the floor upwards to the venue price tick,
 including when its reference market price falls before placement.
 
 The prepared SUI profile follows the owner's wallet-sale policy without a known
-acquisition basis or profitability gate. Its kill switch remains enabled; the
-owner must perform final live activation. The full-remainder threshold is zero
+acquisition basis or profitability gate. Its repository template has the kill
+switch enabled; activation belongs to the owner. The live configuration may
+differ after approved activation, so the template does not establish live status.
+The full-remainder threshold is zero
 and buying remains forbidden. These SUI sales may realize a loss; Main's
 profitable-only protection is unchanged.
 

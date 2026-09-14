@@ -243,3 +243,30 @@ def test_pending_sell_receipt_preserves_cancellation_and_expiry():
     assert receipt['termination_requested'] is None
     assert receipt['expires_at'] is None
     assert receipt['terminal_cause'] is None
+
+
+def test_runtime_pnl_requires_nonempty_explicit_performance_evidence():
+    import ast
+    from pathlib import Path
+    from typing import Any, Dict, List
+
+    import pandas as pd
+    tree = ast.parse(Path('hummingbot/strategy/strategy_v2_base.py').read_text())
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'StrategyV2Base')
+    method = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == '_build_runtime_status_snapshot')
+    namespace = {'Dict': Dict, 'Any': Any, 'List': List, 'Decimal': Decimal, 'pd': pd}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), '<actual snapshot>', 'exec'), namespace)
+    controller = Obj(config=Obj(connector_name='okx'), get_custom_info=lambda: {})
+    entry = {'controller_id': 'c1', 'controller': controller, 'summary': {'pair': 'SUI-USDC', 'price': '1'}, 'executors': [], 'positions': []}
+    for performance, expected in [(None, False), (Obj(), False), (Obj(pnl_available=1), False), (Obj(pnl_available=False), False), (Obj(pnl_available=True), True)]:
+        entries = [dict(entry, performance=performance)]
+        strategy = Obj(_build_controller_status_entries=lambda: entries, _get_balances_snapshot=lambda: [],
+                       connectors={'okx': Obj(in_flight_orders={})}, get_active_orders=lambda _: [],
+                       _runtime_status_snapshot_bot_name=lambda: 'test', _build_runtime_operations_snapshot=lambda: {},
+                       current_timestamp=100, _controller_reports_valid=True, _safe_decimal=lambda v: Decimal(str(v)))
+        snapshot = namespace['_build_runtime_status_snapshot'](strategy)
+        assert snapshot['summary']['pnl_available'] is expected
+        if not expected:
+            assert snapshot['summary']['net_pnl_quote'] is None
+    entries.clear()
+    assert namespace['_build_runtime_status_snapshot'](strategy)['summary']['pnl_available'] is False

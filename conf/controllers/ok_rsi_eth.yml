@@ -25,7 +25,7 @@ position_mode: ONEWAY
 # POSITION SIZING & RISK LIMITS
 # -----------------------------------------------------------------------------
 total_amount_quote: '500'
-usd_per_entry: '25'
+usd_per_entry: '200'
 signal_sell_inventory_slice_multiplier: '2'
 max_total_position_usd: '1500'
 max_executors_per_side: 6

@@ -1,8 +1,11 @@
 import asyncio
 import json
 import logging
-from datetime import datetime
+import os
+import stat
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
@@ -44,6 +47,13 @@ class TelegramNotifier(NotifierBase):
     LONG_POLL_TIMEOUT = 30
     COMMAND_LOOP_RETRY_DELAY = 5.0
     MAX_MESSAGE_LEN = 3900
+    STATUS_SNAPSHOT_ENV = "HB_TELEGRAM_STATUS_SNAPSHOTS"
+    STATUS_SNAPSHOT_MAX_BYTES = 2 * 1024 * 1024
+    STATUS_SNAPSHOT_MAX_AGE_SECONDS = 60
+    STATUS_LANES = {
+        "main": "ok_rsi",
+        "sui": "ok_rsi_sui_sell_only",
+    }
     COMMAND_SPECS = [
         ("start", "bind chat and show command list"),
         ("help", "show all trading desk commands"),
@@ -440,21 +450,48 @@ class TelegramNotifier(NotifierBase):
             f"{self._kv('Time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'), '🕒')}"
         )
 
-    async def _command_status(self, _: List[str]) -> str:
-        snapshot = self._runtime_snapshot()
+    async def _command_status(self, args: List[str]) -> str:
+        if len(args) > 1 or (args and args[0].lower() not in self.STATUS_LANES):
+            return "Usage: /status [main|sui]"
+        scope = args[0].lower() if args else None
+        configured = self._configured_status_snapshots()
+        if configured is None:
+            snapshot = self._runtime_snapshot()
+            if scope is not None and self._status_lane(snapshot) != scope:
+                return f"⚠️ {scope.upper()} status unavailable from this Telegram owner."
+            if snapshot is None:
+                return self._fallback_status_message()
+            return self._format_status_snapshot(snapshot, "STATUS" if scope is None else f"STATUS • {scope.upper()}")
+        if scope is not None:
+            snapshot = configured[scope]
+            if snapshot is None:
+                return f"⚠️ {scope.upper()} status unavailable."
+            return self._format_status_snapshot(snapshot, f"STATUS • {scope.upper()}")
+
+        lines = [self._title("📊", "STATUS • MAIN + SUI")]
+        for lane in self.STATUS_LANES:
+            snapshot = configured[lane]
+            if snapshot is None:
+                lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
+            else:
+                lines.extend(self._format_status_overview(lane, snapshot))
+        lines.append("Use /status main or /status sui for full details.")
+        return "\n".join(lines)
+
+    def _format_status_snapshot(self, snapshot: Dict[str, Any], title: str) -> str:
         if snapshot is None:
             return self._fallback_status_message()
         summary = snapshot["summary"]
         focus_queue = snapshot.get("focus_queue", [])
         lines = [
-            self._title("📊", "STATUS"),
+            self._title("📊", title),
             self._kv("Bot", snapshot["bot_name"], "🤖"),
             self._kv("Updated", snapshot["updated_at"], "🕒"),
-            self._kv("Total Equity", f"${self._format_number(summary.get('balance_value_quote', 0), 2)}", "🏦"),
-            self._kv("Reporting Net", f"${self._format_number(summary.get('net_pnl_quote', 0), 2)}", "💹"),
-            self._kv("Realized", f"${self._format_number(summary.get('realized_pnl_quote', 0), 2)}", "✅"),
-            self._kv("Unrealized", f"${self._format_number(summary.get('unrealized_pnl_quote', 0), 2)}", "📈"),
-            self._kv("Fees", f"${self._format_number(summary.get('fees_quote', 0), 2)}", "🧾"),
+            self._kv("Total Equity", self._format_status_money(summary.get("balance_value_quote")), "🏦"),
+            self._kv("Reporting Net", self._format_status_money(summary.get("net_pnl_quote")), "💹"),
+            self._kv("Realized", self._format_status_money(summary.get("realized_pnl_quote")), "✅"),
+            self._kv("Unrealized", self._format_status_money(summary.get("unrealized_pnl_quote")), "📈"),
+            self._kv("Fees", self._format_status_money(summary.get("fees_quote")), "🧾"),
             self._kv("Active Orders", snapshot.get('active_orders_count', 0), "📬"),
             self._kv("Active Executors", summary.get('active_executor_count', 0), "⚙️"),
             self._kv("Held Positions", summary.get('positions_held_count', 0), "👜"),
@@ -465,6 +502,109 @@ class TelegramNotifier(NotifierBase):
             for item in focus_queue[:5]:
                 lines.append(f"{self.BULLET} {item.get('pair', 'n/a')}: {item.get('focus', '')}")
         return "\n".join(lines)
+
+    def _format_status_overview(self, lane: str, snapshot: Dict[str, Any]) -> List[str]:
+        summary = snapshot["summary"]
+        return [
+            self._kv(lane.upper(), snapshot["bot_name"], "🤖"),
+            self._kv("Updated", snapshot["updated_at"], "🕒"),
+            self._kv("Reporting Net", self._format_status_money(summary.get("net_pnl_quote")), "💹"),
+            self._kv("Orders", snapshot["active_orders_count"], "📬"),
+            self._kv("Executors", summary["active_executor_count"], "⚙️"),
+            self._kv("Held Positions", summary["positions_held_count"], "👜"),
+            self._kv("Controllers", summary["controller_count"], "🧠"),
+        ]
+
+    def _configured_status_snapshots(self) -> Optional[Dict[str, Optional[Dict[str, Any]]]]:
+        raw = os.environ.get(self.STATUS_SNAPSHOT_ENV)
+        if raw is None:
+            return None
+        try:
+            paths = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("Invalid Telegram status snapshot configuration") from exc
+        if not isinstance(paths, dict) or set(paths) != set(self.STATUS_LANES):
+            raise ValueError("Telegram status snapshots must configure main and sui")
+
+        snapshots = {}
+        for lane, expected_bot in self.STATUS_LANES.items():
+            try:
+                snapshots[lane] = self._read_status_snapshot(paths[lane], expected_bot)
+            except (OSError, ValueError, TypeError, UnicodeError):
+                self.logger().warning(
+                    "Telegram %s runtime status snapshot is unavailable or invalid.",
+                    lane,
+                )
+                snapshots[lane] = None
+        return snapshots
+
+    def _read_status_snapshot(self, raw_path: Any, expected_bot: str) -> Dict[str, Any]:
+        if not isinstance(raw_path, str):
+            raise ValueError("Status snapshot path must be text")
+        path = Path(raw_path)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("Status snapshot path must be absolute")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > self.STATUS_SNAPSHOT_MAX_BYTES:
+                raise ValueError("Status snapshot must be a bounded regular file")
+            payload = stream.read(self.STATUS_SNAPSHOT_MAX_BYTES + 1)
+        if len(payload) > self.STATUS_SNAPSHOT_MAX_BYTES:
+            raise ValueError("Status snapshot exceeds size limit")
+        snapshot = json.loads(payload)
+        if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
+            raise ValueError("Unsupported status snapshot schema")
+        if snapshot.get("bot_name") != expected_bot:
+            raise ValueError("Status snapshot owner mismatch")
+        if not isinstance(snapshot.get("summary"), dict) or not isinstance(snapshot.get("controllers"), list):
+            raise ValueError("Incomplete status snapshot")
+        updated_at = snapshot.get("updated_at")
+        if not isinstance(updated_at, str):
+            raise ValueError("Status snapshot timestamp is unavailable")
+        updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if updated.tzinfo is None:
+            raise ValueError("Status snapshot timestamp requires a timezone")
+        age = (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds()
+        if age < -5 or age > self.STATUS_SNAPSHOT_MAX_AGE_SECONDS:
+            raise ValueError("Status snapshot is stale")
+        counts = {
+            "active_orders_count": snapshot.get("active_orders_count"),
+            "active_executor_count": snapshot["summary"].get("active_executor_count"),
+            "positions_held_count": snapshot["summary"].get("positions_held_count"),
+            "controller_count": snapshot["summary"].get("controller_count"),
+        }
+        if any(type(value) is not int or value < 0 for value in counts.values()):
+            raise ValueError("Status snapshot counts are invalid")
+        if counts["controller_count"] != len(snapshot["controllers"]):
+            raise ValueError("Status snapshot controller count mismatch")
+        for key in ("balance_value_quote", "net_pnl_quote", "realized_pnl_quote", "unrealized_pnl_quote", "fees_quote"):
+            raw_value = snapshot["summary"].get(key)
+            if raw_value is None:
+                continue
+            try:
+                value = Decimal(str(raw_value))
+            except ArithmeticError as exc:
+                raise ValueError("Status snapshot economics are invalid") from exc
+            if not value.is_finite():
+                raise ValueError("Status snapshot economics are invalid")
+        return snapshot
+
+    def _status_lane(self, snapshot: Optional[Dict[str, Any]]) -> Optional[str]:
+        if snapshot is None:
+            return None
+        bot_name = snapshot.get("bot_name")
+        return next((lane for lane, expected in self.STATUS_LANES.items() if bot_name == expected), None)
+
+    @classmethod
+    def _format_status_money(cls, value: Any) -> str:
+        try:
+            decimal_value = Decimal(str(value))
+        except ArithmeticError:
+            return "UNAVAILABLE"
+        if not decimal_value.is_finite():
+            return "UNAVAILABLE"
+        return f"${cls._format_number(decimal_value, 2)}"
 
     async def _command_balances(self, _: List[str]) -> str:
         snapshot = self._runtime_snapshot()

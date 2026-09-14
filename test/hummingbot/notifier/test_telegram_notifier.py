@@ -1,8 +1,13 @@
 import asyncio
+import json
+import os
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -15,6 +20,35 @@ from hummingbot.notifier.telegram_notifier import TelegramMarketEventForwarder, 
 
 
 class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
+    @staticmethod
+    def status_snapshot(bot_name, *, controllers, orders, executors, positions, equity, net, pnl_available=True):
+        return {
+            "schema_version": 1,
+            "bot_name": bot_name,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "active_orders_count": orders,
+            "controller_reports_valid": True,
+            "controllers": [{"controller_id": controller} for controller in controllers],
+            "focus_queue": [],
+            "summary": {
+                "balance_value_quote": equity,
+                "pnl_available": pnl_available,
+                "net_pnl_quote": net,
+                "realized_pnl_quote": 0,
+                "unrealized_pnl_quote": net,
+                "fees_quote": 0,
+                "active_executor_count": executors,
+                "positions_held_count": positions,
+                "controller_count": len(controllers),
+            },
+        }
+
+    @staticmethod
+    def write_status_snapshot(root, lane, snapshot):
+        path = root / f"{lane}.status.json"
+        path.write_text(json.dumps(snapshot))
+        return str(path)
+
     @staticmethod
     def exact_fill(side, amount, price, fee, *, base_fee="0", order_id="order", timestamp=1):
         return TradeFill(market="okx", order_id=order_id, exchange_trade_id=order_id, symbol="BTC-USDC",
@@ -517,6 +551,104 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("📬 Active Orders: 2", message)
         self.assertIn("🎯 Focus Queue", message)
         self.assertIn("• BTC-USDC: 2 buy active", message)
+
+    async def test_status_without_scope_combines_main_and_sui_without_summing_shared_equity(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=2, executors=1, positions=5, equity=15000, net=12.5,
+                )),
+                "sui": self.write_status_snapshot(root, "sui", self.status_snapshot(
+                    "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
+                    orders=0, executors=0, positions=1, equity=15000, net=-0.5,
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                message = await TelegramNotifier(self.hb_app)._dispatch_command("status", [])
+
+        self.assertIn("📊 STATUS • MAIN + SUI", message)
+        self.assertIn("🤖 MAIN: ok_rsi", message)
+        self.assertIn("🤖 SUI: ok_rsi_sui_sell_only", message)
+        self.assertIn("📬 Orders: 2", message)
+        self.assertIn("🧠 Controllers: 5", message)
+        self.assertIn("🧠 Controllers: 1", message)
+        self.assertNotIn("Total Equity", message)
+        self.assertLess(message.index("🤖 MAIN"), message.index("🤖 SUI"))
+
+    async def test_status_scope_selects_configured_main_or_sui_snapshot(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=2, executors=1, positions=5, equity=15000, net=12.5,
+                )),
+                "sui": self.write_status_snapshot(root, "sui", self.status_snapshot(
+                    "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
+                    orders=0, executors=0, positions=1, equity=15000, net=-0.5,
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                notifier = TelegramNotifier(self.hb_app)
+                main = await notifier._dispatch_command("status", ["main"])
+                sui = await notifier._dispatch_command("status", ["sui"])
+
+        self.assertIn("📊 STATUS • MAIN", main)
+        self.assertIn("🤖 Bot: ok_rsi", main)
+        self.assertIn("🧠 Controllers: 5", main)
+        self.assertNotIn("ok_rsi_sui_sell_only", main)
+        self.assertIn("📊 STATUS • SUI", sui)
+        self.assertIn("🤖 Bot: ok_rsi_sui_sell_only", sui)
+        self.assertIn("🧠 Controllers: 1", sui)
+
+    async def test_combined_status_keeps_healthy_lane_when_other_snapshot_is_missing(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=0, executors=1, positions=5, equity=15000, net=12.5,
+                )),
+                "sui": str(root / "missing.status.json"),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                message = await TelegramNotifier(self.hb_app)._dispatch_command("status", [])
+
+        self.assertIn("🤖 MAIN: ok_rsi", message)
+        self.assertIn("⚠️ SUI: UNAVAILABLE", message)
+
+    async def test_sui_status_preserves_explicitly_unavailable_pnl_instead_of_zero(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            main = self.status_snapshot(
+                "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                orders=0, executors=1, positions=5, equity=15000, net=12.5,
+            )
+            sui = self.status_snapshot(
+                "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
+                orders=0, executors=0, positions=0, equity=571.18, net=None, pnl_available=False,
+            )
+            sui["summary"]["realized_pnl_quote"] = None
+            paths = {
+                "main": self.write_status_snapshot(root, "main", main),
+                "sui": self.write_status_snapshot(root, "sui", sui),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                message = await TelegramNotifier(self.hb_app)._dispatch_command("status", ["sui"])
+
+        self.assertIn("📊 STATUS • SUI", message)
+        self.assertIn("💹 Reporting Net: UNAVAILABLE", message)
+        self.assertIn("✅ Realized: UNAVAILABLE", message)
+        self.assertIn("📈 Unrealized: UNAVAILABLE", message)
+        self.assertNotIn("Reporting Net: $0", message)
+
+    async def test_status_rejects_unknown_or_extra_scope_arguments(self):
+        notifier = TelegramNotifier(self.hb_app)
+
+        self.assertEqual("Usage: /status [main|sui]", await notifier._dispatch_command("status", ["other"]))
+        self.assertEqual("Usage: /status [main|sui]", await notifier._dispatch_command("status", ["main", "sui"]))
 
     async def test_run_command_loop_retries_after_transient_failure(self):
         notifier = TelegramNotifier(self.hb_app)

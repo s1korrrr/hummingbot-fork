@@ -79,7 +79,8 @@ use_trailing_exit: true
 trailing_activation_pct: 0.015
 trailing_delta_pct: 0.0035
 trailing_stop_order_type: LIMIT
-entry_limit_max_age_seconds: 30
+entry_acquisition_policy: down_only_maker_v1
+entry_total_max_age_seconds: 300
 trailing_stop_limit_max_age_seconds: 3
 
 use_adaptive_trailing: true
@@ -130,8 +131,13 @@ reuse or dynamically mutate the ordinary PositionExecutor trailing barrier.
 
 ## Execution and inventory safeguards
 
-- LIMIT_MAKER entry orders expire after `entry_limit_max_age_seconds` instead
-  of remaining open indefinitely.
+- With `down_only_maker_v1`, LIMIT_MAKER entries have no per-order time lease.
+  They remain eligible while the current book is inside the percentage validity
+  band frozen from the adaptive executor price-gap setting. The policy only
+  reprices downward, holds when the ask reaches the resting bid, and retains
+  `entry_total_max_age_seconds` as the hard intent backstop.
+- `entry_limit_max_age_seconds` applies only to the legacy single-attempt entry
+  path. It does not govern active `down_only_maker_v1` entries.
 - A trailing LIMIT exit falls back according to
   `trailing_stop_limit_max_age_seconds` and the checked-out PositionExecutor.
 - Missing ATR, non-finite/non-positive prices, missing trading rules, or failed

@@ -1,6 +1,8 @@
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from controllers.directional_trading.ok_rsi import OKRSIControllerConfig
@@ -8,6 +10,14 @@ from controllers.directional_trading.ok_rsi_core.down_only_entry import DownOnly
 from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import DownOnlyMakerPositionExecutorConfig
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
+
+MAIN_CONTROLLER_CONFIGS = (
+    "ok_rsi_btc.yml",
+    "ok_rsi_eth.yml",
+    "ok_rsi_sol.yml",
+    "ok_rsi_xrp.yml",
+    "ok_rsi_bnb.yml",
+)
 
 
 def executor_config(**changes) -> DownOnlyMakerPositionExecutorConfig:
@@ -23,21 +33,20 @@ def executor_config(**changes) -> DownOnlyMakerPositionExecutorConfig:
         "leverage": 1,
         "triple_barrier_config": TripleBarrierConfig(
             open_order_type=OrderType.LIMIT_MAKER,
-            open_order_limit_max_age_seconds=30,
+            open_order_limit_max_age_seconds=0,
         ),
+        "activation_bounds": [Decimal("0.005")],
         "entry_order_policy": "single_attempt",
         "decision_best_bid": Decimal("100"),
         "decision_best_ask": Decimal("100.01"),
         "decision_atr_1m": Decimal("1"),
         "decision_price_step": Decimal("0.01"),
         "maximum_acceptable_price": Decimal("100"),
-        "entry_rest_seconds": 30,
         "entry_total_max_age_seconds": 300,
         "entry_max_downward_reprices": 3,
         "entry_reprice_cooldown_seconds": 5,
         "entry_reprice_min_ticks": 3,
         "entry_reprice_atr_fraction": Decimal("0.05"),
-        "entry_max_downward_atr": Decimal("1"),
     }
     values.update(changes)
     return DownOnlyMakerPositionExecutorConfig(**values)
@@ -50,16 +59,25 @@ def test_entry_acquisition_defaults_preserve_legacy_runtime() -> None:
     assert config.entry_limit_max_age_seconds == 30
 
 
+def test_main_controller_yamls_enable_bound_driven_entry_without_thirty_second_lease() -> None:
+    config_root = Path(__file__).parents[1] / "conf" / "controllers"
+    for filename in MAIN_CONTROLLER_CONFIGS:
+        payload = yaml.safe_load((config_root / filename).read_text())
+        config = OKRSIControllerConfig(**payload)
+        assert config.entry_acquisition_policy == "down_only_maker_v1"
+        assert config.entry_total_max_age_seconds == 300
+        assert "entry_limit_max_age_seconds" not in payload
+
+
 def test_shadow_candidate_materializes_frozen_parameters() -> None:
     config = OKRSIControllerConfig(id="shadow", entry_acquisition_shadow_policy="down_only_maker_v1")
-    assert config.down_only_maker_parameters() == DownOnlyMakerParameters(
-        rest_seconds=30,
+    assert config.down_only_maker_parameters(Decimal("0.005")) == DownOnlyMakerParameters(
         total_max_age_seconds=300,
         max_reprices=3,
         cooldown_seconds=5,
         min_ticks=3,
         atr_fraction=Decimal("0.05"),
-        max_downward_atr=Decimal("1.0"),
+        activation_bound_pct=Decimal("0.005"),
     )
 
 
@@ -86,8 +104,6 @@ def test_shadow_candidate_materializes_frozen_parameters() -> None:
         ({"entry_reprice_min_ticks": 101}, "entry_reprice_min_ticks"),
         ({"entry_reprice_atr_fraction": Decimal("0")}, "entry_reprice_atr_fraction"),
         ({"entry_reprice_atr_fraction": Decimal("1.01")}, "entry_reprice_atr_fraction"),
-        ({"entry_max_downward_atr": Decimal("0")}, "entry_max_downward_atr"),
-        ({"entry_max_downward_atr": Decimal("10.01")}, "entry_max_downward_atr"),
         ({"entry_acquisition_policy": "chase_anywhere"}, "entry_acquisition_policy"),
         ({"entry_acquisition_shadow_policy": "legacy_single_attempt"}, "entry_acquisition_shadow_policy"),
     ],
@@ -103,21 +119,13 @@ def test_rejects_rest_lease_outside_bounds(rest) -> None:
         OKRSIControllerConfig(id="invalid", entry_limit_max_age_seconds=rest)
 
 
-def test_rejects_total_age_shorter_than_rest_lease() -> None:
-    with pytest.raises(ValidationError, match="total age"):
-        OKRSIControllerConfig(
-            id="invalid",
-            entry_limit_max_age_seconds=60,
-            entry_total_max_age_seconds=30,
-        )
-
-
 def test_executor_config_retains_exact_frozen_envelope_and_identity() -> None:
     config = executor_config()
     assert config.id == "entry-intent"
     assert config.entry_acquisition_policy == "down_only_maker_v1"
     assert config.decision_best_bid == Decimal("100")
-    assert config.entry_rest_seconds == 30
+    assert config.activation_bounds == [Decimal("0.005")]
+    assert config.triple_barrier_config.open_order_limit_max_age_seconds == 0
 
 
 @pytest.mark.parametrize(
@@ -134,7 +142,14 @@ def test_executor_config_retains_exact_frozen_envelope_and_identity() -> None:
         ({"decision_best_bid": Decimal("100.01")}, "crossed or locked"),
         ({"entry_price": Decimal("100.01")}, "maximum acceptable"),
         ({"decision_atr_1m": Decimal("NaN")}, "decision_atr_1m"),
-        ({"entry_total_max_age_seconds": 30, "entry_rest_seconds": 31}, "total age"),
+        ({"activation_bounds": None}, "activation_bounds"),
+        ({"activation_bounds": []}, "activation_bounds"),
+        ({"activation_bounds": [Decimal("0")]}, "activation bound"),
+        ({"activation_bounds": [Decimal("1")]}, "activation bound"),
+        ({"triple_barrier_config": TripleBarrierConfig(
+            open_order_type=OrderType.LIMIT_MAKER,
+            open_order_limit_max_age_seconds=30,
+        )}, "zero native open-order age"),
     ],
 )
 def test_executor_config_rejects_unsafe_envelope(changes, message) -> None:

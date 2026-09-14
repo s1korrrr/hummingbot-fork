@@ -25,13 +25,11 @@ class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
     decision_atr_1m: Decimal
     decision_price_step: Decimal
     maximum_acceptable_price: Decimal
-    entry_rest_seconds: int = Field(ge=1, le=300)
     entry_total_max_age_seconds: int = Field(ge=30, le=900)
     entry_max_downward_reprices: int = Field(ge=1, le=10)
     entry_reprice_cooldown_seconds: int = Field(ge=1, le=30)
     entry_reprice_min_ticks: int = Field(ge=1, le=100)
     entry_reprice_atr_fraction: Decimal = Field(gt=0, le=1)
-    entry_max_downward_atr: Decimal = Field(gt=0, le=10)
 
     @model_validator(mode="after")
     def validate_down_only_maker_contract(self):
@@ -55,7 +53,6 @@ class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
             "decision_price_step": self.decision_price_step,
             "maximum_acceptable_price": self.maximum_acceptable_price,
             "entry_reprice_atr_fraction": self.entry_reprice_atr_fraction,
-            "entry_max_downward_atr": self.entry_max_downward_atr,
         }
         for name, value in positive_decimals.items():
             if not value.is_finite() or value <= 0:
@@ -66,10 +63,13 @@ class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
             raise ValueError("down-only maker entry rejects a crossed or locked decision book")
         if self.entry_price > self.maximum_acceptable_price:
             raise ValueError("entry_price exceeds the maximum acceptable price")
-        if self.entry_total_max_age_seconds < self.entry_rest_seconds:
-            raise ValueError("entry total age must not be shorter than the rest lease")
-        if self.triple_barrier_config.open_order_limit_max_age_seconds != self.entry_rest_seconds:
-            raise ValueError("entry rest lease must match the native open-order lease")
+        if self.triple_barrier_config.open_order_limit_max_age_seconds != 0:
+            raise ValueError("down-only maker entry requires a zero native open-order age")
+        if self.activation_bounds is None or len(self.activation_bounds) != 1:
+            raise ValueError("down-only maker entry requires exactly one activation_bounds value")
+        activation_bound = self.activation_bounds[0]
+        if not activation_bound.is_finite() or activation_bound <= 0 or activation_bound >= 1:
+            raise ValueError("down-only maker activation bound must be finite and between 0 and 1")
         return self
 
 
@@ -98,13 +98,12 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
     @property
     def _down_only_parameters(self) -> DownOnlyMakerParameters:
         return DownOnlyMakerParameters(
-            rest_seconds=self.config.entry_rest_seconds,
             total_max_age_seconds=self.config.entry_total_max_age_seconds,
             max_reprices=self.config.entry_max_downward_reprices,
             cooldown_seconds=self.config.entry_reprice_cooldown_seconds,
             min_ticks=self.config.entry_reprice_min_ticks,
             atr_fraction=self.config.entry_reprice_atr_fraction,
-            max_downward_atr=self.config.entry_max_downward_atr,
+            activation_bound_pct=self.config.activation_bounds[0],
         )
 
     def control_open_order(self):
@@ -398,7 +397,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "cumulative_filled_base": str(cumulative_filled),
             "remaining_base": str(remaining),
             "reprice_count": self._entry_reprice_count,
-            "rest_seconds": self.config.entry_rest_seconds,
+            "activation_bound_pct": str(self.config.activation_bounds[0]),
             "total_max_age_seconds": self.config.entry_total_max_age_seconds,
             "order_ids": [order.order_id for order in self._entry_orders()],
             "queue_fill_status": "UNAVAILABLE",
@@ -444,6 +443,13 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "cooldown_seconds": self.config.entry_reprice_cooldown_seconds,
             "cumulative_filled_base": str(cumulative_filled),
             "current_order_price": str(self._entry_current_price),
+            "activation_bound_pct": str(self.config.activation_bounds[0]),
+            "activation_lower_price": str(
+                self.config.maximum_acceptable_price * (Decimal("1") - self.config.activation_bounds[0])
+            ),
+            "activation_upper_price": str(
+                self.config.maximum_acceptable_price * (Decimal("1") + self.config.activation_bounds[0])
+            ),
             "decision_atr_1m": str(self.config.decision_atr_1m),
             "intent_age_seconds": str(now - Decimal(str(self._entry_intent_created_at))),
             "intent_id": self.config.id,

@@ -34,21 +34,20 @@ def make_config(**changes) -> DownOnlyMakerPositionExecutorConfig:
         "leverage": 1,
         "triple_barrier_config": TripleBarrierConfig(
             open_order_type=OrderType.LIMIT_MAKER,
-            open_order_limit_max_age_seconds=30,
+            open_order_limit_max_age_seconds=0,
         ),
+        "activation_bounds": [Decimal("0.005")],
         "entry_order_policy": "single_attempt",
         "decision_best_bid": Decimal("100"),
         "decision_best_ask": Decimal("100.01"),
         "decision_atr_1m": Decimal("1"),
         "decision_price_step": Decimal("0.01"),
         "maximum_acceptable_price": Decimal("100"),
-        "entry_rest_seconds": 30,
         "entry_total_max_age_seconds": 300,
         "entry_max_downward_reprices": 3,
         "entry_reprice_cooldown_seconds": 5,
         "entry_reprice_min_ticks": 3,
         "entry_reprice_atr_fraction": Decimal("0.05"),
-        "entry_max_downward_atr": Decimal("1"),
     }
     values.update(changes)
     return DownOnlyMakerPositionExecutorConfig(**values)
@@ -182,7 +181,7 @@ def test_entry_acquisition_snapshot_is_stable_and_json_native() -> None:
             "cumulative_filled_base",
             "remaining_base",
             "reprice_count",
-            "rest_seconds",
+            "activation_bound_pct",
             "total_max_age_seconds",
             "order_ids",
             "queue_fill_status",
@@ -200,7 +199,7 @@ def test_entry_acquisition_snapshot_is_stable_and_json_native() -> None:
         "cumulative_filled_base": "0",
         "remaining_base": "1",
         "reprice_count": 0,
-        "rest_seconds": 30,
+        "activation_bound_pct": "0.005",
         "total_max_age_seconds": 300,
         "order_ids": ["parent"],
         "queue_fill_status": "UNAVAILABLE",
@@ -220,6 +219,52 @@ def test_fractional_config_timestamp_with_whole_second_order_clock_keeps_entry_r
     executor._strategy.cancel.assert_not_called()
     acquisition = executor.get_custom_info()["entry_acquisition"]
     assert acquisition["state"] == "resting"
+    assert acquisition["terminal_reason"] is None
+
+
+def test_valid_untouched_entry_remains_live_after_thirty_seconds() -> None:
+    executor, _, prices = make_executor()
+    executor._open_order = tracked_order()
+    executor._entry_submitted = True
+    executor._strategy.current_timestamp = 31
+    prices[PriceType.BestBid] = Decimal("100.20")
+    prices[PriceType.BestAsk] = Decimal("100.21")
+
+    executor.control_open_order()
+
+    executor._strategy.cancel.assert_not_called()
+    acquisition = executor.get_custom_info()["entry_acquisition"]
+    assert acquisition["state"] == "resting"
+    assert acquisition["terminal_reason"] is None
+
+
+def test_bnb_touch_after_thirty_seconds_waits_for_exchange_fill_update() -> None:
+    config = make_config(
+        trading_pair="BNB-USDC",
+        entry_price=Decimal("722.7"),
+        maximum_acceptable_price=Decimal("722.7"),
+        decision_best_bid=Decimal("722.7"),
+        decision_best_ask=Decimal("723.0"),
+        decision_atr_1m=Decimal("0.204858129220430181860"),
+        decision_price_step=Decimal("0.1"),
+        amount=Decimal("0.024292"),
+    )
+    executor, _, prices = make_executor(config=config)
+    executor._open_order = tracked_order(
+        price="722.7",
+        amount="0.024292",
+        creation_timestamp=0,
+    )
+    executor._entry_submitted = True
+    executor._strategy.current_timestamp = 31
+    prices[PriceType.BestBid] = Decimal("722.4")
+    prices[PriceType.BestAsk] = Decimal("722.5")
+
+    executor.control_open_order()
+
+    executor._strategy.cancel.assert_not_called()
+    acquisition = executor.get_custom_info()["entry_acquisition"]
+    assert acquisition["state"] == "touch_pending"
     assert acquisition["terminal_reason"] is None
 
 
@@ -283,6 +328,9 @@ def test_active_decision_log_has_parseable_bounded_schema(caplog) -> None:
     payload = json.loads(messages[0].split("ENTRY_ACQUISITION_DECISION ", 1)[1])
     assert payload["action"] == "cancel_for_reprice"
     assert payload["candidate_price"] == "99.90"
+    assert payload["activation_bound_pct"] == "0.005"
+    assert payload["activation_lower_price"] == "99.500"
+    assert payload["activation_upper_price"] == "100.500"
     assert payload["queue_fill_status"] == "UNAVAILABLE"
     assert "connectors" not in payload
 
@@ -395,7 +443,7 @@ def test_cancel_uncertainty_blocks_replacement() -> None:
     "timestamp,bid,expected",
     [
         (300, Decimal("99.90"), "total_age_expired"),
-        (10, Decimal("98.99"), "downward_bound_breached"),
+        (10, Decimal("99.49"), "downward_bound_breached"),
     ],
 )
 def test_hard_rails_cancel_terminally(timestamp, bid, expected) -> None:
@@ -412,12 +460,14 @@ def test_hard_rails_cancel_terminally(timestamp, bid, expected) -> None:
     assert executor._entry_pending_target is None
 
 
-def test_reprice_budget_exhaustion_is_terminal() -> None:
+def test_reprice_budget_exhaustion_holds_valid_order() -> None:
     executor, _, prices = make_executor()
     executor._entry_reprice_count = 3
     request_reprice(executor, prices)
-    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "reprice_budget_exhausted"
-    executor._strategy.cancel.assert_called_once()
+    acquisition = executor.get_custom_info()["entry_acquisition"]
+    assert acquisition["state"] == "reprice_budget_exhausted"
+    assert acquisition["terminal_reason"] is None
+    executor._strategy.cancel.assert_not_called()
 
 
 @pytest.mark.asyncio

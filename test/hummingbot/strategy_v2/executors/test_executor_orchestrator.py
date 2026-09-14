@@ -142,21 +142,20 @@ class TestExecutorOrchestrator(unittest.TestCase):
             leverage=1,
             triple_barrier_config=TripleBarrierConfig(
                 open_order_type=OrderType.LIMIT_MAKER,
-                open_order_limit_max_age_seconds=30,
+                open_order_limit_max_age_seconds=0,
             ),
+            activation_bounds=[Decimal("0.005")],
             entry_order_policy="single_attempt",
             decision_best_bid=Decimal("100"),
             decision_best_ask=Decimal("100.01"),
             decision_atr_1m=Decimal("1"),
             decision_price_step=Decimal("0.01"),
             maximum_acceptable_price=Decimal("100"),
-            entry_rest_seconds=30,
             entry_total_max_age_seconds=300,
             entry_max_downward_reprices=3,
             entry_reprice_cooldown_seconds=5,
             entry_reprice_min_ticks=3,
             entry_reprice_atr_fraction=Decimal("0.05"),
-            entry_max_downward_atr=Decimal("1"),
         )
         action = CreateExecutorAction(controller_id="ok-rsi", executor_config=config)
         self.orchestrator.active_executors["ok-rsi"] = []
@@ -189,21 +188,20 @@ class TestExecutorOrchestrator(unittest.TestCase):
             leverage=1,
             triple_barrier_config=TripleBarrierConfig(
                 open_order_type=OrderType.LIMIT_MAKER,
-                open_order_limit_max_age_seconds=30,
+                open_order_limit_max_age_seconds=0,
             ),
+            activation_bounds=[Decimal("0.005")],
             entry_order_policy="single_attempt",
             decision_best_bid=Decimal("100"),
             decision_best_ask=Decimal("100.01"),
             decision_atr_1m=Decimal("1"),
             decision_price_step=Decimal("0.01"),
             maximum_acceptable_price=Decimal("100"),
-            entry_rest_seconds=30,
             entry_total_max_age_seconds=300,
             entry_max_downward_reprices=3,
             entry_reprice_cooldown_seconds=5,
             entry_reprice_min_ticks=3,
             entry_reprice_atr_fraction=Decimal("0.05"),
-            entry_max_downward_atr=Decimal("1"),
         )
         receipt = {
             "policy": "down_only_maker_v1",

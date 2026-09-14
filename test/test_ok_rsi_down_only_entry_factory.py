@@ -78,10 +78,24 @@ def test_active_buy_freezes_exact_down_only_envelope() -> None:
     assert config.leverage == 1
     assert config.triple_barrier_config.open_order_type is OrderType.LIMIT_MAKER
     assert config.entry_order_policy == "single_attempt"
-    assert config.entry_rest_seconds == 30
+    assert config.activation_bounds == [Decimal("0.0045")]
+    assert config.triple_barrier_config.open_order_limit_max_age_seconds == 0
     assert config.entry_total_max_age_seconds == 300
     assert config.entry_max_downward_reprices == 3
     assert config.decision_atr_1m == config.decision_best_bid * controller._latest_atr_pct
+
+
+def test_active_buy_freezes_adaptive_minimum_as_percentage_validity_bound() -> None:
+    controller, _, _ = make_controller()
+    controller.config.use_adaptive_filters = True
+    controller.config.min_executor_price_gap_threshold = Decimal("0.005")
+    controller.config.max_executor_price_gap_threshold = Decimal("0.018")
+    controller.config.price_gap_atr_multiplier = 3.0
+    controller._latest_atr_pct = Decimal("0.000283")
+
+    config = buy_config(controller)
+
+    assert config.activation_bounds == [Decimal("0.005")]
 
 
 @pytest.mark.parametrize("policy", ["legacy_single_attempt", "shadow"])
@@ -119,13 +133,12 @@ def test_active_policy_does_not_change_sell_executor() -> None:
         ("decision_price_step", Decimal("0.1")),
         ("maximum_acceptable_price", Decimal("99.98")),
         ("entry_acquisition_policy", "legacy_single_attempt"),
-        ("entry_rest_seconds", 31),
         ("entry_total_max_age_seconds", 301),
         ("entry_reprice_cooldown_seconds", 6),
         ("entry_max_downward_reprices", 4),
         ("entry_reprice_min_ticks", 4),
         ("entry_reprice_atr_fraction", Decimal("0.06")),
-        ("entry_max_downward_atr", Decimal("1.1")),
+        ("activation_bounds", [Decimal("0.01")]),
     ],
 )
 def test_factory_rejects_tampered_authorization(field, value) -> None:

@@ -10,13 +10,12 @@ from controllers.directional_trading.ok_rsi_core.down_only_entry_shadow import D
 
 def parameters() -> DownOnlyMakerParameters:
     return DownOnlyMakerParameters(
-        rest_seconds=30,
         total_max_age_seconds=300,
         max_reprices=3,
         cooldown_seconds=5,
         min_ticks=3,
         atr_fraction=Decimal("0.05"),
-        max_downward_atr=Decimal("1"),
+        activation_bound_pct=Decimal("0.005"),
     )
 
 
@@ -64,7 +63,7 @@ def test_start_rejects_second_active_intent() -> None:
         )
 
 
-def test_rising_price_expires_without_upward_reprice() -> None:
+def test_rising_price_inside_bound_holds_without_upward_reprice() -> None:
     tracker = started_tracker()
     events = tracker.advance(
         now=Decimal("30"),
@@ -73,12 +72,12 @@ def test_rising_price_expires_without_upward_reprice() -> None:
         opposing_signal=False,
         risk_allowed=True,
     )
-    assert events[-1]["action"] == "cancel_terminal"
-    assert events[-1]["reason"] == "rest_lease_expired"
+    assert events[-1]["action"] == "hold"
+    assert events[-1]["reason"] == "resting"
     assert tracker.snapshot()["current_order_price"] == "100"
 
 
-def test_three_replacements_then_budget_exhaustion() -> None:
+def test_three_replacements_then_budget_exhaustion_holds() -> None:
     tracker = started_tracker()
     for now, bid, ask in (
         ("10", "99.90", "100.01"),
@@ -101,7 +100,8 @@ def test_three_replacements_then_budget_exhaustion() -> None:
     )
     assert tracker.snapshot()["reprice_count"] == 3
     assert events[-1]["reason"] == "reprice_budget_exhausted"
-    assert tracker.snapshot()["terminal_reason"] == "reprice_budget_exhausted"
+    assert events[-1]["action"] == "hold"
+    assert tracker.snapshot()["terminal_reason"] is None
 
 
 def test_total_age_expiry_survives_lease_renewal() -> None:
@@ -127,7 +127,7 @@ def test_downward_bound_is_terminal() -> None:
     tracker = started_tracker()
     events = tracker.advance(
         now=Decimal("10"),
-        best_bid=Decimal("98.99"),
+        best_bid=Decimal("99.49"),
         best_ask=Decimal("100.01"),
         opposing_signal=False,
         risk_allowed=True,

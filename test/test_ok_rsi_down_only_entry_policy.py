@@ -16,13 +16,12 @@ from controllers.directional_trading.ok_rsi_core.down_only_entry import (
 
 def parameters(**changes) -> DownOnlyMakerParameters:
     values = {
-        "rest_seconds": 30,
         "total_max_age_seconds": 300,
         "max_reprices": 3,
         "cooldown_seconds": 5,
         "min_ticks": 3,
         "atr_fraction": Decimal("0.05"),
-        "max_downward_atr": Decimal("1.0"),
+        "activation_bound_pct": Decimal("0.005"),
     }
     values.update(changes)
     return DownOnlyMakerParameters(**values)
@@ -55,13 +54,13 @@ def snapshot(**changes) -> DownOnlyMakerSnapshot:
 @pytest.mark.parametrize(
     "field,value,message",
     [
-        ("rest_seconds", 0, "rest_seconds"),
         ("total_max_age_seconds", 0, "total_max_age_seconds"),
         ("max_reprices", -1, "max_reprices"),
         ("cooldown_seconds", -1, "cooldown_seconds"),
         ("min_ticks", 0, "min_ticks"),
         ("atr_fraction", Decimal("0"), "atr_fraction"),
-        ("max_downward_atr", Decimal("NaN"), "max_downward_atr"),
+        ("activation_bound_pct", Decimal("NaN"), "activation_bound_pct"),
+        ("activation_bound_pct", Decimal("1"), "activation_bound_pct"),
     ],
 )
 def test_rejects_invalid_parameters(field, value, message) -> None:
@@ -126,12 +125,27 @@ def test_total_age_expiry_is_measured_from_original_intent() -> None:
 
 
 def test_downward_bound_breach_cancels_terminally() -> None:
-    result = decide_down_only_maker(parameters(), snapshot(best_bid="98.99", best_ask="99.00"))
+    result = decide_down_only_maker(parameters(), snapshot(best_bid="99.49", best_ask="99.50"))
     assert result.reason is DownOnlyMakerReason.DOWNWARD_BOUND_BREACHED
     assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
 
 
-def test_partial_fill_disables_reprice_and_holds_during_lease() -> None:
+def test_exact_downward_activation_boundary_remains_valid() -> None:
+    result = decide_down_only_maker(
+        parameters(),
+        snapshot(best_bid="99.50", best_ask="99.51", current_order_price="99.40"),
+    )
+    assert result.action is DownOnlyMakerAction.HOLD
+    assert result.reason is DownOnlyMakerReason.RESTING
+
+
+def test_upward_activation_bound_breach_cancels_terminally() -> None:
+    result = decide_down_only_maker(parameters(), snapshot(best_bid="100.50", best_ask="100.51"))
+    assert result.reason is DownOnlyMakerReason.UPWARD_BOUND_BREACHED
+    assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
+
+
+def test_partial_fill_disables_reprice_and_holds_inside_activation_bound() -> None:
     result = decide_down_only_maker(
         parameters(),
         snapshot(best_bid="99.90", best_ask="99.91", cumulative_filled_base="0.25"),
@@ -140,13 +154,42 @@ def test_partial_fill_disables_reprice_and_holds_during_lease() -> None:
     assert result.action is DownOnlyMakerAction.HOLD
 
 
-def test_partial_fill_cancels_only_remainder_after_lease() -> None:
+def test_partial_fill_does_not_expire_after_thirty_seconds() -> None:
     result = decide_down_only_maker(
         parameters(),
         snapshot(now="30", best_bid="99.90", best_ask="99.91", cumulative_filled_base="0.25"),
     )
-    assert result.reason is DownOnlyMakerReason.REST_LEASE_EXPIRED
+    assert result.reason is DownOnlyMakerReason.PARTIAL_FILL_RESTING
+    assert result.action is DownOnlyMakerAction.HOLD
+
+
+def test_partial_fill_outside_activation_bound_cancels_only_remaining_acquisition() -> None:
+    result = decide_down_only_maker(
+        parameters(),
+        snapshot(now="31", best_bid="99.49", best_ask="99.50", cumulative_filled_base="0.25"),
+    )
+    assert result.reason is DownOnlyMakerReason.DOWNWARD_BOUND_BREACHED
     assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
+
+
+def test_marketable_resting_buy_holds_for_fill_reconciliation() -> None:
+    result = decide_down_only_maker(
+        parameters(),
+        snapshot(
+            now="31",
+            initial_best_bid="722.7",
+            initial_best_ask="723.0",
+            best_bid="722.4",
+            best_ask="722.5",
+            current_order_price="722.7",
+            maximum_acceptable_price="722.7",
+            decision_atr_1m="0.204858129220430181860",
+            price_step="0.1",
+            authorized_base="0.024292",
+        ),
+    )
+    assert result.reason is DownOnlyMakerReason.TOUCH_PENDING
+    assert result.action is DownOnlyMakerAction.HOLD
 
 
 def test_qualifying_decline_selects_strictly_lower_quantized_bid() -> None:
@@ -186,25 +229,32 @@ def test_rising_price_never_produces_an_upward_target() -> None:
 def test_cooldown_prevents_rapid_reprice() -> None:
     result = decide_down_only_maker(
         parameters(),
-        snapshot(now="12", last_reprice_at="10", best_bid="99.90", best_ask="99.91", reprice_count=1),
+        snapshot(
+            now="12",
+            last_reprice_at="10",
+            best_bid="99.70",
+            best_ask="99.91",
+            current_order_price="99.80",
+            reprice_count=1,
+        ),
     )
     assert result.reason is DownOnlyMakerReason.RESTING
     assert result.action is DownOnlyMakerAction.HOLD
 
 
-def test_reprice_budget_exhaustion_is_terminal() -> None:
+def test_reprice_budget_exhaustion_holds_valid_resting_order() -> None:
     result = decide_down_only_maker(
         parameters(),
-        snapshot(best_bid="99.90", best_ask="99.91", reprice_count=3),
+        snapshot(best_bid="99.70", best_ask="99.91", current_order_price="99.80", reprice_count=3),
     )
     assert result.reason is DownOnlyMakerReason.REPRICE_BUDGET_EXHAUSTED
-    assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
+    assert result.action is DownOnlyMakerAction.HOLD
 
 
-def test_unqualified_decline_expires_at_local_lease() -> None:
-    result = decide_down_only_maker(parameters(), snapshot(now="30", best_bid="99.98", best_ask="99.99"))
-    assert result.reason is DownOnlyMakerReason.REST_LEASE_EXPIRED
-    assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
+def test_unqualified_decline_remains_live_after_thirty_seconds() -> None:
+    result = decide_down_only_maker(parameters(), snapshot(now="30", best_bid="99.98", best_ask="100.01"))
+    assert result.reason is DownOnlyMakerReason.RESTING
+    assert result.action is DownOnlyMakerAction.HOLD
 
 
 def test_dataclasses_are_immutable() -> None:

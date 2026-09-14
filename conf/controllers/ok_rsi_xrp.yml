@@ -77,7 +77,8 @@ use_trailing_exit: true
 trailing_activation_pct: 0.02  # 2%
 trailing_delta_pct: 0.006  # 0.6%
 trailing_stop_order_type: LIMIT
-entry_limit_max_age_seconds: 30
+entry_acquisition_policy: down_only_maker_v1
+entry_total_max_age_seconds: 300  # hard intent backstop; no 30s lease under down_only_maker_v1
 trailing_stop_limit_max_age_seconds: 3
 use_adaptive_trailing: true
 trailing_atr_baseline: 0.002

@@ -53,6 +53,11 @@ class DownOnlyMakerShadowTracker:
     def is_active(self) -> bool:
         return self._state is not None and self._state.terminal_reason is None
 
+    def configure(self, parameters: DownOnlyMakerParameters) -> None:
+        if self.is_active:
+            raise ValueError("cannot reconfigure an active shadow intent")
+        self._parameters = parameters
+
     def start(
         self,
         *,

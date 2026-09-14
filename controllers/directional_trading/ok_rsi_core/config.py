@@ -151,7 +151,6 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     entry_reprice_cooldown_seconds: int = hl_rsi.Field(default=5, ge=1, le=30)
     entry_reprice_min_ticks: int = hl_rsi.Field(default=3, ge=1, le=100)
     entry_reprice_atr_fraction: Decimal = hl_rsi.Field(default=Decimal("0.05"), gt=0, le=1)
-    entry_max_downward_atr: Decimal = hl_rsi.Field(default=Decimal("1.0"), gt=0, le=10)
     use_adaptive_trailing: bool = hl_rsi.Field(default=True, json_schema_extra={"is_updatable": True})
     trailing_activation_min_pct: float = hl_rsi.Field(default=0.003, gt=0.0, json_schema_extra={"is_updatable": True})
     trailing_activation_max_pct: float = hl_rsi.Field(default=0.05, gt=0.0, json_schema_extra={"is_updatable": True})
@@ -205,8 +204,6 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError("down-only maker entry is incompatible with episode mode")
         if down_only_active and self.trade_mode == "sell_only":
             raise ValueError("active down-only maker entry is unavailable in sell_only mode")
-        if self.entry_total_max_age_seconds < self.entry_limit_max_age_seconds:
-            raise ValueError("entry total age must not be shorter than the rest lease")
         if self.durable_candle_watermark_enabled and self.episode_enabled:
             raise ValueError(
                 "durable candle watermark currently guards only the legacy action path"
@@ -358,13 +355,12 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError("MARKET trailing requires a zero limit fallback timeout")
         return self
 
-    def down_only_maker_parameters(self) -> DownOnlyMakerParameters:
+    def down_only_maker_parameters(self, activation_bound_pct: Decimal) -> DownOnlyMakerParameters:
         return DownOnlyMakerParameters(
-            rest_seconds=self.entry_limit_max_age_seconds,
             total_max_age_seconds=self.entry_total_max_age_seconds,
             max_reprices=self.entry_max_downward_reprices,
             cooldown_seconds=self.entry_reprice_cooldown_seconds,
             min_ticks=self.entry_reprice_min_ticks,
             atr_fraction=self.entry_reprice_atr_fraction,
-            max_downward_atr=self.entry_max_downward_atr,
+            activation_bound_pct=Decimal(str(activation_bound_pct)),
         )

@@ -15,11 +15,12 @@ class DownOnlyMakerAction(str, Enum):
 
 class DownOnlyMakerReason(str, Enum):
     RESTING = "resting"
+    TOUCH_PENDING = "touch_pending"
     PARTIAL_FILL_RESTING = "partial_fill_resting"
     DOWNWARD_REPRICE = "downward_reprice"
-    REST_LEASE_EXPIRED = "rest_lease_expired"
     TOTAL_AGE_EXPIRED = "total_age_expired"
     DOWNWARD_BOUND_BREACHED = "downward_bound_breached"
+    UPWARD_BOUND_BREACHED = "upward_bound_breached"
     OPPOSING_SIGNAL = "opposing_signal"
     RISK_BLOCKED = "risk_blocked"
     REPRICE_BUDGET_EXHAUSTED = "reprice_budget_exhausted"
@@ -27,13 +28,12 @@ class DownOnlyMakerReason(str, Enum):
 
 @dataclass(frozen=True)
 class DownOnlyMakerParameters:
-    rest_seconds: int
     total_max_age_seconds: int
     max_reprices: int
     cooldown_seconds: int
     min_ticks: int
     atr_fraction: Decimal
-    max_downward_atr: Decimal
+    activation_bound_pct: Decimal
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ def _non_negative_finite(value: Decimal, name: str) -> None:
 
 
 def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapshot) -> None:
-    for name in ("rest_seconds", "total_max_age_seconds", "min_ticks"):
+    for name in ("total_max_age_seconds", "min_ticks"):
         value = getattr(parameters, name)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise DownOnlyMakerInputError(f"{name} must be a positive integer")
@@ -84,7 +84,9 @@ def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapsh
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise DownOnlyMakerInputError(f"{name} must be a non-negative integer")
     _positive_finite(parameters.atr_fraction, "atr_fraction")
-    _positive_finite(parameters.max_downward_atr, "max_downward_atr")
+    _positive_finite(parameters.activation_bound_pct, "activation_bound_pct")
+    if parameters.activation_bound_pct >= 1:
+        raise DownOnlyMakerInputError("activation_bound_pct must be below 1")
 
     for name in (
         "initial_best_bid",
@@ -143,21 +145,26 @@ def decide_down_only_maker(
     if intent_age >= Decimal(parameters.total_max_age_seconds):
         return DownOnlyMakerDecision(DownOnlyMakerAction.CANCEL_TERMINAL, DownOnlyMakerReason.TOTAL_AGE_EXPIRED)
 
-    downward_floor = snapshot.initial_best_bid - parameters.max_downward_atr * snapshot.decision_atr_1m
+    downward_floor = snapshot.maximum_acceptable_price * (Decimal("1") - parameters.activation_bound_pct)
     if snapshot.best_bid < downward_floor:
         return DownOnlyMakerDecision(
             DownOnlyMakerAction.CANCEL_TERMINAL,
             DownOnlyMakerReason.DOWNWARD_BOUND_BREACHED,
         )
+    upward_ceiling = snapshot.maximum_acceptable_price * (Decimal("1") + parameters.activation_bound_pct)
+    if snapshot.best_ask > upward_ceiling:
+        return DownOnlyMakerDecision(
+            DownOnlyMakerAction.CANCEL_TERMINAL,
+            DownOnlyMakerReason.UPWARD_BOUND_BREACHED,
+        )
 
-    order_age = snapshot.now - snapshot.order_created_at
     if snapshot.cumulative_filled_base > 0:
-        if order_age >= Decimal(parameters.rest_seconds):
-            return DownOnlyMakerDecision(
-                DownOnlyMakerAction.CANCEL_TERMINAL,
-                DownOnlyMakerReason.REST_LEASE_EXPIRED,
-            )
         return DownOnlyMakerDecision(DownOnlyMakerAction.HOLD, DownOnlyMakerReason.PARTIAL_FILL_RESTING)
+
+    # Once the ask reaches a resting maker bid, wait for the exchange fill/order
+    # update. Canceling to reprice here creates an avoidable fill/cancel race.
+    if snapshot.best_ask <= snapshot.current_order_price:
+        return DownOnlyMakerDecision(DownOnlyMakerAction.HOLD, DownOnlyMakerReason.TOUCH_PENDING)
 
     decision_spread = snapshot.initial_best_ask - snapshot.initial_best_bid
     trigger = max(
@@ -173,7 +180,7 @@ def decide_down_only_maker(
 
     if qualifying_decline and snapshot.reprice_count >= parameters.max_reprices:
         return DownOnlyMakerDecision(
-            DownOnlyMakerAction.CANCEL_TERMINAL,
+            DownOnlyMakerAction.HOLD,
             DownOnlyMakerReason.REPRICE_BUDGET_EXHAUSTED,
         )
     if qualifying_decline and cooldown_elapsed:
@@ -181,10 +188,5 @@ def decide_down_only_maker(
             DownOnlyMakerAction.CANCEL_FOR_REPRICE,
             DownOnlyMakerReason.DOWNWARD_REPRICE,
             target,
-        )
-    if order_age >= Decimal(parameters.rest_seconds):
-        return DownOnlyMakerDecision(
-            DownOnlyMakerAction.CANCEL_TERMINAL,
-            DownOnlyMakerReason.REST_LEASE_EXPIRED,
         )
     return DownOnlyMakerDecision(DownOnlyMakerAction.HOLD, DownOnlyMakerReason.RESTING)

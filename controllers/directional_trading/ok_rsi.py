@@ -141,7 +141,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         self._entry_acquisition_shadow_policy = config.entry_acquisition_shadow_policy
         self._entry_acquisition_shadow = (
             DownOnlyMakerShadowTracker(
-                config.down_only_maker_parameters(),
+                config.down_only_maker_parameters(config.executor_price_gap_threshold),
                 controller_id=config.id,
                 connector_name=config.connector_name,
                 trading_pair=config.trading_pair,
@@ -260,6 +260,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         config = action.executor_config
         try:
             now, best_bid, best_ask, price_step, atr_1m = self._entry_acquisition_shadow_inputs()
+            tracker.configure(self.config.down_only_maker_parameters(self._effective_price_gap()))
             tracker.start(
                 intent_id=f"shadow:{config.id}",
                 now=now,
@@ -1498,7 +1499,11 @@ class OKRSIController(hl_rsi.HLRSIController):
                 trailing_delta=selection.delta,
             ),
             open_order_type=OrderType.LIMIT_MAKER,
-            open_order_limit_max_age_seconds=self.config.entry_limit_max_age_seconds,
+            open_order_limit_max_age_seconds=(
+                0
+                if self._entry_acquisition_policy == "down_only_maker_v1"
+                else self.config.entry_limit_max_age_seconds
+            ),
             take_profit_order_type=self.config.take_profit_order_type,
             trailing_stop_order_type=self.config.trailing_stop_order_type,
             trailing_stop_limit_max_age_seconds=self.config.trailing_stop_limit_max_age_seconds,
@@ -1536,13 +1541,11 @@ class OKRSIController(hl_rsi.HLRSIController):
             decision_atr_1m=decision_atr_1m,
             decision_price_step=decision_price_step,
             maximum_acceptable_price=entry_price,
-            entry_rest_seconds=self.config.entry_limit_max_age_seconds,
             entry_total_max_age_seconds=self.config.entry_total_max_age_seconds,
             entry_max_downward_reprices=self.config.entry_max_downward_reprices,
             entry_reprice_cooldown_seconds=self.config.entry_reprice_cooldown_seconds,
             entry_reprice_min_ticks=self.config.entry_reprice_min_ticks,
             entry_reprice_atr_fraction=self.config.entry_reprice_atr_fraction,
-            entry_max_downward_atr=self.config.entry_max_downward_atr,
         )
         self._down_only_pending_configs[config.id] = config.model_copy(deep=True)
         return config

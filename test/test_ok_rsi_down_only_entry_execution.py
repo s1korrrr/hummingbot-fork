@@ -222,6 +222,64 @@ def test_fractional_config_timestamp_with_whole_second_order_clock_keeps_entry_r
     assert acquisition["terminal_reason"] is None
 
 
+@pytest.mark.parametrize("connector_timestamp", [1789357441, 1789357500])
+def test_connector_clock_does_not_override_fractional_local_submission(connector_timestamp) -> None:
+    submitted = 1789357441.4710643
+    executor, _, _ = make_executor(config=make_config(timestamp=submitted), strategy_timestamp=submitted)
+    executor.control_open_order()
+    executor._open_order = tracked_order(creation_timestamp=connector_timestamp)
+    executor._strategy.current_timestamp = submitted + 1
+
+    executor.control_open_order()
+
+    executor._strategy.cancel.assert_not_called()
+    assert executor._entry_order_created_at == submitted
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "resting"
+
+
+@pytest.mark.parametrize("strategy_timestamp", [99, float("nan"), float("inf")])
+def test_invalid_strategy_clock_still_cancels_acquisition(strategy_timestamp) -> None:
+    executor, _, _ = make_executor(config=make_config(timestamp=100), strategy_timestamp=100)
+    executor.control_open_order()
+    executor._open_order = tracked_order(creation_timestamp=100)
+    executor._strategy.current_timestamp = strategy_timestamp
+
+    executor.control_open_order()
+
+    executor._strategy.cancel.assert_called_once()
+    assert executor._entry_terminal_reason == "input_unavailable"
+
+
+def test_connector_clock_cannot_reset_total_intent_age() -> None:
+    executor, _, _ = make_executor()
+    executor.control_open_order()
+    executor._open_order = tracked_order(creation_timestamp=299)
+    executor._strategy.current_timestamp = 300
+
+    executor.control_open_order()
+
+    executor._strategy.cancel.assert_called_once()
+    assert executor._entry_terminal_reason == "total_age_expired"
+
+
+def test_reprice_cooldown_uses_local_clock_despite_future_connector_timestamp() -> None:
+    executor, _, prices = make_executor()
+    executor._open_order = tracked_order(creation_timestamp=1000)
+    executor._entry_submitted = True
+    executor._entry_order_created_at = 10.25
+    executor._entry_last_reprice_at = 10.25
+    executor._entry_reprice_count = 1
+    prices[PriceType.BestBid] = Decimal("99.90")
+    prices[PriceType.BestAsk] = Decimal("100.01")
+    executor._strategy.current_timestamp = 15.24
+    executor.control_open_order()
+    executor._strategy.cancel.assert_not_called()
+    executor._strategy.current_timestamp = 15.25
+    executor.control_open_order()
+    executor._strategy.cancel.assert_called_once()
+    assert executor._entry_pending_target == Decimal("99.90")
+
+
 def test_valid_untouched_entry_remains_live_after_thirty_seconds() -> None:
     executor, _, prices = make_executor()
     executor._open_order = tracked_order()

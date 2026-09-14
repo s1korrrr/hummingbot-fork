@@ -171,7 +171,9 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
                 DownOnlyMakerSnapshot(
                     now=now,
                     intent_created_at=Decimal(str(self._entry_intent_created_at)),
-                    order_created_at=Decimal(str(order.creation_timestamp or self._entry_order_created_at)),
+                    # Connector receipt clocks may be rounded or offset. Entry age and
+                    # reprice cooldown share the executor strategy clock.
+                    order_created_at=Decimal(str(self._entry_order_created_at)),
                     last_reprice_at=(
                         Decimal(str(self._entry_last_reprice_at))
                         if self._entry_last_reprice_at is not None else None

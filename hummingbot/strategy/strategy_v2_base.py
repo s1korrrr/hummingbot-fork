@@ -880,6 +880,7 @@ class StrategyV2Base(StrategyPyBase):
         ][:5]
 
         active_executors: List[Dict[str, Any]] = []
+        lifecycle_executors: List[Dict[str, Any]] = []
         positions_held: List[Dict[str, Any]] = []
         controllers: List[Dict[str, Any]] = []
 
@@ -903,22 +904,24 @@ class StrategyV2Base(StrategyPyBase):
             )
 
             for executor in entry["executors"]:
-                if not executor.is_active:
+                if executor.is_done:
                     continue
                 side = self._compact_side_label(executor.side or getattr(executor.config, "side", None))
-                active_executors.append(
-                    {
-                        **executor_observation(executor, entry["controller_id"]),
-                        "pair": pair,
-                        "side": side.lower() if side else None,
-                        "executor_type": self._compact_executor_type(executor.type),
-                        "status": (self._compact_enum_label(executor.status) or "unknown").lower(),
-                        "age": self._format_executor_age_short(executor.timestamp),
-                        "net_pnl_quote": float(executor.net_pnl_quote) if executor.net_pnl_quote is not None else None,
-                        "net_pnl_pct": float(executor.net_pnl_pct * Decimal("100")) if executor.net_pnl_pct is not None else None,
-                        "filled_amount_quote": float(self._safe_decimal(executor.filled_amount_quote)),
-                    }
-                )
+                lifecycle_row = {
+                    **executor_observation(executor, entry["controller_id"]),
+                    "pair": pair,
+                    "side": side.lower() if side else None,
+                    "executor_type": self._compact_executor_type(executor.type),
+                    "status": (self._compact_enum_label(executor.status) or "unknown").lower(),
+                    "close_type": (self._compact_enum_label(executor.close_type) or "").lower() or None,
+                    "age": self._format_executor_age_short(executor.timestamp),
+                    "net_pnl_quote": float(executor.net_pnl_quote) if executor.net_pnl_quote is not None else None,
+                    "net_pnl_pct": float(executor.net_pnl_pct * Decimal("100")) if executor.net_pnl_pct is not None else None,
+                    "filled_amount_quote": float(self._safe_decimal(executor.filled_amount_quote)),
+                }
+                lifecycle_executors.append(lifecycle_row)
+                if executor.is_active:
+                    active_executors.append(lifecycle_row)
 
             for position in entry["positions"]:
                 positions_held.append(
@@ -962,12 +965,14 @@ class StrategyV2Base(StrategyPyBase):
             "controllers": controllers,
             "focus_queue": focus_queue,
             "active_executors": active_executors,
+            "lifecycle_executors": lifecycle_executors,
             "positions_held": positions_held,
             "wallet_sales": wallet_sales,
             "summary": {
                 "pnl_available": pnl_available,
                 "balance_value_quote": balance_value_quote,
                 "active_executor_count": len(active_executors),
+                "lifecycle_executor_count": len(lifecycle_executors),
                 "positions_held_count": len(positions_held),
                 "controller_count": len(controllers),
                 "positions_value_quote": positions_value_quote,

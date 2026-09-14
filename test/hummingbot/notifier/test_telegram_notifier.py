@@ -21,12 +21,27 @@ from hummingbot.notifier.telegram_notifier import TelegramMarketEventForwarder, 
 
 class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
     @staticmethod
-    def status_snapshot(bot_name, *, controllers, orders, executors, positions, equity, net, pnl_available=True):
-        return {
+    def status_snapshot(
+        bot_name,
+        *,
+        controllers,
+        orders,
+        executors,
+        positions,
+        equity,
+        net,
+        pnl_available=True,
+        lifecycle_executors=None,
+        active_orders=None,
+    ):
+        active_orders = active_orders or []
+        snapshot = {
             "schema_version": 1,
             "bot_name": bot_name,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "active_orders_count": orders,
+            "active_orders": active_orders,
+            "active_orders_status": {"complete": True, "source": "connector_in_flight_orders", "errors": []},
             "controller_reports_valid": True,
             "controllers": [{"controller_id": controller} for controller in controllers],
             "focus_queue": [],
@@ -42,6 +57,15 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
                 "controller_count": len(controllers),
             },
         }
+        if lifecycle_executors is not None:
+            snapshot["active_executors"] = [
+                row
+                for row in lifecycle_executors
+                if row.get("status") not in {"shutting_down", "shutting-down", "terminated"}
+            ]
+            snapshot["lifecycle_executors"] = lifecycle_executors
+            snapshot["summary"]["lifecycle_executor_count"] = len(lifecycle_executors)
+        return snapshot
 
     @staticmethod
     def write_status_snapshot(root, lane, snapshot):
@@ -649,6 +673,165 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual("Usage: /status [main|sui]", await notifier._dispatch_command("status", ["other"]))
         self.assertEqual("Usage: /status [main|sui]", await notifier._dispatch_command("status", ["main", "sui"]))
+
+    async def test_status_distinguishes_active_from_closing_executor_count(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            lifecycle_executors = [
+                {"status": "running"},
+                {"status": "shutting-down"},
+            ]
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=0, executors=1, positions=5, equity=15000, net=12.5,
+                    lifecycle_executors=lifecycle_executors,
+                )),
+                "sui": self.write_status_snapshot(root, "sui", self.status_snapshot(
+                    "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
+                    orders=0, executors=0, positions=0, equity=500, net=None,
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                message = await TelegramNotifier(self.hb_app)._dispatch_command("status", ["main"])
+
+        self.assertIn("⚙️ Executors: 1 active / 2 in flight", message)
+
+    async def test_executors_combines_lifecycle_and_order_transitions_from_both_owners(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            main_executors = [
+                {
+                    "executor_id": "exec-create-1234567890",
+                    "controller_id": "ok-rsi-btc",
+                    "connector_name": "okx",
+                    "pair": "BTC-USDC",
+                    "side": "buy",
+                    "executor_type": "position",
+                    "status": "not_started",
+                    "age": "2s",
+                    "amount_base": "0.001",
+                    "filled_amount_quote": 0,
+                    "net_pnl_quote": 0,
+                    "net_pnl_pct": 0,
+                    "entry_lifecycle": {"policy": "single_attempt", "state": "awaiting_submission"},
+                },
+                {
+                    "executor_id": "exec-close-1234567890",
+                    "controller_id": "ok-rsi-eth",
+                    "connector_name": "okx",
+                    "pair": "ETH-USDC",
+                    "side": "buy",
+                    "executor_type": "position",
+                    "status": "shutting-down",
+                    "close_type": "trailing-stop",
+                    "age": "3h4m",
+                    "amount_base": "0.004929",
+                    "remaining_position_amount_base": "0.004925",
+                    "filled_amount_quote": 12.31,
+                    "net_pnl_quote": 0.08,
+                    "net_pnl_pct": 0.7,
+                    "trailing_state": "armed",
+                    "trailing_current_price": "2519.85",
+                    "trailing_trigger_price": "2510.25",
+                    "distance_to_trailing_trigger_pct": "0.0038",
+                    "entry_lifecycle": {"policy": "down_only_maker_v1", "state": "managing_fill"},
+                    "entry_acquisition": {
+                        "policy": "down_only_maker_v1",
+                        "state": "cancel_pending_reprice",
+                        "terminal_reason": None,
+                        "current_order_price": "99.90",
+                        "maximum_acceptable_price": "100",
+                        "authorized_base": "1",
+                        "cumulative_filled_base": "0.2",
+                        "remaining_base": "0.8",
+                        "reprice_count": 1,
+                        "rest_seconds": 30,
+                        "total_max_age_seconds": 300,
+                        "queue_fill_status": "UNAVAILABLE",
+                        "fee_economics_status": "AVAILABLE",
+                    },
+                },
+            ]
+            active_orders = [
+                {
+                    "order_id": "order-create-1234567890",
+                    "connector_name": "okx",
+                    "pair": "BTC-USDC",
+                    "controller_id": "ok-rsi-btc",
+                    "side": "buy",
+                    "status": "pending_create",
+                    "amount_base": "0.001",
+                    "filled_amount_base": "0",
+                    "remaining_amount_base": "0.001",
+                    "price_quote": "98000",
+                },
+                {
+                    "order_id": "order-cancel-1234567890",
+                    "connector_name": "okx",
+                    "pair": "ETH-USDC",
+                    "controller_id": "ok-rsi-eth",
+                    "side": "buy",
+                    "status": "pending_cancel",
+                    "amount_base": "0.004929",
+                    "filled_amount_base": "0.001",
+                    "remaining_amount_base": "0.003929",
+                    "price_quote": "2500",
+                },
+            ]
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=2, executors=1, positions=5, equity=15000, net=12.5,
+                    lifecycle_executors=main_executors, active_orders=active_orders,
+                )),
+                "sui": self.write_status_snapshot(root, "sui", self.status_snapshot(
+                    "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
+                    orders=0, executors=0, positions=0, equity=500, net=None,
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                message = await TelegramNotifier(self.hb_app)._dispatch_command("executors", [])
+
+        self.assertIn("⚙️ EXECUTORS • MAIN + SUI", message)
+        self.assertIn("🤖 MAIN: ok_rsi", message)
+        self.assertIn("CREATING", message)
+        self.assertIn("CLOSING • trailing stop", message)
+        self.assertIn("entry down_only_maker_v1:managing fill", message)
+        self.assertIn("acquisition down_only_maker_v1:cancel pending reprice", message)
+        self.assertIn("reprices 1", message)
+        self.assertIn("entry price 99.9 / max 100", message)
+        self.assertIn("filled 0.2 / authorized 1", message)
+        self.assertIn("timing rest 30s / max age 300s", message)
+        self.assertIn("trail armed", message)
+        self.assertIn("trigger 2510.25", message)
+        self.assertIn("📬 CREATING", message)
+        self.assertIn("📬 CANCELING", message)
+        self.assertIn("🤖 SUI: ok_rsi_sui_sell_only", message)
+        self.assertIn("No in-flight executors or orders.", message)
+
+    async def test_executors_scope_selects_snapshot_and_rejects_unknown_scope(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=0, executors=0, positions=5, equity=15000, net=12.5,
+                )),
+                "sui": self.write_status_snapshot(root, "sui", self.status_snapshot(
+                    "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
+                    orders=0, executors=0, positions=0, equity=500, net=None,
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                notifier = TelegramNotifier(self.hb_app)
+                message = await notifier._dispatch_command("executors", ["sui"])
+                usage = await notifier._dispatch_command("executors", ["other"])
+
+        self.assertIn("⚙️ EXECUTORS • SUI", message)
+        self.assertIn("🤖 SUI: ok_rsi_sui_sell_only", message)
+        self.assertNotIn("ok_rsi\n", message)
+        self.assertEqual("Usage: /executors [main|sui]", usage)
 
     async def test_run_command_loop_retries_after_transient_failure(self):
         notifier = TelegramNotifier(self.hb_app)

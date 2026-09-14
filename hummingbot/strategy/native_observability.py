@@ -9,6 +9,18 @@ TRAILING_FIELDS = ('policy', 'peak', 'floor', 'target_base', 'anchor_activation_
 EXECUTOR_FIELDS = ('trailing_state', 'trailing_activation_price', 'trailing_trigger_price',
                    'remaining_position_amount_base', 'executed_amount_base', 'trailing_current_price',
                    'distance_to_trailing_activation_pct', 'distance_to_trailing_trigger_pct')
+ENTRY_LIFECYCLE_FIELDS = ('policy', 'state', 'stop_reason', 'order_id', 'submission_timestamp',
+                          'creation_timestamp', 'deadline_timestamp', 'max_age_seconds',
+                          'stop_requested_timestamp', 'stop_observed_wall_timestamp',
+                          'cancel_requested_timestamp', 'cancel_event_timestamp',
+                          'cancel_event_observed_timestamp', 'cancel_event_observed_wall_timestamp',
+                          'terminal_exchange_timestamp', 'terminal_observed_timestamp',
+                          'failure_event_timestamp')
+ENTRY_ACQUISITION_FIELDS = ('policy', 'intent_id', 'state', 'terminal_reason', 'initial_price',
+                            'current_order_price', 'maximum_acceptable_price', 'decision_atr_1m',
+                            'authorized_base', 'cumulative_filled_base', 'remaining_base',
+                            'reprice_count', 'rest_seconds', 'total_max_age_seconds',
+                            'queue_fill_status', 'fee_economics_status')
 
 
 def number(value):
@@ -86,6 +98,23 @@ def executor_observation(executor, controller_id):
               'amount_base': number(getattr(executor.config, 'amount', None)),
               'price_quote': number(getattr(executor.config, 'price', None))}
     result.update({key: scalar(custom.get(key)) for key in EXECUTOR_FIELDS})
+    entry_lifecycle = custom.get('entry_lifecycle')
+    if isinstance(entry_lifecycle, dict):
+        result['entry_lifecycle'] = {
+            key: scalar(entry_lifecycle[key])
+            for key in ENTRY_LIFECYCLE_FIELDS
+            if key in entry_lifecycle
+        }
+    entry_acquisition = custom.get('entry_acquisition')
+    if isinstance(entry_acquisition, dict):
+        result['entry_acquisition'] = {
+            key: scalar(entry_acquisition[key])
+            for key in ENTRY_ACQUISITION_FIELDS
+            if key in entry_acquisition
+        }
+        order_ids = entry_acquisition.get('order_ids')
+        if isinstance(order_ids, list):
+            result['entry_acquisition']['order_ids'] = [str(order_id) for order_id in order_ids]
     return result
 
 

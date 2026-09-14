@@ -54,6 +54,19 @@ class TelegramNotifier(NotifierBase):
         "main": "ok_rsi",
         "sui": "ok_rsi_sui_sell_only",
     }
+    EXECUTOR_LIFECYCLE_LABELS = {
+        "not_started": "CREATING",
+        "running": "RUNNING",
+        "shutting_down": "CLOSING",
+        "terminated": "CLOSED",
+    }
+    ORDER_LIFECYCLE_LABELS = {
+        "pending_create": "CREATING",
+        "pending_cancel": "CANCELING",
+        "partially_filled": "PARTIALLY FILLED",
+        "open": "OPEN",
+        "created": "CREATED",
+    }
     COMMAND_SPECS = [
         ("start", "bind chat and show command list"),
         ("help", "show all trading desk commands"),
@@ -62,7 +75,7 @@ class TelegramNotifier(NotifierBase):
         ("balances", "current balances and USD values"),
         ("controllers", "controller lanes summary"),
         ("focus", "attention queue from controllers"),
-        ("executors", "active executors, newest first"),
+        ("executors", "executor and order lifecycle (main|sui)"),
         ("positions", "held positions summary"),
         ("performance", "realized, unrealized, fees, volume"),
         ("orders", "active orders and latest stored orders"),
@@ -475,7 +488,7 @@ class TelegramNotifier(NotifierBase):
                 lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
             else:
                 lines.extend(self._format_status_overview(lane, snapshot))
-        lines.append("Use /status main or /status sui for full details.")
+        lines.append("Use /status main or /status sui for full details; /executors for lifecycle details.")
         return "\n".join(lines)
 
     def _format_status_snapshot(self, snapshot: Dict[str, Any], title: str) -> str:
@@ -493,7 +506,7 @@ class TelegramNotifier(NotifierBase):
             self._kv("Unrealized", self._format_status_money(summary.get("unrealized_pnl_quote")), "📈"),
             self._kv("Fees", self._format_status_money(summary.get("fees_quote")), "🧾"),
             self._kv("Active Orders", snapshot.get('active_orders_count', 0), "📬"),
-            self._kv("Active Executors", summary.get('active_executor_count', 0), "⚙️"),
+            self._kv("Executors", self._format_executor_counts(summary), "⚙️"),
             self._kv("Held Positions", summary.get('positions_held_count', 0), "👜"),
             self._kv("Controllers", summary.get('controller_count', 0), "🧠"),
         ]
@@ -510,10 +523,16 @@ class TelegramNotifier(NotifierBase):
             self._kv("Updated", snapshot["updated_at"], "🕒"),
             self._kv("Reporting Net", self._format_status_money(summary.get("net_pnl_quote")), "💹"),
             self._kv("Orders", snapshot["active_orders_count"], "📬"),
-            self._kv("Executors", summary["active_executor_count"], "⚙️"),
+            self._kv("Executors", self._format_executor_counts(summary), "⚙️"),
             self._kv("Held Positions", summary["positions_held_count"], "👜"),
             self._kv("Controllers", summary["controller_count"], "🧠"),
         ]
+
+    @staticmethod
+    def _format_executor_counts(summary: Dict[str, Any]) -> str:
+        active = summary.get("active_executor_count", 0)
+        in_flight = summary.get("lifecycle_executor_count", active)
+        return f"{active} active / {in_flight} in flight"
 
     def _configured_status_snapshots(self) -> Optional[Dict[str, Optional[Dict[str, Any]]]]:
         raw = os.environ.get(self.STATUS_SNAPSHOT_ENV)
@@ -559,6 +578,10 @@ class TelegramNotifier(NotifierBase):
             raise ValueError("Status snapshot owner mismatch")
         if not isinstance(snapshot.get("summary"), dict) or not isinstance(snapshot.get("controllers"), list):
             raise ValueError("Incomplete status snapshot")
+        for key in ("active_executors", "lifecycle_executors", "active_orders"):
+            value = snapshot.get(key)
+            if value is not None and (not isinstance(value, list) or any(not isinstance(row, dict) for row in value)):
+                raise ValueError(f"Status snapshot {key} are invalid")
         updated_at = snapshot.get("updated_at")
         if not isinstance(updated_at, str):
             raise ValueError("Status snapshot timestamp is unavailable")
@@ -578,6 +601,13 @@ class TelegramNotifier(NotifierBase):
             raise ValueError("Status snapshot counts are invalid")
         if counts["controller_count"] != len(snapshot["controllers"]):
             raise ValueError("Status snapshot controller count mismatch")
+        lifecycle_count = snapshot["summary"].get("lifecycle_executor_count")
+        lifecycle_executors = snapshot.get("lifecycle_executors")
+        if lifecycle_count is not None:
+            if type(lifecycle_count) is not int or lifecycle_count < 0:
+                raise ValueError("Status snapshot lifecycle executor count is invalid")
+            if lifecycle_executors is None or lifecycle_count != len(lifecycle_executors):
+                raise ValueError("Status snapshot lifecycle executor count mismatch")
         for key in ("balance_value_quote", "net_pnl_quote", "realized_pnl_quote", "unrealized_pnl_quote", "fees_quote"):
             raw_value = snapshot["summary"].get(key)
             if raw_value is None:
@@ -605,6 +635,38 @@ class TelegramNotifier(NotifierBase):
         if not decimal_value.is_finite():
             return "UNAVAILABLE"
         return f"${cls._format_number(decimal_value, 2)}"
+
+    @staticmethod
+    def _status_text(value: Any, unavailable: str = "UNAVAILABLE") -> str:
+        if value is None:
+            return unavailable
+        text = " ".join(str(value).split())
+        return text[:200] if text else unavailable
+
+    @classmethod
+    def _format_status_number(cls, value: Any, decimals: int) -> str:
+        try:
+            decimal_value = Decimal(str(value))
+        except ArithmeticError:
+            return "UNAVAILABLE"
+        if not decimal_value.is_finite():
+            return "UNAVAILABLE"
+        return cls._format_number(decimal_value, decimals)
+
+    @classmethod
+    def _format_status_percent(cls, value: Any) -> str:
+        number = cls._format_status_number(value, 4)
+        return number if number == "UNAVAILABLE" else f"{number}%"
+
+    @classmethod
+    def _format_status_fraction_percent(cls, value: Any) -> str:
+        try:
+            decimal_value = Decimal(str(value)) * Decimal("100")
+        except ArithmeticError:
+            return "UNAVAILABLE"
+        if not decimal_value.is_finite():
+            return "UNAVAILABLE"
+        return f"{cls._format_number(decimal_value, 4)}%"
 
     async def _command_balances(self, _: List[str]) -> str:
         snapshot = self._runtime_snapshot()
@@ -652,7 +714,152 @@ class TelegramNotifier(NotifierBase):
             lines.append(f"{self.BULLET} {item.get('pair', 'n/a')} | {item.get('focus', '')}")
         return "\n".join(lines)
 
-    async def _command_executors(self, _: List[str]) -> str:
+    async def _command_executors(self, args: List[str]) -> str:
+        if len(args) > 1 or (args and args[0].lower() not in self.STATUS_LANES):
+            return "Usage: /executors [main|sui]"
+        scope = args[0].lower() if args else None
+        configured = self._configured_status_snapshots()
+        if configured is None:
+            return await self._command_local_executors()
+
+        if scope is not None:
+            snapshot = configured[scope]
+            if snapshot is None:
+                return f"⚠️ {scope.upper()} executor status unavailable."
+            lines = [self._title("⚙️", f"EXECUTORS • {scope.upper()}")]
+            lines.extend(self._format_executor_snapshot(scope, snapshot))
+            return "\n".join(lines)
+
+        lines = [self._title("⚙️", "EXECUTORS • MAIN + SUI")]
+        for lane in self.STATUS_LANES:
+            snapshot = configured[lane]
+            if snapshot is None:
+                lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
+            else:
+                lines.extend(self._format_executor_snapshot(lane, snapshot))
+        lines.append("Use /executors main or /executors sui to isolate one owner.")
+        return "\n".join(lines)
+
+    def _format_executor_snapshot(self, lane: str, snapshot: Dict[str, Any]) -> List[str]:
+        executors = snapshot.get("lifecycle_executors")
+        if executors is None:
+            executors = snapshot.get("active_executors", [])
+        orders = snapshot.get("active_orders", [])
+        lines = [
+            self._kv(lane.upper(), snapshot["bot_name"], "🤖"),
+            self._kv("Updated", snapshot["updated_at"], "🕒"),
+            self._kv("In-flight Executors", len(executors), "⚙️"),
+            self._kv("Active Orders", snapshot.get("active_orders_count", len(orders)), "📬"),
+        ]
+        if not executors and not orders:
+            lines.append("No in-flight executors or orders.")
+            return lines
+
+        for row in executors:
+            lines.extend(self._format_executor_lifecycle(row))
+        for row in orders:
+            lines.append(self._format_order_lifecycle(row))
+        order_status = snapshot.get("active_orders_status")
+        if isinstance(order_status, dict) and not order_status.get("complete", False):
+            lines.append("⚠️ Active-order coverage is partial.")
+        return lines
+
+    def _format_executor_lifecycle(self, row: Dict[str, Any]) -> List[str]:
+        raw_status = self._status_text(row.get("status"), "unknown").lower()
+        status_key = raw_status.replace("-", "_")
+        lifecycle = self.EXECUTOR_LIFECYCLE_LABELS.get(status_key, status_key.replace("_", " ").upper())
+        close_type = self._status_text(row.get("close_type"), "").replace("_", " ").replace("-", " ").lower()
+        if close_type:
+            lifecycle = f"{lifecycle} • {close_type}"
+        pair = self._status_text(row.get("pair"))
+        side = self._status_text(row.get("side")).upper()
+        executor_type = self._status_text(row.get("executor_type")).replace("_", " ")
+        lines = [
+            f"⚙️ {lifecycle} | {pair} {side} {executor_type} | age {self._status_text(row.get('age'))}",
+            f"{self.BULLET} id {self._status_text(row.get('executor_id'))} | "
+            f"controller {self._status_text(row.get('controller_id'))} | "
+            f"venue {self._status_text(row.get('connector_name'))}",
+            f"{self.BULLET} amount {self._format_status_number(row.get('amount_base'), 8)} | "
+            f"remaining {self._format_status_number(row.get('remaining_position_amount_base'), 8)} | "
+            f"fill {self._format_status_money(row.get('filled_amount_quote'))} | "
+            f"PnL {self._format_status_money(row.get('net_pnl_quote'))} / "
+            f"{self._format_status_percent(row.get('net_pnl_pct'))}",
+        ]
+        entry = row.get("entry_lifecycle")
+        if isinstance(entry, dict):
+            policy = self._status_text(entry.get("policy"), "unknown")
+            state = self._status_text(entry.get("state"), "unknown").replace("_", " ")
+            reason = self._status_text(entry.get("stop_reason"), "").replace("_", " ")
+            detail = f"{self.BULLET} entry {policy}:{state}"
+            if reason:
+                detail += f" | reason {reason}"
+            lines.append(detail)
+        acquisition = row.get("entry_acquisition")
+        if isinstance(acquisition, dict):
+            policy = self._status_text(acquisition.get("policy"), "unknown")
+            state = self._status_text(acquisition.get("state"), "unknown").replace("_", " ").replace("-", " ")
+            reason = self._status_text(acquisition.get("terminal_reason"), "").replace("_", " ").replace("-", " ")
+            acquisition_line = f"{self.BULLET} acquisition {policy}:{state}"
+            if acquisition.get("reprice_count") is not None:
+                acquisition_line += f" | reprices {self._format_status_number(acquisition['reprice_count'], 0)}"
+            if reason:
+                acquisition_line += f" | terminal {reason}"
+            lines.append(acquisition_line)
+            if any(acquisition.get(key) is not None for key in ("current_order_price", "maximum_acceptable_price")):
+                lines.append(
+                    f"{self.BULLET} entry price "
+                    f"{self._format_status_number(acquisition.get('current_order_price'), 8)} / max "
+                    f"{self._format_status_number(acquisition.get('maximum_acceptable_price'), 8)}"
+                )
+            if any(acquisition.get(key) is not None for key in
+                   ("cumulative_filled_base", "authorized_base", "remaining_base")):
+                lines.append(
+                    f"{self.BULLET} filled "
+                    f"{self._format_status_number(acquisition.get('cumulative_filled_base'), 8)} / authorized "
+                    f"{self._format_status_number(acquisition.get('authorized_base'), 8)} | remaining "
+                    f"{self._format_status_number(acquisition.get('remaining_base'), 8)}"
+                )
+            if any(acquisition.get(key) is not None for key in ("rest_seconds", "total_max_age_seconds")):
+                lines.append(
+                    f"{self.BULLET} timing rest "
+                    f"{self._format_status_number(acquisition.get('rest_seconds'), 2)}s / max age "
+                    f"{self._format_status_number(acquisition.get('total_max_age_seconds'), 2)}s | "
+                    f"queue {self._status_text(acquisition.get('queue_fill_status'))} | "
+                    f"fees {self._status_text(acquisition.get('fee_economics_status'))}"
+                )
+        trailing_state = self._status_text(row.get("trailing_state"), "")
+        if trailing_state:
+            trail = f"{self.BULLET} trail {trailing_state.replace('_', ' ')}"
+            for label, key in (
+                ("current", "trailing_current_price"),
+                ("activation", "trailing_activation_price"),
+                ("trigger", "trailing_trigger_price"),
+            ):
+                if row.get(key) is not None:
+                    trail += f" | {label} {self._format_status_number(row[key], 8)}"
+            gap = row.get("distance_to_trailing_trigger_pct")
+            if gap is None:
+                gap = row.get("distance_to_trailing_activation_pct")
+            if gap is not None:
+                trail += f" | gap {self._format_status_fraction_percent(gap)}"
+            lines.append(trail)
+        return lines
+
+    def _format_order_lifecycle(self, row: Dict[str, Any]) -> str:
+        raw_status = self._status_text(row.get("status"), "unknown").lower()
+        lifecycle = self.ORDER_LIFECYCLE_LABELS.get(raw_status, raw_status.replace("_", " ").upper())
+        return (
+            f"📬 {lifecycle} | {self._status_text(row.get('pair'))} "
+            f"{self._status_text(row.get('side')).upper()} | "
+            f"price {self._format_status_number(row.get('price_quote'), 8)} | "
+            f"amount {self._format_status_number(row.get('amount_base'), 8)} | "
+            f"filled {self._format_status_number(row.get('filled_amount_base'), 8)} | "
+            f"remaining {self._format_status_number(row.get('remaining_amount_base'), 8)} | "
+            f"id {self._status_text(row.get('order_id'))} | "
+            f"controller {self._status_text(row.get('controller_id'))}"
+        )
+
+    async def _command_local_executors(self) -> str:
         strategy = self._current_strategy()
         if strategy is None or not hasattr(strategy, "_build_controller_status_entries"):
             return "Executors are unavailable because no V2 strategy is running."

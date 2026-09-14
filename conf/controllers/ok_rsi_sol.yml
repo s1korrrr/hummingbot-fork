@@ -78,6 +78,7 @@ trailing_activation_pct: 0.022  # 2.2%
 trailing_delta_pct: 0.006  # 0.6%
 trailing_stop_order_type: LIMIT
 entry_acquisition_policy: down_only_maker_v1
+entry_activation_bound_pct: '0.0005'  # 0.05% midpoint distance from original entry
 entry_total_max_age_seconds: 300  # hard intent backstop; no 30s lease under down_only_maker_v1
 trailing_stop_limit_max_age_seconds: 3
 use_adaptive_trailing: true

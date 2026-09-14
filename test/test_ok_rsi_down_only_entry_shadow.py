@@ -127,7 +127,7 @@ def test_downward_bound_is_terminal() -> None:
     tracker = started_tracker()
     events = tracker.advance(
         now=Decimal("10"),
-        best_bid=Decimal("99.49"),
+        best_bid=Decimal("98.9"),
         best_ask=Decimal("100.01"),
         opposing_signal=False,
         risk_allowed=True,

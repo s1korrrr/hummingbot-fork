@@ -66,18 +66,19 @@ def test_main_controller_yamls_enable_bound_driven_entry_without_thirty_second_l
         config = OKRSIControllerConfig(**payload)
         assert config.entry_acquisition_policy == "down_only_maker_v1"
         assert config.entry_total_max_age_seconds == 300
+        assert config.entry_activation_bound_pct == Decimal("0.0005")
         assert "entry_limit_max_age_seconds" not in payload
 
 
 def test_shadow_candidate_materializes_frozen_parameters() -> None:
     config = OKRSIControllerConfig(id="shadow", entry_acquisition_shadow_policy="down_only_maker_v1")
-    assert config.down_only_maker_parameters(Decimal("0.005")) == DownOnlyMakerParameters(
+    assert config.down_only_maker_parameters() == DownOnlyMakerParameters(
         total_max_age_seconds=300,
         max_reprices=3,
         cooldown_seconds=5,
         min_ticks=3,
         atr_fraction=Decimal("0.05"),
-        activation_bound_pct=Decimal("0.005"),
+        activation_bound_pct=Decimal("0.0005"),
     )
 
 
@@ -95,6 +96,9 @@ def test_shadow_candidate_materializes_frozen_parameters() -> None:
         ({"entry_acquisition_shadow_policy": "down_only_maker_v1", "episode_enabled": True}, "episode"),
         ({"entry_acquisition_policy": "down_only_maker_v1", "trade_mode": "sell_only"}, "sell_only"),
         ({"entry_total_max_age_seconds": 29}, "entry_total_max_age_seconds"),
+        ({"entry_activation_bound_pct": 0}, "entry_activation_bound_pct"),
+        ({"entry_activation_bound_pct": 1}, "entry_activation_bound_pct"),
+        ({"entry_activation_bound_pct": "NaN"}, "entry_activation_bound_pct"),
         ({"entry_total_max_age_seconds": 901}, "entry_total_max_age_seconds"),
         ({"entry_reprice_cooldown_seconds": 0}, "entry_reprice_cooldown_seconds"),
         ({"entry_reprice_cooldown_seconds": 31}, "entry_reprice_cooldown_seconds"),

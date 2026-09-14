@@ -145,14 +145,15 @@ def decide_down_only_maker(
     if intent_age >= Decimal(parameters.total_max_age_seconds):
         return DownOnlyMakerDecision(DownOnlyMakerAction.CANCEL_TERMINAL, DownOnlyMakerReason.TOTAL_AGE_EXPIRED)
 
+    mid_price = (snapshot.best_bid + snapshot.best_ask) / Decimal("2")
     downward_floor = snapshot.maximum_acceptable_price * (Decimal("1") - parameters.activation_bound_pct)
-    if snapshot.best_bid < downward_floor:
+    if mid_price < downward_floor:
         return DownOnlyMakerDecision(
             DownOnlyMakerAction.CANCEL_TERMINAL,
             DownOnlyMakerReason.DOWNWARD_BOUND_BREACHED,
         )
     upward_ceiling = snapshot.maximum_acceptable_price * (Decimal("1") + parameters.activation_bound_pct)
-    if snapshot.best_ask > upward_ceiling:
+    if mid_price > upward_ceiling:
         return DownOnlyMakerDecision(
             DownOnlyMakerAction.CANCEL_TERMINAL,
             DownOnlyMakerReason.UPWARD_BOUND_BREACHED,

@@ -141,7 +141,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         self._entry_acquisition_shadow_policy = config.entry_acquisition_shadow_policy
         self._entry_acquisition_shadow = (
             DownOnlyMakerShadowTracker(
-                config.down_only_maker_parameters(config.executor_price_gap_threshold),
+                config.down_only_maker_parameters(),
                 controller_id=config.id,
                 connector_name=config.connector_name,
                 trading_pair=config.trading_pair,
@@ -260,7 +260,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         config = action.executor_config
         try:
             now, best_bid, best_ask, price_step, atr_1m = self._entry_acquisition_shadow_inputs()
-            tracker.configure(self.config.down_only_maker_parameters(self._effective_price_gap()))
+            tracker.configure(self.config.down_only_maker_parameters())
             tracker.start(
                 intent_id=f"shadow:{config.id}",
                 now=now,
@@ -1487,6 +1487,8 @@ class OKRSIController(hl_rsi.HLRSIController):
 
         activation_bounds_cfg: Optional[List[Decimal]] = None
         gap_bound = self._effective_price_gap()
+        if self._entry_acquisition_policy == "down_only_maker_v1":
+            gap_bound = self.config.entry_activation_bound_pct
         if gap_bound is not None and gap_bound > Decimal("0"):
             activation_bounds_cfg = [gap_bound]
 

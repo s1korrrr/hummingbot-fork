@@ -16,6 +16,7 @@ from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+from hummingbot.strategy_v2.models.executors import CloseType
 
 
 class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
@@ -118,6 +119,8 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         tracked = self._open_order
         if tracked is None:
             if not self._entry_submitted and self._entry_stop_reason is None:
+                if not self._submission_is_valid(self._entry_current_price):
+                    return
                 self._entry_submitted = True
                 self._entry_lifecycle["submission_timestamp"] = self._strategy.current_timestamp
                 self._submit_open_order(self._entry_current_price)
@@ -132,6 +135,13 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         order = tracked.order
         if order is None:
             self._entry_lifecycle["state"] = "reconciliation_required"
+            return
+        if order.current_state == OrderState.FILLED:
+            self._entry_pending_target = None
+            self._entry_child_submission_authorized = False
+            self._entry_reprice_cancel_confirmed = False
+            self._cancel_entry_expiry_reconciliation()
+            super()._control_single_attempt_entry()
             return
         if order.is_cancelled and self._entry_pending_target is not None:
             self._open_order_entry_expired = True
@@ -262,6 +272,10 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         super().process_order_canceled_event(_, market, event)
 
     async def _reconcile_expired_entry(self):
+        if self._open_order is not None and self._open_order.order is not None:
+            if self._open_order.order.current_state == OrderState.FILLED:
+                self.control_open_order()
+                return
         if self._entry_pending_target is None:
             await super()._reconcile_expired_entry()
             return
@@ -331,6 +345,18 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
 
         gross_filled = sum((order.executed_amount_base for order in self._entry_orders()), Decimal("0"))
+        if gross_filled > 0:
+            # Keep a terminal owner attached so native barriers can manage late fills.
+            self._open_order = self._completed_open_orders.pop()
+            self._open_order_entry_expired = True
+            self._open_order_expiry_reconciled = True
+            self._entry_pending_target = None
+            self._entry_terminal_reason = "partial_fill"
+            self._end_entry_acquisition("partial_fill")
+            self._entry_lifecycle["state"] = "managing_fill"
+            return
+        if not self._submission_is_valid(target):
+            return
         remaining = self.config.amount - gross_filled
         try:
             remaining = self.connectors[self.config.connector_name].quantize_order_amount(
@@ -379,6 +405,47 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "reprice_count": self._entry_reprice_count,
         })
 
+    def _submission_is_valid(self, target: Decimal) -> bool:
+        """Recheck the book and intent after any asynchronous cancellation wait."""
+        try:
+            now = Decimal(str(self._strategy.current_timestamp))
+            bid = Decimal(str(self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)))
+            ask = Decimal(str(self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)))
+            decision = decide_down_only_maker(self._down_only_parameters, DownOnlyMakerSnapshot(
+                now=now,
+                intent_created_at=Decimal(str(self._entry_intent_created_at)),
+                order_created_at=Decimal(str(self._entry_intent_created_at)),
+                last_reprice_at=None,
+                initial_best_bid=self.config.decision_best_bid,
+                initial_best_ask=self.config.decision_best_ask,
+                best_bid=bid,
+                best_ask=ask,
+                current_order_price=target,
+                decision_atr_1m=self.config.decision_atr_1m,
+                price_step=self.config.decision_price_step,
+                maximum_acceptable_price=self.config.maximum_acceptable_price,
+                authorized_base=self.config.amount,
+                cumulative_filled_base=self._cumulative_entry_filled_base(),
+                reprice_count=self._entry_reprice_count,
+                opposing_signal=False,
+                risk_allowed=True,
+            ))
+            reason = decision.reason.value if decision.action is DownOnlyMakerAction.CANCEL_TERMINAL else None
+            if reason is None and target >= ask:
+                reason = "submission_would_cross"
+        except Exception as exc:
+            self.logger().error(self._log_message(f"Entry submission inputs unavailable: {type(exc).__name__}: {exc}"))
+            reason = "input_unavailable"
+        if reason is None:
+            return True
+        self._entry_pending_target = None
+        self._entry_terminal_reason = reason
+        self._end_entry_acquisition(reason)
+        self._entry_lifecycle["state"] = "ended_no_fill"
+        self.close_type = CloseType.EXPIRED
+        self.stop()
+        return False
+
     def get_custom_info(self):
         custom_info = super().get_custom_info()
         cumulative_filled = self._cumulative_entry_filled_base()
@@ -398,6 +465,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "remaining_base": str(remaining),
             "reprice_count": self._entry_reprice_count,
             "activation_bound_pct": str(self.config.activation_bounds[0]),
+            "activation_reference": "book_midpoint",
             "total_max_age_seconds": self.config.entry_total_max_age_seconds,
             "order_ids": [order.order_id for order in self._entry_orders()],
             "queue_fill_status": "UNAVAILABLE",
@@ -437,6 +505,8 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "authorized_base": str(self.config.amount),
             "best_ask": str(best_ask),
             "best_bid": str(best_bid),
+            "mid_price": str((best_bid + best_ask) / Decimal("2")),
+            "activation_reference": "book_midpoint",
             "candidate_price": str(decision.target_price) if decision.target_price is not None else None,
             "connector": self.config.connector_name,
             "controller": self.config.controller_id,

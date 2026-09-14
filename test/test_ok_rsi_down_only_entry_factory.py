@@ -78,14 +78,14 @@ def test_active_buy_freezes_exact_down_only_envelope() -> None:
     assert config.leverage == 1
     assert config.triple_barrier_config.open_order_type is OrderType.LIMIT_MAKER
     assert config.entry_order_policy == "single_attempt"
-    assert config.activation_bounds == [Decimal("0.0045")]
+    assert config.activation_bounds == [Decimal("0.0005")]
     assert config.triple_barrier_config.open_order_limit_max_age_seconds == 0
     assert config.entry_total_max_age_seconds == 300
     assert config.entry_max_downward_reprices == 3
     assert config.decision_atr_1m == config.decision_best_bid * controller._latest_atr_pct
 
 
-def test_active_buy_freezes_adaptive_minimum_as_percentage_validity_bound() -> None:
+def test_entry_validity_is_independent_of_adaptive_entry_spacing() -> None:
     controller, _, _ = make_controller()
     controller.config.use_adaptive_filters = True
     controller.config.min_executor_price_gap_threshold = Decimal("0.005")
@@ -95,7 +95,7 @@ def test_active_buy_freezes_adaptive_minimum_as_percentage_validity_bound() -> N
 
     config = buy_config(controller)
 
-    assert config.activation_bounds == [Decimal("0.005")]
+    assert config.activation_bounds == [Decimal("0.0005")]
 
 
 @pytest.mark.parametrize("policy", ["legacy_single_attempt", "shadow"])

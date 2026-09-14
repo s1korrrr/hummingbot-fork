@@ -147,6 +147,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         default=30, ge=1, le=300, json_schema_extra={"is_updatable": True}
     )
     entry_total_max_age_seconds: int = hl_rsi.Field(default=300, ge=30, le=900)
+    entry_activation_bound_pct: Decimal = hl_rsi.Field(default=Decimal("0.0005"), gt=0, lt=1)
     entry_max_downward_reprices: int = hl_rsi.Field(default=3, ge=1, le=10)
     entry_reprice_cooldown_seconds: int = hl_rsi.Field(default=5, ge=1, le=30)
     entry_reprice_min_ticks: int = hl_rsi.Field(default=3, ge=1, le=100)
@@ -355,12 +356,12 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError("MARKET trailing requires a zero limit fallback timeout")
         return self
 
-    def down_only_maker_parameters(self, activation_bound_pct: Decimal) -> DownOnlyMakerParameters:
+    def down_only_maker_parameters(self) -> DownOnlyMakerParameters:
         return DownOnlyMakerParameters(
             total_max_age_seconds=self.entry_total_max_age_seconds,
             max_reprices=self.entry_max_downward_reprices,
             cooldown_seconds=self.entry_reprice_cooldown_seconds,
             min_ticks=self.entry_reprice_min_ticks,
             atr_fraction=self.entry_reprice_atr_fraction,
-            activation_bound_pct=Decimal(str(activation_bound_pct)),
+            activation_bound_pct=self.entry_activation_bound_pct,
         )

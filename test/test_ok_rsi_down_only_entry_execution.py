@@ -443,7 +443,7 @@ def test_cancel_uncertainty_blocks_replacement() -> None:
     "timestamp,bid,expected",
     [
         (300, Decimal("99.90"), "total_age_expired"),
-        (10, Decimal("99.49"), "downward_bound_breached"),
+        (10, Decimal("98.9"), "downward_bound_breached"),
     ],
 )
 def test_hard_rails_cancel_terminally(timestamp, bid, expected) -> None:
@@ -500,3 +500,83 @@ async def test_duplicate_terminal_events_never_dispatch_second_child_or_sell() -
     executor.control_open_order()
     assert executor.place_order.call_count == 1
     executor._strategy.sell.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("time,bid,ask,reason", [
+    (300, "99.9", "100.01", "total_age_expired"),
+    (12, "101", "101.01", "upward_bound_breached"),
+    (12, "99", "99.01", "downward_bound_breached"),
+    (12, "99.8", "99.9", "submission_would_cross"),
+])
+async def test_replacement_rechecks_book_and_deadline_after_reconciliation(time, bid, ask, reason):
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor._strategy.current_timestamp = time
+    prices[PriceType.BestBid], prices[PriceType.BestAsk] = Decimal(bid), Decimal(ask)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == reason
+
+
+def test_initial_submission_outside_bound_is_not_sent():
+    executor, _, _ = make_executor(bid=Decimal("101"), ask=Decimal("101.01"))
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "upward_bound_breached"
+
+
+def test_fully_filled_entry_does_not_expire_at_three_hundred_seconds():
+    executor, _, _ = make_executor()
+    executor._open_order = tracked_order(fill="1", state=OrderState.FILLED)
+    executor._strategy.current_timestamp = 301
+    executor.control_open_order()
+    executor._strategy.cancel.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+
+
+def test_filled_order_with_missing_trade_quantities_requires_reconciliation():
+    executor, _, _ = make_executor()
+    executor._open_order = tracked_order(fill="0.4", state=OrderState.FILLED)
+    executor.control_open_order()
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+async def test_fill_after_child_authorization_suppresses_replacement():
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    parent.order = tracked_order(fill="0.4", state=OrderState.CANCELED).order
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.open_filled_amount == Decimal("0.4")
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+    executor.control_open_order()
+    assert executor._entry_terminal_confirmed()
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+    assert executor.open_filled_amount == Decimal("0.4")
+
+
+@pytest.mark.asyncio
+async def test_full_fill_after_cancel_ack_supersedes_pending_reprice():
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    executor._open_order.order.current_state = OrderState.CANCELED
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    executor._open_order.order = tracked_order(fill="1", state=OrderState.FILLED).order
+    await executor._reconcile_expired_entry()
+    executor.control_open_order()
+    assert executor._entry_pending_target is None
+    assert executor._entry_terminal_confirmed()
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+    executor.place_order.assert_not_called()

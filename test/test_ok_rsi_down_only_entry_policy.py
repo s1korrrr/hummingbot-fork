@@ -133,7 +133,7 @@ def test_downward_bound_breach_cancels_terminally() -> None:
 def test_exact_downward_activation_boundary_remains_valid() -> None:
     result = decide_down_only_maker(
         parameters(),
-        snapshot(best_bid="99.50", best_ask="99.51", current_order_price="99.40"),
+        snapshot(best_bid="99.49", best_ask="99.51", current_order_price="99.40"),
     )
     assert result.action is DownOnlyMakerAction.HOLD
     assert result.reason is DownOnlyMakerReason.RESTING
@@ -262,3 +262,19 @@ def test_dataclasses_are_immutable() -> None:
         parameters().rest_seconds = 31
     with pytest.raises(AttributeError):
         replace(snapshot(), best_bid=Decimal("99.99")).best_bid = Decimal("99.98")
+
+
+@pytest.mark.parametrize("bid,ask,expected", [
+    ("722.9", "723.1", DownOnlyMakerReason.RESTING),
+    ("722.4", "722.5", DownOnlyMakerReason.TOUCH_PENDING),
+    ("723.1", "723.2", DownOnlyMakerReason.UPWARD_BOUND_BREACHED),
+    ("722.2", "722.3", DownOnlyMakerReason.DOWNWARD_BOUND_BREACHED),
+])
+def test_bnb_point_zero_five_percent_midpoint_scenarios(bid, ask, expected):
+    result = decide_down_only_maker(parameters(activation_bound_pct=Decimal("0.0005")), snapshot(
+        now="31", initial_best_bid="722.8", initial_best_ask="723.1",
+        best_bid=bid, best_ask=ask, current_order_price="722.7",
+        maximum_acceptable_price="722.7", price_step="0.1",
+        decision_atr_1m="0.204858129220430181860",
+    ))
+    assert result.reason is expected

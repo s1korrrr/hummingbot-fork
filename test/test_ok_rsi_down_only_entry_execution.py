@@ -54,9 +54,11 @@ def make_config(**changes) -> DownOnlyMakerPositionExecutorConfig:
     return DownOnlyMakerPositionExecutorConfig(**values)
 
 
-def make_executor(*, bid=Decimal("100"), ask=Decimal("100.01"), config=None):
+def make_executor(
+    *, bid=Decimal("100"), ask=Decimal("100.01"), config=None, strategy_timestamp=0.0
+):
     strategy = MagicMock(spec=StrategyV2Base)
-    strategy.current_timestamp = 0.0
+    strategy.current_timestamp = strategy_timestamp
     connector = MagicMock()
     connector.supports_terminal_fill_reconciliation = True
     connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
@@ -86,6 +88,7 @@ def tracked_order(
     state=OrderState.OPEN,
     amount="1",
     fee=None,
+    creation_timestamp=0,
 ):
     order = InFlightOrder(
         client_order_id=order_id,
@@ -95,7 +98,7 @@ def tracked_order(
         trade_type=TradeType.BUY,
         amount=Decimal(amount),
         price=Decimal(price),
-        creation_timestamp=0,
+        creation_timestamp=creation_timestamp,
         initial_state=state,
     )
     if Decimal(fill) > 0:
@@ -203,6 +206,21 @@ def test_entry_acquisition_snapshot_is_stable_and_json_native() -> None:
         "queue_fill_status": "UNAVAILABLE",
     }
     json.dumps(snapshot)
+
+
+def test_fractional_config_timestamp_with_whole_second_order_clock_keeps_entry_resting() -> None:
+    config = make_config(timestamp=1789357441.4710643)
+    executor, _, _ = make_executor(config=config, strategy_timestamp=1789357441)
+    executor._open_order = tracked_order(creation_timestamp=1789357441)
+    executor._entry_submitted = True
+    executor._strategy.current_timestamp = 1789357442
+
+    executor.control_open_order()
+
+    executor._strategy.cancel.assert_not_called()
+    acquisition = executor.get_custom_info()["entry_acquisition"]
+    assert acquisition["state"] == "resting"
+    assert acquisition["terminal_reason"] is None
 
 
 def test_cumulative_child_fills_are_monotonic_and_duplicate_trade_ids_are_idempotent() -> None:

@@ -79,9 +79,12 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
     def __init__(self, strategy, config: DownOnlyMakerPositionExecutorConfig, *args, **kwargs):
         super().__init__(strategy, config, *args, **kwargs)
         self.config: DownOnlyMakerPositionExecutorConfig = config
-        self._entry_intent_created_at = float(config.timestamp)
+        self._entry_intent_created_at = min(
+            float(config.timestamp),
+            float(self._strategy.current_timestamp),
+        )
         self._entry_current_price = config.entry_price
-        self._entry_order_created_at = float(config.timestamp)
+        self._entry_order_created_at = self._entry_intent_created_at
         self._entry_last_reprice_at = None
         self._entry_reprice_count = 0
         self._entry_pending_target = None

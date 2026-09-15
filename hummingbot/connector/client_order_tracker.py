@@ -218,6 +218,7 @@ class ClientOrderTracker:
                     fill_fee=trade_update.fee,
                     trade_id=trade_update.trade_id,
                     exchange_order_id=trade_update.exchange_order_id,
+                    is_taker=trade_update.is_taker,
                 )
 
     async def process_order_not_found(self, client_order_id: str):
@@ -406,12 +407,11 @@ class ClientOrderTracker:
                              fill_price: Decimal,
                              fill_fee: TradeFeeBase,
                              trade_id: str,
-                             exchange_order_id: str):
+                             exchange_order_id: str,
+                             is_taker: bool = True):
         if prev_executed_amount_base < tracked_order.executed_amount_base:
             self.logger().info(
-                f"The {tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} "
-                f"amounting to {tracked_order.executed_amount_base}/{tracked_order.amount} {tracked_order.base_asset} "
-                f"has been filled at {fill_price} {tracked_order.quote_asset}."
+                tracked_order.build_order_filled_message(fill_price, fill_fee, is_taker)
             )
             self._trigger_filled_event(
                 order=tracked_order,

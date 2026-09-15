@@ -296,6 +296,7 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("💰 Notional: 73.352844 USDC", message)
         self.assertIn("🧾 Fee: 0.21 USDC", message)
         self.assertIn("✅ Status: filled", message)
+        self.assertNotIn("Trade Realized PnL", message)
         self.assertNotIn("🤖 Bot:", message)
         self.assertNotIn("📁 Config:", message)
         self.assertNotIn("🆔 Instance:", message)
@@ -327,6 +328,37 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("Pair Realized PnL", message)
         self.assertNotIn("Pair Global PnL", message)
         self.assertIn("✅ Status: filled", message)
+
+    def test_format_sell_filled_message_omits_pnl_when_basis_missing(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._sell_fill_realized_pnl_quote = Mock(return_value=None)
+        event = events.OrderFilledEvent(
+            timestamp=1712745600,
+            order_id="OID-SELL-FILL-NO-PNL",
+            trading_pair="ETH-USDC",
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("2144.82"),
+            amount=Decimal("0.0342"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.21"))]),
+            exchange_trade_id="TID-SELL-NO-PNL",
+            exchange_order_id="EX-SELL-NO-PNL",
+        )
+
+        message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
+
+        notifier._sell_fill_realized_pnl_quote.assert_called_once_with(event)
+        self.assertIn("🔴 SELL FILLED", message)
+        self.assertIn("📍 Pair: 🟣 ETH-USDC", message)
+        self.assertIn("💵 Price: 2144.82 USDC", message)
+        self.assertIn("📦 Amount: 0.0342 ETH", message)
+        self.assertIn("💰 Notional: 73.352844 USDC", message)
+        self.assertIn("🧾 Fee: 0.21 USDC", message)
+        self.assertIn("✅ Status: filled", message)
+        self.assertNotIn("Trade Realized PnL", message)
+        self.assertNotIn("Pair Realized PnL", message)
+        self.assertNotIn("Pair Global PnL", message)
+        self.assertNotIn("PnL unavailable", message)
 
     def test_format_sell_completed_message_includes_fee_and_trade_realized_pnl_context(self):
         notifier = TelegramNotifier(self.hb_app)

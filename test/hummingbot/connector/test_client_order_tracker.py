@@ -83,6 +83,9 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
     def _is_logged(self, log_level: str, message: str) -> bool:
         return any(record.levelname == log_level and record.getMessage() == message for record in self.log_records)
 
+    def _is_logged_prefix(self, log_level: str, message: str) -> bool:
+        return any(record.levelname == log_level and record.getMessage().startswith(message) for record in self.log_records)
+
     def async_run_with_timeout(self, coroutine: Awaitable, timeout: float = 1):
         ret = self.ev_loop.run_until_complete(asyncio.wait_for(coroutine, timeout))
         return ret
@@ -633,13 +636,21 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
 
         self.tracker.process_trade_update(trade_update)
 
+        remaining = order.amount - trade_filled_amount
+        notional = trade_filled_price * trade_filled_amount
+        fill_log = next(record.getMessage() for record in self.log_records if "has been filled at" in record.getMessage())
         self.assertTrue(
-            self._is_logged(
-                "INFO",
+            fill_log.startswith(
                 f"The {order.trade_type.name.upper()} order {order.client_order_id} amounting to "
-                f"{trade_filled_amount}/{order.amount} {order.base_asset} has been filled at {trade_filled_price} {order.quote_asset}.",
+                f"{order.executed_amount_base}/{order.amount} {order.base_asset} has been filled at "
+                f"{trade_filled_price} {order.quote_asset}."
             )
         )
+        self.assertIn(f"remaining {remaining} {order.base_asset}", fill_log)
+        self.assertIn(f"notional {notional} {order.quote_asset}", fill_log)
+        self.assertIn(f"fee {fee_paid} {order.quote_asset}", fill_log)
+        self.assertIn("close LIMIT/taker", fill_log)
+        self.assertNotIn("PnL", fill_log)
 
         self.assertEqual(1, len(self.order_filled_logger.event_log))
         order_filled_event: OrderFilledEvent = self.order_filled_logger.event_log[0]
@@ -650,6 +661,47 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
         self.assertEqual(
             order_filled_event.trade_fee, AddedToCostTradeFee(flat_fees=[TokenAmount(self.quote_asset, fee_paid)])
         )
+
+    def test_process_trade_update_logs_maker_sell_without_guessed_pnl(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id="suiSellFill",
+            exchange_order_id="exSellFill",
+            trading_pair="SUI-USDC",
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=TradeType.SELL,
+            amount=Decimal("20.975"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("0.7041"),
+            initial_state=OrderState.OPEN,
+        )
+        self.tracker.start_tracking_order(order)
+        fee_paid = Decimal("0.01477")
+        trade_update = TradeUpdate(
+            trade_id="fill-1",
+            client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair,
+            fill_price=Decimal("0.7041"),
+            fill_base_amount=Decimal("20.975"),
+            fill_quote_amount=Decimal("14.7684975"),
+            fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDC", amount=fee_paid)]),
+            fill_timestamp=1,
+            is_taker=False,
+        )
+
+        self.tracker.process_trade_update(trade_update)
+
+        fill_log = next(record.getMessage() for record in self.log_records if "has been filled at" in record.getMessage())
+        self.assertTrue(
+            fill_log.startswith(
+                "The SELL order suiSellFill amounting to 20.975/20.975 SUI has been filled at 0.7041 USDC."
+            )
+        )
+        self.assertIn(f"remaining {order.amount - order.executed_amount_base} SUI", fill_log)
+        self.assertIn("notional 14.7684975 USDC", fill_log)
+        self.assertIn("fee 0.01477 USDC", fill_log)
+        self.assertIn("close LIMIT_MAKER/maker", fill_log)
+        self.assertNotIn("PnL", fill_log)
 
     def test_process_trade_update_does_not_trigger_filled_event_update_status_when_completely_filled(self):
         order: InFlightOrder = InFlightOrder(
@@ -686,7 +738,7 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
         self.assertNotIn(fetched_order.client_order_id, self.tracker.cached_orders)
 
         self.assertTrue(
-            self._is_logged(
+            self._is_logged_prefix(
                 "INFO",
                 f"The {order.trade_type.name.upper()} order {order.client_order_id} amounting to "
                 f"{order.amount}/{order.amount} {order.base_asset} has been filled at {order.price} {order.quote_asset}.",

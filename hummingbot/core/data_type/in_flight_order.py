@@ -394,6 +394,27 @@ class InFlightOrder:
             f"at {self.price}."
         )
 
+    def build_order_filled_message(self, fill_price: Decimal, fill_fee: TradeFeeBase, is_taker: bool) -> str:
+        remaining = self.amount - self.executed_amount_base
+        role = "taker" if is_taker else "maker"
+        return (
+            f"The {self.trade_type.name.upper()} order {self.client_order_id} "
+            f"amounting to {self.executed_amount_base}/{self.amount} {self.base_asset} "
+            f"has been filled at {fill_price} {self.quote_asset}. "
+            f"remaining {remaining} {self.base_asset} "
+            f"notional {self.executed_amount_quote} {self.quote_asset} "
+            f"fee {self._format_fill_fee_text(fill_fee)} "
+            f"close {self.order_type.name}/{role}"
+        )
+
+    @staticmethod
+    def _format_fill_fee_text(fill_fee: TradeFeeBase) -> str:
+        parts = [f"{item.amount} {item.token}" for item in fill_fee.flat_fees]
+        if fill_fee.percent:
+            token = f" {fill_fee.percent_token}" if fill_fee.percent_token else ""
+            parts.append(f"{fill_fee.percent * Decimal('100')}%{token}")
+        return ", ".join(parts) if parts else "unavailable"
+
 
 class PerpetualDerivativeInFlightOrder(InFlightOrder):
     def build_order_created_message(self) -> str:

@@ -1254,11 +1254,14 @@ class TestGateIoExchange(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, fill_event.leverage)
         self.assertEqual(PositionAction.NIL.value, fill_event.position)
         self.assertTrue(
-            self._is_logged(
-                "INFO",
-                f"The {order.trade_type.name.upper()} order {order.client_order_id} "
-                f"amounting to {order.executed_amount_base}/{order.amount} "
-                f"{order.base_asset} has been filled at {Decimal('10000')} HBOT."
+            any(
+                record.levelname == "INFO"
+                and record.getMessage().startswith(
+                    f"The {order.trade_type.name.upper()} order {order.client_order_id} "
+                    f"amounting to {order.executed_amount_base}/{order.amount} "
+                    f"{order.base_asset} has been filled at {Decimal('10000')} HBOT."
+                )
+                for record in self.log_records
             )
         )
 
@@ -1518,8 +1521,14 @@ class TestGateIoExchange(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(0, len(self.buy_order_completed_logger.event_log))
 
         self.assertTrue(
-            self._is_logged("INFO", f"The {order.trade_type.name} order {order.client_order_id} amounting to "
-                                    f"0.5/{order.amount} {order.base_asset} has been filled at {Decimal('10000.00000000')} HBOT.")
+            any(
+                record.levelname == "INFO"
+                and record.getMessage().startswith(
+                    f"The {order.trade_type.name} order {order.client_order_id} amounting to "
+                    f"0.5/{order.amount} {order.base_asset} has been filled at {Decimal('10000.00000000')} HBOT."
+                )
+                for record in self.log_records
+            )
         )
 
     def test_user_stream_update_for_order_fill(self):

@@ -948,14 +948,14 @@ class BitstampExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         self.assertEqual(buy_order.amount, fill_event.amount)
 
         self.assertTrue(
-            self.is_logged(
+            self.is_partially_logged(
                 "INFO",
                 f"The BUY order {buy_order.client_order_id} amounting to {buy_order.executed_amount_base}/{buy_order.amount} COINALPHA has been filled at {Decimal('10000')} HBOT."
             )
         )
 
         self.assertTrue(
-            self.is_logged(
+            self.is_partially_logged(
                 "INFO",
                 f"The SELL order {sell_order.client_order_id} amounting to {sell_order.executed_amount_base}/{sell_order.amount} COINALPHA has been filled at {Decimal('10000')} HBOT."
             )

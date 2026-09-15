@@ -1386,10 +1386,13 @@ class TestVertexExchange(unittest.TestCase):
         self.assertEqual(0, len(self.buy_order_completed_logger.event_log))
 
         self.assertTrue(
-            self._is_logged(
-                "INFO",
-                f"The {order.trade_type.name} order {order.client_order_id} amounting to "
-                f"{fill_event.amount}/{order.amount} {order.base_asset} has been filled at {Decimal('25000')} USDC.",
+            any(
+                record.levelname == "INFO"
+                and record.getMessage().startswith(
+                    f"The {order.trade_type.name} order {order.client_order_id} amounting to "
+                    f"{fill_event.amount}/{order.amount} {order.base_asset} has been filled at {Decimal('25000')} USDC."
+                )
+                for record in self.log_records
             )
         )
 

@@ -77,6 +77,13 @@ def validate_position(preflight, stopped):
             'preflight executor must be running with no exit trigger')
     require(stopped['status'] == 4 and not stopped['is_active']
             and stopped['close_type'] == CloseType.POSITION_HOLD.value, 'strict terminal POSITION_HOLD required')
+    return validate_position_receipts(preflight, stopped)
+
+
+def validate_position_receipts(preflight, stopped):
+    """Validate unchanged position economics; callers must separately prove lifecycle state."""
+    preflight, stopped = decode_row(preflight), decode_row(stopped)
+    require(stopped['type'] == 'position_executor', 'only PositionExecutor is supported')
     for key in ('id', 'controller_id', 'timestamp', 'config', 'type'):
         require(preflight[key] == stopped[key], f'preflight identity/configuration differs: {key}')
     config = PositionExecutorConfig.model_validate(stopped['config'])
@@ -180,7 +187,7 @@ def bound_files(config_paths, root=ROOT):
     return result
 
 
-def validate_receipts(connection, position, proof):
+def validate_receipts(connection, position, proof, *, pending_hold=False):
     """Match every fill to venue proof, native event storage and held owner ledger."""
     entry = position['entry']
     oid = entry['client_order_id']
@@ -257,8 +264,13 @@ def validate_receipts(connection, position, proof):
         inventory += sign * decimal(receipt['executed_amount_base']) - base_fee_amount(receipt, config['trading_pair'].split('-')[0])
     aggregates = connection.execute('SELECT * FROM Position WHERE controller_id=? AND connector_name=? AND trading_pair=?', scope).fetchall()
     if aggregates:
+        # Exceptional hold completion may corroborate a projection which predates
+        # this exact pending owner's transfer. The singleton owned ledger above
+        # proves the only quantity excluded; arbitrary caller offsets are forbidden.
+        projected_inventory = inventory - decimal(position['net_base']) if pending_hold else inventory
         require(len(aggregates) == 1 and aggregates[0]['side'] == 'BUY'
-                and decimal(aggregates[0]['amount']) == int(inventory * 1000000),
+                and projected_inventory >= 0
+                and decimal(aggregates[0]['amount']) == int(projected_inventory * 1000000),
                 'held aggregate is not completely covered by exact ledger')
     return {'ledger_rows': [dict(row) for row in ledger], 'position_rows': [dict(row) for row in aggregates]}
 

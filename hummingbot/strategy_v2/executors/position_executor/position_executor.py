@@ -1378,6 +1378,11 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        # Queued controller actions can arrive after the control loop terminated,
+        # before the orchestrator archives this executor. Never reopen its state
+        # or replace the terminal close reason when no control loop can drain it.
+        if self.is_closed:
+            return
         self.close_type = CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP
         self._status = RunnableStatus.SHUTTING_DOWN
 

@@ -405,6 +405,54 @@ def test_rising_price_never_requests_cancel_or_upward_reprice() -> None:
     assert executor._entry_pending_target is None
 
 
+def test_eth_split_band_holds_seven_bps_up_and_waits_two_candles_above_ten_bps() -> None:
+    config = make_config(
+        activation_bounds=[Decimal("0.0005")],
+        entry_activation_bound_up_pct=Decimal("0.001"),
+        entry_upward_bound_hysteresis_seconds=120,
+        entry_price=Decimal("2397.68"),
+        decision_best_bid=Decimal("2397.68"),
+        decision_best_ask=Decimal("2397.79"),
+        maximum_acceptable_price=Decimal("2397.68"),
+        decision_atr_1m=Decimal("0.571044"),
+        decision_price_step=Decimal("0.01"),
+        amount=Decimal("0.036115"),
+    )
+    executor, _, prices = make_executor(
+        bid=Decimal("2399.23"),
+        ask=Decimal("2399.56"),
+        config=config,
+        strategy_timestamp=59,
+    )
+    executor._open_order = tracked_order(price="2397.68", amount="0.036115")
+    executor._entry_submitted = True
+    executor._entry_current_price = Decimal("2397.68")
+    executor.control_open_order()
+    executor._strategy.cancel.assert_not_called()
+    acquisition = executor.get_custom_info()["entry_acquisition"]
+    assert acquisition["state"] == "resting"
+    assert acquisition["activation_bound_pct"] == "0.0005"
+    assert acquisition["activation_bound_up_pct"] == "0.001"
+    assert acquisition["terminal_reason"] is None
+
+    prices[PriceType.BestBid] = Decimal("2400.40")
+    prices[PriceType.BestAsk] = Decimal("2400.50")
+    executor._strategy.current_timestamp = 59
+    executor.control_open_order()
+    executor._strategy.cancel.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "upward_bound_pending"
+
+    executor._strategy.current_timestamp = 178
+    executor.control_open_order()
+    executor._strategy.cancel.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "upward_bound_pending"
+
+    executor._strategy.current_timestamp = 179
+    executor.control_open_order()
+    executor._strategy.cancel.assert_called_once()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "upward_bound_breached"
+
+
 def test_qualified_lower_target_requests_cancel_exactly_once() -> None:
     executor, _, prices = make_executor()
     request_reprice(executor, prices)

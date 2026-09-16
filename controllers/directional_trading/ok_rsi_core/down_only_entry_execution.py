@@ -8,6 +8,7 @@ from pydantic import Field, model_validator
 from controllers.directional_trading.ok_rsi_core.down_only_entry import (
     DownOnlyMakerAction,
     DownOnlyMakerParameters,
+    DownOnlyMakerReason,
     DownOnlyMakerSnapshot,
     decide_down_only_maker,
 )
@@ -31,6 +32,8 @@ class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
     entry_reprice_cooldown_seconds: int = Field(ge=1, le=30)
     entry_reprice_min_ticks: int = Field(ge=1, le=100)
     entry_reprice_atr_fraction: Decimal = Field(gt=0, le=1)
+    entry_activation_bound_up_pct: Decimal | None = None
+    entry_upward_bound_hysteresis_seconds: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_down_only_maker_contract(self):
@@ -71,6 +74,12 @@ class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
         activation_bound = self.activation_bounds[0]
         if not activation_bound.is_finite() or activation_bound <= 0 or activation_bound >= 1:
             raise ValueError("down-only maker activation bound must be finite and between 0 and 1")
+        up_pct = self.entry_activation_bound_up_pct
+        if up_pct is not None:
+            if not up_pct.is_finite() or up_pct <= 0 or up_pct >= 1:
+                raise ValueError("entry_activation_bound_up_pct must be finite and between 0 and 1")
+            if up_pct < activation_bound:
+                raise ValueError("entry_activation_bound_up_pct must be at least the downward activation bound")
         return self
 
 
@@ -95,6 +104,15 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         self._entry_cancel_order_id = None
         self._entry_reprice_cancel_confirmed = False
         self._entry_last_event_signature = None
+        self._entry_upward_bound_first_breached_at = None
+
+    def _activation_bound_down_pct(self) -> Decimal:
+        return self.config.activation_bounds[0]
+
+    def _activation_bound_up_pct(self) -> Decimal:
+        if self.config.entry_activation_bound_up_pct is None:
+            return self._activation_bound_down_pct()
+        return self.config.entry_activation_bound_up_pct
 
     @property
     def _down_only_parameters(self) -> DownOnlyMakerParameters:
@@ -104,7 +122,9 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             cooldown_seconds=self.config.entry_reprice_cooldown_seconds,
             min_ticks=self.config.entry_reprice_min_ticks,
             atr_fraction=self.config.entry_reprice_atr_fraction,
-            activation_bound_pct=self.config.activation_bounds[0],
+            activation_bound_pct=self._activation_bound_down_pct(),
+            activation_bound_up_pct=self._activation_bound_up_pct(),
+            upward_hysteresis_seconds=self.config.entry_upward_bound_hysteresis_seconds,
         )
 
     def control_open_order(self):
@@ -193,6 +213,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
                     reprice_count=self._entry_reprice_count,
                     opposing_signal=False,
                     risk_allowed=True,
+                    upward_bound_first_breached_at=self._entry_upward_bound_first_breached_at,
                 ),
             )
         except Exception as exc:
@@ -203,6 +224,11 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
 
         state_before = self._entry_lifecycle.get("state")
+        if decision.reason is DownOnlyMakerReason.UPWARD_BOUND_PENDING:
+            if self._entry_upward_bound_first_breached_at is None:
+                self._entry_upward_bound_first_breached_at = now
+        elif decision.reason is not DownOnlyMakerReason.UPWARD_BOUND_BREACHED:
+            self._entry_upward_bound_first_breached_at = None
         if decision.action is DownOnlyMakerAction.CANCEL_FOR_REPRICE:
             self._entry_pending_target = decision.target_price
             self._entry_cancel_reason = decision.reason.value
@@ -431,6 +457,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
                 reprice_count=self._entry_reprice_count,
                 opposing_signal=False,
                 risk_allowed=True,
+                upward_bound_first_breached_at=self._entry_upward_bound_first_breached_at,
             ))
             reason = decision.reason.value if decision.action is DownOnlyMakerAction.CANCEL_TERMINAL else None
             if reason is None and target >= ask:
@@ -466,7 +493,8 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "cumulative_filled_base": str(cumulative_filled),
             "remaining_base": str(remaining),
             "reprice_count": self._entry_reprice_count,
-            "activation_bound_pct": str(self.config.activation_bounds[0]),
+            "activation_bound_pct": str(self._activation_bound_down_pct()),
+            "activation_bound_up_pct": str(self._activation_bound_up_pct()),
             "activation_reference": "book_midpoint",
             "total_max_age_seconds": self.config.entry_total_max_age_seconds,
             "order_ids": [order.order_id for order in self._entry_orders()],
@@ -515,13 +543,15 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "cooldown_seconds": self.config.entry_reprice_cooldown_seconds,
             "cumulative_filled_base": str(cumulative_filled),
             "current_order_price": str(self._entry_current_price),
-            "activation_bound_pct": str(self.config.activation_bounds[0]),
+            "activation_bound_pct": str(self._activation_bound_down_pct()),
+            "activation_bound_up_pct": str(self._activation_bound_up_pct()),
             "activation_lower_price": str(
-                self.config.maximum_acceptable_price * (Decimal("1") - self.config.activation_bounds[0])
+                self.config.maximum_acceptable_price * (Decimal("1") - self._activation_bound_down_pct())
             ),
             "activation_upper_price": str(
-                self.config.maximum_acceptable_price * (Decimal("1") + self.config.activation_bounds[0])
+                self.config.maximum_acceptable_price * (Decimal("1") + self._activation_bound_up_pct())
             ),
+            "upward_hysteresis_seconds": self.config.entry_upward_bound_hysteresis_seconds,
             "decision_atr_1m": str(self.config.decision_atr_1m),
             "intent_age_seconds": str(now - Decimal(str(self._entry_intent_created_at))),
             "intent_id": self.config.id,

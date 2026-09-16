@@ -20,6 +20,7 @@ class DownOnlyMakerReason(str, Enum):
     DOWNWARD_REPRICE = "downward_reprice"
     TOTAL_AGE_EXPIRED = "total_age_expired"
     DOWNWARD_BOUND_BREACHED = "downward_bound_breached"
+    UPWARD_BOUND_PENDING = "upward_bound_pending"
     UPWARD_BOUND_BREACHED = "upward_bound_breached"
     OPPOSING_SIGNAL = "opposing_signal"
     RISK_BLOCKED = "risk_blocked"
@@ -34,6 +35,8 @@ class DownOnlyMakerParameters:
     min_ticks: int
     atr_fraction: Decimal
     activation_bound_pct: Decimal
+    activation_bound_up_pct: Decimal | None = None
+    upward_hysteresis_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,7 @@ class DownOnlyMakerSnapshot:
     reprice_count: int
     opposing_signal: bool
     risk_allowed: bool
+    upward_bound_first_breached_at: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +91,13 @@ def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapsh
     _positive_finite(parameters.activation_bound_pct, "activation_bound_pct")
     if parameters.activation_bound_pct >= 1:
         raise DownOnlyMakerInputError("activation_bound_pct must be below 1")
+    if parameters.activation_bound_up_pct is not None:
+        _positive_finite(parameters.activation_bound_up_pct, "activation_bound_up_pct")
+        if parameters.activation_bound_up_pct >= 1:
+            raise DownOnlyMakerInputError("activation_bound_up_pct must be below 1")
+    hysteresis_seconds = parameters.upward_hysteresis_seconds
+    if isinstance(hysteresis_seconds, bool) or not isinstance(hysteresis_seconds, int) or hysteresis_seconds < 0:
+        raise DownOnlyMakerInputError("upward_hysteresis_seconds must be a non-negative integer")
 
     for name in (
         "initial_best_bid",
@@ -104,6 +115,8 @@ def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapsh
         _non_negative_finite(getattr(snapshot, name), name)
     if snapshot.last_reprice_at is not None:
         _non_negative_finite(snapshot.last_reprice_at, "last_reprice_at")
+    if snapshot.upward_bound_first_breached_at is not None:
+        _non_negative_finite(snapshot.upward_bound_first_breached_at, "upward_bound_first_breached_at")
     if snapshot.best_bid > snapshot.best_ask:
         raise DownOnlyMakerInputError("crossed book: best_bid exceeds best_ask")
     if snapshot.best_bid == snapshot.best_ask:
@@ -119,6 +132,10 @@ def _validate(parameters: DownOnlyMakerParameters, snapshot: DownOnlyMakerSnapsh
     if snapshot.last_reprice_at is not None:
         if snapshot.last_reprice_at < snapshot.intent_created_at or snapshot.last_reprice_at > snapshot.now:
             raise DownOnlyMakerInputError("last_reprice_at must be within the intent lifetime")
+    if snapshot.upward_bound_first_breached_at is not None:
+        first_breached_at = snapshot.upward_bound_first_breached_at
+        if first_breached_at < snapshot.intent_created_at or first_breached_at > snapshot.now:
+            raise DownOnlyMakerInputError("upward_bound_first_breached_at must be within the intent lifetime")
     if isinstance(snapshot.reprice_count, bool) or not isinstance(snapshot.reprice_count, int) or snapshot.reprice_count < 0:
         raise DownOnlyMakerInputError("reprice_count must be a non-negative integer")
     if snapshot.cumulative_filled_base > snapshot.authorized_base:
@@ -152,11 +169,30 @@ def decide_down_only_maker(
             DownOnlyMakerAction.CANCEL_TERMINAL,
             DownOnlyMakerReason.DOWNWARD_BOUND_BREACHED,
         )
-    upward_ceiling = snapshot.maximum_acceptable_price * (Decimal("1") + parameters.activation_bound_pct)
+    upward_pct = (
+        parameters.activation_bound_up_pct
+        if parameters.activation_bound_up_pct is not None
+        else parameters.activation_bound_pct
+    )
+    upward_ceiling = snapshot.maximum_acceptable_price * (Decimal("1") + upward_pct)
     if mid_price > upward_ceiling:
+        if parameters.upward_hysteresis_seconds <= 0:
+            return DownOnlyMakerDecision(
+                DownOnlyMakerAction.CANCEL_TERMINAL,
+                DownOnlyMakerReason.UPWARD_BOUND_BREACHED,
+            )
+        first_breached_at = snapshot.upward_bound_first_breached_at
+        if (
+            first_breached_at is not None
+            and snapshot.now - first_breached_at >= Decimal(parameters.upward_hysteresis_seconds)
+        ):
+            return DownOnlyMakerDecision(
+                DownOnlyMakerAction.CANCEL_TERMINAL,
+                DownOnlyMakerReason.UPWARD_BOUND_BREACHED,
+            )
         return DownOnlyMakerDecision(
-            DownOnlyMakerAction.CANCEL_TERMINAL,
-            DownOnlyMakerReason.UPWARD_BOUND_BREACHED,
+            DownOnlyMakerAction.HOLD,
+            DownOnlyMakerReason.UPWARD_BOUND_PENDING,
         )
 
     if snapshot.cumulative_filled_base > 0:

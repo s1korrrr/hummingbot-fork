@@ -1535,6 +1535,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         _, decision_best_bid, decision_best_ask, decision_price_step, decision_atr_1m = (
             self._entry_acquisition_shadow_inputs()
         )
+        down_only_parameters = self.config.down_only_maker_parameters()
         config = DownOnlyMakerPositionExecutorConfig(
             **position_config_kwargs,
             controller_id=self.config.id,
@@ -1548,6 +1549,12 @@ class OKRSIController(hl_rsi.HLRSIController):
             entry_reprice_cooldown_seconds=self.config.entry_reprice_cooldown_seconds,
             entry_reprice_min_ticks=self.config.entry_reprice_min_ticks,
             entry_reprice_atr_fraction=self.config.entry_reprice_atr_fraction,
+            entry_activation_bound_up_pct=(
+                down_only_parameters.activation_bound_up_pct
+                if down_only_parameters.activation_bound_up_pct is not None
+                else down_only_parameters.activation_bound_pct
+            ),
+            entry_upward_bound_hysteresis_seconds=down_only_parameters.upward_hysteresis_seconds,
         )
         self._down_only_pending_configs[config.id] = config.model_copy(deep=True)
         return config

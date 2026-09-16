@@ -79,10 +79,22 @@ def test_active_buy_freezes_exact_down_only_envelope() -> None:
     assert config.triple_barrier_config.open_order_type is OrderType.LIMIT_MAKER
     assert config.entry_order_policy == "single_attempt"
     assert config.activation_bounds == [Decimal("0.0005")]
+    assert config.entry_activation_bound_up_pct == Decimal("0.0005")
+    assert config.entry_upward_bound_hysteresis_seconds == 0
     assert config.triple_barrier_config.open_order_limit_max_age_seconds == 0
     assert config.entry_total_max_age_seconds == 300
     assert config.entry_max_downward_reprices == 3
     assert config.decision_atr_1m == config.decision_best_bid * controller._latest_atr_pct
+
+
+def test_eth_yaml_factory_freezes_split_up_wait_and_two_candle_hysteresis() -> None:
+    controller, _, _ = make_controller()
+    controller.config.entry_activation_bound_up_pct = Decimal("0.001")
+    controller.config.entry_upward_bound_hysteresis_candles = 2
+    config = buy_config(controller)
+    assert config.activation_bounds == [Decimal("0.0005")]
+    assert config.entry_activation_bound_up_pct == Decimal("0.001")
+    assert config.entry_upward_bound_hysteresis_seconds == 120
 
 
 def test_entry_validity_is_independent_of_adaptive_entry_spacing() -> None:
@@ -139,6 +151,8 @@ def test_active_policy_does_not_change_sell_executor() -> None:
         ("entry_reprice_min_ticks", 4),
         ("entry_reprice_atr_fraction", Decimal("0.06")),
         ("activation_bounds", [Decimal("0.01")]),
+        ("entry_activation_bound_up_pct", Decimal("0.01")),
+        ("entry_upward_bound_hysteresis_seconds", 60),
     ],
 )
 def test_factory_rejects_tampered_authorization(field, value) -> None:

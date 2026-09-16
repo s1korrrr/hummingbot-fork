@@ -148,6 +148,8 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     )
     entry_total_max_age_seconds: int = hl_rsi.Field(default=300, ge=30, le=900)
     entry_activation_bound_pct: Decimal = hl_rsi.Field(default=Decimal("0.0005"), gt=0, lt=1)
+    entry_activation_bound_up_pct: Optional[Decimal] = hl_rsi.Field(default=None)
+    entry_upward_bound_hysteresis_candles: int = hl_rsi.Field(default=0, ge=0, le=2)
     entry_max_downward_reprices: int = hl_rsi.Field(default=3, ge=1, le=10)
     entry_reprice_cooldown_seconds: int = hl_rsi.Field(default=5, ge=1, le=30)
     entry_reprice_min_ticks: int = hl_rsi.Field(default=3, ge=1, le=100)
@@ -246,6 +248,13 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
                 raise ValueError(f"{field_name} must be finite")
             if isinstance(value, float) and not math.isfinite(value):
                 raise ValueError(f"{field_name} must be finite")
+
+        if self.entry_activation_bound_up_pct is not None:
+            up_pct = self.entry_activation_bound_up_pct
+            if up_pct <= 0 or up_pct >= 1:
+                raise ValueError("entry_activation_bound_up_pct must be finite and between 0 and 1")
+            if up_pct < self.entry_activation_bound_pct:
+                raise ValueError("entry_activation_bound_up_pct must be at least entry_activation_bound_pct")
 
         if (not self.episode_enabled and self.sell_only_if_profitable
                 and self.recovery_sell_execution_strategy == ExecutionStrategy.MARKET):
@@ -357,6 +366,12 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         return self
 
     def down_only_maker_parameters(self) -> DownOnlyMakerParameters:
+        hysteresis_seconds = 0
+        if self.entry_upward_bound_hysteresis_candles:
+            hysteresis_seconds = (
+                int(self.entry_upward_bound_hysteresis_candles)
+                * int(CandlesBase.interval_to_seconds[self.interval])
+            )
         return DownOnlyMakerParameters(
             total_max_age_seconds=self.entry_total_max_age_seconds,
             max_reprices=self.entry_max_downward_reprices,
@@ -364,4 +379,6 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             min_ticks=self.entry_reprice_min_ticks,
             atr_fraction=self.entry_reprice_atr_fraction,
             activation_bound_pct=self.entry_activation_bound_pct,
+            activation_bound_up_pct=self.entry_activation_bound_up_pct,
+            upward_hysteresis_seconds=hysteresis_seconds,
         )

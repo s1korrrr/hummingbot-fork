@@ -278,3 +278,148 @@ def test_bnb_point_zero_five_percent_midpoint_scenarios(bid, ask, expected):
         decision_atr_1m="0.204858129220430181860",
     ))
     assert result.reason is expected
+
+
+def test_split_band_holds_seven_bps_up_inside_ten_bps_up_wait() -> None:
+    result = decide_down_only_maker(
+        parameters(
+            activation_bound_pct=Decimal("0.0005"),
+            activation_bound_up_pct=Decimal("0.001"),
+        ),
+        snapshot(best_bid="100.07", best_ask="100.08"),
+    )
+    assert result.action is DownOnlyMakerAction.HOLD
+    assert result.reason is DownOnlyMakerReason.RESTING
+
+
+def test_split_band_still_cancels_below_five_bps_down_floor() -> None:
+    result = decide_down_only_maker(
+        parameters(
+            activation_bound_pct=Decimal("0.0005"),
+            activation_bound_up_pct=Decimal("0.001"),
+        ),
+        snapshot(best_bid="99.94", best_ask="99.95"),
+    )
+    assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
+    assert result.reason is DownOnlyMakerReason.DOWNWARD_BOUND_BREACHED
+
+
+def test_upward_hysteresis_requires_mid_to_remain_above_ceiling() -> None:
+    params = parameters(
+        activation_bound_pct=Decimal("0.0005"),
+        activation_bound_up_pct=Decimal("0.001"),
+        upward_hysteresis_seconds=120,
+    )
+    first_tick = decide_down_only_maker(
+        params,
+        snapshot(now="10", best_bid="100.11", best_ask="100.12"),
+    )
+    assert first_tick.action is DownOnlyMakerAction.HOLD
+    assert first_tick.reason is DownOnlyMakerReason.UPWARD_BOUND_PENDING
+
+    still_waiting = decide_down_only_maker(
+        params,
+        snapshot(
+            now="129",
+            best_bid="100.11",
+            best_ask="100.12",
+            upward_bound_first_breached_at="10",
+        ),
+    )
+    assert still_waiting.action is DownOnlyMakerAction.HOLD
+    assert still_waiting.reason is DownOnlyMakerReason.UPWARD_BOUND_PENDING
+
+    confirmed = decide_down_only_maker(
+        params,
+        snapshot(
+            now="130",
+            best_bid="100.11",
+            best_ask="100.12",
+            upward_bound_first_breached_at="10",
+        ),
+    )
+    assert confirmed.action is DownOnlyMakerAction.CANCEL_TERMINAL
+    assert confirmed.reason is DownOnlyMakerReason.UPWARD_BOUND_BREACHED
+
+
+def test_upward_hysteresis_resets_when_mid_returns_inside_up_wait() -> None:
+    result = decide_down_only_maker(
+        parameters(
+            activation_bound_pct=Decimal("0.0005"),
+            activation_bound_up_pct=Decimal("0.001"),
+            upward_hysteresis_seconds=120,
+        ),
+        snapshot(
+            now="70",
+            best_bid="100.07",
+            best_ask="100.08",
+            upward_bound_first_breached_at="10",
+        ),
+    )
+    assert result.action is DownOnlyMakerAction.HOLD
+    assert result.reason is DownOnlyMakerReason.RESTING
+
+
+def test_zero_hysteresis_still_cancels_immediately_above_up_wait() -> None:
+    result = decide_down_only_maker(
+        parameters(
+            activation_bound_pct=Decimal("0.0005"),
+            activation_bound_up_pct=Decimal("0.001"),
+            upward_hysteresis_seconds=0,
+        ),
+        snapshot(best_bid="100.11", best_ask="100.12"),
+    )
+    assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
+    assert result.reason is DownOnlyMakerReason.UPWARD_BOUND_BREACHED
+
+
+def _eth_incident_snapshot(**changes):
+    values = {
+        "now": "59",
+        "best_bid": "2399.23",
+        "best_ask": "2399.56",
+        "current_order_price": "2397.68",
+        "maximum_acceptable_price": "2397.68",
+        "initial_best_bid": "2397.68",
+        "initial_best_ask": "2397.79",
+        "price_step": "0.01",
+        "decision_atr_1m": "0.571044",
+        "authorized_base": "0.03611500",
+    }
+    values.update(changes)
+    return snapshot(**values)
+
+
+def test_symmetric_five_bps_still_cancels_eth_incident_print() -> None:
+    result = decide_down_only_maker(
+        parameters(activation_bound_pct=Decimal("0.0005")),
+        _eth_incident_snapshot(),
+    )
+    assert result.action is DownOnlyMakerAction.CANCEL_TERMINAL
+    assert result.reason is DownOnlyMakerReason.UPWARD_BOUND_BREACHED
+
+
+def test_eth_incident_print_holds_with_ten_bps_up_wait() -> None:
+    result = decide_down_only_maker(
+        parameters(
+            activation_bound_pct=Decimal("0.0005"),
+            activation_bound_up_pct=Decimal("0.001"),
+            upward_hysteresis_seconds=120,
+        ),
+        _eth_incident_snapshot(),
+    )
+    assert result.action is DownOnlyMakerAction.HOLD
+    assert result.reason is DownOnlyMakerReason.RESTING
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("activation_bound_up_pct", Decimal("NaN"), "activation_bound_up_pct"),
+        ("activation_bound_up_pct", Decimal("1"), "activation_bound_up_pct"),
+        ("upward_hysteresis_seconds", -1, "upward_hysteresis_seconds"),
+    ],
+)
+def test_rejects_invalid_split_band_parameters(field, value, message) -> None:
+    with pytest.raises(DownOnlyMakerInputError, match=message):
+        decide_down_only_maker(parameters(**{field: value}), snapshot())

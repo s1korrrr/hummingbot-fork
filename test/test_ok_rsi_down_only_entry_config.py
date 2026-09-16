@@ -68,6 +68,21 @@ def test_main_controller_yamls_enable_bound_driven_entry_without_thirty_second_l
         assert config.entry_total_max_age_seconds == 300
         assert config.entry_activation_bound_pct == Decimal("0.0005")
         assert "entry_limit_max_age_seconds" not in payload
+        if filename == "ok_rsi_eth.yml":
+            assert payload["id"] == "ok-rsi-eth"
+            assert payload["trading_pair"] == "ETH-USDC"
+            assert config.rsi_buy_threshold == 31.0
+            assert config.entry_activation_bound_up_pct == Decimal("0.001")
+            assert config.entry_upward_bound_hysteresis_candles == 2
+            assert config.down_only_maker_parameters().activation_bound_up_pct == Decimal("0.001")
+            assert config.down_only_maker_parameters().upward_hysteresis_seconds == 120
+        else:
+            assert "entry_activation_bound_up_pct" not in payload
+            assert "entry_upward_bound_hysteresis_candles" not in payload
+            assert config.entry_activation_bound_up_pct is None
+            assert config.entry_upward_bound_hysteresis_candles == 0
+            assert config.down_only_maker_parameters().activation_bound_up_pct is None
+            assert config.down_only_maker_parameters().upward_hysteresis_seconds == 0
 
 
 def test_shadow_candidate_materializes_frozen_parameters() -> None:
@@ -99,6 +114,12 @@ def test_shadow_candidate_materializes_frozen_parameters() -> None:
         ({"entry_activation_bound_pct": 0}, "entry_activation_bound_pct"),
         ({"entry_activation_bound_pct": 1}, "entry_activation_bound_pct"),
         ({"entry_activation_bound_pct": "NaN"}, "entry_activation_bound_pct"),
+        ({"entry_activation_bound_up_pct": 0}, "entry_activation_bound_up_pct"),
+        ({"entry_activation_bound_up_pct": 1}, "entry_activation_bound_up_pct"),
+        ({"entry_activation_bound_up_pct": "NaN"}, "entry_activation_bound_up_pct"),
+        ({"entry_activation_bound_up_pct": "0.0004"}, "entry_activation_bound_up_pct"),
+        ({"entry_upward_bound_hysteresis_candles": -1}, "entry_upward_bound_hysteresis_candles"),
+        ({"entry_upward_bound_hysteresis_candles": 3}, "entry_upward_bound_hysteresis_candles"),
         ({"entry_total_max_age_seconds": 901}, "entry_total_max_age_seconds"),
         ({"entry_reprice_cooldown_seconds": 0}, "entry_reprice_cooldown_seconds"),
         ({"entry_reprice_cooldown_seconds": 31}, "entry_reprice_cooldown_seconds"),

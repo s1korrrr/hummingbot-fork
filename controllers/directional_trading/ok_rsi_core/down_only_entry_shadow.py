@@ -7,6 +7,7 @@ from typing import Optional
 from controllers.directional_trading.ok_rsi_core.down_only_entry import (
     DownOnlyMakerAction,
     DownOnlyMakerParameters,
+    DownOnlyMakerReason,
     DownOnlyMakerSnapshot,
     decide_down_only_maker,
 )
@@ -27,6 +28,7 @@ class _ShadowState:
     authorized_base: Decimal
     reprice_count: int = 0
     terminal_reason: Optional[str] = None
+    upward_bound_first_breached_at: Optional[Decimal] = None
 
 
 class DownOnlyMakerShadowTracker:
@@ -114,6 +116,11 @@ class DownOnlyMakerShadowTracker:
             self._parameters,
             self._decision_snapshot(state, now, best_bid, best_ask, opposing_signal, risk_allowed),
         )
+        if decision.reason is DownOnlyMakerReason.UPWARD_BOUND_PENDING:
+            if state.upward_bound_first_breached_at is None:
+                state.upward_bound_first_breached_at = now
+        elif decision.reason is not DownOnlyMakerReason.UPWARD_BOUND_BREACHED:
+            state.upward_bound_first_breached_at = None
         if decision.action is DownOnlyMakerAction.CANCEL_FOR_REPRICE:
             state.current_order_price = decision.target_price
             state.order_created_at = now
@@ -221,6 +228,7 @@ class DownOnlyMakerShadowTracker:
             reprice_count=state.reprice_count,
             opposing_signal=opposing_signal,
             risk_allowed=risk_allowed,
+            upward_bound_first_breached_at=state.upward_bound_first_breached_at,
         )
 
     def _record_event(

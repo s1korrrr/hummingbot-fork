@@ -6,6 +6,7 @@ import pytest
 
 from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate
 
 
 @pytest.mark.asyncio
@@ -102,3 +103,126 @@ async def test_explicit_negative_venue_ack_is_a_real_rejection():
     await asyncio.sleep(0)
     assert 'rejected' not in exchange.in_flight_orders
     assert exchange._order_tracker.fetch_order('rejected').is_failure
+
+
+def test_in_flight_order_persists_cancel_source_from_misc_updates():
+    order = InFlightOrder(
+        client_order_id='oid',
+        trading_pair='ETH-USDT',
+        order_type=OrderType.LIMIT_MAKER,
+        trade_type=TradeType.BUY,
+        amount=Decimal('1'),
+        price=Decimal('100'),
+        creation_timestamp=1,
+        exchange_order_id='venue',
+    )
+    updated = order.update_with_order_update(OrderUpdate(
+        trading_pair='ETH-USDT',
+        update_timestamp=2,
+        new_state=OrderState.CANCELED,
+        client_order_id='oid',
+        exchange_order_id='venue',
+        misc_updates={'cancel_source': '31'},
+    ))
+    assert updated is True
+    assert order.cancel_source == '31'
+    assert order.update_with_order_update(OrderUpdate(
+        trading_pair='ETH-USDT',
+        update_timestamp=3,
+        new_state=OrderState.CANCELED,
+        client_order_id='oid',
+        exchange_order_id='venue',
+        misc_updates={'cancel_source': '31'},
+    )) is False
+    assert order.cancel_source == '31'
+
+
+@pytest.mark.asyncio
+async def test_request_order_status_carries_okx_cancel_source():
+    exchange = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+    exchange.start_tracking_order(order_id='oid', exchange_order_id='venue', trading_pair='ETH-USDT',
+                                  trade_type=TradeType.BUY, price=Decimal('100'), amount=Decimal('1'),
+                                  order_type=OrderType.LIMIT_MAKER)
+    order = exchange.in_flight_orders['oid']
+    exchange._request_order_update = AsyncMock(return_value={'data': [{
+        'state': 'canceled', 'accFillSz': '0', 'ordId': 'venue', 'uTime': '1000000', 'cancelSource': '31',
+    }]})
+    exchange._all_trade_updates_for_order = AsyncMock(return_value=[])
+    update = await exchange._request_order_status(order)
+    assert update.new_state == OrderState.CANCELED
+    assert update.misc_updates == {'cancel_source': '31'}
+    assert order.cancel_source == '31'
+
+
+def test_okx_order_misc_updates_ignores_blank_cancel_source():
+    assert OkxExchange._okx_order_misc_updates({'cancelSource': ''}) is None
+    assert OkxExchange._okx_order_misc_updates({}) is None
+    assert OkxExchange._okx_order_misc_updates({'cancelSource': 31}) == {'cancel_source': '31'}
+
+
+@pytest.mark.asyncio
+async def test_cached_canceled_order_does_not_revive_on_delayed_open():
+    exchange = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+    exchange.start_tracking_order(order_id='oid', exchange_order_id='venue', trading_pair='ETH-USDT',
+                                  trade_type=TradeType.BUY, price=Decimal('100'), amount=Decimal('1'),
+                                  order_type=OrderType.LIMIT_MAKER)
+    order = exchange.in_flight_orders['oid']
+    exchange._order_tracker.process_order_update(OrderUpdate(
+        trading_pair='ETH-USDT',
+        update_timestamp=20,
+        new_state=OrderState.CANCELED,
+        client_order_id='oid',
+        exchange_order_id='venue',
+        misc_updates={'cancel_source': '31'},
+    ))
+    await asyncio.sleep(0)
+    assert order.current_state == OrderState.CANCELED
+    assert order.cancel_source == '31'
+    assert 'oid' not in exchange.in_flight_orders
+    assert exchange._order_tracker.fetch_cached_order('oid') is order
+
+    exchange._order_tracker.process_order_update(OrderUpdate(
+        trading_pair='ETH-USDT',
+        update_timestamp=10,
+        new_state=OrderState.OPEN,
+        client_order_id='oid',
+        exchange_order_id='venue',
+    ))
+    await asyncio.sleep(0)
+    assert order.current_state == OrderState.CANCELED
+    assert not order.is_open
+    assert order.last_update_timestamp == 20
+    assert 'oid' not in exchange.in_flight_orders
+    assert exchange._order_tracker.fetch_cached_order('oid') is order
+
+
+@pytest.mark.asyncio
+async def test_request_order_status_delayed_live_does_not_reopen_canceled_order():
+    exchange = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+    exchange.start_tracking_order(order_id='oid', exchange_order_id='venue', trading_pair='ETH-USDT',
+                                  trade_type=TradeType.BUY, price=Decimal('100'), amount=Decimal('1'),
+                                  order_type=OrderType.LIMIT_MAKER)
+    order = exchange.in_flight_orders['oid']
+    exchange._all_trade_updates_for_order = AsyncMock(return_value=[])
+    exchange._request_order_update = AsyncMock(return_value={'data': [{
+        'state': 'canceled', 'accFillSz': '0', 'ordId': 'venue', 'uTime': '20000', 'cancelSource': '31',
+    }]})
+    canceled = await exchange._request_order_status(order)
+    exchange._order_tracker.process_order_update(canceled)
+    await asyncio.sleep(0)
+    assert order.current_state == OrderState.CANCELED
+    assert order.cancel_source == '31'
+    assert order.last_update_timestamp == 20.0
+    assert 'oid' not in exchange.in_flight_orders
+
+    exchange._request_order_update = AsyncMock(return_value={'data': [{
+        'state': 'live', 'accFillSz': '0', 'ordId': 'venue', 'uTime': '10000',
+    }]})
+    live = await exchange._request_order_status(order)
+    assert live.new_state == OrderState.OPEN
+    exchange._order_tracker.process_order_update(live)
+    await asyncio.sleep(0)
+    assert order.current_state == OrderState.CANCELED
+    assert not order.is_open
+    assert order.last_update_timestamp == 20.0
+    assert exchange._order_tracker.fetch_cached_order('oid') is order

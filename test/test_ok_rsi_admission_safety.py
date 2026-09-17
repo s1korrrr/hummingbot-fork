@@ -45,6 +45,170 @@ def test_pending_entry_reserves_its_full_commitment_including_during_shutdown():
     assert instance._get_total_position_value_usd() == D('99')
 
 
+def test_terminally_canceled_remainder_releases_only_resolved_commitment():
+    instance = controller()
+    instance.positions_held = [SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+                                               amount=D('.74'), breakeven_price=D('100'), cum_fees_quote=D('0'))]
+    executor = make_executor()
+    executor.config.amount = D('.25')
+    executor._open_order = tracked('canceled', TradeType.BUY, '.01', OrderState.CANCELED)
+    executor._entry_lifecycle['state'] = 'managing_fill'
+    executor._entry_lifecycle['terminal_exchange_timestamp'] = 1000
+    instance.executors_info = [executor.executor_info]
+    assert instance._get_total_position_value_usd() == D('75')
+
+
+def test_managing_fill_label_without_terminal_confirmation_keeps_unresolved_remainder():
+    instance = controller()
+    executor = make_executor()
+    executor.config.amount = D('1')
+    executor._open_order = tracked('working', TradeType.BUY, '.1', OrderState.PARTIALLY_FILLED)
+    executor._entry_lifecycle['state'] = 'managing_fill'
+    instance.executors_info = [executor.executor_info]
+    assert instance._get_total_position_value_usd() == D('100')
+    assert not instance.can_create_executor(1)
+
+
+def test_terminated_leftover_owned_is_reserved_until_hold_transfer():
+    instance = controller()
+    instance.config.max_total_position_usd = D('1000')
+    leftover = make_executor()
+    leftover.config.amount = D('.4')
+    leftover._open_order = tracked('owned', TradeType.BUY, '.4', OrderState.FILLED)
+    leftover._status = RunnableStatus.TERMINATED
+    instance.executors_info = [leftover.executor_info]
+    assert instance._get_total_position_value_usd() == D('40')
+
+    transferred = make_executor()
+    transferred.config.amount = D('.4')
+    transferred._open_order = tracked('held', TradeType.BUY, '.4', OrderState.FILLED)
+    transferred._status = RunnableStatus.TERMINATED
+    transferred.close_type = CloseType.POSITION_HOLD
+    instance.executors_info = [transferred.executor_info]
+    instance.positions_held = [SimpleNamespace(
+        connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+        amount=D('.4'), breakeven_price=D('100'), cum_fees_quote=D('0'),
+    )]
+    assert instance._get_total_position_value_usd() == D('40')
+
+
+def test_position_hold_without_held_bag_refuses_new_buy():
+    instance = controller()
+    transferring = make_executor()
+    transferring.config.amount = D('.4')
+    transferring._open_order = tracked('held', TradeType.BUY, '.4', OrderState.FILLED)
+    transferring._status = RunnableStatus.SHUTTING_DOWN
+    transferring.close_type = CloseType.POSITION_HOLD
+    instance.executors_info = [transferring.executor_info]
+    instance.positions_held = []
+    assert transferring.executor_info.custom_info['execution_receipt']['accounting_owner'] == 'held_position'
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def _hold_transferring(*, leftover=D('.4')):
+    transferring = make_executor()
+    transferring.config.amount = leftover
+    transferring._open_order = tracked('held', TradeType.BUY, str(leftover), OrderState.FILLED)
+    transferring._status = RunnableStatus.SHUTTING_DOWN
+    transferring.close_type = CloseType.POSITION_HOLD
+    return transferring
+
+
+def _hold_done(*, leftover=D('.4'), executor_id='hold-done', close_timestamp=1000.0):
+    transferring = make_executor()
+    transferring.config.amount = leftover
+    transferring._open_order = tracked('held', TradeType.BUY, str(leftover), OrderState.FILLED)
+    transferring._status = RunnableStatus.TERMINATED
+    transferring.close_type = CloseType.POSITION_HOLD
+    transferring.close_timestamp = close_timestamp
+    return transferring.executor_info.model_copy(update={'id': executor_id})
+
+
+def test_position_hold_undersized_or_prior_bag_refuses_new_buy():
+    instance = controller()
+    transferring = _hold_transferring()
+    transferring_info = transferring.executor_info
+    instance.executors_info = [transferring_info]
+    instance.positions_held = [SimpleNamespace(
+        connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+        amount=D('.1'), breakeven_price=D('100'), cum_fees_quote=D('0'),
+    )]
+    assert transferring_info.custom_info['execution_receipt']['accounting_owner'] == 'held_position'
+    assert instance._executor_owned_base(transferring_info) is None
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+    first_info = _hold_done(executor_id='hold-a', close_timestamp=100.0)
+    second_info = _hold_done(executor_id='hold-b', close_timestamp=200.0)
+    instance.executors_info = [second_info, first_info]
+    instance.positions_held = [SimpleNamespace(
+        connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+        amount=D('.4'), breakeven_price=D('100'), cum_fees_quote=D('0'),
+    )]
+    assert instance._executor_owned_base(first_info) == D('0')
+    assert instance._executor_owned_base(second_info) is None
+    assert instance._executor_counts_toward_buy_capital(second_info)
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_new_shutting_down_hold_before_stored_prior_hold_refuses_new_buy():
+    instance = controller()
+    new_info = _hold_transferring().executor_info
+    prior_info = _hold_done(executor_id='prior-hold', close_timestamp=100.0)
+    instance.executors_info = [new_info, prior_info]
+    instance.positions_held = [SimpleNamespace(
+        connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+        amount=D('.4'), breakeven_price=D('100'), cum_fees_quote=D('0'),
+    )]
+    assert instance._executor_owned_base(new_info) is None
+    assert instance._executor_owned_base(prior_info) == D('0')
+    assert instance._executor_counts_toward_buy_capital(new_info)
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_new_hold_without_prior_claimant_refuses_leftover_sized_bag():
+    instance = controller()
+    new_info = _hold_transferring().executor_info
+    instance.executors_info = [new_info]
+    instance.positions_held = [SimpleNamespace(
+        connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+        amount=D('.4'), breakeven_price=D('100'), cum_fees_quote=D('0'),
+    )]
+    assert new_info.custom_info['execution_receipt']['accounting_owner'] == 'held_position'
+    assert instance._executor_owned_base(new_info) is None
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_transferring_owned_inventory_between_native_owners_preserves_buying_capacity():
+    instance = controller()
+    instance.config.max_total_position_usd = D('1000')
+    held = SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+                           amount=D('.74'), breakeven_price=D('120'), cum_fees_quote=D('0'))
+    instance.positions_held = [held]
+    held_capacity = instance._get_total_position_value_usd()
+    assert held_capacity == D('74')
+
+    instance.positions_held = []
+    executor = make_executor()
+    executor.config.amount = D('.74')
+    executor.config.entry_price = D('120')
+    executor._open_order = tracked('owned', TradeType.BUY, '1', OrderState.FILLED)
+    executor._open_order.order.executed_amount_base = D('.74')
+    executor._open_order.order.executed_amount_quote = D('88.8')
+    executor._entry_lifecycle['state'] = 'managing_fill'
+    instance.executors_info = [executor.executor_info]
+    assert instance._get_total_position_value_usd() == held_capacity
+
+
 def test_invalid_inventory_cannot_be_valued_as_zero_exposure():
     instance = controller()
     instance.positions_held = [SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,

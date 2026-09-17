@@ -106,6 +106,7 @@ _OPEN_NATIVE_ORDER_STATES = frozenset({
 })
 _RECONCILED_NATIVE_ORDER_STATES = frozenset({"CANCELED", "FILLED", "COMPLETED"})
 _RECONCILED_ACQUISITION_STATES = frozenset({"ended_no_fill", "held_residual"})
+_HOLD_LEDGER_UNSET = object()
 
 
 def _extract_client_field_value(client_data: Optional[ClientFieldData], key: str):
@@ -1472,7 +1473,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             return True
         return getattr(executor, "close_type", None) == CloseType.POSITION_HOLD
 
-    def _hold_ledger_rows(self) -> Optional[List]:
+    def _load_hold_ledger_rows(self) -> Optional[List]:
         recorder = MarketsRecorder.get_existing_instance()
         if recorder is None:
             return None
@@ -1485,16 +1486,47 @@ class HLRSIController(DirectionalTradingControllerBase):
             return None
         return list(rows)
 
-    def _executor_hold_order_ids(self, executor) -> set:
+    def _hold_ledger_rows(self) -> Optional[List]:
+        cached = getattr(self, "_hold_ledger_pass", _HOLD_LEDGER_UNSET)
+        if cached is not _HOLD_LEDGER_UNSET:
+            return cached
+        return self._load_hold_ledger_rows()
+
+    def _begin_hold_ledger_pass(self) -> bool:
+        if getattr(self, "_hold_ledger_pass", _HOLD_LEDGER_UNSET) is not _HOLD_LEDGER_UNSET:
+            return False
+        self._hold_ledger_pass = self._load_hold_ledger_rows()
+        return True
+
+    def _end_hold_ledger_pass(self, owned: bool) -> None:
+        if owned:
+            self._hold_ledger_pass = _HOLD_LEDGER_UNSET
+
+    def _executor_hold_required_fills(self, executor) -> Optional[List[Tuple[str, Decimal, Decimal, Decimal]]]:
         custom = self._executor_custom_info(executor)
-        order_ids = {str(oid) for oid in (custom.get("order_ids") or []) if oid not in (None, "")}
-        for held in custom.get("held_position_orders") or []:
+        orders = custom.get("held_position_orders")
+        if not isinstance(orders, list):
+            return None if orders is not None else []
+        required: List[Tuple[str, Decimal, Decimal, Decimal]] = []
+        for held in orders:
             if not isinstance(held, dict):
-                continue
+                return None
             oid = held.get("client_order_id") or held.get("order_id")
-            if oid not in (None, ""):
-                order_ids.add(str(oid))
-        return order_ids
+            if oid in (None, ""):
+                return None
+            valid, base = self._finite_nonnegative_base(held.get("executed_amount_base"))
+            if not valid:
+                return None
+            if base is None or base == 0:
+                continue
+            valid, quote = self._finite_nonnegative_base(held.get("executed_amount_quote"))
+            if not valid:
+                return None
+            valid, fee = self._finite_nonnegative_base(held.get("cumulative_fee_paid_quote"))
+            if not valid:
+                return None
+            required.append((str(oid), base, quote or Decimal("0"), fee or Decimal("0")))
+        return required
 
     def _executor_hold_released_to_bag(self, executor) -> bool:
         if not self._executor_claims_held_position(executor):
@@ -1504,15 +1536,18 @@ class HLRSIController(DirectionalTradingControllerBase):
         executor_id = getattr(executor, "id", None)
         if executor_id in (None, ""):
             return False
+        required = self._executor_hold_required_fills(executor)
+        if not required:
+            return False
         rows = self._hold_ledger_rows()
         if not rows:
             return False
         want_id = str(executor_id)
         connector = self.config.connector_name
         pair = self.config.trading_pair
-        order_ids = self._executor_hold_order_ids(executor)
         expected_side = getattr(getattr(executor, "side", None), "name", getattr(executor, "side", None))
         expected_side_name = None if expected_side in (None, "") else str(expected_side).upper()
+        matched: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}
         for row in rows:
             if str(getattr(row, "executor_id", "") or "") != want_id:
                 continue
@@ -1524,12 +1559,24 @@ class HLRSIController(DirectionalTradingControllerBase):
             if position_side not in (None, "") and expected_side_name is not None:
                 if str(position_side).upper() != expected_side_name:
                     continue
-            if order_ids:
-                row_oid = getattr(row, "client_order_id", None)
-                if row_oid in (None, "") or str(row_oid) not in order_ids:
-                    continue
-            return True
-        return False
+            row_oid = getattr(row, "client_order_id", None)
+            if row_oid in (None, ""):
+                continue
+            valid, base = self._finite_nonnegative_base(getattr(row, "executed_amount_base", None))
+            if not valid or base is None:
+                return False
+            valid, quote = self._finite_nonnegative_base(getattr(row, "executed_amount_quote", None))
+            if not valid:
+                return False
+            valid, fee = self._finite_nonnegative_base(getattr(row, "cumulative_fee_paid_quote", None))
+            if not valid:
+                return False
+            record = (base, quote or Decimal("0"), fee or Decimal("0"))
+            key = str(row_oid)
+            if key in matched and matched[key] != record:
+                return False
+            matched[key] = record
+        return all(matched.get(oid) == (base, quote, fee) for oid, base, quote, fee in required)
 
     def _executor_is_done(self, executor) -> bool:
         if hasattr(executor, "is_done"):
@@ -1554,6 +1601,8 @@ class HLRSIController(DirectionalTradingControllerBase):
     def _executor_acquisition_remainder_reconciled(self, executor) -> bool:
         if self._executor_claims_held_position(executor):
             return self._executor_hold_released_to_bag(executor)
+        if self._executor_acquisition_may_still_fill(executor):
+            return False
         native = self._executor_native_order_state(executor)
         if native in _OPEN_NATIVE_ORDER_STATES:
             return False
@@ -1632,6 +1681,12 @@ class HLRSIController(DirectionalTradingControllerBase):
             return None
         return self._executor_reported_owned_base(executor)
 
+    @staticmethod
+    def _supplied_nonnegative_base(container: object, key: str) -> Tuple[bool, Optional[Decimal]]:
+        if not isinstance(container, dict) or key not in container:
+            return True, None
+        return HLRSIController._finite_nonnegative_base(container[key])
+
     def _executor_outstanding_base(self, executor) -> Optional[Decimal]:
         if self._executor_hold_released_to_bag(executor):
             return Decimal("0")
@@ -1643,23 +1698,41 @@ class HLRSIController(DirectionalTradingControllerBase):
             return None
         custom = self._executor_custom_info(executor)
         if getattr(config, "type", None) == "order_executor":
-            filled = self._decimal_or_none(custom.get("executed_amount_base"))
-            if filled is None or filled < 0:
+            valid, filled = self._supplied_nonnegative_base(custom, "executed_amount_base")
+            if not valid or filled is None:
                 return None
-            remainder = max(Decimal("0"), authorized - filled)
+            if filled > authorized:
+                return None
+            remainder = authorized - filled
         else:
-            filled = self._decimal_or_none(custom.get("open_order_filled_amount_base"))
-            acquired = self._decimal_or_none((custom.get("entry_acquisition") or {}).get("cumulative_filled_base"))
-            if filled is None:
-                filled = Decimal("0")
-            if filled < 0:
+            valid, filled = self._supplied_nonnegative_base(custom, "open_order_filled_amount_base")
+            if not valid:
                 return None
-            used = filled
-            if acquired is not None:
-                if acquired < 0:
+            filled = filled or Decimal("0")
+            acquisition = custom.get("entry_acquisition")
+            receipt = custom.get("execution_receipt")
+            if acquisition is None:
+                acquisition = {}
+            elif not isinstance(acquisition, dict):
+                return None
+            if receipt is None:
+                receipt = {}
+            elif not isinstance(receipt, dict):
+                return None
+            gross_values: List[Decimal] = []
+            for container, key in (
+                (acquisition, "cumulative_filled_base"),
+                (receipt, "entry_gross_base"),
+            ):
+                valid, parsed = self._supplied_nonnegative_base(container, key)
+                if not valid:
                     return None
-                used = max(filled, acquired)
-            if used > authorized:
+                if parsed is not None:
+                    gross_values.append(parsed)
+            if gross_values and any(item != gross_values[0] for item in gross_values[1:]):
+                return None
+            used = gross_values[0] if gross_values else filled
+            if used > authorized or filled > used:
                 return None
             remainder = authorized - used
         if remainder == 0 or self._executor_acquisition_remainder_reconciled(executor):
@@ -1740,6 +1813,13 @@ class HLRSIController(DirectionalTradingControllerBase):
         return total_value
 
     def _get_total_position_value_usd(self) -> Decimal:
+        owned = self._begin_hold_ledger_pass()
+        try:
+            return self._total_position_value_usd()
+        finally:
+            self._end_hold_ledger_pass(owned)
+
+    def _total_position_value_usd(self) -> Decimal:
         try:
             amount = Decimal("0")
             for position in self.positions_held:
@@ -4611,6 +4691,13 @@ class HLRSIController(DirectionalTradingControllerBase):
     def can_create_executor(self, signal: int) -> bool:
         if signal == 0:
             return False
+        owned = self._begin_hold_ledger_pass()
+        try:
+            return self._decide_can_create_executor(signal)
+        finally:
+            self._end_hold_ledger_pass(owned)
+
+    def _decide_can_create_executor(self, signal: int) -> bool:
         self._ingest_closed_executor_results()
         if signal > 0 and not self._get_total_position_value_usd().is_finite():
             self._record_gate_reason(TradeType.BUY, "exposure_unavailable")

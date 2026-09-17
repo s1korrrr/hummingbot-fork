@@ -66,6 +66,7 @@ def _buy_executor(
     is_done=False,
     accounting_owner=None,
     receipt_remaining=None,
+    entry_gross_base=None,
     include_filled=True,
     include_remaining=True,
     native_order_state=None,
@@ -73,6 +74,7 @@ def _buy_executor(
     close_timestamp=None,
     cumulative_filled_base=None,
     order_ids=None,
+    held_position_orders=None,
 ):
     custom = {
         'side': TradeType.BUY,
@@ -104,15 +106,19 @@ def _buy_executor(
     if average_price is not None:
         custom['current_position_average_price'] = average_price
         custom['entry_price'] = average_price
-    if accounting_owner is not None or receipt_remaining is not None:
+    if accounting_owner is not None or receipt_remaining is not None or entry_gross_base is not None:
         receipt = {}
         if accounting_owner is not None:
             receipt['accounting_owner'] = accounting_owner
         if receipt_remaining is not None:
             receipt['remaining_owned_base'] = receipt_remaining
+        if entry_gross_base is not None:
+            receipt['entry_gross_base'] = entry_gross_base
         custom['execution_receipt'] = receipt
     if order_ids is not None:
         custom['order_ids'] = list(order_ids)
+    if held_position_orders is not None:
+        custom['held_position_orders'] = list(held_position_orders)
     return SimpleNamespace(
         id=executor_id,
         is_active=is_active,
@@ -136,13 +142,18 @@ def _buy_executor(
 
 
 def _ledger_row(*, executor_id, client_order_id='OID-1', connector_name='hyperliquid',
-                trading_pair='HYPE-USDC', position_side=None):
+                trading_pair='HYPE-USDC', position_side=None,
+                executed_amount_base='0.4', executed_amount_quote='40',
+                cumulative_fee_paid_quote='0'):
     return SimpleNamespace(
         executor_id=executor_id,
         client_order_id=client_order_id,
         connector_name=connector_name,
         trading_pair=trading_pair,
         position_side=position_side,
+        executed_amount_base=executed_amount_base,
+        executed_amount_quote=executed_amount_quote,
+        cumulative_fee_paid_quote=cumulative_fee_paid_quote,
     )
 
 
@@ -309,6 +320,13 @@ def test_terminated_leftover_owned_stays_reserved_until_hold_transfer():
         receipt_remaining=D('0.4'),
         terminal_exchange_timestamp=1000,
         order_ids=['OID-held'],
+        held_position_orders=[{
+            'client_order_id': 'OID-held',
+            'trade_type': 'BUY',
+            'executed_amount_base': '0.4',
+            'executed_amount_quote': '40',
+            'cumulative_fee_paid_quote': '0',
+        }],
     )
     instance.executors_info = [transferred]
     instance.positions_held = [_held_bag(D('0.4'))]
@@ -341,6 +359,16 @@ def test_position_hold_without_held_bag_refuses_new_buy():
     assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
 
 
+def _held_fill(order_id, base, quote='40', fee='0'):
+    return {
+        'client_order_id': order_id,
+        'trade_type': 'BUY',
+        'executed_amount_base': str(base),
+        'executed_amount_quote': str(quote),
+        'cumulative_fee_paid_quote': str(fee),
+    }
+
+
 def _hold_claimant(*, executor_id, leftover=D('0.4'), is_active=True, is_done=False, close_timestamp=None):
     return _buy_executor(
         executor_id=executor_id,
@@ -355,6 +383,13 @@ def _hold_claimant(*, executor_id, leftover=D('0.4'), is_active=True, is_done=Fa
         receipt_remaining=leftover,
         terminal_exchange_timestamp=1000,
         close_timestamp=close_timestamp,
+        held_position_orders=[{
+            'client_order_id': 'OID-1',
+            'trade_type': 'BUY',
+            'executed_amount_base': str(leftover),
+            'executed_amount_quote': str(leftover * D('100')),
+            'cumulative_fee_paid_quote': '0',
+        }],
     )
 
 
@@ -427,7 +462,7 @@ def test_hold_transfer_survives_partial_bag_sale():
     transferred = _hold_claimant(
         executor_id='held-ex', leftover=D('0.4'), is_active=False, is_done=True,
     )
-    transferred.custom_info['order_ids'] = ['OID-this']
+    transferred.custom_info['held_position_orders'] = [_held_fill('OID-this', '0.4', '40')]
     instance.executors_info = [transferred]
     instance.positions_held = [_held_bag(D('0.3'))]
     with _use_hold_ledger([_ledger_row(executor_id='held-ex', client_order_id='OID-this')]):
@@ -442,7 +477,7 @@ def test_hold_transfer_survives_full_bag_disposal():
     transferred = _hold_claimant(
         executor_id='held-ex', leftover=D('0.4'), is_active=False, is_done=True,
     )
-    transferred.custom_info['order_ids'] = ['OID-this']
+    transferred.custom_info['held_position_orders'] = [_held_fill('OID-this', '0.4', '40')]
     instance.executors_info = [transferred]
     instance.positions_held = []
     with _use_hold_ledger([_ledger_row(executor_id='held-ex', client_order_id='OID-this')]):
@@ -464,6 +499,45 @@ def test_unrelated_equal_bag_does_not_release_new_claimant():
         assert instance._executor_owned_base(new_hold) is None
         assert instance._executor_outstanding_base(new_hold) is None
         assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+        assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_incomplete_hold_ledger_does_not_release_whole_executor():
+    instance = _controller()
+    transferred = _hold_claimant(
+        executor_id='held-ex', leftover=D('0.4'), is_active=False, is_done=True,
+    )
+    transferred.custom_info['held_position_orders'] = [
+        _held_fill('buy-1', '0.1', '10'),
+        _held_fill('buy-2', '0.3', '30'),
+    ]
+    instance.executors_info = [transferred]
+    instance.positions_held = [_held_bag(D('0.4'))]
+    with _use_hold_ledger([
+        _ledger_row(executor_id='held-ex', client_order_id='buy-1',
+                    executed_amount_base='0.1', executed_amount_quote='10'),
+    ]):
+        assert instance._executor_hold_released_to_bag(transferred) is False
+        assert instance._executor_owned_base(transferred) is None
+        assert not instance.can_create_executor(1)
+        assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_stale_hold_ledger_quantity_does_not_release_whole_executor():
+    instance = _controller()
+    transferred = _hold_claimant(
+        executor_id='held-ex', leftover=D('0.4'), is_active=False, is_done=True,
+    )
+    transferred.custom_info['held_position_orders'] = [_held_fill('buy-1', '0.4', '40')]
+    instance.executors_info = [transferred]
+    instance.positions_held = [_held_bag(D('0.4'))]
+    with _use_hold_ledger([
+        _ledger_row(executor_id='held-ex', client_order_id='buy-1',
+                    executed_amount_base='0.1', executed_amount_quote='10'),
+    ]):
+        assert instance._executor_hold_released_to_bag(transferred) is False
+        assert instance._executor_owned_base(transferred) is None
         assert not instance.can_create_executor(1)
         assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
 
@@ -571,6 +645,65 @@ def test_missing_or_conflicting_owned_receipts_are_unavailable():
     instance.executors_info = [non_finite]
     assert instance._executor_owned_base(non_finite) is None
     assert not instance._get_total_position_value_usd().is_finite()
+
+
+def test_invalid_cumulative_gross_makes_outstanding_unavailable():
+    instance = _controller()
+    for gross in ('NaN', 'Infinity', 'broken'):
+        executor = _buy_executor(
+            amount=D('1'),
+            entry_price=D('100'),
+            filled_base=D('0.4'),
+            remaining_base=D('0.4'),
+            lifecycle='managing_fill',
+            native_order_state='OPEN',
+            cumulative_filled_base=gross,
+        )
+        instance.executors_info = [executor]
+        assert instance._executor_outstanding_base(executor) is None
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+        assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_conflicting_native_gross_receipts_make_outstanding_unavailable():
+    instance = _controller()
+    executor = _buy_executor(
+        amount=D('1'),
+        entry_price=D('100'),
+        filled_base=D('0.4'),
+        remaining_base=D('0.4'),
+        lifecycle='managing_fill',
+        native_order_state='OPEN',
+        cumulative_filled_base=D('0.9'),
+        entry_gross_base=D('0.4'),
+    )
+    instance.executors_info = [executor]
+    assert instance._executor_outstanding_base(executor) is None
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_over_authorized_order_executor_executed_amount_is_unavailable():
+    instance = _controller()
+    executor = SimpleNamespace(
+        id='order-ex',
+        is_active=True,
+        is_done=False,
+        connector_name='hyperliquid',
+        trading_pair='HYPE-USDC',
+        side=TradeType.BUY,
+        timestamp=1.0,
+        net_pnl_pct=D('0'),
+        config=SimpleNamespace(type='order_executor', amount=D('1')),
+        custom_info={'executed_amount_base': D('2'), 'side': TradeType.BUY},
+    )
+    instance.executors_info = [executor]
+    assert instance._executor_outstanding_base(executor) is None
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
 
 
 def test_backtest_signal_frame_replays_two_entry_exit_cycles_chronologically():

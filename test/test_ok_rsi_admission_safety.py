@@ -32,13 +32,18 @@ def controller():
 
 
 def _ledger_row(*, executor_id, client_order_id='held', connector_name='okx',
-                trading_pair='ETH-USDT', position_side=None):
+                trading_pair='ETH-USDT', position_side=None,
+                executed_amount_base='.4', executed_amount_quote='40',
+                cumulative_fee_paid_quote='0'):
     return SimpleNamespace(
         executor_id=executor_id,
         client_order_id=client_order_id,
         connector_name=connector_name,
         trading_pair=trading_pair,
         position_side=position_side,
+        executed_amount_base=executed_amount_base,
+        executed_amount_quote=executed_amount_quote,
+        cumulative_fee_paid_quote=cumulative_fee_paid_quote,
     )
 
 
@@ -107,6 +112,7 @@ def test_terminated_leftover_owned_is_reserved_until_hold_transfer():
     transferred._open_order = tracked('held', TradeType.BUY, '.4', OrderState.FILLED)
     transferred._status = RunnableStatus.TERMINATED
     transferred.close_type = CloseType.POSITION_HOLD
+    transferred._held_position_orders = [transferred._open_order.order.to_json()]
     info = transferred.executor_info
     instance.executors_info = [info]
     instance.positions_held = [_held_bag(D('.4'))]
@@ -246,6 +252,51 @@ def test_unrelated_equal_bag_does_not_release_new_claimant():
         assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
 
 
+def _held_fill(order_id, base, quote='40', fee='0'):
+    return {
+        'client_order_id': order_id,
+        'trade_type': 'BUY',
+        'executed_amount_base': str(base),
+        'executed_amount_quote': str(quote),
+        'cumulative_fee_paid_quote': str(fee),
+    }
+
+
+def test_incomplete_hold_ledger_does_not_release_whole_executor():
+    instance = controller()
+    info = _hold_done(executor_id='held-ex')
+    info.custom_info['held_position_orders'] = [
+        _held_fill('buy-1', '0.1', '10'),
+        _held_fill('buy-2', '0.3', '30'),
+    ]
+    instance.executors_info = [info]
+    instance.positions_held = [_held_bag(D('.4'))]
+    with _use_hold_ledger([
+        _ledger_row(executor_id='held-ex', client_order_id='buy-1',
+                    executed_amount_base='0.1', executed_amount_quote='10'),
+    ]):
+        assert instance._executor_hold_released_to_bag(info) is False
+        assert instance._executor_owned_base(info) is None
+        assert not instance.can_create_executor(1)
+        assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_stale_hold_ledger_quantity_does_not_release_whole_executor():
+    instance = controller()
+    info = _hold_done(executor_id='held-ex')
+    info.custom_info['held_position_orders'] = [_held_fill('buy-1', '0.4', '40')]
+    instance.executors_info = [info]
+    instance.positions_held = [_held_bag(D('.4'))]
+    with _use_hold_ledger([
+        _ledger_row(executor_id='held-ex', client_order_id='buy-1',
+                    executed_amount_base='0.1', executed_amount_quote='10'),
+    ]):
+        assert instance._executor_hold_released_to_bag(info) is False
+        assert instance._executor_owned_base(info) is None
+        assert not instance.can_create_executor(1)
+        assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
 def test_gross_fill_above_authorized_makes_outstanding_unavailable():
     instance = controller()
     executor = make_executor()
@@ -276,10 +327,70 @@ def test_fee_dust_gross_vs_net_keeps_finite_outstanding():
         'cumulative_filled_base': '0.41',
         'native_order_state': 'OPEN',
     }
+    info.custom_info['execution_receipt']['entry_gross_base'] = D('0.41')
     instance.executors_info = [info]
     assert instance._executor_owned_base(info) == D('.4')
     assert instance._executor_outstanding_base(info) == D('0.59')
     assert instance._get_total_position_value_usd().is_finite()
+
+
+def test_invalid_cumulative_gross_makes_outstanding_unavailable():
+    instance = controller()
+    for gross in ('NaN', 'Infinity', 'broken'):
+        executor = make_executor()
+        executor.config.amount = D('1')
+        executor._open_order = tracked('working', TradeType.BUY, '.4', OrderState.PARTIALLY_FILLED)
+        executor._entry_lifecycle['state'] = 'managing_fill'
+        info = executor.executor_info
+        info.custom_info['entry_acquisition'] = {
+            'cumulative_filled_base': gross,
+            'native_order_state': 'OPEN',
+        }
+        instance.executors_info = [info]
+        assert instance._executor_outstanding_base(info) is None
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+        assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_conflicting_native_gross_receipts_make_outstanding_unavailable():
+    instance = controller()
+    executor = make_executor()
+    executor.config.amount = D('1')
+    executor._open_order = tracked('working', TradeType.BUY, '.4', OrderState.PARTIALLY_FILLED)
+    executor._entry_lifecycle['state'] = 'managing_fill'
+    info = executor.executor_info
+    info.custom_info['entry_acquisition'] = {
+        'cumulative_filled_base': '0.9',
+        'native_order_state': 'OPEN',
+    }
+    info.custom_info['execution_receipt']['entry_gross_base'] = D('0.4')
+    instance.executors_info = [info]
+    assert instance._executor_outstanding_base(info) is None
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_over_authorized_order_executor_executed_amount_is_unavailable():
+    instance = controller()
+    info = SimpleNamespace(
+        id='order-ex',
+        is_active=True,
+        is_done=False,
+        connector_name='okx',
+        trading_pair='ETH-USDT',
+        side=TradeType.BUY,
+        timestamp=1.0,
+        net_pnl_pct=D('0'),
+        config=SimpleNamespace(type='order_executor', amount=D('1')),
+        custom_info={'executed_amount_base': D('2'), 'side': TradeType.BUY},
+    )
+    instance.executors_info = [info]
+    assert instance._executor_outstanding_base(info) is None
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
 
 
 def test_missing_or_failed_hold_ledger_does_not_release():

@@ -25,6 +25,7 @@ from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import OrderCancelledEvent
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.strategy_v2.executors.executor_orchestrator import PositionHold
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -453,5 +454,80 @@ async def test_native_recorder_requires_complete_fills_and_survives_disposal():
             assert instance._get_total_position_value_usd() == Decimal("30")
             instance.can_create_executor(1)
             assert instance._last_gate_reason[TradeType.BUY] != "exposure_unavailable"
+    finally:
+        MarketsRecorder._shared_instance = previous
+
+
+@pytest.mark.asyncio
+async def test_native_recorder_accepts_exact_payload_after_scaled_column_round_trip():
+    instance = okx_controller()
+    previous = MarketsRecorder._shared_instance
+    recorder = _memory_recorder()
+    try:
+        raw = _held_order("order-1", "0.02800601", "66.64391778", "0.06664391778")
+        info = _hold_done(executor_id="held-ex")
+        info.custom_info["held_position_orders"] = [raw]
+        instance.executors_info = [info]
+        recorder.store_or_update_position_hold_ledger_entries(
+            controller_id=instance.config.id,
+            executor_id="held-ex",
+            connector_name="okx",
+            trading_pair="ETH-USDT",
+            held_position_orders=[raw],
+        )
+        rows = recorder.get_position_hold_ledger_entries_by_controller(instance.config.id)
+        row = next(item for item in rows if item.client_order_id == "order-1")
+        assert row.executed_amount_base != Decimal("0.02800601")
+        assert row.executed_amount_quote != Decimal("66.64391778")
+        assert row.cumulative_fee_paid_quote != Decimal("0.06664391778")
+        assert row.order_payload["executed_amount_quote"] == "66.64391778"
+        bag = PositionHold("okx", "ETH-USDT", TradeType.BUY)
+        bag.add_order_record(row.to_order_record())
+        assert bag.buy_amount_base == Decimal("0.02800601")
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            _clear_hold_pass(instance)
+            assert instance._executor_hold_released_to_bag(info) is True
+            assert instance._executor_owned_base(info) == Decimal("0")
+    finally:
+        MarketsRecorder._shared_instance = previous
+
+
+@pytest.mark.asyncio
+async def test_native_recorder_rejects_payload_that_disagrees_with_row():
+    instance = okx_controller()
+    previous = MarketsRecorder._shared_instance
+    recorder = _memory_recorder()
+    try:
+        raw = _held_order("order-1", "0.028006", "66.644", "0.01")
+        info = _hold_done(executor_id="held-ex")
+        info.custom_info["held_position_orders"] = [raw]
+        instance.executors_info = [info]
+        recorder.store_or_update_position_hold_ledger_entries(
+            controller_id=instance.config.id,
+            executor_id="held-ex",
+            connector_name="okx",
+            trading_pair="ETH-USDT",
+            held_position_orders=[raw],
+        )
+        with recorder.sql_manager.get_new_session() as session:
+            row = session.query(PositionHoldLedger).filter_by(client_order_id="order-1").one()
+            payload = dict(row.order_payload)
+            payload["executed_amount_base"] = "0.9"
+            row.order_payload = payload
+            session.commit()
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            _clear_hold_pass(instance)
+            assert instance._executor_hold_released_to_bag(info) is False
+
+        with recorder.sql_manager.get_new_session() as session:
+            row = session.query(PositionHoldLedger).filter_by(client_order_id="order-1").one()
+            payload = dict(row.order_payload)
+            payload["executed_amount_base"] = "0.028006"
+            payload["client_order_id"] = "different-order"
+            row.order_payload = payload
+            session.commit()
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            _clear_hold_pass(instance)
+            assert instance._executor_hold_released_to_bag(info) is False
     finally:
         MarketsRecorder._shared_instance = previous

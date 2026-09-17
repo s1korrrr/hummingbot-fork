@@ -1515,18 +1515,60 @@ class HLRSIController(DirectionalTradingControllerBase):
             if oid in (None, ""):
                 return None
             valid, base = self._finite_nonnegative_base(held.get("executed_amount_base"))
-            if not valid:
+            if not valid or base is None:
                 return None
-            if base is None or base == 0:
+            if base == 0:
                 continue
             valid, quote = self._finite_nonnegative_base(held.get("executed_amount_quote"))
-            if not valid:
+            if not valid or quote is None or quote <= 0:
                 return None
             valid, fee = self._finite_nonnegative_base(held.get("cumulative_fee_paid_quote"))
-            if not valid:
+            if not valid or fee is None:
                 return None
-            required.append((str(oid), base, quote or Decimal("0"), fee or Decimal("0")))
+            required.append((str(oid), base, quote, fee))
         return required
+
+    def _hold_ledger_cumulative_receipt(self, row) -> Optional[Tuple[Decimal, Decimal, Decimal]]:
+        # SqliteDecimal columns are scaled projections. The native JSON payload
+        # preserves exact cumulative amounts used to rebuild the held position.
+        payload = getattr(row, "order_payload", None)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return None
+        payload_oid = payload.get("client_order_id") or payload.get("order_id")
+        if payload_oid not in (None, "") and str(payload_oid) != str(row.client_order_id):
+            return None
+        payload_side = payload.get("trade_type")
+        if payload_side not in (None, ""):
+            row_side = getattr(row, "order_side", None)
+            if row_side in (None, "") or str(payload_side).upper() != str(row_side).upper():
+                return None
+        values: List[Decimal] = []
+        for field in ("executed_amount_base", "executed_amount_quote", "cumulative_fee_paid_quote"):
+            valid, stored = self._finite_nonnegative_base(getattr(row, field, None))
+            if not valid or stored is None:
+                return None
+            value = stored
+            if field in payload:
+                valid, value = self._finite_nonnegative_base(payload[field])
+                if not valid or value is None:
+                    return None
+                # Compare using the actual native persistence conversion, not
+                # an epsilon or a guessed precision. Conflicts stay unavailable.
+                column_type = getattr(getattr(type(row), field, None), "type", None)
+                if column_type is None:
+                    return None
+                try:
+                    encoded = column_type.process_bind_param(value, None)
+                    projected = column_type.process_result_value(encoded, None)
+                except (ArithmeticError, AttributeError, TypeError, ValueError):
+                    return None
+                if projected != stored:
+                    return None
+            values.append(value)
+        base, quote, fee = values
+        return base, quote, fee
 
     def _executor_hold_released_to_bag(self, executor) -> bool:
         if not self._executor_claims_held_position(executor):
@@ -1562,16 +1604,9 @@ class HLRSIController(DirectionalTradingControllerBase):
             row_oid = getattr(row, "client_order_id", None)
             if row_oid in (None, ""):
                 continue
-            valid, base = self._finite_nonnegative_base(getattr(row, "executed_amount_base", None))
-            if not valid or base is None:
+            record = self._hold_ledger_cumulative_receipt(row)
+            if record is None:
                 return False
-            valid, quote = self._finite_nonnegative_base(getattr(row, "executed_amount_quote", None))
-            if not valid:
-                return False
-            valid, fee = self._finite_nonnegative_base(getattr(row, "cumulative_fee_paid_quote", None))
-            if not valid:
-                return False
-            record = (base, quote or Decimal("0"), fee or Decimal("0"))
             key = str(row_oid)
             if key in matched and matched[key] != record:
                 return False

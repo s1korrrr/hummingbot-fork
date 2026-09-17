@@ -221,7 +221,12 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         if tracked is None:
             if not self._entry_submitted and self._acquisition_permitted():
                 self._submit_initial_maker()
-            elif self._entry_stop_reason is None:
+            elif self._entry_submitted:
+                # Losing the local handle is not evidence that submission failed.
+                reason = self._revocation_or_deadline_reason()
+                if reason is not None:
+                    self._clear_replacement()
+                    self._end_entry_acquisition(reason)
                 self._entry_lifecycle["state"] = "reconciliation_required"
             return
 
@@ -229,7 +234,12 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         self.update_tracked_orders_with_order_id(tracked.order_id)
         order = tracked.order
         if order is None:
-            self._entry_lifecycle["state"] = "awaiting_order_update"
+            # The client identity remains reserved while the receipt is unknown.
+            reason = self._revocation_or_deadline_reason()
+            if reason is not None:
+                self._request_terminal_cancel(reason)
+            else:
+                self._entry_lifecycle["state"] = "awaiting_order_update"
             return
         if order.current_state == OrderState.FILLED:
             self._clear_replacement()
@@ -281,6 +291,15 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._request_terminal_cancel("input_unavailable")
             return
 
+        if best_bid is None or best_ask is None:
+            if decision.action is DownOnlyMakerAction.CANCEL_TERMINAL:
+                self._request_terminal_cancel(decision.reason.value)
+            elif self._entry_pending_target is not None:
+                self._request_current_cancel()
+            else:
+                self._entry_lifecycle["state"] = "awaiting_order_update"
+            return
+
         if self._entry_pending_target is not None:
             self._entry_lifecycle["state"] = "cancel_pending"
             if decision.action is DownOnlyMakerAction.CANCEL_TERMINAL:
@@ -329,8 +348,9 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
         price = self._maker_safe_price(self._entry_current_price)
         if price is None:
-            if self._intent_age_expired():
-                self._request_terminal_cancel("total_age_expired")
+            reason = self._revocation_or_deadline_reason()
+            if reason is not None:
+                self._request_terminal_cancel(reason)
             else:
                 self._entry_lifecycle["state"] = "awaiting_order_update"
             return
@@ -417,7 +437,10 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._entry_lifecycle["state"] = "reconciliation_required"
             return
         order.current_state = OrderState.CANCELED
-        if getattr(order, "cancel_source", None) == OKX_STP_CANCEL_SOURCE:
+        cancel_source = getattr(order, "cancel_source", None)
+        # A pending local reprice cannot override an explicit venue veto.
+        # Source 1 also covers API cancellations; it is not automatic-repair authority.
+        if cancel_source not in (None, "", "1", OKX_POST_ONLY_CANCEL_SOURCE):
             self._clear_replacement()
             super().process_order_canceled_event(_, market, event)
             return
@@ -548,7 +571,8 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
         target = self._maker_safe_price(previous_price)
         if not self._intent_allows_price(target if target is not None else previous_price):
-            self._entry_child_submission_authorized = False
+            if not self._acquisition_permitted():
+                self._entry_child_submission_authorized = False
             return
         if (
             target is None
@@ -635,12 +659,15 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         return tick
 
     def _live_book(self) -> Optional[tuple[Decimal, Decimal]]:
-        bid = self._to_decimal(self.get_price(
-            self.config.connector_name, self.config.trading_pair, PriceType.BestBid
-        ))
-        ask = self._to_decimal(self.get_price(
-            self.config.connector_name, self.config.trading_pair, PriceType.BestAsk
-        ))
+        try:
+            bid = self._to_decimal(self.get_price(
+                self.config.connector_name, self.config.trading_pair, PriceType.BestBid
+            ))
+            ask = self._to_decimal(self.get_price(
+                self.config.connector_name, self.config.trading_pair, PriceType.BestAsk
+            ))
+        except (ArithmeticError, AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return None
         if bid is None or ask is None or bid <= 0 or ask <= 0 or bid >= ask:
             return None
         return bid, ask
@@ -714,7 +741,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
 
     def _intent_allows_price(self, target: Decimal) -> bool:
         try:
-            decision, _, _, now = self._live_maker_decision(target, use_intent_clock=True)
+            decision, best_bid, best_ask, now = self._live_maker_decision(target, use_intent_clock=True)
         except Exception as exc:
             self.logger().error(self._log_message(f"Entry submission inputs unavailable: {type(exc).__name__}: {exc}"))
             self._request_terminal_cancel("input_unavailable")
@@ -726,6 +753,11 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._entry_upward_bound_first_breached_at = None
         if decision.action is DownOnlyMakerAction.CANCEL_TERMINAL:
             self._request_terminal_cancel(decision.reason.value)
+            return False
+        # A non-terminal HOLD is not submission permission. Recheck the latest
+        # observed ask; wait and recompute without consuming a new intent.
+        if best_bid is None or best_ask is None or target >= best_ask:
+            self._entry_lifecycle["state"] = "awaiting_order_update"
             return False
         return True
 

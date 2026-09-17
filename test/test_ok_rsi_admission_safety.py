@@ -86,6 +86,21 @@ def test_terminally_canceled_remainder_releases_only_resolved_commitment():
     assert instance._get_total_position_value_usd() == D('75')
 
 
+def test_managing_fill_canceled_open_order_state_releases_remainder_without_timestamp():
+    instance = controller()
+    instance.positions_held = [SimpleNamespace(connector_name='okx', trading_pair='ETH-USDT', side=TradeType.BUY,
+                                               amount=D('.74'), breakeven_price=D('100'), cum_fees_quote=D('0'))]
+    executor = make_executor()
+    executor.config.amount = D('.25')
+    executor._open_order = tracked('canceled', TradeType.BUY, '.01', OrderState.CANCELED)
+    executor._entry_lifecycle['state'] = 'managing_fill'
+    info = executor.executor_info
+    assert info.custom_info['open_order_state'] == 'CANCELED'
+    assert 'terminal_exchange_timestamp' not in (info.custom_info.get('entry_lifecycle') or {})
+    instance.executors_info = [info]
+    assert instance._get_total_position_value_usd() == D('75')
+
+
 def test_managing_fill_label_without_terminal_confirmation_keeps_unresolved_remainder():
     instance = controller()
     executor = make_executor()

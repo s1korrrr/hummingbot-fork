@@ -663,11 +663,20 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
 
     def _live_book(self) -> Optional[tuple[Decimal, Decimal]]:
         connector = self.connectors.get(self.config.connector_name)
-        if connector is not None and getattr(connector, "ready", None) is False:
+        if connector is None or getattr(connector, "ready", None) is False:
+            return None
+        tracker = getattr(connector, "order_book_tracker", None)
+        if tracker is not None and getattr(tracker, "ready", None) is False:
             return None
         provider = getattr(self._strategy, "market_data_provider", None)
         if provider is not None and getattr(provider, "ready", None) is False:
             return None
+        controllers = getattr(self._strategy, "controllers", None)
+        if isinstance(controllers, dict):
+            controller = controllers.get(self.config.controller_id)
+            controller_provider = getattr(controller, "market_data_provider", None) if controller is not None else None
+            if controller_provider is not None and getattr(controller_provider, "ready", None) is False:
+                return None
         try:
             bid = self._to_decimal(self.get_price(
                 self.config.connector_name, self.config.trading_pair, PriceType.BestBid

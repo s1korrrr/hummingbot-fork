@@ -167,6 +167,7 @@ def bind_controller(
         processed_data=processed_data,
         config=SimpleNamespace(manual_kill_switch=kill),
         _operator_entry_paused=pause,
+        market_data_provider=SimpleNamespace(ready=True),
     )
     if status is not None:
         controller.status = status
@@ -1211,14 +1212,18 @@ async def test_missing_controller_status_keeps_owned_fills_without_child():
     assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
 
 
-@pytest.mark.parametrize("unready", ["connector", "provider", "both"])
+@pytest.mark.parametrize("unready", ["connector", "provider", "tracker", "controller_provider", "both"])
 def test_execution_book_unreadiness_waits_despite_cached_quotes(unready):
     executor, connector, prices = make_executor()
-    bind_controller(executor, data_health={"ready": True})
+    controller = bind_controller(executor, data_health={"ready": True})
     if unready in ("connector", "both"):
         connector.ready = False
     if unready in ("provider", "both"):
         executor._strategy.market_data_provider = SimpleNamespace(ready=False)
+    if unready == "tracker":
+        connector.order_book_tracker = SimpleNamespace(ready=False)
+    if unready == "controller_provider":
+        controller.market_data_provider.ready = False
     assert prices[PriceType.BestBid] > 0
     assert prices[PriceType.BestAsk] > prices[PriceType.BestBid]
     executor.control_open_order()
@@ -1227,13 +1232,15 @@ def test_execution_book_unreadiness_waits_despite_cached_quotes(unready):
     assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
 
     connector.ready = True
+    connector.order_book_tracker = SimpleNamespace(ready=True)
     executor._strategy.market_data_provider = SimpleNamespace(ready=True)
+    controller.market_data_provider.ready = True
     executor.control_open_order()
     executor.place_order.assert_called_once()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("unready", ["connector", "provider"])
+@pytest.mark.parametrize("unready", ["connector", "provider", "tracker", "controller_provider"])
 async def test_execution_book_unreadiness_waits_on_child_despite_cached_quotes(unready):
     executor, connector, prices = make_executor()
     request_reprice(executor, prices)
@@ -1241,12 +1248,16 @@ async def test_execution_book_unreadiness_waits_on_child_despite_cached_quotes(u
     parent.order.current_state = OrderState.CANCELED
     install_terminal_reconciliation(connector, parent)
     executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
-    bind_controller(executor, data_health={"ready": True})
+    controller = bind_controller(executor, data_health={"ready": True})
     await finish_reconciliation(executor)
     if unready == "connector":
         connector.ready = False
-    else:
+    elif unready == "provider":
         executor._strategy.market_data_provider = SimpleNamespace(ready=False)
+    elif unready == "tracker":
+        connector.order_book_tracker = SimpleNamespace(ready=False)
+    else:
+        controller.market_data_provider.ready = False
     assert prices[PriceType.BestBid] > 0
     assert prices[PriceType.BestAsk] > prices[PriceType.BestBid]
     executor.control_open_order()

@@ -473,12 +473,24 @@ class PositionExecutor(ExecutorBase):
             and self.open_filled_amount > Decimal("0")
         )
 
+    def _expected_close_amount(self) -> Optional[Decimal]:
+        remaining = self._to_decimal(self.amount_to_close)
+        if remaining is None or remaining <= Decimal("0"):
+            return None
+        try:
+            parsed = self._to_decimal(self._close_order_amount())
+        except Exception:
+            return None
+        if parsed is None or parsed <= Decimal("0") or parsed > remaining:
+            return None
+        return parsed
+
     def _expected_close_fee_rate(self) -> Optional[Decimal]:
         assets = self.config.trading_pair.split("-")
         if len(assets) < 2:
             return None
-        close_qty = self._to_decimal(self._close_order_amount())
-        if close_qty is None or close_qty <= Decimal("0"):
+        close_amount = self._expected_close_amount()
+        if close_amount is None:
             return None
         close_order_type = self._close_order_type_for(CloseType.TRAILING_STOP)
         is_maker = close_order_type == OrderType.LIMIT_MAKER
@@ -491,7 +503,7 @@ class PositionExecutor(ExecutorBase):
                 quote_currency=assets[1],
                 order_type=close_order_type,
                 order_side=self.close_order_side,
-                amount=close_qty,
+                amount=close_amount,
                 price=self.entry_price,
                 is_maker=is_maker,
             )
@@ -506,13 +518,13 @@ class PositionExecutor(ExecutorBase):
                     assets[1],
                     close_order_type,
                     self.close_order_side,
-                    close_qty,
+                    close_amount,
                     self.entry_price,
                 )
             except Exception:
                 # ponytail: TradeFeeSchemaLoader raises Exception for unknown connectors; hold rather than sell
                 return None
-        return self._fee_rate_from_trade_fee(fee, close_qty, self.entry_price)
+        return self._fee_rate_from_trade_fee(fee, close_amount, self.entry_price)
 
     def _fee_rate_from_trade_fee(
         self, fee: TradeFeeBase, amount: Decimal, price: Decimal
@@ -1612,6 +1624,10 @@ class PositionExecutor(ExecutorBase):
             "open_order_expiry_reconciled": self._open_order_expiry_reconciled,
             "open_order_filled_amount_base": self.open_filled_amount,
             "open_order_filled_amount_quote": self.open_filled_amount_quote,
+            "open_order_state": (
+                None if self._open_order is None or self._open_order.order is None
+                else self._open_order.order.current_state.name
+            ),
             "order_ids": [order.order_id for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()])],
             "close_order_filled_amount_base": self.close_filled_amount,
             "remaining_position_amount_base": self.amount_to_close,

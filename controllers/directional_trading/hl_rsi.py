@@ -1619,10 +1619,17 @@ class HLRSIController(DirectionalTradingControllerBase):
         return not bool(getattr(executor, "is_active", True))
 
     def _executor_native_order_state(self, executor) -> Optional[str]:
-        state = (self._executor_custom_info(executor).get("entry_acquisition") or {}).get("native_order_state")
-        if state in (None, ""):
-            return None
-        return str(state).upper()
+        custom = self._executor_custom_info(executor)
+        acquisition = custom.get("entry_acquisition") or {}
+        for candidate in (
+            acquisition.get("native_order_state"),
+            custom.get("open_order_state"),
+        ):
+            if candidate in (None, ""):
+                continue
+            name = candidate.name if hasattr(candidate, "name") else str(candidate)
+            return name.upper()
+        return None
 
     @staticmethod
     def _finite_nonnegative_base(value: object) -> Tuple[bool, Optional[Decimal]]:

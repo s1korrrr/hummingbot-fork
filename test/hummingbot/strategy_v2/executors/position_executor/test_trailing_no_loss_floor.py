@@ -230,7 +230,24 @@ def test_flat_fee_floor_uses_remainder_after_prior_close():
 
 def test_blocked_close_quantity_holds_without_inventing_a_fee_rate():
     executor = _executor(D("110"), close_fee=_flat_close_fee(), available_base=D("0"))
+    executor.connectors["okx"].get_fee.reset_mock()
     assert executor._close_order_amount() == D("0")
+    assert executor._expected_close_amount() is None
     assert executor._expected_close_fee_rate() is None
+    executor.connectors["okx"].get_fee.assert_not_called()
     assert executor._min_no_loss_sell_price() is None
     assert executor._should_hold_trailing_close() is True
+
+
+def test_oversized_or_failed_native_close_does_not_invent_a_fee_rate():
+    executor = _executor(D("110"), close_fee=_flat_close_fee())
+    executor.connectors["okx"].get_fee.reset_mock()
+    executor._close_order_amount = lambda: executor.amount_to_close + D("1")
+    assert executor._expected_close_amount() is None
+    assert executor._expected_close_fee_rate() is None
+    executor.connectors["okx"].get_fee.assert_not_called()
+
+    executor._close_order_amount = MagicMock(side_effect=RuntimeError("qty"))
+    assert executor._expected_close_amount() is None
+    assert executor._expected_close_fee_rate() is None
+    executor.connectors["okx"].get_fee.assert_not_called()

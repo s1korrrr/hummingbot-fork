@@ -159,12 +159,14 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         pause = bool(getattr(controller, "_operator_entry_paused", False))
         risk_allowed = not (kill or pause)
         status = getattr(controller, "status", None)
-        if status is not None and status != RunnableStatus.RUNNING:
+        if status != RunnableStatus.RUNNING:
             risk_allowed = False
         data_health = getattr(controller, "data_health", None)
         if data_health is None and isinstance(processed, dict):
             data_health = processed.get("data_health")
-        if data_health is not None:
+        if data_health is None:
+            risk_allowed = False
+        else:
             ready = data_health.get("ready") if isinstance(data_health, dict) else getattr(data_health, "ready", None)
             if not ready:
                 risk_allowed = False
@@ -363,6 +365,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         self._submit_open_order(price)
         self._entry_current_price = price
         self._entry_order_created_at = float(self._strategy.current_timestamp)
+        self._entry_last_reprice_at = self._entry_order_created_at
         self._entry_lifecycle["state"] = "awaiting_order_update"
 
     def early_stop(self, keep_position: bool = False):
@@ -659,6 +662,12 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         return tick
 
     def _live_book(self) -> Optional[tuple[Decimal, Decimal]]:
+        connector = self.connectors.get(self.config.connector_name)
+        if connector is not None and getattr(connector, "ready", None) is False:
+            return None
+        provider = getattr(self._strategy, "market_data_provider", None)
+        if provider is not None and getattr(provider, "ready", None) is False:
+            return None
         try:
             bid = self._to_decimal(self.get_price(
                 self.config.connector_name, self.config.trading_pair, PriceType.BestBid

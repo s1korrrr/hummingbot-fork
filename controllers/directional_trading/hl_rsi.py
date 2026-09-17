@@ -31,6 +31,7 @@ from pydantic import Field as PydanticField, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
 from hummingbot.client.config.config_data_types import ClientFieldData
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -1471,71 +1472,63 @@ class HLRSIController(DirectionalTradingControllerBase):
             return True
         return getattr(executor, "close_type", None) == CloseType.POSITION_HOLD
 
-    def _held_buy_inventory_amount(self) -> Optional[Decimal]:
-        total = Decimal("0")
-        for position in self.positions_held:
-            if (position.connector_name != self.config.connector_name or
-                    position.trading_pair != self.config.trading_pair or
-                    position.side != TradeType.BUY):
-                continue
-            held_amount = self._decimal_or_none(position.amount)
-            if held_amount is None or held_amount < 0:
-                return None
-            total += held_amount
-        return total
-
-    def _executor_hold_age_key(self, executor) -> Optional[Tuple[float, str]]:
-        close_ts = getattr(executor, "close_timestamp", None)
-        age = close_ts if close_ts not in (None, "") else getattr(executor, "timestamp", None)
-        if age in (None, ""):
+    def _hold_ledger_rows(self) -> Optional[List]:
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is None:
             return None
         try:
-            age_value = float(age)
-        except (TypeError, ValueError):
+            rows = recorder.get_position_hold_ledger_entries_by_controller(self.config.id)
+        except Exception:
+            # ponytail: any recorder/SQL miss is unmatched; bag amount is not a transfer proof.
             return None
-        if age_value != age_value:
+        if rows is None:
             return None
-        executor_id = getattr(executor, "id", None)
-        tie = "" if executor_id in (None, "") else str(executor_id)
-        return (age_value, tie)
+        return list(rows)
 
-    def _done_buy_hold_claimants_oldest_first(self) -> Optional[List]:
-        keyed: List[Tuple[Tuple[float, str], object]] = []
-        seen_keys = set()
-        for other in self._filter_same_side(TradeType.BUY, active_only=False):
-            if not self._executor_claims_held_position(other):
+    def _executor_hold_order_ids(self, executor) -> set:
+        custom = self._executor_custom_info(executor)
+        order_ids = {str(oid) for oid in (custom.get("order_ids") or []) if oid not in (None, "")}
+        for held in custom.get("held_position_orders") or []:
+            if not isinstance(held, dict):
                 continue
-            if not self._executor_is_done(other):
-                continue
-            key = self._executor_hold_age_key(other)
-            if key is None or key in seen_keys:
-                return None
-            seen_keys.add(key)
-            keyed.append((key, other))
-        keyed.sort(key=lambda item: item[0])
-        return [item[1] for item in keyed]
+            oid = held.get("client_order_id") or held.get("order_id")
+            if oid not in (None, ""):
+                order_ids.add(str(oid))
+        return order_ids
 
     def _executor_hold_released_to_bag(self, executor) -> bool:
         if not self._executor_claims_held_position(executor):
             return False
         if not self._executor_is_done(executor):
             return False
-        held = self._held_buy_inventory_amount()
-        if held is None or held <= 0:
+        executor_id = getattr(executor, "id", None)
+        if executor_id in (None, ""):
             return False
-        # ponytail: covering-sum of done/TERMINATED hold leftovers, oldest close first.
-        # Ceiling: bag rows have no executor id; a dropped released claimant no longer consumes the bag.
-        claimants = self._done_buy_hold_claimants_oldest_first()
-        if claimants is None:
+        rows = self._hold_ledger_rows()
+        if not rows:
             return False
-        allocated = Decimal("0")
-        for other in claimants:
-            leftover = self._executor_reported_owned_base(other)
-            if leftover is None:
-                return False
-            allocated += leftover
-            if other is executor:
-                return held >= allocated
+        want_id = str(executor_id)
+        connector = self.config.connector_name
+        pair = self.config.trading_pair
+        order_ids = self._executor_hold_order_ids(executor)
+        expected_side = getattr(getattr(executor, "side", None), "name", getattr(executor, "side", None))
+        expected_side_name = None if expected_side in (None, "") else str(expected_side).upper()
+        for row in rows:
+            if str(getattr(row, "executor_id", "") or "") != want_id:
+                continue
+            if getattr(row, "connector_name", None) != connector:
+                continue
+            if getattr(row, "trading_pair", None) != pair:
+                continue
+            position_side = getattr(row, "position_side", None)
+            if position_side not in (None, "") and expected_side_name is not None:
+                if str(position_side).upper() != expected_side_name:
+                    continue
+            if order_ids:
+                row_oid = getattr(row, "client_order_id", None)
+                if row_oid in (None, "") or str(row_oid) not in order_ids:
+                    continue
+            return True
         return False
 
     def _executor_is_done(self, executor) -> bool:
@@ -1653,16 +1646,22 @@ class HLRSIController(DirectionalTradingControllerBase):
             filled = self._decimal_or_none(custom.get("executed_amount_base"))
             if filled is None or filled < 0:
                 return None
+            remainder = max(Decimal("0"), authorized - filled)
         else:
             filled = self._decimal_or_none(custom.get("open_order_filled_amount_base"))
             acquired = self._decimal_or_none((custom.get("entry_acquisition") or {}).get("cumulative_filled_base"))
             if filled is None:
                 filled = Decimal("0")
-            if acquired is not None:
-                filled = max(filled, acquired)
             if filled < 0:
                 return None
-        remainder = max(Decimal("0"), authorized - filled)
+            used = filled
+            if acquired is not None:
+                if acquired < 0:
+                    return None
+                used = max(filled, acquired)
+            if used > authorized:
+                return None
+            remainder = authorized - used
         if remainder == 0 or self._executor_acquisition_remainder_reconciled(executor):
             return Decimal("0")
         return remainder

@@ -284,10 +284,12 @@ class OKRSIController(hl_rsi.HLRSIController):
         actions = super().stop_actions_proposal()
         if self._entry_acquisition_policy != "down_only_maker_v1":
             return actions
+        # Operator pause refuses new BUY in can_create_executor. It must not
+        # POSITION_HOLD a filled trailing owner or an empty unfilled remainder.
+        # Kill and opposing signal stay broader and still stop the executor.
         invalidated = (
             (self.processed_data or {}).get("signal", 0) < 0
             or bool(getattr(self.config, "manual_kill_switch", False))
-            or bool(getattr(self, "_operator_entry_paused", False))
         )
         if not invalidated:
             try:

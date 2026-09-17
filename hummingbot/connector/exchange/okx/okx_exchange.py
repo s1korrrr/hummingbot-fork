@@ -407,6 +407,16 @@ class OkxExchange(ExchangePyBase):
 
         return trade_updates
 
+    @staticmethod
+    def _okx_order_misc_updates(data: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        source = data.get("cancelSource")
+        if source is None:
+            return None
+        text = str(source).strip()
+        if not text:
+            return None
+        return {"cancel_source": text}
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         updated_order_data = await self._request_order_update(order=tracked_order)
 
@@ -415,12 +425,17 @@ class OkxExchange(ExchangePyBase):
         if new_state in {OrderState.CANCELED, OrderState.FILLED}:
             await self._reconcile_terminal_order_fills(tracked_order, order_data)
 
+        misc_updates = self._okx_order_misc_updates(order_data)
+        cancel_source = None if misc_updates is None else misc_updates.get("cancel_source")
+        if cancel_source:
+            tracked_order.cancel_source = cancel_source
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(order_data["ordId"]),
             trading_pair=tracked_order.trading_pair,
             update_timestamp=int(order_data["uTime"]) * 1e-3,
             new_state=new_state,
+            misc_updates=misc_updates,
         )
         return order_update
 
@@ -486,6 +501,7 @@ class OkxExchange(ExchangePyBase):
                                 new_state=order_status,
                                 client_order_id=updatable_order.client_order_id,
                                 exchange_order_id=str(data["ordId"]),
+                                misc_updates=self._okx_order_misc_updates(data),
                             )
                             self._order_tracker.process_order_update(order_update=order_update)
 

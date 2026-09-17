@@ -1,0 +1,49 @@
+{
+  "reviewed_product_commit": "bd46d9bb167b17bf27f1a299e14dcd69d4cb17c3",
+  "repository": "s1korrrr/hummingbot",
+  "pull_request": 52,
+  "verdict": "REQUEST_CHANGES",
+  "baseline": {
+    "passed": 15,
+    "failed": 9,
+    "errors": 0,
+    "skipped": 0
+  },
+  "candidate_excerpt": {
+    "passed": 24,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "scope": "Source-extracted controller predicates; real SQLAlchemy/SQLite persistence; substituted recorder, terminal-owner and decimal-parser dependencies. Not native Hummingbot execution.",
+  "runtime": {
+    "python": "3.13.5",
+    "sqlalchemy": "2.0.50",
+    "pytest": "9.0.2"
+  },
+  "source": {
+    "controllers/directional_trading/hl_rsi.py": {
+      "full_git_blob_from_github": "7745b9e51f4e6f99e2d54a344676e016af85981c",
+      "local_representation": "excerpt only; full blob not independently reconstructed",
+      "excerpt_sha256": "58fed47550be59a323eaf2040e3a26274a14c3cddb1254073915a44cbdbc83f2"
+    },
+    "hummingbot/model/position_hold_ledger.py": {
+      "full_git_blob_verified": "377064842c795f64254a4d96d318316e68c68f07"
+    },
+    "hummingbot/model/decimal_type_decorator.py": {
+      "full_git_blob_verified": "2d5189b65d4ed9ea952c7d61b3ce8f06a1b57852"
+    }
+  },
+  "proposed_patch_sha256": "cd2922399eeae088550f8d7aa1bfdb1b777e18db755cddbd877c8c542e78bcdb",
+  "not_run": [
+    "full native Hummingbot suite",
+    "full source-bound build",
+    "recorder/orchestrator application or recovery integration",
+    "exchange execution",
+    "independent review of the new candidate patch"
+  ],
+  "production_changes_applied": false,
+  "merged": false,
+  "deployed": false,
+  "execution_started_or_restarted": false
+}

@@ -31,6 +31,7 @@ from pydantic import Field as PydanticField, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
 from hummingbot.client.config.config_data_types import ClientFieldData
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -89,6 +90,23 @@ _MARKET_DATA_ERRORS = (AttributeError, KeyError, RuntimeError, TypeError, ValueE
 _PROVIDER_ERRORS = (AttributeError, KeyError, RuntimeError, TypeError, ValueError)
 _INDICATOR_ERRORS = (AttributeError, KeyError, IndexError, RuntimeError, TypeError, ValueError, ArithmeticError)
 _STATUS_FORMAT_ERRORS = (AttributeError, KeyError, OSError, TypeError, ValueError, ArithmeticError)
+_TERMINAL_ENTRY_LIFECYCLE_STATES = frozenset({
+    "managing_fill",
+    "ended_no_fill",
+    "held_residual",
+})
+_OPEN_NATIVE_ORDER_STATES = frozenset({
+    "PENDING_CREATE",
+    "OPEN",
+    "PENDING_CANCEL",
+    "PARTIALLY_FILLED",
+    "PENDING_APPROVAL",
+    "APPROVED",
+    "CREATED",
+})
+_RECONCILED_NATIVE_ORDER_STATES = frozenset({"CANCELED", "FILLED", "COMPLETED"})
+_RECONCILED_ACQUISITION_STATES = frozenset({"ended_no_fill", "held_residual"})
+_HOLD_LEDGER_UNSET = object()
 
 
 def _extract_client_field_value(client_data: Optional[ClientFieldData], key: str):
@@ -302,7 +320,7 @@ class HLRSIControllerConfig(DirectionalTradingControllerConfigBase):
 
     # --- Multi-indicator signal scoring ---
     min_signal_score: int = Field(default=2, ge=1, le=4, client_data=ClientFieldData(prompt=lambda mi: "Min indicators that must agree (1-4):", prompt_on_new=False, is_updatable=True))
-    dca_score_boost: int = Field(default=1, ge=0, le=2, client_data=ClientFieldData(prompt=lambda mi: "Extra score required when DCA-ing into loss:", prompt_on_new=False, is_updatable=True))
+    dca_score_boost: int = Field(default=1, ge=0, le=2, client_data=ClientFieldData(prompt=lambda mi: "Extra score for averaging-down additions into a losing owned position:", prompt_on_new=False, is_updatable=True))
     buy_confirmation_mode: str = Field(default="none", client_data=ClientFieldData(prompt=lambda mi: "BUY confirmation mode (none/rebound_confirm):", prompt_on_new=False, is_updatable=True))
     buy_confirmation_rsi_delta: float = Field(default=1.0, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "BUY confirmation RSI rebound delta:", prompt_on_new=False, is_updatable=True))
     buy_confirmation_max_wait_seconds: int = Field(default=75, ge=0, client_data=ClientFieldData(prompt=lambda mi: "BUY confirmation max wait seconds (0=no timeout):", prompt_on_new=False, is_updatable=True))
@@ -336,7 +354,7 @@ class HLRSIControllerConfig(DirectionalTradingControllerConfigBase):
     # --- Max hold time (0 = no limit) ---
     max_hold_time_seconds: int = Field(default=0, ge=0, client_data=ClientFieldData(prompt=lambda mi: "Max hold time seconds (0=disabled):", prompt_on_new=False, is_updatable=True))
 
-    # --- Entry spacing (DCA ladder) ---
+    # --- Entry spacing between independently admitted entries ---
     executor_price_gap_threshold: Decimal = Field(default=Decimal("0.0045"), client_data=ClientFieldData(prompt=lambda mi: "Min price gap between entries:", prompt_on_new=False, is_updatable=True))
     sell_executor_price_gap_threshold: Decimal = Field(default=Decimal("0.01"), ge=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Min price gap between sell executors:", prompt_on_new=False, is_updatable=True))
     cooldown_time: int = Field(default=90, ge=15, client_data=ClientFieldData(prompt=lambda mi: "Base cooldown seconds:", prompt_on_new=False, is_updatable=True))
@@ -1220,6 +1238,13 @@ class HLRSIController(DirectionalTradingControllerBase):
             return None
         return decimal_value if decimal_value.is_finite() else None
 
+    @staticmethod
+    def _positive_decimal(value: object) -> Optional[Decimal]:
+        parsed = HLRSIController._decimal_or_none(value)
+        if parsed is None or parsed <= 0:
+            return None
+        return parsed
+
     def _get_available_asset_balance(self, asset: Optional[str]) -> Optional[Decimal]:
         if asset is None:
             return None
@@ -1294,7 +1319,7 @@ class HLRSIController(DirectionalTradingControllerBase):
                 executor_id = getattr(executor, "id", None)
                 if executor_id is None or executor_id in stopped_executor_ids:
                     continue
-                ref_price = self._executor_ref_price(executor)
+                ref_price = self._executor_remaining_position_basis(executor)
                 if ref_price is None or ref_price <= 0:
                     continue
                 pnl_pct = (
@@ -1422,27 +1447,421 @@ class HLRSIController(DirectionalTradingControllerBase):
             context_parts.append(f"avg_entry={avg_entry:.6f}")
         return " ".join(context_parts)
 
+    def _executor_custom_info(self, executor) -> Dict:
+        return getattr(executor, "custom_info", None) or {}
+
+    def _executor_entry_lifecycle_state(self, executor) -> Optional[str]:
+        custom = self._executor_custom_info(executor)
+        acquisition = custom.get("entry_acquisition") or {}
+        lifecycle = custom.get("entry_lifecycle") or {}
+        state = acquisition.get("state") or lifecycle.get("state")
+        if state in (None, ""):
+            return None
+        return str(state)
+
+    def _executor_acquisition_may_still_fill(self, executor) -> bool:
+        return self._executor_entry_lifecycle_state(executor) not in _TERMINAL_ENTRY_LIFECYCLE_STATES
+
+    def _executor_accounting_owner(self, executor) -> Optional[str]:
+        owner = (self._executor_custom_info(executor).get("execution_receipt") or {}).get("accounting_owner")
+        if owner in (None, ""):
+            return None
+        return str(owner)
+
+    def _executor_claims_held_position(self, executor) -> bool:
+        if self._executor_accounting_owner(executor) == "held_position":
+            return True
+        return getattr(executor, "close_type", None) == CloseType.POSITION_HOLD
+
+    def _load_hold_ledger_rows(self) -> Optional[List]:
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is None:
+            return None
+        try:
+            rows = recorder.get_position_hold_ledger_entries_by_controller(self.config.id)
+        except Exception:
+            # ponytail: any recorder/SQL miss is unmatched; bag amount is not a transfer proof.
+            return None
+        if rows is None:
+            return None
+        return list(rows)
+
+    def _hold_ledger_rows(self) -> Optional[List]:
+        cached = getattr(self, "_hold_ledger_pass", _HOLD_LEDGER_UNSET)
+        if cached is not _HOLD_LEDGER_UNSET:
+            return cached
+        return self._load_hold_ledger_rows()
+
+    def _begin_hold_ledger_pass(self) -> bool:
+        if getattr(self, "_hold_ledger_pass", _HOLD_LEDGER_UNSET) is not _HOLD_LEDGER_UNSET:
+            return False
+        self._hold_ledger_pass = self._load_hold_ledger_rows()
+        return True
+
+    def _end_hold_ledger_pass(self, owned: bool) -> None:
+        if owned:
+            self._hold_ledger_pass = _HOLD_LEDGER_UNSET
+
+    def _executor_hold_required_fills(self, executor) -> Optional[List[Tuple[str, Decimal, Decimal, Decimal]]]:
+        custom = self._executor_custom_info(executor)
+        orders = custom.get("held_position_orders")
+        if not isinstance(orders, list):
+            return None if orders is not None else []
+        required: List[Tuple[str, Decimal, Decimal, Decimal]] = []
+        for held in orders:
+            if not isinstance(held, dict):
+                return None
+            oid = held.get("client_order_id") or held.get("order_id")
+            if oid in (None, ""):
+                return None
+            valid, base = self._finite_nonnegative_base(held.get("executed_amount_base"))
+            if not valid or base is None:
+                return None
+            if base == 0:
+                continue
+            valid, quote = self._finite_nonnegative_base(held.get("executed_amount_quote"))
+            if not valid or quote is None or quote <= 0:
+                return None
+            valid, fee = self._finite_nonnegative_base(held.get("cumulative_fee_paid_quote"))
+            if not valid or fee is None:
+                return None
+            required.append((str(oid), base, quote, fee))
+        return required
+
+    def _hold_ledger_cumulative_receipt(self, row) -> Optional[Tuple[Decimal, Decimal, Decimal]]:
+        # SqliteDecimal columns are scaled projections. The native JSON payload
+        # preserves exact cumulative amounts used to rebuild the held position.
+        payload = getattr(row, "order_payload", None)
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            return None
+        payload_oid = payload.get("client_order_id") or payload.get("order_id")
+        if payload_oid not in (None, "") and str(payload_oid) != str(row.client_order_id):
+            return None
+        payload_side = payload.get("trade_type")
+        if payload_side not in (None, ""):
+            row_side = getattr(row, "order_side", None)
+            if row_side in (None, "") or str(payload_side).upper() != str(row_side).upper():
+                return None
+        values: List[Decimal] = []
+        for field in ("executed_amount_base", "executed_amount_quote", "cumulative_fee_paid_quote"):
+            valid, stored = self._finite_nonnegative_base(getattr(row, field, None))
+            if not valid or stored is None:
+                return None
+            value = stored
+            if field in payload:
+                valid, value = self._finite_nonnegative_base(payload[field])
+                if not valid or value is None:
+                    return None
+                # Compare using the actual native persistence conversion, not
+                # an epsilon or a guessed precision. Conflicts stay unavailable.
+                column_type = getattr(getattr(type(row), field, None), "type", None)
+                if column_type is None:
+                    return None
+                try:
+                    encoded = column_type.process_bind_param(value, None)
+                    projected = column_type.process_result_value(encoded, None)
+                except (ArithmeticError, AttributeError, TypeError, ValueError):
+                    return None
+                if projected != stored:
+                    return None
+            values.append(value)
+        base, quote, fee = values
+        return base, quote, fee
+
+    def _executor_hold_released_to_bag(self, executor) -> bool:
+        if not self._executor_claims_held_position(executor):
+            return False
+        if not self._executor_is_done(executor):
+            return False
+        executor_id = getattr(executor, "id", None)
+        if executor_id in (None, ""):
+            return False
+        required = self._executor_hold_required_fills(executor)
+        if not required:
+            return False
+        rows = self._hold_ledger_rows()
+        if not rows:
+            return False
+        want_id = str(executor_id)
+        connector = self.config.connector_name
+        pair = self.config.trading_pair
+        expected_side = getattr(getattr(executor, "side", None), "name", getattr(executor, "side", None))
+        expected_side_name = None if expected_side in (None, "") else str(expected_side).upper()
+        matched: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}
+        for row in rows:
+            if str(getattr(row, "executor_id", "") or "") != want_id:
+                continue
+            if getattr(row, "connector_name", None) != connector:
+                continue
+            if getattr(row, "trading_pair", None) != pair:
+                continue
+            position_side = getattr(row, "position_side", None)
+            if position_side not in (None, "") and expected_side_name is not None:
+                if str(position_side).upper() != expected_side_name:
+                    continue
+            row_oid = getattr(row, "client_order_id", None)
+            if row_oid in (None, ""):
+                continue
+            record = self._hold_ledger_cumulative_receipt(row)
+            if record is None:
+                return False
+            key = str(row_oid)
+            if key in matched and matched[key] != record:
+                return False
+            matched[key] = record
+        return all(matched.get(oid) == (base, quote, fee) for oid, base, quote, fee in required)
+
+    def _executor_is_done(self, executor) -> bool:
+        if hasattr(executor, "is_done"):
+            return bool(executor.is_done)
+        return not bool(getattr(executor, "is_active", True))
+
+    def _executor_native_order_state(self, executor) -> Optional[str]:
+        custom = self._executor_custom_info(executor)
+        acquisition = custom.get("entry_acquisition") or {}
+        for candidate in (
+            acquisition.get("native_order_state"),
+            custom.get("open_order_state"),
+        ):
+            if candidate in (None, ""):
+                continue
+            name = candidate.name if hasattr(candidate, "name") else str(candidate)
+            return name.upper()
+        return None
+
+    @staticmethod
+    def _finite_nonnegative_base(value: object) -> Tuple[bool, Optional[Decimal]]:
+        if value is None or value == "":
+            return True, None
+        parsed = HLRSIController._decimal_or_none(value)
+        if parsed is None or parsed < 0:
+            return False, None
+        return True, parsed
+
+    def _executor_acquisition_remainder_reconciled(self, executor) -> bool:
+        if self._executor_claims_held_position(executor):
+            return self._executor_hold_released_to_bag(executor)
+        if self._executor_acquisition_may_still_fill(executor):
+            return False
+        native = self._executor_native_order_state(executor)
+        if native in _OPEN_NATIVE_ORDER_STATES:
+            return False
+        if self._executor_entry_lifecycle_state(executor) == "reconciliation_required":
+            return False
+        if native in _RECONCILED_NATIVE_ORDER_STATES:
+            return True
+        custom = self._executor_custom_info(executor)
+        if custom.get("open_order_expiry_reconciled"):
+            return True
+        lifecycle = custom.get("entry_lifecycle") or {}
+        if lifecycle.get("terminal_exchange_timestamp") not in (None, ""):
+            return True
+        if self._executor_entry_lifecycle_state(executor) in _RECONCILED_ACQUISITION_STATES:
+            return True
+        return self._executor_is_done(executor)
+
+    def _executor_counts_toward_buy_capital(self, executor) -> bool:
+        if self._executor_hold_released_to_bag(executor):
+            return False
+        if not self._executor_is_done(executor):
+            return True
+        owned = self._executor_owned_base(executor)
+        outstanding = self._executor_outstanding_base(executor)
+        if owned is None or outstanding is None:
+            return True
+        return owned > 0 or outstanding > 0
+
+    def _buy_executors_for_capital(self):
+        return [
+            executor for executor in self._filter_same_side(TradeType.BUY, active_only=False)
+            if self._executor_counts_toward_buy_capital(executor)
+        ]
+
+    def _executor_reported_owned_base(self, executor) -> Optional[Decimal]:
+        custom = self._executor_custom_info(executor)
+        receipt = custom.get("execution_receipt") or {}
+        measures: List[Decimal] = []
+        for candidate in (
+            custom.get("remaining_position_amount_base"),
+            receipt.get("remaining_owned_base"),
+        ):
+            valid, parsed = self._finite_nonnegative_base(candidate)
+            if not valid:
+                return None
+            if parsed is not None:
+                measures.append(parsed)
+        filled_raw = custom.get("open_order_filled_amount_base")
+        if "open_order_filled_amount_base" in custom or filled_raw is not None:
+            valid, filled = self._finite_nonnegative_base(filled_raw)
+            if not valid or filled is None:
+                return None
+            valid, closed = self._finite_nonnegative_base(custom.get("close_order_filled_amount_base", 0))
+            if not valid:
+                return None
+            derived = filled - (closed or Decimal("0"))
+            if derived < 0:
+                return None
+            measures.append(derived)
+        if not measures:
+            return None
+        owned = measures[0]
+        if any(item != owned for item in measures[1:]):
+            return None
+        authorized = self._decimal_or_none(getattr(getattr(executor, "config", None), "amount", None))
+        if authorized is None or authorized < 0 or owned > authorized:
+            return None
+        return owned
+
+    def _executor_owned_base(self, executor) -> Optional[Decimal]:
+        if getattr(getattr(executor, "config", None), "type", None) == "order_executor":
+            return Decimal("0")
+        if self._executor_hold_released_to_bag(executor):
+            return Decimal("0")
+        if self._executor_claims_held_position(executor):
+            return None
+        return self._executor_reported_owned_base(executor)
+
+    @staticmethod
+    def _supplied_nonnegative_base(container: object, key: str) -> Tuple[bool, Optional[Decimal]]:
+        if not isinstance(container, dict) or key not in container:
+            return True, None
+        return HLRSIController._finite_nonnegative_base(container[key])
+
+    def _executor_outstanding_base(self, executor) -> Optional[Decimal]:
+        if self._executor_hold_released_to_bag(executor):
+            return Decimal("0")
+        if self._executor_claims_held_position(executor):
+            return None
+        config = getattr(executor, "config", None)
+        authorized = self._decimal_or_none(getattr(config, "amount", None))
+        if authorized is None or authorized < 0:
+            return None
+        custom = self._executor_custom_info(executor)
+        if getattr(config, "type", None) == "order_executor":
+            valid, filled = self._supplied_nonnegative_base(custom, "executed_amount_base")
+            if not valid or filled is None:
+                return None
+            if filled > authorized:
+                return None
+            remainder = authorized - filled
+        else:
+            valid, filled = self._supplied_nonnegative_base(custom, "open_order_filled_amount_base")
+            if not valid:
+                return None
+            filled = filled or Decimal("0")
+            acquisition = custom.get("entry_acquisition")
+            receipt = custom.get("execution_receipt")
+            if acquisition is None:
+                acquisition = {}
+            elif not isinstance(acquisition, dict):
+                return None
+            if receipt is None:
+                receipt = {}
+            elif not isinstance(receipt, dict):
+                return None
+            gross_values: List[Decimal] = []
+            for container, key in (
+                (acquisition, "cumulative_filled_base"),
+                (receipt, "entry_gross_base"),
+            ):
+                valid, parsed = self._supplied_nonnegative_base(container, key)
+                if not valid:
+                    return None
+                if parsed is not None:
+                    gross_values.append(parsed)
+            if gross_values and any(item != gross_values[0] for item in gross_values[1:]):
+                return None
+            used = gross_values[0] if gross_values else filled
+            if used > authorized or filled > used:
+                return None
+            remainder = authorized - used
+        if remainder == 0 or self._executor_acquisition_remainder_reconciled(executor):
+            return Decimal("0")
+        return remainder
+
+    def _executor_intent_ceiling(self, executor) -> Optional[Decimal]:
+        config = getattr(executor, "config", None)
+        for candidate in (
+            getattr(config, "maximum_acceptable_price", None),
+            getattr(config, "entry_price", None),
+        ):
+            parsed = self._positive_decimal(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _executor_working_order_price(self, executor) -> Optional[Decimal]:
+        custom = self._executor_custom_info(executor)
+        acquisition = custom.get("entry_acquisition") or {}
+        config = getattr(executor, "config", None)
+        for candidate in (
+            acquisition.get("current_order_price"),
+            custom.get("order_price"),
+            getattr(config, "price", None),
+        ):
+            parsed = self._positive_decimal(candidate)
+            if parsed is not None:
+                return parsed
+        if self._executor_acquisition_may_still_fill(executor):
+            return self._positive_decimal(getattr(config, "entry_price", None))
+        return None
+
+    def _executor_remaining_position_basis(self, executor) -> Optional[Decimal]:
+        custom = self._executor_custom_info(executor)
+        owned = self._executor_owned_base(executor)
+        if owned is None or owned <= 0:
+            return None
+        parsed = self._positive_decimal(custom.get("current_position_average_price"))
+        if parsed is not None:
+            return parsed
+        filled = self._positive_decimal(custom.get("open_order_filled_amount_base"))
+        quote = self._decimal_or_none(custom.get("open_order_filled_amount_quote"))
+        if filled is not None and quote is not None and quote > 0:
+            return quote / filled
+        receipt = custom.get("execution_receipt") or {}
+        gross_base = self._positive_decimal(receipt.get("entry_gross_base"))
+        gross_quote = self._decimal_or_none(receipt.get("entry_gross_quote"))
+        if gross_base is not None and gross_quote is not None and gross_quote > 0:
+            return gross_quote / gross_base
+        return None
+
+    def _executor_commitment_price(self, executor, mid_price: Decimal) -> Optional[Decimal]:
+        commitment = self._executor_working_order_price(executor) or self._executor_intent_ceiling(executor)
+        if commitment is None or commitment <= 0:
+            return mid_price
+        return max(mid_price, commitment)
+
+    def _executor_spacing_ref_price(self, executor) -> Optional[Decimal]:
+        if self._executor_acquisition_may_still_fill(executor):
+            return self._executor_working_order_price(executor)
+        return self._executor_remaining_position_basis(executor)
+
     def _get_active_buy_executor_position_value_usd(self) -> Decimal:
         total_value = Decimal("0")
         mid_price = self._decimal_or_none(self._get_mid_price())
-        for executor in self._filter_same_side(TradeType.BUY, active_only=True):
-            config = getattr(executor, "config", None)
-            amount = self._decimal_or_none(getattr(config, "amount", None))
-            entry_price = self._decimal_or_none(getattr(config, "entry_price", None))
-            custom = getattr(executor, "custom_info", {}) or {}
-            closed = self._decimal_or_none(custom.get("close_order_filled_amount_base", 0))
-            if amount is None or amount < 0 or closed is None or closed < 0 or mid_price is None or mid_price <= 0:
+        for executor in self._buy_executors_for_capital():
+            owned = self._executor_owned_base(executor)
+            outstanding = self._executor_outstanding_base(executor)
+            if owned is None or outstanding is None or mid_price is None or mid_price <= 0:
                 return Decimal("Infinity")
-            if getattr(config, "type", None) == "order_executor":
-                # OrderExecutor fills are already owned by the held-position ledger.
-                closed = self._decimal_or_none(custom.get("executed_amount_base", 0))
-                if closed is None:
+            total_value += owned * mid_price
+            if outstanding > 0:
+                reservation_price = self._executor_commitment_price(executor, mid_price)
+                if reservation_price is None or reservation_price <= 0:
                     return Decimal("Infinity")
-            reservation_price = max(mid_price, entry_price or mid_price)
-            total_value += max(Decimal("0"), amount - closed) * reservation_price
+                total_value += outstanding * reservation_price
         return total_value
 
     def _get_total_position_value_usd(self) -> Decimal:
+        owned = self._begin_hold_ledger_pass()
+        try:
+            return self._total_position_value_usd()
+        finally:
+            self._end_hold_ledger_pass(owned)
+
+    def _total_position_value_usd(self) -> Decimal:
         try:
             amount = Decimal("0")
             for position in self.positions_held:
@@ -1521,6 +1940,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             "price_gap": "gap",
             "capacity": "capacity",
             "dca_score_low": "score-low",
+            "averaging_score_low": "averaging-score",
             "max_position": "max-pos",
             "price_unavailable": "no-price",
             "balance_low": "quote-low",
@@ -2634,24 +3054,15 @@ class HLRSIController(DirectionalTradingControllerBase):
             candidates,
             key=lambda x: float(getattr(x, "close_timestamp", None) or getattr(x, "timestamp", 0.0) or 0.0),
         )
-        return self._executor_ref_price(latest)
+        return self._executor_spacing_ref_price(latest)
 
     def _executor_ref_price(self, executor_info) -> Optional[Decimal]:
-        try:
-            config = getattr(executor_info, "config", None)
-            ci = executor_info.custom_info or {}
-            for candidate in (
-                getattr(config, "price", None),
-                getattr(config, "entry_price", None),
-                ci.get("order_price"),
-                ci.get("entry_price"),
-                ci.get("current_position_average_price"),
-            ):
-                if candidate is not None and float(candidate) > 0:
-                    return Decimal(str(candidate))
-        except _DECIMAL_ATTRIBUTE_ERRORS:
-            pass
-        return None
+        """Labeled display fallback. Decision callers use the named price helpers."""
+        return (
+            self._executor_remaining_position_basis(executor_info)
+            or self._executor_working_order_price(executor_info)
+            or self._executor_intent_ceiling(executor_info)
+        )
 
     def _get_min_price_increment(self) -> Optional[Decimal]:
         try:
@@ -3839,7 +4250,11 @@ class HLRSIController(DirectionalTradingControllerBase):
     def _build_backtest_signal_frame(
         self, df: pd.DataFrame, *, rsi_buy_eff: float, rsi_sell_eff: float,
     ) -> pd.DataFrame:
-        """Build per-row signal + state payload for BacktestingEngineBase compatibility."""
+        """BacktestingEngineBase compatibility path: one chronological walk.
+
+        Simulated inventory and close assumptions only. Not native order or
+        fill outcomes, and not a second execution engine.
+        """
         frame = pd.DataFrame(index=df.index)
         frame["signal"] = 0
         rsi_col = f"RSI_{self.config.rsi_length}"
@@ -3899,14 +4314,27 @@ class HLRSIController(DirectionalTradingControllerBase):
             condition_reason.loc[low_vol] = "low_vol"
             condition_reason.loc[high_vol] = "high_vol"
 
-        # BUY: run the same confirmation state machine used in live mode.
+        sell_rsi_rollover = (rsi.shift(1) - rsi) >= float(self.config.sell_rsi_rollover_delta)
+        sell_price_below_ema = (
+            (close < pd.to_numeric(df[ema_fast_col], errors="coerce"))
+            if ema_fast_col in df.columns
+            else pd.Series(False, index=df.index, dtype=bool)
+        )
+        sell_macd_rollover = (
+            (macd_h < macd_h_prev)
+            if macd_h is not None and macd_h_prev is not None
+            else pd.Series(False, index=df.index, dtype=bool)
+        )
+        sell_reversal = ((sell_rsi_rollover & sell_price_below_ema) | sell_macd_rollover).fillna(False)
+        sell_candidate = (rsi >= sell_thr) & sell_reversal
+
         split_entries_enabled = self._split_entries_enabled()
         scout_fraction = float(self._effective_scout_fraction("neutral"))
         runner_fraction = float(max(Decimal("0"), Decimal("1") - Decimal(str(scout_fraction))))
         pending_setup: Optional[BuyConfirmationSetup] = None
-        buy_mask = pd.Series(False, index=df.index, dtype=bool)
         backtest_state: List[Dict[str, object]] = []
-        inventory_units = Decimal("0")
+        simulated_units = Decimal("0")
+        simulated_avg_entry: Optional[Decimal] = None
         scout_established = False
         runner_established = False
         for row_number, idx in enumerate(df.index):
@@ -3936,101 +4364,72 @@ class HLRSIController(DirectionalTradingControllerBase):
                 "buy_entry_fraction": 0.0,
                 "buy_context_bias": "neutral",
             }
+            row_bought = False
+
+            def apply_buy(role: str, fraction: float) -> bool:
+                nonlocal simulated_units, simulated_avg_entry, scout_established, runner_established
+                frame.loc[idx, "signal"] = 1
+                row_state["buy_entry_role"] = role
+                row_state["buy_entry_fraction"] = fraction
+                previous_units = simulated_units
+                row_fraction = Decimal(str(fraction))
+                simulated_units += row_fraction
+                if pd.notna(row_close):
+                    row_close_decimal = Decimal(str(row_close))
+                    if simulated_avg_entry is None or previous_units <= 0:
+                        simulated_avg_entry = row_close_decimal
+                    else:
+                        simulated_avg_entry = (
+                            (simulated_avg_entry * previous_units) + (row_close_decimal * row_fraction)
+                        ) / simulated_units
+                if role == "scout":
+                    scout_established = True
+                elif role == "runner":
+                    runner_established = True
+                return True
 
             if (
                 split_entries_enabled
                 and row_raw_candidate
-                and inventory_units <= Decimal("0")
+                and simulated_units <= Decimal("0")
                 and not scout_established
                 and not runner_established
             ):
                 if row_condition_ok:
-                    buy_mask.loc[idx] = True
-                    frame.loc[idx, "signal"] = 1
-                    row_state["buy_entry_role"] = "scout"
-                    row_state["buy_entry_fraction"] = scout_fraction
-                    inventory_units += Decimal(str(scout_fraction))
-                    scout_established = True
-                backtest_state.append(row_state)
-                continue
-
-            if buy_signal and not row_condition_ok:
-                pending_setup = previous_setup
-                buy_signal = False
-
-            if buy_signal:
-                buy_mask.loc[idx] = True
-                frame.loc[idx, "signal"] = 1
-                if split_entries_enabled and scout_established and not runner_established:
-                    row_state["buy_entry_role"] = "runner"
-                    row_state["buy_entry_fraction"] = runner_fraction
-                    inventory_units += Decimal(str(runner_fraction))
-                    runner_established = True
-                else:
-                    row_state["buy_entry_role"] = "full"
-                    row_state["buy_entry_fraction"] = 1.0
-                    inventory_units += Decimal("1")
+                    row_bought = apply_buy("scout", scout_fraction)
+            else:
+                if buy_signal and not row_condition_ok:
+                    pending_setup = previous_setup
+                    buy_signal = False
+                if buy_signal:
+                    if split_entries_enabled and scout_established and not runner_established:
+                        row_bought = apply_buy("runner", runner_fraction)
+                    else:
+                        row_bought = apply_buy("full", 1.0)
 
             backtest_state.append(row_state)
 
-        sell_rsi_rollover = (rsi.shift(1) - rsi) >= float(self.config.sell_rsi_rollover_delta)
-        sell_price_below_ema = (
-            (close < pd.to_numeric(df[ema_fast_col], errors="coerce"))
-            if ema_fast_col in df.columns
-            else pd.Series(False, index=df.index, dtype=bool)
-        )
-        sell_macd_rollover = (
-            (macd_h < macd_h_prev)
-            if macd_h is not None and macd_h_prev is not None
-            else pd.Series(False, index=df.index, dtype=bool)
-        )
-        sell_reversal = ((sell_rsi_rollover & sell_price_below_ema) | sell_macd_rollover).fillna(False)
-        sell_candidate = (rsi >= sell_thr) & sell_reversal
-
-        simulated_units = Decimal("0")
-        simulated_avg_entry: Optional[Decimal] = None
-        for idx in df.index:
-            row_close = close.loc[idx]
-            if pd.isna(row_close):
+            if row_bought or pd.isna(row_close):
                 continue
+            if not bool(sell_candidate.loc[idx]) or simulated_units <= 0:
+                continue
+            profitability_ok = True
             row_close_decimal = Decimal(str(row_close))
-            row_buy = bool(buy_mask.loc[idx])
-            row_sell = bool(sell_candidate.loc[idx])
-
-            if row_buy and row_sell:
-                continue
-
-            if row_buy:
-                previous_units = simulated_units
-                row_state = backtest_state[df.index.get_loc(idx)]
-                row_fraction = Decimal(str(row_state.get("buy_entry_fraction", 1.0) or 1.0))
-                simulated_units += row_fraction
-                if simulated_avg_entry is None or previous_units <= 0:
-                    simulated_avg_entry = row_close_decimal
-                else:
-                    simulated_avg_entry = (
-                        (simulated_avg_entry * previous_units) + (row_close_decimal * row_fraction)
-                    ) / simulated_units
-                continue
-
-            if row_sell and simulated_units > 0:
-                profitability_ok = True
-                if (
-                    self.config.sell_only_if_profitable
-                    and simulated_avg_entry is not None
-                    and simulated_avg_entry > 0
-                ):
-                    min_exit_price = simulated_avg_entry * (
-                        Decimal("1") + Decimal(str(self.config.min_profit_pct_for_sell))
-                    )
-                    profitability_ok = row_close_decimal >= min_exit_price
-                if profitability_ok:
-                    frame.loc[idx, "signal"] = -1
-                    simulated_units = Decimal("0")
-                    simulated_avg_entry = None
-                    scout_established = False
-                    runner_established = False
-                    inventory_units = Decimal("0")
+            if (
+                self.config.sell_only_if_profitable
+                and simulated_avg_entry is not None
+                and simulated_avg_entry > 0
+            ):
+                min_exit_price = simulated_avg_entry * (
+                    Decimal("1") + Decimal(str(self.config.min_profit_pct_for_sell))
+                )
+                profitability_ok = row_close_decimal >= min_exit_price
+            if profitability_ok:
+                frame.loc[idx, "signal"] = -1
+                simulated_units = Decimal("0")
+                simulated_avg_entry = None
+                scout_established = False
+                runner_established = False
 
         frame["signal_state"] = backtest_state
         return frame
@@ -4334,6 +4733,13 @@ class HLRSIController(DirectionalTradingControllerBase):
     def can_create_executor(self, signal: int) -> bool:
         if signal == 0:
             return False
+        owned = self._begin_hold_ledger_pass()
+        try:
+            return self._decide_can_create_executor(signal)
+        finally:
+            self._end_hold_ledger_pass(owned)
+
+    def _decide_can_create_executor(self, signal: int) -> bool:
         self._ingest_closed_executor_results()
         if signal > 0 and not self._get_total_position_value_usd().is_finite():
             self._record_gate_reason(TradeType.BUY, "exposure_unavailable")
@@ -4375,17 +4781,33 @@ class HLRSIController(DirectionalTradingControllerBase):
             self._record_gate_reason(target_side, "capacity")
             return False
 
-        # Position-aware DCA gating: require higher score when adding to losing positions
-        if signal > 0 and active_same_side and self.config.dca_score_boost > 0:
+        # Averaging-down addition: owned underwater inventory plus the approved
+        # extra-score budget. Down-only constrains replacement children inside one
+        # intent; it is not a portfolio-wide average-down rule. A new independently
+        # justified entry, or a runner scale-in, is not DCA merely because inventory
+        # exists.
+        runner_scale_in = (
+            runner_entry
+            and self._has_active_buy_leg("scout")
+            and not self._has_active_buy_leg("runner")
+        )
+        owned_active = [
+            executor for executor in active_same_side
+            if (self._executor_owned_base(executor) or Decimal("0")) > 0
+        ]
+        averaging_down = (
+            signal > 0
+            and owned_active
+            and self.config.dca_score_boost > 0
+            and not runner_scale_in
+            and all((getattr(executor, "net_pnl_pct", None) or 0) < 0 for executor in owned_active)
+        )
+        if averaging_down:
             score = state.get("signal_score", 0) or 0
-            all_underwater = all(
-                (getattr(ex, "net_pnl_pct", None) or 0) < 0 for ex in active_same_side
-            )
-            if all_underwater and not (runner_entry and self._has_active_buy_leg("scout") and not self._has_active_buy_leg("runner")):
-                required = self.config.min_signal_score + self.config.dca_score_boost
-                if score < required:
-                    self._record_gate_reason(target_side, "dca_score_low")
-                    return False
+            required = self.config.min_signal_score + self.config.dca_score_boost
+            if score < required:
+                self._record_gate_reason(target_side, "averaging_score_low")
+                return False
 
         try:
             mp_val = self.market_data_provider.get_price_by_type(
@@ -4417,6 +4839,7 @@ class HLRSIController(DirectionalTradingControllerBase):
         # Max total position
         if signal > 0:
             _, entry_usd, entry_price, _, _ = self._resolve_buy_entry_plan(new_price, state)
+            # Held-inventory spacing vs owned cost basis. Not a DCA label.
             if not self._has_sufficient_avg_entry_gap_for_buy(entry_price):
                 self._record_gate_reason(target_side, "avg_entry_gap")
                 return False
@@ -4455,7 +4878,8 @@ class HLRSIController(DirectionalTradingControllerBase):
                     self._record_gate_reason(target_side, "ib_cooldown")
                     return False
 
-        # Price gap
+        # Duplicate-entry spacing vs last same-side working order or acquired price.
+        # Runner scale-in is exempt. Not a DCA rule.
         if signal > 0 and not runner_entry and not self._has_sufficient_price_gap(target_side, new_price):
             self._record_gate_reason(target_side, "price_gap")
             return False
@@ -4671,7 +5095,7 @@ class HLRSIController(DirectionalTradingControllerBase):
 
         all_qualify = True
         for ex in active_buys:
-            ref_price = self._executor_ref_price(ex)
+            ref_price = self._executor_remaining_position_basis(ex)
             if ref_price is None or ref_price <= 0:
                 all_qualify = False
                 break
@@ -4694,7 +5118,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             ))
             self.logger().debug(
                 f"BAG FREEZE | {self._controller_pair_log_prefix()} executor={ex.id} "
-                f"ref={self._executor_ref_price(ex)} current={current_price}"
+                f"ref={self._executor_remaining_position_basis(ex)} current={current_price}"
             )
 
         self._bag_freeze_count += 1
@@ -4974,22 +5398,13 @@ class HLRSIController(DirectionalTradingControllerBase):
         )
 
     def _status_executor_price(self, executor) -> Optional[Decimal]:
-        executor_config = getattr(executor, "config", None)
-        custom_info = getattr(executor, "custom_info", None) or {}
-        for candidate in (
-            getattr(executor_config, "price", None),
-            custom_info.get("order_price"),
-            custom_info.get("entry_price"),
-            custom_info.get("current_position_average_price"),
-        ):
-            try:
-                if candidate is None:
-                    continue
-                price = Decimal(str(candidate))
-                if price > 0:
-                    return price
-            except (InvalidOperation, TypeError, ValueError):
-                continue
+        if self._executor_acquisition_may_still_fill(executor):
+            working = self._executor_working_order_price(executor)
+            if working is not None:
+                return working
+        basis = self._executor_remaining_position_basis(executor)
+        if basis is not None:
+            return basis
         return self._executor_ref_price(executor)
 
     def _status_inventory_line(self) -> str:

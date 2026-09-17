@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import unittest
 from decimal import Decimal
@@ -413,6 +414,7 @@ class InFlightOrderPyUnitTests(unittest.TestCase):
         self.assertEqual(order_json["position"], order.position.value)
         self.assertEqual(order_json["creation_timestamp"], order.creation_timestamp)
         self.assertEqual(order_json["last_update_timestamp"], order.last_update_timestamp)
+        self.assertIsNone(order_json["cancel_source"])
         self.assertEqual(order_json["order_fills"], {"1": trade_update.to_json()})
 
     def test_to_limit_order(self):
@@ -727,3 +729,228 @@ class InFlightOrderPyUnitTests(unittest.TestCase):
         self.assertTrue(order.update_with_trade_update(trade_update))
         self.assertIsNone(order.exchange_order_id)
         self.assertFalse(order.exchange_order_id_update_event.is_set())
+
+    def test_update_with_order_update_does_not_reopen_canceled_order(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id=self.client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+            exchange_order_id=self.exchange_order_id,
+        )
+        self.assertTrue(order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=20,
+            new_state=OrderState.CANCELED,
+        )))
+        self.assertEqual(20, order.last_update_timestamp)
+
+        delayed_open: OrderUpdate = OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=10,
+            new_state=OrderState.OPEN,
+        )
+        self.assertFalse(order.update_with_order_update(delayed_open))
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertNotEqual(10, order.last_update_timestamp)
+        self.assertEqual(20, order.last_update_timestamp)
+
+        for new_state in (OrderState.PENDING_CREATE, OrderState.PENDING_CANCEL, OrderState.PARTIALLY_FILLED):
+            self.assertFalse(order.update_with_order_update(OrderUpdate(
+                client_order_id=self.client_order_id,
+                exchange_order_id=self.exchange_order_id,
+                trading_pair=self.trading_pair,
+                update_timestamp=10,
+                new_state=new_state,
+            )))
+            self.assertEqual(OrderState.CANCELED, order.current_state)
+            self.assertEqual(20, order.last_update_timestamp)
+
+        mismatch_open: OrderUpdate = OrderUpdate(
+            client_order_id="mismatchClientOrderId",
+            exchange_order_id="mismatchExchangeOrderId",
+            trading_pair=self.trading_pair,
+            update_timestamp=30,
+            new_state=OrderState.OPEN,
+        )
+        self.assertFalse(order.update_with_order_update(mismatch_open))
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertEqual(20, order.last_update_timestamp)
+
+    def test_update_with_order_update_does_not_reopen_filled_order(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id=self.client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+            exchange_order_id=self.exchange_order_id,
+        )
+        self.assertTrue(order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=20,
+            new_state=OrderState.FILLED,
+        )))
+
+        self.assertFalse(order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=10,
+            new_state=OrderState.OPEN,
+        )))
+        self.assertEqual(OrderState.FILLED, order.current_state)
+        self.assertEqual(20, order.last_update_timestamp)
+
+    def test_update_with_order_update_still_copies_exchange_id_and_cancel_source_on_refused_open(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id=self.client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+        )
+        self.assertTrue(order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=20,
+            new_state=OrderState.CANCELED,
+        )))
+        self.assertIsNone(order.exchange_order_id)
+        self.assertIsNone(order.cancel_source)
+
+        updated = order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=10,
+            new_state=OrderState.OPEN,
+            misc_updates={"cancel_source": "31"},
+        ))
+        self.assertTrue(updated)
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertEqual(self.exchange_order_id, order.exchange_order_id)
+        self.assertEqual("31", order.cancel_source)
+        self.assertNotEqual(10, order.last_update_timestamp)
+        self.assertEqual(20, order.last_update_timestamp)
+
+    def test_update_with_order_update_filled_after_canceled_still_applies(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id=self.client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+            exchange_order_id=self.exchange_order_id,
+        )
+        self.assertTrue(order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=20,
+            new_state=OrderState.CANCELED,
+        )))
+        self.assertTrue(order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=30,
+            new_state=OrderState.FILLED,
+        )))
+        self.assertEqual(OrderState.FILLED, order.current_state)
+        self.assertEqual(30, order.last_update_timestamp)
+
+    def test_update_with_trade_update_still_applies_after_canceled(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id=self.client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+            exchange_order_id=self.exchange_order_id,
+        )
+        order.update_with_order_update(OrderUpdate(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            update_timestamp=20,
+            new_state=OrderState.CANCELED,
+        ))
+        trade_update: TradeUpdate = TradeUpdate(
+            trade_id="lateFill",
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            fill_price=Decimal("1.0"),
+            fill_base_amount=Decimal("500.0"),
+            fill_quote_amount=Decimal("500.0"),
+            fee=AddedToCostTradeFee(
+                flat_fees=[TokenAmount(token=self.quote_asset, amount=self.trade_fee_percent * Decimal("500.0"))]),
+            fill_timestamp=25,
+        )
+        self.assertTrue(order.update_with_trade_update(trade_update))
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertEqual(Decimal("500.0"), order.executed_amount_base)
+        self.assertEqual(25, order.last_update_timestamp)
+        self.assertIn(trade_update.trade_id, order.order_fills)
+
+    def test_canceled_cancel_source_json_round_trip_is_not_open(self):
+        order: InFlightOrder = InFlightOrder(
+            client_order_id=self.client_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1000.0"),
+            creation_timestamp=1640001112.0,
+            price=Decimal("1.0"),
+            exchange_order_id=self.exchange_order_id,
+            initial_state=OrderState.CANCELED,
+        )
+        order.cancel_source = "31"
+        order.last_update_timestamp = 20
+
+        restored = InFlightOrder.from_json(json.loads(json.dumps(order.to_json())))
+        self.assertEqual("31", restored.cancel_source)
+        self.assertEqual(OrderState.CANCELED, restored.current_state)
+        self.assertFalse(restored.is_open)
+
+    def test_from_json_missing_or_blank_cancel_source_is_none(self):
+        order_json = {
+            "client_order_id": self.client_order_id,
+            "exchange_order_id": self.exchange_order_id,
+            "trading_pair": self.trading_pair,
+            "order_type": OrderType.LIMIT.name,
+            "trade_type": TradeType.BUY.name,
+            "price": "1.0",
+            "amount": "1000.0",
+            "executed_amount_base": "0",
+            "executed_amount_quote": "0",
+            "last_state": str(OrderState.CANCELED.value),
+            "leverage": "1",
+            "position": PositionAction.NIL.value,
+            "creation_timestamp": 1640001112,
+        }
+        self.assertIsNone(InFlightOrder.from_json(order_json).cancel_source)
+        order_json["cancel_source"] = ""
+        self.assertIsNone(InFlightOrder.from_json(order_json).cancel_source)
+        order_json["cancel_source"] = None
+        restored = InFlightOrder.from_json(order_json)
+        self.assertIsNone(restored.cancel_source)
+        self.assertFalse(restored.is_open)

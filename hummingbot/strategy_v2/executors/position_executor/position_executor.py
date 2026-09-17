@@ -473,18 +473,27 @@ class PositionExecutor(ExecutorBase):
             and self.open_filled_amount > Decimal("0")
         )
 
+    def _expected_close_amount(self) -> Optional[Decimal]:
+        remaining = self._to_decimal(self.amount_to_close)
+        if remaining is None or remaining <= Decimal("0"):
+            return None
+        try:
+            parsed = self._to_decimal(self._close_order_amount())
+        except Exception:
+            return None
+        if parsed is None or parsed <= Decimal("0") or parsed > remaining:
+            return None
+        return parsed
+
     def _expected_close_fee_rate(self) -> Optional[Decimal]:
         assets = self.config.trading_pair.split("-")
         if len(assets) < 2:
             return None
+        close_amount = self._expected_close_amount()
+        if close_amount is None:
+            return None
         close_order_type = self._close_order_type_for(CloseType.TRAILING_STOP)
-        max_age = max(0, int(self.config.triple_barrier_config.trailing_stop_limit_max_age_seconds or 0))
-        is_maker = (
-            close_order_type.is_limit_type()
-            and max_age <= 0
-            and not getattr(self, "_trailing_limit_fallback_pending", False)
-        )
-        order_type = close_order_type if is_maker else OrderType.MARKET
+        is_maker = close_order_type == OrderType.LIMIT_MAKER
         fee = None
         connector = self.connectors.get(self.config.connector_name)
         get_fee = getattr(connector, "get_fee", None) if connector is not None else None
@@ -492,9 +501,9 @@ class PositionExecutor(ExecutorBase):
             candidate = get_fee(
                 base_currency=assets[0],
                 quote_currency=assets[1],
-                order_type=order_type,
+                order_type=close_order_type,
                 order_side=self.close_order_side,
-                amount=self.open_filled_amount,
+                amount=close_amount,
                 price=self.entry_price,
                 is_maker=is_maker,
             )
@@ -507,22 +516,45 @@ class PositionExecutor(ExecutorBase):
                     is_maker,
                     assets[0],
                     assets[1],
-                    order_type,
+                    close_order_type,
                     self.close_order_side,
-                    self.open_filled_amount,
+                    close_amount,
                     self.entry_price,
                 )
             except Exception:
                 # ponytail: TradeFeeSchemaLoader raises Exception for unknown connectors; hold rather than sell
                 return None
+        return self._fee_rate_from_trade_fee(fee, close_amount, self.entry_price)
+
+    def _fee_rate_from_trade_fee(
+        self, fee: TradeFeeBase, amount: Decimal, price: Decimal
+    ) -> Optional[Decimal]:
+        if amount <= Decimal("0") or price <= Decimal("0"):
+            return None
+        assets = self.config.trading_pair.split("-")
+        if len(assets) < 2:
+            return None
         percent = getattr(fee, "percent", None)
         if percent is None:
             return None
         try:
             rate = percent if isinstance(percent, Decimal) else Decimal(str(percent))
-        except (InvalidOperation, ValueError, TypeError):
+            extra = Decimal("0")
+            for flat in getattr(fee, "flat_fees", None) or ():
+                flat_amount = flat.amount if isinstance(flat.amount, Decimal) else Decimal(str(flat.amount))
+                if not flat_amount.is_finite() or flat_amount < Decimal("0"):
+                    return None
+                if flat.token == assets[1]:
+                    extra += flat_amount
+                elif flat.token == assets[0]:
+                    extra += flat_amount * price
+                else:
+                    # ponytail: third-token flats need a rate oracle; hold rather than understate the floor
+                    return None
+            rate = rate + extra / (amount * price)
+        except (InvalidOperation, ValueError, TypeError, AttributeError, ZeroDivisionError):
             return None
-        if rate < Decimal("0") or rate >= Decimal("1"):
+        if not rate.is_finite() or rate < Decimal("0") or rate >= Decimal("1"):
             return None
         return rate
 
@@ -1592,6 +1624,10 @@ class PositionExecutor(ExecutorBase):
             "open_order_expiry_reconciled": self._open_order_expiry_reconciled,
             "open_order_filled_amount_base": self.open_filled_amount,
             "open_order_filled_amount_quote": self.open_filled_amount_quote,
+            "open_order_state": (
+                None if self._open_order is None or self._open_order.order is None
+                else self._open_order.order.current_state.name
+            ),
             "order_ids": [order.order_id for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()])],
             "close_order_filled_amount_base": self.close_filled_amount,
             "remaining_position_amount_base": self.amount_to_close,

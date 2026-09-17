@@ -2,11 +2,14 @@ import asyncio
 import json
 import logging
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+    ENTRY_REPLACEMENT_DOWNWARD_REPRICE,
+    ENTRY_REPLACEMENT_POST_ONLY_REPAIR,
     DownOnlyMakerPositionExecutor,
     DownOnlyMakerPositionExecutorConfig,
 )
@@ -16,9 +19,9 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import OrderCancelledEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
-from hummingbot.strategy_v2.executors.position_executor.data_types import TripleBarrierConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import TrailingStop, TripleBarrierConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
-from hummingbot.strategy_v2.models.executors import TrackedOrder
+from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 
 def make_config(**changes) -> DownOnlyMakerPositionExecutorConfig:
@@ -61,7 +64,9 @@ def make_executor(
     connector = MagicMock()
     connector.supports_terminal_fill_reconciliation = True
     connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+    connector.ready = True
     strategy.connectors = {"okx": connector}
+    strategy.market_data_provider = SimpleNamespace(ready=True)
     rule = TradingRule(
         "ETH-USDC",
         min_order_size=Decimal("0.01"),
@@ -76,6 +81,7 @@ def make_executor(
     executor.get_price = MagicMock(side_effect=lambda connector_name, trading_pair, price_type: prices[price_type])
     executor.get_in_flight_order = MagicMock(return_value=None)
     executor.place_order = MagicMock(side_effect=["parent", "child-1", "child-2", "child-3"])
+    bind_controller(executor)
     return executor, connector, prices
 
 
@@ -143,6 +149,30 @@ def request_reprice(executor, prices):
     prices[PriceType.BestBid] = Decimal("99.90")
     prices[PriceType.BestAsk] = Decimal("100.01")
     executor.control_open_order()
+
+
+def bind_controller(
+    executor,
+    *,
+    pause=False,
+    kill=False,
+    signal=1,
+    status=RunnableStatus.RUNNING,
+    data_health={"ready": True},
+):
+    processed_data = {"signal": signal}
+    if data_health is not None:
+        processed_data["data_health"] = data_health
+    controller = SimpleNamespace(
+        processed_data=processed_data,
+        config=SimpleNamespace(manual_kill_switch=kill),
+        _operator_entry_paused=pause,
+        market_data_provider=SimpleNamespace(ready=True),
+    )
+    if status is not None:
+        controller.status = status
+    executor._strategy.controllers = {executor.config.controller_id: controller}
+    return controller
 
 
 def test_initial_submission_is_one_maker_buy() -> None:
@@ -613,7 +643,6 @@ async def test_duplicate_terminal_events_never_dispatch_second_child_or_sell() -
     (300, "99.9", "100.01", "total_age_expired"),
     (12, "101", "101.01", "upward_bound_breached"),
     (12, "99", "99.01", "downward_bound_breached"),
-    (12, "99.8", "99.9", "submission_would_cross"),
 ])
 async def test_replacement_rechecks_book_and_deadline_after_reconciliation(time, bid, ask, reason):
     executor, connector, prices = make_executor()
@@ -686,3 +715,599 @@ async def test_full_fill_after_cancel_ack_supersedes_pending_reprice():
     assert executor._entry_terminal_confirmed()
     assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
     executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_only_repair_allows_same_price_when_book_is_unchanged() -> None:
+    executor, connector, prices = make_executor()
+    executor._open_order = tracked_order(state=OrderState.CANCELED)
+    executor._open_order.order.cancel_source = "31"
+    executor._entry_submitted = True
+    install_terminal_reconciliation(connector, executor._open_order)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    assert executor.place_order.call_count == 1
+    assert executor.place_order.call_args.kwargs["price"] == Decimal("100")
+
+
+@pytest.mark.asyncio
+async def test_replacement_local_cross_waits_inside_original_intent() -> None:
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    prices[PriceType.BestBid] = Decimal("99.90")
+    prices[PriceType.BestAsk] = Decimal("99.90")
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason is None
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
+
+
+def test_pending_submission_does_not_resubmit_when_ask_crosses() -> None:
+    executor, _, prices = make_executor()
+    executor.control_open_order()
+    pending = tracked_order(state=OrderState.PENDING_CREATE)
+    pending.order.exchange_order_id = None
+    executor._open_order = pending
+    prices[PriceType.BestBid] = Decimal("99.40")
+    prices[PriceType.BestAsk] = Decimal("99.50")
+
+    executor.control_open_order()
+
+    assert executor.place_order.call_count == 1
+    acquisition = executor.get_custom_info()["entry_acquisition"]
+    assert acquisition["state"] == "awaiting_order_update"
+    assert executor._entry_stop_reason is None
+    executor._strategy.cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_post_only_cancel_permits_one_fresh_book_repair() -> None:
+    executor, connector, prices = make_executor()
+    executor._open_order = tracked_order(price="2379.63")
+    executor._entry_current_price = Decimal("2379.63")
+    executor.config.entry_price = Decimal("2379.63")
+    executor.config.maximum_acceptable_price = Decimal("2379.63")
+    executor.config.decision_best_bid = Decimal("2379.63")
+    executor.config.decision_best_ask = Decimal("2379.64")
+    executor._entry_submitted = True
+    executor._open_order.order.cancel_source = "31"
+    executor._open_order.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, executor._open_order)
+    prices[PriceType.BestBid] = Decimal("2379.08")
+    prices[PriceType.BestAsk] = Decimal("2379.62")
+
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.control_open_order()
+
+    assert executor.place_order.call_count == 1
+    assert executor.place_order.call_args.kwargs["price"] == Decimal("2379.08")
+    assert executor._entry_reprice_count == 1
+    assert executor._entry_stop_reason is None
+
+
+def test_unknown_cancel_without_pending_target_does_not_repair_or_rest() -> None:
+    executor, connector, _ = make_executor()
+    executor._open_order = tracked_order(state=OrderState.CANCELED)
+    executor._entry_submitted = True
+
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    executor.control_open_order()
+
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason == "exchange_canceled"
+    assert executor.get_custom_info()["entry_acquisition"]["state"] != "resting"
+
+
+def test_local_cross_before_first_submission_waits_or_recomputes_inside_ceiling() -> None:
+    executor, _, prices = make_executor()
+    prices[PriceType.BestBid] = Decimal("100")
+    prices[PriceType.BestAsk] = Decimal("100")
+
+    executor.control_open_order()
+
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason is None
+    assert executor._entry_submitted is False
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
+
+    prices[PriceType.BestBid] = Decimal("99.90")
+    prices[PriceType.BestAsk] = Decimal("99.91")
+    executor.control_open_order()
+
+    assert executor.place_order.call_count == 1
+    assert executor.place_order.call_args.kwargs["price"] == Decimal("99.90")
+    assert executor.place_order.call_args.kwargs["price"] <= executor.config.maximum_acceptable_price
+
+
+@pytest.mark.asyncio
+async def test_cancel_with_unobserved_reported_fills_does_not_treat_missing_as_zero() -> None:
+    executor, connector, prices = make_executor()
+    executor._open_order = tracked_order(state=OrderState.CANCELED)
+    executor._open_order.order.cancel_source = "31"
+    executor._entry_submitted = True
+    connector._request_order_status = AsyncMock(side_effect=IOError("Terminal fill reconciliation pending"))
+
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason is None
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_during_post_only_cancel_manages_fill_without_repair() -> None:
+    executor, connector, prices = make_executor()
+    parent = tracked_order(fill="0.4", state=OrderState.CANCELED)
+    parent.order.cancel_source = "31"
+    executor._open_order = parent
+    executor._entry_submitted = True
+    install_terminal_reconciliation(connector, parent)
+
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+
+    executor.place_order.assert_not_called()
+    assert executor.open_filled_amount == Decimal("0.4")
+    assert executor._entry_stop_reason == "partial_fill"
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_cancel_and_late_reconciliation_do_not_revive_or_duplicate_child() -> None:
+    executor, connector, prices = make_executor()
+    executor._open_order = tracked_order(state=OrderState.CANCELED)
+    executor._open_order.order.cancel_source = "31"
+    executor._entry_submitted = True
+    install_terminal_reconciliation(connector, executor._open_order)
+    event = OrderCancelledEvent(12, "parent")
+    executor.process_order_canceled_event(0, connector, event)
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.process_order_canceled_event(0, connector, event)
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+
+    assert executor.place_order.call_count == 1
+    executor._end_entry_acquisition("risk_blocked")
+    executor._entry_child_submission_authorized = True
+    executor.control_open_order()
+    assert executor.place_order.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_while_repair_pending_blocks_new_buy_and_keeps_fills() -> None:
+    executor, connector, prices = make_executor()
+    parent = tracked_order(fill="0.4", state=OrderState.CANCELED)
+    parent.order.cancel_source = "31"
+    executor._open_order = parent
+    executor._entry_submitted = True
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    executor._entry_child_submission_authorized = True
+    executor.early_stop(keep_position=True)
+    executor.control_open_order()
+
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason is not None
+    assert executor.open_filled_amount == Decimal("0.4")
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+
+
+def test_operator_pause_keeps_filled_trailing_owner_running():
+    config = make_config(triple_barrier_config=TripleBarrierConfig(
+        open_order_type=OrderType.LIMIT_MAKER,
+        open_order_limit_max_age_seconds=0,
+        trailing_stop=TrailingStop(activation_price=Decimal("0.001"), trailing_delta=Decimal("0.0005")),
+    ))
+    executor, _, prices = make_executor(config=config)
+    executor._open_order = tracked_order(fill="1", state=OrderState.FILLED)
+    executor._entry_submitted = True
+    executor.control_open_order()
+    prices[PriceType.BestBid] = Decimal("102")
+    prices[PriceType.BestAsk] = Decimal("102.01")
+    executor.control_trailing_stop()
+    armed = executor._trailing_stop_trigger_pct
+    assert armed is not None
+    bind_controller(executor, pause=True)
+    executor.control_open_order()
+    executor.control_trailing_stop()
+    assert executor.status is RunnableStatus.RUNNING
+    assert executor.close_type is None
+    assert executor._trailing_stop_trigger_pct == armed
+    executor._strategy.cancel.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+
+
+def test_operator_pause_cancels_unfilled_acquisition_without_position_hold():
+    executor, _, _ = make_executor()
+    executor._open_order = tracked_order()
+    executor._entry_submitted = True
+    bind_controller(executor, pause=True)
+    executor.control_open_order()
+    executor._strategy.cancel.assert_called_once()
+    assert executor.close_type is not CloseType.POSITION_HOLD
+    assert executor.status is RunnableStatus.RUNNING
+    assert executor._entry_terminal_reason == "risk_blocked"
+    assert executor._entry_child_submission_authorized is False
+
+
+def test_operator_pause_cancels_partial_remainder_without_keep_position_stop():
+    executor, _, _ = make_executor()
+    executor._open_order = tracked_order(fill="0.4", state=OrderState.PARTIALLY_FILLED)
+    executor._entry_submitted = True
+    bind_controller(executor, pause=True)
+    executor.control_open_order()
+    executor._strategy.cancel.assert_called_once()
+    assert executor.close_type is not CloseType.POSITION_HOLD
+    assert executor.status is RunnableStatus.RUNNING
+    assert executor._status is not RunnableStatus.SHUTTING_DOWN
+    assert executor.open_filled_amount == Decimal("0.4")
+    assert executor._entry_terminal_reason == "risk_blocked"
+
+
+def test_failed_cancel_retries_after_intent_deadline_and_blocks_replacement():
+    executor, _, prices = make_executor()
+    request_reprice(executor, prices)
+    assert executor._strategy.cancel.call_count == 1
+    executor._strategy.current_timestamp = 14
+    executor.control_open_order()
+    assert executor._strategy.cancel.call_count == 1
+    executor._strategy.current_timestamp = 15
+    executor.control_open_order()
+    assert executor._strategy.cancel.call_count == 2
+    executor._strategy.current_timestamp = 900
+    executor.control_open_order()
+    assert executor._strategy.cancel.call_count >= 3
+    assert executor._entry_terminal_reason == "total_age_expired"
+    assert executor._entry_stop_reason == "total_age_expired"
+    assert executor._entry_pending_target is None
+    assert executor._entry_child_submission_authorized is False
+    assert executor._open_order is not None
+    assert executor._open_order.order.current_state is OrderState.OPEN
+    assert executor.status is RunnableStatus.RUNNING
+    assert executor.close_type is None
+
+
+@pytest.mark.asyncio
+async def test_operator_pause_partial_fill_ack_keeps_managing_fill_owner():
+    config = make_config(triple_barrier_config=TripleBarrierConfig(
+        open_order_type=OrderType.LIMIT_MAKER,
+        open_order_limit_max_age_seconds=0,
+        trailing_stop=TrailingStop(activation_price=Decimal("0.001"), trailing_delta=Decimal("0.0005")),
+    ))
+    executor, connector, prices = make_executor(config=config)
+    owner = tracked_order(fill="0.4", state=OrderState.PARTIALLY_FILLED)
+    executor._open_order = owner
+    executor._entry_submitted = True
+    bind_controller(executor, pause=True)
+    executor.control_open_order()
+    executor._strategy.cancel.assert_called_once()
+    assert executor._entry_pending_target is None
+
+    owner.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, owner)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+
+    prices[PriceType.BestBid] = Decimal("102")
+    prices[PriceType.BestAsk] = Decimal("102.01")
+    executor.control_trailing_stop()
+
+    assert executor._open_order is owner
+    assert executor.open_filled_amount == Decimal("0.4")
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+    assert executor.status is RunnableStatus.RUNNING
+    assert executor.close_type is not CloseType.POSITION_HOLD
+    assert executor._trailing_stop_trigger_pct is not None
+    executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("controllers", [None, {}])
+async def test_unbound_controller_cannot_place_replacement_after_recon(controllers):
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    executor._strategy.controllers = controllers
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "risk_blocked"
+    assert executor._entry_child_submission_authorized is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoke", ["pause", "kill", "opposing", "locked_book"])
+async def test_replacement_does_not_submit_after_permission_or_book_revoked(revoke):
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    if revoke == "pause":
+        bind_controller(executor, pause=True)
+    elif revoke == "kill":
+        bind_controller(executor, kill=True)
+    elif revoke == "opposing":
+        bind_controller(executor, signal=-1)
+    else:
+        prices[PriceType.BestBid] = Decimal("100.01")
+        prices[PriceType.BestAsk] = Decimal("100.01")
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    reason = executor.get_custom_info()["entry_acquisition"]["terminal_reason"]
+    if revoke == "opposing":
+        assert reason == "opposing_signal"
+    elif revoke == "locked_book":
+        assert reason is None
+        assert executor._entry_stop_reason is None
+        assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
+    else:
+        assert reason == "risk_blocked"
+
+
+@pytest.mark.asyncio
+async def test_stp_cancel_source_does_not_place_bound_reprice_child():
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    parent.order.cancel_source = "32"
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor._entry_replacement_purpose is None
+    assert executor._entry_child_submission_authorized is False
+    assert executor._entry_stop_reason == "exchange_canceled"
+
+
+def test_pending_create_expires_intent_without_dropping_identity():
+    executor, _, _ = make_executor()
+    executor.control_open_order()
+    pending = tracked_order(state=OrderState.PENDING_CREATE)
+    executor._open_order = pending
+    executor._strategy.current_timestamp = 900
+    executor.control_open_order()
+    assert executor.place_order.call_count == 1
+    executor.place_order.assert_called_once()
+    assert executor._entry_stop_reason == "total_age_expired"
+    assert executor._open_order is pending
+    assert executor._entry_child_submission_authorized is False
+    executor._strategy.cancel.assert_called()
+    assert executor.status is RunnableStatus.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("purpose", [
+    ENTRY_REPLACEMENT_DOWNWARD_REPRICE,
+    ENTRY_REPLACEMENT_POST_ONLY_REPAIR,
+])
+async def test_reprice_child_honors_cooldown_at_submit(purpose):
+    executor, connector, prices = make_executor(config=make_config(entry_reprice_cooldown_seconds=30))
+    if purpose == ENTRY_REPLACEMENT_DOWNWARD_REPRICE:
+        executor._open_order = tracked_order()
+        executor._entry_submitted = True
+        executor._strategy.current_timestamp = 30
+        prices[PriceType.BestBid] = Decimal("99.90")
+        prices[PriceType.BestAsk] = Decimal("100.01")
+        executor.control_open_order()
+        parent = executor._open_order
+        parent.order.current_state = OrderState.CANCELED
+    else:
+        parent = tracked_order(state=OrderState.CANCELED)
+        parent.order.cancel_source = "31"
+        executor._open_order = parent
+        executor._entry_submitted = True
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor._entry_last_reprice_at = float(executor._strategy.current_timestamp) - 1
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason is None
+    assert executor._entry_child_submission_authorized is True
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [RunnableStatus.TERMINATED, RunnableStatus.SHUTTING_DOWN, "STOPPED"])
+async def test_stopped_owner_cannot_place_replacement_after_recon(status):
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    bind_controller(executor, signal=1, status=status)
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "risk_blocked"
+    assert executor._entry_child_submission_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_data_health_unreadiness_blocks_child_despite_cached_quotes():
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    bind_controller(executor, signal=1, data_health={"ready": False})
+    await finish_reconciliation(executor)
+    assert prices[PriceType.BestBid] > 0
+    assert prices[PriceType.BestAsk] > prices[PriceType.BestBid]
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "risk_blocked"
+    assert executor._entry_child_submission_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_missing_controller_status_blocks_child_after_recon():
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    bind_controller(executor, signal=1, status=None)
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "risk_blocked"
+    assert executor._entry_child_submission_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_missing_data_health_blocks_child_after_recon():
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    bind_controller(executor, signal=1, data_health=None)
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "risk_blocked"
+    assert executor._entry_child_submission_authorized is False
+
+
+@pytest.mark.asyncio
+async def test_missing_controller_status_keeps_owned_fills_without_child():
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    bind_controller(executor, signal=1, status=None)
+    await finish_reconciliation(executor)
+    parent.order = tracked_order(fill="0.4", state=OrderState.CANCELED).order
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.open_filled_amount == Decimal("0.4")
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "managing_fill"
+
+
+@pytest.mark.parametrize("unready", ["connector", "provider", "tracker", "controller_provider", "both"])
+def test_execution_book_unreadiness_waits_despite_cached_quotes(unready):
+    executor, connector, prices = make_executor()
+    controller = bind_controller(executor, data_health={"ready": True})
+    if unready in ("connector", "both"):
+        connector.ready = False
+    if unready in ("provider", "both"):
+        executor._strategy.market_data_provider = SimpleNamespace(ready=False)
+    if unready == "tracker":
+        connector.order_book_tracker = SimpleNamespace(ready=False)
+    if unready == "controller_provider":
+        controller.market_data_provider.ready = False
+    assert prices[PriceType.BestBid] > 0
+    assert prices[PriceType.BestAsk] > prices[PriceType.BestBid]
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason is None
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
+
+    connector.ready = True
+    connector.order_book_tracker = SimpleNamespace(ready=True)
+    executor._strategy.market_data_provider = SimpleNamespace(ready=True)
+    controller.market_data_provider.ready = True
+    executor.control_open_order()
+    executor.place_order.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unready", ["connector", "provider", "tracker", "controller_provider"])
+async def test_execution_book_unreadiness_waits_on_child_despite_cached_quotes(unready):
+    executor, connector, prices = make_executor()
+    request_reprice(executor, prices)
+    parent = executor._open_order
+    parent.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    controller = bind_controller(executor, data_health={"ready": True})
+    await finish_reconciliation(executor)
+    if unready == "connector":
+        connector.ready = False
+    elif unready == "provider":
+        executor._strategy.market_data_provider = SimpleNamespace(ready=False)
+    elif unready == "tracker":
+        connector.order_book_tracker = SimpleNamespace(ready=False)
+    else:
+        controller.market_data_provider.ready = False
+    assert prices[PriceType.BestBid] > 0
+    assert prices[PriceType.BestAsk] > prices[PriceType.BestBid]
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason is None
+    assert executor._entry_child_submission_authorized is True
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
+
+
+def test_execution_book_unreadiness_still_expires_at_intent_deadline():
+    executor, connector, _ = make_executor()
+    connector.ready = False
+    executor._strategy.current_timestamp = 900
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor.get_custom_info()["entry_acquisition"]["terminal_reason"] == "total_age_expired"
+    assert executor._entry_stop_reason == "total_age_expired"
+
+
+@pytest.mark.asyncio
+async def test_first_post_only_repair_honors_shared_cooldown_after_real_place():
+    executor, connector, _ = make_executor(config=make_config(entry_reprice_cooldown_seconds=30))
+    executor.control_open_order()
+    assert executor.place_order.call_count == 1
+    intent_created = executor._entry_intent_created_at
+    assert executor._entry_last_reprice_at == executor._entry_order_created_at
+    assert executor._entry_last_reprice_at == float(intent_created)
+
+    executor._strategy.current_timestamp = 1
+    parent = tracked_order(state=OrderState.CANCELED)
+    parent.order.cancel_source = "31"
+    executor._open_order = parent
+    install_terminal_reconciliation(connector, parent)
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.place_order.assert_called_once()
+    assert executor._entry_stop_reason is None
+    assert executor._entry_child_submission_authorized is True
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "awaiting_order_update"
+    assert executor._entry_intent_created_at == intent_created
+
+    executor._strategy.current_timestamp = 29
+    executor.control_open_order()
+    executor.place_order.assert_called_once()
+    assert executor._entry_intent_created_at == intent_created
+
+    executor._strategy.current_timestamp = 30
+    executor.control_open_order()
+    assert executor.place_order.call_count == 2
+    assert executor.place_order.call_args.kwargs["price"] == Decimal("100")
+    assert executor._entry_intent_created_at == intent_created
+    assert executor.config.entry_total_max_age_seconds == 300

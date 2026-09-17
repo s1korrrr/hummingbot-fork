@@ -116,6 +116,7 @@ class InFlightOrder:
         self.current_state = initial_state
         self.leverage = leverage
         self.position = position
+        self.cancel_source: Optional[str] = None
 
         self.executed_amount_base = s_decimal_0
         self.executed_amount_quote = s_decimal_0
@@ -248,6 +249,9 @@ class InFlightOrder:
                                   for key, value
                                   in data.get("order_fills", {}).items()})
         order.last_update_timestamp = data.get("last_update_timestamp", order.creation_timestamp)
+        raw_cancel_source = data.get("cancel_source")
+        if raw_cancel_source not in (None, ""):
+            order.cancel_source = str(raw_cancel_source)
 
         order.check_filled_condition()
         order.check_processed_by_exchange_condition()
@@ -274,6 +278,7 @@ class InFlightOrder:
             "position": self.position.value,
             "creation_timestamp": self.creation_timestamp,
             "last_update_timestamp": self.last_update_timestamp,
+            "cancel_source": self.cancel_source,
             "order_fills": {key: fill.to_json() for key, fill in self.order_fills.items()},
             "cumulative_fee_paid_base": float(self.cumulative_fee_paid(self.base_asset)),
             "cumulative_fee_paid_quote": float(self.cumulative_fee_paid(self.quote_asset)),
@@ -341,12 +346,28 @@ class InFlightOrder:
         if self.exchange_order_id is None and order_update.exchange_order_id is not None:
             self.update_exchange_order_id(order_update.exchange_order_id)
 
-        self.current_state = order_update.new_state
+        refused_regression = (
+            self.current_state in {OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED}
+            and order_update.new_state in {
+                OrderState.OPEN,
+                OrderState.PENDING_CREATE,
+                OrderState.PENDING_CANCEL,
+                OrderState.PARTIALLY_FILLED,
+            }
+        )
+        if not refused_regression:
+            self.current_state = order_update.new_state
+        if order_update.misc_updates:
+            cancel_source = order_update.misc_updates.get("cancel_source")
+            if cancel_source not in (None, ""):
+                self.cancel_source = str(cancel_source)
         self.check_processed_by_exchange_condition()
 
         updated: bool = prev_data != (self.exchange_order_id, self.current_state)
 
-        if updated:
+        if updated and not (
+            refused_regression and order_update.update_timestamp < self.last_update_timestamp
+        ):
             self.last_update_timestamp = order_update.update_timestamp
 
         return updated

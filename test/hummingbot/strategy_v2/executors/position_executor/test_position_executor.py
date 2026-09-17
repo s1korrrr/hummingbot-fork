@@ -691,7 +691,12 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
                 fill_timestamp=10,
             )
         )
-        self.strategy.connectors["binance"].quantize_order_amount.return_value = Decimal("1")
+        connector = self.strategy.connectors["binance"]
+        connector.quantize_order_amount.return_value = Decimal("1")
+        connector.get_fee.return_value = AddedToCostTradeFee(
+            percent=Decimal("0.001"),
+            flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.05"))],
+        )
 
         position_executor.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
 
@@ -700,6 +705,65 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
             ("binance", "ETH-USDT", Decimal("1"), OrderType.LIMIT, Decimal("109"), PositionAction.CLOSE),
         )
         self.assertEqual(position_executor._close_order.order_id, "OID-SELL-1")
+        self.assertEqual(connector.get_fee.call_args.kwargs["is_maker"], False)
+        self.assertEqual(connector.get_fee.call_args.kwargs["order_type"], OrderType.LIMIT)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_trailing_stop_places_marketable_limit_close_when_max_age_is_zero(self, mock_get_price, mock_get_trading_rules):
+        mock_get_price.side_effect = lambda connector, pair, price_type=PriceType.MidPrice: (
+            Decimal("109") if price_type == PriceType.BestBid else Decimal("110")
+        )
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        mock_get_trading_rules.return_value = trading_rules
+
+        position_config = self.get_position_config_market_long_with_trailing()
+        position_config.triple_barrier_config.trailing_stop_limit_max_age_seconds = 0
+        position_executor = self.get_position_executor_running_from_config(position_config)
+        position_executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        position_executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.FILLED,
+        )
+        position_executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("100"),
+                fill_base_amount=Decimal("1"),
+                fill_quote_amount=Decimal("100"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.2"))]),
+                fill_timestamp=10,
+            )
+        )
+        connector = self.strategy.connectors["binance"]
+        connector.quantize_order_amount.return_value = Decimal("1")
+        connector.get_fee.return_value = AddedToCostTradeFee(
+            percent=Decimal("0.001"),
+            flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.05"))],
+        )
+
+        position_executor.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
+
+        self.assertEqual(
+            self.strategy.sell.call_args.args,
+            ("binance", "ETH-USDT", Decimal("1"), OrderType.LIMIT, Decimal("109"), PositionAction.CLOSE),
+        )
+        self.assertEqual(position_executor._close_order.order_id, "OID-SELL-1")
+        self.assertEqual(connector.get_fee.call_args.kwargs["is_maker"], False)
+        self.assertEqual(connector.get_fee.call_args.kwargs["order_type"], OrderType.LIMIT)
+        self.assertFalse(position_executor._should_fallback_trailing_limit_close())
 
     @patch.object(PositionExecutor, "get_trading_rules")
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")

@@ -192,8 +192,16 @@ def active_info(config):
     )
 
 
-@pytest.mark.parametrize("condition", ["opposing", "kill", "pause", "unavailable"])
+KEEP_POSITION_STOP_CONDITIONS = ("opposing", "kill", "unavailable")
+
+
+@pytest.mark.parametrize("condition", [*KEEP_POSITION_STOP_CONDITIONS, "pause"])
 def test_active_entry_invalidation_emits_keep_position_stop(condition) -> None:
+    """Kill, opposing signal, and unusable book still POSITION_HOLD the owner.
+
+    Operator entry pause does not. Pause must not emit StopExecutorAction, even
+    for an unfilled down-only executor. Unfilled cancel is the executor's job.
+    """
     controller, _, prices = make_controller()
     config = buy_config(controller)
     controller.executors_info = [active_info(config)]
@@ -207,7 +215,35 @@ def test_active_entry_invalidation_emits_keep_position_stop(condition) -> None:
         prices[PriceType.BestAsk] = None
     with patch.object(hl_rsi.HLRSIController, "stop_actions_proposal", return_value=[]):
         actions = controller.stop_actions_proposal()
+    if condition == "pause":
+        assert actions == []
+        return
     assert actions == [StopExecutorAction(
+        controller_id=controller.config.id,
+        executor_id=config.id,
+        keep_position=True,
+    )]
+
+
+def test_operator_pause_does_not_stop_a_filled_trailing_owner_and_refuses_new_buy() -> None:
+    controller, _, _ = make_controller()
+    config = buy_config(controller)
+    filled = active_info(config)
+    filled.filled_amount_quote = Decimal("100")
+    filled.custom_info = {"open_order_filled_amount_base": Decimal("1"), "trailing_state": "armed"}
+    controller.executors_info = [filled]
+    controller._operator_entry_paused = True
+    with patch.object(hl_rsi.HLRSIController, "stop_actions_proposal", return_value=[]):
+        assert controller.stop_actions_proposal() == []
+    paused, _, _ = make_controller()
+    paused._operator_entry_paused = True
+    assert paused.can_create_executor(1) is False
+
+    controller._operator_entry_paused = False
+    controller.config.manual_kill_switch = True
+    with patch.object(hl_rsi.HLRSIController, "stop_actions_proposal", return_value=[]):
+        kill_actions = controller.stop_actions_proposal()
+    assert kill_actions == [StopExecutorAction(
         controller_id=controller.config.id,
         executor_id=config.id,
         keep_position=True,

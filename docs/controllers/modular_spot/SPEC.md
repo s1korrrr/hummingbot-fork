@@ -22,9 +22,12 @@ This publication adds documentation only. It does not apply the attached impleme
 
 ## 2. Evidence baseline — do not confuse these layers
 
+**Publication-time update:** while these documents were being prepared, the branch advanced to code checkpoint `b0fd5ef865fe88b87a9da8b8b10e3025d97576c2`. It adds overlapping data, profile, selection and budget helpers. The exact attachment below still has not been applied as a unit. The original code row is historical, not the complete current file inventory. Follow the current-source reconciliation in PLAN.md; do not overwrite or blindly reapply overlapping files.
+
 | Layer | Identity and observed scope | What it establishes |
 |---|---|---|
-| Published PR code | `6472dfece06ca71d9ebc6b887dda341ccdf5befb`, branch `feat/andrzej_isolated_modular_spot`, base `4df9ff3158a405b71d28b1c07446cfc7864a19fa` | Single-pair `ModularSpotController(ControllerBase)`, private policies, native PositionExecutor specialization, BUY acquisition, no external inventory adoption |
+| Original published PR code | `6472dfece06ca71d9ebc6b887dda341ccdf5befb`, branch `feat/andrzej_isolated_modular_spot`, base `4df9ff3158a405b71d28b1c07446cfc7864a19fa` | Single-pair `ModularSpotController(ControllerBase)`, private policies, native PositionExecutor specialization, BUY acquisition, no external inventory adoption |
+| Newer published code checkpoint | `b0fd5ef865fe88b87a9da8b8b10e3025d97576c2`: `candle_data.py`, `candle_transport.py`, `data_reader.py`, `feature_cache.py`, `native_bindings.py`, `profiles.py`, `program_budget.py`, `selection_state.py`, `universe.py`, and a `planner.py` change | Additional helper implementations observed in source; different schemas from the attachment; integration/native validation not established |
 | Attached patch | `pr55_shared_data_universe.patch`, SHA-256 `a30dede9a1c0ad3a47be4936c4fecb5bdd55662faf2343a05c6d9f8485e92523` | Unpublished candidate shared-candle service/reader, universe-selection helpers and feature-result cache |
 | Attached bundle | `pr55_shared_data_update.zip`, SHA-256 `4585bd99764efbe951a375a6c95cc8ea4e3b01cdc873d837ab104cb525ff6134` | Candidate bytes, manifest, patch helper, logs and prior validation receipt; not a remote commit |
 | Prior patch receipt | `pr55_shared_data_validation.md`, SHA-256 `3be487817fe051027d2e3b5ffd00078db423cfe92e17e0bbb5239d8997dc31b0` | Reports 60 new focused tests passed and one entire native module skipped; partial reconstruction, not full native validation |
@@ -34,7 +37,7 @@ PR #55 separately records 61 original tests passed and one native module skipped
 
 The attachment SHA-256 values were recalculated while preparing this specification. Historical test receipts were read, not rerun. The prior session's publication blocker describes that session; current publication success must be established by the new commit/PR receipt.
 
-Read the exact baseline files, not an assumed latest upstream implementation:
+Read the original baseline and the newer checkpoint, then refresh the actual PR head before implementation. Do not assume latest upstream or the attachment describes current wiring:
 
 - `controllers/generic/modular_spot.py` and `controllers/generic/modular_spot_core/`.
 - `hummingbot/strategy_v2/controllers/controller_base.py` and `hummingbot/strategy/strategy_v2_base.py`.
@@ -70,11 +73,13 @@ Use one logical data publisher per identical dataset, independent of execution o
 
 Separate bot processes consume local replicas. Consumers cannot stop another consumer's source or mutate a shared DataFrame. Deduplication applies to an identical dataset subscription, not to all traffic or to the execution connector's private/account streams.
 
-### 4.2 Initial bounded implementation
+### 4.2 Candidate variants and first delivery contract
 
-The attached candidate implements native OKX spot, trade-price, confirmed candles for `1m`, `3m`, `5m`, `15m`, `30m` and `1h`; a static consumer manifest; maximum required history per dataset; an exclusive-writer dedicated SQLite store; and scoped loopback HTTP snapshot reads. It polls native buffers, not a new exchange socket implementation.
+The attachment variant implements native OKX spot, trade-price, confirmed candles for `1m`, `3m`, `5m`, `15m`, `30m` and `1h`; a static consumer manifest; maximum required history per dataset; an exclusive-writer dedicated SQLite store; and scoped loopback HTTP snapshot reads. It polls native buffers, not a new exchange socket implementation.
 
 It retains only two recent changed snapshots per stream. It is not MQTT distribution, an ordered raw-trade log, dynamic all-instrument discovery, an intrabar impulse feed or a historical point-in-time archive. None of those capabilities may be inferred from its existence.
+
+The newer branch variant uses `Dataset`, `CandleSnapshot`, `Replica` and `SnapshotHub` in `candle_data.py`, with `data_reader.py` and a different `candle_transport.py`. Its interval vocabulary and profile/configuration fields differ from the attachment. Source presence is not equivalent integration or acceptance. M1 must choose one coherent contract, port missing safeguards and preserve required behavior; do not install both pipelines or silently union their configuration schemas. Start acceptance with confirmed one-minute OKX spot; additional intervals require explicit adapter validation.
 
 Keep HTTP snapshot polling as the first delivery contract. MQTT can be a later transport adapter only after capacity or latency evidence justifies it; its implementation must retain the same identity/recovery guarantees. Do not add multiple brokers or a centralized service per indicator.
 
@@ -98,7 +103,7 @@ The proposed stack deployment remains a separate owner change. Do not assume the
 
 ## 5. Reusable feature contracts
 
-Initially distribute candles and calculate strategy-specific features locally using reusable versioned code. Cache computed results only for genuinely identical contracts. The attached `FeatureCache` is process-local; it is not shared computation across processes.
+Initially distribute candles and calculate strategy-specific features locally using reusable versioned code. Cache computed results only for genuinely identical contracts. The attachment cache is process-local, and the newer branch also has a different `feature_cache.py`. Compare their provenance contracts before choosing the implementation. Neither file name proves shared computation across processes.
 
 Feature identity includes implementation hash/version, parameters, input fields/datasets, finality, initialization/checkpoint identity, missing-data policy and output schema. Result provenance additionally binds the actual input-window content/revisions and availability time. A name such as RSI(14) alone is insufficient. Learned outputs also bind model/scaler artifacts and training cutoff.
 
@@ -124,7 +129,7 @@ The inspected planned-resume path can construct the base PositionExecutor direct
 
 ## 7. Capital, slots, inventory and sell-only admission
 
-Local sizing consumes an assigned budget; it does not claim the whole wallet. Use one existing logical capital authority per account or real account/subaccount segregation. An in-process lock does not coordinate separate processes, and allocating different symbols does not segregate shared quote cash.
+Local sizing consumes an assigned budget; it does not claim the whole wallet. The newer `program_budget.py` explicitly scopes its Metadata reservations to one native recorder/strategy configuration, not independently owned account databases. Its source presence cannot close the cross-process/account-wide gate. Use one existing logical capital authority per account or real account/subaccount segregation. An in-process lock does not coordinate separate processes, and allocating different symbols does not segregate shared quote cash.
 
 Reservations bind account, owner/program, intent, asset, quantity/quote cap, fees, expiry and native order/executor identity. Admission and slot reservation must be atomic relative to competing new programs. Submission uncertainty, signal expiry, process absence or a cancellation request cannot release a commitment. Release follows authoritative terminal reconciliation. Risk limits include reserved acquisitions, marked inventory, retained inventory and per-base concentration; a recovery label cannot free capital or a slot.
 

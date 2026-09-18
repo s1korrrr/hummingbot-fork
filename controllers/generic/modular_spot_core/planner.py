@@ -21,7 +21,7 @@ class EntryProposal:
 
 
 def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, available_quote,
-         amount_step, minimum_amount, minimum_notional, pnl, signal, acquisition, risk):
+         amount_step, minimum_amount, minimum_notional, pnl, signal, acquisition, risk, allow_acquisition=True):
     budget = decimal(budget, 'budget', positive=True)
     bid, ask = decimal(bid, 'bid', positive=True), decimal(ask, 'ask', positive=True)
     now = decimal(now, 'now')
@@ -51,6 +51,10 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
         return revised, None, 'campaign_flat'
     if assessment.paused:
         return revised, None, assessment.reason
+    if type(allow_acquisition) is not bool:
+        raise PolicyError('invalid acquisition permission')
+    if not allow_acquisition:
+        return revised, None, 'acquisition_disabled'
     if fresh_owner:
         return revised, None, 'seeded'
     if market.candle_open == state.candle:

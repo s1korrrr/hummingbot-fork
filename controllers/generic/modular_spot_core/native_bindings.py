@@ -1,5 +1,5 @@
 """Narrow native imports and effects. No orders are submitted by this adapter."""
-from decimal import Decimal
+from decimal import ROUND_FLOOR
 
 from .domain import DataUnavailable, PolicyError, decimal
 
@@ -52,7 +52,6 @@ class NativeBindings:
         rules = connector.trading_rules[c.trading_pair]
         tick = decimal(rules.min_price_increment, 'price increment', positive=True)
         # A buy limit must not round above the price used to reserve quote capital.
-        from decimal import ROUND_FLOOR
         bid = (bid / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
         return dict(bid=bid, ask=ask, available_quote=available, pnl=pnl,
                     amount_step=rules.min_base_amount_increment, minimum_amount=rules.min_order_size,

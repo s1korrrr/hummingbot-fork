@@ -1,97 +1,99 @@
 """Native read/decision adapter. Persistence contains claims, never fill accounting."""
-from decimal import Decimal
+from hashlib import sha256
+from pathlib import Path
 
-from hummingbot.client.settings import AllConnectorSettings, ConnectorType
-from hummingbot.connector.markets_recorder import MarketsRecorder
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
-from hummingbot.strategy_v2.executors.planned_position_resume import pending_manifest
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
-from hummingbot.strategy_v2.utils.market_analysis import calculate_trend_state
+import pandas as pd
 
-from .domain import DataUnavailable, PolicyError, decimal
-from .execution import ModularPositionExecutor, native_config
+from .data_reader import attach_pool, dataset_for, release_pool
+from .domain import DataUnavailable, PolicyError, decimal, identity
 from .inventory import inventory_view
 from .market import features
 from .planner import plan
+from .program_budget import BudgetStore, Reservation
 from .risk import risk_update
+from .selection_state import SelectionStore
 from .state import DecisionStore
+from .universe import select_universe
 
-ERRORS = (ValueError, TypeError, ArithmeticError, RuntimeError, KeyError, AttributeError)
+ERRORS = (ValueError, TypeError, ArithmeticError, RuntimeError, KeyError, AttributeError, OSError)
 
 
 class ModularRuntime:
-    def __init__(self, controller):
+    def __init__(self, controller, bindings=None):
+        if bindings is None:
+            from .native_bindings import NativeBindings
+            bindings = NativeBindings()
+        self.bindings = bindings
         self.controller = controller
         self.fingerprint = controller.config.fingerprint()
-        self.store = None
-        self.market = None
-        self.pending = {}
+        self.feature_implementation = sha256(Path(__file__).with_name("market.py").read_bytes()).hexdigest()
+        self.store = self.budget = self.selection_store = None
+        self.market = self.input_identity = None
+        self.pending, self.pending_inputs = {}, {}
         self.dispatched = set()
         self.fault = None
         self.reason = 'execution_disabled'
-        self.guard_resume()
+        self.coverage = None
+        self.bindings.guard_resume(controller, self.bindings.recorder())
+        self.pool = attach_pool(controller.market_data_provider, controller.config)
 
-    def guard_resume(self):
-        recorder = MarketsRecorder.get_existing_instance()
-        if recorder is not None:
-            path = recorder.sql_manager.db_path
-            manifest = pending_manifest(path) if path else None
-            if manifest and any(p['controller_id'] == self.controller.config.id for p in manifest['positions']):
-                raise PolicyError('native planned resume bypasses local executor selection; not supported')
+    def start_data(self):
+        if self.pool is not None:
+            self.pool.start()
+
+    def close_data(self):
+        pool, self.pool = self.pool, None
+        return release_pool(self.controller.market_data_provider, pool)
 
     def ensure_store(self):
         if self.store is None:
-            self.guard_resume()
-            recorder = MarketsRecorder.get_existing_instance()
+            recorder = self.bindings.recorder()
             if recorder is None:
                 raise PolicyError('initialized native recorder required')
+            self.bindings.guard_resume(self.controller, recorder)
             c = self.controller.config
-            self.store = DecisionStore(recorder, c.id, c.connector_name, c.trading_pair)
+            self.store = DecisionStore(recorder, c.id, c.connector_name, c.trading_pair,
+                                       metadata_model=self.bindings.metadata_model)
+            if c.budget is not None:
+                self.budget = BudgetStore(recorder, c.budget, connector=c.connector_name,
+                                          quote=c.trading_pair.split('-')[1], metadata_model=self.bindings.metadata_model)
         return self.store
 
     def observe(self):
-        c = self.controller.config
-        p = self.controller.market_data_provider
-        self.market = None
+        c, p = self.controller.config, self.controller.market_data_provider
+        self.market = self.input_identity = None
         try:
-            self.market = features(p.get_candles_df(c.connector_name, c.trading_pair, c.interval, c.max_records),
-                                   now=p.time(), interval=c.interval_seconds(), max_age=c.max_candle_age_seconds,
-                                   policy=c.signal, trend_analyzer=calculate_trend_state)
+            now = p.time()
+            def compute(frame):
+                return features(frame, now=now, interval=c.interval_seconds(), max_age=c.max_candle_age_seconds,
+                                policy=c.signal, trend_analyzer=self.bindings.trend)
+            if c.data.mode == 'shared':
+                if self.pool is None:
+                    raise DataUnavailable('shared candle reader is stopped')
+                snapshot = self.pool.snapshot(dataset_for(c), now=now, max_age=c.max_candle_age_seconds)
+                self.market = self.pool.features.get(snapshot, spec=c.signal.model_dump(mode='json'),
+                    implementation='modular-closed-features-v1:' + self.feature_implementation, now=now,
+                    max_age=c.max_candle_age_seconds, compute=compute)
+                self.input_identity = snapshot.digest
+            else:
+                frame = p.get_candles_df(c.connector_name, c.trading_pair, c.interval, c.max_records)
+                self.market = compute(frame)
+                closed = frame.loc[frame.timestamp + c.interval_seconds() <= now,
+                                   ['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                self.input_identity = identity(pd.util.hash_pandas_object(closed, index=False).astype(str).tolist())
             self.reason = 'observed' if c.execution_enabled else 'execution_disabled'
         except ERRORS as exc:
             self.reason = f'market_unavailable:{type(exc).__name__}:{exc}'
         return self.market
 
     def snapshot(self):
-        c = self.controller.config
-        p = self.controller.market_data_provider
-        setting = AllConnectorSettings.get_connector_settings().get(c.connector_name)
-        if setting is None or setting.type != ConnectorType.Exchange:
-            raise PolicyError('only native centralized spot connectors are supported')
-        connector = p.connectors[c.connector_name]
-        if p.ready is not True or connector.ready is not True:
-            raise DataUnavailable('native market/account provider not ready')
-        if getattr(connector, 'supports_terminal_fill_reconciliation', False) is not True:
-            raise PolicyError('authoritative terminal fill reconciliation is required')
-        report = self.controller.performance_report
-        if report is None or report.pnl_available is not True or report.global_pnl_quote is None:
-            raise DataUnavailable('native marked performance unavailable')
-        pnl = decimal(report.global_pnl_quote, 'native marked pnl', minimum=Decimal('-Infinity'))
-        bid = decimal(p.get_price_by_type(c.connector_name, c.trading_pair, PriceType.BestBid), 'bid', positive=True)
-        ask = decimal(p.get_price_by_type(c.connector_name, c.trading_pair, PriceType.BestAsk), 'ask', positive=True)
-        quote = c.trading_pair.split('-')[1]
-        available = decimal(connector.get_available_balance(quote), 'available quote')
-        rules = connector.trading_rules[c.trading_pair]
-        return dict(bid=bid, ask=ask, available_quote=available, pnl=pnl,
-                    amount_step=rules.min_base_amount_increment, minimum_amount=rules.min_order_size,
-                    minimum_notional=rules.min_notional_size)
+        return self.bindings.snapshot(self.controller)
 
     def inventory(self):
         c = self.controller.config
         recorder = self.ensure_store().recorder
         kwargs = dict(controller_id=c.id, connector=c.connector_name, pair=c.trading_pair)
-        saved = inventory_view(recorder.get_executors_by_controller(c.id),
-                               recorder.get_positions_by_controller(c.id), **kwargs)
+        saved = inventory_view(recorder.get_executors_by_controller(c.id), recorder.get_positions_by_controller(c.id), **kwargs)
         current = inventory_view(self.controller.executors_info, self.controller.positions_held, **kwargs)
         for key, value in current.items():
             old = saved.get(key)
@@ -100,31 +102,75 @@ class ModularRuntime:
                 raise PolicyError('native execution receipt regressed')
         return {**saved, **current}
 
+    def acquisition_permitted(self):
+        c = self.controller.config
+        if not c.acquisition_enabled or c.universe.mode == 'sell_only':
+            self.reason = 'sell_only_no_acquisition'
+            return False
+        if c.data.mode == 'shared' and (self.pool is None or not self.pool.entry_ready(dataset_for(c))):
+            self.reason = 'shared_data_resynchronization'
+            return False
+        if c.universe.mode == 'fixed':
+            permitted = c.universe.symbols or (c.trading_pair,)
+            return c.trading_pair in permitted
+        self.ensure_store()
+        scores, self.coverage = self.pool.screen(c, now=self.controller.market_data_provider.time())
+        policy_hash = identity([c.universe.model_dump(mode='json'), c.data.model_dump(mode='json'),
+                                c.connector_name, c.interval])
+        if self.selection_store is None:
+            self.selection_store = SelectionStore(self.store.recorder, group=c.budget.group,
+                policy_hash=policy_hash, metadata_model=self.bindings.metadata_model)
+        now = self.controller.market_data_provider.time()
+        candle = int(now // c.interval_seconds()) * c.interval_seconds() - c.interval_seconds()
+        evidence_hash = identity([candle, [(pair, str(score)) for pair, score in sorted(scores.items())], str(self.coverage)])
+        entries = self.selection_store.choose(candle=candle, evidence_hash=evidence_hash,
+            select=lambda previous: select_universe(c.universe, available=c.data.symbols,
+                tradable=c.universe.symbols, scores=scores, managed=(), pending=(), blocked=(), previous=previous).entries)
+        if c.trading_pair not in entries:
+            self.reason = 'not_selected_or_incomplete_universe'
+            return False
+        return True
+
+    def reservation(self, config):
+        c = self.controller.config
+        return Reservation(executor_id=config.id, controller_id=c.id, trading_pair=c.trading_pair,
+                           reserved_quote=config.amount * config.entry_price * (1 + c.risk.fee_reserve_fraction))
+
     def actions(self):
         c = self.controller.config
-        if not c.execution_enabled or c.manual_kill_switch or self.fault or self.market is None:
+        if not c.execution_enabled or c.manual_kill_switch or self.fault:
             return []
         try:
             if c.fingerprint() != self.fingerprint:
                 raise PolicyError('implementation/configuration changed')
+            if self.observe() is None:
+                return []
+            allowed = self.acquisition_permitted()
+            permission_reason = self.reason
             store = self.ensure_store()
             state, raw = store.load()
             revised, proposal, reason = plan(
                 state, self.inventory(), fingerprint=self.fingerprint, budget=c.total_amount_quote,
                 now=self.controller.market_data_provider.time(), market=self.market,
-                signal=c.signal, acquisition=c.acquisition, risk=c.risk, **self.snapshot())
-            # Before even a single CreateExecutorAction can leave this controller.
+                signal=c.signal, acquisition=c.acquisition, risk=c.risk,
+                allow_acquisition=allowed, **self.snapshot())
+            config = self.bindings.config(c, proposal) if proposal is not None else None
+            if config is not None and self.budget is not None:
+                if not self.budget.reserve(self.reservation(config), native_executors=store.recorder.get_all_executors()):
+                    self.reason = 'program_capital_or_asset_limit'
+                    return []
+            # A group claim remains reserved if this second persistence boundary fails.
             if revised != state and not store.compare_and_swap(raw, revised):
                 raise PolicyError('decision CAS conflict; no dispatch')
-            self.reason = reason
+            self.reason = permission_reason if reason == 'acquisition_disabled' else reason
             self.pending = {key: value for key, value in self.pending.items() if key in revised.claims}
+            self.pending_inputs = {key: value for key, value in self.pending_inputs.items() if key in revised.claims}
             self.dispatched.intersection_update(revised.claims)
-            if proposal is None:
+            if config is None:
                 return []
-            config = native_config(c, identifier=proposal.identifier, timestamp=proposal.timestamp,
-                                   price=proposal.price, amount=proposal.amount, cycle=proposal.cycle, stage=proposal.stage)
             self.pending[config.id] = config.model_copy(deep=True)
-            return [CreateExecutorAction(controller_id=c.id, executor_config=config)]
+            self.pending_inputs[config.id] = self.input_identity
+            return [self.bindings.action(c.id, config)]
         except DataUnavailable as exc:
             self.reason = f'data_hold:{exc}'
             return []
@@ -146,11 +192,18 @@ class ModularRuntime:
             state, raw = store.load()
             if state is None or state.fingerprint != self.fingerprint or config.id not in state.claims:
                 return False
+            if self.budget is not None and not self.budget.contains(
+                    self.reservation(config), native_executors=store.recorder.get_all_executors()):
+                raise PolicyError('group capital reservation is unavailable')
             snapshot = self.snapshot()
             now = decimal(self.controller.market_data_provider.time(), 'now')
-            if now < config.timestamp or now - Decimal(str(config.timestamp)) > c.acquisition.entry_timeout_seconds:
+            timestamp = decimal(config.timestamp, 'entry timestamp')
+            if now < timestamp or now - timestamp > c.acquisition.entry_timeout_seconds:
                 return False
-            if self.observe() is None:
+            if self.observe() is None or not self.acquisition_permitted():
+                return False
+            if self.pending_inputs.get(config.id) != self.input_identity:
+                self.reason = 'entry_input_revision_changed'
                 return False
             assessment = risk_update(c.risk, budget=c.total_amount_quote, pnl=snapshot['pnl'], day=int(now // 86400),
                                      peak=state.risk_peak, previous_day=state.risk_day,
@@ -165,19 +218,7 @@ class ModularRuntime:
             required = config.amount * config.entry_price * (1 + c.risk.fee_reserve_fraction)
             if check_funds and required + c.risk.cash_reserve_quote > snapshot['available_quote']:
                 return False
-            connector = self.controller.market_data_provider.connectors[c.connector_name]
-            base, quote = c.trading_pair.split('-')
-            fee = connector.get_fee(base_currency=base, quote_currency=quote, order_type=OrderType.LIMIT,
-                                    order_side=TradeType.BUY, amount=config.amount, price=config.entry_price, is_maker=False)
-            if fee.percent and fee.percent_token not in (None, base, quote):
-                return False
-            rate = decimal(fee.percent, 'entry fee')
-            for item in fee.flat_fees:
-                amount = decimal(item.amount, 'flat entry fee')
-                if item.token not in (base, quote):
-                    return False
-                rate += amount * (config.entry_price if item.token == base else 1) / (config.amount * config.entry_price)
-            return rate <= c.risk.fee_reserve_fraction
+            return self.bindings.fees_permit(self.controller, config)
         except DataUnavailable as exc:
             self.reason = f'data_hold:{exc}'
             return False
@@ -193,4 +234,4 @@ class ModularRuntime:
         if config.id in self.dispatched or not self.entry_permission(config):
             raise PolicyError('ungranted or already consumed modular executor request')
         self.dispatched.add(config.id)
-        return ModularPositionExecutor
+        return self.bindings.executor_class()

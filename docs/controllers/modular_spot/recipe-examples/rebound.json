@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "name": "rebound_reference",
+  "family": "rebound",
+  "connector": "okx",
+  "capital_model": "spot_cash_inventory_1x",
+  "account_topology": "single_native_recorder",
+  "symbols": ["BTC-USDC", "ETH-USDC"],
+  "quote_budget": "1000",
+  "max_positions": 2,
+  "history": 300,
+  "signal": {"kind": "rsi_rebound", "rsi_length": 14, "oversold": "30"},
+  "acquisition": {"fractions": ["0.3", "0.4", "0.3"]},
+  "trailing": {"activation": "0.015", "delta": "0.005"}
+}

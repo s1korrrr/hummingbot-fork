@@ -16,6 +16,7 @@ from controllers.generic.modular_spot_core.config import AcquisitionPolicy, Risk
 from controllers.generic.modular_spot_core.data_reader import DataPolicy, attach_pool, dataset_for
 from controllers.generic.modular_spot_core.domain import identity
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
+from controllers.generic.modular_spot_core.recipe_contract import RecipeBinding, source_digest, verify_binding
 from controllers.generic.modular_spot_core.runtime import ModularRuntime
 from controllers.generic.modular_spot_core.universe import UniversePolicy
 
@@ -44,6 +45,7 @@ class ModularSpotControllerConfig(ControllerConfigBase):
     data: DataPolicy = Field(default_factory=DataPolicy)
     universe: UniversePolicy = Field(default_factory=UniversePolicy)
     budget: BudgetPolicy | None = None
+    recipe_binding: RecipeBinding | None = None
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
 
     @model_validator(mode='after')
@@ -72,6 +74,9 @@ class ModularSpotControllerConfig(ControllerConfigBase):
                 raise ValueError('acquisition universe exceeds observed instruments')
             if self.trading_pair not in self.universe.symbols:
                 raise ValueError('pair is outside the configured acquisition universe')
+        if self.recipe_binding is not None:
+            verify_binding(self.recipe_binding, self.model_dump(mode='json'),
+                           source_sha256=source_digest(Path(__file__).parent, source_files()))
         return self
 
     def interval_seconds(self):
@@ -140,7 +145,9 @@ class ModularSpotController(ControllerBase):
                                'acquisition_enabled': self.config.acquisition_enabled,
                                'universe_mode': self.config.universe.mode,
                                'universe_coverage': self.runtime.coverage,
-                               'data_source': self.config.data.mode}
+                               'data_source': self.config.data.mode,
+                               'recipe_binding': None if self.config.recipe_binding is None
+                               else self.config.recipe_binding.model_dump(mode='json')}
 
     def determine_executor_actions(self):
         if self.status != RunnableStatus.RUNNING:

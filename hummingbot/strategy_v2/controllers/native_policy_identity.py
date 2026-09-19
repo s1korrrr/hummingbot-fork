@@ -12,3 +12,13 @@ def is_ok_rsi_policy(config) -> bool:
     # circular dependency. An opt-in name alone never grants the policy exception.
     from controllers.generic.modular_ok_rsi import ModularOKRSIControllerConfig
     return type(config) is ModularOKRSIControllerConfig
+
+
+def is_modular_policy(config) -> bool:
+    """Exact modular model identity for operational rails, never accounting exceptions."""
+    if getattr(config, 'controller_name', None) not in {'modular_spot', 'modular_ok_rsi', 'modular_rsi_v5'}:
+        return False
+    from controllers.generic.modular_ok_rsi import ModularOKRSIControllerConfig
+    from controllers.generic.modular_rsi_v5 import ModularRSIV5ControllerConfig
+    from controllers.generic.modular_spot import ModularSpotControllerConfig
+    return type(config) in {ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, ModularSpotControllerConfig}

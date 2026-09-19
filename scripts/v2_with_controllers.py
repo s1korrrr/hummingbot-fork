@@ -1,6 +1,9 @@
 import os
+import time
 from decimal import Decimal
 from typing import Dict, List, Optional
+
+from pydantic import field_validator
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
@@ -9,7 +12,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.remote_iface.mqtt import ExternalEventFactory
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
-from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
+from hummingbot.strategy_v2.controllers.native_policy_identity import is_modular_policy, is_ok_rsi_policy
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
@@ -18,6 +21,14 @@ class V2WithControllersConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
     max_global_drawdown_quote: Optional[float] = None
     max_controller_drawdown_quote: Optional[float] = None
+
+    @field_validator('max_global_drawdown_quote', 'max_controller_drawdown_quote', mode='before')
+    @classmethod
+    def reject_boolean_limits(cls, value):
+        if isinstance(value, bool):
+            raise ValueError('Loss limits must be numeric, not boolean')
+        return value
+
     runtime_db_sync_enabled: bool = True
     runtime_db_sync_interval: int = 10
     runtime_status_snapshot_enabled: bool = True
@@ -51,12 +62,15 @@ class V2WithControllers(StrategyV2Base):
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self._operator_event_queue = ExternalEventFactory.create_queue("rsibot.operator")
-        self._risk_persistence_enabled = any(is_ok_rsi_policy(c.config)
+        self._risk_persistence_enabled = any(is_ok_rsi_policy(c.config) or is_modular_policy(c.config)
                                              for c in self.controllers.values())
+        self._operator_started_at = time.time()
+        self._operator_watermarks = {}
         self._last_risk_state = None
         self._risk_reconciliation_error: Optional[str] = None
         if self._risk_persistence_enabled:
             try:
+                self._validate_modular_loss_limits()
                 recorder = MarketsRecorder.get_instance()
                 state = recorder.load_strategy_risk_state()
                 if state is None:
@@ -71,6 +85,7 @@ class V2WithControllers(StrategyV2Base):
                             or type(state['stopped']) is not bool
                             or any(type(paused) is not bool for paused in state['operator_paused'].values())):
                         raise ValueError('Incomplete or invalid durable risk state')
+                    self._operator_watermarks = self._validate_operator_watermarks(state.get('operator_watermarks', {}))
                     self.max_global_pnl = Decimal(state['max_global_pnl'])
                     self.max_pnl_by_controller = {key: Decimal(value) for key, value in state['max_pnl_by_controller'].items()}
                     if not self.max_global_pnl.is_finite() or any(not x.is_finite() for x in self.max_pnl_by_controller.values()):
@@ -87,7 +102,7 @@ class V2WithControllers(StrategyV2Base):
                 self._risk_reconciliation_error = str(error) or type(error).__name__
                 self.logger().exception('Risk state unavailable; execution blocked pending reconciliation')
 
-    def _persist_risk_state(self):
+    def _persist_risk_state(self, *, operator_receipts=()):
         if not getattr(self, '_risk_persistence_enabled', False):
             return
         if getattr(self, '_risk_reconciliation_error', None) is not None:
@@ -99,8 +114,14 @@ class V2WithControllers(StrategyV2Base):
                  'drawdown_exited_controllers': sorted(set(self.drawdown_exited_controllers)),
                  'stopped': self._is_stop_triggered,
                  'operator_paused': {cid: bool(getattr(c, '_operator_entry_paused', False)) for cid, c in self.controllers.items()}}
-        if state != self._last_risk_state:
-            MarketsRecorder.get_instance().store_strategy_risk_state(state)
+        if getattr(self, '_operator_watermarks', {}):
+            state['operator_watermarks'] = self._operator_watermarks.copy()
+        if state != self._last_risk_state or operator_receipts:
+            recorder = MarketsRecorder.get_instance()
+            if operator_receipts:
+                recorder.store_strategy_risk_state(state, operator_receipts=operator_receipts)
+            else:
+                recorder.store_strategy_risk_state(state)
             self._last_risk_state = state
 
     def validate_create_action(self, action):
@@ -142,10 +163,52 @@ class V2WithControllers(StrategyV2Base):
             self._is_stop_triggered = True
             self.logger().exception('Unable to persist risk state; new execution blocked')
 
+    def _validate_operator_watermarks(self, watermarks):
+        if not isinstance(watermarks, dict) or not set(watermarks).issubset(self.controllers):
+            raise ValueError('Invalid operator command scope')
+        for value in watermarks.values():
+            if (not isinstance(value, dict) or set(value) != {'requested_at', 'command_id'}
+                    or type(value['requested_at']) not in (float, int)
+                    or not Decimal(str(value['requested_at'])).is_finite() or value['requested_at'] < 0
+                    or not isinstance(value['command_id'], str) or not 1 <= len(value['command_id']) <= 128):
+                raise ValueError('Invalid persisted operator command receipt')
+        return watermarks
+
+    def _native_operator_command_is_fresh(self, payload, targets):
+        native = [c for c in targets if is_modular_policy(c.config)]
+        if not native:
+            return True
+        if getattr(self, '_risk_reconciliation_error', None):
+            return False
+        timestamp, command_id = payload.get('requested_at'), payload.get('command_id')
+        bot_id = HummingbotApplication.main_application().instance_id
+        now = time.time()
+        if (not isinstance(bot_id, str) or not bot_id or payload.get('bot_name') != bot_id
+                or type(timestamp) not in (float, int) or not Decimal(str(timestamp)).is_finite()
+                or not self._operator_started_at <= timestamp <= now + 5 or now - timestamp > 60
+                or not isinstance(command_id, str) or not 1 <= len(command_id) <= 128):
+            return False
+        for controller in native:
+            previous = self._operator_watermarks.get(controller.config.id)
+            if previous and (timestamp <= previous['requested_at'] or command_id == previous['command_id']):
+                return False
+            try:
+                if MarketsRecorder.get_instance().has_operator_command(controller.config.id, command_id):
+                    return False
+            except Exception:
+                self._is_stop_triggered = True
+                self._risk_reconciliation_error = 'Operator receipt store unavailable'
+                self.logger().exception(self._risk_reconciliation_error)
+                return False
+        return True
+
     def process_operator_events(self):
         while len(self._operator_event_queue) > 0:
             event_name, event = self._operator_event_queue.popleft()
             payload = getattr(event, "data", {}) or {}
+            if not isinstance(payload, dict):
+                self.logger().warning('Rejected non-mapping operator event')
+                continue
             action = str(payload.get("action") or "").strip()
             controller_id = payload.get("controller_id")
             requested_at = payload.get("requested_at")
@@ -158,6 +221,13 @@ class V2WithControllers(StrategyV2Base):
             )
             target_controllers = [controller for controller in target_controllers if controller is not None]
 
+            if action not in {'global_pause_entries', 'bot_pause_entries', 'global_resume_entries',
+                              'bot_resume_entries', 'bot_cancel_pending_entries'}:
+                self.logger().warning('Unsupported operator action: %s', action)
+                continue
+            if not self._native_operator_command_is_fresh(payload, target_controllers):
+                self.logger().warning('Rejected stale, duplicate or incorrectly addressed native operator command')
+                continue
             if action in {"global_pause_entries", "bot_pause_entries"}:
                 scope = "global" if action == "global_pause_entries" else "bot"
                 for controller in target_controllers:
@@ -192,10 +262,33 @@ class V2WithControllers(StrategyV2Base):
                 ]
                 if actions:
                     self.executor_orchestrator.execute_actions(actions)
-            else:
-                self.logger().warning(f"Unsupported operator event {event_name}: {payload}")
+            for controller in target_controllers:
+                if is_modular_policy(controller.config):
+                    self._operator_watermarks[controller.config.id] = {
+                        'requested_at': requested_at, 'command_id': command_id}
+            if any(is_modular_policy(c.config) for c in target_controllers):
+                try:
+                    receipts = tuple({'controller_id': c.config.id, 'command_id': command_id,
+                                      'requested_at': requested_at} for c in target_controllers if is_modular_policy(c.config))
+                    self._persist_risk_state(operator_receipts=receipts)
+                except Exception as error:
+                    self._is_stop_triggered = True
+                    self._risk_reconciliation_error = 'Operator command persistence failed'
+                    self.logger().exception(self._risk_reconciliation_error)
+                    raise RuntimeError(self._risk_reconciliation_error) from error
+
+    def _validate_modular_loss_limits(self):
+        if not any(is_modular_policy(c.config) for c in self.controllers.values()):
+            return
+        limits = [self.config.max_global_drawdown_quote, self.config.max_controller_drawdown_quote]
+        if any(value is None or isinstance(value, bool) for value in limits):
+            raise ValueError('Native modular execution requires finite positive loss limits')
+        limits = [Decimal(str(value)) for value in limits]
+        if any(not value.is_finite() or value <= 0 for value in limits) or limits[1] > limits[0]:
+            raise ValueError('Native modular loss limits must be finite, positive and controller <= global')
 
     def control_max_drawdown(self):
+        self._validate_modular_loss_limits()
         if self.config.max_controller_drawdown_quote:
             self.check_max_controller_drawdown()
         if self.config.max_global_drawdown_quote:

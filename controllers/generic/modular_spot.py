@@ -140,6 +140,20 @@ class ModularSpotController(ControllerBase):
     def __init__(self, config: ModularSpotControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.runtime = ModularRuntime(self)
+        self._operator_entry_paused = False
+        self._operator_state = {'entry_paused': False, 'reason': None, 'scope': None,
+                                'updated_at': None, 'last_command_id': None}
+
+    def set_operator_entry_pause(self, enabled, *, reason=None, scope=None, command_id=None, updated_at=None):
+        if type(enabled) is not bool:
+            raise ValueError('Operator pause must be a boolean')
+        self._operator_entry_paused = enabled
+        self._operator_state = {'entry_paused': enabled, 'reason': reason, 'scope': scope,
+                                'updated_at': updated_at if updated_at is not None else time.time(),
+                                'last_command_id': command_id}
+
+    def get_operator_state(self):
+        return dict(self._operator_state)
 
     def start(self):
         if self.config.data.mode == 'shared' and self.runtime.pool is None:
@@ -193,6 +207,7 @@ class ModularSpotController(ControllerBase):
     def get_custom_info(self) -> dict:
         """Bounded, read-only metadata for the native performance-report publisher."""
         return {
+            'operator': self.get_operator_state(),
             'modular_status': self.runtime.reason.split(':', 1)[0][:80],
             'candle_open': self.processed_data.get('candle_open'),
             'execution_enabled': self.config.execution_enabled,

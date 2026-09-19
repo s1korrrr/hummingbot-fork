@@ -4,7 +4,7 @@ import asyncio
 import importlib
 from copy import deepcopy
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
@@ -115,6 +115,7 @@ def required_shared_history(config, family):
 class NativeCompositionFields(BaseModel):
     """Additional fields; all strategy parameters come from the actual native schema."""
     _native_family: ClassVar[str]
+    execution_mode: Literal['live', 'paper'] = 'live'
     execution_enabled: StrictBool = Field(default=False, json_schema_extra={'is_updatable': True})
     data: DataPolicy = Field(default_factory=DataPolicy)
     shared_history: int | None = Field(default=None, ge=500, le=10000, strict=True)
@@ -123,9 +124,12 @@ class NativeCompositionFields(BaseModel):
 
     @model_validator(mode='after')
     def validate_native_composition(self):
-        if (self.connector_name != 'okx' or self.leverage != 1 or self.position_mode != PositionMode.ONEWAY
+        expected_connector = 'okx_paper_trade' if self.execution_mode == 'paper' else 'okx'
+        if (self.connector_name != expected_connector or self.leverage != 1 or self.position_mode != PositionMode.ONEWAY
                 or not self.trading_pair.endswith('-USDC')):
             raise ValueError('native modular composition admits OKX USDC spot at 1x only')
+        if self.execution_mode == 'paper' and self.candles_connector != 'okx':
+            raise ValueError('paper execution requires the explicit public OKX candle owner')
         controls = {'mode', 'transport', 'origin', 'token_file'}
         if self.data.model_dump(exclude=controls) != DataPolicy().model_dump(exclude=controls):
             raise ValueError('native composition does not consume generic screening or source-profile settings')
@@ -209,6 +213,11 @@ class NativeComposition:
     def __init__(self, config, market_data_provider, actions_queue, **kwargs):
         # Revalidate before a native constructor may use any strategy parameter.
         config = type(config).model_validate(config.model_dump(mode='json'))
+        if config.execution_mode == 'paper':
+            from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
+            connector = getattr(market_data_provider, 'connectors', {}).get(config.connector_name)
+            if not is_native_paper_connector(connector):
+                raise ValueError('paper composition requires the isolated native paper connector')
         self.shared_candles = None
         if config.data.mode == 'shared':
             self.shared_candles = NativeCandleProvider(market_data_provider, config, self._native_family)
@@ -290,6 +299,7 @@ class NativeComposition:
     def get_custom_info(self):
         info = super().get_custom_info()
         info['modular_composition'] = {'native_family': self._native_family,
+                                       'execution_mode': self.config.execution_mode,
                                        'data_mode': self.config.data.mode,
                                        'transport': self.config.data.transport,
                                        'execution_enabled': self.config.execution_enabled,

@@ -5,7 +5,7 @@ from collections import deque
 from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 from hummingbot.client.native_lifecycle import ShutdownResult
 from hummingbot.connector.markets_recorder import MarketsRecorder
@@ -238,8 +238,10 @@ class ExecutorOrchestrator:
                  strategy: "StrategyV2Base",
                  executors_update_interval: float = 1.0,
                  executors_max_retries: int = 10,
-                 initial_positions_by_controller: Optional[dict] = None):
+                 initial_positions_by_controller: Optional[dict] = None,
+                 executor_start: Optional[Callable] = None):
         self.strategy = strategy
+        self._executor_start = executor_start
         self.executors_update_interval = executors_update_interval
         self.executors_max_retries = executors_max_retries
         self.active_executors = {}
@@ -1593,7 +1595,10 @@ class ExecutorOrchestrator:
         # Persist intent before starting anything that can submit an order. A failed write must not start execution.
         MarketsRecorder.get_instance().store_or_update_executor(executor)
         self.active_executors[controller_id].append(executor)
-        executor.start()
+        if self._executor_start is None:
+            executor.start()
+        else:
+            self._executor_start(executor)
         self.logger().debug(f"Created {type(executor).__name__} for controller {controller_id}")
 
     def _validate_okx_wallet_reservation(self, config):

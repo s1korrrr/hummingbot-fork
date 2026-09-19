@@ -29,7 +29,7 @@ class NativePolicyRecipe(PolicyModel):
     @model_validator(mode='after')
     def complete(self):
         reserved = {'id', 'controller_name', 'controller_type', 'execution_enabled', 'data', 'shared_history',
-                    'recipe_binding', 'initial_positions', 'legacy_controller_ids'}
+                    'execution_mode', 'recipe_binding', 'initial_positions', 'legacy_controller_ids'}
         if reserved & set(self.parameters):
             raise ValueError('native recipe parameters cannot override identity, transport, authority or inventory')
         if len(canonical_json(self.model_dump(mode='json'))) > 65536:

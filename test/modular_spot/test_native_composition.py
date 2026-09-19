@@ -47,7 +47,7 @@ def controllers(family, wrapper_config, wrapper, native_config, native, **change
     config = wrapper_config(id='modular_spot_parity', trading_pair='BTC-USDC', strict_hmm_mode=False,
                             **changes)
     wrapped = wrapper(config, provider(), asyncio.Queue())
-    values = config.model_dump(mode='python', exclude={'data', 'shared_history', 'recipe_binding', 'execution_enabled'})
+    values = config.model_dump(mode='python', exclude={'data', 'shared_history', 'recipe_binding', 'execution_enabled', 'execution_mode'})
     values['controller_name'] = family
     values['controller_type'] = 'directional_trading'
     legacy = native(native_config.model_validate(values), provider(), asyncio.Queue())

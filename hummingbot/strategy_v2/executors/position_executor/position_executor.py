@@ -230,9 +230,9 @@ class PositionExecutor(ExecutorBase):
     @property
     def is_perpetual(self) -> bool:
         """
-        Check if the exchange connector is perpetual.
+        Check if the position is perpetual.
 
-        :return: True if the exchange connector is perpetual, False otherwise.
+        :return: True if the position is perpetual, False otherwise.
         """
         return self.is_perpetual_connector(self.config.connector_name)
 
@@ -291,12 +291,31 @@ class PositionExecutor(ExecutorBase):
 
         capped_amount = min(close_amount, max(available_base, Decimal("0")))
         try:
-            capped_amount = self.connectors[self.config.connector_name].quantize_order_amount(
-                trading_pair=self.config.trading_pair,
-                amount=capped_amount,
+            quantized_amount = self._to_decimal(
+                self.connectors[self.config.connector_name].quantize_order_amount(
+                    trading_pair=self.config.trading_pair,
+                    amount=capped_amount,
+                )
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.logger().error(self._log_message(
+                f"Close order amount quantization failed; retaining position "
+                f"amount_to_close={close_amount} available_{base_asset}={available_base} "
+                f"error={type(exc).__name__}"
+            ))
+            return Decimal("0")
+        if (
+            quantized_amount is None
+            or quantized_amount < Decimal("0")
+            or quantized_amount > capped_amount
+        ):
+            self.logger().error(self._log_message(
+                f"Close order amount quantization invalid; retaining position "
+                f"amount_to_close={close_amount} available_{base_asset}={available_base} "
+                f"quantized_amount={quantized_amount}"
+            ))
+            return Decimal("0")
+        capped_amount = quantized_amount
         if available_base < close_amount:
             self.logger().warning(
                 self._log_message(
@@ -365,7 +384,7 @@ class PositionExecutor(ExecutorBase):
         """
         Get the filled amount of the open order in quote currency.
 
-        :return: The filled amount of the open order in quote currency.
+        :return: The filled amount of the open order if it exists, otherwise 0.
         """
         return self.open_filled_amount * self.entry_price
 
@@ -700,7 +719,7 @@ class PositionExecutor(ExecutorBase):
         """
         Calculate the trade pnl in quote asset
 
-        :return: The trade pnl in quote asset.
+        :return: The trade pnl quote in quote asset.
         """
         return self.trade_pnl_pct * self.open_filled_amount * self.entry_price
 
@@ -1832,6 +1851,5 @@ class PositionExecutor(ExecutorBase):
         This method is responsible for sleeping the executor for a specific time.
 
         :param delay: The time to sleep.
-        :return: None
         """
         await asyncio.sleep(delay)

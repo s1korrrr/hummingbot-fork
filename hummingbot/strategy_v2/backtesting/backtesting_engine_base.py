@@ -222,7 +222,10 @@ class BacktestingEngineBase:
             return self.dca_executor_simulator.simulate(df, config, trade_cost)
         elif isinstance(config, PositionExecutorConfig):
             return self.position_executor_simulator.simulate(df, config, trade_cost)
-        return None
+        raise NotImplementedError(
+            f"No faithful backtesting simulator is registered for {type(config).__name__}; "
+            "the executor action cannot be silently discarded. Use native execution replay."
+        )
 
     def manage_active_executors(self, simulation: ExecutorSimulation):
         """

@@ -269,3 +269,66 @@ This handoff preserves the original evidence and newly observed published helper
 ### Copyable implementation handoff
 
 > Read current root/owner instructions, then `docs/controllers/modular_spot/SPEC.md` and `PLAN.md`. Refresh PR #55 and resume M0, then M1's current-source/attachment reconciliation. Preserve newer published helpers and existing controllers; do not blindly apply or rewind to the old patch. Reuse native Hummingbot interfaces, validate actual wiring and run real native tests with independent review. Record exact progress, evidence and blockers. Do not activate execution, touch accounts, run economic backtests, merge or deploy without separate authority.
+
+
+## M9 — Mean-reversion context policy: shadow first, reduction-only enforcement later
+
+**Authority:** research/specification and source validation only unless a later task explicitly authorizes an economic backtest or paper/canary/live activation. **Owners:** Hummingbot for controller/native decision semantics; Hummingbot API/Market Pulse is an input producer only; Quants Lab owns economic backtests; Research OS owns durable research evidence.
+
+### M9.0 — Bind the input contract
+
+Inspect the exact Market Pulse/component producer and the final M0-M8 modular interfaces before coding. Record source SHAs, component formula/schema, universe construction, finality, observation/receipt timestamps, coverage behavior and cross-venue identity. Add a versioned immutable context snapshot adapter; do not make the controller call dashboard/reporting code or create a second market-data/execution owner.
+
+Red tests: stale/missing context, low coverage, universe revision, future/unfinished candle, changed producer epoch, cross-venue identity, out-of-order snapshot, duplicate snapshot and correction. Existing position management must remain independent when only entry context is unavailable.
+
+**Accept:** the same eligible completed observation produces the same bound snapshot; unavailable/invalid context cannot authorize new risk.
+
+### M9.1 — Separate validity from economic context
+
+Expose freshness/readiness/coverage as hard validity metadata rather than a favorable economic component. Preserve the existing public Market Pulse scalar for compatibility; do not silently redefine its dashboard meaning. The new MR policy consumes explicit components and derivatives (level/change) under a new schema/version.
+
+Add prefix-invariance tests: features attributed to decision time `t` computed from data available through `t` must not change when future data are appended. Explicitly test close-derived features are unavailable before candle close/receipt. Historical rebuilds that synthesize `event_age_seconds=0` are not accepted as live-freshness replay.
+
+**Accept:** no lookahead through timestamp labeling, forward fill, universe membership or later corrections; validity cannot be offset by bullish components.
+
+### M9.2 — Shadow policy for initial entries
+
+Add an opt-in `MeanReversionContextPolicy` (name may adapt to current owner conventions) behind the strategy opportunity and before capital reservation. Output `ALLOW/DEFER/DENY`, `multiplier [0,1]`, expiry and reason codes. In shadow mode, persist/emit the proposed context decision and baseline proposal identity but do not change native actions.
+
+Capture every baseline-eligible opportunity, including those shadow policy would reject, with causal context, strategy setup, current inventory/reservations and later outcome references. Do not label rejected trades as realized avoided losses.
+
+**Accept:** with enforcement disabled, native action sequence is parity-equivalent to baseline; shadow records are deterministic, causal and attributable.
+
+### M9.3 — Research: initial-entry incremental value
+
+Through the existing Research OS/Quants Lab registration flow, preregister unchanged baseline, simple trend/volatility context control, current raw composite gate (diagnostic only) and component-based MR context candidate. Use the mandated cached May-August 2026 window, identical spot 1x accounting and realistic costs. Match/normalize exposure when interpreting risk improvement.
+
+Primary evidence: after-cost portfolio return/equity, max drawdown and duration, tail loss/MAE, trade activity, deployed-capital and capital-days, inventory age/unfinished inventory, turnover/fees and regime/fold stability. Record trial count and parameter sensitivity. No threshold tuning after seeing the final comparison.
+
+**Accept for next stage:** preregistered incremental criteria pass with adequate activity and robustness. Otherwise record contradicted/inconclusive evidence and keep the layer shadow-only.
+
+### M9.4 — Shadow and research next-DCA-tranche admission
+
+Do not change DCA spacing, tranche amounts and exit logic simultaneously. First evaluate only whether the baseline's already-planned next tranche is admitted/deferred. Bind the decision to current native per-tranche inventory, outstanding commitments and remaining program budget. A lower combined average price is not itself evidence of improved economics.
+
+Required failure cases: accelerating systemic selloff, context recovery after defer, stale context, reservation already consumed/uncertain, price gaps, minimum-notional rounding, retained inventory and restart. Expired context never releases an uncertain native commitment.
+
+**Accept:** DCA admission improves preregistered portfolio outcomes versus unchanged DCA under matched execution assumptions; per-tranche native accounting remains conserved.
+
+### M9.5 — Candidate ranking for screener profile
+
+Only after entry-context evidence, test ranking as `local MR setup × global context × executable cost/capacity`. The global component cannot alone distinguish candidates. Use deterministic ties, bounded queues, base-asset concentration and current executable-universe admission. Do not force unused budget into fewer survivors.
+
+**Accept:** ranking improves opportunity selection under fixed aggregate risk without increasing concentration or bypassing M5 capital/slot authority.
+
+### M9.6 — Optional bounded enforcement
+
+Enforcement remains opt-in, default off and reduction-only. Before any paper/canary/live use, require exact source/image/config identity, native M0-M8 gates, causal context freshness/coverage monitoring, reconciliation, aggregate account limits, alerting, rollback and operator approval. On context failure, fail closed for dependent new acquisition; do not synthesize exits or restart execution owners.
+
+Sizing multipliers above 1 and score-driven exit/trailing changes are explicitly out of this milestone and require separate hypotheses/specs/evidence.
+
+### M9 validation matrix
+
+At minimum retain tests for: baseline parity in shadow mode; no context-only BUY; multiplier bounds; minimum-order deny/defer; stale/missing/low-coverage fail-closed; future candle/lookahead refusal; snapshot/config/intent identity; universe revision; cross-venue labeling; duplicate/out-of-order/correction behavior; DCA uncertain reservation; restart determinism; management independence; and reason-code projection.
+
+Record implementation, research, native, paper/canary/live and promotion status separately. Passing unit/native tests does not establish economic merit; passing a backtest does not authorize capital.

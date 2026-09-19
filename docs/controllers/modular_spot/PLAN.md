@@ -449,3 +449,9 @@ strategy and whole-program roadmap. The candidate is local and uncommitted.
 Remote CI is blocked by GitHub billing; publication, economic research, live-owner
 migration and activation remain separate. All thirteen live stack container IDs,
 image IDs and start times were preserved.
+
+## Publication stack reconciliation — 2026-09-19
+
+PR #55 foundation commit `0c1aa65ed9e31c92f7d5d353ae7a574ec9a1e294` is now an ancestor of this integration. Its standalone [publication receipt](PUBLICATION_RECEIPT.md) records 446 passing tests plus 10 subtests, zero skips; those results describe the parent, not this larger candidate. The original public-candle diagnostic is retained from the parent.
+
+The merge preserves this integration's already validated 10,000-row history, asynchronous bounded snapshot capture, WebSocket selection, recipe binding and transport regression tests. Older conflicting forms would remove those features. The 1,173-file final production manifest is unchanged. Parent publication documentation is retained in its receipt; current integration SPEC/PLAN/README/VALIDATION retain their newer evidence and limits. No source/history rewrite, component pin, merge into the default branch or live deployment is authorized.

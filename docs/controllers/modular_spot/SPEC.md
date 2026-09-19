@@ -166,3 +166,65 @@ The completed design must demonstrate: two isolated consumers sharing one identi
 Closed-bar functionality can be accepted without MQTT or intrabar strategies, provided that limitation is explicit. Full multi-symbol dispatch, external sell-only admission, aggregate capital enforcement and native recovery are not optional omissions hidden behind selection helpers. Keep their phases open until implemented and independently validated.
 
 No legacy migration, perpetuals, forced loss sales, live-account inspection, deployment, root pin changes or economic experiments occur in this documentation publication. Follow [PLAN.md](PLAN.md) from its first eligible unchecked step, preserving current authority and recording the evidence from the actual next run.
+
+
+## 9. Mean-reversion context policy — specified extension
+
+Status: **research/specification only; no trading authority and no economic claim.** This extension reuses market-wide context as a secondary decision input for the modular controller. It does not make the existing Market Pulse scalar a standalone BUY/SELL signal and does not modify legacy controllers.
+
+### 9.1 Decision boundary
+
+For new acquisition, extend the pipeline to:
+
+`eligible observations -> features -> strategy opportunity -> mean-reversion context -> acquisition proposal -> capital/risk admission -> native executor action`
+
+The strategy remains responsible for identifying a dip/setup. The context layer may qualify the commitment; hard portfolio/risk/native checks remain authoritative. Position management and exits continue independently and are not disabled by loss of entry-context data.
+
+The first implementation MUST be **reduction-only** relative to the strategy proposal: `0 <= acquisition_multiplier <= 1`. A favorable context cannot increase the strategy's baseline requested notional, bypass program/account limits, create a slot, or override ownership, freshness, reconciliation or profitability guards. If the reduced amount is below venue minimums, deny/defer rather than round exposure upward.
+
+### 9.2 Do not bind authority to the current scalar
+
+The existing Market Pulse composite mixes economic components (momentum, breadth, volume, volatility quality) with data freshness/readiness. Treat those as separate concerns:
+
+1. **Context validity** — causal/final observations, coverage, universe identity, source/transport age, required fields and dependency alignment. Missing required validity fails closed for dependent *new acquisition*.
+2. **Opportunity context** — broad momentum/breadth and their trajectory, volume/liquidity context, volatility state, and symbol-specific dislocation relative to a declared benchmark.
+3. **Portfolio capacity** — authoritative remaining budget, reservations, inventory, concentration and slots. Context may reduce a proposal but cannot manufacture capacity.
+
+Keep the current dashboard score unchanged for compatibility until evidence justifies a versioned replacement. New trading policy consumes a versioned component snapshot, not an undocumented threshold such as `composite_score > 70`.
+
+### 9.3 Proposed contract
+
+A context snapshot binds source/venue domain, quote universe, universe revision, component schema/version, finalized observation cutoff, availability/receipt time, content identity, coverage and expiry. Cross-venue context is explicitly labeled and never substitutes for local executable prices, rules or costs.
+
+A policy evaluation binds the strategy opportunity/intent ID, instrument, program/config revision, snapshot identity and current portfolio-state version and returns only:
+
+- `ALLOW | DEFER | DENY`;
+- `acquisition_multiplier in [0,1]`;
+- expiry;
+- stable reason codes and diagnostics.
+
+No component submits orders, mutates native balances, owns fills/PnL, releases reservations, resets cost basis, or transfers inventory ownership.
+
+### 9.4 Initial use cases
+
+Implement/evaluate in this order:
+
+1. **Initial-entry admission** — qualify an already-valid mean-reversion entry; no context-only entries.
+2. **Next-DCA-tranche admission** — decide whether the already-planned next tranche remains justified. Preserve current per-tranche native position/exit semantics; do not advertise basket-average DCA.
+3. **Candidate ranking** — for broad screening, rank candidates from symbol-specific setup × global context × cost/capacity interactions. A single global score cannot rank symbols by itself.
+4. **Sizing beyond reduction-only** — HOLD until calibrated incremental evidence exists.
+5. **Exit/trailing adaptation** — separate later policy/research problem. Do not invert the entry score into SELL decisions or weaken the approved profit floor/protective state.
+
+Flash-crash operational protection remains separate from experimental recovery-entry alpha. Closed-bar context must not be advertised as sub-minute bottom detection.
+
+### 9.5 Causal research requirements
+
+Before economic use, distinguish candle open, candle close, first availability/receipt and decision time. Historical reconstruction that marks rows ready/live with zero event age cannot validate live freshness behavior. Do not join a completed candle to its open timestamp as though close-derived features were known then.
+
+Research must preserve point-in-time universe membership and missingness, include rejected/deferred opportunities as counterfactual observations rather than realized outcomes, and compare against unchanged owner baseline plus simpler context controls. Match exposure/cash when judging drawdown improvements so that merely trading less is not mislabeled alpha.
+
+Use the repository's mandated cached May-August 2026 scored window and Research OS/Quants Lab workflow when an economic run is separately authorized. Register trial count, costs, partial fills, spread/slippage/latency, inventory mark-to-market, drawdown/duration, capital-days, unfinished inventory, activity and regime/fold stability. Internal folds are not untouched OOS evidence.
+
+### 9.6 Acceptance and rejection
+
+The layer earns enforcement only if source-bound evidence shows incremental value over the unchanged controller and a simpler trend/volatility/context rule after realistic costs and exposure matching. HOLD/REJECT enforcement if benefits are threshold-fragile, universe/missingness-dependent, dominated by reduced exposure, too stale for the intended horizon, or unsupported by causal availability data. It may remain an observability/research feature even if it never receives trading authority.

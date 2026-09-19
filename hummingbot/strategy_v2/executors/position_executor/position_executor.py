@@ -230,9 +230,9 @@ class PositionExecutor(ExecutorBase):
     @property
     def is_perpetual(self) -> bool:
         """
-        Check if the position is perpetual.
+        Check if the exchange connector is perpetual.
 
-        :return: True if the position is perpetual, False otherwise.
+        :return: True if the exchange connector is perpetual, False otherwise.
         """
         return self.is_perpetual_connector(self.config.connector_name)
 
@@ -384,7 +384,7 @@ class PositionExecutor(ExecutorBase):
         """
         Get the filled amount of the open order in quote currency.
 
-        :return: The filled amount of the open order if it exists, otherwise 0.
+        :return: The filled amount of the open order in quote currency.
         """
         return self.open_filled_amount * self.entry_price
 
@@ -719,7 +719,7 @@ class PositionExecutor(ExecutorBase):
         """
         Calculate the trade pnl in quote asset
 
-        :return: The trade pnl quote in quote asset.
+        :return: The trade pnl in quote asset.
         """
         return self.trade_pnl_pct * self.open_filled_amount * self.entry_price
 
@@ -1851,5 +1851,6 @@ class PositionExecutor(ExecutorBase):
         This method is responsible for sleeping the executor for a specific time.
 
         :param delay: The time to sleep.
+        :return: None
         """
         await asyncio.sleep(delay)

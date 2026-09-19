@@ -1254,7 +1254,7 @@ class PositionExecutor(ExecutorBase):
                 and self.all_orders_completed()):
             self.early_stop(keep_position=True)
             return
-        if close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
+        if close_amount > Decimal("0") and close_amount >= self.trading_rules.min_order_size and close_type != CloseType.POSITION_HOLD:
             order_type = self._close_order_type_for(close_type)
             if close_type == CloseType.TRAILING_STOP and self._trailing_requires_no_loss_floor():
                 min_sell = self._min_no_loss_sell_price()

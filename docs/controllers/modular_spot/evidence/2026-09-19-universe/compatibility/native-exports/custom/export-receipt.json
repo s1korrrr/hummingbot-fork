@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "account": "offline_review",
+  "program_revision": "0",
+  "policy_revision": "0",
+  "inventory_adoption_supported": false,
+  "execution_authorized": false,
+  "recipe": {
+    "schema_version": 1,
+    "name": "review_native_owner",
+    "family": "rebound",
+    "connector": "okx",
+    "capital_model": "spot_cash_inventory_1x",
+    "account_topology": "single_native_recorder",
+    "symbols": [
+      "BTC-USDC"
+    ],
+    "observation_symbols": [],
+    "benchmarks": [],
+    "native_owners": [
+      "modular_spot_existing"
+    ],
+    "account": "offline_review",
+    "program_revision": "0",
+    "policy_revision": "0",
+    "quote_budget": "100",
+    "max_positions": 1,
+    "history": 300,
+    "data_origin": "http://127.0.0.1:8100",
+    "token_file": "/run/secrets/modular_candle_reader",
+    "signal": {
+      "kind": "rsi_rebound",
+      "rsi_length": 14,
+      "oversold": "30",
+      "breakout_lookback": 20,
+      "require_uptrend": true
+    },
+    "acquisition": {
+      "fractions": [
+        "1"
+      ],
+      "minimum_drop": "0.02",
+      "cooldown_seconds": 300,
+      "entry_timeout_seconds": 60
+    },
+    "trailing": {
+      "activation": "0.015",
+      "delta": "0.005"
+    },
+    "risk": {
+      "max_drawdown_fraction": "0.10",
+      "max_daily_loss_fraction": "0.05",
+      "max_spread_fraction": "0.003",
+      "fee_reserve_fraction": "0.005",
+      "cash_reserve_quote": "0"
+    }
+  },
+  "recipe_sha256": "9024f516744bbd0c86c319850d8e70e1a6b061602759c68f326643ce6cc0bc74",
+  "native_validation": "CONFIGURATION_PASSED",
+  "native_runtime_validation": "NOT_RUN",
+  "capital_authority": "NOT_PROVEN",
+  "account_topology": "single_native_recorder",
+  "sell_only_handoff": "NOT_APPLICABLE",
+  "source_sha256": "db029530c1990f8caa1892656e758fccec4e4489461378b45ebfcbf2096cda37",
+  "files": {
+    "candle-manifest.json": "ad2237ff1bfea21b682a1e8e63fc4c854edece126259d38ac35681ccea52986a",
+    "modular_spot_existing.yml": "9fd0347b69e1320f2af370432af339bda9814c66ca1260170c89c91be9b127b1",
+    "recipe.json": "7aa4d1670ad32f43382a613281b490e590927237bf29eb044efe7e9482c79c4c"
+  },
+  "bundle_sha256": "cb611c1664fff33a378435f3977f36606c79eaf560fe2c23082cf271a9446dcb"
+}

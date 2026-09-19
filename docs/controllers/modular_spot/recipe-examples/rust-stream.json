@@ -1,0 +1,12 @@
+{
+  "name": "rust_stream_rebound_demo",
+  "family": "rebound",
+  "symbols": ["BTC-USDC"],
+  "account": "unassigned",
+  "quote_budget": "100",
+  "max_positions": 1,
+  "history": 90,
+  "data_transport": "stream",
+  "data_origin": "http://127.0.0.1:8766",
+  "token_file": "/run/secrets/modular_candle_reader"
+}

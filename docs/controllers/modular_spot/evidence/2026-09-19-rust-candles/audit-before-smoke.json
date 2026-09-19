@@ -1,0 +1,30 @@
+{
+  "status": "APPROVED_FOR_900_SECOND_PUBLIC_SMOKE",
+  "scope": "Rustproducer/nativePythonstreamadapter/nativeconfig/harness",
+  "independent_reviewer": "okx_stream_limits",
+  "method": "read-only source inspection",
+  "binary_sha256": "0086ee6f69bdadc887a4375fa3a755e0acefba0ff558cc3b505137c62dd2c4fb",
+  "native_source_sha256": "98b82026fecf5542ba8ae3992b973b6e9944b529cfe747d1871df966ec9379dc",
+  "parent_observed_checks": {
+    "native_tests": 605,
+    "native_subtests": 10,
+    "rust_tests": 14,
+    "fmt": "PASS",
+    "clippy": "PASS",
+    "release": "PASS",
+    "cargo_audit": "0 vulnerabilities and no warnings",
+    "API_schema_roundtrip": "PASS",
+    "native_disabled_recipe_export_and_root_handoff": "PASS"
+  },
+  "resolved_findings": [
+    "strict confirmed close timestamp parity",
+    "per-symbol malformed row isolation and stale seed generation",
+    "smoke incremental coverage separate from backfill completeness",
+    "monotonic duration and clock movement checks",
+    "bounded consumer recovery with exact per-reader interruption windows",
+    "recipe stream transport forwarding and explicit90history ceiling",
+    "actualRust missingpong busytraffic/ACK/EOF tests"
+  ],
+  "remaining_material_source_findings": [],
+  "activation_or_deployment_authority": false
+}

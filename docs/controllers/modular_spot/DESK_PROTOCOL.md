@@ -33,7 +33,9 @@ The files under `recipe-examples/` illustrate different compositions; instrument
 - `impulse.json`: shared observations, bounded breakout shortlist and one-shot acquisition.
 - `sell-only.json`: no entry signal/acquisition; **native external inventory handoff remains unsupported**. This does not adopt or replace the existing SUI owner.
 
-Inspect without importing the native execution package:
+Inspect in the genuine native Hummingbot environment. Inspection validates the
+underlying profile against the native configuration schema and requires its
+dependencies, but never constructs a connector, starts a controller or writes an export:
 
 ```bash
 python -m controllers.generic.modular_spot_core.recipe_compiler inspect \
@@ -49,6 +51,16 @@ python -m controllers.generic.modular_spot_core.recipe_compiler export \
 ```
 
 The output parent must exist; the output directory must not exist or use symlinks. Writes are exclusive, file-synced and marked `INCOMPLETE` until finished. Every controller is disabled, inventory adoption is empty/unsupported and the receipt includes payload hashes. `CONFIGURATION_PASSED` means configuration parsing only, not native executor validation. No CLI command starts, deploys or trades.
+
+Recipes preserve the assigned `account`, `native_owners`, `benchmarks`,
+`program_revision` and `policy_revision` through native profile compilation and
+seal them into the exported configuration. The default `unassigned` account is a
+disabled design example and cannot pass native capital admission. Changing an
+assigned identity requires revising the recipe and recompiling it.
+
+The native `get_custom_info()` performance-report path publishes bounded recipe
+identity, data source, latest observed candle, universe coverage and current hold
+status. It omits token paths, transport details and full configuration payloads.
 
 The source seal covers this controller entry point and all private Python source files, not the full native package/image or arbitrary transitive dependencies. Exact native image and full execution-input closure remain separate gates. Source additions invalidate existing seals; do not hot-reload open positions, discard checkpoints or edit a running configuration to evade this.
 

@@ -1,0 +1,7 @@
+{
+  "live_containers": 13,
+  "same_ids_images_started_at": true,
+  "nested_hummingbot_status_unchanged": true,
+  "root_status_difference": "Only unrelated quants-lab status changed from M to m during concurrent workspace work; this task did not modify that repository. Left untouched.",
+  "source_changes": "Only isolated Hummingbot integration, API and PR188 helper worktrees; original PR55 task docs/evidence updated; no live writes."
+}

@@ -41,7 +41,7 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
                              peak=state.risk_peak, previous_day=state.risk_day,
                              day_start=state.risk_day_start, paused=state.risk_paused)
     updated = state.model_copy(update={'risk_peak': assessment.peak, 'risk_day': assessment.day,
-                                      'risk_day_start': assessment.day_start, 'risk_paused': assessment.paused})
+                                       'risk_day_start': assessment.day_start, 'risk_paused': assessment.paused})
     revised, reconciliation = reconcile_claims(updated, inventory)
     if reconciliation not in {'reconciled', 'campaign_flat'}:
         return updated, None, reconciliation
@@ -84,6 +84,6 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     identifier = identity([fingerprint, market.candle_open, revised.cycle, len(owned)])
     proposal = EntryProposal(identifier, bid, allocation.amount, float(now), revised.cycle, len(owned))
     revised = revised.model_copy(update={'claims': (*revised.claims, identifier),
-                                        'committed_quote': revised.committed_quote + allocation.reserved_quote,
-                                        'last_entry_time': now})
+                                         'committed_quote': revised.committed_quote + allocation.reserved_quote,
+                                         'last_entry_time': now})
     return revised, proposal, 'entry_proposed'

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "account": "isolated_data_only",
+  "program_revision": "0",
+  "policy_revision": "0",
+  "inventory_adoption_supported": false,
+  "execution_authorized": false,
+  "recipe": {
+    "schema_version": 1,
+    "name": "rust_candle_validation",
+    "family": "rebound",
+    "connector": "okx",
+    "capital_model": "spot_cash_inventory_1x",
+    "account_topology": "single_native_recorder",
+    "symbols": [
+      "BTC-USDC"
+    ],
+    "observation_symbols": [],
+    "benchmarks": [],
+    "native_owners": [],
+    "account": "isolated_data_only",
+    "program_revision": "0",
+    "policy_revision": "0",
+    "quote_budget": "100",
+    "max_positions": 1,
+    "history": 90,
+    "data_transport": "stream",
+    "data_origin": "http://127.0.0.1:8766",
+    "token_file": "/run/secrets/modular_candle_reader",
+    "signal": {
+      "kind": "rsi_rebound",
+      "rsi_length": 14,
+      "oversold": "30",
+      "breakout_lookback": 20,
+      "require_uptrend": true
+    },
+    "acquisition": {
+      "fractions": [
+        "1"
+      ],
+      "minimum_drop": "0.02",
+      "cooldown_seconds": 300,
+      "entry_timeout_seconds": 60
+    },
+    "trailing": {
+      "activation": "0.015",
+      "delta": "0.005"
+    },
+    "risk": {
+      "max_drawdown_fraction": "0.10",
+      "max_daily_loss_fraction": "0.05",
+      "max_spread_fraction": "0.003",
+      "fee_reserve_fraction": "0.005",
+      "cash_reserve_quote": "0"
+    }
+  },
+  "recipe_sha256": "13530c827819c71484683c1dbceebc4ac7d3df69db708634bc4c4e2ccd5b49fc",
+  "native_validation": "CONFIGURATION_PASSED",
+  "native_runtime_validation": "NOT_RUN",
+  "capital_authority": "NOT_PROVEN",
+  "account_topology": "single_native_recorder",
+  "sell_only_handoff": "NOT_APPLICABLE",
+  "source_sha256": "98b82026fecf5542ba8ae3992b973b6e9944b529cfe747d1871df966ec9379dc",
+  "files": {
+    "candle-manifest.json": "abd197d1e080bbc69934aec212fc9d1c44d03955453b8bcfd054e99090bd31e8",
+    "modular_spot_rust_candle_validation_BTC_USDC.yml": "a577fe29c765b3bc2232fc0dd2abe19e0252f77cc94be14004bfa53911de63ef",
+    "recipe.json": "72558f4f311ebce60fba2fb5e25b57504049dd5c118aa18033670c4a458de043"
+  },
+  "bundle_sha256": "ba034b821b12c3ec506130b43f76ba869c053fdcae9a9c30fa0f8a2a27640f10"
+}

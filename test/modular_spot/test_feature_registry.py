@@ -1,9 +1,10 @@
+import importlib
 from decimal import Decimal
 from hashlib import sha256
-import importlib
 from pathlib import Path
 
 import pytest
+
 from controllers.generic.modular_spot_core.candle_data import Candle, CandleSnapshot, Dataset
 
 
@@ -176,6 +177,7 @@ def test_nonfinite_feature_output_is_never_cached():
 
 def test_callable_closure_cannot_hide_unversioned_state():
     captured = 4
+
     def hidden_state(frame, dependencies, parameters):
         return {'value': captured}
     registry = api().FeatureRegistry()

@@ -13,13 +13,20 @@ def test_controller_does_not_inherit_a_strategy_family():
     assert [ast.unparse(base) for base in controller.bases] == ['ControllerBase']
 
 
-def test_no_legacy_controller_imports_or_shared_registry_mutations():
+def test_legacy_imports_are_confined_to_explicit_composition_seams_without_registry_mutations():
     for path in [ENTRY, *CORE.glob('*.py')]:
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
                 if node.module.startswith('controllers.'):
-                    assert node.module.startswith('controllers.generic.modular_spot_core')
+                    permitted = {
+                        'native_composition.py': {'controllers.directional_trading.ok_rsi_core.candles',
+                                                  'controllers.directional_trading.ok_rsi_core.context'},
+                        'native_recovery.py': {'controllers.directional_trading.hl_rsi',
+                                               'controllers.directional_trading.rsi_v5'},
+                    }
+                    assert (node.module.startswith('controllers.generic.modular_spot_core')
+                            or node.module in permitted.get(path.name, set()))
             if isinstance(node, ast.Import):
                 assert all(not name.name.startswith('controllers.directional_trading') for name in node.names)
             if isinstance(node, ast.Attribute):

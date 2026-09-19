@@ -54,7 +54,7 @@ class ModularPositionExecutor(PositionExecutor):
     def _current_trailing_reference_price(self):
         try:
             return decimal(self.get_price(self.config.connector_name, self.config.trading_pair,
-                                           PriceType.BestBid), 'executable bid', positive=True)
+                                          PriceType.BestBid), 'executable bid', positive=True)
         except (PolicyError, RuntimeError, KeyError, AttributeError):
             return None
 

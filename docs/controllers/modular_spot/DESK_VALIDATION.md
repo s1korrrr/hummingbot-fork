@@ -1,3 +1,5 @@
+> Current 2026-09-19 integrated validation: [UNIVERSE_VALIDATION.md](UNIVERSE_VALIDATION.md). Earlier counts below retain their original source scope.
+
 # Modular desk first-slice validation
 
 Source parent: `808919077af8b0fa88736a0690a725def31fff44` (PR #55).

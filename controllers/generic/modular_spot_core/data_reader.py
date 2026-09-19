@@ -1,5 +1,6 @@
 """Opt-in, process-local sharing for modular controllers; native providers are untouched."""
 import asyncio
+import time
 from decimal import Decimal
 from typing import Literal
 from weakref import WeakKeyDictionary
@@ -7,6 +8,7 @@ from weakref import WeakKeyDictionary
 from pydantic import Field, model_validator
 
 from .candle_data import CandleSnapshot, Dataset
+from .candle_stream import CandleStreamClient
 from .candle_transport import CandleClient, validate_origin
 from .config import PolicyModel
 from .domain import DataUnavailable, PolicyError, identity
@@ -16,6 +18,7 @@ from .universe import pairs
 
 class DataPolicy(PolicyModel):
     mode: Literal['native', 'shared'] = 'native'
+    transport: Literal['snapshot', 'stream'] = 'snapshot'
     origin: str | None = None
     token_file: str | None = None
     source_profile: str = Field(default='native', min_length=1, max_length=80)
@@ -27,6 +30,8 @@ class DataPolicy(PolicyModel):
     @model_validator(mode='after')
     def validate_transport(self):
         pairs(self.symbols)
+        if self.transport == 'stream' and self.mode != 'shared':
+            raise ValueError('stream transport requires shared mode')
         if self.mode == 'shared':
             if not self.origin or not self.token_file:
                 raise ValueError('shared candles require an authenticated origin and token file')
@@ -44,8 +49,9 @@ def dataset_for(config, pair=None):
 
 
 class DataPool:
-    def __init__(self, policy: DataPolicy):
+    def __init__(self, policy: DataPolicy, *, clock=time.time):
         self.policy = policy
+        self.clock = clock
         self.datasets = {}
         self.references = 0
         self.client = None
@@ -66,7 +72,9 @@ class DataPool:
 
     def start(self):
         if self.client is None:
-            self.client = CandleClient(self.policy.origin, self.policy.token_file, tuple(self.datasets.values()))
+            client_type = CandleStreamClient if self.policy.transport == 'stream' else CandleClient
+            self.client = client_type(self.policy.origin, self.policy.token_file, tuple(self.datasets.values()),
+                                      clock=self.clock)
             self.client.start()
 
     async def close(self):
@@ -125,7 +133,7 @@ class DataPool:
                     scores[pair] = change * relative
             cached = scores
             self.ranking_cache = {signature: scores}
-        result = {} if coverage < config.data.minimum_coverage else dict(cached)
+        result = dict(cached)
         self.screen_cache = (key, min(expires, now + 1) if not snapshots else expires, result, coverage)
         return dict(result), coverage
 
@@ -137,7 +145,7 @@ def attach_pool(provider, config):
     policy = config.data
     if policy.mode != 'shared':
         return None
-    key = (validate_origin(policy.origin), policy.token_file)
+    key = (validate_origin(policy.origin), policy.token_file, policy.transport)
     peers = _POOLS.setdefault(provider, {})
     pool = peers.get(key)
     if pool is None:

@@ -12,15 +12,25 @@ class NativeBindings:
         from hummingbot.connector.markets_recorder import MarketsRecorder
         return MarketsRecorder.get_existing_instance()
 
+    # Owner dependency: ExecutorOrchestrator._claim_planned_positions constructs
+    # PositionExecutor directly and never calls get_executor_class_for_config.
+    UNSUPPORTED_PLANNED_RESUME = (
+        'native planned resume bypasses local executor selection; not supported '
+        '(ExecutorOrchestrator._claim_planned_positions constructs PositionExecutor directly)'
+    )
+
     @staticmethod
     def guard_resume(controller, recorder):
         if recorder is None:
             return
         from hummingbot.strategy_v2.executors.planned_position_resume import pending_manifest
-        path = recorder.sql_manager.db_path
-        manifest = pending_manifest(path) if path else None
+        path = getattr(getattr(recorder, 'sql_manager', None), 'db_path', None)
+        try:
+            manifest = pending_manifest(path) if path else None
+        except (TypeError, ValueError, OSError) as exc:
+            raise PolicyError(NativeBindings.UNSUPPORTED_PLANNED_RESUME) from exc
         if manifest and any(p['controller_id'] == controller.config.id for p in manifest['positions']):
-            raise PolicyError('native planned resume bypasses local executor selection; not supported')
+            raise PolicyError(NativeBindings.UNSUPPORTED_PLANNED_RESUME)
 
     @staticmethod
     def trend(frame, **kwargs):

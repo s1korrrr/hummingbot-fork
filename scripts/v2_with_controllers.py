@@ -9,6 +9,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.remote_iface.mqtt import ExternalEventFactory
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
@@ -50,7 +51,7 @@ class V2WithControllers(StrategyV2Base):
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self._operator_event_queue = ExternalEventFactory.create_queue("rsibot.operator")
-        self._risk_persistence_enabled = any(getattr(c.config, 'controller_name', '') == 'ok_rsi'
+        self._risk_persistence_enabled = any(is_ok_rsi_policy(c.config)
                                              for c in self.controllers.values())
         self._last_risk_state = None
         self._risk_reconciliation_error: Optional[str] = None
@@ -209,7 +210,7 @@ class V2WithControllers(StrategyV2Base):
             return value
         config = self.controllers[controller_id].config
         if (getattr(report, "pnl_unavailable_reason", None) == "unknown_wallet_acquisition_cost"
-                and getattr(config, "controller_name", None) == "ok_rsi"
+                and is_ok_rsi_policy(config)
                 and getattr(config, "trade_mode", None) == "sell_only"
                 and getattr(config, "sell_only_strict_fraction", False)
                 and not getattr(config, "sell_only_if_profitable", True)):

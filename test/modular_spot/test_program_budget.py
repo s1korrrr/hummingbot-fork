@@ -6,13 +6,14 @@ import pytest
 from sqlalchemy import Column, Text, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from controllers.generic.modular_spot_core.program_budget import BudgetPolicy, BudgetStore, Reservation
 from controllers.generic.modular_spot_core.domain import PolicyError
+from controllers.generic.modular_spot_core.program_budget import BudgetPolicy, BudgetStore, Reservation
 
 
 @pytest.fixture
 def budget(tmp_path):
     base = declarative_base()
+
     class Metadata(base):
         __tablename__ = 'Metadata'
         key = Column(Text, primary_key=True)
@@ -21,14 +22,16 @@ def budget(tmp_path):
     base.metadata.create_all(engine)
     recorder = NS(config_file_path='native-strategy.yml', sql_manager=NS(get_new_session=sessionmaker(bind=engine)))
     policy = BudgetPolicy(group='five-assets', max_quote=D('100'), max_assets=2)
-    store = BudgetStore(recorder, policy, connector='okx', quote='USDC', metadata_model=Metadata)
+    store = BudgetStore(recorder, policy, connector='okx', quote='USDC', account='paper-okx',
+                        metadata_model=Metadata)
     yield store
     engine.dispose()
 
 
 def reservation(i=1, amount='50', pair='BTC-USDC'):
     return Reservation(executor_id=f'claim-{i}', controller_id=f'modular_spot_{i}', trading_pair=pair,
-                       reserved_quote=D(amount))
+                       reserved_quote=D(amount), reserved_base=D('1'), account='paper-okx',
+                       connector='okx', program='five-assets', slot=pair.split('-')[0], expires_at=D('0'))
 
 
 def test_queued_unacknowledged_claims_count_against_capital(budget):
@@ -96,6 +99,8 @@ def test_late_inventory_after_released_claim_blocks_other_group_members(budget):
 def test_existing_group_member_cannot_switch_instrument_ownership(budget):
     assert budget.reserve(reservation(amount='50'), native_executors=[])
     changed = Reservation(executor_id='new-claim', controller_id='modular_spot_1',
-                          trading_pair='ETH-USDC', reserved_quote=D('50'))
+                          trading_pair='ETH-USDC', reserved_quote=D('50'), reserved_base=D('1'),
+                          account='paper-okx', connector='okx', program='five-assets', slot='ETH',
+                          expires_at=D('0'))
     with pytest.raises(PolicyError):
         budget.reserve(changed, native_executors=[receipt()])

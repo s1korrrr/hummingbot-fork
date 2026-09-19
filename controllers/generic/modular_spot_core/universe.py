@@ -57,6 +57,9 @@ def select_universe(policy: UniversePolicy, *, available, tradable, scores,
     observation = requested | set(policy.benchmarks) | management
     if policy.mode == 'sell_only':
         return UniverseSelection(tuple(sorted(observation)), (), tuple(sorted(management)))
+    if not set(policy.benchmarks) <= available:
+        return UniverseSelection(tuple(sorted(observation)), (), tuple(sorted(management)))
+    occupied = {pair.split('-')[0] for pair in management}
     permitted = requested & available & tradable - blocked
     if policy.mode == 'fixed':
         chosen = [x for x in policy.symbols if x in permitted][:policy.max_candidates]
@@ -74,4 +77,12 @@ def select_universe(policy: UniversePolicy, *, available, tradable, scores,
                 if ranked[symbol] > ranked[weakest] + policy.replacement_margin:
                     chosen[chosen.index(weakest)] = symbol
         chosen.sort(key=lambda x: (-ranked[x], x))
-    return UniverseSelection(tuple(sorted(observation)), tuple(chosen), tuple(sorted(management)))
+    selected = []
+    used = set(occupied)
+    for symbol in chosen:
+        base = symbol.split('-')[0]
+        if base in used or len(used) >= policy.max_candidates:
+            continue
+        selected.append(symbol)
+        used.add(base)
+    return UniverseSelection(tuple(sorted(observation)), tuple(selected), tuple(sorted(management)))

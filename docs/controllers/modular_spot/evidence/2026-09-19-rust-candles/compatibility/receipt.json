@@ -1,0 +1,10 @@
+{
+  "native_source_sha256": "98b82026fecf5542ba8ae3992b973b6e9944b529cfe747d1871df966ec9379dc",
+  "recipe_sha256": "13530c827819c71484683c1dbceebc4ac7d3df69db708634bc4c4e2ccd5b49fc",
+  "native_config": "PASS stream90 disabled",
+  "api_schema_roundtrip": "PASS defaultsnapshot300 and explicitstream90; exactschemahelper,notdeployedAPI",
+  "api_helper_file_sha256": "987f2686a0e135075a2e694f25e949c539bd0d869ada3bf778de00195a714bb1",
+  "root_handoff": "PASS VERIFIED disabled unregistered",
+  "handoff_sha256": "52301e20259c842839fd8dbb20e2de6b77587f67e5682c70c8ea034bceabd70a",
+  "service_identity": "separately bound by smoke source.json; native source seal includes Python only"
+}

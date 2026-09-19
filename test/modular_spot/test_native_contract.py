@@ -34,9 +34,9 @@ def test_native_discovery_and_default_disabled():
 
 
 @pytest.mark.parametrize('overrides', [dict(initial_positions=[{}]), dict(execution_enabled='yes'),
-                                     dict(total_amount_quote='NaN'), dict(id='ok_rsi_existing'),
-                                     dict(trading_pair='BTC-USDC-X'),
-                                     dict(signal={'kind': 'breakout'}, acquisition={'fractions': ['.5', '.5']})])
+                                       dict(total_amount_quote='NaN'), dict(id='ok_rsi_existing'),
+                                       dict(trading_pair='BTC-USDC-X'),
+                                       dict(signal={'kind': 'breakout'}, acquisition={'fractions': ['.5', '.5']})])
 def test_invalid_controller_configs_rejected(overrides):
     with pytest.raises((ValueError, TypeError)):
         value = {'id': 'modular_spot_test', 'connector_name': 'okx', 'trading_pair': 'BTC-USDC', **overrides}
@@ -82,3 +82,22 @@ def test_ungranted_configs_never_fall_back_to_unprotected_native_executor():
     assert not controller.validate_executor_config(native)
     with pytest.raises(ValueError):
         controller.get_executor_class_for_config(native)
+
+
+def test_duplicate_intent_is_consumed_once():
+    controller = ModularSpotController(config(execution_enabled=True), NS(ready=True), asyncio.Queue())
+    controller._status = RunnableStatus.RUNNING
+    native = native_config(config(), identifier='once', timestamp=120, price=D('100'), amount=D('1'), cycle=0, stage=0)
+    controller.runtime.pending[native.id] = native.model_copy(deep=True)
+    controller.runtime.entry_permission = lambda request, check_funds=True: request.id == 'once'
+    assert controller.get_executor_class_for_config(native) is ModularPositionExecutor
+    with pytest.raises(ValueError):
+        controller.get_executor_class_for_config(native)
+    assert not controller.validate_executor_config(native)
+
+
+def test_fingerprint_ignores_execution_flags_and_changes_with_policy():
+    left, right = config(), config(execution_enabled=True, acquisition_enabled=False)
+    assert left.fingerprint() == right.fingerprint()
+    assert config(total_amount_quote=D('200')).fingerprint() != left.fingerprint()
+    assert config(trailing={'activation': '.02', 'delta': '.005'}).fingerprint() != left.fingerprint()

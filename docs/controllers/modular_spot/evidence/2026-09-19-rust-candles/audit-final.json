@@ -1,0 +1,27 @@
+{
+  "status": "PASS_COMPONENT_READY_FOR_NEXT_INTEGRATION_STAGE",
+  "independent_reviewer": "okx_stream_limits",
+  "method": "source review and independent recomputation from raw receipts",
+  "binary_sha256": "f7b509249bf3e02b83d76f4d4fd20d323a978176c368fb44a93f8c80fd72e61e",
+  "native_source_sha256": "98b82026fecf5542ba8ae3992b973b6e9944b529cfe747d1871df966ec9379dc",
+  "remaining_material_source_findings": [],
+  "checks": {
+    "native_combined": "605 passed +10 subtests, no skips",
+    "harness_regressions": "7 passed; overlapping count",
+    "rust": "16 passed; parent confirmed after smoke",
+    "cargo_fmt": "PASS",
+    "cargo_clippy_all_targets_D_warnings": "PASS",
+    "cargo_audit": "0 known vulnerabilities; no warnings",
+    "public_smoke": "900.014 seconds PASS",
+    "source_integrity": "44 files and release binary unchanged"
+  },
+  "limits": [
+    "macOS local process topology only",
+    "cold producer restart recovery66.428seconds",
+    "history ceiling90 subject to configured native warmup",
+    "close latency excludes backfilled rows",
+    "no full legacy controller parity",
+    "no deployment or activation"
+  ],
+  "production_deployment_ready": false
+}

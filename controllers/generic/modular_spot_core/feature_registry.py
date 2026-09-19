@@ -1,10 +1,10 @@
 """Versioned feature DAG over existing candle snapshots and the existing bounded cache."""
-from collections.abc import Callable, Mapping
-from hashlib import sha256
 import inspect
+from collections.abc import Callable, Mapping
+from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
-from decimal import Decimal
 
 from pydantic import Field, field_validator, model_validator
 

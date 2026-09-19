@@ -12,13 +12,13 @@ def module():
 
 def scope(m, **change):
     return m.DecisionScope.model_validate(dict(program_id='rebound', owner_id='modular_spot_rebound_BTC_USDC',
-        connector='okx', trading_pair='BTC-USDC', recipe_sha256='a' * 64, **change))
+                                               connector='okx', trading_pair='BTC-USDC', recipe_sha256='a' * 64, **change))
 
 
 def opportunity(m, stamp=1000, revision=1, **change):
     values = dict(scope=scope(m), setup='rsi_rebound', action='acquire',
                   primary=m.ObservationRef(dataset_sha256='b' * 64, epoch='one', revision=revision,
-                      content_sha256=str(revision) * 64, event_time_ms=stamp, available_time_ms=stamp + 10),
+                                           content_sha256=str(revision) * 64, event_time_ms=stamp, available_time_ms=stamp + 10),
                   dependencies=(), created_at_ms=stamp + 20, lifetime_ms=100, expected_return=None)
     values.update(change)
     return m.Opportunity.model_validate(values)
@@ -81,7 +81,7 @@ def test_sell_only_scope_rejects_buy_proposals():
 
 
 @pytest.mark.parametrize('change', [dict(created_at_ms=True), dict(created_at_ms=1005),
-    dict(created_at_ms=1120), dict(lifetime_ms=0), dict(expected_return='NaN')])
+                                    dict(created_at_ms=1120), dict(lifetime_ms=0), dict(expected_return='NaN')])
 def test_invalid_time_or_estimate_rejected(change):
     m = module()
     with pytest.raises(ValueError):

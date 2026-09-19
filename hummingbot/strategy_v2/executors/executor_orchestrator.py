@@ -15,6 +15,7 @@ from hummingbot.model.exact_order_values import OrderExact
 from hummingbot.model.order import Order
 from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
+from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.planned_position_resume import claim, pending_manifest
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
@@ -942,7 +943,7 @@ class ExecutorOrchestrator:
         controller = self.strategy.controllers.get(info.controller_id)
         policy = getattr(controller, "config", None)
         config = info.config
-        return (getattr(policy, "controller_name", None) == "ok_rsi"
+        return (is_ok_rsi_policy(policy)
                 and getattr(policy, "trade_mode", None) == "sell_only"
                 and getattr(policy, "sell_only_strict_fraction", False) is True
                 and getattr(policy, "sell_only_if_profitable", True) is False

@@ -141,11 +141,11 @@ def decide(previous: DecisionCursor | None, opportunity: Opportunity, *, now_ms:
     elif blockers:
         reason = 'prerequisite_hold'
     revised = DecisionCursor(scope=opportunity.scope, setup=opportunity.setup, action=opportunity.action,
-        primary_dataset_sha256=opportunity.primary.dataset_sha256, last_event_ms=event,
-        last_opportunity_id=opportunity.opportunity_id, last_clock_ms=now_ms)
+                             primary_dataset_sha256=opportunity.primary.dataset_sha256, last_event_ms=event,
+                             last_opportunity_id=opportunity.opportunity_id, last_clock_ms=now_ms)
     trace = DecisionTrace(opportunity_id=opportunity.opportunity_id, consumption_key=opportunity.consumption_key,
-        decision_time_ms=now_ms, status='ELIGIBLE_FOR_NATIVE_ADMISSION' if reason == 'eligible' else 'HOLD',
-        reason=reason, blockers=blockers, prerequisite_sha256=digest([item.model_dump(mode='json') for item in checks]))
+                          decision_time_ms=now_ms, status='ELIGIBLE_FOR_NATIVE_ADMISSION' if reason == 'eligible' else 'HOLD',
+                          reason=reason, blockers=blockers, prerequisite_sha256=digest([item.model_dump(mode='json') for item in checks]))
     return revised, trace
 
 

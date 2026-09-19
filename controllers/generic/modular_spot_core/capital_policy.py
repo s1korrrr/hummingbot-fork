@@ -1,5 +1,5 @@
 """Read-only capital proposals. Atomic spending permission remains a native owner concern."""
-from decimal import Decimal, ROUND_FLOOR, localcontext
+from decimal import ROUND_FLOOR, Decimal, localcontext
 from typing import Literal
 
 from pydantic import Field, StrictBool, model_validator
@@ -73,6 +73,7 @@ def assess_acquisition(request: CapitalRequest, snapshot: CapitalSnapshot, limit
     if request.account_id != snapshot.account_id or request.valuation_currency != snapshot.valuation_currency:
         raise PolicyError('native account/valuation scope mismatch')
     stamp = digest([request, snapshot, limits, now_ms])
+
     def hold(reason):
         return CapitalAssessment(status='HOLD', reason=reason, input_sha256=stamp)
     if not 0 <= now_ms - snapshot.observed_at_ms <= limits.max_age_ms:
@@ -103,8 +104,8 @@ def assess_acquisition(request: CapitalRequest, snapshot: CapitalSnapshot, limit
               (asset, limits.base_quote, 'base_limit'), (request.requested_quote, snapshot.available_quote, 'available_quote_limit'))
     reason = next((name for value, ceiling, name in checks if value > ceiling), 'eligible')
     return CapitalAssessment(status='ELIGIBLE_FOR_NATIVE_ADMISSION' if reason == 'eligible' else 'HOLD',
-        reason=reason, input_sha256=stamp, projected_account_quote=account, projected_program_quote=program,
-        projected_base_quote=asset)
+                             reason=reason, input_sha256=stamp, projected_account_quote=account, projected_program_quote=program,
+                             projected_base_quote=asset)
 
 
 class AllocationTargets(PolicyModel):

@@ -1,9 +1,9 @@
 """Immutable recipe identities. These records never grant execution authority."""
+import json
+import re
 from decimal import Decimal
 from hashlib import sha256
-import json
 from pathlib import Path
-import re
 from typing import Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
@@ -94,9 +94,15 @@ class StrategyRecipe(PolicyModel):
     account_topology: Literal['single_native_recorder', 'segregated_account'] = 'single_native_recorder'
     symbols: tuple[str, ...] = Field(min_length=1, max_length=1000)
     observation_symbols: tuple[str, ...] = Field(default=(), max_length=1000)
+    benchmarks: tuple[str, ...] = Field(default=(), max_length=1000)
+    native_owners: tuple[str, ...] = Field(default=(), max_length=1000)
+    account: str = Field(default='unassigned', pattern=r'^[A-Za-z0-9_-]{1,80}$')
+    program_revision: str = Field(default='0', pattern=r'^[A-Za-z0-9._-]{1,64}$')
+    policy_revision: str = Field(default='0', pattern=r'^[A-Za-z0-9._-]{1,64}$')
     quote_budget: Decimal = Field(gt=0)
     max_positions: int = Field(ge=1, le=1000, strict=True)
     history: int = Field(default=300, ge=61, le=3000, strict=True)
+    data_transport: Literal['snapshot', 'stream'] = 'snapshot'
     data_origin: str = 'http://127.0.0.1:8100'
     token_file: str = '/run/secrets/modular_candle_reader'
     signal: SignalPolicy | None = None
@@ -131,9 +137,14 @@ class StrategyRecipe(PolicyModel):
 
     @model_validator(mode='after')
     def compatible(self):
-        for values in (self.symbols, self.observation_symbols):
+        for values in (self.symbols, self.observation_symbols, self.benchmarks):
             if len(set(values)) != len(values) or any(PAIR.fullmatch(item) is None for item in values):
                 raise ValueError('unique native instrument identities required')
+        if self.native_owners and (
+                len(self.native_owners) != len(self.symbols)
+                or len(set(self.native_owners)) != len(self.native_owners)
+                or any(re.fullmatch(r'modular_spot_[A-Za-z0-9_-]+', owner) is None for owner in self.native_owners)):
+            raise ValueError('unique native owner references must match execution symbols')
         if len({item.split('-')[1] for item in self.symbols}) != 1:
             raise ValueError('one quote currency per native budget program is required')
         if self.max_positions > len(self.symbols):

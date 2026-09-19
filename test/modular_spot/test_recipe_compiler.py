@@ -1,12 +1,13 @@
 import importlib
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-from controllers.generic.modular_spot_core.recipe_contract import StrategyRecipe
+
 from controllers.generic.modular_spot_core.profiles import ProgramProfile, build_profile
+from controllers.generic.modular_spot_core.recipe_contract import StrategyRecipe
 
 
 def api():
@@ -67,19 +68,28 @@ def test_inspect_command_is_data_only(tmp_path):
     assert payload['execution_authorized'] is False
 
 
-def test_export_requires_native_import_and_leaves_no_output_when_unavailable(tmp_path):
+@pytest.mark.parametrize('command', ['inspect', 'export'])
+def test_compiler_requires_native_import_and_leaves_no_output_when_unavailable(tmp_path, command):
     m = api()
-    try:
-        import hummingbot  # noqa: F401
-    except ModuleNotFoundError:
-        source, output = tmp_path / 'recipe.json', tmp_path / 'export'
-        source.write_text(recipe().model_dump_json())
-        result = subprocess.run([sys.executable, '-m', m.__name__, 'export', str(source), '--output', str(output)],
-                                capture_output=True, text=True)
-        assert result.returncode != 0
-        assert not output.exists()
-    else:
-        pytest.skip('native-present path is covered by the genuine native test module')
+    source, output = tmp_path / 'recipe.json', tmp_path / 'export'
+    source.write_text(recipe().model_dump_json())
+    blocker = '''
+import runpy
+import sys
+class WithoutNative:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'hummingbot' or fullname.startswith('hummingbot.'):
+            raise ModuleNotFoundError('native package unavailable for this test')
+sys.meta_path.insert(0, WithoutNative())
+module = sys.argv.pop(1)
+runpy.run_module(module, run_name='__main__')
+'''
+    args = [sys.executable, '-c', blocker, m.__name__, command, str(source)]
+    if command == 'export':
+        args.extend(['--output', str(output)])
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode != 0 and 'native package unavailable for this test' in result.stderr
+    assert not output.exists()
 
 
 def test_export_writer_refuses_existing_or_symlink_destination(tmp_path):

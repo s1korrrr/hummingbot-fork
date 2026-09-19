@@ -4,7 +4,6 @@ import pytest
 
 from controllers.generic.modular_spot_core.universe import UniversePolicy, select_universe
 
-
 BASE = dict(available=('A-USDC', 'B-USDC', 'C-USDC', 'BTC-USDC'),
             tradable=('A-USDC', 'B-USDC', 'C-USDC'), scores={'A-USDC': D('2'), 'B-USDC': D('3'), 'C-USDC': D('1')},
             managed=(), pending=(), blocked=(), previous=())
@@ -57,3 +56,34 @@ def test_rank_ties_are_deterministic_and_missing_scores_do_not_become_zero():
 def test_bad_universe_config_rejected(kwargs):
     with pytest.raises(ValueError):
         UniversePolicy(**kwargs)
+
+
+def test_missing_required_context_holds_candidates_but_keeps_subscriptions():
+    policy = UniversePolicy(symbols=('A-USDC',), benchmarks=('ETH-USDT',), max_candidates=2)
+    result = select_universe(policy, **{**BASE, 'available': ('A-USDC', 'B-USDC', 'C-USDC')})
+    assert result.entries == ()
+    assert 'ETH-USDT' in result.observation
+
+
+def test_pending_and_managed_inventory_consume_slots():
+    policy = UniversePolicy(symbols=('A-USDC', 'B-USDC', 'C-USDC'), max_candidates=2)
+    result = select_universe(policy, **{**BASE, 'managed': ('X-USDC',), 'pending': ('Y-USDC',)})
+    assert result.entries == ()
+    assert set(result.management) == {'X-USDC', 'Y-USDC'}
+
+
+def test_alias_pairs_count_as_one_asset_for_slots():
+    policy = UniversePolicy(symbols=('BTC-USDC', 'ETH-USDC'), max_candidates=2)
+    result = select_universe(policy, available=('BTC-USDC', 'ETH-USDC', 'BTC-USDT'),
+                             tradable=('BTC-USDC', 'ETH-USDC'), scores={}, managed=('BTC-USDT',),
+                             pending=(), blocked=(), previous=())
+    assert 'BTC-USDC' not in result.entries
+    assert result.entries == ('ETH-USDC',)
+    assert 'BTC-USDT' in result.management
+
+
+@pytest.mark.parametrize('value', ['NaN', 'Infinity', '-Infinity'])
+def test_nonfinite_score_cannot_enter_ranking(value):
+    policy = UniversePolicy(mode='impulse', observe_all=True, max_candidates=1)
+    with pytest.raises(ValueError):
+        select_universe(policy, **{**BASE, 'scores': {'A-USDC': D(value)}})

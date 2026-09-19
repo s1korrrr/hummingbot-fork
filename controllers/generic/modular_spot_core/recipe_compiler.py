@@ -1,13 +1,15 @@
 """Render recipes through #55 profiles; export only after genuine native config validation."""
 import argparse
-from copy import deepcopy
-from hashlib import sha256
+import importlib
 import json
 import os
+from copy import deepcopy
+from hashlib import sha256
 from pathlib import Path
 
 from .config import SignalPolicy
 from .domain import PolicyError
+from .native_recipe import NativePolicyRecipe, render_native_recipe
 from .profiles import ProgramProfile, build_profile
 from .recipe_contract import RecipeBinding, StrategyRecipe, canonical_json, configuration_digest, digest, source_digest
 
@@ -27,14 +29,24 @@ def strict_json(raw: str):
     return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
 
 
-def render_recipe(recipe: StrategyRecipe) -> dict:
+def parse_recipe(payload):
+    cls = NativePolicyRecipe if payload.get('family') in {'ok_rsi', 'rsi_v5'} else StrategyRecipe
+    return cls.model_validate(payload)
+
+
+def render_recipe(recipe: StrategyRecipe | NativePolicyRecipe) -> dict:
+    if isinstance(recipe, NativePolicyRecipe):
+        return render_native_recipe(recipe)
     recipe = StrategyRecipe.model_validate(recipe.model_dump(mode='json'))
     profile = ProgramProfile(
         name=recipe.name, connector=recipe.connector, symbols=recipe.symbols,
         observation_symbols=recipe.observation_symbols,
+        benchmarks=recipe.benchmarks, native_owners=recipe.native_owners, account=recipe.account,
+        program_revision=recipe.program_revision, policy_revision=recipe.policy_revision,
         mode='fixed' if recipe.family == 'rebound' else recipe.family,
         quote_budget=recipe.quote_budget, max_positions=recipe.max_positions,
-        history=recipe.history, data_origin=recipe.data_origin, token_file=recipe.token_file,
+        history=recipe.history, data_transport=recipe.data_transport,
+        data_origin=recipe.data_origin, token_file=recipe.token_file,
     )
     bundle = build_profile(profile)
     for config in bundle['controllers']:
@@ -49,20 +61,25 @@ def render_recipe(recipe: StrategyRecipe) -> dict:
             'sell_only_handoff': 'UNSUPPORTED' if not recipe.acquisition_allowed else 'NOT_APPLICABLE'}
 
 
-def bind_native_bundle(recipe: StrategyRecipe) -> dict:
-    from controllers.generic import modular_spot as native
+def bind_native_bundle(recipe: StrategyRecipe | NativePolicyRecipe) -> dict:
+    if isinstance(recipe, NativePolicyRecipe):
+        from .native_composition import module_for
+        native = module_for(recipe.family)
+    else:
+        native = importlib.import_module('controllers.generic.modular_spot')
+    config_type = getattr(native, native.CONFIG_CLASS)
     bundle = render_recipe(recipe)
     sources = native.source_files()
-    source_hash = source_digest(Path(native.__file__).parent, sources)
+    source_hash = source_digest(native.source_root(), sources)
     controllers = []
     for payload in bundle['controllers']:
-        config = native.ModularSpotControllerConfig.model_validate(payload)
+        config = config_type.model_validate(payload)
         normalized = config.model_dump(mode='json')
         normalized['recipe_binding'] = RecipeBinding(
             recipe_id=recipe.name, recipe_sha256=recipe.digest, source_sha256=source_hash,
             configuration_sha256=configuration_digest(normalized),
         ).model_dump(mode='json')
-        sealed = native.ModularSpotControllerConfig.model_validate(normalized)
+        sealed = config_type.model_validate(normalized)
         if sealed.execution_enabled or sealed.initial_positions:
             raise PolicyError('compiler must never activate execution or adopt inventory')
         controllers.append(sealed.model_dump(mode='json'))
@@ -79,7 +96,7 @@ def write_bundle(bundle: dict, output: Path) -> None:
         raise ValueError('export requires a new absolute directory under an existing non-symlink parent')
     if bundle.get('native_validation') != 'CONFIGURATION_PASSED':
         raise ValueError('unvalidated recipe bundles cannot be exported as native configurations')
-    recipe = StrategyRecipe.model_validate(bundle['recipe'])
+    recipe = parse_recipe(bundle['recipe'])
     # A caller-supplied PASSED string is not validation evidence.
     expected = bind_native_bundle(recipe)
     if canonical_json(expected) != canonical_json(bundle):
@@ -114,7 +131,8 @@ def write_bundle(bundle: dict, output: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Inspect or export disabled modular recipes; never start a bot')
+    parser = argparse.ArgumentParser(
+        description='Inspect or export disabled modular recipes in the native Hummingbot environment; never start a bot')
     parser.add_argument('command', choices=('inspect', 'export'))
     parser.add_argument('recipe', type=Path)
     parser.add_argument('--output', type=Path)
@@ -123,7 +141,7 @@ def main() -> None:
         data = stream.read(1024 * 1024 + 1)
     if len(data) > 1024 * 1024:
         raise ValueError('recipe exceeds one MiB')
-    recipe = StrategyRecipe.model_validate(strict_json(data.decode('utf-8')))
+    recipe = parse_recipe(strict_json(data.decode('utf-8')))
     if args.command == 'inspect':
         if args.output is not None:
             parser.error('inspect is read-only and does not accept an output directory')

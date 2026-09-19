@@ -1,0 +1,47 @@
+{
+  "status": "PASS_BOUNDED_PUBLIC_SMOKE",
+  "observed_seconds": 900.0144658750505,
+  "summary_sha256": "e59a209ede9e233ccc84c103184481bf637282741120f35a7a108a2f016f77ac",
+  "source_sha256": "32c99f974d2229255eb3c647235725d1daeba1bb39380290b53295064b796fe4",
+  "unchanged_source_files": 44,
+  "source_differences": [],
+  "binary_matches": true,
+  "epoch_final_counters": {
+    "40ded272-295b-490c-b856-892456bbf332": {
+      "buffered_before_ack": 98,
+      "candle_events": 2413,
+      "confirmed_rows": 2646,
+      "connection_attempts": 3,
+      "duplicates_ignored": 1,
+      "rest_requests": 294,
+      "snapshots": 294,
+      "text_pings": 75,
+      "text_pongs": 75,
+      "upstream_frames": 18470
+    },
+    "e793e8b6-fb67-4559-ad64-62f865a7c56b": {
+      "buffered_before_ack": 17,
+      "candle_events": 1935,
+      "confirmed_rows": 2058,
+      "connection_attempts": 3,
+      "duplicates_ignored": 2,
+      "rest_requests": 294,
+      "snapshots": 294,
+      "text_pings": 66,
+      "text_pongs": 65,
+      "upstream_frames": 15710
+    }
+  },
+  "coverage_intervals_per_reader": 14,
+  "pair_intervals_per_reader": 4116,
+  "planned_interruption_backfilled_pair_intervals_per_reader": [
+    123,
+    123
+  ],
+  "latency_scope": "Incremental candle events only; snapshot and backfill delivery delays are excluded. Producer recovery outage is reported separately.",
+  "container_identity_matches": true,
+  "container_count": 13,
+  "root_status_unchanged": true,
+  "nested_status_unchanged": true,
+  "no_deployment_or_trading_authority": true
+}

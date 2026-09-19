@@ -6,7 +6,7 @@ advertised as coordination across independently owned account databases.
 import json
 from decimal import Decimal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -26,17 +26,38 @@ class Reservation(PolicyModel):
     controller_id: str = Field(pattern=r'^modular_spot_[A-Za-z0-9_-]+$', max_length=128)
     trading_pair: str = Field(pattern=PAIR_PATTERN, max_length=80)
     reserved_quote: Decimal = Field(gt=0)
+    reserved_base: Decimal = Field(gt=0)
+    account: str = Field(pattern=r'^[A-Za-z0-9_-]{1,80}$')
+    connector: str = Field(min_length=1, max_length=80)
+    program: str = Field(pattern=r'^[A-Za-z0-9_-]{1,80}$')
+    slot: str = Field(pattern=r'^[A-Z0-9]+$', max_length=40)
+    expires_at: Decimal = Field(ge=0)
+
+    @model_validator(mode='after')
+    def slot_is_base_asset(self):
+        if self.slot != self.trading_pair.split('-')[0]:
+            raise ValueError('position slot must be the base asset')
+        return self
 
 
 class BudgetStore:
-    def __init__(self, recorder, policy: BudgetPolicy, *, connector: str, quote: str, metadata_model=None):
+    def __init__(self, recorder, policy: BudgetPolicy, *, connector: str, quote: str, account: str,
+                 metadata_model=None):
         if metadata_model is None:
             from hummingbot.model.metadata import Metadata
             metadata_model = Metadata
         self.model, self.recorder, self.policy = metadata_model, recorder, policy
-        self.connector, self.quote = connector, quote
+        self.connector, self.quote, self.account = connector, quote, account
+        # ponytail: one Metadata row per recorder/connector/quote/group. Account is bound on
+        # each claim; a second namespace would not segregate exchange quote cash.
         self.key = 'modular-program-budget:v1:' + identity([recorder.config_file_path, connector, quote, policy.group])
         self.policy_hash = identity(policy.model_dump(mode='json'))
+
+    def _member_probe(self, owner, pair):
+        return Reservation(
+            executor_id='member-validation', controller_id=owner, trading_pair=pair,
+            reserved_quote=1, reserved_base=1, account=self.account, connector=self.connector,
+            program=self.policy.group, slot=pair.split('-')[0], expires_at=0)
 
     def _parse(self, raw):
         if raw is None:
@@ -50,7 +71,7 @@ class BudgetStore:
                 raise PolicyError('program budget schema or policy changed')
             members = value['members']
             for owner, pair in members.items():
-                Reservation(executor_id='member-validation', controller_id=owner, trading_pair=pair, reserved_quote=1)
+                self._member_probe(owner, pair)
                 if pair.split('-')[1] != self.quote:
                     raise PolicyError('program member quote identity mismatch')
             reservations = [Reservation.model_validate(item) for item in value['reservations']]
@@ -58,10 +79,15 @@ class BudgetStore:
                 raise PolicyError('duplicate or unbounded program commitments')
             if any(members.get(r.controller_id) != r.trading_pair for r in reservations):
                 raise PolicyError('program member identity mismatch')
+            if any(r.account != self.account or r.connector != self.connector or r.program != self.policy.group
+                   for r in reservations):
+                raise PolicyError('wrong program member account or connector')
             if sum((r.reserved_quote for r in reservations), Decimal('0')) > self.policy.max_quote:
                 raise PolicyError('persisted program overcommitted')
-            if len({r.trading_pair for r in reservations}) > self.policy.max_assets:
+            if len({r.slot for r in reservations}) > self.policy.max_assets:
                 raise PolicyError('persisted asset limit violated')
+            if len({(r.slot, r.trading_pair) for r in reservations}) != len({r.slot for r in reservations}):
+                raise PolicyError('persisted base-asset concentration violated')
             return {r.executor_id: r for r in reservations}, members
         except (ValueError, TypeError, KeyError) as exc:
             raise PolicyError('program budget checkpoint invalid') from exc
@@ -90,11 +116,38 @@ class BudgetStore:
         except IntegrityError:
             return False
 
+    def _bind(self, claim: Reservation):
+        if claim.connector != self.connector:
+            raise PolicyError('reservation connector differs from program')
+        if claim.program != self.policy.group:
+            raise PolicyError('wrong program')
+        if claim.account != self.account:
+            raise PolicyError('wrong program member account')
+        if claim.account == 'unassigned':
+            raise PolicyError('account topology is unproven')
+        if claim.trading_pair.split('-')[1] != self.quote:
+            raise PolicyError('reservation quote differs from program')
+
     def contains(self, claim: Reservation, *, native_executors=()) -> bool:
+        self._bind(claim)
         try:
             reservations, members = self._parse(self._load())
-            self._check_unreserved(reservations, members, self._evidence(native_executors))
+            evidence = self._evidence(native_executors)
+            self._reject_foreign(evidence)
+            self._check_unreserved(reservations, members, evidence)
             return reservations.get(claim.executor_id) == claim
+        except (SQLAlchemyError, AttributeError) as exc:
+            raise PolicyError('program reservation store unavailable') from exc
+
+    def occupied_pairs(self, *, native_executors=()):
+        try:
+            reservations, members = self._parse(self._load())
+            evidence = self._evidence(native_executors)
+            self._reject_foreign(evidence)
+            self._check_unreserved(reservations, members, evidence)
+            pairs = {r.trading_pair for r in reservations.values()}
+            pairs.update(self._active_modular_pairs(evidence))
+            return tuple(sorted(pairs))
         except (SQLAlchemyError, AttributeError) as exc:
             raise PolicyError('program reservation store unavailable') from exc
 
@@ -102,12 +155,44 @@ class BudgetStore:
         if (info.controller_id != owner or info.config.controller_id != owner
                 or info.config.connector_name != self.connector or info.config.trading_pair != pair):
             raise PolicyError('program receipt ownership differs')
+        return self._is_terminal_flat(info)
+
+    def _is_terminal_flat(self, info):
         if info.is_done is not True or info.is_active is not False:
             return False
-        receipt = info.custom_info.get('execution_receipt')
-        if not isinstance(receipt, dict) or receipt.get('accounting_owner') != 'executor':
+        try:
+            receipt = info.custom_info.get('execution_receipt')
+            if not isinstance(receipt, dict) or receipt.get('accounting_owner') != 'executor':
+                return False
+            return decimal(receipt.get('remaining_owned_base'), 'remaining native inventory') == 0
+        except (PolicyError, AttributeError, TypeError):
             return False
-        return decimal(receipt.get('remaining_owned_base'), 'remaining native inventory') == 0
+
+    def _active_modular_pairs(self, evidence):
+        pairs = set()
+        for info in evidence.values():
+            cid = info.controller_id
+            if not isinstance(cid, str) or not cid.startswith('modular_spot_'):
+                continue
+            pair = getattr(info.config, 'trading_pair', None)
+            if isinstance(pair, str) and '-' in pair and not self._is_terminal_flat(info):
+                pairs.add(pair)
+        return pairs
+
+    def _reject_foreign(self, evidence):
+        for info in evidence.values():
+            cid = info.controller_id
+            if isinstance(cid, str) and cid.startswith('modular_spot_'):
+                continue
+            cfg = info.config
+            if getattr(cfg, 'connector_name', None) != self.connector:
+                continue
+            pair = getattr(cfg, 'trading_pair', '')
+            if not isinstance(pair, str) or '-' not in pair or pair.split('-')[1] != self.quote:
+                continue
+            if self._is_terminal_flat(info):
+                continue
+            raise PolicyError('foreign spender on this connector quote; topology unproven')
 
     @staticmethod
     def _evidence(native_executors):
@@ -124,11 +209,19 @@ class BudgetStore:
             if pair is not None and key not in reservations and not self._flat(info.controller_id, pair, info):
                 raise PolicyError('unreserved or reappearing native inventory requires reconciliation')
 
+    def _concentration_blocked(self, revised, claim, evidence):
+        if any(r.slot == claim.slot and r.trading_pair != claim.trading_pair for r in revised.values()):
+            return True
+        for pair in self._active_modular_pairs(evidence):
+            if pair.split('-')[0] == claim.slot and pair != claim.trading_pair:
+                return True
+        return False
+
     def reserve(self, claim: Reservation, *, native_executors) -> bool:
-        if claim.trading_pair.split('-')[1] != self.quote:
-            raise PolicyError('reservation quote differs from program')
+        self._bind(claim)
         try:
             evidence = self._evidence(native_executors)
+            self._reject_foreign(evidence)
             if claim.executor_id in evidence:
                 return False  # Native ownership already exists; this is not a new admission.
             for _ in range(32):
@@ -148,11 +241,14 @@ class BudgetStore:
                 if existing is not None and existing != claim:
                     raise PolicyError('program reservation identity mutated')
                 self._check_unreserved(current, members, evidence)
+                # Expiry, process absence, recovery labels and unconfirmed cancels never drop rows here.
                 revised = {key: value for key, value in current.items()
                            if key not in evidence or not self._flat(value.controller_id, value.trading_pair, evidence[key])}
+                if self._concentration_blocked(revised, claim, evidence):
+                    return False
                 revised[claim.executor_id] = claim
                 total = sum((r.reserved_quote for r in revised.values()), Decimal('0'))
-                if total > self.policy.max_quote or len({r.trading_pair for r in revised.values()}) > self.policy.max_assets:
+                if total > self.policy.max_quote or len({r.slot for r in revised.values()}) > self.policy.max_assets:
                     return False
                 if len(revised) > 4096:
                     raise PolicyError('program commitment capacity exceeded')

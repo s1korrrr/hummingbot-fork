@@ -1,5 +1,6 @@
-from decimal import Decimal
 import importlib
+from decimal import Decimal
+
 import pytest
 
 MODULE = 'controllers.generic.modular_spot_core.recipe_contract'

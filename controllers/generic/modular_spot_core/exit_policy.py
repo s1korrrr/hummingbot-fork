@@ -1,5 +1,5 @@
 """Pure exit arbitration over native evidence; not an exit engine or a cost ledger."""
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from typing import Literal
 
 from pydantic import Field, StrictBool
@@ -72,6 +72,7 @@ def arbitrate_exit(view: NativeExitView, proposals: tuple[ExitProposal, ...], fl
     if floor is not None:
         floor = NativeProfitFloor.model_validate(floor.model_dump(mode='json'))
     input_hash = digest([view, proposals, floor, now_ms, max_age_ms])
+
     def hold(reason):
         return ExitAssessment(status='HOLD', reason=reason, input_sha256=input_hash)
     if not 0 <= now_ms - view.observed_at_ms <= max_age_ms:
@@ -117,5 +118,5 @@ def arbitrate_exit(view: NativeExitView, proposals: tuple[ExitProposal, ...], fl
     if view.bid < price:
         return hold('bid_below_profit_floor')
     return ExitAssessment(status='PROPOSED_REDUCTION', reason='native_price_bounded_reduction',
-        input_sha256=input_hash, amount_base=quantity, limit_price=price,
-        policy_ids=tuple(item.policy_id for item in current))
+                          input_sha256=input_hash, amount_base=quantity, limit_price=price,
+                          policy_ids=tuple(item.policy_id for item in current))

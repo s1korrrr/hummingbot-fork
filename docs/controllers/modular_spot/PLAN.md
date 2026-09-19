@@ -1,8 +1,10 @@
 # Modular spot programs and shared data — execution plan
 
+> Publication continuation: the standalone foundation is prepared on `feat/andrzej_modular_pr55_publication`, based on remote `2f9e4d016`. Earlier worktree statuses, authorities and validation entries below are retained as dated history; the current local publication receipt is [PUBLICATION_RECEIPT.md](PUBLICATION_RECEIPT.md). PR #57 owns the later native-policy, Rust stream and integration candidate.
+
 > Living ExecPlan. On an authorized implementation run, resume the first eligible unchecked milestone, use fresh review checkpoints, and update progress, decisions, evidence and blockers here. A separate actor is required for an independent audit. Use the available executing-plans or subagent-driven-development workflow; do not start another task ledger.
 
-**Goal:** Complete isolated modular spot programs, reusable confirmed market data, fixed-symbol trading, assigned-inventory sell-only management and bounded broad-universe screening without changing existing controllers or bypassing native Hummingbot ownership.
+**Goal:** Validate the isolated native modular foundation for reusable OK RSI/RSI V5 workflows. Preserve running controllers and native Hummingbot ownership; prove strategy parity before treating a modular policy as a replacement. Existing fixed-symbol, sell-only and screening code remains bounded integration scope.
 
 **Architecture:** Hummingbot owns orders, fills, accounting, executors and lifecycle. Private policies compose observations, opportunities, acquisition, exits and risk. One read-only data publisher serves compatible local replicas; universe selection, capital permission and position management remain distinct.
 
@@ -10,9 +12,41 @@
 
 **Spec:** [SPEC.md](SPEC.md). **PR:** [hummingbot#55](https://github.com/s1korrrr/hummingbot/pull/55). **Branch:** `feat/andrzej_isolated_modular_spot`.
 
-## Immediate next action — current source differs from the attachment
+## 2026-09-19 authorized validation and repair
 
-Prepare a clean complete owner checkout, refresh the PR head and run M0's native baseline. Then reconcile the newer published helper implementation with the attached patch in M1. **Do not blindly apply `pr55_shared_data_universe.patch` or reset the branch to its old head.**
+- Objective: verify the preserved M0-M7 candidate, repair concrete modular-family defects, prove native OKX WebSocket candle collection and local reader availability where public connectivity permits, and reconcile this plan with the implementation receipt.
+- Scope: existing PR #55 task branch and modular controller, private components, tests and documentation. User intent is reusable modular policies for working OK RSI/RSI V5 workflows; this candidate must not claim semantic parity without comparison.
+- Authority: repository-process-only. Public unauthenticated market-data subscriptions and temporary loopback verification only. No authenticated exchange calls, orders, live owner enrollment, stack writes/restarts/deployments, component pins, backtests, commits, pushes or merges.
+- Preservation: prior dirty candidate and docs archived with per-file SHA-256 in root `.audit/pr55-validation-20260919/before.tar.gz` and `before-sha256.json`; root/nested statuses and live container identity recorded. Continue in existing task branch `feat/andrzej_isolated_modular_spot`; do not switch the dirty worktree.
+- Completion bar: fresh combined native tests without skips, targeted failure regressions, source review, isolated public feed evidence or precise external blocker, truthful strategy parity and operational handoff.
+- Verification: native conda Python with `PYTHONPATH` bound to this worktree; `pytest -q test/modular_spot`; native PositionExecutor, OrderExecutor and orchestrator suites; focused native OKX candle tests; scoped lint; `git diff --check`; compare container IDs/images/start times before/after.
+- Rollback: restore only this validation's touched files from the preserved archive after inspecting its incremental diff. Do not reset or discard the pre-existing uncommitted candidate. Stop only temporary test processes.
+- Independent streams: native lifecycle audit; OK RSI/RSI V5 composition and spec comparison; fresh native baseline verification. Parent owns candle path, repairs, integration and handoff.
+
+### Validation milestones
+
+- [x] V1: preserve current candidate and collect fresh baseline/reviews.
+- [x] V2: reproduce and repair verified scoped defects with regression checks.
+- [x] V3: run isolated native public WebSocket to shared-reader smoke.
+- [x] V4: synchronize specification/plan, record final evidence and next actions.
+
+## 2026-09-19 full-USDC streaming and companion PR continuation
+
+- User priority: test every currently listed live OKX USDC spot instrument at1m concurrently; measure freshness, delivery delay, gaps, errors and recovery. Public listing is observation scope, not account eligibility.
+- User product requirement: preserve all existing OK RSI/RSI V5 capabilities as reusable policies and verify Hummingbot, Hummingbot API and rsibot-stack contracts. Inspect companion PR57 at068702141f1b and root PR188 atacd1f83; do not assume library-only delivery is native integration.
+- Authority remains repository-process-only with isolated unauthenticated public reads. No live-stack writes/restarts, account calls, orders, activation, deployment, research economics, pins, publication or merge.
+- Preserve preceding repaired candidate in root `.audit/pr55-universe-20260919/before.tar.gz`; existing dirty task branch retained.
+- Catalogue: freeze public instrument response bytes, filter live USDC spot. Initial count294.
+- Test contract: pacing below official3 connections/second/IP; bounded small socket count and subscription messages; TLS enabled, public endpoints only, text ping/pong and bounded reconnect. Do not create294 sockets at once.
+- Baseline design limitation: current native per-pair collector has neither IP-wide connection pacing nor OKX text-ping watchdog. First benchmark uses native WSAssistant plus OKX parser on bounded multiplexed subscriptions; this is venue/transport evidence, not proof that the current production collector scales. Record this distinction.
+- Measure candle-close-to-receipt with clock-offset/RTT uncertainty, local parse/publish/read durations, coverage per completed minute, duplicates/corrections/gaps, first-ready time, errors and expected versus unexpected reconnects. Raw candle payload has no exchange-send timestamp, so do not label close delay as network latency.
+- Milestones: U1 frozen catalogue/docs/preflight; U2 all-pair public benchmark and targeted recovery; U3 reproduce/fix measured reader/publisher or PR compatibility defects locally; U4 native companion PR tests and owner/API/stack gap mapping; U5 independent review and source-bound handoff.
+- Validation: deterministic metric/watchdog regressions, native tests for changed code, scoped hooks, bounded public soak, source manifests, preservation comparison. Any result is bounded observed evidence, never a promise of zero future failures.
+- Rollback: stop only benchmark-owned tasks/sockets and revert only this continuation's patch using the preserved candidate.
+
+## Historical immediate action — current source differed from the attachment
+
+Historical instruction (completed by M0-M8 and freshly verified below): prepare the complete owner checkout, refresh the PR head and run the native baseline, then reconcile the current helper implementation with the attachment. **Do not blindly apply `pr55_shared_data_universe.patch` or reset the branch to its old head.**
 
 During documentation publication the branch gained code checkpoint `b0fd5ef865fe88b87a9da8b8b10e3025d97576c2`, adding nine files and modifying `planner.py` relative to the original `6472dfece06ca71d9ebc6b887dda341ccdf5befb`. Several paths overlap the attachment but have different schemas. These changes were preserved; this documentation task does not claim authorship, native validation or integration completion for them.
 
@@ -20,7 +54,7 @@ The first documentation commits are `6ec32c4e2d5179b88a8f9f3cc711ad592e7797cb` a
 
 ## Scope, authority and completion bar
 
-This task publishes documentation only in `docs/controllers/modular_spot/`. It does not apply source patches, touch account/runtime state, modify other controllers, activate execution, run economic backtests, update root pins, deploy or merge.
+The original task published documentation only. The 2026-09-18 M0-M8 implementation and 2026-09-19 local validation/repair are authorized continuations, bounded by the current validation contract above. No account/runtime changes, existing-controller edits, activation, economic backtests, pin updates, deploy or merge are authorized.
 
 When implementation is explicitly resumed, keep code in `controllers/generic/modular_spot.py` and `controllers/generic/modular_spot_core/`, tests in `test/modular_spot/`, and task documentation here. Add another native-discoverable entry point for this family only if composition requires it and its exact path is reviewed. No inheritance from or mutation of OK RSI, HL RSI, RSI V5 or other existing controllers. No global executor-map change or alternate fill/PnL ledger.
 
@@ -54,15 +88,15 @@ Attachments are not repository paths and may not be mounted in the next environm
 - [x] Inspect original PR state, scoped plan, bundle interfaces, manifests, logs and artifact identities.
 - [x] Publish the target spec and initial execution plan without changing code.
 - [x] Detect the newer source checkpoint, preserve its code and revise the plan for overlapping implementations.
-- [ ] M0: Bind the actual owner checkout/runtime and establish the native baseline.
-- [ ] M1: Reconcile current source versus attachment into one coherent pipeline and run combined tests.
-- [ ] M2: Prove native admission, exits, partial fills, accounting and restart semantics.
-- [ ] M3: Prove shared data, feature provenance, dependency readiness and bounded load.
-- [ ] M4: Wire fixed-symbol programs through actual native-discoverable configurations.
-- [ ] M5: Prove aggregate capital and slot enforcement for the admitted account topology.
-- [ ] M6: Implement external inventory handoff and genuine sell-only native reduction.
-- [ ] M7: Wire broad screening to bounded native multi-symbol acquisition.
-- [ ] M8: Complete independent source review and separately gated release/research handoffs.
+- [x] M0: Bind the actual owner checkout/runtime and establish the native baseline. Worktree `.worktrees/hummingbot-modular-spot-pr55`; HB_PYTHON conda hummingbot; native imports from worktree.
+- [x] M1: Reconcile current source versus attachment into one coherent pipeline and run combined tests. Attachment not applied. HTTP snapshot polling. review-m1-fix PASS.
+- [x] M2: Prove native admission, exits, partial fills, accounting and restart semantics. Planned-resume hold. review-m2-fix PASS.
+- [x] M3: Prove shared data, feature provenance, dependency readiness and bounded load. Bounded recovery; hub retain. review-m3-fix PASS.
+- [x] M4: Wire fixed-symbol programs through actual native-discoverable configurations. Selection does not grant capital. review-m4 PASS.
+- [x] M5: Prove aggregate capital and slot enforcement for the admitted account topology. 2026-09-18 review-m5-fix Spec PASS / quality APPROVED. Process-local BudgetStore; reserved pair admitted; watchlist not a slot. Not a cross-process allocator.
+- [x] M6: Implement external inventory handoff and genuine sell-only native reduction. 2026-09-18 review-m6-fix Spec PASS / quality APPROVED. OrderExecutor LIMIT SELL CLOSE through create_executor; planned-resume hold; no live SUI/main handoff.
+- [x] M7: Wire broad screening to bounded native multi-symbol acquisition. 2026-09-19 review-m7-fix Spec PASS / quality APPROVED. Combined 230; default coverage keeps peer scores; closed-bar; no hot-enroll.
+- [x] M8: Complete independent source review and separately gated release/research handoffs. 2026-09-19 review-m8 Spec PASS / quality APPROVED. Combined 230, native executors 182, skips 0. Operational/economic/activation/merge/deploy HOLD. Product uncommitted.
 
 Append exact source/runtime, command, result and limitation when changing a box. A native skip or an unconnected helper keeps its milestone open.
 
@@ -269,6 +303,7 @@ This handoff preserves the original evidence and newly observed published helper
 ### Copyable implementation handoff
 
 > Read current root/owner instructions, then `docs/controllers/modular_spot/SPEC.md` and `PLAN.md`. Refresh PR #55 and resume M0, then M1's current-source/attachment reconciliation. Preserve newer published helpers and existing controllers; do not blindly apply or rewind to the old patch. Reuse native Hummingbot interfaces, validate actual wiring and run real native tests with independent review. Record exact progress, evidence and blockers. Do not activate execution, touch accounts, run economic backtests, merge or deploy without separate authority.
+> Read current root/owner instructions, SPEC.md, PLAN.md and the 2026-09-19 VALIDATION.md receipt. M0-M8 implementation has been revalidated and repaired in the uncommitted candidate. Follow the next implementation order below: reuse one selected existing controller policy and prove parity before strategy expansion. Preserve newer remote documentation and existing live owners. No activation, account mutation, backtest, publication, merge or deployment follows from source/test evidence.
 
 
 ## M9 — Mean-reversion context policy: shadow first, reduction-only enforcement later
@@ -332,3 +367,62 @@ Sizing multipliers above 1 and score-driven exit/trailing changes are explicitly
 At minimum retain tests for: baseline parity in shadow mode; no context-only BUY; multiplier bounds; minimum-order deny/defer; stale/missing/low-coverage fail-closed; future candle/lookahead refusal; snapshot/config/intent identity; universe revision; cross-venue labeling; duplicate/out-of-order/correction behavior; DCA uncertain reservation; restart determinism; management independence; and reason-code projection.
 
 Record implementation, research, native, paper/canary/live and promotion status separately. Passing unit/native tests does not establish economic merit; passing a backtest does not authorize capital.
+
+
+## Next implementation order after 2026-09-19 validation
+
+1. Review/publish the repaired local candidate when explicitly authorized. Preserve
+   the newer documentation-only remote additions at `2f9e4d0168df64d4c99a3d6e3055945a36ad572e`;
+   no newer remote product code existed at inspection. The worktree is still at
+   `808919077` plus uncommitted product/repair bytes; do not describe it as remote HEAD.
+2. Freeze one existing controller configuration and implement a named compatibility
+   policy by reusing its existing decision functions, not copying its order engine.
+   Compare identical candle/native-receipt inputs, signal identity, entry type,
+   amount, cooldown, expiry, trailing and reductions. Start with OK RSI, then RSI V5.
+3. Validate crash/restart ownership through the exact native executor specialization.
+   Keep planned-resume refusal until the separate shared-engine owner change is proven.
+4. Bind one isolated operational owner/account and image, then use the existing
+   Research OS owner workflow for a separately authorized cached May-August 2026
+   comparison. Do not transfer legacy strategy evidence to the simple modular baseline.
+5. Only a later operator mandate may activate an isolated canary or migrate a legacy
+   owner. Preserve current rsibot-stack owner IDs, start times and inventory throughout.
+
+M9 context and flash-crash specifications are preserved design work, not part of
+this validation or a reason to expand strategy scope before parity and recovery.
+A new account-wide allocator is not required for this local work. BudgetStore is
+a small reservation guard inside one recorder/strategy; existing independent
+wallet spenders remain outside that scope.
+
+
+## 2026-09-19 final validation receipt
+
+- V1-V4 complete for the authorized local validation/repair scope.
+- Preserved M0-M8 candidate; fresh baseline: 230 modular,172 native +10 subtests.
+- Added 11 failure regressions; final combined: 241 modular +172 native +33 candle
+  tests = 446 passed, plus 10 subtests; zero skips/failures/warnings.
+- Applicable actual pre-commit hooks and diff checks passed after scoped formatting.
+- Independent final repair review APPROVED; no Critical/Important findings.
+- Isolated public native OKX WebSocket smoke passed:2 feeds / 2 readers / 90-bar windows,
+  three successive confirmed 1m bars per pair, reader reconnect, 2.15s final candle age.
+- All 13 live container ID/image/start-time identities unchanged. Root and nested
+  Hummingbot statuses unchanged. No live writes, orders, commits or pushes.
+- Remote additions through 2f9e4d0 preserved; local HEAD remains 808919077 plus dirty
+  product. Source hash manifest and exact commands/results in VALIDATION.md.
+- Remaining gates: legacy policy parity, planned-resume restoration, operational
+  owner/image/account binding, long soak and authorized economic/activation work.
+- Rollback uses the pre-task archive for dirty paths and recorded HEAD for paths
+  that were clean; task-only incremental patch is in root audit directory.
+
+
+### Companion PR integration handoff
+
+The all-USDC continuation completed in the isolated sibling worktree
+`/Users/s1kor/dev/trading/rsibot/.worktrees/hummingbot-modular-integration-pr57`,
+branch `feat/andrzej_modular_stack_validation` based on PR #57 `068702141f1b`.
+It preserves this repaired PR #55 candidate and adds companion recipe/API/handoff
+fixes. See that worktree's `docs/controllers/modular_spot/UNIVERSE_VALIDATION.md`
+for 294-pair public evidence, the 563-test +10-subtest combined native receipt,
+112 API tests, 19 root handoff tests, source seals and remaining production/parity
+gaps. Those counts apply to the integrated candidate, not this older checkout.
+All 13 live container identities/start times/images remain unchanged. No commit,
+push, merge, deployment, orders or economic backtests were performed.

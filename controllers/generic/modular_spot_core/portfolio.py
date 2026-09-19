@@ -20,4 +20,4 @@ def allocate(*, stage_quote, remaining_quote, available_quote, price, amount_ste
     quantity = (budget / (price * (1 + fees)) / step).to_integral_value(rounding=ROUND_FLOOR) * step
     if quantity <= 0 or quantity < minimum_amount or quantity * price < minimum_notional:
         return None
-    return Allocation(quantity, quantity * price * (1 + fees))
+    return Allocation(quantity, quantity * price * (1 + fees), quantity * (1 + fees))

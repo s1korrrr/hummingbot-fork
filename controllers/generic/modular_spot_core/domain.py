@@ -38,3 +38,4 @@ class SignalDecision:
 class Allocation:
     amount: Decimal
     reserved_quote: Decimal
+    reserved_base: Decimal

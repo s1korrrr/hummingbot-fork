@@ -7,9 +7,9 @@ Execution plan: [PLAN.md](PLAN.md). Owning PR: [s1korrrr/hummingbot#55](https://
 
 Build independent spot strategy programs that reuse market observations and well-defined policy implementations while retaining native Hummingbot execution ownership. Support three operator-facing profiles: selected-symbol buy/sell, assigned-inventory sell-only, and broad-universe screening with bounded impulse acquisition.
 
-The user's later instruction supersedes the original proposal to refactor OK RSI: this is a new controller family. Do not modify, inherit from, redirect or migrate `ok_rsi`, `hl_rsi`, `rsi_v5` or another existing controller. The original design's separation of decisions, lifecycle coordination and accounting remains relevant; its recommendation to make OK RSI the first consumer does not.
+**2026-09-19 scope clarification:** the intended product is reusable modular composition for the already working `ok_rsi` and `rsi_v5` workflows, retaining native Hummingbot execution. The current isolated controller is the integration foundation; its simple RSI/breakout policies are experimental baselines and do not establish strategy parity. The next strategy slice must reuse a selected existing policy and prove decision/configuration parity before adding new strategy families. Do not modify, redirect, migrate or enroll any running legacy owner during this work. The earlier instruction to develop an isolated family remains the implementation boundary, not a claim that different signals are equivalent to those controllers.
 
-This publication adds documentation only. It does not apply the attached implementation patch, authorize economic backtests, change a deployment, import inventory, merge the PR or activate execution. Instructions in this document do not grant authority beyond the user's task and current repository contracts.
+The initial publication was documentation only. M0-M8 subsequently produced an uncommitted implementation, and the 2026-09-19 task authorizes local validation and scoped repairs. This does not authorize economic backtests, deployment, live inventory handoff, PR publication, merge or activation. See PLAN.md and VALIDATION.md for source identities and observed evidence.
 
 ### Constraints retained from the approved direction
 
@@ -81,7 +81,7 @@ It retains only two recent changed snapshots per stream. It is not MQTT distribu
 
 The newer branch variant uses `Dataset`, `CandleSnapshot`, `Replica` and `SnapshotHub` in `candle_data.py`, with `data_reader.py` and a different `candle_transport.py`. Its interval vocabulary and profile/configuration fields differ from the attachment. Source presence is not equivalent integration or acceptance. M1 must choose one coherent contract, port missing safeguards and preserve required behavior; do not install both pipelines or silently union their configuration schemas. Start acceptance with confirmed one-minute OKX spot; additional intervals require explicit adapter validation.
 
-Keep HTTP snapshot polling as the first delivery contract. MQTT can be a later transport adapter only after capacity or latency evidence justifies it; its implementation must retain the same identity/recovery guarantees. Do not add multiple brokers or a centralized service per indicator.
+**Exchange collection uses native OKX WebSockets; REST supplies initial/recovery history only.** Keep HTTP snapshot polling as the first local delivery contract. MQTT can be a later transport adapter only after capacity or latency evidence justifies it; its implementation must retain the same identity/recovery guarantees. Do not add multiple brokers or a centralized service per indicator.
 
 ### 4.3 Dataset and observation contract
 
@@ -137,6 +137,8 @@ Avoid a second fill ledger: any reservation journal references native receipts a
 
 External sell-only admission requires an explicit operator-approved native handoff with account/instrument, prior and new owner, available and reserved quantity, native acquisition-cost/fee provenance, reconciliation receipt and policy revision. Configuration declarations or current market price cannot supply missing acquisition cost.
 
+The implemented sell-only profile is explicit profit-floor liquidation of an admitted lot, not RSI rollover selling or a trailing high-water policy. Its trailing configuration supplies the profit-margin floor only. Admission currently requires complete native quote-denominated acquisition fee evidence; unsupported base/third-token acquisition fees and nonzero flat/base-denominated exit fees hold until an exact native contract is supported. This restriction does not alter legacy sell-only owners.
+
 A new sale must not exceed owned reconciled base minus outstanding sell commitments, with base-denominated fees and lot/minimum rules included. Use an applicable native reduce-inventory/order path, never a SELL PositionExecutor interpreted as a short entry. Disable buying, DCA, repurchase, pyramiding and automatic entry rearm at every boundary.
 
 Profit eligibility uses native attributed cost and complete fee evidence. Preserve tick-rounded price-bounded execution without automatic market fallback. Unknown cost, unsupported fees, gaps below the floor and dust produce explicit holds. Price protection does not guarantee a fill or bounded mark-to-market loss. One program cannot sell another program's lot merely because the exchange exposes one net balance.
@@ -168,11 +170,11 @@ Closed-bar functionality can be accepted without MQTT or intrabar strategies, pr
 No legacy migration, perpetuals, forced loss sales, live-account inspection, deployment, root pin changes or economic experiments occur in this documentation publication. Follow [PLAN.md](PLAN.md) from its first eligible unchecked step, preserving current authority and recording the evidence from the actual next run.
 
 
-## 9. Mean-reversion context policy — specified extension
+## 10. Mean-reversion context policy — specified extension
 
 Status: **research/specification only; no trading authority and no economic claim.** This extension reuses market-wide context as a secondary decision input for the modular controller. It does not make the existing Market Pulse scalar a standalone BUY/SELL signal and does not modify legacy controllers.
 
-### 9.1 Decision boundary
+### 10.1 Decision boundary
 
 For new acquisition, extend the pipeline to:
 
@@ -182,7 +184,7 @@ The strategy remains responsible for identifying a dip/setup. The context layer 
 
 The first implementation MUST be **reduction-only** relative to the strategy proposal: `0 <= acquisition_multiplier <= 1`. A favorable context cannot increase the strategy's baseline requested notional, bypass program/account limits, create a slot, or override ownership, freshness, reconciliation or profitability guards. If the reduced amount is below venue minimums, deny/defer rather than round exposure upward.
 
-### 9.2 Do not bind authority to the current scalar
+### 10.2 Do not bind authority to the current scalar
 
 The existing Market Pulse composite mixes economic components (momentum, breadth, volume, volatility quality) with data freshness/readiness. Treat those as separate concerns:
 
@@ -192,7 +194,7 @@ The existing Market Pulse composite mixes economic components (momentum, breadth
 
 Keep the current dashboard score unchanged for compatibility until evidence justifies a versioned replacement. New trading policy consumes a versioned component snapshot, not an undocumented threshold such as `composite_score > 70`.
 
-### 9.3 Proposed contract
+### 10.3 Proposed contract
 
 A context snapshot binds source/venue domain, quote universe, universe revision, component schema/version, finalized observation cutoff, availability/receipt time, content identity, coverage and expiry. Cross-venue context is explicitly labeled and never substitutes for local executable prices, rules or costs.
 
@@ -205,7 +207,7 @@ A policy evaluation binds the strategy opportunity/intent ID, instrument, progra
 
 No component submits orders, mutates native balances, owns fills/PnL, releases reservations, resets cost basis, or transfers inventory ownership.
 
-### 9.4 Initial use cases
+### 10.4 Initial use cases
 
 Implement/evaluate in this order:
 
@@ -217,7 +219,7 @@ Implement/evaluate in this order:
 
 Flash-crash operational protection remains separate from experimental recovery-entry alpha. Closed-bar context must not be advertised as sub-minute bottom detection.
 
-### 9.5 Causal research requirements
+### 10.5 Causal research requirements
 
 Before economic use, distinguish candle open, candle close, first availability/receipt and decision time. Historical reconstruction that marks rows ready/live with zero event age cannot validate live freshness behavior. Do not join a completed candle to its open timestamp as though close-derived features were known then.
 
@@ -225,6 +227,6 @@ Research must preserve point-in-time universe membership and missingness, includ
 
 Use the repository's mandated cached May-August 2026 scored window and Research OS/Quants Lab workflow when an economic run is separately authorized. Register trial count, costs, partial fills, spread/slippage/latency, inventory mark-to-market, drawdown/duration, capital-days, unfinished inventory, activity and regime/fold stability. Internal folds are not untouched OOS evidence.
 
-### 9.6 Acceptance and rejection
+### 10.6 Acceptance and rejection
 
 The layer earns enforcement only if source-bound evidence shows incremental value over the unchanged controller and a simpler trend/volatility/context rule after realistic costs and exposure matching. HOLD/REJECT enforcement if benefits are threshold-fragile, universe/missingness-dependent, dominated by reduced exposure, too stale for the intended horizon, or unsupported by causal availability data. It may remain an observability/research feature even if it never receives trading authority.

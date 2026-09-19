@@ -2,20 +2,24 @@
 import asyncio
 import json
 import os
-from pathlib import Path
 import secrets
 import stat
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 import aiohttp
 from aiohttp import web
 
-from .candle_data import CandleSnapshot, Dataset, Replica, SnapshotHub
+from .candle_data import SCHEMA_VERSION, CandleSnapshot, Dataset, Replica, SnapshotHub
 from .domain import DataUnavailable, PolicyError, decimal
 
 MAX_MESSAGE = 8 * 1024 * 1024
+
+
+def snapshot_etag(value: CandleSnapshot) -> str:
+    return f'"{value.epoch}:{value.sequence}:{value.digest}"'
 
 
 def read_token(path: str) -> str:
@@ -48,31 +52,70 @@ def validate_origin(value: str) -> str:
 
 
 def create_app(hub: SnapshotHub, *, token: str, clock=time.time, poll_seconds: float = 1.0,
-               max_clients: int = 128) -> web.Application:
+               max_clients: int = 128, grants: dict | None = None) -> web.Application:
     poll_seconds = float(decimal(poll_seconds, 'poll interval', positive=True))
-    if len(token) < 32 or not 1 <= max_clients <= 1024:
+    if (grants is None and (not token or len(token) < 32)) or not 1 <= max_clients <= 1024:
+        raise ValueError('invalid service authentication or client bound')
+    if grants is None:
+        grants = {token: {key: spec.history for key, spec in hub.datasets.items()}}
+    elif any(len(name) < 32 for name in grants):
         raise ValueError('invalid service authentication or client bound')
     clients = set()
+
+    def _granted(request):
+        offered = request.get('candle_token')
+        allowed = grants.get(offered)
+        if allowed is None:
+            raise web.HTTPUnauthorized()
+        return allowed
 
     @web.middleware
     async def authenticate(request, handler):
         candidate = request.headers.get('Authorization', '')
-        if not secrets.compare_digest(candidate, 'Bearer ' + token):
+        if not candidate.startswith('Bearer '):
             raise web.HTTPUnauthorized()
+        offered = candidate[7:]
+        matched = None
+        for value in tuple(grants):
+            if len(offered) == len(value) and secrets.compare_digest(offered, value):
+                matched = value
+                break
+        if matched is None:
+            raise web.HTTPUnauthorized()
+        request['candle_token'] = matched
         return await handler(request)
 
     app = web.Application(middlewares=[authenticate], client_max_size=65536)
 
     async def catalog(request):
-        return web.json_response({'schema_version': 1, 'epoch': hub.epoch,
-                                  'datasets': [spec.model_dump(mode='json') for spec in hub.datasets.values()],
-                                  'errors': dict(hub.errors)})
+        allowed = _granted(request)
+        return web.json_response({'schema_version': SCHEMA_VERSION, 'epoch': hub.epoch,
+                                  'datasets': [spec.model_dump(mode='json') for key, spec in hub.datasets.items()
+                                               if key in allowed],
+                                  'errors': {key: error for key, error in hub.errors.items() if key in allowed}})
 
     async def snapshot(request):
         try:
-            value = hub.latest(request.match_info['key'])
+            allowed = _granted(request)
+            key = request.match_info['key']
+            if key not in allowed or allowed[key] < 2:
+                raise web.HTTPForbidden(text='dataset or history outside consumer scope')
+            value = hub.latest(key)
+            limit = allowed[key]
+            if limit < value.dataset.history:
+                spec = value.dataset.model_copy(update={'history': limit})
+                value = value.model_copy(update={'dataset': spec, 'rows': value.rows[-limit:]})
             value.frame(now=clock(), max_age=hub.max_age)
-            return web.json_response(value.model_dump(mode='json'))
+            etag = snapshot_etag(value)
+            headers = {'ETag': etag, 'Cache-Control': 'no-store', 'X-Published-At': str(value.published_at)}
+            if request.headers.get('If-None-Match') == etag:
+                return web.Response(status=304, headers=headers)
+            body = json.dumps(value.model_dump(mode='json'), separators=(',', ':'), allow_nan=False).encode()
+            if len(body) > MAX_MESSAGE:
+                raise PolicyError('snapshot exceeds bounded transport size')
+            return web.Response(body=body, headers=headers, content_type='application/json')
+        except web.HTTPException:
+            raise
         except PolicyError as exc:
             raise web.HTTPServiceUnavailable(text=str(exc)) from exc
 
@@ -87,9 +130,11 @@ def create_app(hub: SnapshotHub, *, token: str, clock=time.time, poll_seconds: f
             if not isinstance(initial, dict) or set(initial) != {'datasets'}:
                 raise PolicyError('exact dataset subscription required')
             keys = initial['datasets']
+            allowed = _granted(request)
             if (not isinstance(keys, list) or not 1 <= len(keys) <= 1000
                     or any(not isinstance(key, str) for key in keys)
-                    or len(set(keys)) != len(keys) or not set(keys) <= set(hub.datasets)):
+                    or len(set(keys)) != len(keys) or not set(keys) <= set(allowed)
+                    or not set(keys) <= set(hub.datasets)):
                 raise PolicyError('unknown, duplicated or unbounded dataset subscription')
             sent = {}
             while not ws.closed:
@@ -132,6 +177,7 @@ def create_app(hub: SnapshotHub, *, token: str, clock=time.time, poll_seconds: f
     async def lifecycle(application):
         hub.start()
         hub.capture(now=clock())
+
         async def capture_loop():
             while True:
                 await asyncio.sleep(poll_seconds)
@@ -156,15 +202,19 @@ def create_app(hub: SnapshotHub, *, token: str, clock=time.time, poll_seconds: f
 
 
 class CandleClient:
-    """An opt-in consumer. Reconnect warms state but never authorizes a historical entry."""
+    """HTTP snapshot polling consumer. Reconnect warms state but never authorizes a historical entry."""
 
-    def __init__(self, origin: str, token_file: str, datasets: tuple[Dataset, ...], *, clock=time.time):
+    def __init__(self, origin: str, token_file: str, datasets: tuple[Dataset, ...], *, clock=time.time,
+                 poll_seconds: float = 1.0):
         self.origin = validate_origin(origin)
         self.token_file = token_file
         self.replica = Replica(datasets)
         self.clock = clock
+        self.poll_seconds = float(decimal(poll_seconds, 'poll interval', positive=True))
+        self.etags = {}
         self.task = None
         self.error = None
+        self.dataset_errors = {}
 
     def start(self):
         if self.task is None:
@@ -177,8 +227,74 @@ class CandleClient:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+    async def poll(self, session, token):
+        if not self.replica.connected:
+            self.replica.begin_session()
+            self.etags.clear()
+        statuses = []
+        request = {'allow_redirects': False}
+        if self.origin.startswith('https://'):
+            request['ssl'] = True
+        for key in self.replica.datasets:
+            headers = {'Authorization': 'Bearer ' + token}
+            etag = self.etags.get(key)
+            if etag is not None:
+                headers['If-None-Match'] = etag
+            async with session.get(f'{self.origin}/v1/snapshot/{key}', headers=headers, **request) as response:
+                origin = f'{urlsplit(str(response.url)).scheme}://{urlsplit(str(response.url)).netloc}'
+                if origin.rstrip('/') != self.origin:
+                    raise PolicyError('market-data origin changed')
+                statuses.append(response.status)
+                if response.status == 304:
+                    self._apply_not_modified(key, response)
+                elif response.status == 200:
+                    await self._apply_snapshot(key, response)
+                elif response.status == 503:
+                    # A warming/unavailable symbol must not reset healthy peers or their watermarks.
+                    self.replica.snapshots.pop(key, None)
+                    self.replica.seed_bars.pop(key, None)
+                    self.replica.revision += 1
+                    self.etags.pop(key, None)
+                    self.dataset_errors[key] = 'candle HTTP status 503'
+                    continue
+                else:
+                    raise DataUnavailable(f'candle HTTP status {response.status}')
+                self.dataset_errors.pop(key, None)
+        return statuses
+
+    def _apply_not_modified(self, key, response):
+        previous = self.replica.snapshots.get(key)
+        etag = response.headers.get('ETag')
+        if previous is None or etag != snapshot_etag(previous):
+            raise PolicyError('unbound not-modified response')
+        published = response.headers.get('X-Published-At')
+        if published is None:
+            raise PolicyError('not-modified missing publication time')
+        self.replica.touch(key, epoch=previous.epoch, sequence=previous.sequence, digest=previous.digest,
+                           published_at=float(published), now=self.clock())
+
+    async def _apply_snapshot(self, key, response):
+        if response.content_type != 'application/json':
+            raise PolicyError('unexpected snapshot content type')
+        if response.content_length is not None and response.content_length > MAX_MESSAGE:
+            raise PolicyError('snapshot exceeds bounded transport size')
+        body = bytearray()
+        async for chunk in response.content.iter_chunked(65536):
+            if len(body) + len(chunk) > MAX_MESSAGE:
+                raise PolicyError('snapshot exceeds bounded transport size')
+            body.extend(chunk)
+        snapshot = CandleSnapshot.model_validate(json.loads(body))
+        if snapshot.dataset.key != key:
+            raise PolicyError('snapshot does not match requested dataset')
+        etag = response.headers.get('ETag')
+        if etag != snapshot_etag(snapshot):
+            raise PolicyError('snapshot content identity mismatch')
+        self.replica.accept(snapshot, now=self.clock())
+        self.etags[key] = etag
+
     async def run(self):
         delay = 1.0
+
         async def reject_redirect(*args):
             raise PolicyError('market-data redirects are not admitted')
         trace = aiohttp.TraceConfig()
@@ -189,22 +305,12 @@ class CandleClient:
                                              trace_configs=[trace]) as session:
                 while True:
                     try:
-                        async with session.ws_connect(self.origin + '/v1/stream', heartbeat=10, compress=0,
-                                                      max_msg_size=MAX_MESSAGE, ssl=True,
-                                                      headers={'Authorization': 'Bearer ' + token}) as socket:
-                            self.replica.begin_session()
-                            await socket.send_json({'datasets': list(self.replica.datasets)})
-                            while True:
-                                message = await asyncio.wait_for(socket.receive(), timeout=15)
-                                if message.type != aiohttp.WSMsgType.TEXT:
-                                    if message.type in {aiohttp.WSMsgType.PING, aiohttp.WSMsgType.PONG}:
-                                        continue
-                                    raise DataUnavailable('candle socket disconnected')
-                                body = json.loads(message.data)
-                                self.consume(body)
-                                delay, self.error = 1.0, None
+                        await self.poll(session, token)
+                        delay, self.error = 1.0, None
+                        await asyncio.sleep(self.poll_seconds)
                     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, KeyError) as exc:
                         self.replica.disconnect()
+                        self.etags.clear()
                         self.error = f'{type(exc).__name__}: {exc}'
                         await asyncio.sleep(delay)
                         delay = min(delay * 2, 30.0)
@@ -257,7 +363,7 @@ def main():
     if source.stat().st_size > 1024 * 1024:
         raise ValueError('candle manifest is too large')
     manifest = json.loads(source.read_text())
-    if not isinstance(manifest, dict) or set(manifest) != {'schema_version', 'datasets'} or type(manifest['schema_version']) is not int or manifest['schema_version'] != 1:
+    if not isinstance(manifest, dict) or set(manifest) != {'schema_version', 'datasets'} or type(manifest['schema_version']) is not int or manifest['schema_version'] != SCHEMA_VERSION:
         raise ValueError('unsupported candle manifest')
     specs = tuple(Dataset.model_validate(row) for row in manifest['datasets'])
     from hummingbot.client.settings import AllConnectorSettings, ConnectorType
@@ -265,6 +371,7 @@ def main():
     from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
     from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
     throttlers = {}
+
     def native_factory(spec):
         setting = AllConnectorSettings.get_connector_settings().get(spec.connector)
         if spec.source_profile != 'native' or setting is None or setting.type != ConnectorType.Exchange:

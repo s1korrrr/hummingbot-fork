@@ -1,16 +1,61 @@
 """Immutable, finalized candle snapshots; no exchange orders or strategy state."""
-from decimal import Decimal
 import math
+import sqlite3
+from decimal import Decimal
+from pathlib import Path
 from typing import Callable, Literal
 
 import pandas as pd
-from pydantic import Field, StrictBool, model_validator
+from pydantic import Field, StrictBool, field_validator, model_validator
 
 from .config import PolicyModel
 from .domain import DataUnavailable, PolicyError, decimal, identity
 
+SCHEMA_VERSION = 1
+# Confirmed 1m OKX spot is the admitted first delivery. Do not silently add 3m/30m or extra venues.
+FIRST_DELIVERY = {
+    'connector': 'okx',
+    'source_domain': 'okx',
+    'market_type': 'spot',
+    'interval': '1m',
+    'price_type': 'trade',
+    'boundary': 'utc_epoch',
+    'finality': 'confirmed',
+}
+# Measured local-fixture bound for first delivery. Not the hub's configured 1000-dataset cap.
+FIRST_DELIVERY_LOAD = {
+    'connector': 'okx',
+    'interval': '1m',
+    'feeds': 2,
+    'history': 90,
+    'consumers': 2,
+}
+ADMITTED_NATIVE_CONNECTORS = frozenset({'okx'})
 INTERVALS = {'1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400}
 PAIR_PATTERN = r'^[A-Z0-9]+-[A-Z0-9]+$'
+_EXECUTION_TABLES = frozenset({
+    'orders', 'order', 'tradefill', 'trade_fill', 'trade_fills', 'executors', 'positions', 'position',
+})
+
+
+def reject_execution_database(path):
+    """Refuse execution/owner sqlite and unidentified files. First delivery is in-memory bounded recovery."""
+    target = Path(path)
+    if target.exists() and (target.is_symlink() or not target.is_file()):
+        raise ValueError('refusing foreign database; use a separate market-data path')
+    if not target.exists() or target.stat().st_size == 0:
+        raise ValueError('refusing foreign database; use a separate market-data path')
+    try:
+        db = sqlite3.connect(f'file:{target.resolve()}?mode=ro', uri=True)
+        try:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        raise ValueError('refusing foreign database; use a separate market-data path') from exc
+    if {name.lower() for name in tables} & _EXECUTION_TABLES:
+        raise ValueError('refusing foreign database; use a separate market-data path')
+    raise ValueError('refusing foreign database; use a separate market-data path')
 
 
 class Dataset(PolicyModel):
@@ -18,8 +63,22 @@ class Dataset(PolicyModel):
     trading_pair: str = Field(pattern=PAIR_PATTERN, max_length=80)
     interval: Literal['1m', '5m', '15m', '1h', '4h'] = '1m'
     market_type: Literal['spot'] = 'spot'
+    source_domain: Literal['okx'] = 'okx'
     source_profile: str = Field(default='native', min_length=1, max_length=80)
+    price_type: Literal['trade'] = 'trade'
+    boundary: Literal['utc_epoch'] = 'utc_epoch'
     history: int = Field(default=300, ge=60, le=5000, strict=True)
+
+    @model_validator(mode='after')
+    def admitted_native_spot(self):
+        base, quote = self.trading_pair.split('-')
+        if base == quote:
+            raise ValueError('base and quote must differ')
+        if self.source_profile == 'native' and (
+                self.connector not in ADMITTED_NATIVE_CONNECTORS or self.source_domain != self.connector
+                or self.market_type != 'spot' or self.price_type != 'trade' or self.boundary != 'utc_epoch'):
+            raise ValueError('native datasets are limited to admitted confirmed OKX spot')
+        return self
 
     @property
     def key(self) -> str:
@@ -48,17 +107,24 @@ class Candle(PolicyModel):
 
 
 class CandleSnapshot(PolicyModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1] = SCHEMA_VERSION
     dataset: Dataset
     epoch: str = Field(pattern=r'^[A-Za-z0-9_-]{1,128}$')
     sequence: int = Field(ge=1, strict=True)
     published_at: float = Field(ge=0)
     rows: tuple[Candle, ...] = Field(min_length=2, max_length=5000)
 
+    @field_validator('schema_version', mode='before')
+    @classmethod
+    def integer_schema_version(cls, value):
+        if type(value) is not int:
+            raise ValueError('schema version must be an integer')
+        return value
+
     @model_validator(mode='after')
     def continuity(self):
-        if type(self.schema_version) is not int:
-            raise ValueError('invalid schema version')
+        if self.schema_version != SCHEMA_VERSION:
+            raise ValueError('unsupported candle schema version')
         times = [row.open_time for row in self.rows]
         step = self.dataset.seconds
         if len(times) > self.dataset.history or any(t % step for t in times):
@@ -183,7 +249,10 @@ class Replica:
 class SnapshotHub:
     """One native feed per dataset, sized before startup; readers never stop feeds."""
 
-    def __init__(self, datasets: tuple[Dataset, ...], *, factory: Callable, epoch: str, max_age: float = 120):
+    def __init__(self, datasets: tuple[Dataset, ...], *, factory: Callable, epoch: str, max_age: float = 120,
+                 checkpoint=None):
+        if checkpoint is not None:
+            reject_execution_database(checkpoint)
         if not datasets or len(datasets) > 1000:
             raise ValueError('one to one thousand datasets must be explicitly admitted')
         self.datasets = {}
@@ -197,6 +266,7 @@ class SnapshotHub:
         self.max_age = float(decimal(max_age, 'maximum age', positive=True))
         self.feeds = {}
         self.snapshots: dict[str, CandleSnapshot] = {}
+        self.prior: dict[str, CandleSnapshot] = {}
         self.errors: dict[str, str] = {}
         self.started = False
 
@@ -209,6 +279,7 @@ class SnapshotHub:
                 self.feeds[key] = feed
                 feed.start()
             self.started = True
+            self.errors = {key: error for key, error in self.errors.items() if error != 'producer stopped'}
         except Exception:
             self.stop()
             raise
@@ -222,7 +293,8 @@ class SnapshotHub:
                 feed.stop()
             except Exception as exc:
                 errors.append((key, type(exc).__name__))
-        self.errors = {key: 'producer stopped' for key in self.datasets}
+        for key in self.datasets:
+            self.errors.setdefault(key, 'producer stopped')
         if errors:
             raise PolicyError(f'native candle cleanup failed: {errors}')
 
@@ -249,10 +321,22 @@ class SnapshotHub:
                                            published_at=now, rows=tuple(parsed))
                 candidate.frame(now=now, max_age=self.max_age)
                 if old is not None and candidate.digest != old.digest:
+                    self.prior[key] = old
                     candidate = candidate.model_copy(update={'sequence': old.sequence + 1})
                 self.snapshots[key] = candidate
                 self.errors.pop(key, None)
             except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as exc:
+                old = self.snapshots.get(key)
+                retained = False
+                if old is not None:
+                    try:
+                        old.frame(now=now, max_age=self.max_age)
+                        retained = True
+                    except PolicyError:
+                        retained = False
+                if retained:
+                    self.errors.pop(key, None)
+                    continue
                 self.errors[key] = f'{type(exc).__name__}: {exc}'
 
     def latest(self, key: str) -> CandleSnapshot:

@@ -1,5 +1,6 @@
 """Opt-in, process-local sharing for modular controllers; native providers are untouched."""
 import asyncio
+import time
 from decimal import Decimal
 from typing import Literal
 from weakref import WeakKeyDictionary
@@ -44,8 +45,9 @@ def dataset_for(config, pair=None):
 
 
 class DataPool:
-    def __init__(self, policy: DataPolicy):
+    def __init__(self, policy: DataPolicy, *, clock=time.time):
         self.policy = policy
+        self.clock = clock
         self.datasets = {}
         self.references = 0
         self.client = None
@@ -66,7 +68,8 @@ class DataPool:
 
     def start(self):
         if self.client is None:
-            self.client = CandleClient(self.policy.origin, self.policy.token_file, tuple(self.datasets.values()))
+            self.client = CandleClient(self.policy.origin, self.policy.token_file, tuple(self.datasets.values()),
+                                       clock=self.clock)
             self.client.start()
 
     async def close(self):
@@ -125,7 +128,7 @@ class DataPool:
                     scores[pair] = change * relative
             cached = scores
             self.ranking_cache = {signature: scores}
-        result = {} if coverage < config.data.minimum_coverage else dict(cached)
+        result = dict(cached)
         self.screen_cache = (key, min(expires, now + 1) if not snapshots else expires, result, coverage)
         return dict(result), coverage
 

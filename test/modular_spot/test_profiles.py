@@ -37,3 +37,18 @@ def test_impulse_can_observe_all_admitted_symbols_but_trade_only_an_explicit_sub
 def test_invalid_or_mixed_quote_programs_rejected(symbols):
     with pytest.raises(ValueError):
         ProgramProfile(name='bad', connector='okx', symbols=symbols, mode='fixed', quote_budget='100', max_positions=1)
+
+
+def test_profile_bundle_is_a_disabled_native_controller_config():
+    from controllers.generic.modular_spot import ModularSpotControllerConfig
+    result = build_profile(ProgramProfile(
+        name='selected', connector='okx', symbols=('BTC-USDC',), mode='fixed', quote_budget='100', max_positions=1))
+    validated = ModularSpotControllerConfig.model_validate(result['controllers'][0])
+    assert validated.execution_enabled is False
+    assert validated.data.mode == 'shared'
+
+
+def test_unknown_profile_keys_are_rejected():
+    with pytest.raises(ValueError):
+        ProgramProfile(name='selected', connector='okx', symbols=('BTC-USDC',), mode='fixed',
+                       quote_budget='100', max_positions=1, capital_file='nope.yml')

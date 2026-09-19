@@ -1,7 +1,8 @@
 # Modular spot controller — isolated candidate
 
-Status: repository candidate, execution disabled by default. Not a replacement for
-OK RSI, not a promotion decision, and not an economically validated strategy.
+Status: locally validated integration candidate, execution disabled by default.
+The goal is modular reuse for OK RSI and RSI V5, but the current baseline policies
+are not behavior-equivalent replacements. See [PUBLICATION_RECEIPT.md](PUBLICATION_RECEIPT.md) for the fresh standalone checks and [VALIDATION.md](VALIDATION.md) for historical evidence. The later native-policy and Rust-stream candidate belongs to PR #57.
 Native contract baseline: Hummingbot commit
 `4df9ff3158a405b71d28b1c07446cfc7864a19fa`.
 
@@ -80,9 +81,16 @@ forcing loss realization. A price gap can leave inventory unsold or a limit orde
 unfilled: **profit-only selling does not guarantee bounded mark-to-market loss**.
 Late fee corrections still require native accounting reconciliation.
 
-Held/dust inventory is not erased, renamed into free capital, adopted from another
-owner or automatically resold. It blocks new acquisition and requires explicit
-native reconciliation. New initial-position assignments are rejected.
+Held/dust inventory is not erased or renamed into free capital. The buy/sell
+profile does not adopt another owner's lot. The separate sell-only profile requires
+an explicit, persisted handoff bound to complete native receipts; a configured
+wallet balance or initial-position assignment does not establish ownership.
+
+The current sell-only policy liquidates the admitted remaining lot when its
+after-fee profit floor and fresh-data checks allow a native LIMIT SELL CLOSE. It
+is not the legacy RSI rollover or adaptive trailing policy. Unsupported fee
+forms, missing/corrected receipts, an unresolved sale or a below-floor bid hold
+new sales. Native orders, fills and cancellations remain owned by OrderExecutor.
 
 ## Capital, risk and operational boundaries
 
@@ -128,6 +136,13 @@ controller_type: generic
 connector_name: okx
 trading_pair: BTC-USDC
 execution_enabled: false
+account: isolated_research_account
+program_revision: '1'
+policy_revision: '1'
+budget:
+  group: modular_research
+  max_quote: '100'
+  max_assets: 1
 total_amount_quote: '100'
 interval: 1m
 max_records: 300
@@ -158,10 +173,9 @@ is changed by this PR.
 
 ## Review and validation gates
 
-Run `python -m pytest -q test/modular_spot`. The native test module skips only when
-the Hummingbot package is entirely absent. In the owning environment, explicitly
-import the native controller first so an accidental all-policy-only run cannot
-be accepted as native validation:
+Run `python -m pytest -q test/modular_spot` with the complete native Hummingbot
+runtime. Missing native imports must fail validation; a skipped native module is
+not an accepted result. Explicitly bind PYTHONPATH to the owner checkout:
 
 ```bash
 python -c 'from controllers.generic.modular_spot import ModularSpotControllerConfig; from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor'
@@ -177,3 +191,38 @@ limit venue semantics, ownership locks, recovery refusal, alert delivery, backup
 image/source binding, and rollback. Research OS/quants-lab intake and authorized
 native-semantic economic evaluation are separate work; none was executed here.
 See `VALIDATION.md` for the evidence actually produced.
+
+## Public candle path and availability
+
+`OKX public WebSocket -> native OKXSpotCandles -> SnapshotHub -> authenticated
+loopback HTTP snapshots -> DataPool -> modular policy`. Native REST history fills
+the initial/recovery window. It does not replace live WebSocket updates.
+No new exchange socket implementation or message broker is needed.
+
+Run the bounded public-data smoke from this checkout with the native interpreter:
+
+```bash
+PYTHONPATH="$PWD" /Users/s1kor/anaconda3/envs/hummingbot/bin/python \
+  docs/controllers/modular_spot/public_candle_smoke.py \
+  --seconds 240 --output /tmp/pr55-public-candle-smoke.json
+```
+
+It starts two native public 1m feeds, an ephemeral loopback publisher and two
+readers, verifies confirmed bars and new-bar entry readiness, reconnects one
+reader while the other stays available, then shuts its own processes down. It
+uses no exchange credentials, account connector, owner DB or orders. This is a
+bounded data-path smoke, not a persistent deployment or a live trading soak.
+
+`profiles.py` exports disabled controller configurations and their matching
+manifest. The standalone publisher is available as:
+
+```bash
+PYTHONPATH="$PWD" python -m controllers.generic.modular_spot_core.candle_transport \
+  --manifest /absolute/path/candle-manifest.json \
+  --token-file /absolute/private/path/reader-token --port 8100
+```
+
+The token must be an absolute, non-symlink, private regular file containing at
+least 32 non-whitespace ASCII characters. Do not place its content in YAML/Git.
+The sample account name does not prove segregation or shared-wallet authority.
+Native mode remains available without deploying a shared publisher.

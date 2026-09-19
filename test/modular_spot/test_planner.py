@@ -1,5 +1,5 @@
-from decimal import Decimal as D
 from dataclasses import replace
+from decimal import Decimal as D
 
 import pytest
 

@@ -24,7 +24,11 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TrailingStop
+from hummingbot.strategy_v2.executors.position_executor.data_types import (
+    PositionExecutorConfig,
+    TrailingStop,
+    parse_position_config,
+)
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
@@ -200,7 +204,7 @@ class PositionExecutor(ExecutorBase):
         """Restore the original terminal receipt; caller must atomically claim before start."""
         if self.status != RunnableStatus.NOT_STARTED or self._open_order is not None:
             raise ValueError("Position must be new and unstarted before hydration")
-        if self.config != PositionExecutorConfig.model_validate(position["config"]):
+        if self.config != parse_position_config(position["config"]):
             raise ValueError("Planned position configuration differs")
         order = InFlightOrder.from_json(position["entry"])
         if order.current_state != OrderState.FILLED or order.executed_amount_base != order.amount:

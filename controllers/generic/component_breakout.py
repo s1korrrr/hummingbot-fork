@@ -112,7 +112,7 @@ class ComponentBreakoutController(ControllerBase):
 
     def _paper_ready(self):
         connector = self.market_data_provider.connectors.get(self.config.connector_name)
-        return (is_native_paper_connector(connector) and connector.ready
+        return (is_native_paper_connector(connector) and connector.pair_ready(self.config.trading_pair)
                 and identity(self.config.model_dump(mode='json', exclude={'manual_kill_switch'})) == self._config_identity)
 
     async def update_processed_data(self):

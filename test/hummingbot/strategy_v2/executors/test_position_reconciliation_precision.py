@@ -169,7 +169,9 @@ def test_report_validity_gate_recovers_only_after_complete_receipts_return():
     orchestrator.recovery_required['unrelated-controller'] = ['persisted-unfinished']
     controller = MagicMock()
     harness = SimpleNamespace(executor_orchestrator=orchestrator, controllers={'btc': controller},
-                              logger=lambda: MagicMock(), _controller_reports_valid=False)
+                              logger=lambda: MagicMock(), _controller_reports_valid=False,
+                              _controller_report_error=None, _last_controller_report_error_log_ts=None,
+                              current_timestamp=1000)
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
         StrategyV2Base.update_executors_info(harness)
         assert harness._controller_reports_valid is True

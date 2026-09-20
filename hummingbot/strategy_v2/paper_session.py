@@ -171,6 +171,8 @@ class NativePaperSession:
         self.markets = {connector.name: set(connector.trading_pairs)}
         self.market_data_provider = InjectedPaperMarketData(connector)
         self.controllers = {c.id: c.get_controller_class()(c, self.market_data_provider, asyncio.Queue()) for c in configs}
+        from controllers.generic.modular_spot_core.native_funding import bind_funding_scope
+        bind_funding_scope(self.controllers)
         for controller in self.controllers.values():
             if restore and type(controller.config) is ComponentBreakoutConfig:
                 controller.recovery_hold = "reference_restart_requires_inventory_reconciliation"
@@ -251,9 +253,11 @@ class NativePaperSession:
         if self._closed or name != self._connector.name or not is_native_paper_connector(self._connector):
             raise RuntimeError('Unexpected or closed paper execution route')
 
-    def _refresh_reports(self):
-        reports = self.executor_orchestrator.get_all_reports()
+    def _refresh_reports(self, *, controller_ids=None):
+        reports = self.executor_orchestrator.get_all_reports(controller_ids=controller_ids)
         for key, controller in self.controllers.items():
+            if controller_ids is not None and key not in controller_ids:
+                continue
             report = reports.get(key, {})
             controller.executors_info = report.get('executors', [])
             controller.positions_held = report.get('positions', [])
@@ -363,11 +367,17 @@ class NativePaperSession:
             self._oracle.set_price(book['trading_pair'], self._connector.get_mid_price(book['trading_pair']))
         for frame in candles:
             self.market_data_provider.set_candles(**frame)
+        fresh_ids = {key for key, controller in self.controllers.items()
+                     if self._connector.pair_ready(controller.config.trading_pair)}
         for trade in trades:
             await self._connector.process_trade(**trade)
-        self._refresh_reports()
+        self._refresh_reports(controller_ids=fresh_ids)
         actions = []
-        for controller in self.controllers.values():
+        for key, controller in self.controllers.items():
+            if key not in fresh_ids:
+                controller.processed_data = {'signal': 0, 'data_health': {'ready': False,
+                                                                          'reason': 'public_book_unavailable'}}
+                continue
             await controller.update_processed_data()
             actions.extend(controller.determine_executor_actions())
         self._validate_actions(actions)
@@ -375,16 +385,19 @@ class NativePaperSession:
         started, self._started = self._started, []
         for executor in started:
             await executor.on_start()
-        for executors in self.executor_orchestrator.active_executors.values():
+        for key, executors in self.executor_orchestrator.active_executors.items():
+            if key not in fresh_ids:
+                continue
             for executor in list(executors):
                 if not executor.is_closed:
                     await executor.control_task()
                     await self._connector.drain()
-        self.executor_orchestrator.sync_live_state_to_db()
-        reports = self._refresh_reports()
+        self.executor_orchestrator.sync_live_state_to_db(controller_ids=fresh_ids)
+        reports = self._refresh_reports(controller_ids=fresh_ids)
         reasons = []
         if not self._connector.ready:
             reasons.append('fresh_book_required')
+        reasons.extend('exposed_pair_book_unavailable:' + p for p in self.unavailable_exposure())
         for key, controller in self.controllers.items():
             recovery_hold = getattr(controller, '_recovery_hold', getattr(controller, 'recovery_hold', ''))
             if recovery_hold:
@@ -397,11 +410,38 @@ class NativePaperSession:
         return {'actions': actions, 'reports': reports, 'market_state': self._connector.tracking_states,
                 'readiness': {'ready': not reasons, 'reasons': reasons}}
 
+    def unavailable_exposure(self):
+        pairs = {executor.config.trading_pair for executors in self.executor_orchestrator.active_executors.values()
+                 for executor in executors if not executor.is_closed}
+        pairs.update(position.trading_pair for positions in self.executor_orchestrator.positions_held.values()
+                     for position in positions)
+        return sorted(pair for pair in pairs if not self._connector.pair_ready(pair))
+
     async def close(self):
         if self._closed:
             return
         self._is_stop_triggered = True
         try:
+            if self.unavailable_exposure():
+                # A current mark cannot be invented merely to close a session.
+                # Save exact tracker/cash state, leave prior executor/position
+                # receipts intact and require explicit reconciliation on restore.
+                if self._failure is None:
+                    self._failure = {'status': 'shutdown_without_fresh_exposed_book', 'identity': self._identity}
+                    self._write_step_receipt(self._failure)
+                await self._connector.cancel_all(5)
+                with self._sql.get_new_session() as session, session.begin():
+                    self.recorder.save_market_states('native-paper-session', self._connector, session)
+                for executors in self.executor_orchestrator.active_executors.values():
+                    for executor in executors:
+                        tasks = [getattr(executor, name, None) for name in
+                                 ('_entry_expiry_reconciliation_task', '_funding_entry_reconciliation_task')]
+                        for task in tasks:
+                            if task is not None:
+                                task.cancel()
+                        await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
+                        executor.unregister_events()
+                return
             await self._connector.cancel_all(5)
             for executors in self.executor_orchestrator.active_executors.values():
                 for executor in executors:

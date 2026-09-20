@@ -18,7 +18,7 @@ from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.planned_position_resume import claim, pending_manifest
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 
 if TYPE_CHECKING:
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -394,7 +394,7 @@ class ExecutorOrchestrator:
         instances = []
         required_base = {}
         for position in manifest["positions"]:
-            config = PositionExecutorConfig.model_validate(position["config"])
+            config = parse_position_config(position["config"])
             controller = self.strategy.controllers.get(position["controller_id"])
             if (controller is None or position["controller_id"] in self.initial_positions_by_controller
                     or config.connector_name not in self.strategy.connectors
@@ -413,7 +413,22 @@ class ExecutorOrchestrator:
             base = config.trading_pair.split('-')[0]
             key = config.connector_name, base
             required_base[key] = required_base.get(key, Decimal(0)) + Decimal(position["net_base"])
-            executor = PositionExecutor(self.strategy, config, self.executors_update_interval, self.executors_max_retries)
+            executor_class = PositionExecutor
+            if getattr(config, 'entry_acquisition_policy', None) == 'down_only_maker_v1':
+                from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+                trusted_owner = (type(controller.config) is OKRSIControllerConfig
+                                 or getattr(controller.config, 'controller_name', None) != 'ok_rsi'
+                                 and is_ok_rsi_policy(controller.config))
+                if (not trusted_owner
+                        or getattr(controller.config, 'entry_acquisition_policy', None) != 'down_only_maker_v1'):
+                    raise ValueError('Planned down-only native owner policy differs')
+                from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+                    DownOnlyMakerPositionExecutor,
+                )
+                executor_class = DownOnlyMakerPositionExecutor
+            # The consumed manifest authorizes sealed existing inventory. Do not
+            # request a new entry factory authorization or create a new BUY intent.
+            executor = executor_class(self.strategy, config, self.executors_update_interval, self.executors_max_retries)
             executor.hydrate_planned_position(position, manifest["id"])
             instances.append(executor)
         for (connector_name, base), amount in required_base.items():
@@ -837,9 +852,11 @@ class ExecutorOrchestrator:
                 for order in (executor_info.custom_info or {}).get("execution_order_snapshots", [])
                 for trade_id in order.get("order_fills", {})}
 
-    def _executor_accounted_fill_keys(self) -> Set[Tuple[str, str, str, str]]:
+    def _executor_accounted_fill_keys(self, *, controller_ids: Optional[Set[str]] = None) -> Set[Tuple[str, str, str, str]]:
         keys = set(self._non_hold_fill_ids)
-        for executors in self.active_executors.values():
+        for controller_id, executors in self.active_executors.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             for executor in executors:
                 info = executor.executor_info
                 if info.is_done and self._has_single_attempt_receipts(info):
@@ -864,9 +881,11 @@ class ExecutorOrchestrator:
         return {(executor_info.connector_name, executor_info.trading_pair, str(order_id))
                 for order_id in order_ids if order_id}
 
-    def _executor_owned_order_keys(self) -> Set[Tuple[str, str, str]]:
+    def _executor_owned_order_keys(self, *, controller_ids: Optional[Set[str]] = None) -> Set[Tuple[str, str, str]]:
         owned = set(self._non_hold_order_ids)
-        for executors in self.active_executors.values():
+        for controller_id, executors in self.active_executors.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             for executor in executors:
                 info = executor.executor_info
                 if (info.type == "order_executor" or (info.is_done and info.close_type == CloseType.POSITION_HOLD)
@@ -959,9 +978,11 @@ class ExecutorOrchestrator:
         return (owner is not None and entry.executor_id == owner.id and entry.order_side == "SELL"
                 and entry.position_side in (None, "", "None"))
 
-    def _wallet_sale_owners(self):
+    def _wallet_sale_owners(self, *, controller_ids: Optional[Set[str]] = None):
         owners = {}
         for controller in self.strategy.controllers:
+            if controller_ids is not None and controller not in controller_ids:
+                continue
             infos = {info.id: info for info in self.stored_executors.get(controller, [])}
             infos.update({executor.executor_info.id: executor.executor_info
                           for executor in self.active_executors.get(controller, [])})
@@ -980,25 +1001,34 @@ class ExecutorOrchestrator:
         trade_fills: List[TradeFill],
         ledger_entries=None,
         *,
+        controller_ids: Optional[Set[str]] = None,
         check_existing=True,
         config_file_path=None,
     ) -> Tuple[Set[Tuple[str, str, str]], Dict[Tuple[str, str, str], PositionHold]]:
         """Build atomically from exact receipts; legacy rows can only corroborate ledger truth."""
         controller_by_pair, ambiguous = self._controller_ids_by_market_pair()
-        owned_orders = self._executor_owned_order_keys()
-        accounted_fills = self._executor_accounted_fill_keys()
+        selected_pairs = {(getattr(getattr(c, "config", c), "connector_name", None),
+                           getattr(getattr(c, "config", c), "trading_pair", None))
+                          for cid, c in self.strategy.controllers.items()
+                          if controller_ids is None or cid in controller_ids}
+        owned_orders = self._executor_owned_order_keys(controller_ids=controller_ids)
+        accounted_fills = self._executor_accounted_fill_keys(controller_ids=controller_ids)
         groups, ledger_by_order, positions = {}, {}, {}
         wallet_sales, wallet_amounts = {}, {}
         owned_scopes = {(controller, position.connector_name, position.trading_pair)
-                        for controller, held in self.positions_held.items() for position in held}
+                        for controller, held in self.positions_held.items() for position in held
+                        if controller_ids is None or controller in controller_ids}
         try:
-            wallet_owners = self._wallet_sale_owners()
+            wallet_owners = self._wallet_sale_owners(controller_ids=controller_ids)
             for fill in sorted(trade_fills, key=lambda fill: (fill.timestamp, fill.order_id, str(fill.exchange_trade_id))):
                 pair = (fill.market, fill.symbol)
+                if controller_ids is not None and pair not in selected_pairs:
+                    continue
                 if pair in ambiguous:
                     raise ValueError("Ambiguous fill ownership")
                 controller = controller_by_pair.get(pair)
-                if (controller is None or controller in self.initial_positions_by_controller
+                if (controller is None or (controller_ids is not None and controller not in controller_ids)
+                        or controller in self.initial_positions_by_controller
                         or "_perpetual" in fill.market or fill.symbol not in self.strategy.markets.get(fill.market, set())):
                     continue
                 key = (controller, fill.market, fill.symbol, fill.order_id)
@@ -1024,7 +1054,8 @@ class ExecutorOrchestrator:
             for entry in ledger_entries or []:
                 pair = (entry.connector_name, entry.trading_pair)
                 controller = controller_by_pair.get(pair)
-                if (controller is None or controller in self.initial_positions_by_controller
+                if (controller is None or (controller_ids is not None and controller not in controller_ids)
+                        or controller in self.initial_positions_by_controller
                         or "_perpetual" in entry.connector_name):
                     continue
                 if controller != entry.controller_id or entry.position_side not in (None, "", "None"):
@@ -1041,6 +1072,8 @@ class ExecutorOrchestrator:
                 raise ValueError("Native fills omit exact ledger orders")
             # Include flat histories: absence of a position summary is not proof of no prior fills.
             for controller, held in (self.positions_held.items() if check_existing else []):
+                if controller_ids is not None and controller not in controller_ids:
+                    continue
                 if controller in self.initial_positions_by_controller:
                     continue
                 for position in held:
@@ -1116,20 +1149,27 @@ class ExecutorOrchestrator:
                         if not observed.is_finite() or observed != wallet_amounts.get(owner.id, Decimal("0")):
                             raise ValueError("Wallet sale native fills omit recorded execution")
             for scope, previous_sales in self._wallet_sale_receipts.items():
+                if controller_ids is not None and scope[0] not in controller_ids:
+                    continue
                 current = {(sale["order_id"], sale["trade_id"]): sale for sale in wallet_sales.get(scope, [])}
                 if any(current.get((sale["order_id"], sale["trade_id"])) != sale for sale in previous_sales):
                     raise ValueError("Previously observed wallet sale receipts changed or disappeared")
             for summary in self._wallet_sale_position_summaries:
+                if controller_ids is not None and summary.controller_id not in controller_ids:
+                    continue
                 scope = (summary.controller_id, summary.connector_name, summary.trading_pair)
                 validate_wallet_sale_summary(summary, wallet_sales.get(scope, []))
             if any(position.buy_amount_base < position.sell_amount_base for position in positions.values()):
                 raise ValueError("Spot fill history produces unowned negative inventory")
         except (ValueError, TypeError, KeyError, ArithmeticError) as error:
             raise RuntimeError(f"Held inventory reconciliation unavailable: {error}") from error
-        self._wallet_sale_receipts = deepcopy(wallet_sales)
+        retained = {} if controller_ids is None else {
+            scope: sales for scope, sales in self._wallet_sale_receipts.items() if scope[0] not in controller_ids}
+        self._wallet_sale_receipts = retained
+        self._wallet_sale_receipts.update(deepcopy(wallet_sales))
         return set(positions) | set(wallet_sales), positions
 
-    def _reconcile_positions_from_trade_fills(self):
+    def _reconcile_positions_from_trade_fills(self, *, controller_ids: Optional[Set[str]] = None):
         try:
             markets_recorder = MarketsRecorder.get_instance()
         except TypeError:
@@ -1143,8 +1183,8 @@ class ExecutorOrchestrator:
             raise RuntimeError("Held inventory reconciliation unavailable: native fill read failed") from e
         ledger_entries = markets_recorder.get_all_position_hold_ledger_entries()
         seen_market_pairs, reconciled_positions = self._build_reconciled_positions_from_trade_fills(
-            trade_fills, ledger_entries, config_file_path=config_file_path)
-        self._recover_completed_wallet_sales(markets_recorder, ledger_entries)
+            trade_fills, ledger_entries, config_file_path=config_file_path, controller_ids=controller_ids)
+        self._recover_completed_wallet_sales(markets_recorder, ledger_entries, controller_ids=controller_ids)
         for controller_id, connector_name, trading_pair in seen_market_pairs:
             positions = self.positions_held.setdefault(controller_id, [])
             existing_position = self._find_existing_position(
@@ -1178,13 +1218,15 @@ class ExecutorOrchestrator:
                     )
             self.positions_held[controller_id] = positions
 
-    def _recover_completed_wallet_sales(self, recorder, ledger_entries):
+    def _recover_completed_wallet_sales(self, recorder, ledger_entries, *, controller_ids: Optional[Set[str]] = None):
         """Resolve only fully filled saved wallet sellers using immutable local execution receipts."""
         recovered = []
         ledger = {(entry.controller_id, entry.connector_name, entry.trading_pair, entry.client_order_id): entry
                   for entry in ledger_entries}
         try:
             for controller_id, infos in self.stored_executors.items():
+                if controller_ids is not None and controller_id not in controller_ids:
+                    continue
                 for info in infos:
                     if info.is_done or not self._is_unknown_wallet_sale(info):
                         continue
@@ -1354,13 +1396,15 @@ class ExecutorOrchestrator:
         # Clear executors and trigger garbage collection
         self.active_executors.clear()
 
-    def store_all_positions(self, *, clear: bool = True, strict: bool = False):
+    def store_all_positions(self, *, clear: bool = True, strict: bool = False, controller_ids: Optional[Set[str]] = None):
         """
         Store or update all positions in the database.
         """
-        self._update_positions_from_done_executors()
+        self._update_positions_from_done_executors(controller_ids=controller_ids)
         markets_recorder = MarketsRecorder.get_instance()
         for controller_id, positions_list in self.positions_held.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             if controller_id is None:
                 if strict and positions_list:
                     raise ValueError("Cannot reconcile held positions without controller identity")
@@ -1410,18 +1454,24 @@ class ExecutorOrchestrator:
 
         # Clear all positions after storing (avoid modifying list while iterating)
         if clear:
-            self.positions_held.clear()
+            if controller_ids is None:
+                self.positions_held.clear()
+            else:
+                for controller_id in controller_ids:
+                    self.positions_held.pop(controller_id, None)
 
-    def sync_live_positions_to_db(self):
+    def sync_live_positions_to_db(self, *, controller_ids: Optional[Set[str]] = None):
         """
         Mirror the current in-memory held positions into the database without clearing them.
         This keeps SQLite closer to live runtime state while preserving the existing shutdown flow.
         """
-        self._update_positions_from_done_executors()
+        self._update_positions_from_done_executors(controller_ids=controller_ids)
         markets_recorder = MarketsRecorder.get_instance()
         live_position_keys: Set[Tuple[str, str, str, str]] = set()
 
         for controller_id, positions_list in self.positions_held.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             if controller_id is None:
                 continue
             for position in positions_list:
@@ -1461,6 +1511,8 @@ class ExecutorOrchestrator:
                 markets_recorder.update_or_store_position(position_record)
 
         for controller_id in self.strategy.controllers.keys():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             for db_position in markets_recorder.get_positions_by_controller(controller_id):
                 position_key = (
                     controller_id,
@@ -1487,8 +1539,10 @@ class ExecutorOrchestrator:
                     )
                 )
 
-    def store_all_executors(self, *, clear: bool = True):
+    def store_all_executors(self, *, clear: bool = True, controller_ids: Optional[Set[str]] = None):
         for controller_id, executors_list in self.active_executors.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             for executor in executors_list:
                 # Store the executor in the database
                 MarketsRecorder.get_instance().store_or_update_executor(executor)
@@ -1498,20 +1552,26 @@ class ExecutorOrchestrator:
                     self._record_stored_executor(controller_id, executor.executor_info)
         # Remove the executors from the list
         if clear:
-            self.active_executors = {}
+            if controller_ids is None:
+                self.active_executors = {}
+            else:
+                for controller_id in controller_ids:
+                    self.active_executors.pop(controller_id, None)
 
-    def sync_live_executors_to_db(self):
+    def sync_live_executors_to_db(self, *, controller_ids: Optional[Set[str]] = None):
         """
         Mirror active and recently finished executors into the database without mutating the in-memory sets.
         """
-        for executors_list in self.active_executors.values():
+        for controller_id, executors_list in self.active_executors.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             for executor in executors_list:
                 MarketsRecorder.get_instance().store_or_update_executor(executor)
                 self._persist_position_hold_entries_from_executor_info(executor.executor_info)
 
-    def sync_live_state_to_db(self):
-        self.sync_live_positions_to_db()
-        self.sync_live_executors_to_db()
+    def sync_live_state_to_db(self, *, controller_ids: Optional[Set[str]] = None):
+        self.sync_live_positions_to_db(controller_ids=controller_ids)
+        self.sync_live_executors_to_db(controller_ids=controller_ids)
 
     def execute_action(self, action: ExecutorAction):
         """
@@ -1562,15 +1622,8 @@ class ExecutorOrchestrator:
 
         if getattr(self.strategy, "_is_stop_triggered", False) is True:
             raise RuntimeError("Strategy is stopping; new execution is blocked")
-        controller = self.strategy.controllers.get(controller_id)
-        if controller is not None:
-            if getattr(self.strategy, "_controller_reports_valid", None) is False:
-                raise RuntimeError("Current execution reports are unavailable")
-            controller.executors_info = self.get_executors_report().get(controller_id, [])
-            validator = getattr(controller, "validate_executor_config", None)
-            if validator is not None and not validator(executor_config):
-                self.logger().warning(f"Rejected executor {executor_config.id}: current controller gates do not permit execution")
-                return
+        # Check transient account availability before a controller can persist a
+        # funded intent. A normal cash shortage must not create an orphan claim.
         if getattr(executor_config, 'connector_name', None) == 'okx':
             owned = {key[2] for executors in self.active_executors.values() for executor in executors
                      for key in self._owned_order_keys(executor.executor_info)}
@@ -1578,7 +1631,25 @@ class ExecutorOrchestrator:
                        if order.trading_pair == executor_config.trading_pair and oid not in owned]
             if unknown:
                 raise RuntimeError(f'Unowned OKX orders require reconciliation: {unknown}')
-        self._validate_okx_wallet_reservation(executor_config)
+        self._validate_okx_wallet_reservation(executor_config, controller_id=controller_id)
+        controller = self.strategy.controllers.get(controller_id)
+        if controller is not None:
+            if getattr(self.strategy, "_controller_reports_valid", None) is False:
+                raise RuntimeError("Current execution reports are unavailable")
+            peers = getattr(controller, '_funding_peers', None)
+            report_ids = {peer.config.id for peer in peers} if isinstance(peers, tuple) and peers else {controller_id}
+            reports = self.get_executors_report(controller_ids=report_ids)
+            if isinstance(peers, tuple) and peers:
+                for peer in peers:
+                    if self.strategy.controllers.get(peer.config.id) is not peer:
+                        raise RuntimeError('Funding owner identity changed; reconciliation required')
+                    peer.executors_info = reports.get(peer.config.id, [])
+            else:
+                controller.executors_info = reports.get(controller_id, [])
+            validator = getattr(controller, "validate_executor_config", None)
+            if validator is not None and not validator(executor_config):
+                self.logger().warning(f"Rejected executor {executor_config.id}: current controller gates do not permit execution")
+                return
         executor_config.controller_id = controller_id
 
         executor_class = self._resolve_executor_class(controller_id, executor_config)
@@ -1601,13 +1672,21 @@ class ExecutorOrchestrator:
             self._executor_start(executor)
         self.logger().debug(f"Created {type(executor).__name__} for controller {controller_id}")
 
-    def _validate_okx_wallet_reservation(self, config):
+    def _validate_okx_wallet_reservation(self, config, *, controller_id=None):
         if getattr(config, "connector_name", None) != "okx" or config.type not in {"position_executor", "order_executor"}:
             return
         base, quote = config.trading_pair.split("-")
         asset = quote if config.side == TradeType.BUY else base
         connector = self.strategy.connectors[config.connector_name]
         available = Decimal(str(connector.get_available_balance(asset)))
+
+        def funded_multiplier(owner_id):
+            from hummingbot.strategy_v2.controllers.native_policy_identity import is_modular_policy
+            owner = self.strategy.controllers.get(owner_id)
+            policy = getattr(getattr(owner, 'config', None), 'funding', None)
+            if owner is not None and is_modular_policy(owner.config) and policy is not None:
+                return Decimal('1') + policy.fee_reserve_fraction
+            return Decimal('1')
         pending = Decimal("0")
         for executors in self.active_executors.values():
             for executor in executors:
@@ -1632,6 +1711,7 @@ class ExecutorOrchestrator:
                     if price is None:
                         raise RuntimeError("Pending order has no reservable price")
                     remaining *= Decimal(str(price))
+                    remaining *= funded_multiplier(other.controller_id)
                 pending += max(Decimal("0"), remaining)
         required = Decimal(str(config.amount))
         if config.side == TradeType.BUY:
@@ -1639,6 +1719,7 @@ class ExecutorOrchestrator:
             if price is None:
                 raise RuntimeError("New order has no reservable price")
             required *= Decimal(str(price))
+            required *= funded_multiplier(controller_id or config.controller_id)
         if not all(value.is_finite() for value in (available, pending, required)) or required <= 0 or required + pending > available:
             raise RuntimeError(f"Insufficient unreserved {asset}: required={required}, pending={pending}, available={available}")
 
@@ -1665,12 +1746,14 @@ class ExecutorOrchestrator:
             return
         executor.early_stop(action.keep_position)
 
-    def _update_positions_from_done_executors(self):
+    def _update_positions_from_done_executors(self, *, controller_ids: Optional[Set[str]] = None):
         """
         Update positions from executors that are done but haven't been processed yet.
         This is called before generating reports to ensure position state is current.
         """
         for controller_id, executors_list in self.active_executors.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             # Filter executors that need position updates
             executors_to_process = [
                 executor for executor in executors_list
@@ -1763,13 +1846,15 @@ class ExecutorOrchestrator:
         del executor
         # Trigger garbage collection after executor cleanup
 
-    def get_executors_report(self) -> Dict[str, List[ExecutorInfo]]:
+    def get_executors_report(self, *, controller_ids: Optional[Set[str]] = None) -> Dict[str, List[ExecutorInfo]]:
         """
         Generate a report of all executors.
         """
         report = {}
-        controller_ids = set(list(self.active_executors.keys()) + list(self.stored_executors.keys()))
-        for controller_id in controller_ids:
+        selected_ids = set(self.active_executors) | set(self.stored_executors)
+        if controller_ids is not None:
+            selected_ids &= controller_ids
+        for controller_id in selected_ids:
             active_executors = [executor.executor_info for executor in self.active_executors.get(controller_id, []) if executor]
             active_executor_ids = {executor.id for executor in active_executors}
             stored_executors = [
@@ -1792,12 +1877,14 @@ class ExecutorOrchestrator:
                 report[controller_id].append(info)
         return report
 
-    def get_positions_report(self) -> Dict[str, List[PositionSummary]]:
+    def get_positions_report(self, *, controller_ids: Optional[Set[str]] = None) -> Dict[str, List[PositionSummary]]:
         """
         Generate a report of all positions held.
         """
         report = {}
         for controller_id, positions_list in self.positions_held.items():
+            if controller_ids is not None and controller_id not in controller_ids:
+                continue
             positions_summary = []
             for position in positions_list:
                 mid_price = self.strategy.market_data_provider.get_price_by_type(
@@ -1808,25 +1895,32 @@ class ExecutorOrchestrator:
             report[controller_id] = positions_summary
         return report
 
-    def get_all_reports(self) -> Dict[str, Dict]:
+    def get_all_reports(self, *, controller_ids: Optional[Set[str]] = None) -> Dict[str, Dict]:
         """
-        Generate a unified report containing executors, positions, and performance for all controllers.
-        Returns a dictionary with controller_id as key and a dict containing all reports as value.
+        Generate native reports for all owners, or only explicitly selected owners.
+
+        Scoped calls never mark or persist an excluded owner. Their previous native
+        records remain intact; the caller must expose excluded valuation as unavailable.
+        An empty scope selects nobody, while None preserves the all-owner behavior.
         """
         if self._planned_resume_pending:
             raise RuntimeError("Planned position resume pending; reports unavailable until ownership is established")
+        scope = {} if controller_ids is None else {"controller_ids": controller_ids}
         # Update any pending position holds from done executors
-        self._update_positions_from_done_executors()
-        self._reconcile_positions_from_trade_fills()
+        self._update_positions_from_done_executors(**scope)
+        self._reconcile_positions_from_trade_fills(**scope)
 
         # Generate all reports
-        executors_report = self.get_executors_report()
-        positions_report = self.get_positions_report()
+        executors_report = self.get_executors_report(**scope)
+        positions_report = self.get_positions_report(**scope)
 
         # Get all controller IDs
         all_controller_ids = set(list(self.active_executors.keys()) +
                                  list(self.positions_held.keys()) +
                                  list(self.cached_performance.keys()))
+
+        if controller_ids is not None:
+            all_controller_ids &= controller_ids
 
         # Use dict comprehension to compile reports for each controller
         return {

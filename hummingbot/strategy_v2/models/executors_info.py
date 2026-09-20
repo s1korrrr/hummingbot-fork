@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, field_validator
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
@@ -23,7 +23,7 @@ class ExecutorInfo(BaseModel):
     timestamp: float
     type: str
     status: RunnableStatus
-    config: AnyExecutorConfig = Field(..., discriminator="type")
+    config: SerializeAsAny[AnyExecutorConfig] = Field(..., discriminator="type")
     net_pnl_pct: Optional[Decimal]
     net_pnl_quote: Optional[Decimal]
     cum_fees_quote: Decimal
@@ -35,6 +35,14 @@ class ExecutorInfo(BaseModel):
     close_type: Optional[CloseType] = None
     controller_id: Optional[str] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @field_validator('config', mode='before')
+    @classmethod
+    def restore_native_position_subtype(cls, value):
+        if isinstance(value, dict) and value.get('type') == 'position_executor' and 'entry_acquisition_policy' in value:
+            from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
+            return parse_position_config(value)
+        return value
 
     @property
     def is_done(self):

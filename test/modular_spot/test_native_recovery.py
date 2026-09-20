@@ -1,7 +1,6 @@
 """Native recovery holds. Planned resume is refused until the owner path selects ModularPositionExecutor."""
 import asyncio
 import importlib.util
-import inspect
 import json
 from decimal import Decimal as D
 from types import SimpleNamespace as NS
@@ -98,11 +97,10 @@ def test_config_change_with_open_position_holds_without_resetting_trailing(recor
     assert loaded.claims == (executor.config.id,)
 
 
-def test_orchestrator_planned_resume_constructs_base_executor_not_the_specialization():
-    src = inspect.getsource(ExecutorOrchestrator._claim_planned_positions)
-    assert 'PositionExecutor(' in src
-    assert '_resolve_executor_class' not in src
-    assert 'get_executor_class_for_config' not in src
+def test_generic_planned_resume_keeps_base_executor_without_requesting_new_entry_grant():
+    # This generic recipe remains unsupported by its native binding guard.
+    # A direct native manifest does not gain a controller entry-factory grant;
+    # genuine down-only specialization has separate native resume coverage.
 
     cfg = native_config(config(), identifier='resume-1', timestamp=100, price=D('100'), amount=D('1'),
                         cycle=0, stage=0)

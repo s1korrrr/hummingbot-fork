@@ -3,7 +3,7 @@ import time
 from decimal import Decimal
 from typing import Dict, List, Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.connector_base import ConnectorBase
@@ -21,8 +21,9 @@ class V2WithControllersConfig(StrategyV2ConfigBase):
     script_file_name: str = os.path.basename(__file__)
     max_global_drawdown_quote: Optional[float] = None
     max_controller_drawdown_quote: Optional[float] = None
+    max_daily_loss_quote: Optional[Decimal] = Field(default=None, gt=0, allow_inf_nan=False)
 
-    @field_validator('max_global_drawdown_quote', 'max_controller_drawdown_quote', mode='before')
+    @field_validator('max_global_drawdown_quote', 'max_controller_drawdown_quote', 'max_daily_loss_quote', mode='before')
     @classmethod
     def reject_boolean_limits(cls, value):
         if isinstance(value, bool):
@@ -56,6 +57,8 @@ class V2WithControllers(StrategyV2Base):
     def __init__(self, connectors: Dict[str, ConnectorBase], config: V2WithControllersConfig):
         super().__init__(connectors, config)
         self.config = config
+        from controllers.generic.modular_spot_core.native_funding import bind_funding_scope
+        self._funding_scope_owners = bind_funding_scope(self.controllers)
         self.max_pnl_by_controller = {}
         self.max_global_pnl = Decimal("0")
         self.drawdown_exited_controllers = []
@@ -68,6 +71,7 @@ class V2WithControllers(StrategyV2Base):
         self._operator_watermarks = {}
         self._last_risk_state = None
         self._risk_reconciliation_error: Optional[str] = None
+        self._daily_entry_risk = None
         if self._risk_persistence_enabled:
             try:
                 self._validate_modular_loss_limits()
@@ -96,6 +100,15 @@ class V2WithControllers(StrategyV2Base):
                         self.controllers[cid].set_operator_entry_pause(paused, reason='restored', scope='bot')
                     for cid in self.drawdown_exited_controllers:
                         self.controllers[cid].stop()
+                if (state is not None and state.get('daily_entry_risk') is not None
+                        and self.config.max_daily_loss_quote is None):
+                    raise ValueError('Persisted daily loss limit was removed; explicit reconciliation required')
+                if self.config.max_daily_loss_quote is not None:
+                    from hummingbot.strategy_v2.models.daily_entry_risk import DailyEntryRisk
+                    self._daily_entry_risk = (DailyEntryRisk.new(self.config.max_daily_loss_quote, time.time())
+                                              if state is None else DailyEntryRisk.restore(
+                                                  state.get('daily_entry_risk'), self.config.max_daily_loss_quote))
+                    self._apply_daily_entry_pause()
                 self._persist_risk_state()
             except Exception as error:
                 self._is_stop_triggered = True
@@ -116,6 +129,8 @@ class V2WithControllers(StrategyV2Base):
                  'operator_paused': {cid: bool(getattr(c, '_operator_entry_paused', False)) for cid, c in self.controllers.items()}}
         if getattr(self, '_operator_watermarks', {}):
             state['operator_watermarks'] = self._operator_watermarks.copy()
+        if self._daily_entry_risk is not None:
+            state['daily_entry_risk'] = self._daily_entry_risk.snapshot()
         if state != self._last_risk_state or operator_receipts:
             recorder = MarketsRecorder.get_instance()
             if operator_receipts:
@@ -130,11 +145,18 @@ class V2WithControllers(StrategyV2Base):
             self._is_stop_triggered = True
             return False
         try:
+            if self._funding_scope_owners and (
+                    set(self.controllers) != {owner.config.id for owner in self._funding_scope_owners}
+                    or any(self.controllers.get(owner.config.id) is not owner for owner in self._funding_scope_owners)):
+                raise ValueError('Funded controller topology changed; restart and reconcile explicitly')
             self.process_operator_events()
             self.check_manual_kill_switch()
             self.control_max_drawdown()
+            self._observe_daily_entry_risk()
             self._persist_risk_state()
-            return not self._is_stop_triggered and action.controller_id not in self.drawdown_exited_controllers
+            buying = getattr(getattr(action, 'executor_config', None), 'side', TradeType.BUY) == TradeType.BUY
+            daily_block = self._daily_entry_risk is not None and self._daily_entry_risk.paused and buying
+            return not daily_block and not self._is_stop_triggered and action.controller_id not in self.drawdown_exited_controllers
         except Exception:
             self._is_stop_triggered = True
             self.logger().exception('Risk check or persistence failed; new execution blocked')
@@ -156,12 +178,33 @@ class V2WithControllers(StrategyV2Base):
         if not self._is_stop_triggered and not self.executor_orchestrator._planned_resume_pending:
             self.check_manual_kill_switch()
             self.control_max_drawdown()
+            self._observe_daily_entry_risk()
             self.send_performance_report()
         try:
             self._persist_risk_state()
         except Exception:
             self._is_stop_triggered = True
             self.logger().exception('Unable to persist risk state; new execution blocked')
+
+    def _apply_daily_entry_pause(self):
+        if self._daily_entry_risk is not None and self._daily_entry_risk.paused:
+            for controller in self.controllers.values():
+                if not getattr(controller, '_operator_entry_paused', False):
+                    controller.set_operator_entry_pause(True, reason='daily-loss-limit', scope='global')
+
+    def _observe_daily_entry_risk(self):
+        if self._daily_entry_risk is None:
+            return
+        values = [self._drawdown_pnl(cid) for cid in self.controllers]
+        if any(value is None for value in values):
+            raise ValueError('Native PnL unavailable for daily entry risk')
+        self._daily_entry_risk.observe(time.time(), sum(values, Decimal('0')))
+        self._apply_daily_entry_pause()
+
+    def _build_runtime_status_snapshot(self):
+        result = super()._build_runtime_status_snapshot()
+        result['daily_entry_risk'] = self._daily_entry_risk.snapshot() if self._daily_entry_risk is not None else None
+        return result
 
     def _validate_operator_watermarks(self, watermarks):
         if not isinstance(watermarks, dict) or not set(watermarks).issubset(self.controllers):
@@ -228,6 +271,14 @@ class V2WithControllers(StrategyV2Base):
             if not self._native_operator_command_is_fresh(payload, target_controllers):
                 self.logger().warning('Rejected stale, duplicate or incorrectly addressed native operator command')
                 continue
+            if action in {'global_resume_entries', 'bot_resume_entries'} and self._daily_entry_risk is not None:
+                self._observe_daily_entry_risk()
+                if self._daily_entry_risk.paused:
+                    if (action != 'global_resume_entries' or controller_id is not None
+                            or not self._daily_entry_risk.acknowledge(time.time(), self._daily_entry_risk.last_pnl_quote)):
+                        self._persist_risk_state()
+                        self.logger().warning('Daily loss entry pause requires global acknowledgement after UTC rollover')
+                        continue
             if action in {"global_pause_entries", "bot_pause_entries"}:
                 scope = "global" if action == "global_pause_entries" else "bot"
                 for controller in target_controllers:
@@ -286,6 +337,9 @@ class V2WithControllers(StrategyV2Base):
         limits = [Decimal(str(value)) for value in limits]
         if any(not value.is_finite() or value <= 0 for value in limits) or limits[1] > limits[0]:
             raise ValueError('Native modular loss limits must be finite, positive and controller <= global')
+        if (self._daily_entry_risk is not None
+                and self.config.max_daily_loss_quote != self._daily_entry_risk.limit_quote):
+            raise ValueError('Daily loss limit changed; explicit reconciliation required')
 
     def control_max_drawdown(self):
         self._validate_modular_loss_limits()

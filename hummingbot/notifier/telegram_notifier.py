@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import stat
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -131,6 +132,11 @@ class TelegramNotifier(NotifierBase):
         if not self._config.telegram_chat_id:
             self.logger().warning("Skipping Telegram notification because telegram_chat_id is not bound yet.")
             return
+        if os.environ.get("HB_TELEGRAM_OWNER_LABEL_ENABLED") == "1":
+            owner = self._hb_app.instance_id
+            if not isinstance(owner, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", owner) is None:
+                raise ValueError("Outgoing Telegram owner label requires a valid native instance ID")
+            message = f"[{owner}]\n{message}"
         await self._send_telegram_text(message)
 
     async def _send_telegram_text(self, message: str):

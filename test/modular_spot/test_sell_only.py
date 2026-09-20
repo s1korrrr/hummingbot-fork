@@ -34,6 +34,7 @@ from controllers.generic.modular_spot_core.sell_only import (  # noqa: E402
     propose_reduction,
 )
 from controllers.generic.modular_spot_core.state import DecisionState  # noqa: E402
+from hummingbot.connector.markets_recorder import MarketsRecorder  # noqa: E402
 from hummingbot.connector.trading_rule import TradingRule  # noqa: E402
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType  # noqa: E402
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate  # noqa: E402
@@ -204,9 +205,18 @@ def orchestrator_for(controller):
         sql_manager=NS(db_path=None), get_all_executors=lambda: [], get_all_positions=lambda: [],
         get_all_position_hold_ledger_entries=lambda: [], get_trades_for_config=lambda *a, **k: [],
         config_file_path='modular.yml', store_or_update_executor=lambda executor: None)
-    with patch('hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder') as markets:
-        markets.get_instance.return_value = stub
-        yield ExecutorOrchestrator(strategy=strategy), strategy
+    previous = MarketsRecorder._shared_instance
+    try:
+        with patch('hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder') as markets:
+            markets.get_instance.return_value = stub
+            yield ExecutorOrchestrator(strategy=strategy), strategy
+    finally:
+        current = MarketsRecorder._shared_instance
+        try:
+            if current is not None and current is not previous:
+                current.stop()
+        finally:
+            MarketsRecorder._shared_instance = previous
 
 
 def test_native_order_executor_is_limit_reduce_not_short_position():
@@ -498,7 +508,11 @@ def test_granted_reduce_passes_validate_and_create_executor():
         id='unfloored-gate', timestamp=1200, controller_id=controller.config.id, connector_name='okx',
         trading_pair='A-USDC', side=TradeType.SELL, amount=D('1'), price=D('110'),
         position_action=PositionAction.CLOSE, execution_strategy=ExecutionStrategy.LIMIT, leverage=1)
-    with orchestrator_for(controller) as (orchestrator, _):
+    with orchestrator_for(controller) as (orchestrator, strategy):
+        # This tests the controller intent gate after wallet admission; provide
+        # enough quote for the deliberately invalid 100-USDC BUY intent.
+        strategy.connectors['okx'].get_available_balance.side_effect = lambda asset: D('200') if asset == 'USDC' else D('10')
+
         def rejected(config, *, pending=True):
             if pending:
                 rt.pending[config.id] = config.model_copy(deep=True)

@@ -888,6 +888,27 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(2, len(attempts))
         self.assertEqual([notifier.COMMAND_LOOP_RETRY_DELAY], sleep_delays)
 
+    async def test_outgoing_owner_prefix_is_opt_in_and_does_not_enable_commands(self):
+        from unittest.mock import AsyncMock
+
+        from hummingbot.notifier.notifier_base import NotifierBase
+
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._config.telegram_commands_enabled = False
+        notifier._send_telegram_text = AsyncMock()
+        notifier._run_command_loop = AsyncMock()
+        with patch.dict(os.environ, {"HB_TELEGRAM_OWNER_LABEL_ENABLED": "1"}), patch.object(NotifierBase, 'start'):
+            notifier.start()
+            await notifier._send_message('BUY filled')
+            notifier._send_telegram_text.assert_awaited_once_with('[instance-1]\nBUY filled')
+            notifier._run_command_loop.assert_not_called()
+            self.assertIsNone(notifier._command_task)
+            self.assertFalse(notifier._command_menu_published)
+        notifier._send_telegram_text.reset_mock()
+        with patch.dict(os.environ, {"HB_TELEGRAM_OWNER_LABEL_ENABLED": "0"}):
+            await notifier._send_message('legacy notification')
+            notifier._send_telegram_text.assert_awaited_once_with('legacy notification')
+
     async def test_conflict_suspends_polling_without_stopping_notifications(self):
         from unittest.mock import AsyncMock
 

@@ -156,3 +156,22 @@ def test_public_native_action_path_preserves_policy(profile, recorder):
     native_config, native = next(row[3:] for row in FAMILIES if row[0] == profile)
     test_actual_native_create_action_path_matches(
         profile, config_class, config_class(**payload(profile)).get_controller_class(), native_config, native, recorder)
+
+
+@pytest.mark.parametrize('profile', ['ok_rsi', 'rsi_v5'])
+def test_native_observation_publishes_genuine_config_profile(profile):
+    from test_native_composition import provider
+
+    from controllers.generic.rsi_modular import get_config_class
+    from hummingbot.strategy.native_observability import controller_observation
+    config = get_config_class(profile)(**payload(profile))
+    owner = config.get_controller_class()(config, provider(), asyncio.Queue())
+    wrong = 'rsi_v5' if profile == 'ok_rsi' else 'ok_rsi'
+    owner.get_custom_info = lambda: {'controller_name': 'forged', 'profile': wrong,
+                                     'modular_composition': {'controller_name': 'forged', 'profile': wrong}}
+    result = controller_observation({'controller': owner, 'controller_id': config.id,
+                                     'summary': {'controller_name': 'forged', 'profile': wrong}})
+    assert result['controller_name'] == 'rsi_modular'
+    assert result['profile'] == profile
+    assert result['controller_id'] == config.id
+    assert result['observation_status'] == 'available'

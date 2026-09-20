@@ -49,6 +49,8 @@ def remaining(total, filled):
 def controller_observation(entry):
     controller = entry['controller']
     result = {'controller_id': entry['controller_id'],
+              'controller_name': getattr(controller.config, 'controller_name', None),
+              'profile': getattr(controller.config, 'profile', None),
               'connector_name': getattr(controller.config, 'connector_name', None),
               'custom_info': {}, 'observation_status': 'available'}
     summary = entry.get('summary', {})

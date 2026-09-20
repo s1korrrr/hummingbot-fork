@@ -1,4 +1,5 @@
 """Actual native action -> recorder -> funding -> partial fill/cancel/restart."""
+import asyncio
 import tempfile
 from pathlib import Path
 from test.hummingbot.strategy_v2.paper.test_paper_session import PAIR, D, causal_reversal_frames, config, paper
@@ -52,7 +53,7 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
             finally:
                 await session.close()
 
-    async def test_partial_fill_cancel_restart_retains_unused_commitment_and_native_exits(self):
+    async def test_partial_fill_restart_releases_after_native_shutdown_reconciliation(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / 'paper.sqlite'
             session = NativePaperSession(paper(), [funded_config()], db)
@@ -78,8 +79,8 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                 restored._connector.set_order_book(PAIR, 4, 600061, [(90, 10)], [(90.1, 10)])
                 owner.executors_info = restored.recorder.get_executors_by_controller(owner.config.id)
                 restored_store = NativeFundingStore(owner, restored.recorder)
-                with self.assertRaisesRegex(PolicyError, 'allocation exhausted'):
-                    restored_store.admit(next_config)
+                self.assertTrue(restored_store.admit(next_config))
+                self.assertEqual(restored_store.status['released_intents'], 1)
                 self.assertEqual(restored._connector.get_balance('BTC'), D('.1'))
                 with restored.recorder.sql_manager.get_new_session() as sql, sql.begin():
                     sql.delete(sql.get(Metadata, restored_store.key))
@@ -209,5 +210,135 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                 self.assertTrue(any(fill.trade_type == 'SELL' for fill in fills))
                 self.assertEqual(session._connector.get_balance('BTC'), D('0'))
                 self.assertEqual(len(session.recorder.get_all_executors()), 1)
+            finally:
+                await session.close()
+
+    async def test_terminal_cancel_releases_only_unused_capacity_and_survives_restart(self):
+        for partial in (False, True):
+            with self.subTest(partial=partial), tempfile.TemporaryDirectory() as directory:
+                db = Path(directory) / 'paper.sqlite'
+                session = NativePaperSession(paper(), [funded_config()], db)
+                try:
+                    await self.seed(session)
+                    owner = next(iter(session.controllers.values()))
+                    executor = session.executor_orchestrator.active_executors[owner.config.id][0]
+                    order = executor._open_order.order
+                    if partial:
+                        await session.step(600061, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600061,
+                                                                side=TradeType.SELL, price=order.price, amount=D('.1'))])
+                    session._connector.cancel(PAIR, order.client_order_id)
+                    await session._connector.drain()
+                    owner.executors_info = [executor.executor_info]
+                    store = owner._funding_store
+                    before = store.reconcile()
+                    self.assertEqual(before['released_intents'], 0)  # Local cancel alone cannot release.
+                    self.assertGreater(D(before['pending_quote']), 0)
+                    await executor._request_expired_entry_reconciliation(executor._entry_orders())
+                    owner.executors_info = [executor.executor_info]
+                    after = store.reconcile()
+                    self.assertEqual(after['released_intents'], 1)
+                    self.assertEqual(D(after['pending_quote']), 0)
+                    self.assertGreater(D(after['available_quote']), D(before['available_quote']))
+                    raw, _ = store._load()
+                    self.assertEqual(store.reconcile(), after)
+                    self.assertEqual(store._load()[0], raw)  # Idempotent without new metadata revision.
+                    session.recorder.store_or_update_executor(executor)
+                finally:
+                    await session.close()
+                restored = NativePaperSession(paper(), [funded_config()], db, restore=True)
+                try:
+                    owner = next(iter(restored.controllers.values()))
+                    restored._connector.set_order_book(PAIR, 4, restored._connector.current_timestamp, [(90, 10)], [(90.1, 10)])
+                    owner.executors_info = restored.recorder.get_executors_by_controller(owner.config.id)
+                    result = NativeFundingStore(owner, restored.recorder).reconcile()
+                    self.assertEqual(result['released_intents'], 1)
+                    self.assertEqual(D(result['pending_quote']), 0)
+                    self.assertEqual(restored._connector.get_balance('BTC'), D('.1') if partial else D('0'))
+                finally:
+                    await restored.close()
+
+    async def test_terminal_receipt_rejects_scope_coverage_and_authority_changes(self):
+        import copy
+        for field, value in [('source', 'okx_terminal_status_v1'), ('order_id', 'foreign'),
+                             ('exchange_order_id', 'foreign'), ('filled_base', '.1'),
+                             ('trade_ids', ['missing']), ('side', 'SELL'), ('schema', True)]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                session = NativePaperSession(paper(), [funded_config()], Path(directory) / 'paper.sqlite')
+                try:
+                    await self.seed(session)
+                    owner = next(iter(session.controllers.values()))
+                    executor = session.executor_orchestrator.active_executors[owner.config.id][0]
+                    session._connector.cancel(PAIR, executor._open_order.order_id)
+                    await session._connector.drain()
+                    await executor._request_expired_entry_reconciliation(executor._entry_orders())
+                    executor._entry_reconciliation = copy.deepcopy(executor._entry_reconciliation)
+                    executor._entry_reconciliation[field] = value
+                    owner.executors_info = [executor.executor_info]
+                    with self.assertRaises(PolicyError):
+                        owner._funding_store.reconcile()
+                    self.assertEqual(owner._funding_store._load()[1]['releases'], {})
+                finally:
+                    await session.close()
+
+    async def test_late_fill_after_terminal_proof_blocks_readmission_without_disabling_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [funded_config()], Path(directory) / 'paper.sqlite')
+            try:
+                await self.seed(session)
+                owner = next(iter(session.controllers.values()))
+                executor = session.executor_orchestrator.active_executors[owner.config.id][0]
+                order = executor._open_order.order
+                await session.step(600061, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600061,
+                                                        side=TradeType.SELL, price=order.price, amount=D('.1'))])
+                session._connector.cancel(PAIR, order.client_order_id)
+                await session._connector.drain()
+                await executor._request_expired_entry_reconciliation(executor._entry_orders())
+                owner.executors_info = [executor.executor_info]
+                store = owner._funding_store
+                self.assertEqual(store.reconcile()['released_intents'], 1)
+                await session._connector._fill(order, D('.1'), order.price, True, 'contradictory-late-fill')
+                owner.executors_info = [executor.executor_info]
+                with self.assertRaisesRegex(PolicyError, 'reconciliation scope or quantity'):
+                    store.admit(owner.get_executor_config(TradeType.BUY, D('90'), D('.3')))
+                self.assertFalse(executor.is_closed)
+                self.assertEqual(executor.open_filled_amount, D('.2'))
+                self.assertEqual(len(session.recorder.get_trades_for_config('native-paper-session')), 2)
+                owner._funding_hold = 'Contradictory terminal receipt'
+                for offset in range(10):
+                    timestamp, bid = 600062 + offset, 100 if offset < 6 else 91
+                    await session.step(timestamp, books=[dict(trading_pair=PAIR, sequence=4 + offset,
+                                                              timestamp=timestamp, bids=[(bid, 10)], asks=[(bid + .1, 10)])])
+                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+                self.assertEqual(session._connector.get_balance('BTC'), D('0'), executor.get_custom_info())
+                self.assertTrue(any(fill.trade_type == 'SELL' for fill in session.recorder.get_trades_for_config('native-paper-session')))
+            finally:
+                await session.close()
+
+    async def test_persisted_release_cannot_outlive_missing_native_receipt_or_audit_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [funded_config()], Path(directory) / 'paper.sqlite')
+            try:
+                await self.seed(session)
+                owner = next(iter(session.controllers.values()))
+                executor = session.executor_orchestrator.active_executors[owner.config.id][0]
+                session._connector.cancel(PAIR, executor._open_order.order_id)
+                await session._connector.drain()
+                await executor._request_expired_entry_reconciliation(executor._entry_orders())
+                owner.executors_info = [executor.executor_info]
+                store = owner._funding_store
+                self.assertEqual(store.reconcile()['released_intents'], 1)
+                proof = executor._entry_reconciliation
+                executor._entry_reconciliation = None
+                owner.executors_info = [executor.executor_info]
+                with self.assertRaisesRegex(PolicyError, 'reconciliation scope'):
+                    store.reconcile()
+                executor._entry_reconciliation = proof
+                owner.executors_info = [executor.executor_info]
+                with session.recorder.sql_manager.get_new_session() as sql, sql.begin():
+                    row = sql.query(Metadata).filter(Metadata.key.like(store.key + ':release:%')).one()
+                    sql.delete(row)
+                with self.assertRaisesRegex(PolicyError, 'disappeared or changed'):
+                    store.reconcile()
             finally:
                 await session.close()

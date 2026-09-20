@@ -79,7 +79,7 @@ def _config_identity(config, controller_id):
 class NativeFundingStore:
     """A small durable intent envelope, never an order/fill or balance ledger.
 
-    Unused canceled/rejected intent remains reserved until explicit reconciliation.
+    Unused canceled/rejected intent stays reserved until native terminal reconciliation.
     Neither timeouts nor terminal flags release uncertain late-fill capacity.
     """
 
@@ -104,7 +104,7 @@ class NativeFundingStore:
             raise PolicyError('Funding checkpoint identity/schema changed')
         if raw is None and rows:
             raise PolicyError('Funding checkpoint missing with existing admissions')
-        claims, fills = {}, {}
+        claims, fills, releases = {}, {}, {}
         for row in rows:
             item = json.loads(row.value)
             if not isinstance(item, dict) or item.get('binding') != self.binding:
@@ -124,6 +124,14 @@ class NativeFundingStore:
                 if decimal(claim['fee_fraction'], 'fee reserve') != self.policy.fee_reserve_fraction:
                     raise PolicyError('Funding fee bound changed')
                 claims[key] = claim
+            elif kind == 'release':
+                if set(item) != {'binding', 'executor_id', 'receipt'}:
+                    raise PolicyError('Funding release audit record corrupt')
+                key = item['executor_id']
+                if (not isinstance(key, str) or not key or key in releases
+                        or row.key != self.key + ':release:' + identity(key) or not isinstance(item['receipt'], dict)):
+                    raise PolicyError('Funding release identity corrupt')
+                releases[key] = item['receipt']
             elif kind == 'fill':
                 if set(item) != {'binding', 'fill_key', 'digest'}:
                     raise PolicyError('Funding fill audit record corrupt')
@@ -134,19 +142,33 @@ class NativeFundingStore:
                 fills[key] = digest
             else:
                 raise PolicyError('Unknown funding audit record')
-        if header['audit_sha256'] != identity([sorted(claims.items()), sorted(fills.items())]):
+        state = {**header, 'claims': claims, 'fills': fills, 'releases': releases}
+        if header['audit_sha256'] != self._audit_hash(state):
             raise PolicyError('Funding admission or fill audit records disappeared or changed')
-        return raw, {**header, 'claims': claims, 'fills': fills}
+        if not set(releases).issubset(claims):
+            raise PolicyError('Funding release has no admitted intent')
+        return raw, state
+
+    @staticmethod
+    def _audit_hash(state):
+        # Preserve existing v1 checkpoint hashes until the first release.
+        parts = [sorted(state['claims'].items()), sorted(state['fills'].items())]
+        if state['releases']:
+            parts.append(sorted(state['releases'].items()))
+        return identity(parts)
 
     def _write(self, raw, state):
         header = {'schema': 1, 'binding': self.binding, 'revision': state['revision'] + 1,
-                  'audit_sha256': identity([sorted(state['claims'].items()), sorted(state['fills'].items())])}
+                  'audit_sha256': self._audit_hash(state)}
         encoded = json.dumps(header, sort_keys=True, separators=(',', ':'), allow_nan=False)
         records = [(self.key + ':claim:' + identity(key),
                     {'binding': self.binding, 'executor_id': key, 'claim': claim})
                    for key, claim in state['claims'].items()]
         records.extend((self.key + ':fill:' + key, {'binding': self.binding, 'fill_key': key, 'digest': digest})
                        for key, digest in state['fills'].items())
+        records.extend((self.key + ':release:' + identity(key),
+                        {'binding': self.binding, 'executor_id': key, 'receipt': receipt})
+                       for key, receipt in state['releases'].items())
         try:
             with self.recorder.sql_manager.get_new_session() as session, session.begin():
                 if raw is None:
@@ -169,7 +191,7 @@ class NativeFundingStore:
         except IntegrityError:
             return False
 
-    def _evidence(self, state, raw):
+    def _evidence(self, state, raw, *, reconcile=False):
         config = self.owner.config
         saved = self.recorder.get_all_executors()
         current = list(self.owner.executors_info)
@@ -242,8 +264,78 @@ class NativeFundingStore:
             authorized = decimal(claim['amount'], 'funded amount', positive=True)
             if quantity > authorized:
                 raise PolicyError('Native acquisition exceeds funded quantity')
-            pending += (authorized - quantity) * decimal(claim['price'], 'funded price') * (1 + self.policy.fee_reserve_fraction)
+            released = state['releases'].get(executor_id)
+            receipt = (info.custom_info or {}).get('entry_reconciliation') if info is not None else None
+            if released is not None or (reconcile and receipt is not None):
+                self._validate_release(info, receipt, quantity, fills, orders)
+                if released is not None and released != receipt:
+                    raise PolicyError('Native terminal reconciliation changed after funding release')
+                state['releases'][executor_id] = receipt
+            else:
+                pending += (authorized - quantity) * decimal(claim['price'], 'funded price') * (1 + self.policy.fee_reserve_fraction)
         return projection, pending, infos
+
+    def _validate_release(self, info, receipt, quantity, fills, orders):
+        fields = {'schema', 'source', 'order_id', 'exchange_order_id', 'trading_pair',
+                  'side', 'amount', 'filled_base', 'state', 'trade_ids'}
+        if (info is None or not isinstance(receipt, dict) or set(receipt) != fields
+                or type(receipt['schema']) is not int or receipt['schema'] != 1
+                or (info.config.entry_order_policy != 'single_attempt' and info.is_active)
+                or receipt['trading_pair'] != self.owner.config.trading_pair or receipt['side'] != 'BUY'
+                or decimal(receipt['amount'], 'reconciled amount', positive=True) != info.config.amount
+                or decimal(receipt['filled_base'], 'reconciled filled quantity') != quantity):
+            raise PolicyError('Native terminal reconciliation scope or quantity differs')
+        order_id = receipt['order_id']
+        owned = {key[2] for key in ExecutorOrchestrator._owned_order_keys(info)}
+        if not isinstance(order_id, str) or not order_id or order_id not in owned:
+            raise PolicyError('Native terminal reconciliation order is unowned')
+        rows = [fill for fill in fills if fill.order_id == order_id]
+        if (any(fill.trade_type != 'BUY' for fill in rows)
+                or sum((fill.amount_decimal for fill in rows), ZERO) != quantity
+                or receipt['trade_ids'] != sorted(str(fill.exchange_trade_id) for fill in rows)):
+            raise PolicyError('Native terminal reconciliation trade coverage differs')
+        mode = self.owner.config.execution_mode
+        source = receipt['source']
+        rejected = source == 'okx_submission_rejected_v1'
+        if rejected:
+            valid = mode == 'live' and receipt['state'] == 'REJECTED' and quantity == 0 and receipt['exchange_order_id'] is None
+        else:
+            expected = 'native_paper_terminal_v1' if mode == 'paper' else 'okx_terminal_status_v1'
+            valid = (source == expected and receipt['state'] in {'CANCELED', 'FILLED'}
+                     and isinstance(receipt['exchange_order_id'], str) and bool(receipt['exchange_order_id']))
+        if not valid:
+            raise PolicyError('Native terminal reconciliation authority unavailable')
+        recorded_order = next((order for order in orders if order.id == order_id), None)
+        if not rejected and (recorded_order is None
+                             or recorded_order.exchange_order_id != receipt['exchange_order_id']
+                             or recorded_order.symbol != receipt['trading_pair']
+                             or recorded_order.market != self.owner.config.connector_name):
+            raise PolicyError('Native recorded order conflicts with terminal funding release')
+        # Terminal proof seals a single native submission. A later changed fill
+        # is a contradiction and blocks new risk; exits continue independently.
+        tracker = self.owner.market_data_provider.connectors[self.owner.config.connector_name]._order_tracker
+        tracked = tracker.all_orders.get(order_id)
+        if tracked is not None and (not tracked.is_done or tracked.executed_amount_base != quantity
+                                    or tracked.exchange_order_id != receipt['exchange_order_id']):
+            raise PolicyError('Native tracker conflicts with terminal funding release')
+
+    def reconcile(self):
+        """Release only native-proven unused capacity; safe to retry after restart.
+
+        This performs no exchange requests, order actions or balance mutations.
+        The native executor/connector first produces authoritative evidence.
+        """
+        for _ in range(8):
+            raw, state = self._load()
+            previous = self._audit_hash(state)
+            projection, pending, _ = self._evidence(state, raw, reconcile=True)
+            state['fills'] = projection['fills']
+            if previous == self._audit_hash(state) or self._write(raw, state):
+                self.status = {'released_intents': len(state['releases']), 'pending_quote': str(pending),
+                               'available_quote': str(max(ZERO, self.policy.allocation_quote - projection['used'] - pending)),
+                               'unused_intent_release': 'native_terminal_reconciliation'}
+                return dict(self.status)
+        raise PolicyError('Funding reconciliation contention; no release')
 
     def admit(self, executor_config):
         config = self.owner.config
@@ -263,6 +355,7 @@ class NativeFundingStore:
             rate = decimal(fee.percent, 'native estimated fee')
             if fee.percent_token not in (None, base, quote) or fee.flat_fees or rate > self.policy.fee_reserve_fraction:
                 raise PolicyError('Native fee exceeds explicit funding fee bound or has unsupported fixed fees')
+        self.reconcile()
         claim = {'config': _config_identity(executor_config, config.id), 'amount': str(amount),
                  'price': str(price), 'fee_fraction': str(self.policy.fee_reserve_fraction)}
         for _ in range(8):
@@ -279,7 +372,8 @@ class NativeFundingStore:
                            'native_inventory_cost': str(projection['inventory_cost']),
                            'pending_quote': str(pending), 'new_quote': str(required),
                            'available_quote': str(max(ZERO, self.policy.allocation_quote - projection['used'] - pending)),
-                           'unused_intent_release': 'explicit_reconciliation_required'}
+                           'released_intents': len(state['releases']),
+                           'unused_intent_release': 'native_terminal_reconciliation'}
             if projection['used'] + pending + required > self.policy.allocation_quote:
                 raise PolicyError('Candidate funding allocation exhausted')
             state['claims'][executor_config.id] = claim

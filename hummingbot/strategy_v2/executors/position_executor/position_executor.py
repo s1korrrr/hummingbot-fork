@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import logging
 import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -184,6 +185,7 @@ class PositionExecutor(ExecutorBase):
         self._entry_submitted: bool = False
         self._entry_stop_reason: Optional[str] = None
         self._entry_cancel_last_attempt_at: Optional[float] = None
+        self._entry_reconciliation = None
         self._entry_failure_is_final: bool = False
         self._entry_lifecycle: Dict = {"state": "awaiting_submission", "stop_reason": None}
         self._close_quantity: Dict = {}
@@ -1131,6 +1133,7 @@ class PositionExecutor(ExecutorBase):
         # Opt-in connectors must reconcile authoritative cumulative fill totals.
         if getattr(connector, "supports_terminal_fill_reconciliation", False) is not True:
             raise ValueError("Connector does not support authoritative terminal fill reconciliation")
+        reconciled = []
         for tracked in orders:
             order = tracked.order
             if order is None or order.exchange_order_id is None:
@@ -1142,6 +1145,11 @@ class PositionExecutor(ExecutorBase):
                     or update.exchange_order_id != order.exchange_order_id):
                 raise ValueError("Expired entry terminal order state is unavailable or mismatched")
             self.update_tracked_orders_with_order_id(order.client_order_id)
+            proof = (update.misc_updates or {}).get('terminal_reconciliation')
+            if proof is not None:
+                reconciled.append(copy.deepcopy(proof))
+        if len(orders) == len(reconciled) == 1:
+            self._entry_reconciliation = reconciled[0]
 
     def _is_within_activation_bounds(self, order_price: Decimal, side: TradeType, order_type: OrderType) -> bool:
         """
@@ -1545,7 +1553,11 @@ class PositionExecutor(ExecutorBase):
         self.update_tracked_orders_with_order_id(event.order_id)
         if self._open_order and event.order_id == self._open_order.order_id:
             if self.config.entry_order_policy == "single_attempt":
-                self._entry_failure_is_final = self._is_permanent_validation_failure(event)
+                rejected = getattr(self._open_order.order, 'terminal_reconciliation', None)
+                if (isinstance(rejected, dict) and rejected.get('source') == 'okx_submission_rejected_v1'
+                        and rejected.get('order_id') == event.order_id and rejected.get('filled_base') == '0'):
+                    self._entry_reconciliation = copy.deepcopy(rejected)
+                self._entry_failure_is_final = self._is_permanent_validation_failure(event) or self._entry_reconciliation is not None
                 self._end_entry_acquisition("entry_rejected" if self._entry_failure_is_final else "entry_failure")
                 self._entry_lifecycle["failure_event_timestamp"] = event.timestamp
                 return
@@ -1651,6 +1663,7 @@ class PositionExecutor(ExecutorBase):
             "close_order_filled_amount_base": self.close_filled_amount,
             "remaining_position_amount_base": self.amount_to_close,
             "held_position_orders": self._held_position_orders,
+            "entry_reconciliation": copy.deepcopy(self._entry_reconciliation),
             "entry_lifecycle": {"policy": self.config.entry_order_policy, **self._entry_lifecycle},
             "exit_trigger_reason": self._exit_trigger_reason,
             "close_quantity": self._close_quantity,

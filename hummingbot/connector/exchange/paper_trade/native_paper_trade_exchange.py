@@ -23,6 +23,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.data_type.terminal_reconciliation import terminal_reconciliation
 from hummingbot.core.data_type.trade_fee import TradeFeeBase, TradeFeeSchema
 from hummingbot.core.network_iterator import NetworkStatus
 
@@ -230,8 +231,12 @@ class NativePaperTradeExchange(ExchangeBase):
         if (order is None or order is not tracked_order
                 or order.exchange_order_id != tracked_order.exchange_order_id):
             raise ValueError('Paper order identity is unavailable for native reconciliation')
+        misc = None
+        if order.current_state in {OrderState.CANCELED, OrderState.FILLED}:
+            misc = {'terminal_reconciliation': terminal_reconciliation(
+                order, 'native_paper_terminal_v1', order.current_state.name, order.executed_amount_base)}
         return OrderUpdate(order.trading_pair, self.current_timestamp, order.current_state,
-                           order.client_order_id, order.exchange_order_id)
+                           order.client_order_id, order.exchange_order_id, misc)
 
     async def _update_orders_with_error_handler(self, orders, error_handler):
         for order in orders:

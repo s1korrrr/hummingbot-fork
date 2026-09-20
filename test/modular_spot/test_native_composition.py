@@ -44,12 +44,14 @@ def provider():
 
 
 def controllers(family, wrapper_config, wrapper, native_config, native, **changes):
+    if getattr(wrapper_config, '_public_module', None) == 'rsi_modular':
+        changes['profile'] = family
     if changes.get('execution_enabled'):
         changes['funding'] = {'allocation_quote': '50', 'fee_reserve_fraction': '.003'}
     config = wrapper_config(id='modular_spot_parity', trading_pair='BTC-USDC', strict_hmm_mode=False,
                             **changes)
     wrapped = wrapper(config, provider(), asyncio.Queue())
-    values = config.model_dump(mode='python', exclude={'data', 'shared_history', 'recipe_binding', 'execution_enabled', 'execution_mode', 'funding'})
+    values = config.model_dump(mode='python', exclude={'profile', 'data', 'shared_history', 'recipe_binding', 'execution_enabled', 'execution_mode', 'funding'})
     values['controller_name'] = family
     values['controller_type'] = 'directional_trading'
     legacy = native(native_config.model_validate(values), provider(), asyncio.Queue())
@@ -104,13 +106,14 @@ def test_real_native_recipe_export_roundtrip_and_source_closure(
     output = tmp_path / family
     write_bundle(bundle, output)
     payload = json.loads((output / 'modular_spot_recipe.yml').read_text())
-    config = wrapper_config.model_validate(payload)
-    assert config.get_controller_class() is wrapper
+    from controllers.generic.rsi_modular import get_config_class
+    config = get_config_class(family).model_validate(payload)
+    assert config.controller_name == 'rsi_modular' and config.profile == family
     assert not config.execution_enabled and config.data.mode == 'native'
     assert parse_recipe(recipe.model_dump(mode='json')) == recipe
     payload['usd_per_entry'] = str(D(str(payload['usd_per_entry'])) + 1)
     with pytest.raises(ValueError, match='configuration changed'):
-        wrapper_config.model_validate(payload)
+        get_config_class(family).model_validate(payload)
 
 
 @pytest.mark.parametrize('family,wrapper_config,wrapper,native_config,native', FAMILIES)

@@ -1,5 +1,4 @@
 import importlib
-import inspect
 import os
 from decimal import Decimal
 from typing import Dict, List, Optional, Type, Union
@@ -11,16 +10,11 @@ import yaml
 from hummingbot.client import settings
 from hummingbot.core.data_type.common import LazyDict, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
-from hummingbot.exceptions import InvalidController
 from hummingbot.strategy_v2.backtesting.backtesting_data_provider import BacktestingDataProvider
 from hummingbot.strategy_v2.backtesting.executor_simulator_base import ExecutorSimulation
 from hummingbot.strategy_v2.backtesting.executors_simulator.dca_executor_simulator import DCAExecutorSimulator
 from hummingbot.strategy_v2.backtesting.executors_simulator.position_executor_simulator import PositionExecutorSimulator
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
-from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
-    DirectionalTradingControllerConfigBase,
-)
-from hummingbot.strategy_v2.controllers.market_making_controller_base import MarketMakingControllerConfigBase
 from hummingbot.strategy_v2.executors.dca_executor.data_types import DCAExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -30,7 +24,7 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 
 class BacktestingEngineBase:
-    __controller_class_cache = LazyDict[str, Type[ControllerBase]]()
+    __controller_class_cache = LazyDict[tuple, Type[ControllerBase]]()
 
     def __init__(self):
         self.controller = None
@@ -69,15 +63,8 @@ class BacktestingEngineBase:
         module_path = f"{controllers_module}.{controller_type}.{controller_name}"
         module = importlib.import_module(module_path)
 
-        config_class = next((member for member_name, member in inspect.getmembers(module)
-                             if inspect.isclass(member) and member not in [ControllerConfigBase,
-                                                                           MarketMakingControllerConfigBase,
-                                                                           DirectionalTradingControllerConfigBase]
-                             and (issubclass(member, ControllerConfigBase))), None)
-        if not config_class:
-            raise InvalidController(f"No configuration class found in the module {controller_name}.")
-
-        return config_class(**config_data)
+        from hummingbot.strategy_v2.controllers.controller_loader import load_controller_config
+        return load_controller_config(config_data, controllers_module, module)
 
     async def run_backtesting(self,
                               controller_config: ControllerConfigBase,
@@ -89,8 +76,9 @@ class BacktestingEngineBase:
             from hummingbot.strategy_v2.utils.common import generate_unique_id
             controller_config.id = generate_unique_id()
 
-        controller_class = self.__controller_class_cache.get_or_add(controller_config.controller_name, controller_config.get_controller_class)
-        # controller_class = controller_config.get_controller_class()
+        resolved = controller_config.get_controller_class()
+        key = (type(controller_config), getattr(controller_config, 'profile', None), resolved)
+        controller_class = self.__controller_class_cache.get_or_add(key, lambda: resolved)
         # Load historical candles
         self.backtesting_data_provider.update_backtesting_time(start, end)
         await self.backtesting_data_provider.initialize_trading_rules(controller_config.connector_name)

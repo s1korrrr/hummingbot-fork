@@ -6,6 +6,9 @@ def is_ok_rsi_policy(config) -> bool:
     name = getattr(config, 'controller_name', None)
     if name == 'ok_rsi':
         return True
+    if name == 'rsi_modular':
+        from controllers.generic.rsi_modular import get_config_class
+        return type(config) is get_config_class('ok_rsi') and config.profile == 'ok_rsi'
     if name != 'modular_ok_rsi':
         return False
     # Loading controllers from the orchestrator's module scope would introduce a
@@ -16,6 +19,9 @@ def is_ok_rsi_policy(config) -> bool:
 
 def is_modular_policy(config) -> bool:
     """Exact modular model identity for operational rails, never accounting exceptions."""
+    if getattr(config, 'controller_name', None) == 'rsi_modular':
+        from controllers.generic.rsi_modular import CONFIG_PROFILES
+        return any(type(config) is cls and config.profile == profile for profile, cls in CONFIG_PROFILES.items())
     if getattr(config, 'controller_name', None) not in {'modular_spot', 'modular_ok_rsi', 'modular_rsi_v5'}:
         return False
     from controllers.generic.modular_ok_rsi import ModularOKRSIControllerConfig

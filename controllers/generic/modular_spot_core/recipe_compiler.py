@@ -63,13 +63,12 @@ def render_recipe(recipe: StrategyRecipe | NativePolicyRecipe) -> dict:
 
 def bind_native_bundle(recipe: StrategyRecipe | NativePolicyRecipe) -> dict:
     if isinstance(recipe, NativePolicyRecipe):
-        from .native_composition import module_for
-        native = module_for(recipe.family)
+        from controllers.generic import rsi_modular as native
     else:
         native = importlib.import_module('controllers.generic.modular_spot')
-    config_type = getattr(native, native.CONFIG_CLASS)
+    config_type = native.get_config_class(recipe.family) if isinstance(recipe, NativePolicyRecipe) else getattr(native, native.CONFIG_CLASS)
     bundle = render_recipe(recipe)
-    sources = native.source_files()
+    sources = native.source_files(recipe.family) if isinstance(recipe, NativePolicyRecipe) else native.source_files()
     source_hash = source_digest(native.source_root(), sources)
     controllers = []
     for payload in bundle['controllers']:

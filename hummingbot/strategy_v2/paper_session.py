@@ -145,7 +145,8 @@ class NativePaperSession:
         if prior_oracle is not None and (prior_oracle.started or prior_oracle._fetch_price_task is not None):
             raise RuntimeError('Paper session refuses an existing active rate oracle')
         configs = list(controller_configs)
-        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig)
+        from controllers.generic.rsi_modular import CONFIG_PROFILES
+        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values())
         if not configs or len({c.id for c in configs}) != len(configs):
             raise ValueError('Distinct native paper controller identities required')
         for config in configs:

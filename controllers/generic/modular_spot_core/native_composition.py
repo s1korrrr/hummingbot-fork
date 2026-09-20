@@ -28,14 +28,14 @@ def source_root():
     return Path(__file__).parents[2]
 
 
-def source_files(family):
+def source_files(family, *, public_module=None):
     """Controller-source closure, including relative imports and package initializers.
 
     Native Hummingbot engine dependencies outside controllers are bound by the
     deployment image identity, not misrepresented as part of this source seal.
     """
     root = source_root()
-    pending = [root / 'generic' / (FAMILIES[family] + '.py'),
+    pending = [root / 'generic' / ((public_module or FAMILIES[family]) + '.py'),
                root / 'directional_trading' / (family + '.py'),
                *sorted((root / 'generic' / 'modular_spot_core').rglob('*.py'))]
     seen = set()
@@ -116,6 +116,7 @@ def required_shared_history(config, family):
 class NativeCompositionFields(BaseModel):
     """Additional fields; all strategy parameters come from the actual native schema."""
     _native_family: ClassVar[str]
+    _public_module: ClassVar[str | None] = None
     execution_mode: Literal['live', 'paper'] = 'live'
     execution_enabled: StrictBool = Field(default=False, json_schema_extra={'is_updatable': True})
     data: DataPolicy = Field(default_factory=DataPolicy)
@@ -162,7 +163,7 @@ class NativeCompositionFields(BaseModel):
             raise ValueError('shared_history requires shared data mode')
         if self.recipe_binding is not None:
             verify_binding(self.recipe_binding, self.model_dump(mode='json'),
-                           source_sha256=source_digest(source_root(), source_files(self._native_family)))
+                           source_sha256=source_digest(source_root(), source_files(self._native_family, public_module=self._public_module)))
         return self
 
 
@@ -216,6 +217,7 @@ class NativeCandleProvider:
 class NativeComposition:
     """MRO mixin: native signal, sizing, execution, stop and recovery methods are inherited."""
     _native_family = None
+    _public_module = None
 
     def __init__(self, config, market_data_provider, actions_queue, **kwargs):
         # Revalidate before a native constructor may use any strategy parameter.
@@ -236,11 +238,11 @@ class NativeComposition:
         self._recovery_store = None
         self._recovery_hold = None
         self._recovery_fault = None
-        self._native_source_hash = source_digest(source_root(), source_files(self._native_family))
+        self._native_source_hash = source_digest(source_root(), source_files(self._native_family, public_module=self._public_module))
 
     @classmethod
     def implementation_source_files(cls):
-        return source_files(cls._native_family)
+        return source_files(cls._native_family, public_module=cls._public_module)
 
     def _composition_unchanged(self):
         return configuration_digest(self.config.model_dump(mode='json')) == self._composition_digest
@@ -297,6 +299,11 @@ class NativeComposition:
             config.require_terminal_entry_reconciliation = True
         return config
 
+    def update_config(self, new_config):
+        if type(new_config) is not type(self.config):
+            raise ValueError('Controller profile/type change requires restart and explicit state reconciliation')
+        return super().update_config(new_config)
+
     def can_create_executor(self, signal):
         if signal > 0 and (not self.config.execution_enabled or not self._composition_unchanged()
                            or self.shared_candles is not None and not self.shared_candles.entry_ready()):
@@ -336,6 +343,9 @@ class NativeComposition:
                                        'recovery_hold': self._recovery_hold,
                                        'funding_hold': self._funding_hold,
                                        'funding': self._funding_store.status if self._funding_store else None}
+        if hasattr(self.config, 'profile'):
+            info['modular_composition']['profile'] = self.config.profile
+            info['modular_composition']['controller_name'] = self.config.controller_name
         return info
 
 

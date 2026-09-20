@@ -28,7 +28,7 @@ class NativePolicyRecipe(PolicyModel):
 
     @model_validator(mode='after')
     def complete(self):
-        reserved = {'id', 'controller_name', 'controller_type', 'execution_enabled', 'data', 'shared_history',
+        reserved = {'profile', 'id', 'controller_name', 'controller_type', 'execution_enabled', 'data', 'shared_history',
                     'execution_mode', 'recipe_binding', 'initial_positions', 'legacy_controller_ids'}
         if reserved & set(self.parameters):
             raise ValueError('native recipe parameters cannot override identity, transport, authority or inventory')
@@ -42,12 +42,13 @@ class NativePolicyRecipe(PolicyModel):
 
 
 def render_native_recipe(recipe):
+    from controllers.generic import rsi_modular as native
+
     from .candle_data import Dataset
-    from .native_composition import module_for, required_shared_history
+    from .native_composition import required_shared_history
     recipe = NativePolicyRecipe.model_validate(recipe.model_dump(mode='json'))
-    native = module_for(recipe.family)
-    config_type = getattr(native, native.CONFIG_CLASS)
-    config = config_type.model_validate({**recipe.parameters, 'id': recipe.controller_id,
+    config_type = native.get_config_class(recipe.family)
+    config = config_type.model_validate({**recipe.parameters, 'profile': recipe.family, 'id': recipe.controller_id,
                                         'execution_enabled': False, 'data': recipe.data,
                                          'shared_history': recipe.shared_history})
     if config.execution_enabled or config.initial_positions:
@@ -58,7 +59,7 @@ def render_native_recipe(recipe):
                                 history=config.shared_history or required_shared_history(config, recipe.family)))
     root = native.source_root()
     manifest = {path.relative_to(root).as_posix(): sha256(path.read_bytes()).hexdigest()
-                for path in native.source_files()}
+                for path in native.source_files(recipe.family)}
     return {'schema_version': 1, 'controllers': [config.model_dump(mode='json')],
             'candle_manifest': {'schema_version': 1, 'datasets': [spec.model_dump(mode='json') for spec in datasets]},
             'recipe': recipe.model_dump(mode='json'), 'recipe_sha256': recipe.digest,

@@ -1,4 +1,6 @@
 import asyncio
+import json
+import os
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -54,6 +56,26 @@ class OkxExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._last_traded_price_source_timestamps = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+
+    async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
+        if os.environ.get('RSIBOT_V2_DURABLE_ORDER_TRACKING') == '1':
+            from hummingbot.connector.markets_recorder import MarketsRecorder
+            recorder = MarketsRecorder.get_existing_instance()
+            if (recorder is None or recorder.config_file_path != 'rsi_modular_v2.yml'
+                    or self not in recorder._markets):
+                raise ValueError('A matching durable V2 native recorder is required before submission')
+            # The existing MarketState is the native order-tracker checkpoint,
+            # including PENDING_CREATE. Commit its client ID before venue I/O.
+            with recorder._sql_manager.get_new_session() as session:
+                with session.begin():
+                    recorder.save_market_states(recorder.config_file_path, self, session)
+                    from hummingbot.model.metadata import Metadata
+                    key = 'v2-submitted-order:' + order.client_order_id
+                    if session.get(Metadata, key) is not None:
+                        raise ValueError('Durable V2 client order ID was already submitted')
+                    session.add(Metadata(key=key, value=json.dumps({
+                        'owner': recorder.config_file_path, 'order': order.to_json()}, sort_keys=True)))
+        return await super()._place_order_and_process_update(order, **kwargs)
 
     @property
     def authenticator(self):

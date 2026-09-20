@@ -25,8 +25,12 @@ def test_legacy_imports_are_confined_to_explicit_composition_seams_without_regis
                         'native_recovery.py': {'controllers.directional_trading.hl_rsi',
                                                'controllers.directional_trading.rsi_v5'},
                     }
+                    public_recipe_import = (
+                        path.name in {'native_recipe.py', 'recipe_compiler.py'}
+                        and node.module == 'controllers.generic'
+                        and [alias.name for alias in node.names] == ['rsi_modular'])
                     assert (node.module.startswith('controllers.generic.modular_spot_core')
-                            or node.module in permitted.get(path.name, set()))
+                            or node.module in permitted.get(path.name, set()) or public_recipe_import)
             if isinstance(node, ast.Import):
                 assert all(not name.name.startswith('controllers.directional_trading') for name in node.names)
             if isinstance(node, ast.Attribute):

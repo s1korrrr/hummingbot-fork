@@ -34,9 +34,9 @@ def component_source_files(root=None):
         raise error
 
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=inaccessible):
-        # Reject linked directories even when they contain no visible Python file.
-        if any((Path(directory) / name).is_symlink() for name in dirs):
-            raise ValueError('component source cannot contain symlink directories')
+        # Reject every link before filtering: dangling directory links are reported as files.
+        if any((Path(directory) / name).is_symlink() for name in (*dirs, *files)):
+            raise ValueError('component source cannot contain symlink entries')
         for name in files:
             path = Path(directory) / name
             if path.suffix != '.py':

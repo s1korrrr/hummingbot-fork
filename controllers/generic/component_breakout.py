@@ -24,12 +24,11 @@ from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 
 
 def source_root():
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def source_files():
-    from hummingbot.strategy_v2.components.source_identity import component_source_files
-    return [Path(__file__).resolve(), *component_source_files()]
+    return [Path(__file__).resolve()]
 
 
 def breakout_features(frame, lookback, atr_period):
@@ -89,7 +88,9 @@ class ComponentBreakoutController(ControllerBase):
 
     @classmethod
     def implementation_source_files(cls):
-        return source_files()
+        from hummingbot.strategy_v2.components.source_identity import component_source_files
+
+        return [*source_files(), *component_source_files()]
 
     def __init__(self, config, market_data_provider, actions_queue, **kwargs):
         if type(config) is not ComponentBreakoutConfig:

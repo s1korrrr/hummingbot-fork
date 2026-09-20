@@ -260,3 +260,29 @@ def test_programmatic_config_bypass_cannot_increase_reference_capital(tmp_path):
     with pytest.raises(ValueError):
         NativePaperSession(paper(), [invalid], tmp_path / 'invalid.sqlite')
     assert not (tmp_path / 'invalid.sqlite').exists()
+
+
+def test_reference_source_seal_supports_split_installed_component_layout(tmp_path, monkeypatch):
+    import shutil
+
+    from controllers.generic import component_breakout
+    from hummingbot.strategy_v2.components import source_identity
+    from hummingbot.strategy_v2.components.recipe_contract import source_digest, source_records
+
+    installed = tmp_path.resolve() / 'installed-components'
+    shutil.copytree(source_identity.component_root(), installed, ignore=shutil.ignore_patterns('__pycache__'))
+    monkeypatch.setattr(source_identity, 'component_root', lambda: installed)
+    root, files = component_breakout.source_root(), component_breakout.source_files()
+    seal = source_digest(root, files)
+    records = source_records(root, files)
+    assert len(seal) == 64
+    assert root == Path(component_breakout.__file__).resolve().parents[1]
+    assert files == [Path(component_breakout.__file__).resolve()]
+    assert len(records) == 1 + len(source_identity.component_source_files())
+    assert any(name == 'generic/component_breakout.py' for name, _ in records)
+    assert any(name == '@strategy_components/portfolio.py' for name, _ in records)
+    assert set(component_breakout.ComponentBreakoutController.implementation_source_files()) == {
+        *files, *source_identity.component_source_files()}
+    with (installed / 'portfolio.py').open('a') as stream:
+        stream.write('\n# split-layout source mutation\n')
+    assert source_digest(root, files) != seal

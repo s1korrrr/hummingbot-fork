@@ -32,16 +32,20 @@ def test_legacy_sources_keep_controller_only_digest(tmp_path):
     assert source_digest(tmp_path, [source]) == digest([('legacy.py', sha256(source.read_bytes()).hexdigest())])
 
 
-@pytest.mark.parametrize('mode', ['missing', 'symlink_file', 'symlink_directory', 'oversize'])
+@pytest.mark.parametrize('mode', ['missing', 'symlink_file', 'symlink_directory', 'dangling_link', 'non_python_link', 'oversize'])
 def test_component_manifest_rejects_unsafe_source(tmp_path, mode):
     for name in ('__init__.py', 'source_identity.py', 'recipe_contract.py'):
         (tmp_path / name).write_text('# component\n')
     if mode == 'missing':
         (tmp_path / 'recipe_contract.py').unlink()
     elif mode == 'symlink_file':
-        (tmp_path / 'escape.py').symlink_to('/etc/hosts')
+        (tmp_path / 'escape.py').symlink_to(tmp_path / '__init__.py')
     elif mode == 'symlink_directory':
-        (tmp_path / 'escape').symlink_to('/private/tmp', target_is_directory=True)
+        (tmp_path / 'escape').symlink_to(tmp_path.parent, target_is_directory=True)
+    elif mode == 'dangling_link':
+        (tmp_path / 'dangling').symlink_to(tmp_path / 'missing_target')
+    elif mode == 'non_python_link':
+        (tmp_path / 'metadata.txt').symlink_to(tmp_path / '__init__.py')
     else:
         (tmp_path / 'big.py').write_bytes(b'x' * (2 * 1024 * 1024 + 1))
     with pytest.raises(ValueError):

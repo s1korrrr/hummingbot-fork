@@ -4,10 +4,13 @@ on:
   pull_request:
     paths:
       - 'controllers/generic/modular_**'
+      - 'controllers/generic/rsi_modular.py'
+      - 'controllers/generic/component_breakout.py'
       - 'controllers/generic/modular_spot_core/**'
       - 'controllers/directional_trading/**'
       - 'hummingbot/strategy_v2/**'
       - 'hummingbot/strategy/strategy_v2_base.py'
+      - 'hummingbot/strategy/native_observability.py'
       - 'hummingbot/connector/**'
       - 'hummingbot/model/**'
       - 'hummingbot/core/**'
@@ -84,11 +87,16 @@ jobs:
               "controllers.generic.modular_spot",
               "controllers.generic.modular_ok_rsi",
               "controllers.generic.modular_rsi_v5",
+              "controllers.generic.rsi_modular",
+              "controllers.generic.component_breakout",
+              "hummingbot.strategy_v2.components",
           ):
               importlib.import_module(module)
           print("Required compiled native and controller imports passed")
           PYTHON
           PYTHONPATH="$PWD" python -m pytest \
+            test/test_strategy_components.py \
+            test/test_strategy_component_source_identity.py \
             test/modular_spot \
             test/hummingbot/strategy_v2/executors/position_executor \
             test/hummingbot/strategy_v2/executors/order_executor \
@@ -105,6 +113,21 @@ jobs:
             test/test_rsi_v5_controller_import.py \
             test/test_rsi_v5_runtime.py \
             test/test_rsi_v5_runtime_store.py \
-            test/test_rsi_v5_audit_edge_cases.py \
             test/test_controller_report_health.py \
+            test/hummingbot/connector/exchange/paper_trade/test_native_paper_executors.py \
+            test/hummingbot/connector/exchange/paper_trade/test_native_paper_trade_exchange.py \
+            test/hummingbot/strategy_v2/paper/test_paper_session.py \
+            test/hummingbot/strategy_v2/backtesting \
+            test/hummingbot/strategy_v2/paper/test_paper_funding.py \
+            test/hummingbot/connector/exchange/okx/test_okx_order_uncertainty.py \
+            test/hummingbot/strategy_v2/paper/test_rsi_modular_paper.py \
+            test/hummingbot/strategy/test_strategy_v2_base.py \
+            test/hummingbot/strategy/test_controller_source_guard.py \
+            test/hummingbot/client/command/test_create_command.py \
+            test/hummingbot/remote_iface/test_mqtt.py \
+            test/hummingbot/remote_iface/test_mqtt_disconnect_ownership.py \
+            test/hummingbot/remote_iface/test_mqtt_log_isolation.py \
+            test/test_native_bot_observability.py \
+            test/test_ok_rsi_chart_snapshots.py \
+            test/test_rsi_v5_audit_edge_cases.py \
             -q -rs --basetemp=/tmp/modular-native-ci

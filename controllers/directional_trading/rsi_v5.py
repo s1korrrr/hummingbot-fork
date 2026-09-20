@@ -521,6 +521,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             htf_confirm=False,
         )
 
+        self._last_chart_snapshot_timestamps: Dict[str, int] = {}
+        self._chart_snapshot_bootstrapped: Dict[str, bool] = {}
+
         super().__init__(config, *args, **kwargs)
 
     # -----------------------------------------------------------------------
@@ -584,6 +587,127 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if candles_df is None or candles_df.empty:
             return None
         return candles_df.copy()
+
+    def _chart_snapshot_intervals(self) -> List[str]:
+        intervals = [self.config.interval]
+        if self.config.trend_confirmation_enabled:
+            for interval in (
+                self.config.trend_confirmation_medium_interval,
+                self.config.trend_confirmation_long_interval,
+            ):
+                if interval and interval not in intervals:
+                    intervals.append(interval)
+        return intervals
+
+    @staticmethod
+    def _chart_series_value(row: pd.Series, key: str):
+        try:
+            value = row.get(key)
+        except (AttributeError, TypeError):
+            value = None
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return value
+
+    @staticmethod
+    def _chart_timestamp_millis(value) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                return int(timestamp)
+            return int(timestamp * 1000)
+        except (TypeError, ValueError):
+            return None
+
+    def _chart_prepare_interval_frame(self, interval: str) -> Optional[pd.DataFrame]:
+        if interval == self.config.interval:
+            features = (self.processed_data or {}).get("features")
+            if isinstance(features, pd.DataFrame) and not features.empty:
+                return features.copy()
+        return self._get_interval_candles_df(interval)
+
+    def _build_chart_snapshot_payload_for_row(
+        self,
+        *,
+        bot_name: str,
+        interval: str,
+        row: pd.Series,
+        enforce_latest_guard: bool,
+    ) -> Optional[Dict[str, object]]:
+        candle_timestamp = self._chart_timestamp_millis(self._chart_series_value(row, "timestamp"))
+        if candle_timestamp is None:
+            return None
+        if enforce_latest_guard and self._last_chart_snapshot_timestamps.get(interval) == candle_timestamp:
+            return None
+        close_price = self._chart_series_value(row, "close")
+        if close_price is None:
+            return None
+        processed = self.processed_data or {}
+        indicators = processed.get("indicators") if isinstance(processed.get("indicators"), dict) else {}
+        rsi_col = f"RSI_{self.config.rsi_length}"
+        rsi_value = self._chart_series_value(row, rsi_col)
+        if rsi_value is None:
+            rsi_value = indicators.get("rsi") if interval == self.config.interval else None
+        payload = {
+            "bot_name": bot_name,
+            "controller_id": self.config.id,
+            "pair": self.config.trading_pair,
+            "interval": interval,
+            "candle_timestamp": candle_timestamp,
+            "open_price": float(self._chart_series_value(row, "open") or 0),
+            "high_price": float(self._chart_series_value(row, "high") or 0),
+            "low_price": float(self._chart_series_value(row, "low") or 0),
+            "close_price": float(close_price),
+            "volume": float(self._chart_series_value(row, "volume") or 0),
+            "rsi": None if rsi_value is None else float(rsi_value),
+            "signal": int(self._chart_series_value(row, "signal") or processed.get("signal") or 0),
+        }
+        return payload
+
+    def build_chart_snapshot_rows(self, bot_name: str) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for interval in self._chart_snapshot_intervals():
+            frame = self._chart_prepare_interval_frame(interval)
+            if frame is None or frame.empty:
+                continue
+            interval_rows: List[Dict[str, object]] = []
+            if not self._chart_snapshot_bootstrapped.get(interval):
+                for _, row in frame.iterrows():
+                    payload = self._build_chart_snapshot_payload_for_row(
+                        bot_name=bot_name,
+                        interval=interval,
+                        row=row,
+                        enforce_latest_guard=False,
+                    )
+                    if payload is not None:
+                        interval_rows.append(payload)
+            else:
+                payload = self._build_chart_snapshot_payload_for_row(
+                    bot_name=bot_name,
+                    interval=interval,
+                    row=frame.iloc[-1],
+                    enforce_latest_guard=True,
+                )
+                if payload is not None:
+                    interval_rows.append(payload)
+            rows.extend(interval_rows)
+        return rows
+
+    def chart_snapshot_rows_persisted(self, rows: List[Dict[str, object]]) -> None:
+        """Advance chart guards only after the native recorder commits the batch."""
+        for row in rows:
+            if row.get("controller_id") != self.config.id or row.get("pair") != self.config.trading_pair:
+                continue
+            interval = row["interval"]
+            timestamp = int(row["candle_timestamp"])
+            self._last_chart_snapshot_timestamps[interval] = max(
+                timestamp, self._last_chart_snapshot_timestamps.get(interval, timestamp))
+            self._chart_snapshot_bootstrapped[interval] = True
 
     def set_operator_entry_pause(
         self,

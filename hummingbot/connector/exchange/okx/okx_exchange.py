@@ -15,6 +15,7 @@ from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.terminal_reconciliation import terminal_reconciliation
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.estimate_fee import build_trade_fee
@@ -224,6 +225,9 @@ class OkxExchange(ExchangePyBase):
     def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
                           order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):
         if isinstance(exception, OkxOrderRejectedError):
+            order = self._order_tracker.fetch_order(order_id)
+            if order is not None and order.exchange_order_id is None and order.executed_amount_base == 0:
+                order.terminal_reconciliation = terminal_reconciliation(order, 'okx_submission_rejected_v1', 'REJECTED', '0')
             return super()._on_order_failure(order_id, trading_pair, amount, trade_type, order_type, price, exception, **kwargs)
         self.logger().error(
             f"Submission status unknown for {order_id}: {type(exception).__name__}: {exception}. "
@@ -426,6 +430,17 @@ class OkxExchange(ExchangePyBase):
             await self._reconcile_terminal_order_fills(tracked_order, order_data)
 
         misc_updates = self._okx_order_misc_updates(order_data)
+        # Funding release requires the actual venue identity, not the request's
+        # substituted client ID. Older incomplete status fixtures remain usable
+        # by ordinary status polling but cannot attest funding release.
+        if (new_state in {OrderState.CANCELED, OrderState.FILLED}
+                and order_data.get('clOrdId') == tracked_order.client_order_id
+                and order_data.get('side') == tracked_order.trade_type.name.lower()
+                and order_data.get('instId')
+                and order_data['instId'] == await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)):
+            misc_updates = dict(misc_updates or {})
+            misc_updates['terminal_reconciliation'] = terminal_reconciliation(
+                tracked_order, 'okx_terminal_status_v1', new_state.name, order_data['accFillSz'])
         cancel_source = None if misc_updates is None else misc_updates.get("cancel_source")
         if cancel_source:
             tracked_order.cancel_source = cancel_source

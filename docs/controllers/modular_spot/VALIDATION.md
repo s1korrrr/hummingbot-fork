@@ -1,7 +1,5 @@
 # Validation receipt — native modular spot candidate
 
-> Historical validation of the preserved PR #55 working candidate. The source, authority, unpublished status and output paths below describe that earlier run. For the fresh standalone publication checks and PR #55/#57 split, see [PUBLICATION_RECEIPT.md](PUBLICATION_RECEIPT.md). Generated historical evidence remains in the original checkout and is not part of this publication.
-
 Date: 2026-09-19. Verdict: local implementation validation and bounded public
 market-data path PASS after repairs. Strategy parity and operational activation HOLD.
 
@@ -20,7 +18,7 @@ market-data path PASS after repairs. Strategy parity and operational activation 
 - Final modular Python package identity:
   `c0365c8a015e5e8a76cb455469b5c206d0490c0885a304354bf7e93a76869921`.
   This is SHA-256 of the sorted compact JSON path-to-file-SHA mapping in
-  historical final-source.json (`evidence/2026-09-19/final-source.json` in the original checkout), not a Git commit or
+  [final-source.json](evidence/2026-09-19/final-source.json), not a Git commit or
   the historical M8 patch digest.
 - Authority: repository-process-only; temporary credentials-free public market data
   and loopback readers. No trading, deployment, owner enrollment, economic backtest,
@@ -28,7 +26,7 @@ market-data path PASS after repairs. Strategy parity and operational activation 
 
 All 13 live container IDs, image IDs and start times were identical before/after.
 The root and separate nested `hummingbot` Git statuses were also unchanged.
-See historical stack-preservation.json (`evidence/2026-09-19/stack-preservation.json` in the original checkout).
+See [stack-preservation.json](evidence/2026-09-19/stack-preservation.json).
 This establishes non-interference; it is not an exchange/account reconciliation.
 
 ## Native reuse and product meaning
@@ -107,8 +105,8 @@ PYTHONPATH="$PWD" /Users/s1kor/anaconda3/envs/hummingbot/bin/python -m pytest -q
 
 **446 passed + 10 subtests passed, zero failures, zero skips, zero warnings:**
 241 modular tests, 172 native executor/orchestrator tests plus 10 subtests, and
-33 native OKX/base candle tests. historical Log (`evidence/2026-09-19/final-native.log` in the original checkout) ·
-historical JUnit (`evidence/2026-09-19/final-native.xml` in the original checkout).
+33 native OKX/base candle tests. [Log](evidence/2026-09-19/final-native.log) ·
+[JUnit](evidence/2026-09-19/final-native.xml).
 
 ```bash
 pre-commit run --files controllers/generic/modular_spot.py \
@@ -120,12 +118,12 @@ git diff --check
 All applicable hooks passed: whitespace, end-of-file, file size, flake8, private-key
 checks, autopep8 and isort. YAML and eslint hooks had no matching files.
 The first hook pass formatted imports; the second passed with no further edits.
-historical Hook log (`evidence/2026-09-19/pre-commit-final.log` in the original checkout).
+[Hook log](evidence/2026-09-19/pre-commit-final.log).
 The README YAML also validates against the real native configuration class with
 execution disabled and an explicit budget/account example.
 
 Independent source audit and post-format confirmation found no open Critical or
-Important defects in the repair scope. See historical review.md (`evidence/2026-09-19/review.md` in the original checkout).
+Important defects in the repair scope. See [review.md](evidence/2026-09-19/review.md).
 This is a bounded review, not a claim of exhaustive proof of every future program.
 
 ## Observed public WebSocket path
@@ -152,8 +150,8 @@ The repaired data path passed in 140.43 seconds:
 Initial HTTP 503s represented normal startup warmup; HTTP 200/304 responses then
 served current snapshots. Exchange collection is WebSocket; local delivery is
 HTTP snapshot polling, as specified. No consumer-WebSocket rewrite is required.
-historical Receipt (`evidence/2026-09-19/public-candle-smoke.json` in the original checkout) ·
-historical Log (`evidence/2026-09-19/public-candle-smoke.log` in the original checkout).
+[Receipt](evidence/2026-09-19/public-candle-smoke.json) ·
+[Log](evidence/2026-09-19/public-candle-smoke.log).
 The smoke loaded repaired code before final import sorting; the final native test
 suite and independent review bind the formatted source bytes. This was a bounded
 public-feed test with reader reconnect, not an endurance soak or a public-socket

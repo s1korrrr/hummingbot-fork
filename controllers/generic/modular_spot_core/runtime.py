@@ -153,6 +153,9 @@ class ModularRuntime:
 
     def acquisition_permitted(self):
         c = self.controller.config
+        if getattr(self.controller, '_operator_entry_paused', False):
+            self.reason = 'operator_entry_pause'
+            return False
         if not c.acquisition_enabled or c.universe.mode == 'sell_only':
             self.reason = 'sell_only_no_acquisition'
             return False

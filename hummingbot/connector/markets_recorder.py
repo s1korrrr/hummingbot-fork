@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os.path
@@ -903,10 +904,30 @@ class MarketsRecorder:
             row = session.get(Metadata, f"strategy-risk:{self._config_file_path}")
             return json.loads(row.value) if row is not None else None
 
-    def store_strategy_risk_state(self, state: dict):
+    def _operator_command_key(self, controller_id: str, command_id: str) -> str:
+        if (not isinstance(controller_id, str) or not 1 <= len(controller_id) <= 180
+                or not isinstance(command_id, str) or not 1 <= len(command_id) <= 128):
+            raise ValueError('Invalid native operator receipt identity')
+        identity = json.dumps([self._config_file_path, controller_id, command_id], separators=(',', ':'))
+        return 'strategy-operator:' + hashlib.sha256(identity.encode()).hexdigest()
+
+    def has_operator_command(self, controller_id: str, command_id: str) -> bool:
+        with self._sql_manager.get_new_session() as session:
+            return session.get(Metadata, self._operator_command_key(controller_id, command_id)) is not None
+
+    def store_strategy_risk_state(self, state: dict, *, operator_receipts=()):
         payload = json.dumps(state, allow_nan=False, sort_keys=True)
         with self._sql_manager.get_new_session() as session:
             with session.begin():
+                for receipt in operator_receipts:
+                    if (not isinstance(receipt, dict) or set(receipt) != {'controller_id', 'command_id', 'requested_at'}
+                            or type(receipt['requested_at']) not in (int, float)
+                            or not Decimal(str(receipt['requested_at'])).is_finite() or receipt['requested_at'] < 0):
+                        raise ValueError('Invalid native operator receipt')
+                    receipt_key = self._operator_command_key(receipt['controller_id'], receipt['command_id'])
+                    if session.get(Metadata, receipt_key) is not None:
+                        raise ValueError('Native operator command already applied')
+                    session.add(Metadata(key=receipt_key, value=json.dumps(receipt, allow_nan=False, sort_keys=True)))
                 key = f"strategy-risk:{self._config_file_path}"
                 row = session.get(Metadata, key)
                 if row is None:

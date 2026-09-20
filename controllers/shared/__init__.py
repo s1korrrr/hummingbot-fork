@@ -1,1 +1,1 @@
-"""Read-only shared clients used by portfolio controllers."""
+"""Shared controller policies and read-only integration clients."""

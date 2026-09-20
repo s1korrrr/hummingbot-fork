@@ -53,6 +53,7 @@ async def test_submission_timeout_retains_client_order_identity_for_status_recov
     assert 'uncertain' in exchange.in_flight_orders
     order = exchange.in_flight_orders['uncertain']
     assert not order.is_failure
+    assert getattr(order, 'terminal_reconciliation', None) is None
     exchange._request_order_update = AsyncMock(return_value={'data': [{'state': 'live', 'ordId': 'venue', 'uTime': '1000000'}]})
     update = await exchange._request_order_status(order)
     exchange._order_tracker.process_order_update(update)
@@ -103,6 +104,10 @@ async def test_explicit_negative_venue_ack_is_a_real_rejection():
     await asyncio.sleep(0)
     assert 'rejected' not in exchange.in_flight_orders
     assert exchange._order_tracker.fetch_order('rejected').is_failure
+    proof = exchange._order_tracker.fetch_order('rejected').terminal_reconciliation
+    assert proof['source'] == 'okx_submission_rejected_v1'
+    assert proof['filled_base'] == '0' and proof['trade_ids'] == []
+    assert proof['exchange_order_id'] is None
 
 
 def test_in_flight_order_persists_cancel_source_from_misc_updates():
@@ -226,3 +231,32 @@ async def test_request_order_status_delayed_live_does_not_reopen_canceled_order(
     assert not order.is_open
     assert order.last_update_timestamp == 20.0
     assert exchange._order_tracker.fetch_cached_order('oid') is order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('quantity', ['0', '.4'])
+async def test_terminal_funding_receipt_requires_venue_identity_and_exact_trade_coverage(quantity):
+    from hummingbot.core.data_type.in_flight_order import TradeUpdate
+    from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+    exchange = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+    exchange.exchange_symbol_associated_to_pair = AsyncMock(return_value='ETH-USDT')
+    exchange.start_tracking_order(order_id='entry', exchange_order_id='venue', trading_pair='ETH-USDT',
+                                  trade_type=TradeType.BUY, price=Decimal('100'), amount=Decimal('1'), order_type=OrderType.LIMIT)
+    order = exchange.in_flight_orders['entry']
+    payload = {'state': 'canceled', 'accFillSz': quantity, 'ordId': 'venue', 'clOrdId': 'entry',
+               'instId': 'ETH-USDT', 'side': 'buy', 'uTime': '1000000'}
+    exchange._request_order_update = AsyncMock(return_value={'data': [payload]})
+    fill = TradeUpdate('fill', 'entry', 'venue', 'ETH-USDT', 999, Decimal('100'), Decimal(quantity),
+                       Decimal(quantity) * 100, AddedToCostTradeFee())
+    exchange._all_trade_updates_for_order = AsyncMock(return_value=[fill] if quantity != '0' else [])
+    update = await exchange._request_order_status(order)
+    proof = update.misc_updates['terminal_reconciliation']
+    assert Decimal(proof['filled_base']) == Decimal(quantity)
+    assert proof['trade_ids'] == (['fill'] if quantity != '0' else [])
+    assert proof['exchange_order_id'] == 'venue'
+    assert proof['source'] == 'okx_terminal_status_v1'
+    for field in ('clOrdId', 'instId', 'side'):
+        wrong = {**payload, field: 'foreign'}
+        exchange._request_order_update.return_value = {'data': [wrong]}
+        update = await exchange._request_order_status(order)
+        assert 'terminal_reconciliation' not in (update.misc_updates or {})

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "datasets": [
+    {
+      "connector": "okx",
+      "trading_pair": "BTC-USDC",
+      "interval": "1m",
+      "market_type": "spot",
+      "source_domain": "okx",
+      "source_profile": "native",
+      "price_type": "trade",
+      "boundary": "utc_epoch",
+      "history": 300
+    }
+  ]
+}

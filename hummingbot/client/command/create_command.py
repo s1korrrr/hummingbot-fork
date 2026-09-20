@@ -33,11 +33,6 @@ from hummingbot.client.ui.completer import load_completer
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.exceptions import InvalidController, InvalidScriptModule
 from hummingbot.strategy.strategy_v2_base import StrategyV2ConfigBase
-from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
-from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
-    DirectionalTradingControllerConfigBase,
-)
-from hummingbot.strategy_v2.controllers.market_making_controller_base import MarketMakingControllerConfigBase
 
 if TYPE_CHECKING:
     from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
@@ -80,16 +75,17 @@ class CreateCommand:
             if not module:
                 raise InvalidController(f"The controller {controller_name} was not found in any subfolder.")
 
-            # Load the configuration class from the module
-            config_class = next((member for member_name, member in inspect.getmembers(module)
-                                 if inspect.isclass(member) and member not in [ControllerConfigBase,
-                                                                               MarketMakingControllerConfigBase,
-                                                                               DirectionalTradingControllerConfigBase,]
-                                 and (issubclass(member, ControllerConfigBase))), None)
-            if not config_class:
-                raise InvalidController(f"No configuration class found in the module {controller_name}.")
-
-            config_class_instance = config_class.model_construct()
+            from hummingbot.strategy_v2.controllers.controller_loader import resolve_controller_config_class
+            values = {}
+            profiles = getattr(module, 'CONFIG_PROFILES', None)
+            if profiles is not None:
+                selected = await self.app.prompt(prompt=f"Select native profile ({', '.join(profiles)}) >>> ")
+                if self.app.to_stop_config:
+                    self.reset_application_state()
+                    return
+                values['profile'] = selected.strip()
+            config_class = resolve_controller_config_class(module, values)
+            config_class_instance = config_class.model_construct(**values)
             config_class_instance.id = config_class_instance.set_id(None)
             config_map = ClientConfigAdapter(config_class_instance)
 

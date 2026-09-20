@@ -185,9 +185,6 @@ def test_data_pool_start_constructs_http_snapshot_polling_client(tmp_path):
             pool.start()
             assert isinstance(pool.client, CandleClient)
             assert "ws_connect" not in inspect.getsource(CandleClient.run)
-            poll_src = inspect.getsource(CandleClient.poll)
-            assert "/v1/snapshot/" in poll_src
-            assert "If-None-Match" in poll_src
             for _ in range(40):
                 if pool.client.replica.snapshots:
                     break
@@ -394,4 +391,64 @@ def test_snapshot_size_limit_stops_stream_before_full_body_read(tmp_path, monkey
         client = CandleClient('http://127.0.0.1:8100', token_path(tmp_path), (dataset(),))
         with pytest.raises(PolicyError, match='bounded transport'):
             await client._apply_snapshot(dataset().key, response)
+    asyncio.run(scenario())
+
+
+def test_http_poll_uses_bounded_parallel_requests_for_large_universe(tmp_path):
+    async def scenario():
+        active = 0
+        peak = 0
+
+        async def warming(request):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(.01)
+            active -= 1
+            return web.Response(status=503)
+
+        app = web.Application()
+        app.router.add_get('/v1/snapshot/{key}', warming)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        specs = tuple(dataset(f'ASSET{i}-USDC') for i in range(24))
+        client = CandleClient(f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}',
+                              token_path(tmp_path), specs, clock=lambda: 6000.0)
+        try:
+            async with aiohttp.ClientSession() as session:
+                assert await client.poll(session, TOKEN) == [503] * 24
+            assert 2 <= peak <= 8
+            assert len(client.dataset_errors) == 24
+        finally:
+            await client.close()
+            await runner.cleanup()
+    asyncio.run(scenario())
+
+
+def test_large_capture_yields_to_connection_watchdogs():
+    import time
+
+    class SlowFeed(Feed):
+        def __getattribute__(self, name):
+            if name == 'candles_df':
+                time.sleep(.004)
+            return super().__getattribute__(name)
+
+    async def scenario():
+        hub = SnapshotHub(tuple(dataset(f'ASSET{i}-USDC') for i in range(24)),
+                          factory=SlowFeed, epoch='yield-capture')
+        hub.start()
+        ticks = []
+        capture = asyncio.create_task(hub.capture_async(now=6000))
+        try:
+            while not capture.done():
+                await asyncio.sleep(.001)
+                ticks.append(time.monotonic())
+            await capture
+            assert len(ticks) >= 5
+            assert len(hub.snapshots) == 24
+        finally:
+            hub.stop()
     asyncio.run(scenario())

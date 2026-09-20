@@ -1,0 +1,7 @@
+{
+  "passed": false,
+  "aborted_at": 1789845775.5098088,
+  "reason": "Repeated real venue confirmed frames before subscription ACK; strict collector disconnected requested groups. Stop disposable harness for repair; no completed900s evidence.",
+  "owned_harness_pid": 63301,
+  "signal": "SIGINT graceful Pythonfinally closespoolsandproducer"
+}

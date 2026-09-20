@@ -391,3 +391,28 @@ async def test_single_attempt_native_okx_cancel_ack_waits_for_missing_partial_fi
     finally:
         executor._cancel_entry_expiry_reconciliation()
         executor.unregister_events()
+
+
+@pytest.mark.asyncio
+async def test_native_okx_explicit_rejection_seals_entry_receipt_without_retry():
+    from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange, OkxOrderRejectedError
+    executor = single_attempt()
+    entry = tracked('entry', TradeType.BUY, '0', OrderState.PENDING_CREATE)
+    entry.order.exchange_order_id = None
+    executor._open_order = entry
+    okx = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='',
+                      trading_pairs=['ETH-USDT'], trading_required=False)
+    okx._order_tracker.start_tracking_order(entry.order)
+    executor.connectors['okx'] = okx
+    executor.register_events()
+    try:
+        okx._on_order_failure('entry', 'ETH-USDT', entry.order.amount, TradeType.BUY,
+                              OrderType.LIMIT, D('100'), OkxOrderRejectedError('51008 insufficient balance'))
+        await asyncio.sleep(0)
+        await cycle(executor)
+        assert executor.is_closed
+        assert executor.get_custom_info()['entry_reconciliation']['source'] == 'okx_submission_rejected_v1'
+        assert executor.get_custom_info()['entry_reconciliation']['filled_base'] == '0'
+        executor.place_order.assert_not_called()
+    finally:
+        executor.unregister_events()

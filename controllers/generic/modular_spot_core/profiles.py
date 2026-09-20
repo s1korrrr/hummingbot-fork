@@ -34,6 +34,7 @@ class ProgramProfile(PolicyModel):
     quote_budget: Decimal = Field(gt=0)
     max_positions: int = Field(ge=1, le=1000, strict=True)
     history: int = Field(default=300, ge=61, le=3000, strict=True)
+    data_transport: Literal['snapshot', 'stream'] = 'snapshot'
     data_origin: str = 'http://127.0.0.1:8100'
     token_file: str = '/run/secrets/modular_candle_reader'
     account: str = Field(default='unassigned', pattern=r'^[A-Za-z0-9_-]{1,80}$')
@@ -83,7 +84,8 @@ def _controller(profile: ProgramProfile, symbol: str, owner: str, observed, pair
         'budget': {'group': profile.name, 'max_quote': str(profile.quote_budget), 'max_assets': profile.max_positions},
         'signal': {'kind': 'breakout' if profile.mode == 'impulse' else 'rsi_rebound'},
         'acquisition': {'fractions': ['1']},
-        'data': {'mode': 'shared', 'origin': profile.data_origin, 'token_file': profile.token_file,
+        'data': {'mode': 'shared', 'transport': profile.data_transport,
+                 'origin': profile.data_origin, 'token_file': profile.token_file,
                  'symbols': list(observed)},
         'universe': {'mode': profile.mode, 'symbols': list(profile.symbols),
                      'benchmarks': list(profile.benchmarks),

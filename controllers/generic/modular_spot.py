@@ -1,6 +1,5 @@
 """Standalone spot composition using native Hummingbot execution ownership."""
 import asyncio
-import hashlib
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -13,12 +12,25 @@ from controllers.generic.modular_spot_core.config import AcquisitionPolicy, Risk
 from controllers.generic.modular_spot_core.data_reader import DataPolicy, attach_pool, dataset_for
 from controllers.generic.modular_spot_core.domain import identity
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
+from controllers.generic.modular_spot_core.recipe_contract import (
+    RecipeBinding,
+    source_digest,
+    source_records,
+    verify_binding,
+)
 from controllers.generic.modular_spot_core.runtime import ModularRuntime
 from controllers.generic.modular_spot_core.universe import UniversePolicy
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.strategy_v2.components.source_identity import component_source_files
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
+
+CONFIG_CLASS = 'ModularSpotControllerConfig'
+
+
+def source_root():
+    return Path(__file__).parent
 
 
 def source_files():
@@ -48,6 +60,7 @@ class ModularSpotControllerConfig(ControllerConfigBase):
     account: str = Field(default='unassigned', pattern=r'^[A-Za-z0-9_-]{1,80}$')
     program_revision: str = Field(default='0', pattern=r'^[A-Za-z0-9._-]{1,64}$')
     policy_revision: str = Field(default='0', pattern=r'^[A-Za-z0-9._-]{1,64}$')
+    recipe_binding: RecipeBinding | None = None
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
 
     @model_validator(mode='after')
@@ -69,6 +82,10 @@ class ModularSpotControllerConfig(ControllerConfigBase):
             if (self.interval != FIRST_DELIVERY['interval'] or self.connector_name != FIRST_DELIVERY['connector']):
                 raise ValueError('shared first delivery is confirmed 1m OKX spot')
             dataset_for(self)
+            if self.data.transport == 'stream':
+                symbols = (self.trading_pair, *self.universe.symbols, *self.universe.benchmarks, *self.data.symbols)
+                if self.data.source_profile != 'native' or any(not pair.endswith('-USDC') for pair in symbols):
+                    raise ValueError('stream transport requires native OKX USDC spot datasets')
         if self.universe.mode == 'impulse':
             if self.data.mode != 'shared' or self.budget is None or self.signal.kind != 'breakout':
                 raise ValueError('impulse requires shared data, a program budget and breakout policy')
@@ -78,6 +95,9 @@ class ModularSpotControllerConfig(ControllerConfigBase):
                 raise ValueError('acquisition universe exceeds observed instruments')
             if self.trading_pair not in self.universe.symbols:
                 raise ValueError('pair is outside the configured acquisition universe')
+        if self.recipe_binding is not None:
+            verify_binding(self.recipe_binding, self.model_dump(mode='json'),
+                           source_sha256=source_digest(Path(__file__).parent, source_files()))
         return self
 
     def interval_seconds(self):
@@ -92,8 +112,7 @@ class ModularSpotControllerConfig(ControllerConfigBase):
         data = dict(values['data'])
         data['symbols'] = []
         values['data'] = data
-        sources = [(p.relative_to(Path(__file__).parent).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
-                   for p in source_files()]
+        sources = source_records(source_root(), source_files())
         return identity({'configuration': values, 'sources': sources, 'policy_version': 2})
 
     def update_markets(self, markets):
@@ -105,7 +124,7 @@ class ModularSpotController(ControllerBase):
 
     @classmethod
     def implementation_source_files(cls):
-        return source_files()
+        return [*source_files(), *component_source_files()]
 
     @property
     def performance_report(self):
@@ -125,6 +144,20 @@ class ModularSpotController(ControllerBase):
     def __init__(self, config: ModularSpotControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.runtime = ModularRuntime(self)
+        self._operator_entry_paused = False
+        self._operator_state = {'entry_paused': False, 'reason': None, 'scope': None,
+                                'updated_at': None, 'last_command_id': None}
+
+    def set_operator_entry_pause(self, enabled, *, reason=None, scope=None, command_id=None, updated_at=None):
+        if type(enabled) is not bool:
+            raise ValueError('Operator pause must be a boolean')
+        self._operator_entry_paused = enabled
+        self._operator_state = {'entry_paused': enabled, 'reason': reason, 'scope': scope,
+                                'updated_at': updated_at if updated_at is not None else time.time(),
+                                'last_command_id': command_id}
+
+    def get_operator_state(self):
+        return dict(self._operator_state)
 
     def start(self):
         if self.config.data.mode == 'shared' and self.runtime.pool is None:
@@ -164,7 +197,9 @@ class ModularSpotController(ControllerBase):
                                'acquisition_enabled': self.config.acquisition_enabled,
                                'universe_mode': self.config.universe.mode,
                                'universe_coverage': self.runtime.coverage,
-                               'data_source': self.config.data.mode}
+                               'data_source': self.config.data.mode,
+                               'recipe_binding': None if self.config.recipe_binding is None
+                               else self.config.recipe_binding.model_dump(mode='json')}
 
     def determine_executor_actions(self):
         if self.status != RunnableStatus.RUNNING:
@@ -172,6 +207,21 @@ class ModularSpotController(ControllerBase):
         actions = self.runtime.actions()
         self.processed_data['modular_status'] = self.runtime.reason
         return actions
+
+    def get_custom_info(self) -> dict:
+        """Bounded, read-only metadata for the native performance-report publisher."""
+        return {
+            'operator': self.get_operator_state(),
+            'modular_status': self.runtime.reason.split(':', 1)[0][:80],
+            'candle_open': self.processed_data.get('candle_open'),
+            'execution_enabled': self.config.execution_enabled,
+            'acquisition_enabled': self.config.acquisition_enabled,
+            'universe_mode': self.config.universe.mode,
+            'universe_coverage': None if self.runtime.coverage is None else str(self.runtime.coverage),
+            'data_source': self.config.data.mode,
+            'recipe_binding': None if self.config.recipe_binding is None
+            else self.config.recipe_binding.model_dump(mode='json'),
+        }
 
     def entry_permission(self, config, *, check_funds=True):
         return super().validate_executor_config(config) and self.runtime.entry_permission(config, check_funds=check_funds)

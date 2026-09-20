@@ -1,8 +1,12 @@
+> Current native composition: [CONTROLLER_PARITY.md](CONTROLLER_PARITY.md). Rust transport history: [RUST_CANDLE_VALIDATION.md](RUST_CANDLE_VALIDATION.md). Final cross-repository evidence belongs to `rsibot/docs/reports/2026-09-19-modular-native-completion.md`. Earlier counts below retain their original source scope.
+
 # Modular spot controller — isolated candidate
 
 Status: locally validated integration candidate, execution disabled by default.
-The goal is modular reuse for OK RSI and RSI V5, but the current baseline policies
-are not behavior-equivalent replacements. See [PUBLICATION_RECEIPT.md](PUBLICATION_RECEIPT.md) for the fresh standalone checks and [VALIDATION.md](VALIDATION.md) for historical evidence. The later native-policy and Rust-stream candidate belongs to PR #57.
+The `modular_ok_rsi` and `modular_rsi_v5` families reuse the complete existing native
+controllers through thin composition wrappers. The separate `modular_spot` RSI-cross
+and breakout policies remain experimental baselines. They are not relabeled as
+either native strategy. See CONTROLLER_PARITY.md for their distinct contracts.
 Native contract baseline: Hummingbot commit
 `4df9ff3158a405b71d28b1c07446cfc7864a19fa`.
 
@@ -10,10 +14,29 @@ Native contract baseline: Hummingbot commit
 
 `controllers/generic/modular_spot.py` declares `ModularSpotController(ControllerBase)`
 and its native-discoverable configuration in the same module. All policies and
-adapters are private to `controllers/generic/modular_spot_core/`. Existing controllers,
-shared executors, connector implementations, API/UI registration, deployment
-configuration and root component pins are unchanged. No other controller is
-migrated, redirected, monkey-patched or automatically enrolled.
+adapters are private to `controllers/generic/modular_spot_core/`. The new native
+wrappers live beside that controller and inherit the original implementations.
+Three runner/accounting gates recognize genuine modular OK RSI through a narrow
+native configuration-class predicate. The API companion binds native configuration
+and immutable image identity. Existing controller algorithms, connector and executor
+implementations, live deployment configuration and root component pins are unchanged.
+No running owner is migrated or automatically enrolled.
+
+Native-family recipes use `NativePolicyRecipe`, the actual native parameter schema,
+and an explicit separate owner ID. Exports are disabled and contain no initial
+inventory adoption. Native candle transport remains available; shared confirmed
+WebSocket transport is opt-in. The Rust service admits 2–10,000 rows per pair within
+a three-million-row service bound, with validated persistent cache recovery. Native
+warm-up defaults are 1,500 rows for OK RSI, 3,660 for episode context, and 7,514 for
+RSI V5. These bounds do not constitute an all-universe long-history benchmark.
+
+Each native wrapper currently uses one stream connection; the service admits 32
+clients. The 294-pair multiplexed feed test is distinct from running 294 native
+controllers. Source seals cover controller dependencies; the native engine and
+runner must additionally be bound by the tested image identity.
+
+The remaining component and policy sections describe the original `modular_spot`
+baseline. Native families retain their own signal, sizing, execution and exit rules.
 
 Native Hummingbot owns candles/market-data access, trend-context calculation,
 ExecutorActions, executor construction, orders, fills, cancellation, terminal-fill

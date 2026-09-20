@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "sell_only_design",
+  "family": "sell_only",
+  "connector": "okx",
+  "capital_model": "spot_cash_inventory_1x",
+  "account_topology": "segregated_account",
+  "symbols": ["SUI-USDC"],
+  "quote_budget": "100",
+  "max_positions": 1,
+  "history": 300,
+  "signal": null,
+  "acquisition": {"fractions": ["1"]}
+}

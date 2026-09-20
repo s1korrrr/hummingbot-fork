@@ -1,0 +1,16 @@
+{"reader": 0, "pair": "ETH-USDC", "open_time": 1789845000, "received_at": 1789845097.448929, "adapter_at": 1789845097.45045, "sequence": 1, "type": "snapshot", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "ETH-USDC", "open_time": 1789845000, "received_at": 1789845097.448929, "adapter_at": 1789845097.451026, "sequence": 1, "type": "snapshot", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 0, "pair": "BTC-USDC", "open_time": 1789845000, "received_at": 1789845097.677831, "adapter_at": 1789845097.679529, "sequence": 1, "type": "snapshot", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "BTC-USDC", "open_time": 1789845000, "received_at": 1789845097.677831, "adapter_at": 1789845097.679002, "sequence": 1, "type": "snapshot", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 0, "pair": "ETH-USDC", "open_time": 1789845060, "received_at": 1789845120.313256, "adapter_at": 1789845120.314796, "sequence": 2, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "ETH-USDC", "open_time": 1789845060, "received_at": 1789845120.313256, "adapter_at": 1789845120.314521, "sequence": 2, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 0, "pair": "BTC-USDC", "open_time": 1789845060, "received_at": 1789845121.12582, "adapter_at": 1789845121.1271281, "sequence": 2, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "BTC-USDC", "open_time": 1789845060, "received_at": 1789845121.12582, "adapter_at": 1789845121.1266408, "sequence": 2, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 0, "pair": "BTC-USDC", "open_time": 1789845120, "received_at": 1789845180.945553, "adapter_at": 1789845180.947159, "sequence": 3, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "BTC-USDC", "open_time": 1789845120, "received_at": 1789845180.945553, "adapter_at": 1789845180.947745, "sequence": 3, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 0, "pair": "ETH-USDC", "open_time": 1789845120, "received_at": 1789845181.414226, "adapter_at": 1789845181.4150982, "sequence": 3, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "ETH-USDC", "open_time": 1789845120, "received_at": 1789845181.414226, "adapter_at": 1789845181.414856, "sequence": 3, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 0, "pair": "BTC-USDC", "open_time": 1789845180, "received_at": 1789845241.027495, "adapter_at": 1789845241.03025, "sequence": 4, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "BTC-USDC", "open_time": 1789845180, "received_at": 1789845241.027495, "adapter_at": 1789845241.029827, "sequence": 4, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 0, "pair": "ETH-USDC", "open_time": 1789845180, "received_at": 1789845241.240249, "adapter_at": 1789845241.240949, "sequence": 4, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}
+{"reader": 1, "pair": "ETH-USDC", "open_time": 1789845180, "received_at": 1789845241.240249, "adapter_at": 1789845241.241431, "sequence": 4, "type": "candle", "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183"}

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "name": "rust_candle_validation",
+  "family": "rebound",
+  "connector": "okx",
+  "capital_model": "spot_cash_inventory_1x",
+  "account_topology": "single_native_recorder",
+  "symbols": [
+    "BTC-USDC"
+  ],
+  "observation_symbols": [],
+  "benchmarks": [],
+  "native_owners": [],
+  "account": "isolated_data_only",
+  "program_revision": "0",
+  "policy_revision": "0",
+  "quote_budget": "100",
+  "max_positions": 1,
+  "history": 90,
+  "data_transport": "stream",
+  "data_origin": "http://127.0.0.1:8766",
+  "token_file": "/run/secrets/modular_candle_reader",
+  "signal": {
+    "kind": "rsi_rebound",
+    "rsi_length": 14,
+    "oversold": "30",
+    "breakout_lookback": 20,
+    "require_uptrend": true
+  },
+  "acquisition": {
+    "fractions": [
+      "1"
+    ],
+    "minimum_drop": "0.02",
+    "cooldown_seconds": 300,
+    "entry_timeout_seconds": 60
+  },
+  "trailing": {
+    "activation": "0.015",
+    "delta": "0.005"
+  },
+  "risk": {
+    "max_drawdown_fraction": "0.10",
+    "max_daily_loss_fraction": "0.05",
+    "max_spread_fraction": "0.003",
+    "fee_reserve_fraction": "0.005",
+    "cash_reserve_quote": "0"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "passed": true,
+  "scope": "150-second two-pair preflight only",
+  "reason_full_smoke_passed_is_false": "The harness full passed flag requires900seconds and bothplannedrestarts; these are deliberately not part of this shortpreflight.",
+  "summary": "summary.json",
+  "binary_sha256": "d1c7eec637530641d1edf834507a024632ba0f51758519cc5ba5f762889fab64"
+}

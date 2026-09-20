@@ -1,0 +1,133 @@
+name: Modular native validation
+
+on:
+  pull_request:
+    paths:
+      - 'controllers/generic/modular_**'
+      - 'controllers/generic/rsi_modular.py'
+      - 'controllers/generic/component_breakout.py'
+      - 'controllers/generic/modular_spot_core/**'
+      - 'controllers/directional_trading/**'
+      - 'hummingbot/strategy_v2/**'
+      - 'hummingbot/strategy/strategy_v2_base.py'
+      - 'hummingbot/strategy/native_observability.py'
+      - 'hummingbot/connector/**'
+      - 'hummingbot/model/**'
+      - 'hummingbot/core/**'
+      - 'setup/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'environment.yml'
+      - 'install'
+      - 'compile'
+      - '.github/actions/install_env_and_hb/**'
+      - 'hummingbot/data_feed/candles_feed/**'
+      - 'scripts/v2_with_controllers.py'
+      - 'services/okx-candle-service/**'
+      - 'test/**'
+      - 'docs/controllers/modular_spot/**'
+      - '.github/workflows/modular-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: modular-native-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust candle contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: services/okx-candle-service
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install declared minimum Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+      - name: Verify formatting, contracts and strict lint
+        run: |
+          cargo +1.88.0 fmt --check
+          cargo +1.88.0 test --locked
+          cargo +1.88.0 clippy --locked --all-targets -- -D warnings
+
+  native:
+    name: Native modular and legacy regression contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Build the owning native environment
+        uses: ./.github/actions/install_env_and_hb
+        with:
+          program-cache-hit: 'false'
+          dependencies-cache-hit: 'false'
+      - name: Run native modular and existing controller boundaries
+        shell: bash
+        run: |
+          source "$CONDA/etc/profile.d/conda.sh"
+          conda activate hummingbot
+          PYTHONPATH="$PWD" python - <<'PYTHON'
+          import importlib
+          for module in (
+              "hummingbot.connector.connector_base",
+              "hummingbot.connector.markets_recorder",
+              "hummingbot.strategy.strategy_v2_base",
+              "hummingbot.strategy_v2.executors.position_executor.position_executor",
+              "hummingbot.strategy_v2.executors.order_executor.order_executor",
+              "controllers.generic.modular_spot",
+              "controllers.generic.modular_ok_rsi",
+              "controllers.generic.modular_rsi_v5",
+              "controllers.generic.rsi_modular",
+              "controllers.generic.component_breakout",
+              "hummingbot.strategy_v2.components",
+          ):
+              importlib.import_module(module)
+          print("Required compiled native and controller imports passed")
+          PYTHON
+          PYTHONPATH="$PWD" python -m pytest \
+            test/test_strategy_components.py \
+            test/test_strategy_component_source_identity.py \
+            test/modular_spot \
+            test/hummingbot/strategy_v2/executors/position_executor \
+            test/hummingbot/strategy_v2/executors/order_executor \
+            test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py \
+            test/hummingbot/strategy_v2/executors/test_wallet_sale_accounting.py \
+            test/hummingbot/data_feed/candles_feed/okx_spot_candles \
+            test/hummingbot/data_feed/candles_feed/test_candles_base.py \
+            test/test_ok_rsi_controller.py \
+            test/test_ok_rsi_candle_aggregation.py \
+            test/test_ok_rsi_sell_policy.py \
+            test/test_ok_rsi_signal_safety.py \
+            test/test_ok_rsi_restart_safety.py \
+            test/test_ok_rsi_entry_boundary_regressions.py \
+            test/test_rsi_v5_controller_import.py \
+            test/test_rsi_v5_runtime.py \
+            test/test_rsi_v5_runtime_store.py \
+            test/test_controller_report_health.py \
+            test/hummingbot/connector/exchange/paper_trade/test_native_paper_executors.py \
+            test/hummingbot/connector/exchange/paper_trade/test_native_paper_trade_exchange.py \
+            test/hummingbot/strategy_v2/paper/test_paper_session.py \
+            test/hummingbot/strategy_v2/backtesting \
+            test/hummingbot/strategy_v2/paper/test_paper_funding.py \
+            test/hummingbot/connector/exchange/okx/test_okx_order_uncertainty.py \
+            test/hummingbot/strategy_v2/paper/test_rsi_modular_paper.py \
+            test/hummingbot/strategy/test_strategy_v2_base.py \
+            test/hummingbot/strategy/test_controller_source_guard.py \
+            test/hummingbot/client/command/test_create_command.py \
+            test/hummingbot/remote_iface/test_mqtt.py \
+            test/hummingbot/remote_iface/test_mqtt_disconnect_ownership.py \
+            test/hummingbot/remote_iface/test_mqtt_log_isolation.py \
+            test/test_native_bot_observability.py \
+            test/test_ok_rsi_chart_snapshots.py \
+            test/test_rsi_v5_audit_edge_cases.py \
+            -q -rs --basetemp=/tmp/modular-native-ci

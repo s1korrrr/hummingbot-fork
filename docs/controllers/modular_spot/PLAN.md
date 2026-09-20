@@ -1,7 +1,5 @@
 # Modular spot programs and shared data — execution plan
 
-> Publication continuation: the standalone foundation is prepared on `feat/andrzej_modular_pr55_publication`, based on remote `2f9e4d016`. Earlier worktree statuses, authorities and validation entries below are retained as dated history; the current local publication receipt is [PUBLICATION_RECEIPT.md](PUBLICATION_RECEIPT.md). PR #57 owns the later native-policy, Rust stream and integration candidate.
-
 > Living ExecPlan. On an authorized implementation run, resume the first eligible unchecked milestone, use fresh review checkpoints, and update progress, decisions, evidence and blockers here. A separate actor is required for an independent audit. Use the available executing-plans or subagent-driven-development workflow; do not start another task ledger.
 
 **Goal:** Validate the isolated native modular foundation for reusable OK RSI/RSI V5 workflows. Preserve running controllers and native Hummingbot ownership; prove strategy parity before treating a modular policy as a replacement. Existing fixed-symbol, sell-only and screening code remains bounded integration scope.
@@ -32,6 +30,8 @@
 
 ## 2026-09-19 full-USDC streaming and companion PR continuation
 
+The subsequent user-approved Rust producer implementation is tracked in [the completed Rust candle plan](../../plans/archive/2026-09-19-rust-candle-service.md), with source-bound results in [RUST_CANDLE_VALIDATION.md](RUST_CANDLE_VALIDATION.md). Historical HTTP/default transport milestones below retain their original scope.
+
 - User priority: test every currently listed live OKX USDC spot instrument at1m concurrently; measure freshness, delivery delay, gaps, errors and recovery. Public listing is observation scope, not account eligibility.
 - User product requirement: preserve all existing OK RSI/RSI V5 capabilities as reusable policies and verify Hummingbot, Hummingbot API and rsibot-stack contracts. Inspect companion PR57 at068702141f1b and root PR188 atacd1f83; do not assume library-only delivery is native integration.
 - Authority remains repository-process-only with isolated unauthenticated public reads. No live-stack writes/restarts, account calls, orders, activation, deployment, research economics, pins, publication or merge.
@@ -56,7 +56,7 @@ The first documentation commits are `6ec32c4e2d5179b88a8f9f3cc711ad592e7797cb` a
 
 The original task published documentation only. The 2026-09-18 M0-M8 implementation and 2026-09-19 local validation/repair are authorized continuations, bounded by the current validation contract above. No account/runtime changes, existing-controller edits, activation, economic backtests, pin updates, deploy or merge are authorized.
 
-When implementation is explicitly resumed, keep code in `controllers/generic/modular_spot.py` and `controllers/generic/modular_spot_core/`, tests in `test/modular_spot/`, and task documentation here. Add another native-discoverable entry point for this family only if composition requires it and its exact path is reviewed. No inheritance from or mutation of OK RSI, HL RSI, RSI V5 or other existing controllers. No global executor-map change or alternate fill/PnL ledger.
+When implementation is explicitly resumed, keep code in `controllers/generic/modular_spot.py` and `controllers/generic/modular_spot_core/`, tests in `test/modular_spot/`, and task documentation here. Add another native-discoverable entry point for this family only if composition requires it and its exact path is reviewed. Reuse pure OK RSI/RSI V5 policies with parity tests; do not inherit whole legacy controllers or mutate running owners. No global executor-map change or alternate fill/PnL ledger.
 
 Shared-engine, API, stack, account-topology and legacy-owner changes are separate owner work, not implicit permission to expand PR #55. Preserve the distinct execution main/SUI owners. Keep default execution disabled; spot sell-only reduces owned base rather than opening a short. Never introduce below-floor market fallback or reset acquisition cost.
 
@@ -302,7 +302,6 @@ This handoff preserves the original evidence and newly observed published helper
 
 ### Copyable implementation handoff
 
-> Read current root/owner instructions, then `docs/controllers/modular_spot/SPEC.md` and `PLAN.md`. Refresh PR #55 and resume M0, then M1's current-source/attachment reconciliation. Preserve newer published helpers and existing controllers; do not blindly apply or rewind to the old patch. Reuse native Hummingbot interfaces, validate actual wiring and run real native tests with independent review. Record exact progress, evidence and blockers. Do not activate execution, touch accounts, run economic backtests, merge or deploy without separate authority.
 > Read current root/owner instructions, SPEC.md, PLAN.md and the 2026-09-19 VALIDATION.md receipt. M0-M8 implementation has been revalidated and repaired in the uncommitted candidate. Follow the next implementation order below: reuse one selected existing controller policy and prove parity before strategy expansion. Preserve newer remote documentation and existing live owners. No activation, account mutation, backtest, publication, merge or deployment follows from source/test evidence.
 
 
@@ -414,15 +413,47 @@ wallet spenders remain outside that scope.
   that were clean; task-only incremental patch is in root audit directory.
 
 
-### Companion PR integration handoff
+## Full-universe continuation receipt (2026-09-19)
 
-The all-USDC continuation completed in the isolated sibling worktree
-`/Users/s1kor/dev/trading/rsibot/.worktrees/hummingbot-modular-integration-pr57`,
-branch `feat/andrzej_modular_stack_validation` based on PR #57 `068702141f1b`.
-It preserves this repaired PR #55 candidate and adds companion recipe/API/handoff
-fixes. See that worktree's `docs/controllers/modular_spot/UNIVERSE_VALIDATION.md`
-for 294-pair public evidence, the 563-test +10-subtest combined native receipt,
-112 API tests, 19 root handoff tests, source seals and remaining production/parity
-gaps. Those counts apply to the integrated candidate, not this older checkout.
-All 13 live container identities/start times/images remain unchanged. No commit,
-push, merge, deployment, orders or economic backtests were performed.
+- Integration owner moved to isolated branch `feat/andrzej_modular_stack_validation` at PR #57 `068702141f1b`, with preserved/repaired PR #55 source reconciled on top. Original PR #55 candidate retained. Scope includes isolated API schema/managed-source fixes and the PR #188 native-owner handoff seam; live surfaces remain forbidden.
+- [x] U1: frozen 294-pair live USDC spot catalog and current official protocol limits.
+- [x] U2: five-minute multiplexed public test, 1,176/1,176 eligible confirmed bars, expected-disconnect recovery; failed first attempt retained.
+- [x] U3: measured publisher/reader responsiveness repaired and compared; concrete native recipe/API compatibility defects repaired.
+- [x] U4: fresh combined native suite 563 tests +10 subtests, zero skips; API 112 tests; native/stack/parity boundaries documented.
+- [x] U5: final exact-source default/custom-owner handoffs; root helper 19 regressions; independent reviews; unchanged 13 live container identities and nested Hummingbot status. Unrelated concurrent quants-lab status change recorded, left untouched. Source seal and receipts linked in UNIVERSE_VALIDATION.
+
+See [UNIVERSE_VALIDATION.md](UNIVERSE_VALIDATION.md) for commands, measurements, limitations, native reuse matrix and next order. This closes the first all-symbol diagnostic, not all-pair production collector integration or legacy strategy parity. Current-source documentation supersedes stale attachment instructions while preserving the earlier receipt as historical evidence.
+
+## Native completion continuation — 2026-09-19
+
+The selected reusable native path is implemented in `modular_ok_rsi` and
+`modular_rsi_v5`, with actual native configuration, executor/lifecycle inheritance,
+optional confirmed stream candles and recorder-backed held-trail checkpointing.
+See CONTROLLER_PARITY.md and the canonical root report
+`rsibot/docs/reports/2026-09-19-modular-native-completion.md`.
+
+Fresh host verification passed 1,029 tests plus 39 subtests without skips. Final
+Linux validation passed 1,009 tests plus 39 subtests; twenty optional PyArrow-backed dtype aggregation cases
+require PyArrow and passed in the host run. The Rust service passed 29 tests. The
+294-pair Linux stream ran 900.020 steady seconds successfully; the final-image
+four-wrapper, 7,514-row probe passed 150.069 steady seconds with native features,
+independent higher-timeframe comparisons and cache restart.
+
+Native integration required three narrow runner/accounting identity gates outside
+the private controller directory. Their independent audit and actual runner/SQLite
+regressions passed. Existing controller algorithms and native order/fill ownership
+remain unchanged. API integration is separately owned and source/image-bound.
+
+This completes the bounded native integration continuation, not the later M9/new
+strategy and whole-program roadmap. The candidate is local and uncommitted.
+Remote CI is blocked by GitHub billing; publication, economic research, live-owner
+migration and activation remain separate. All thirteen live stack container IDs,
+image IDs and start times were preserved.
+
+## Publication stack reconciliation — 2026-09-19
+
+PR #55 foundation commit `0c1aa65ed9e31c92f7d5d353ae7a574ec9a1e294` is now an ancestor of this integration. Its standalone [publication receipt](PUBLICATION_RECEIPT.md) records 446 passing tests plus 10 subtests, zero skips; those results describe the parent, not this larger candidate. The original public-candle diagnostic is retained from the parent.
+
+The merge preserves this integration's already validated 10,000-row history, asynchronous bounded snapshot capture, WebSocket selection, recipe binding and transport regression tests. Older conflicting forms would remove those features. The 1,173-file final production manifest is unchanged. Parent publication documentation is retained in its receipt; current integration SPEC/PLAN/README/VALIDATION retain their newer evidence and limits. No source/history rewrite, component pin, merge into the default branch or live deployment is authorized.
+
+The merged candidate passed the full combined native command again: 1,029 tests plus 39 subtests, zero skips, in 45.67 seconds. Publication exposed a hosted coverage gap: the existing CI branch filters exclude #57's stacked base. `.github/workflows/modular-native.yml` now requests exact-head Rust minimum-toolchain and combined native regression jobs on relevant PR paths without a base-branch or draft exemption. It has read-only permissions, publishes no images and sends no notifications. Local actionlint passed; hosted execution remains unverified while GitHub billing prevents job startup.

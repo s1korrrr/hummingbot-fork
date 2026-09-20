@@ -1,0 +1,128 @@
+{
+  "contract": "native OKXSpotCandles parser plus Candle geometry; decimal comparisons in native float representation",
+  "cases": [
+    {
+      "name": "normal",
+      "row": [
+        "1789840020000",
+        "100.25",
+        "101.00",
+        "99.5",
+        "100.75",
+        "1.2345",
+        "1.2345",
+        "124.3875",
+        "1"
+      ],
+      "outcome": "accepted",
+      "expected": {
+        "open_time": 1789840020,
+        "open": "100.25",
+        "high": "101.00",
+        "low": "99.5",
+        "close": "100.75",
+        "volume": "1.2345",
+        "quote_volume": "124.3875",
+        "confirmed": true
+      }
+    },
+    {
+      "name": "tiny_price",
+      "row": [
+        "1789840080000",
+        "0.00000001",
+        "0.00000003",
+        "0.00000001",
+        "0.00000002",
+        "10000000",
+        "10000000",
+        "0.2",
+        "1"
+      ],
+      "outcome": "accepted",
+      "expected": {
+        "open_time": 1789840080,
+        "open": "1E-8",
+        "high": "3E-8",
+        "low": "1E-8",
+        "close": "2E-8",
+        "volume": "10000000",
+        "quote_volume": "0.2",
+        "confirmed": true
+      }
+    },
+    {
+      "name": "zero_volume",
+      "row": [
+        "1789840140000",
+        "1",
+        "1",
+        "1",
+        "1",
+        "0",
+        "0",
+        "0",
+        "1"
+      ],
+      "outcome": "accepted",
+      "expected": {
+        "open_time": 1789840140,
+        "open": "1",
+        "high": "1",
+        "low": "1",
+        "close": "1",
+        "volume": "0",
+        "quote_volume": "0",
+        "confirmed": true
+      }
+    },
+    {
+      "name": "forming",
+      "row": [
+        "1789840200000",
+        "100",
+        "101",
+        "99",
+        "100",
+        "1",
+        "1",
+        "100",
+        "0"
+      ],
+      "outcome": "ignored",
+      "expected": null
+    },
+    {
+      "name": "bad_geometry",
+      "row": [
+        "1789840200000",
+        "100",
+        "99",
+        "101",
+        "100",
+        "1",
+        "1",
+        "100",
+        "1"
+      ],
+      "outcome": "rejected",
+      "expected": null
+    },
+    {
+      "name": "negative_volume",
+      "row": [
+        "1789840200000",
+        "100",
+        "101",
+        "99",
+        "100",
+        "-1",
+        "-1",
+        "100",
+        "1"
+      ],
+      "outcome": "rejected",
+      "expected": null
+    }
+  ]
+}

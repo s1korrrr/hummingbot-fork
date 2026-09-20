@@ -28,16 +28,11 @@ from hummingbot.core.event.events import OrderType, PositionAction
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
-from hummingbot.exceptions import InvalidController
 from hummingbot.logger import HummingbotLogger
 from hummingbot.remote_iface.mqtt import ETopicPublisher
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_py_base import StrategyPyBase
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
-from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
-    DirectionalTradingControllerConfigBase,
-)
-from hummingbot.strategy_v2.controllers.market_making_controller_base import MarketMakingControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import (
@@ -186,15 +181,8 @@ class StrategyV2ConfigBase(BaseClientModel):
                 reload_changed_modules=reload_changed_modules,
             )
 
-            config_class = next((member for member_name, member in inspect.getmembers(module)
-                                 if inspect.isclass(member) and member not in [ControllerConfigBase,
-                                                                               MarketMakingControllerConfigBase,
-                                                                               DirectionalTradingControllerConfigBase]
-                                 and (issubclass(member, ControllerConfigBase))), None)
-            if not config_class:
-                raise InvalidController(f"No configuration class found in the module {controller_name}.")
-
-            loaded_configs.append(config_class(**config_data))
+            from hummingbot.strategy_v2.controllers.controller_loader import load_controller_config
+            loaded_configs.append(load_controller_config(config_data, settings.CONTROLLERS_MODULE, module))
 
         return loaded_configs
 

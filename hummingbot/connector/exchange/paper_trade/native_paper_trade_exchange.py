@@ -174,6 +174,18 @@ class NativePaperTradeExchange(ExchangeBase):
     def ready(self):
         return all(self._fresh(p) for p in self._rules)
 
+    def pair_ready(self, trading_pair):
+        """Observed freshness for one configured pair; aggregate readiness stays strict."""
+        return trading_pair in self._rules and self._fresh(trading_pair)
+
+    def invalidate_order_book(self, trading_pair):
+        """Known upstream loss revokes depth immediately, without releasing orders."""
+        if trading_pair not in self._rules:
+            raise ValueError('Unknown paper book')
+        self._books.pop(trading_pair, None)
+        self._depth.pop(trading_pair, None)
+        self._book_time.pop(trading_pair, None)
+
     @property
     def status_dict(self):
         return {'fresh_injected_books': self.ready}

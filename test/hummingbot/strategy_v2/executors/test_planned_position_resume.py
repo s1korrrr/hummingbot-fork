@@ -90,7 +90,7 @@ class ResumeValidationTests(TestCase):
             validate_position(self.preflight, self.row)
 
 
-async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2'):
+async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_pair='ETH-USDT', controller_id='owner'):
     db = tmp_path / 'stopped.sqlite'
     preflight = tmp_path / 'preflight.sqlite'
     root = tmp_path / 'runtime'
@@ -99,13 +99,26 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2'):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text((resume.ROOT / file).read_text() if file in resume.SOURCES else 'id: owner\n')
     (root / 'conf/scripts/owner.yml').write_text('script_file_name: v2_with_controllers.py\ncontrollers_config: [owner.yml]\n')
-    (root / 'conf/controllers/owner.yml').write_text('id: owner\nconnector_name: okx\ntrading_pair: ETH-USDT\n')
+    (root / 'conf/controllers/owner.yml').write_text(f'id: {controller_id}\nconnector_name: okx\ntrading_pair: {trading_pair}\n')
     manager = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS, db_path=str(db))
     recorder = MarketsRecorder(manager, [], 'owner.yml', 'v2_with_controllers',
                                market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False))
     executor = make_executor()
-    executor.config.controller_id = 'owner'
-    executor._open_order = tracked('entry', TradeType.BUY, '1', OrderState.FILLED)
+    executor.config.controller_id = controller_id
+    executor.config.trading_pair = trading_pair
+
+    def pair_tracked(*args):
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+        original = tracked(*args)
+        payload = original.order.to_json()
+        payload['trading_pair'] = trading_pair
+        for fill in payload['order_fills'].values():
+            fill['trading_pair'] = trading_pair
+        result = TrackedOrder(original.order_id)
+        result.order = InFlightOrder.from_json(payload)
+        return result
+
+    executor._open_order = pair_tracked('entry', TradeType.BUY, '1', OrderState.FILLED)
     if armed:
         executor._trailing_stop_trigger_pct = Decimal('.035')
         executor._trailing_stop_move_count = 4
@@ -118,29 +131,29 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2'):
     await executor.control_task()
     assert executor.is_closed
     recorder.store_or_update_executor(executor)
-    recorder.store_or_update_position_hold_ledger_entries('owner', executor.config.id, 'okx', 'ETH-USDT',
+    recorder.store_or_update_position_hold_ledger_entries(controller_id, executor.config.id, 'okx', trading_pair,
                                                           executor._held_position_orders)
     # An independent held receipt in the SAME pair must survive ownership transfer.
-    unrelated = tracked('unrelated', TradeType.BUY, unrelated_amount, OrderState.FILLED).order.to_json()
+    unrelated = pair_tracked('unrelated', TradeType.BUY, unrelated_amount, OrderState.FILLED).order.to_json()
     if Decimal(unrelated_amount):
-        recorder.store_or_update_position_hold_ledger_entries('owner', 'other-executor', 'okx', 'ETH-USDT', [unrelated])
+        recorder.store_or_update_position_hold_ledger_entries(controller_id, 'other-executor', 'okx', trading_pair, [unrelated])
     with manager.get_new_session() as session:
         receipts = [executor._held_position_orders[0]] + ([unrelated] if Decimal(unrelated_amount) else [])
         for receipt in receipts:
             oid = receipt['client_order_id']
             session.add(Order(id=oid, config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
-                              symbol='ETH-USDT', base_asset='ETH', quote_asset='USDT', creation_timestamp=1000,
+                              symbol=trading_pair, base_asset='ETH', quote_asset=trading_pair.split('-')[1], creation_timestamp=1000,
                               order_type='LIMIT', amount=Decimal(receipt['amount']), leverage=1, price=Decimal('100'),
                               last_status='BuyOrderCompleted', last_update_timestamp=2000, exchange_order_id=oid,
                               position='NIL'))
             for tid, fill in receipt['order_fills'].items():
                 session.add(TradeFill(config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
-                                      symbol='ETH-USDT', base_asset='ETH', quote_asset='USDT', timestamp=2000,
+                                      symbol=trading_pair, base_asset='ETH', quote_asset=trading_pair.split('-')[1], timestamp=2000,
                                       order_id=oid, trade_type='BUY', order_type='LIMIT', price=Decimal(fill['fill_price']),
                                       amount=Decimal(fill['fill_base_amount']), leverage=1, trade_fee=fill['fee'],
                                       trade_fee_in_quote=Decimal(0), exchange_trade_id=tid, position='NIL'))
-        session.add(Position(id='aggregate', controller_id='owner', connector_name='okx', side='BUY',
-                             trading_pair='ETH-USDT', timestamp=1000, volume_traded_quote=Decimal('120'),
+        session.add(Position(id='aggregate', controller_id=controller_id, connector_name='okx', side='BUY',
+                             trading_pair=trading_pair, timestamp=1000, volume_traded_quote=Decimal('120'),
                              amount=Decimal('1') + Decimal(unrelated_amount), breakeven_price=Decimal('100'),
                              unrealized_pnl_quote=Decimal('0'), realized_pnl_quote=Decimal('0'), cum_fees_quote=Decimal('0')))
         session.commit()
@@ -148,7 +161,7 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2'):
     evidence = {'schema': 1, 'owner': 'test-owner', 'script_config': 'owner.yml', 'owner_stopped': True, 'venue_open_orders': [], 'observed_at': 1000,
                 'expires_at': 1800, 'config_paths': ['conf/scripts/owner.yml', 'conf/controllers/owner.yml', 'conf/conf_client.yml', 'conf/connectors/okx.yml'],
                 'executors': [{'executor_id': executor.config.id, 'client_order_id': 'entry',
-                               'exchange_order_id': 'entry', 'trading_pair': 'ETH-USDT', 'state': 'filled',
+                               'exchange_order_id': 'entry', 'trading_pair': trading_pair, 'state': 'filled',
                                'filled_base': '1', 'filled_quote': '100', 'net_base': '1',
                                'fills': {tid: {'fill_base_amount': f['fill_base_amount'], 'fill_price': f['fill_price'],
                                                'fee': f['fee']} for tid, f in entry['order_fills'].items()}}]}
@@ -157,24 +170,24 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2'):
     with sqlite3.connect(db) as checkpoint:
         checkpoint.execute('PRAGMA wal_checkpoint(TRUNCATE)')
     sha = hashlib.sha256(db.read_bytes()).hexdigest()
-    pending = [{'pair': 'ETH-USDT', 'regular': [], 'regular_count': 0, 'algo_count': 0, 'algos': {kind: [] for kind in resume.SPOT_ALGO_TYPES}}]
+    pending = [{'pair': trading_pair, 'regular': [], 'regular_count': 0, 'algo_count': 0, 'algos': {kind: [] for kind in resume.SPOT_ALGO_TYPES}}]
     evidence['reconciliation'] = {
         'schema_version': 1, 'kind': 'okx_stopped_owner_get_reconciliation', 'venue_queried': True,
         'read_only': True, 'result': 'EVIDENCE_COMPLETE', 'blockers': [], 'owner': 'test-owner',
         'database': {'sha256': sha, 'sha256_after': sha},
         'started_at': datetime.fromtimestamp(990, timezone.utc).isoformat(),
         'finished_at': datetime.fromtimestamp(1000, timezone.utc).isoformat(),
-        'controller_pairs': {'owner': 'ETH-USDT'}, 'selected_executor_ids': [executor.config.id],
+        'controller_pairs': {controller_id: trading_pair}, 'selected_executor_ids': [executor.config.id],
         'pending_before': pending, 'pending_after': pending,
         'balance_coverage': [{'asset': 'ETH', 'owned_residual': '1', 'cash_balance': '10',
                               'available_balance': '10', 'covered': True}],
-        'selected_executors': [{'executor_id': executor.config.id, 'controller_id': 'owner', 'pair': 'ETH-USDT',
+        'selected_executors': [{'executor_id': executor.config.id, 'controller_id': controller_id, 'pair': trading_pair,
                                'venue_orders': [{'raw_order': {'clOrdId': 'entry', 'ordId': 'entry',
-                                                               'instId': 'ETH-USDT', 'side': 'buy',
+                                                               'instId': trading_pair, 'side': 'buy',
                                                                'state': 'filled', 'tdMode': 'cash',
                                                                'sz': '1', 'accFillSz': '1'},
                                                  'raw_fills': [{'tradeId': 'entry', 'ordId': 'entry',
-                                                                'instId': 'ETH-USDT', 'side': 'buy',
+                                                                'instId': trading_pair, 'side': 'buy',
                                                                 'fillSz': '1', 'fillPx': '100',
                                                                 'fee': '0', 'feeCcy': 'ETH'}],
                                                  'receipt': {'blockers': []},

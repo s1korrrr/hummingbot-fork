@@ -67,3 +67,20 @@ class PositionExecutorConfig(ExecutorConfigBase):
     entry_order_policy: Literal["retry", "single_attempt"] = "retry"
     require_terminal_entry_reconciliation: bool = False
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+def parse_position_config(payload):
+    """Decode the explicit native subtype without dropping durable entry policy."""
+    if not isinstance(payload, dict):
+        raise ValueError('Position configuration must be an object')
+    config_class = PositionExecutorConfig
+    if 'entry_acquisition_policy' in payload:
+        if payload['entry_acquisition_policy'] != 'down_only_maker_v1':
+            raise ValueError('Unsupported persisted position entry policy')
+        from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+            DownOnlyMakerPositionExecutorConfig,
+        )
+        config_class = DownOnlyMakerPositionExecutorConfig
+    if set(payload) - set(config_class.model_fields):
+        raise ValueError('Unknown persisted position configuration fields')
+    return config_class.model_validate(payload)

@@ -19,7 +19,7 @@ from hummingbot.connector.exchange.okx.native_reconciliation import SPOT_ALGO_TY
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.models.executors import CloseType
 
 TABLE = 'PlannedPositionResume'
@@ -35,6 +35,11 @@ SOURCES = (
     'hummingbot/connector/markets_recorder.py',
     'hummingbot/connector/exchange/okx/okx_exchange.py',
     'hummingbot/connector/exchange/okx/native_reconciliation.py',
+    'hummingbot/strategy_v2/models/executors_info.py',
+    'hummingbot/strategy_v2/controllers/native_policy_identity.py',
+    'controllers/directional_trading/ok_rsi_core/down_only_entry_execution.py',
+    'controllers/directional_trading/ok_rsi_core/down_only_entry.py',
+    'controllers/directional_trading/ok_rsi_core/execution.py',
 )
 TRAILING_KEYS = ('trailing_state', 'trailing_stop_trigger_pct', 'trailing_move_count',
                  'trailing_armed_timestamp', 'trailing_last_update_timestamp')
@@ -86,7 +91,7 @@ def validate_position_receipts(preflight, stopped):
     require(stopped['type'] == 'position_executor', 'only PositionExecutor is supported')
     for key in ('id', 'controller_id', 'timestamp', 'config', 'type'):
         require(preflight[key] == stopped[key], f'preflight identity/configuration differs: {key}')
-    config = PositionExecutorConfig.model_validate(stopped['config'])
+    config = parse_position_config(stopped['config'])
     require(config.id == stopped['id'] and config.controller_id == stopped['controller_id'], 'executor owner differs')
     require(config.side == TradeType.BUY and config.leverage == 1 and config.connector_name == 'okx',
             'only fully filled OKX 1x spot BUY is supported')
@@ -102,6 +107,21 @@ def validate_position_receipts(preflight, stopped):
     require(len(entries) == 1, 'one singleton terminal entry receipt required')
     entry = entries[0]
     order_id = entry['client_order_id']
+    acquisition = custom.get('entry_acquisition')
+    if acquisition is not None or getattr(config, 'entry_acquisition_policy', None) is not None:
+        require(getattr(config, 'entry_acquisition_policy', None) == 'down_only_maker_v1',
+                'missing native down-only configuration; explicit reconciliation required')
+        for snapshot in (preflight['custom_info'], custom):
+            receipt = snapshot.get('entry_acquisition')
+            require(isinstance(receipt, dict) and receipt.get('policy') == 'down_only_maker_v1'
+                    and receipt.get('intent_id') == config.id and receipt.get('order_ids') == [order_id]
+                    and type(receipt.get('reprice_count')) is int and receipt['reprice_count'] == 0
+                    and receipt.get('replacement_purpose') is None
+                    and receipt.get('replacement_of_order_id') is None,
+                    'planned down-only resume supports an unreplaced singleton entry only')
+            require(decimal(receipt.get('cumulative_filled_base')) == config.amount
+                    and decimal(receipt.get('remaining_base')) == 0,
+                    'planned down-only resume requires a completely filled entry')
     require(custom.get('order_ids') == [order_id] and preflight['custom_info'].get('order_ids') == [order_id],
             'singleton entry identity changed or extra order exists')
     order = InFlightOrder.from_json(entry)

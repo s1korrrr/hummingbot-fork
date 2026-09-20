@@ -1,11 +1,13 @@
 """Candidate admission only. Native fills, executors and PositionHold own accounting.
 
-One recorder/strategy/controller/pair, at most 50 USDC for this opt-in candidate.
+One recorder/strategy envelope, at most 50 USDC for this opt-in candidate.
+The default remains one controller/pair; strategy scope binds every native peer.
 This does not reserve funds from independent processes sharing the wallet.
 """
 import json
 import re
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import Field
 from sqlalchemy import update
@@ -24,6 +26,30 @@ ZERO = Decimal('0')
 class CandidateFundingPolicy(PolicyModel):
     allocation_quote: Decimal = Field(gt=0, le=50)
     fee_reserve_fraction: Decimal = Field(gt=0, le=Decimal('.1'))
+    max_position_quote: Decimal = Field(default=50, gt=0, le=50)
+    scope: Literal['controller', 'strategy'] = 'controller'
+
+
+def bind_funding_scope(controllers):
+    """Bind one runner's genuine owners; never coordinate independent recorders."""
+    funded = [c for c in controllers.values() if getattr(c.config, 'funding', None) is not None]
+    if not any(c.config.funding.scope == 'strategy' for c in funded):
+        return
+    from hummingbot.strategy_v2.controllers.native_policy_identity import is_modular_policy
+    policy = funded[0].config.funding
+    if (len(funded) != len(controllers) or not 1 <= len(funded) <= 1000
+            or any(not is_modular_policy(c.config) or c.config.funding != policy
+                   or c.config.funding.scope != 'strategy' for c in funded)):
+        raise PolicyError('Strategy funding requires identical policies on every genuine native owner')
+    if (len({c.config.id for c in funded}) != len(funded)
+            or len({c.config.trading_pair for c in funded}) != len(funded)
+            or len({(c.config.connector_name, c.config.execution_mode) for c in funded}) != 1
+            or any(key != owner.config.id for key, owner in controllers.items())):
+        raise PolicyError('Strategy funding requires unique pairs and owners on one native connector')
+    peers = tuple(controllers[key] for key in sorted(controllers))
+    for owner in peers:
+        owner._funding_peers = peers
+    return peers
 
 
 def funding_projection(fills, connector, pair):
@@ -87,8 +113,19 @@ class NativeFundingStore:
         self.owner, self.recorder = owner, recorder
         self.policy = owner.config.funding
         self.key = 'modular-candidate-funding:v1:' + identity([recorder.config_file_path])
-        self.binding = identity([owner.config.id, owner.config.connector_name, owner.config.trading_pair,
-                                 owner._composition_digest, owner._native_source_hash])
+        if self.policy.scope == 'strategy':
+            peers = getattr(owner, '_funding_peers', ())
+            if not peers or not any(peer is owner for peer in peers):
+                raise PolicyError('Strategy funding requires runner-bound owners')
+            self.owners = {peer.config.id: peer for peer in peers}
+            bind_funding_scope(self.owners)
+            self.binding = identity(['strategy', self.policy.model_dump(mode='json'),
+                                     [[peer.config.id, peer.config.connector_name, peer.config.trading_pair,
+                                       peer._composition_digest, peer._native_source_hash] for peer in peers]])
+        else:
+            self.owners = {owner.config.id: owner}
+            self.binding = identity([owner.config.id, owner.config.connector_name, owner.config.trading_pair,
+                                     owner._composition_digest, owner._native_source_hash])
         self.status = {}
 
     def _load(self):
@@ -193,10 +230,14 @@ class NativeFundingStore:
 
     def _evidence(self, state, raw, *, reconcile=False):
         config = self.owner.config
+        if self.policy.scope == 'strategy':
+            bind_funding_scope(self.owners)
+            if any(peer.config.funding != self.policy or not peer._composition_unchanged() for peer in self.owners.values()):
+                raise PolicyError('Strategy funding owner configuration or implementation changed')
         saved = self.recorder.get_all_executors()
-        current = list(self.owner.executors_info)
-        if any(info.controller_id != config.id for info in [*saved, *current]):
-            raise PolicyError('Candidate funding admits one native controller per recorder')
+        current = [info for peer in self.owners.values() for info in peer.executors_info]
+        if any(info.controller_id not in self.owners for info in [*saved, *current]):
+            raise PolicyError('Candidate funding admits only its bound native controllers per recorder')
         infos = {}
         for collection in (saved, current):
             seen = set()
@@ -205,22 +246,23 @@ class NativeFundingStore:
                     raise PolicyError('Duplicate native executor evidence')
                 seen.add(info.id)
                 previous = infos.get(info.id)
-                if previous is not None and _config_identity(previous.config, config.id) != _config_identity(info.config, config.id):
+                if previous is not None and _config_identity(previous.config, info.controller_id) != _config_identity(info.config, info.controller_id):
                     raise PolicyError('Saved/current native executor configuration conflict')
                 infos[info.id] = info
         fills = self.recorder.get_trades_for_config(self.recorder.config_file_path)
         connector = self.owner.market_data_provider.connectors[config.connector_name]
         orders = self.recorder.get_orders_for_config_and_market(self.recorder.config_file_path, connector)
-        if raw is None and (infos or fills or orders or self.owner.positions_held):
+        if raw is None and (infos or fills or orders or any(peer.positions_held for peer in self.owners.values())):
             raise PolicyError('Native history exists without funding checkpoint; reconcile explicitly')
         owned = {}
         for info in infos.values():
             cfg = info.config
-            if cfg.connector_name != config.connector_name or cfg.trading_pair != config.trading_pair:
+            owner_config = self.owners[info.controller_id].config
+            if cfg.connector_name != owner_config.connector_name or cfg.trading_pair != owner_config.trading_pair:
                 raise PolicyError('Foreign native executor scope in funding recorder')
             if cfg.side == TradeType.BUY:
                 claim = state['claims'].get(info.id)
-                if claim is None or claim['config'] != _config_identity(cfg, config.id):
+                if claim is None or claim['config'] != _config_identity(cfg, info.controller_id):
                     raise PolicyError('Native BUY lacks immutable funding admission')
             for _, _, order_id in ExecutorOrchestrator._owned_order_keys(info):
                 if order_id in owned and owned[order_id] != info.id:
@@ -242,7 +284,18 @@ class NativeFundingStore:
                 raise PolicyError('Unowned order in candidate connector')
             if any((order_id, str(trade)) not in recorded for trade in order.order_fills):
                 raise PolicyError('Native fill is not durably recorded yet')
-        projection = funding_projection(fills, config.connector_name, config.trading_pair)
+        pairs = {peer.config.trading_pair for peer in self.owners.values()}
+        if any(fill.symbol not in pairs for fill in fills):
+            raise PolicyError('Native fill has an unbound pair')
+        by_pair = {pair: funding_projection([fill for fill in fills if fill.symbol == pair], config.connector_name, pair)
+                   for pair in sorted(pairs)}
+        projections = list(by_pair.values())
+        projection = {key: sum((part[key] for part in projections), ZERO)
+                      for key in ('cash_used', 'inventory_cost', 'used')}
+        projection.update({key: {item: value for part in projections for item, value in part[key].items()}
+                           for key in ('fills', 'bought_by_order')})
+        projection['used_by_pair'] = {pair: part['used'] for pair, part in by_pair.items()}
+        projection['pending_by_pair'] = {pair: ZERO for pair in pairs}
         if any(projection['fills'].get(key) != value for key, value in state['fills'].items()):
             raise PolicyError('Recorded funding fills disappeared or changed')
         for fill in fills:
@@ -272,7 +325,9 @@ class NativeFundingStore:
                     raise PolicyError('Native terminal reconciliation changed after funding release')
                 state['releases'][executor_id] = receipt
             else:
-                pending += (authorized - quantity) * decimal(claim['price'], 'funded price') * (1 + self.policy.fee_reserve_fraction)
+                reserved = (authorized - quantity) * decimal(claim['price'], 'funded price') * (1 + self.policy.fee_reserve_fraction)
+                pending += reserved
+                projection['pending_by_pair'][info.config.trading_pair] += reserved
         return projection, pending, infos
 
     def _validate_release(self, info, receipt, quantity, fills, orders):
@@ -309,7 +364,7 @@ class NativeFundingStore:
         if (info is None or not isinstance(receipt, dict) or set(receipt) != fields
                 or type(receipt['schema']) is not int or receipt['schema'] != 1
                 or (info.config.entry_order_policy != 'single_attempt' and info.is_active)
-                or receipt['trading_pair'] != self.owner.config.trading_pair or receipt['side'] != 'BUY'
+                or receipt['trading_pair'] != info.config.trading_pair or receipt['side'] != 'BUY'
                 or not quantity <= decimal(receipt['amount'], 'reconciled amount', positive=True) <= info.config.amount
                 or decimal(receipt['filled_base'], 'reconciled filled quantity') != quantity):
             raise PolicyError('Native terminal reconciliation scope or quantity differs')
@@ -395,6 +450,9 @@ class NativeFundingStore:
                     raise PolicyError('Duplicate or mutated funded native executor')
                 raise PolicyError('Unresolved funded intent requires explicit reconciliation')
             required = amount * price * (1 + self.policy.fee_reserve_fraction)
+            if (required + projection['used_by_pair'][config.trading_pair]
+                    + projection['pending_by_pair'][config.trading_pair] > self.policy.max_position_quote):
+                raise PolicyError('Candidate per-position funding allocation exhausted')
             self.status = {'allocation_quote': str(self.policy.allocation_quote),
                            'native_cash_used': str(projection['cash_used']),
                            'native_inventory_cost': str(projection['inventory_cost']),

@@ -17,6 +17,7 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from .candle_data import Dataset
 from .data_reader import DataPolicy, DataPool
 from .domain import DataUnavailable, PolicyError
+from .native_funding import CandidateFundingPolicy, NativeFundingStore
 from .native_recovery import NativeRecoveryStore
 from .recipe_contract import RecipeBinding, configuration_digest, source_digest, verify_binding
 
@@ -120,6 +121,7 @@ class NativeCompositionFields(BaseModel):
     data: DataPolicy = Field(default_factory=DataPolicy)
     shared_history: int | None = Field(default=None, ge=500, le=10000, strict=True)
     recipe_binding: RecipeBinding | None = None
+    funding: CandidateFundingPolicy | None = None
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
 
     @model_validator(mode='after')
@@ -130,6 +132,11 @@ class NativeCompositionFields(BaseModel):
             raise ValueError('native modular composition admits OKX USDC spot at 1x only')
         if self.execution_mode == 'paper' and self.candles_connector != 'okx':
             raise ValueError('paper execution requires the explicit public OKX candle owner')
+        if self.execution_mode == 'live' and self.execution_enabled and self.funding is None:
+            raise ValueError('Enabled live native candidate requires explicit funding allocation and fee bound')
+        if self.funding is not None:
+            if self.trading_pair.split('-')[0] == 'SUI' or getattr(self, 'trade_mode', 'buy_sell') != 'buy_sell':
+                raise ValueError('Initial funded candidate excludes wallet-wide seller assets and sell-only adoption')
         controls = {'mode', 'transport', 'origin', 'token_file'}
         if self.data.model_dump(exclude=controls) != DataPolicy().model_dump(exclude=controls):
             raise ValueError('native composition does not consume generic screening or source-profile settings')
@@ -224,6 +231,8 @@ class NativeComposition:
             market_data_provider = self.shared_candles
         super().__init__(config, market_data_provider, actions_queue, **kwargs)
         self._composition_digest = configuration_digest(config.model_dump(mode='json'))
+        self._funding_store = None
+        self._funding_hold = None
         self._recovery_store = None
         self._recovery_hold = None
         self._recovery_fault = None
@@ -294,7 +303,22 @@ class NativeComposition:
         if config.side == TradeType.BUY and (not self.config.execution_enabled or not self._composition_unchanged()
                                              or self.shared_candles is not None and not self.shared_candles.entry_ready()):
             return False
-        return super().validate_executor_config(config)
+        if not super().validate_executor_config(config):
+            return False
+        if config.side == TradeType.BUY and self.config.funding is not None:
+            try:
+                if self._funding_store is None:
+                    from hummingbot.connector.markets_recorder import MarketsRecorder
+                    recorder = MarketsRecorder.get_existing_instance()
+                    if recorder is None:
+                        raise PolicyError('Native recorder required for candidate funding')
+                    self._funding_store = NativeFundingStore(self, recorder)
+                self._funding_store.admit(config)
+                self._funding_hold = None
+            except Exception as error:
+                self._funding_hold = str(error) or type(error).__name__
+                return False
+        return True
 
     def get_custom_info(self):
         info = super().get_custom_info()
@@ -303,7 +327,9 @@ class NativeComposition:
                                        'data_mode': self.config.data.mode,
                                        'transport': self.config.data.transport,
                                        'execution_enabled': self.config.execution_enabled,
-                                       'recovery_hold': self._recovery_hold}
+                                       'recovery_hold': self._recovery_hold,
+                                       'funding_hold': self._funding_hold,
+                                       'funding': self._funding_store.status if self._funding_store else None}
         return info
 
 

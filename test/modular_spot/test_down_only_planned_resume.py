@@ -19,6 +19,24 @@ from hummingbot.strategy_v2.models.base import RunnableStatus
 recorder = _recorder_fixture
 
 
+@pytest.fixture
+def stopped_recorder_scope():
+    """Finalize only the recorder created by this test's stopped-owner factory."""
+    previous = MarketsRecorder._shared_instance
+    try:
+        yield
+    finally:
+        current = MarketsRecorder._shared_instance
+        try:
+            if current is not None and current is not previous:
+                try:
+                    current.stop()
+                finally:
+                    current._sql_manager.engine.dispose()
+        finally:
+            MarketsRecorder._shared_instance = previous
+
+
 def down_only_executor():
     old = legacy.make_executor()
     barriers = old.config.triple_barrier_config.model_copy(update={'open_order_limit_max_age_seconds': 0})
@@ -47,7 +65,7 @@ async def test_actual_recorder_preserves_down_only_config_and_funding_identity(r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('owner_kind', ['public', 'spoof'])
-async def test_supported_native_resume_retains_class_config_trailing_and_no_buy(tmp_path, owner_kind):
+async def test_supported_native_resume_retains_class_config_trailing_and_no_buy(tmp_path, owner_kind, stopped_recorder_scope):
     from types import SimpleNamespace
 
     from controllers.generic.rsi_modular import get_config_class
@@ -120,7 +138,7 @@ async def test_supported_native_resume_retains_class_config_trailing_and_no_buy(
     ('missing_policy', 'missing native down-only'),
     ('unknown_policy', 'Unsupported persisted'),
 ])
-async def test_resume_rejects_unsupported_down_only_history(tmp_path, damage, reason):
+async def test_resume_rejects_unsupported_down_only_history(tmp_path, damage, reason, stopped_recorder_scope):
     from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
     original_factory = legacy.make_executor
 

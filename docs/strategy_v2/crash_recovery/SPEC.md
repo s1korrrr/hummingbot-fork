@@ -1,6 +1,8 @@
 # rsibot-stack v2: crash protection and recovery acquisition
 
-Revision: 2 | Reviewed source date: 2026-09-20 | Status: SPECIFIED, NOT IMPLEMENTED BY THIS CHANGE
+Revision: 3 | Source baseline: 2026-09-20 | Status: NO-ORDER M1/M2 FOUNDATION IMPLEMENTED; NATIVE EXECUTION AND ECONOMICS HELD
+
+Current scope, precise contracts and verification: [IMPLEMENTATION.md](IMPLEMENTATION.md). The native adapter proposed below is not implemented or registered.
 
 Execution plan: [EXECPLAN.md](EXECPLAN.md). This replaces the controller-private direction in the [historical specification](https://github.com/s1korrrr/hummingbot/blob/cdafa2539e8bd6d51f4634e403b51192eb1cb2b7/docs/controllers/modular_spot/FLASH_CRASH_RECOVERY_SPEC.md). Its economic question remains; its implementation placement and readiness assumptions do not.
 
@@ -8,7 +10,7 @@ Execution plan: [EXECPLAN.md](EXECPLAN.md). This replaces the controller-private
 
 Test whether withholding new acquisition during market stress, then requiring causal recovery evidence, improves after-cost downside and capital efficiency without unacceptable loss of useful participation. Exact future-bottom identification and lowest average purchase price are not optimization objectives. A daily-chart sell-off and an intrasecond liquidity shock need distinct evidence capabilities.
 
-This publication changes documentation only. It does not authorize implementation, experiments, graph mutations, paper/live activation, deployment, source-image replacement or inventory migration. For an investigation mandate use `execution.enabled=false`; native controller `execution_enabled` also remains false until separately admitted. These are different controls.
+The user subsequently authorized scoped implementation, tests and publication to PR #62. The implemented slice performs no I/O and emits no orders. This continuation does not authorize economic experiments, graph mutations, paper/live activation, deployment, installed-image replacement or inventory migration. For an investigation mandate use `execution.enabled=false`; native controller `execution_enabled` also remains false until separately admitted. These are different controls.
 
 Freeze `ok_rsi`, `rsi_v5`, their configurations, defaults, persistence and deployed lifecycles. Existing `rsi_modular` profiles are compatibility consumers, not the new strategy architecture. Do not attach this behavior by inheriting, patching or reconfiguring them. Preserve all shared helpers and compatibility aliases they consume. Prove transitive isolation, not merely unchanged controller files.
 
@@ -42,7 +44,7 @@ Use the existing construction sequence:
 
 Exit and inventory management remain independent of new-entry selection and crash eligibility.
 
-| Proposed addition; not present functionality | Responsibility |
+| Component location; current status in IMPLEMENTATION.md | Responsibility |
 | --- | --- |
 | `hummingbot/strategy_v2/components/market_stress_v1.py` | Strict, bounded stress evidence and pure state reduction. No strategy thresholds chosen internally. |
 | `hummingbot/strategy_v2/components/recovery_evidence_v1.py` | Causal running-low, stabilization and reclaim evidence. No order or capital authority. |
@@ -51,7 +53,7 @@ Exit and inventory management remain independent of new-entry selection and cras
 | `controllers/generic/crash_recovery_v2.py` | A thin native adapter only if M0 finds no compatible isolated v2 host. Reuse a proven existing host instead of adding a redundant controller. |
 | `test/crash_recovery_v2/` | Contract, isolation, state, admission and native failure-path tests. |
 
-These names are proposed paths, not supported configuration keys or installed capabilities. Do not change canonical `acquisition.py`, `risk.py`, `config.py`, compatibility exports or `StrategyRecipe` defaults to make the feature appear everywhere. Keep strategy composition outside the neutral package. No service per module, new feed, supervisor, broker, wallet authority or fill/PnL ledger is needed.
+The two neutral modules and the recipe/pure composition core now exist. The thin native controller entrypoint remains proposed, not registered. Their presence is not evidence of installed native execution capability. Do not change canonical `acquisition.py`, `risk.py`, `config.py`, compatibility exports or `StrategyRecipe` defaults to make the feature appear everywhere. Keep strategy composition outside the neutral package. No service per module, new feed, supervisor, broker, wallet authority or fill/PnL ledger is needed.
 
 Hummingbot owns native execution and inventory truth; API owns orchestration. Root owns pins, integration and packaging evidence. Quants Lab owns simulation/economic execution. Research OS owns intake, attempts and assessments; its reader remains read-only. Condor/reporting project owner-emitted traces and authorized controls only.
 
@@ -69,7 +71,7 @@ A fast book/trade veto is a distinct later capability. It requires causal native
 
 ## 5. Deterministic reducers and state semantics
 
-Proposed pure interfaces are `evaluate_stress(state, snapshot, parameters, now_ms)` and `evaluate_recovery(state, snapshot, parameters, now_ms)`, returning immutable next state plus evidence status, reason codes and source references. Inputs include the clock; imports and evaluation perform no I/O. Validate finite values, units, strict types, resource limits and monotone event/clock cursors.
+Implemented pure interfaces are `evaluate_stress(state, received_candles, parameters, now_ms)` and `evaluate_recovery(state, stress_evaluation, parameters, now_ms)`, returning immutable next state plus evidence status, reason codes and source references. Recovery consumes the source-bound stress evaluation rather than recomputing its inputs; matching clocks, parameters and checkpoint references are required. The first implemented method is absolute drawdown from preceding closed-candle closes, plus R0 recovery; normalized, book/trade and learned methods remain unsupported and cannot silently replace it. Inputs include the clock; imports and evaluation perform no I/O. Validate finite values, units, strict types, resource limits and monotone event/clock cursors.
 
 The recipe must explicitly bind downside horizon/threshold, volatility estimator and initialization, maximum input age, qualifying-low tolerance, stabilization duration, reclaim amount, recovery TTL and maximum state/history size. Thresholds are not calibrated by this spec. An incomplete parameter set is invalid, not a reason to select hidden defaults. Test absolute and lagged/frozen robust-volatility definitions separately; contemporaneous volatility must not silently normalize away the shock.
 
@@ -94,7 +96,7 @@ Preserve all blockers and resolve deterministically: operational/ownership/data 
 
 Kronos, momentum, composite context or other indicators may supply separately versioned evidence/proposals in later ablations. Do not average their confidence, let them clear safety vetoes or learn into live policy.
 
-**Source-binding hazard:** current `source_records()` adds the complete component Python tree. Even unused additive module files change the seal of a component-dependent consumer in that package. Preserve old V1 images/source bundles and bindings; do not globally regenerate seals, filter files out of hashing, hot-reload a shared package or relabel old evidence. A fresh v2 bundle and explicit source-impact report are required. The documentation-only change adds no component Python files and therefore does not itself add that hazard.
+**Source-binding hazard:** current `source_records()` adds the complete component Python tree. Even unused additive module files change the seal of a component-dependent consumer in that package. Preserve old V1 images/source bundles and bindings; do not globally regenerate seals, filter files out of hashing, hot-reload a shared package or relabel old evidence. A fresh v2 bundle and explicit source-impact report are required. This continuation adds two versioned component Python modules and therefore changes new composite source seals. Old images, source bundles, seals and root pins remain untouched; native installation and legacy package qualification remain blocked.
 
 ## 7. Acquisition, funding and native execution
 
@@ -148,7 +150,7 @@ Acceptance requires neutral-import and transitive-legacy isolation, deterministi
 
 Engineering tests, merged foundations and native paper results do not promote this strategy. Deployment requires separate source/image/config/state admission, operator limits, reconciled real inventory, monitoring and rollback. Paper inventory cannot become real inventory by changing a mode flag.
 
-For this publication, revert only the three documentation changes. For future code, preserve the admitted safety policy and safe native exits while entries are held; reconcile owner obligations before source rollback. Never reset DBs, erase checkpoints/claims or remove an active safety veto to clear a hold. No V1 owner restart is required by this design publication.
+To roll back this continuation, revert only its scoped new component/core/test files and documentation changes after checking later edits. The pre-implementation source remains at `fd3592dff2993bb4c7a0ff69bb594d673362b02c`. For future code, preserve the admitted safety policy and safe native exits while entries are held; reconcile owner obligations before source rollback. Never reset DBs, erase checkpoints/claims or remove an active safety veto to clear a hold. No V1 owner restart is required by this design publication.
 
 ## Source locators
 

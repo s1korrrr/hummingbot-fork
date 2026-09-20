@@ -1,6 +1,8 @@
 # Crash protection and recovery acquisition: v2 ExecPlan
 
-Revision: 2 | Source review: 2026-09-20 | Status: PLAN ONLY; implementation milestones not started
+Revision: 3 | Source baseline: 2026-09-20 | Status: M1 ABSOLUTE/R0 AND PURE M2 SUBSET IMPLEMENTED; NATIVE/ECONOMIC GATES OPEN
+
+Implementation receipt: [IMPLEMENTATION.md](IMPLEMENTATION.md). Source/test hashes: [VALIDATION.json](VALIDATION.json).
 
 **Goal:** Evaluate acquisition protection through isolated, versioned v2 recipes while preserving native ownership, legacy behavior and attributable research evidence.
 
@@ -12,15 +14,15 @@ Revision: 2 | Source review: 2026-09-20 | Status: PLAN ONLY; implementation mile
 
 ## Authority, progress and continuity
 
-The current request authorizes review and publication of documentation. It does not authorize implementation, economic execution, mutation of supervisor state, deployment, activation, source-pin changes or a merge. Use `execution.enabled=false` for investigation. Keep native candidate execution disabled.
+The latest user request authorizes scoped implementation, testing and pushing to the existing PR. It does not authorize economic execution, mutation of supervisor state, deployment, activation, installed source-pin changes or a merge. Use `execution.enabled=false` for investigation. Keep native candidate execution disabled.
 
 - [x] Read the published crash spec and current canonical component/recipe/admission source.
 - [x] Reconcile merged #55/#57/#59 and the root's actual component gitlinks.
 - [x] Identify compatibility-profile inheritance, recursive component source seals and the economic-adapter gap.
 - [x] Rewrite the spec and provide this gated plan with a redirect from the old document.
 - [ ] M0: Admit an isolated v2 host, source package and research context for implementation.
-- [ ] M1: Implement pure stress and recovery evidence contracts/reducers.
-- [ ] M2: Compose a versioned v2 recipe and causal decision traces.
+- [x] M1 subset: implement/test absolute closed-candle stress and R0 recovery reducers. Normalized, book/trade and learned methods are explicitly unsupported; no native capability is implied.
+- [ ] M2: pure sealed recipe, causal traces and checkpoint codec implemented/tested; actual v2 baseline and native host qualification remain open.
 - [ ] M3: Prove native admission, acquisition revocation and legacy isolation.
 - [ ] M4: Prove persistent state, funding, management and restore behavior.
 - [ ] M5: Qualify Quants parity and the actual v2 economic-admission boundary.
@@ -55,7 +57,7 @@ No numeric threshold, allocation or fee in a synthetic fixture is a recommended 
 
 ## M1 — strict evidence contracts and pure reducers
 
-**Proposed files:** `hummingbot/strategy_v2/components/market_stress_v1.py`, `recovery_evidence_v1.py`; `test/crash_recovery_v2/test_evidence.py`, `test_state.py`. No edits to canonical existing risk/acquisition algorithms or package startup behavior.
+**Implemented subset files:** `hummingbot/strategy_v2/components/market_stress_v1.py`, `recovery_evidence_v1.py`; `test/crash_recovery_v2/test_evidence.py`. State cases are included in that test file rather than a separate `test_state.py`. No edits to canonical existing risk/acquisition algorithms or package startup behavior.
 
 **Interfaces:** `evaluate_stress(state, snapshot, parameters, now_ms)` and `evaluate_recovery(state, snapshot, parameters, now_ms)` return immutable next state and evidence with status, reasons and observation references. Define the strict versioned input/output models in these files before consumers import them. All price/ratio/time fields have explicit units. No hidden clock, native balances or I/O.
 
@@ -71,7 +73,7 @@ A non-economic R0 test vector must pin the low and clock semantics. For example,
 
 ## M2 — v2 recipe and trace composition
 
-**Proposed files:** `controllers/generic/crash_recovery_v2_core/recipe.py`, `runtime.py`; `test/crash_recovery_v2/test_recipe.py`, `test_decisions.py`. Reuse `components/recipe_contract.py` and `decision_protocol.py` without changing their existing semantics.
+**Implemented pure subset files:** `controllers/generic/crash_recovery_v2_core/recipe.py`, `runtime.py`; `test/crash_recovery_v2/test_composition.py`, `test_isolation.py`. Native integration and real baseline parity remain open. Reuse `components/recipe_contract.py` and `decision_protocol.py` without changing their existing semantics.
 
 - [ ] Test that the recipe binds module versions/parameters, feature dependencies, timing, universes, adapter capabilities, state schema and unchanged exit mandate. Reject unsupported combinations, incomplete parameters and accidental live mode.
 - [ ] Reuse current `RecipeBinding` schema 1. Confirm stress mode and all thresholds affect behavioral configuration/source hashes. Do not add them to excluded control fields.
@@ -158,14 +160,30 @@ PYTHONPATH="$PWD" "$HB_PYTHON" -m pytest -q \
   test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py
 ```
 
-`test/crash_recovery_v2` is a proposed test directory created by M1, not a currently passing suite. The full current native/legacy selection and any affected API/root/Quants suites are additionally required for implementation acceptance. Run no services, install no missing dependencies and send no exchange requests as a test fallback.
+`test/crash_recovery_v2` now contains the 84 passing no-order contract cases. They were run in partial-source staging, not with the full native command above. The full current native/legacy selection and any affected API/root/Quants suites remain required for implementation acceptance. Run no services, install no missing dependencies and send no exchange requests as a test fallback.
 
-For this documentation publication only, validate Markdown links/fences, source references, staged diff whitespace, exact three-file scope and remote blob identities. Native tests, independent audit, economic backtests and installed-runtime acceptance are NOT RUN by this publication.
+For this implementation, validate the complete new no-order suite, syntax, Markdown links, scoped diff and remote blob identities. Native tests, independent audit, economic backtests and installed-runtime acceptance remain NOT RUN. An actual native import probe failed because the compiled native runtime is absent.
 
 ## Rollback and stop conditions
 
-Documentation rollback reverts only this three-file revision; the original spec stays recoverable at its pinned historical commit. Do not alter root pins, old PR metadata, source code or research stores.
+Rollback of the initial documentation revision reverts its three files; rollback of the continuation is limited to its scoped new source/tests and document updates; the original spec stays recoverable at its pinned historical commit. Do not alter root pins, old PR metadata, source code or research stores.
 
-For future code, separate small owner commits and retain source-bound checkpoints. A deployed owner with obligations requires authorized reconciliation and source/image-aware rollback while new entries remain held and native exits remain available. Never clear DBs, risk latches, claims or an active safety veto to bypass a blocker.
+For future code, separate small owner commits and retain source-bound checkpoints. A deployed owner with obligations requires authorized reconciliation and source/image-aware rollback while new entries are held and native exits remain available. Never clear DBs, risk latches, claims or an active safety veto to bypass a blocker.
 
 Stop for missing authority, unsupported owner/capital/restore capability, failed independent audit, incomplete cache/execution evidence, source drift or exhausted frozen research budget. Report the exact failing gate and next owner action; do not manufacture success with a new ID, narrower window or legacy label.
+
+
+## 2026-09-20 implementation continuation and rulings
+
+- Remote parent: `fd3592dff2993bb4c7a0ff69bb594d673362b02c`; PR #62 remains the publication target. No PR comments were present when resumed.
+- Work is in a new isolated partial-source Git workspace. Direct clone failed due DNS; eight unchanged canonical modules were reconstructed and verified against exact Git blob IDs. Parent packages use namespace layout here; this is not the complete native package initialization or a native checkout. No connector/executor stubs were supplied.
+- Ruling: missing native host/runtime blocks M0 native admission and M3 onward, but not pure no-order M1/M2 construction on genuine canonical candle/decision contracts. Do not create a ControllerBase host or modify native identity/registration to bypass this limit.
+- Ruling: implement only explicit `closed_drawdown_v1` and `closed_reclaim_v1`. Methods requiring unavailable volatility calibration or order-flow data reject instead of falling back.
+- Ruling: preserve native `decide()` event-regression exceptions; an initial test expected HOLD and was corrected after inspecting the genuine canonical behavior. No existing protocol was changed.
+- Ruling: publication age and receipt age must both be fresh. A delayed first receipt cannot make an old snapshot timely.
+- Ruling: recovery cannot seed NORMAL from an existing stress checkpoint if its own checkpoint is missing. Fresh stress evidence requires actual validated close/low values.
+- Ruling: a newly detected shock outside SHOCK_HOLD starts a fresh market-low reference; consecutive shocked observations extend that low. This does not reset or even store capital, inventory or campaign state.
+- Implemented checkpoint encoding/verification is pure serialization against an externally retained digest/binding, not native Metadata persistence, signed authority or M4 completion.
+- Current tests: 84 passed with warnings treated as errors. See the implementation receipt for exact scope and failed-attempt history. Native host/runtime, native regression suite, independent audit, actual economic baseline and deployment remain held/not run.
+
+The continuation also adds the new tests to the existing native CI selection and its path filter. This is test discovery only; hosted CI/native execution is not claimed.

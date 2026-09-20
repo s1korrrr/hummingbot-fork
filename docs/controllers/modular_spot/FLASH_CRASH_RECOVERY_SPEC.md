@@ -13,4 +13,4 @@ The earlier intent remains: preserve acquisition capital during stress, require 
 
 The [original 2026-09-19 specification](https://github.com/s1korrrr/hummingbot/blob/cdafa2539e8bd6d51f4634e403b51192eb1cb2b7/docs/controllers/modular_spot/FLASH_CRASH_RECOVERY_SPEC.md) is preserved in Git. Its private-module placement, old checkpoint, earlier capability assumptions and M0-M8 directions must not override the current spec or source evidence.
 
-Status: documentation only. No crash-policy implementation, economic run, deployment, state migration or activation is delivered or authorized by this update.
+Current implementation status is recorded in [the v2 implementation receipt](../../strategy_v2/crash_recovery/IMPLEMENTATION.md). The isolated no-order evidence/recipe foundation is implemented; no native execution adapter, economic run, deployment, state migration or activation is delivered by it.

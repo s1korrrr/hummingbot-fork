@@ -73,3 +73,20 @@ def test_v5_chart_failure_retries_identical_rows_until_recorder_commit(recorder)
         StrategyV2Base._write_chart_snapshots_if_due(runner(owner))
         assert len(stored(recorder)) == 6
         assert owner.build_chart_snapshot_rows('rsi-modular-v2') == []
+
+
+def test_v5_chart_history_never_borrows_current_signal_or_rsi(recorder):
+    owner = chart_owner()
+    frame = pd.DataFrame([
+        {'timestamp': 120, 'close': 100, 'signal': 0, f'RSI_{owner.config.rsi_length}': None},
+        {'timestamp': 180, 'close': 101, 'signal': None, f'RSI_{owner.config.rsi_length}': 0},
+        {'timestamp': 240, 'close': 102, 'signal': -1, f'RSI_{owner.config.rsi_length}': 42},
+    ])
+    owner.processed_data = {'features': frame, 'signal': 1, 'indicators': {'rsi': 99}}
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        StrategyV2Base._write_chart_snapshots_if_due(runner(owner))
+    with recorder._sql_manager.get_new_session() as session:
+        rows = session.query(ChartSnapshot).filter_by(interval='1m').order_by(ChartSnapshot.candle_timestamp).all()
+        assert [(row.signal, row.rsi) for row in rows] == [(0, None), (None, 0), (-1, 42)]
+    assert owner.processed_data['signal'] == 1
+    assert owner.processed_data['indicators']['rsi'] == 99

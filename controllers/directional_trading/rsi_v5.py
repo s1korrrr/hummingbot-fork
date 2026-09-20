@@ -647,12 +647,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         close_price = self._chart_series_value(row, "close")
         if close_price is None:
             return None
-        processed = self.processed_data or {}
-        indicators = processed.get("indicators") if isinstance(processed.get("indicators"), dict) else {}
-        rsi_col = f"RSI_{self.config.rsi_length}"
-        rsi_value = self._chart_series_value(row, rsi_col)
-        if rsi_value is None:
-            rsi_value = indicators.get("rsi") if interval == self.config.interval else None
+        # A historical candle can only carry features attributed to that row.
+        # Current controller state must never be painted back across bootstrap history.
+        rsi_value = self._chart_series_value(row, f"RSI_{self.config.rsi_length}")
+        signal_value = self._chart_series_value(row, "signal")
         payload = {
             "bot_name": bot_name,
             "controller_id": self.config.id,
@@ -665,7 +663,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             "close_price": float(close_price),
             "volume": float(self._chart_series_value(row, "volume") or 0),
             "rsi": None if rsi_value is None else float(rsi_value),
-            "signal": int(self._chart_series_value(row, "signal") or processed.get("signal") or 0),
+            "signal": None if signal_value is None else int(signal_value),
         }
         return payload
 

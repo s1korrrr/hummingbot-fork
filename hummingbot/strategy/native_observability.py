@@ -1,4 +1,6 @@
 """Bounded projections of owner state. No decisions, connector calls or order actions."""
+import math
+import re
 from decimal import Decimal, InvalidOperation
 
 EPISODE_FIELDS = ('enabled', 'mode', 'phase', 'episode_id', 'reason', 'hold_reason', 'base', 'cost',
@@ -46,6 +48,38 @@ def remaining(total, filled):
     return str(Decimal(total) - Decimal(filled))
 
 
+def strategy_components_observation(source):
+    """Bounded diagnostics only; identity and economics remain native-owned."""
+    if not isinstance(source, dict):
+        raise ValueError('Invalid strategy component observation')
+    ids = source.get('component_ids')
+    if (not isinstance(ids, list) or not 1 <= len(ids) <= 16
+            or any(not isinstance(value, str) or re.fullmatch(r'[a-z][a-z0-9_]{0,63}', value) is None for value in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError('Invalid strategy component identifiers')
+    result = {'component_ids': list(ids)}
+    for name in ('execution_mode', 'execution_enabled', 'data_ready', 'data_reason',
+                 'decision_time', 'signal', 'recovery_hold', 'components_version', 'parameters_version'):
+        if name not in source:
+            continue
+        value = source[name]
+        if value is None:
+            result[name] = None
+        elif name in ('execution_enabled', 'data_ready'):
+            if type(value) is not bool:
+                raise ValueError('Invalid component boolean')
+            result[name] = value
+        elif name in ('decision_time', 'signal'):
+            if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > 10**15:
+                raise ValueError('Invalid component number')
+            result[name] = value
+        elif not isinstance(value, str) or len(value) > 256:
+            raise ValueError('Invalid component string')
+        else:
+            result[name] = value
+    return result
+
+
 def controller_observation(entry):
     controller = entry['controller']
     result = {'controller_id': entry['controller_id'],
@@ -65,6 +99,8 @@ def controller_observation(entry):
             source = custom.get(name)
             if isinstance(source, dict):
                 result['custom_info'][name] = {key: scalar(source[key]) for key in fields if key in source}
+        if 'strategy_components' in custom:
+            result['custom_info']['strategy_components'] = strategy_components_observation(custom['strategy_components'])
         runtime = getattr(controller, '_episode_runtime', None)
         requests = []
         if runtime is not None:

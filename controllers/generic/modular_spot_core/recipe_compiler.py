@@ -7,26 +7,13 @@ from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 
+from hummingbot.strategy_v2.components.strict_json import strict_json
+
 from .config import SignalPolicy
 from .domain import PolicyError
 from .native_recipe import NativePolicyRecipe, render_native_recipe
 from .profiles import ProgramProfile, build_profile
 from .recipe_contract import RecipeBinding, StrategyRecipe, canonical_json, configuration_digest, digest, source_digest
-
-
-def strict_json(raw: str):
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError(f'duplicate JSON key: {key}')
-            result[key] = value
-        return result
-
-    def constant(value):
-        raise ValueError(f'nonfinite JSON constant: {value}')
-
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
 
 
 def parse_recipe(payload):
@@ -56,6 +43,7 @@ def render_recipe(recipe: StrategyRecipe | NativePolicyRecipe) -> dict:
         config['trailing'] = recipe.trailing.model_dump(mode='json')
         config['risk'] = recipe.risk.model_dump(mode='json')
     return {**bundle, 'recipe': recipe.model_dump(mode='json'), 'recipe_sha256': recipe.digest,
+            'receipt_kind': 'modular_spot_composition_v2', 'source_scope': 'controllers+strategy_components',
             'native_validation': 'NOT_RUN', 'native_runtime_validation': 'NOT_RUN',
             'capital_authority': 'NOT_PROVEN', 'account_topology': recipe.account_topology,
             'sell_only_handoff': 'UNSUPPORTED' if not recipe.acquisition_allowed else 'NOT_APPLICABLE'}

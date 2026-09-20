@@ -1,12 +1,6 @@
-from decimal import ROUND_CEILING
+"""Compatibility import for the canonical strategy-neutral component."""
+import sys
 
-from .config import TrailingPolicy
-from .domain import decimal
+from hummingbot.strategy_v2.components import trailing as _implementation
 
-
-def protected_sell_price(native_no_loss_price, policy: TrailingPolicy, price_step):
-    """Tighten the native after-cost floor; do not create another fill ledger."""
-    native_floor = decimal(native_no_loss_price, 'native after-cost floor', positive=True)
-    tick = decimal(price_step, 'price increment', positive=True)
-    floor = native_floor * (1 + policy.minimum_profit)
-    return (floor / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+sys.modules[__name__] = _implementation

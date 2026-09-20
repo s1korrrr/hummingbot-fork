@@ -98,8 +98,8 @@ def test_real_native_recipe_export_roundtrip_and_source_closure(
     recipe = NativePolicyRecipe(name='parity', family=family, controller_id='modular_spot_recipe',
                                 parameters={'trading_pair': 'BTC-USDC', 'strict_hmm_mode': False})
     bundle = bind_native_bundle(recipe)
-    assert bundle['receipt_kind'] == 'native_policy_composition_v1'
-    assert bundle['source_scope'] == 'controllers'
+    assert bundle['receipt_kind'] == 'native_policy_composition_v2'
+    assert bundle['source_scope'] == 'controllers+strategy_components'
     assert 'directional_trading/rsi_signals.py' in bundle['source_files']
     assert 'directional_trading/pandas_compat.py' in bundle['source_files']
     assert all(path.is_relative_to(source_root()) for path in source_files(family))

@@ -1,6 +1,5 @@
 """Standalone spot composition using native Hummingbot execution ownership."""
 import asyncio
-import hashlib
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -13,11 +12,17 @@ from controllers.generic.modular_spot_core.config import AcquisitionPolicy, Risk
 from controllers.generic.modular_spot_core.data_reader import DataPolicy, attach_pool, dataset_for
 from controllers.generic.modular_spot_core.domain import identity
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
-from controllers.generic.modular_spot_core.recipe_contract import RecipeBinding, source_digest, verify_binding
+from controllers.generic.modular_spot_core.recipe_contract import (
+    RecipeBinding,
+    source_digest,
+    source_records,
+    verify_binding,
+)
 from controllers.generic.modular_spot_core.runtime import ModularRuntime
 from controllers.generic.modular_spot_core.universe import UniversePolicy
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.strategy_v2.components.source_identity import component_source_files
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.models.base import RunnableStatus
 
@@ -107,8 +112,7 @@ class ModularSpotControllerConfig(ControllerConfigBase):
         data = dict(values['data'])
         data['symbols'] = []
         values['data'] = data
-        sources = [(p.relative_to(Path(__file__).parent).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
-                   for p in source_files()]
+        sources = source_records(source_root(), source_files())
         return identity({'configuration': values, 'sources': sources, 'policy_version': 2})
 
     def update_markets(self, markets):
@@ -120,7 +124,7 @@ class ModularSpotController(ControllerBase):
 
     @classmethod
     def implementation_source_files(cls):
-        return source_files()
+        return [*source_files(), *component_source_files()]
 
     @property
     def performance_report(self):

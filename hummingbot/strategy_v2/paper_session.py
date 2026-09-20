@@ -145,8 +145,9 @@ class NativePaperSession:
         if prior_oracle is not None and (prior_oracle.started or prior_oracle._fetch_price_task is not None):
             raise RuntimeError('Paper session refuses an existing active rate oracle')
         configs = list(controller_configs)
+        from controllers.generic.component_breakout import ComponentBreakoutConfig
         from controllers.generic.rsi_modular import CONFIG_PROFILES
-        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values())
+        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(), ComponentBreakoutConfig)
         if not configs or len({c.id for c in configs}) != len(configs):
             raise ValueError('Distinct native paper controller identities required')
         for config in configs:
@@ -171,6 +172,8 @@ class NativePaperSession:
         self.market_data_provider = InjectedPaperMarketData(connector)
         self.controllers = {c.id: c.get_controller_class()(c, self.market_data_provider, asyncio.Queue()) for c in configs}
         for controller in self.controllers.values():
+            if restore and type(controller.config) is ComponentBreakoutConfig:
+                controller.recovery_hold = "reference_restart_requires_inventory_reconciliation"
             controller._status = RunnableStatus.RUNNING
             controller.initialize_candles()
         self._connector = connector
@@ -383,8 +386,9 @@ class NativePaperSession:
         if not self._connector.ready:
             reasons.append('fresh_book_required')
         for key, controller in self.controllers.items():
-            if controller._recovery_hold:
-                reasons.append(f'{key}: {controller._recovery_hold}')
+            recovery_hold = getattr(controller, '_recovery_hold', getattr(controller, 'recovery_hold', ''))
+            if recovery_hold:
+                reasons.append(f'{key}: {recovery_hold}')
             if not controller.processed_data.get('data_health', {}).get('ready'):
                 reasons.append(f'{key}: native_candles_unavailable')
         for key, pending in self.executor_orchestrator.recovery_required.items():
@@ -437,7 +441,7 @@ class NativePaperSession:
             # preserving every existing trail field. No policy decision, new
             # peak, reduction intent, or recovery-hold bypass is introduced.
             for controller in self.controllers.values():
-                store = controller._recovery_store
+                store = getattr(controller, '_recovery_store', None)
                 if (self._failure is None and store is not None and store.restored and not controller._recovery_fault
                         and not controller._recovery_hold and controller._composition_unchanged()):
                     positions = store.prepare()  # Also checks pending reduction receipts.

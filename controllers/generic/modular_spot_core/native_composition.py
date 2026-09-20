@@ -9,13 +9,13 @@ from typing import ClassVar, Literal
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
-from controllers.directional_trading.ok_rsi_core.candles import derive_higher_timeframe_candles
 from hummingbot.core.data_type.common import PositionMode, TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
+from hummingbot.strategy_v2.components.candle_aggregation import derive_higher_timeframe_candles
+from hummingbot.strategy_v2.components.candle_data import Dataset
+from hummingbot.strategy_v2.components.data_reader import DataPolicy, DataPool
 
-from .candle_data import Dataset
-from .data_reader import DataPolicy, DataPool
 from .domain import DataUnavailable, PolicyError
 from .native_funding import CandidateFundingPolicy, NativeFundingStore
 from .native_recovery import NativeRecoveryStore
@@ -242,7 +242,9 @@ class NativeComposition:
 
     @classmethod
     def implementation_source_files(cls):
-        return source_files(cls._native_family, public_module=cls._public_module)
+        from hummingbot.strategy_v2.components.source_identity import component_source_files
+
+        return [*source_files(cls._native_family, public_module=cls._public_module), *component_source_files()]
 
     def _composition_unchanged(self):
         return configuration_digest(self.config.model_dump(mode='json')) == self._composition_digest

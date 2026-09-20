@@ -1,5 +1,4 @@
 """Recipes for complete existing native controller policies, without synthetic policy aliases."""
-from hashlib import sha256
 from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -7,7 +6,7 @@ from pydantic import Field, field_validator, model_validator
 from .config import PolicyModel
 from .data_reader import DataPolicy
 from .domain import PolicyError
-from .recipe_contract import canonical_json, digest
+from .recipe_contract import canonical_json, digest, source_records
 
 
 class NativePolicyRecipe(PolicyModel):
@@ -58,13 +57,12 @@ def render_native_recipe(recipe):
         datasets.append(Dataset(connector='okx', trading_pair=config.trading_pair,
                                 history=config.shared_history or required_shared_history(config, recipe.family)))
     root = native.source_root()
-    manifest = {path.relative_to(root).as_posix(): sha256(path.read_bytes()).hexdigest()
-                for path in native.source_files(recipe.family)}
+    manifest = dict(source_records(root, native.source_files(recipe.family)))
     return {'schema_version': 1, 'controllers': [config.model_dump(mode='json')],
             'candle_manifest': {'schema_version': 1, 'datasets': [spec.model_dump(mode='json') for spec in datasets]},
             'recipe': recipe.model_dump(mode='json'), 'recipe_sha256': recipe.digest,
-            'receipt_kind': 'native_policy_composition_v1',
-            'source_scope': 'controllers', 'source_files': manifest,
+            'receipt_kind': 'native_policy_composition_v2',
+            'source_scope': 'controllers+strategy_components', 'source_files': manifest,
             'native_validation': 'NOT_RUN', 'native_runtime_validation': 'NOT_RUN',
             'capital_authority': 'NOT_PROVEN', 'account_topology': 'single_native_owner',
             'inventory_adoption_supported': False, 'execution_authorized': False,

@@ -65,4 +65,5 @@ class PositionExecutorConfig(ExecutorConfigBase):
     # Single-attempt entries cancel only the remainder and keep acquired inventory managed.
     # Other strategies retain their existing retry/expiry semantics unless they opt in.
     entry_order_policy: Literal["retry", "single_attempt"] = "retry"
+    require_terminal_entry_reconciliation: bool = False
     model_config = ConfigDict(arbitrary_types_allowed=True)

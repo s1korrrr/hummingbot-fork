@@ -186,6 +186,7 @@ class PositionExecutor(ExecutorBase):
         self._entry_stop_reason: Optional[str] = None
         self._entry_cancel_last_attempt_at: Optional[float] = None
         self._entry_reconciliation = None
+        self._funding_entry_reconciliation_task = None
         self._entry_failure_is_final: bool = False
         self._entry_lifecycle: Dict = {"state": "awaiting_submission", "stop_reason": None}
         self._close_quantity: Dict = {}
@@ -220,8 +221,15 @@ class PositionExecutor(ExecutorBase):
             raise ValueError("Hydrated owned inventory differs from sealed receipt")
 
     def stop(self):
+        task = self._funding_entry_reconciliation_task
+        self._funding_entry_reconciliation_task = None
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            elif not task.cancelled():
+                task.exception()
         self._cancel_entry_expiry_reconciliation()
-        if self.config.entry_order_policy == "single_attempt" and not self.is_closed:
+        if (self.config.entry_order_policy == "single_attempt" or self.config.require_terminal_entry_reconciliation) and not self.is_closed:
             # Detach the terminal receipt from mutable connector cache objects.
             # Later fills belong to recorder/held reconciliation after listeners stop.
             for tracked in self._unique_orders([*self._entry_orders(), *self._exit_orders()]):
@@ -828,6 +836,7 @@ class PositionExecutor(ExecutorBase):
             self.cancel_open_orders()
             await self._sleep(1.0)
             return
+        funding_ready = await self._reconcile_funding_entries()
         entry_done = self._entry_terminal_confirmed()
         tp_done = not self._take_profit_limit_order or self._take_profit_limit_order.is_done
         if not entry_done or not tp_done:
@@ -836,7 +845,7 @@ class PositionExecutor(ExecutorBase):
             if self._close_order and not self._close_order.is_done:
                 self._strategy.cancel(connector_name=self.config.connector_name,
                                       trading_pair=self.config.trading_pair, order_id=self._close_order.order_id)
-            else:
+            elif funding_ready:
                 self._held_position_orders = [order.order.to_json() for order in
                                               self._unique_orders([*self._entry_orders(), *self._exit_orders()])
                                               if order.order and order.executed_amount_base > Decimal("0")]
@@ -844,7 +853,8 @@ class PositionExecutor(ExecutorBase):
                     self.close_type = CloseType.EARLY_STOP
                 self.stop()
         elif self.open_and_close_volume_match():
-            self.stop()
+            if funding_ready:
+                self.stop()
         else:
             await self.control_close_order()
         await self._sleep(1.0)
@@ -916,7 +926,10 @@ class PositionExecutor(ExecutorBase):
                 and self.all_orders_completed()
                 and (not self._open_order_entry_expired or self._open_order_expiry_reconciled)):
             self.close_type = CloseType.FAILED
-            self.stop()
+            if self.config.require_terminal_entry_reconciliation:
+                self._status = RunnableStatus.SHUTTING_DOWN
+            else:
+                self.stop()
 
     async def on_start(self):
         """
@@ -1136,6 +1149,11 @@ class PositionExecutor(ExecutorBase):
         reconciled = []
         for tracked in orders:
             order = tracked.order
+            rejected = getattr(order, 'terminal_reconciliation', None)
+            if (order is not None and order.is_failure and isinstance(rejected, dict)
+                    and rejected.get('source') == 'okx_submission_rejected_v1'):
+                reconciled.append(copy.deepcopy(rejected))
+                continue
             if order is None or order.exchange_order_id is None:
                 raise ValueError("Expired entry order identity is unavailable")
             update = await asyncio.wait_for(connector._request_order_status(tracked_order=order), timeout=10.0)
@@ -1148,8 +1166,40 @@ class PositionExecutor(ExecutorBase):
             proof = (update.misc_updates or {}).get('terminal_reconciliation')
             if proof is not None:
                 reconciled.append(copy.deepcopy(proof))
-        if len(orders) == len(reconciled) == 1:
-            self._entry_reconciliation = reconciled[0]
+        if len(orders) == len(reconciled) and reconciled:
+            self._entry_reconciliation = (reconciled[0] if len(reconciled) == 1 else
+                                          {'schema': 1, 'source': 'native_terminal_entry_set_v1', 'orders': reconciled})
+
+    async def _reconcile_funding_entries(self):
+        """Opt-in shutdown proof; native exits keep running while reads are pending."""
+        if not self.config.require_terminal_entry_reconciliation:
+            return True
+        orders = self._entry_orders()
+        if not orders or any(order.order is None or not order.is_done for order in orders):
+            return False
+        proofs = self._entry_reconciliation
+        proofs = proofs.get('orders', [proofs]) if isinstance(proofs, dict) else []
+        quantities = {order.order_id: order.executed_amount_base for order in orders}
+        if (len(proofs) == len(orders)
+                and {proof['order_id'] for proof in proofs} == set(quantities)
+                and all(Decimal(proof['filled_base']) == quantities[proof['order_id']] for proof in proofs)):
+            return True
+        task = self._funding_entry_reconciliation_task
+        if task is None:
+            self._funding_entry_reconciliation_task = asyncio.create_task(self._request_expired_entry_reconciliation(orders))
+            return False
+        if not task.done():
+            return False
+        self._funding_entry_reconciliation_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return False
+        except Exception as exc:
+            self.logger().warning(self._log_message(f"Funding entry reconciliation pending: {type(exc).__name__}: {exc}"))
+            return False
+        # Re-check next cycle against any fill received while the GET was pending.
+        return False
 
     def _is_within_activation_bounds(self, order_price: Decimal, side: TradeType, order_type: OrderType) -> bool:
         """
@@ -1683,7 +1733,7 @@ class PositionExecutor(ExecutorBase):
             "execution_order_snapshots": [o.order.to_json() for o in
                                           self._unique_orders([*self._entry_orders(), *self._exit_orders()])
                                           if o.order is not None]
-            if self.config.entry_order_policy == "single_attempt" else None,
+            if self.config.entry_order_policy == "single_attempt" or self.config.require_terminal_entry_reconciliation else None,
         }
         custom_info.update(trailing_snapshot)
         return custom_info

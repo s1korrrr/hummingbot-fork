@@ -291,6 +291,12 @@ class NativeComposition:
             self._recovery_hold = self._recovery_fault
             return []
 
+    def get_executor_config(self, *args, **kwargs):
+        config = super().get_executor_config(*args, **kwargs)
+        if self.config.funding is not None and config.side == TradeType.BUY:
+            config.require_terminal_entry_reconciliation = True
+        return config
+
     def can_create_executor(self, signal):
         if signal > 0 and (not self.config.execution_enabled or not self._composition_unchanged()
                            or self.shared_candles is not None and not self.shared_candles.entry_ready()):

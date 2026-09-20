@@ -20,9 +20,11 @@ The connector and executor must first provide the evidence:
 2. PositionExecutor saves `entry_reconciliation` in its existing custom-info
    record. The receipt includes source/schema, order and exchange IDs, pair,
    side, submitted amount, final filled amount, terminal state and exact trade IDs.
-   The single-attempt entry cannot replace that submission. A legacy entry can
-   release only after the executor is inactive and the receipt covers its sole
-   entry order.
+   The single-attempt entry cannot replace that submission. A native retry entry
+   can release only after the executor is inactive and a complete terminal set
+   covers every native BUY snapshot, including canceled prior attempts. Individual
+   attempts must agree with their own recorder fills; aggregate fills must agree
+   with the executor's native entry receipt.
 3. Funding validates the immutable admitted executor configuration, native gross
    entry receipt, exact recorder fills and fees, native order identity and any
    retained tracker state. It writes an immutable release receipt alongside its
@@ -34,6 +36,16 @@ An explicit OKX submission rejection produces a separate zero-fill receipt when
 there is no exchange order ID or fill. A timeout, lost order, exception message,
 local canceled/failed status or elapsed time is never release authority. Paper
 receipts have a distinct source and cannot qualify a live owner.
+
+Funded modular wrappers opt into the native executor field
+`require_terminal_entry_reconciliation=True`. This preserves OK RSI's
+`single_attempt` and RSI V5's `retry` policy, signals, sizes, prices and barriers.
+The sole intentional factory divergence from the corresponding unfunded controller
+is stronger terminal evidence before shutdown completes. Default false preserves
+existing owners. During funded shutdown, connector GET reconciliation runs as a
+bounded native task; protective exits keep running while it is pending. Native
+held-inventory handoff or final termination waits for complete proof. Paper shutdown
+settles/cancels that task explicitly instead of leaving an orphaned coroutine.
 
 Repeated reconciliation is idempotent. A restored recorder can reuse its durable
 native executor receipt after all the same checks. Missing or changed intent,
@@ -77,6 +89,18 @@ reject the unfamiliar release audit records rather than silently reuse funds.
 
 Validation receipt (2026-09-20): the full prior native regression command, with
 OKX order-uncertainty coverage added, passed **1,151 tests and 65 subtests, zero
-skips** in 100.91 seconds. Scoped Flake8 and `git diff --check` passed. Isort is
-not installed in the native interpreter; no package was installed to change that
-environment. The exact full command and log were retained for the root handoff.
+skips** in 100.91 seconds. Scoped Flake8 and `git diff --check` passed. The repository pre-commit hooks, including isort, passed. The exact full command and log were retained for the root handoff.
+
+
+RSI V5 extension validation additionally exercises its unchanged native retry
+policy: first canceled attempt, native replacement with a distinct order ID,
+optional partial fill, native shutdown, all-attempt terminal reconciliation,
+recorder restart and capacity release. Removing one attempt from the terminal set
+holds all release. This is native paper execution evidence, not a synthetic policy
+object or a change of RSI V5 to single-attempt semantics.
+
+The RSI V5 extension's full native regression passed **1,152 tests and 67
+subtests, zero skips** in 108.58 seconds. An additional real native paper test
+then held the terminal GET pending while RSI V5's protective MARKET SELL flattened
+the acquired position; the executor waited for proof before terminating and
+releasing unused funding. That additional focused test passed independently.

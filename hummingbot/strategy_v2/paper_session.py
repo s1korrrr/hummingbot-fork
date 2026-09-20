@@ -406,14 +406,19 @@ class NativePaperSession:
                         for _ in range(3):
                             await executor.control_task()
                             await self._connector.drain()
-                            task = getattr(executor, '_entry_expiry_reconciliation_task', None)
-                            if task is not None:
-                                await asyncio.gather(task, return_exceptions=True)
+                            tasks = [getattr(executor, name, None) for name in
+                                     ('_entry_expiry_reconciliation_task', '_funding_entry_reconciliation_task')]
+                            await asyncio.gather(*(task for task in tasks if task is not None), return_exceptions=True)
                             if executor.is_closed:
                                 break
                     task = getattr(executor, '_entry_expiry_reconciliation_task', None)
                     if task is not None:
                         executor._cancel_entry_expiry_reconciliation()
+                        await asyncio.gather(task, return_exceptions=True)
+                    task = getattr(executor, '_funding_entry_reconciliation_task', None)
+                    if task is not None:
+                        executor._funding_entry_reconciliation_task = None
+                        task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
                     executor.unregister_events()
             if self._failure is None:

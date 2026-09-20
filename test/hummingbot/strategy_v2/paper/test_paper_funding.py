@@ -12,8 +12,9 @@ from hummingbot.model.metadata import Metadata
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
 
-def funded_config(allocation='50'):
-    return config(execution_enabled=True, min_signal_score=1, dynamic_position_sizing=False,
+def funded_config(allocation='50', family=None):
+    args = () if family is None else (family,)
+    return config(*args, execution_enabled=True, min_signal_score=1, dynamic_position_sizing=False,
                   funding={'allocation_quote': allocation, 'fee_reserve_fraction': '.003'})
 
 
@@ -298,7 +299,7 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                 self.assertEqual(store.reconcile()['released_intents'], 1)
                 await session._connector._fill(order, D('.1'), order.price, True, 'contradictory-late-fill')
                 owner.executors_info = [executor.executor_info]
-                with self.assertRaisesRegex(PolicyError, 'reconciliation scope or quantity'):
+                with self.assertRaisesRegex(PolicyError, 'reconciliation.*(scope|coverage)'):
                     store.admit(owner.get_executor_config(TradeType.BUY, D('90'), D('.3')))
                 self.assertFalse(executor.is_closed)
                 self.assertEqual(executor.open_filled_amount, D('.2'))
@@ -341,4 +342,105 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(PolicyError, 'disappeared or changed'):
                     store.reconcile()
             finally:
+                await session.close()
+
+    async def test_rsi_v5_native_retry_entries_release_complete_terminal_set(self):
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                await self._rsi_v5_retry_terminal_case(partial)
+
+    async def _rsi_v5_retry_terminal_case(self, partial):
+        from controllers.generic.modular_rsi_v5 import ModularRSIV5ControllerConfig
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / 'paper.sqlite'
+            session = NativePaperSession(paper(), [funded_config(family=ModularRSIV5ControllerConfig)], db)
+            try:
+                await self.seed(session)
+                owner = next(iter(session.controllers.values()))
+                executors = session.executor_orchestrator.active_executors[owner.config.id]
+                self.assertEqual(len(executors), 1, owner.get_custom_info())
+                executor = executors[0]
+                self.assertEqual(executor.config.entry_order_policy, 'retry')
+                self.assertTrue(executor.config.require_terminal_entry_reconciliation)
+                first = executor._open_order.order
+                if partial:
+                    await session.step(600061, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600061,
+                                                            side=TradeType.SELL, price=first.price, amount=D('.1'))])
+                session._connector.cancel(PAIR, first.client_order_id)
+                await session._connector.drain()
+                await session.step(600061, books=[dict(trading_pair=PAIR, sequence=4, timestamp=600061,
+                                                       bids=[(90, 10)], asks=[(90.1, 10)])])
+                second = executor._open_order.order
+                self.assertNotEqual(first.client_order_id, second.client_order_id)
+                self.assertEqual(len(executor._entry_orders()), 2)
+                # Native stop ends retry authority. Each canceled attempt must
+                # independently pass terminal connector reconciliation.
+                await session.close()
+            finally:
+                await session.close()
+            restored = NativePaperSession(paper(), [funded_config(family=ModularRSIV5ControllerConfig)], db, restore=True)
+            try:
+                owner = next(iter(restored.controllers.values()))
+                owner.executors_info = restored.recorder.get_executors_by_controller(owner.config.id)
+                info = owner.executors_info[0]
+                self.assertFalse(info.is_active)
+                self.assertEqual(len(info.custom_info['entry_reconciliation']['orders']), 2)
+                restored._connector.set_order_book(PAIR, 5, restored._connector.current_timestamp, [(90, 10)], [(90.1, 10)])
+                store = NativeFundingStore(owner, restored.recorder)
+                proof = info.custom_info['entry_reconciliation']
+                info.custom_info['entry_reconciliation'] = {**proof, 'orders': proof['orders'][:1]}
+                with self.assertRaisesRegex(PolicyError, 'trade coverage'):
+                    store.reconcile()
+                self.assertEqual(store._load()[1]['releases'], {})
+                info.custom_info['entry_reconciliation'] = proof
+                result = store.reconcile()
+                self.assertEqual(result['released_intents'], 1)
+                self.assertEqual(D(result['pending_quote']), D('0'))
+                self.assertEqual(restored._connector.get_balance('BTC'), D('.1') if partial else D('0'))
+                if not partial:
+                    self.assertEqual(D(result['available_quote']), D('50'))
+                else:
+                    self.assertGreater(D(result['available_quote']), D('40'))
+                    self.assertLess(D(result['available_quote']), D('41'))
+            finally:
+                await restored.close()
+
+    async def test_rsi_v5_protective_native_sell_continues_while_terminal_get_is_pending(self):
+        from controllers.generic.modular_rsi_v5 import ModularRSIV5ControllerConfig
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [funded_config(family=ModularRSIV5ControllerConfig)], Path(directory) / 'paper.sqlite')
+            gate = asyncio.Event()
+            original = session._connector._request_order_status
+
+            async def delayed_status(tracked_order):
+                if tracked_order.trade_type == TradeType.BUY:
+                    await gate.wait()
+                return await original(tracked_order)
+
+            try:
+                await self.seed(session)
+                owner = next(iter(session.controllers.values()))
+                executor = session.executor_orchestrator.active_executors[owner.config.id][0]
+                order = executor._open_order.order
+                await session.step(600061, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600061,
+                                                        side=TradeType.SELL, price=order.price, amount=D('.1'))])
+                session._connector.cancel(PAIR, order.client_order_id)
+                await session._connector.drain()
+                session._connector._request_order_status = delayed_status
+                executor.early_stop(keep_position=False)
+                await session.step(600062, books=[dict(trading_pair=PAIR, sequence=4, timestamp=600062,
+                                                       bids=[(90, 10)], asks=[(90.1, 10)])])
+                self.assertEqual(session._connector.get_balance('BTC'), D('0'))
+                self.assertFalse(executor.is_closed)  # Proof pending; exit already executed.
+                self.assertIsNotNone(executor._funding_entry_reconciliation_task)
+                gate.set()
+                await executor._funding_entry_reconciliation_task
+                await session.step(600063, books=[dict(trading_pair=PAIR, sequence=5, timestamp=600063,
+                                                       bids=[(90, 10)], asks=[(90.1, 10)])])
+                self.assertTrue(executor.is_closed)
+                owner.executors_info = [executor.executor_info]
+                self.assertEqual(owner._funding_store.reconcile()['released_intents'], 1)
+            finally:
+                gate.set()
+                session._connector._request_order_status = original
                 await session.close()

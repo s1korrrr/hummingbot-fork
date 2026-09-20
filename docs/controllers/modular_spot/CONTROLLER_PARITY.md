@@ -77,3 +77,14 @@ Checkpoint CAS completes before returning any new action list. A persistence fai
 Focused tests live in `test_native_composition.py` and `test_native_composition_recovery.py`. They cover full native signal/configuration parity, actual BUY action generation, native partial/cancel/late-fill ownership, running held recovery, a real SQLite restart, missing/corrupt checkpoints, transient native report lag, CAS conflicts, unsupported peak regression and persistence failure before action dispatch. A regression test injects inventory lag after a native recovery SELL proposal resets its peak; no action escapes, the previous peak is restored, and the reconciled next cycle emits one native SELL. The focused composition and recovery suite passed 23 tests after this fix.
 
 These are local inert-transport tests. They establish the tested native behavior and checkpoint boundaries, not exchange execution, economic performance, production image deployment, live-owner migration or all possible legacy parameter combinations. The inherited native episode BUY hold remains an explicit unsupported capability; neither an export nor passing tests removes it. Live-stack integration still requires the source/image/immutable-bundle evidence owned by the parent integration task.
+
+
+Funded candidate lifecycle divergence (2026-09-20): the modular wrapper preserves
+all native signal, sizing, order-policy, price and exit parameters, and additionally
+sets `PositionExecutorConfig.require_terminal_entry_reconciliation=True`. Existing
+unfunded owners default false. This opt-in waits for complete connector-authoritative
+terminal proof of every entry attempt before native shutdown/held handoff completes;
+protective exits continue while proof is pending. The funding gate can then release
+only unused canceled/rejected capacity. Both OK RSI single-attempt and RSI V5 retry
+factories/actions have explicit parity assertions for this one operational field.
+See [capital reconciliation](CAPITAL_RECONCILIATION.md) for evidence and limitations.

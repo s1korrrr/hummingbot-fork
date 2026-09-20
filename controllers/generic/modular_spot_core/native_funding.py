@@ -276,13 +276,41 @@ class NativeFundingStore:
         return projection, pending, infos
 
     def _validate_release(self, info, receipt, quantity, fills, orders):
+        if info is None or not isinstance(receipt, dict):
+            raise PolicyError('Native terminal reconciliation scope or quantity differs')
+        if receipt.get('source') == 'native_terminal_entry_set_v1':
+            if (set(receipt) != {'schema', 'source', 'orders'} or type(receipt['schema']) is not int
+                    or receipt['schema'] != 1 or not isinstance(receipt['orders'], list) or not receipt['orders']):
+                raise PolicyError('Native terminal entry set is invalid')
+            proofs = receipt['orders']
+        else:
+            proofs = [receipt]
+        if info.config.entry_order_policy == 'single_attempt' and len(proofs) != 1:
+            raise PolicyError('Single-attempt reconciliation contains multiple entry orders')
+        snapshots = (info.custom_info or {}).get('execution_order_snapshots')
+        if not isinstance(snapshots, list):
+            raise PolicyError('Native entry order snapshots unavailable')
+        entries = {row['client_order_id']: row for row in snapshots if row.get('trade_type') == 'BUY'}
+        proof_ids = [proof.get('order_id') for proof in proofs if isinstance(proof, dict)]
+        if (len(proof_ids) != len(proofs) or len(set(proof_ids)) != len(proofs) or set(proof_ids) != set(entries)
+                or sum((decimal(proof.get('filled_base'), 'terminal entry total') for proof in proofs), ZERO) != quantity):
+            raise PolicyError('Native terminal reconciliation trade coverage differs')
+        for proof in proofs:
+            snapshot = entries[proof['order_id']]
+            if (snapshot.get('exchange_order_id') != proof.get('exchange_order_id')
+                    or decimal(snapshot.get('amount'), 'native submitted amount', positive=True)
+                    != decimal(proof.get('amount'), 'terminal submitted amount', positive=True)):
+                raise PolicyError('Native terminal entry snapshot differs')
+            self._validate_order_release(info, proof, decimal(proof['filled_base'], 'terminal fill total'), fills, orders)
+
+    def _validate_order_release(self, info, receipt, quantity, fills, orders):
         fields = {'schema', 'source', 'order_id', 'exchange_order_id', 'trading_pair',
                   'side', 'amount', 'filled_base', 'state', 'trade_ids'}
         if (info is None or not isinstance(receipt, dict) or set(receipt) != fields
                 or type(receipt['schema']) is not int or receipt['schema'] != 1
                 or (info.config.entry_order_policy != 'single_attempt' and info.is_active)
                 or receipt['trading_pair'] != self.owner.config.trading_pair or receipt['side'] != 'BUY'
-                or decimal(receipt['amount'], 'reconciled amount', positive=True) != info.config.amount
+                or not quantity <= decimal(receipt['amount'], 'reconciled amount', positive=True) <= info.config.amount
                 or decimal(receipt['filled_base'], 'reconciled filled quantity') != quantity):
             raise PolicyError('Native terminal reconciliation scope or quantity differs')
         order_id = receipt['order_id']

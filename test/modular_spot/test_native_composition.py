@@ -64,7 +64,9 @@ def controllers(family, wrapper_config, wrapper, native_config, native, **change
 def test_native_executor_factory_parameters_match_exactly(family, wrapper_config, wrapper, native_config, native):
     wrapped, legacy = controllers(family, wrapper_config, wrapper, native_config, native, execution_enabled=True)
     created = [owner.get_executor_config(TradeType.BUY, D('100'), D('.3')) for owner in (wrapped, legacy)]
-    assert created[0].model_dump(exclude={'id'}) == created[1].model_dump(exclude={'id'})
+    assert created[0].require_terminal_entry_reconciliation is True
+    assert created[1].require_terminal_entry_reconciliation is False
+    assert created[0].model_dump(exclude={'id', 'require_terminal_entry_reconciliation'}) == created[1].model_dump(exclude={'id', 'require_terminal_entry_reconciliation'})
     assert created[0].type == 'position_executor'
     assert created[0].leverage == 1
 
@@ -224,7 +226,8 @@ def test_actual_native_create_action_path_matches(family, wrapper_config, wrappe
         actions = owner.determine_executor_actions()
         assert len(actions) == 1
         assert actions[0].executor_config.side == TradeType.BUY
-        results.append(actions[0].model_dump(exclude={'executor_config': {'id'}}))
+        assert actions[0].executor_config.require_terminal_entry_reconciliation is (owner is wrapped)
+        results.append(actions[0].model_dump(exclude={'executor_config': {'id', 'require_terminal_entry_reconciliation'}}))
     assert results[0] == results[1]
 
 

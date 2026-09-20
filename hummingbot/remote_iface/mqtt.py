@@ -733,21 +733,16 @@ class MQTTGateway(Node):
         ):
             return endpoint
 
-        original_on_disconnect = client.on_disconnect
-
         def safe_on_disconnect(client_obj, userdata, rc, *args, **kwargs):
-            try:
-                if original_on_disconnect is not None:
-                    return original_on_disconnect(client_obj, userdata, rc, *args, **kwargs)
-            except Exception as exc:
-                self._health = False
+            # commlib's callback calls loop_stop and synchronously reconnects,
+            # even for an intentional disconnect (rc=0). That competes with our
+            # serialized gateway recovery and can deadlock shutdown in thread
+            # joins. Paho owns its I/O loop; the gateway owns endpoint recovery.
+            transport._connected = False
+            self._health = False
+            if rc != 0:
                 self._transport_disconnect_errors += 1
-                self._last_transport_disconnect_error = exc
-                return None
-            finally:
-                current_client = getattr(transport, "_client", None)
-                if current_client is not None:
-                    current_client.on_disconnect = safe_on_disconnect
+                self._last_transport_disconnect_error = ConnectionError(f'MQTT disconnected: {rc}')
             return None
 
         client.on_disconnect = safe_on_disconnect

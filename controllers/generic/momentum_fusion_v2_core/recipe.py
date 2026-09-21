@@ -69,6 +69,10 @@ def bind(source_sha256: str, configuration_sha256: str, spec: RecipeSpec | None 
     )
 
 
+def runtime_prerequisites(evidence_sha256: str, vetoes: tuple[Prerequisite, ...] = ()) -> tuple[Prerequisite, ...]:
+    return (Prerequisite(name='data', status='PASS', evidence_sha256=evidence_sha256),) + vetoes
+
+
 def select(proposals: tuple[setups.SetupState, ...], prerequisites: tuple[Prerequisite, ...],
            enabled: frozenset[str]) -> setups.SetupState | None:
     blockers = tuple(item for item in prerequisites if item.status != 'PASS')

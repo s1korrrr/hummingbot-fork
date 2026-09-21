@@ -57,3 +57,14 @@ def test_momentum_source_does_not_mutate_component_tree(tmp_path, monkeypatch):
 def test_canonical_component_manifest_still_complete():
     names = {path.name for path in component_source_files()}
     assert {'__init__.py', 'source_identity.py', 'recipe_contract.py'} <= names
+
+
+def test_controller_emit_path_calls_native_planners():
+    source = CONTROLLER.read_text()
+    assert 'runtime.plan_acquisition' in source
+    assert 'runtime.plan_management' in source
+    assert 'select(tuple(self._states.values()), (),' not in source
+    assert "getattr(row, 'confirmed', None) is False" not in source
+    assert 'is_explicitly_confirmed' in source
+    emit = source.split('def determine_executor_actions')[1].split('def get_status_summary')[0]
+    assert 'return []' not in emit

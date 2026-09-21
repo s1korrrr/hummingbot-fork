@@ -23,6 +23,13 @@ def is_closed_minute(open_time, now):
     return int(open_time) + INTERVAL_SECONDS['1m'] <= int(now)
 
 
+def is_explicitly_confirmed(row):
+    flag = getattr(row, 'confirmed', None)
+    if flag is None:
+        return False
+    return bool(flag) and flag == flag
+
+
 def prior_channel_break(frame, dependencies, parameters):
     lookback = int(parameters['lookback'])
     close = decimal(frame['close'].iloc[-1], 'close', positive=True)

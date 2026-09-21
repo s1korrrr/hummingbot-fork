@@ -24,6 +24,16 @@ def test_safety_veto_dominates_alpha():
     assert recipe.select((proposed('c1_shelf'),), veto, enabled) is None
 
 
+def test_runtime_prerequisites_are_not_an_empty_tuple():
+    checks = recipe.runtime_prerequisites('a' * 64)
+    assert checks != ()
+    assert checks[0].name == 'data'
+    assert checks[0].status == 'PASS'
+    vetoed = recipe.runtime_prerequisites(
+        'a' * 64, vetoes=(Prerequisite(name='risk', status='HOLD'),))
+    assert recipe.select((proposed('c1_shelf'),), vetoed, frozenset({'c1_shelf'})) is None
+
+
 def test_disabled_modules_cannot_win():
     enabled = frozenset({'b0_breakout'})
     checks = (Prerequisite(name='data', status='PASS', evidence_sha256='a' * 64),)

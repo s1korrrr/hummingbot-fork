@@ -19,6 +19,8 @@ def test_disabled_execution_and_live_are_rejected_at_construction():
     assert MomentumFusionV2Config(id='mom').execution_enabled is False
     with pytest.raises(ValueError, match='live'):
         MomentumFusionV2Config(id='mom', execution_enabled=True, execution_mode='live')
+    with pytest.raises(ValueError, match='claim_store_path'):
+        MomentumFusionV2Config(id='mom', execution_enabled=True, execution_mode='paper')
     with pytest.raises(ValueError):
         MomentumFusionV2Config(id='mom', trade_quote=100, total_amount_quote=10)
 

@@ -45,6 +45,21 @@ def test_prior_channel_excludes_the_candidate_bar():
     assert flat['break'] == 0
 
 
+def test_missing_confirmed_is_not_treated_as_true():
+    class Missing:
+        pass
+
+    class Denied:
+        confirmed = False
+
+    class Allowed:
+        confirmed = True
+
+    assert features.is_explicitly_confirmed(Missing()) is False
+    assert features.is_explicitly_confirmed(Denied()) is False
+    assert features.is_explicitly_confirmed(Allowed()) is True
+
+
 def test_unconfirmed_candle_cannot_enter_a_snapshot():
     with pytest.raises(ValueError):
         Candle(open_time=0, open=1, high=1, low=1, close=1, volume=0, confirmed=False)

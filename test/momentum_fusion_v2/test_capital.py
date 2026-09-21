@@ -69,3 +69,52 @@ def test_claim_status_advances_reserved_to_submitted(tmp_path):
                                                       'executor_identity': 'e' * 64}))
     assert submitted.status == 'SUBMITTED_UNACKNOWLEDGED'
     assert runtime.ClaimStore(tmp_path / 'claims.json').get('c' * 64).status == 'SUBMITTED_UNACKNOWLEDGED'
+
+
+def _acquire(tmp_path, **over):
+    store = over.pop('claims', runtime.ClaimStore(tmp_path / 'claims.json'))
+    values = dict(
+        claims=store, execution_enabled=True, acquisition_allowed=True, recovery_hold='',
+        data_ready=True, signal=1, last_decision=None, decision_time=1_700_000_000,
+        now=1_700_000_005, max_candle_age_seconds=10, pending_inflight=False,
+        controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
+        available_quote='100', total_amount_quote='100', trade_quote='60', risk_fraction='0.05',
+        price='100', atr='1', atr_stop_multiple='2', maximum_stop_fraction='0.10',
+        take_profit='0.04', time_limit=3600, fee_buffer='0.003', amount_step='0.01',
+        minimum_amount='0.01', minimum_notional='1',
+    )
+    values.update(over)
+    return runtime.plan_acquisition(**values)
+
+
+def test_emit_without_claim_store_is_rejected_with_reason(tmp_path):
+    plan = _acquire(tmp_path, claims=None)
+    assert plan.actions == ()
+    assert plan.reason == 'claim_store_required'
+
+
+def test_rejected_entry_never_omits_reason(tmp_path):
+    stopped = _acquire(tmp_path, atr='0')
+    assert stopped.actions == ()
+    assert stopped.reason
+    sized = _acquire(tmp_path, minimum_notional='10000')
+    assert sized.actions == ()
+    assert sized.reason
+
+
+def test_open_claim_binds_the_second_sixty_unit_plan(tmp_path):
+    first = _acquire(tmp_path)
+    assert first.actions
+    assert first.reason == 'submitted'
+    second = _acquire(tmp_path, decision_time=1_700_000_060, now=1_700_000_065)
+    assert second.actions == ()
+    assert second.reason in {'account_limit', 'program_limit', 'available_quote_limit'}
+
+
+def test_restart_does_not_reemit_submitted_claim(tmp_path):
+    first = _acquire(tmp_path)
+    assert first.actions
+    restored = runtime.ClaimStore(tmp_path / 'claims.json')
+    again = _acquire(tmp_path, claims=restored, last_decision=None)
+    assert again.actions == ()
+    assert again.reason == 'claim_already_open'

@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import ConfigDict, Field, model_validator
 
 from controllers.generic.momentum_fusion_v2_core import features, recipe, runtime, setups
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.components.candle_data import Candle, CandleSnapshot, Dataset
 from hummingbot.strategy_v2.components.data_reader import DataPolicy
@@ -18,11 +19,11 @@ from hummingbot.strategy_v2.components.decision_protocol import (
     decide,
 )
 from hummingbot.strategy_v2.components.domain import DataUnavailable, PolicyError, identity
+from hummingbot.strategy_v2.components.exit_policy import ExitProposal, NativeExitView
 from hummingbot.strategy_v2.components.feature_cache import FeatureCache
 from hummingbot.strategy_v2.components.recipe_contract import configuration_digest, source_digest
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
-from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 
 
 def source_root():
@@ -62,6 +63,8 @@ class MomentumFusionV2Config(ControllerConfigBase):
     def disabled_until_admitted(self):
         if self.execution_enabled and self.execution_mode == 'live':
             raise ValueError('live execution is not admitted by this package')
+        if self.execution_enabled and not self.claim_store_path:
+            raise ValueError('claim_store_path is required when execution is enabled')
         if self.trade_quote > self.total_amount_quote:
             raise ValueError('trade quote cannot exceed assigned capital')
         recipe.RecipeSpec(enabled=self.enabled_modules)
@@ -122,7 +125,7 @@ class MomentumFusionV2Controller(ControllerBase):
             now_s = int(now)
             rows = []
             for row in frame.itertuples():
-                if getattr(row, 'confirmed', None) is False:
+                if not features.is_explicitly_confirmed(row):
                     continue
                 open_time = int(row.timestamp) if float(row.timestamp).is_integer() else -1
                 if open_time < 0 or not features.is_closed_minute(open_time, now_s):
@@ -161,7 +164,12 @@ class MomentumFusionV2Controller(ControllerBase):
                 uptrend=values['uptrend'], event_ms=event_ms, now_ms=now_ms,
                 pullback_max=params['c3_pullback_max'], lifetime_ms=int(params['lifetime_ms']),
                 cooldown_ms=int(params['cooldown_ms']))
-            selected = recipe.select(tuple(self._states.values()), (), frozenset(self.config.enabled_modules))
+            evidence = identity({'decision': values['decision_time'], 'close': str(values['close'])})
+            vetoes = ()
+            if not values.get('atr'):
+                vetoes = (Prerequisite(name='atr', status='HOLD'),)
+            checks = recipe.runtime_prerequisites(evidence, vetoes=vetoes)
+            selected = recipe.select(tuple(self._states.values()), checks, frozenset(self.config.enabled_modules))
             self.processed_data = {
                 **values, 'data_health': {'ready': True}, 'setup': None if selected is None else selected.setup,
                 'phase': None if selected is None else selected.phase, 'signal': int(selected is not None),
@@ -172,77 +180,111 @@ class MomentumFusionV2Controller(ControllerBase):
 
     def determine_executor_actions(self):
         c, data = self.config, self.processed_data
-        if (not c.execution_enabled or c.manual_kill_switch or self.recovery_hold
-                or not data.get('data_health', {}).get('ready') or data.get('signal') != 1):
-            return []
         now = self.market_data_provider.time()
-        decision = data['decision_time']
-        if not 0 <= now - decision <= c.max_candle_age_seconds or (
-                self._last_decision is not None and decision <= self._last_decision):
-            return []
-        if self._pending is not None:
-            prior = next((item for item in self.executors_info if item.id == self._pending.id), None)
-            if prior is None or prior.is_active or not prior.is_done:
-                return []
-            self._pending = None
-        if self.positions_held or any(item.is_active or not item.is_done for item in self.executors_info):
-            return []
-        ref = ObservationRef(
-            dataset_sha256=identity({'pair': c.trading_pair, 'interval': '1m'}),
-            epoch='native', revision=1,
-            content_sha256=identity({'decision': decision, 'close': str(data['close'])}),
-            event_time_ms=int(decision * 1000), available_time_ms=int(decision * 1000),
-        )
-        opportunity = Opportunity(
-            scope=self._scope(), setup=data.get('setup') or 'b0_breakout', action='acquire',
-            primary=ref, created_at_ms=int(now * 1000),
-            lifetime_ms=int(recipe.PARAMETERS['lifetime_ms']))
-        cursor_key = (opportunity.setup, opportunity.action, opportunity.primary.dataset_sha256)
+        held = bool(self.positions_held) or any(item.is_active or not item.is_done for item in self.executors_info)
         try:
-            cursor, trace = decide(
-                self._cursors.get(cursor_key), opportunity, now_ms=int(now * 1000),
-                prerequisites=(Prerequisite(name='data', status='PASS', evidence_sha256=ref.content_sha256),))
-        except PolicyError:
-            return []
-        self._cursors[cursor_key] = cursor
-        if trace.status != 'ELIGIBLE_FOR_NATIVE_ADMISSION' or trace.execution_authorized:
-            return []
-        price = Decimal(str(data['close']))
-        stop = Decimal(str(data['atr'])) * c.atr_stop_multiple / price
-        if not Decimal('0') < stop <= c.maximum_stop_fraction:
-            return []
-        try:
-            rules = self.market_data_provider.get_trading_rules(c.connector_name, c.trading_pair)
-            available = self.market_data_provider.get_available_balance(c.connector_name, 'USDC')
-            allocation = runtime.size_entry(
-                stage_quote=min(c.trade_quote, c.total_amount_quote * c.risk_fraction / stop),
-                remaining_quote=c.total_amount_quote, available_quote=available, price=price,
-                amount_step=rules.min_base_amount_increment, minimum_amount=rules.min_order_size,
-                minimum_notional=rules.min_notional_size, fee_buffer=c.fee_buffer, cash_reserve=0)
-        except (ValueError, KeyError, PolicyError):
-            return []
-        if allocation is None:
-            return []
-        executor = runtime.position_config(
-            now=now, controller_id=c.id, connector_name=c.connector_name, trading_pair=c.trading_pair,
-            amount=allocation.amount, price=price, stop=stop, take_profit=c.take_profit,
-            time_limit=c.time_limit, ttl_seconds=60)
-        if self._claims is not None:
-            claim = runtime.Claim(
-                claim_id=runtime.claim_id_for(str(decision), c.id), opportunity_id=str(decision),
-                controller_id=c.id, trading_pair=c.trading_pair, status='RESERVED',
-                reserved_quote=allocation.reserved_quote, reserved_base=allocation.reserved_base)
-            stored = self._claims.put(claim)
-            if stored.status != 'RESERVED' or stored.claim_id != claim.claim_id:
-                return []
-        self._pending, self._last_decision = executor, decision
-        self._pending_identity = identity(executor.model_dump(mode='json'))
-        if self._claims is not None:
-            self._claims.put(claim.model_copy(update={
-                'status': 'SUBMITTED_UNACKNOWLEDGED',
-                'executor_identity': self._pending_identity,
-            }))
-        return [CreateExecutorAction(controller_id=c.id, executor_config=executor)]
+            if held:
+                view, proposals, extras = self._management_inputs(now)
+                plan = runtime.plan_management(
+                    claims=self._claims, acquisition_allowed=self._scope().acquisition_allowed,
+                    view=view, proposals=proposals, **extras)
+            else:
+                pending_inflight = False
+                if self._pending is not None:
+                    prior = next((item for item in self.executors_info if item.id == self._pending.id), None)
+                    pending_inflight = prior is None or prior.is_active or not prior.is_done
+                    if not pending_inflight:
+                        self._pending = None
+                rules = self.market_data_provider.get_trading_rules(c.connector_name, c.trading_pair)
+                available = self.market_data_provider.get_available_balance(c.connector_name, 'USDC')
+                if data.get('signal') == 1 and data.get('data_health', {}).get('ready'):
+                    ref = ObservationRef(
+                        dataset_sha256=identity({'pair': c.trading_pair, 'interval': '1m'}),
+                        epoch='native', revision=1,
+                        content_sha256=identity({'decision': data['decision_time'], 'close': str(data['close'])}),
+                        event_time_ms=int(data['decision_time'] * 1000),
+                        available_time_ms=int(data['decision_time'] * 1000),
+                    )
+                    opportunity = Opportunity(
+                        scope=self._scope(), setup=data.get('setup') or 'b0_breakout', action='acquire',
+                        primary=ref, created_at_ms=int(now * 1000),
+                        lifetime_ms=int(recipe.PARAMETERS['lifetime_ms']))
+                    cursor_key = (opportunity.setup, opportunity.action, opportunity.primary.dataset_sha256)
+                    cursor, trace = decide(
+                        self._cursors.get(cursor_key), opportunity, now_ms=int(now * 1000),
+                        prerequisites=recipe.runtime_prerequisites(ref.content_sha256))
+                    self._cursors[cursor_key] = cursor
+                    if trace.status != 'ELIGIBLE_FOR_NATIVE_ADMISSION' or trace.execution_authorized:
+                        plan = runtime.ActionPlan((), trace.reason)
+                    else:
+                        plan = None
+                else:
+                    plan = None
+                if plan is None:
+                    plan = runtime.plan_acquisition(
+                        claims=self._claims, execution_enabled=c.execution_enabled,
+                        acquisition_allowed=self._scope().acquisition_allowed,
+                        recovery_hold=self.recovery_hold,
+                        data_ready=bool(data.get('data_health', {}).get('ready')),
+                        signal=int(data.get('signal') or 0), last_decision=self._last_decision,
+                        decision_time=data.get('decision_time') or 0, now=now,
+                        max_candle_age_seconds=c.max_candle_age_seconds, pending_inflight=pending_inflight,
+                        controller_id=c.id, connector_name=c.connector_name, trading_pair=c.trading_pair,
+                        available_quote=available, total_amount_quote=c.total_amount_quote,
+                        trade_quote=c.trade_quote, risk_fraction=c.risk_fraction,
+                        price=data.get('close') or 0, atr=data.get('atr') or 0,
+                        atr_stop_multiple=c.atr_stop_multiple, maximum_stop_fraction=c.maximum_stop_fraction,
+                        take_profit=c.take_profit, time_limit=c.time_limit, fee_buffer=c.fee_buffer,
+                        amount_step=rules.min_base_amount_increment, minimum_amount=rules.min_order_size,
+                        minimum_notional=rules.min_notional_size)
+        except (PolicyError, ValueError, TypeError, KeyError, AttributeError) as error:
+            plan = runtime.ActionPlan((), str(error) or 'emit_failed')
+        data['action_reason'] = plan.reason
+        if plan.actions and not held:
+            self._pending = plan.actions[0].executor_config
+            self._last_decision = data.get('decision_time')
+            self._pending_identity = identity(self._pending.model_dump(mode='json'))
+        return list(plan.actions)
+
+    def _management_inputs(self, now):
+        c = self.config
+        active = next((item for item in self.executors_info if item.is_active or not item.is_done), None)
+        info = dict(getattr(active, 'custom_info', None) or {})
+        remaining = info.get('remaining_position_amount_base') or info.get('remaining_owned_base')
+        if remaining is None and self.positions_held:
+            pos = self.positions_held[0]
+            remaining = getattr(pos, 'amount', None) or getattr(pos, 'base_amount', None)
+        if remaining is None:
+            raise PolicyError('native_exit_view_unavailable')
+        rules = self.market_data_provider.get_trading_rules(c.connector_name, c.trading_pair)
+        bid = self.market_data_provider.get_price_by_type(
+            c.connector_name, c.trading_pair, PriceType.BestBid)
+        receipt = identity({'executor': getattr(active, 'id', c.id), 'pair': c.trading_pair})
+        owner = c.id
+        executor_id = str(getattr(active, 'id', None) or 'held-position')
+        view = NativeExitView(
+            owner_id=owner, executor_id=executor_id, connector=c.connector_name,
+            trading_pair=c.trading_pair, receipt_sha256=receipt, observed_at_ms=int(now * 1000),
+            reconciled=True, fees_complete=getattr(active, 'cum_fees_quote', None) is not None,
+            remaining_base=str(remaining), reserved_base='0',
+            base_fee_fraction=str(c.fee_buffer),
+            amount_step=str(rules.min_base_amount_increment),
+            price_step=str(getattr(rules, 'min_price_increment', '0.01')),
+            minimum_amount=str(rules.min_order_size),
+            minimum_notional=str(rules.min_notional_size), bid=str(bid))
+        harvest = remaining
+        proposals = (ExitProposal(
+            policy_id='trail', owner_id=owner, executor_id=executor_id, receipt_sha256=receipt,
+            requested_base=str(harvest), minimum_price='0', expires_at_ms=int(now * 1000) + 1000),)
+        entry = info.get('entry_price') or info.get('current_position_average_price')
+        if entry is None:
+            raise PolicyError('unknown_cost')
+        cost = Decimal(str(entry)) * Decimal(str(remaining))
+        extras = dict(
+            cost_quote=str(cost), harvest_base=str(harvest), fee_fraction=str(c.fee_buffer),
+            margin='0', buffer='0', now_ms=int(now * 1000), controller_id=c.id,
+            connector_name=c.connector_name, trading_pair=c.trading_pair, time_limit=c.time_limit)
+        return view, proposals, extras
 
     def get_status_summary(self):
         data = self.processed_data
@@ -261,6 +303,7 @@ class MomentumFusionV2Controller(ControllerBase):
             'data_ready': self.processed_data.get('data_health', {}).get('ready', False),
             'data_reason': self.processed_data.get('data_health', {}).get('reason'),
             'setup': self.processed_data.get('setup'), 'signal': self.processed_data.get('signal', 0),
+            'action_reason': self.processed_data.get('action_reason'),
             'recovery_hold': self.recovery_hold,
             'component_ids': ['candle_snapshot', 'feature_cache', 'quote_allocation', 'native_position_executor',
                               'exit_arbitration', 'decision_protocol'],

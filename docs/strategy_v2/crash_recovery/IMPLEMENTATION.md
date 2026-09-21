@@ -5,18 +5,18 @@ PR: [Hummingbot #62](https://github.com/s1korrrr/hummingbot/pull/62).
 
 ## Result and boundary
 
-Implemented the absolute closed-candle/R0 evidence subset of M1 and the pure
-recipe/decision composition subset of M2. This is usable policy code with tests,
-not a ControllerBase, a native execution adapter or a backtest result. Nothing
-here can submit, cancel, replace or sell an exchange order. All recipe instances
-require `execution_enabled=false`; all returned traces retain
+Implemented the absolute closed-candle/R0 evidence subset of M1, the pure
+recipe/decision composition subset of M2, and a non-executing isolated host
+`controllers/generic/crash_recovery_v2.py`. Evidence modules still cannot submit,
+cancel, replace or sell an exchange order. The host emits no executor actions.
+All recipe instances require `execution_enabled=false`; all returned traces retain
 `execution_authorized=false`.
 
-**84 tests passed**, with warnings treated as errors, in a fresh partial-source
-workspace using Python 3.13.5, Pydantic 2.13.4 and pandas 2.2.3. Native compiled
-runtime, full native/legacy regression, independent audit, real cache/supervisor
-state, economic baseline and deployment acceptance remain unavailable/not run.
-The native import probe failed; it was not skipped or replaced by fake executors.
+**106 tests passed** in the pinned Hummingbot 3.13 environment with warnings
+treated as errors. Earlier 84-test claim was partial-source only. Native compiled
+runtime import now succeeds in this worktree. Full native/legacy regression,
+independent audit, real cache/supervisor state, economic baseline and deployment
+acceptance remain not run.
 
 ## Implemented files
 
@@ -26,11 +26,8 @@ The native import probe failed; it was not skipped or replaced by fake executors
 | `hummingbot/strategy_v2/components/recovery_evidence_v1.py` | NORMAL/SHOCK_HOLD/STABILIZING/RECOVERY_ELIGIBLE state, causal low/reclaim, fixed expiry, invalidation and parameter-bound checkpoints. |
 | `controllers/generic/crash_recovery_v2_core/recipe.py` | Strict single-dataset, OKX/USDC/1m no-order recipe; actual RecipeBinding reuse; sealed off/stress-only/recovery treatments. |
 | `controllers/generic/crash_recovery_v2_core/runtime.py` | Pure observation and Opportunity/Prerequisite/DecisionTrace composition, mandatory acquisition declarations, independent reduction cursor, bounded checkpoint codec. |
-| `test/crash_recovery_v2/` | Real canonical-model contract tests, deterministic transitions, corruption/replay/freshness cases, no-I/O checks and source-seal impact tests. |
-
-The package initializer starts nothing. No native controller entrypoint or exact
-model-admission exception was added. Existing canonical helpers and legacy
-controllers/configurations/defaults/persistence were not edited.
+| `controllers/generic/crash_recovery_v2.py` | Isolated non-executing ControllerBase host, host source seal, CheckpointStore. Never `ok_rsi`/`rsi_v5`. |
+| `test/crash_recovery_v2/` | Canonical-model contracts plus compiled-env admission, revoke, persist, restore, and isolation tests. |
 
 ## Exact first-revision semantics
 
@@ -146,24 +143,38 @@ existing V1 owner to make its guard pass.
 
 ## Remaining gates and next action
 
-M0 native host/package admission is still held. M2 has no verified actual v2
-baseline. M3 native loader/factory/funding/risk/permission-revocation tests and M4
-native persistence/cancel/late-fill/restore tests remain unimplemented. M5 needs
-the actual Quants/program/result admission. M6-M8 have no economic or promotion
-result. Independent review is NOT RUN; author review is not represented as a
-separate audit.
-
-The next implementation action is to run this new suite in the pinned owning
-native environment, verify the actual isolated v2 host and source-impact matrix,
-then implement acquisition-only native integration without modifying legacy
-semantics. Resume existing research state before any separately authorized full
-cached May-August economic comparison. Never substitute a shorter run or legacy
-program label.
+M0 isolated host is in this worktree. M3/M4 compiled-env subset passed. Full
+modular-native.yml, `v2_with_controllers` loader, Quants replay, cached May-August
+economics, independent audit, and promotion remain open. M5 Research OS fail-closed
+admission lives in root/`research_os`. Do not relabel as `ok_rsi` or `okx_spot_dca`.
+Do not install this branch onto a live V1/V2 owner.
 
 Rollback only this continuation's scoped source/test/document changes after
 checking for later work. Preserve all native inventory, claims, risk state and
 approved exits. No services were started, no orders were issued and no deployment
 or merge occurred in this continuation.
+
+## 2026-09-21 compiled-env host
+
+Isolated host `controllers/generic/crash_recovery_v2.py` plus `CheckpointStore`.
+`compose_crash_prerequisites` exports acquire-only `crash.*` checks. Traces keep
+`execution_authorized=false`. Host `entry_permission` is false and
+`determine_executor_actions` is empty.
+
+Pinned env: `/Users/s1kor/anaconda3/envs/hummingbot/bin/python` with this
+worktree compiled in place.
+
+```
+PYTHONPATH="$PWD" python -m pytest -q -W error test/crash_recovery_v2
+106 passed in 25.23s
+```
+
+Native import of `hummingbot.connector.connector_base` succeeded. Full
+modular-native.yml suite, independent audit, Quants replay, and cached-window
+economics were not run. Research OS fail-closed program
+`okx_spot_crash_recovery_v2` is a root/`research_os` change, not this nested
+commit.
+
 
 ## CI selection
 

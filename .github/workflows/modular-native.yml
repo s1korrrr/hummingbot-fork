@@ -7,6 +7,7 @@ on:
       - 'controllers/generic/rsi_modular.py'
       - 'controllers/generic/component_breakout.py'
       - 'controllers/generic/modular_spot_core/**'
+      - 'controllers/generic/crash_recovery_v2.py'
       - 'controllers/generic/crash_recovery_v2_core/**'
       - 'controllers/directional_trading/**'
       - 'hummingbot/strategy_v2/**'
@@ -91,6 +92,7 @@ jobs:
               "controllers.generic.modular_rsi_v5",
               "controllers.generic.rsi_modular",
               "controllers.generic.component_breakout",
+              "controllers.generic.crash_recovery_v2",
               "hummingbot.strategy_v2.components",
           ):
               importlib.import_module(module)

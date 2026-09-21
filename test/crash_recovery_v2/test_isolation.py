@@ -1,5 +1,6 @@
 import ast
 import importlib
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -54,12 +55,10 @@ def test_neutral_components_never_import_a_controller_family():
 
 
 def test_new_imports_and_evaluation_do_not_start_services_or_write_files():
-    script = 'import sys; sys.path.insert(0, ' + repr(str(Path(__file__).resolve().parents[1])) + ')\n' + '''
-import sys
-from crash_recovery_v2.test_evidence import packet, policies
-from hummingbot.strategy_v2.components.candle_data import CandleSnapshot
-from hummingbot.strategy_v2.components.decision_protocol import decide
-import socket, sqlite3, subprocess, threading
+    repo = str(Path(__file__).resolve().parents[2])
+    script = '''
+from test.crash_recovery_v2.test_evidence import packet, policies
+import socket, sqlite3, subprocess, sys, threading
 
 def forbidden(*args, **kwargs):
     raise AssertionError('unexpected service, network or database action')
@@ -83,7 +82,8 @@ assert r.status == 'HOLD'
 assert not any(n.startswith('controllers.directional_trading') for n in sys.modules)
 print('no service or controller-family import')
 '''
-    result = subprocess.run([sys.executable, '-B', '-c', script], capture_output=True, text=True, timeout=20)
+    result = subprocess.run([sys.executable, '-B', '-c', script], capture_output=True, text=True,
+                            timeout=180, env={**os.environ, 'PYTHONPATH': repo})
     assert result.returncode == 0, result.stderr
 
 

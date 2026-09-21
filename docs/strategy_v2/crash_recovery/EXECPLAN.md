@@ -1,6 +1,6 @@
 # Crash protection and recovery acquisition: v2 ExecPlan
 
-Revision: 3 | Source baseline: 2026-09-20 | Status: M1 ABSOLUTE/R0 AND PURE M2 SUBSET IMPLEMENTED; NATIVE/ECONOMIC GATES OPEN
+Revision: 4 | Source baseline: 2026-09-21 | Status: M1 ABSOLUTE/R0, PURE M2, ISOLATED HOST, M3/M4 COMPILED-ENV SUBSET; ECONOMICS BLOCKED
 
 Implementation receipt: [IMPLEMENTATION.md](IMPLEMENTATION.md). Source/test hashes: [VALIDATION.json](VALIDATION.json).
 
@@ -20,12 +20,12 @@ The latest user request authorizes scoped implementation, testing and pushing to
 - [x] Reconcile merged #55/#57/#59 and the root's actual component gitlinks.
 - [x] Identify compatibility-profile inheritance, recursive component source seals and the economic-adapter gap.
 - [x] Rewrite the spec and provide this gated plan with a redirect from the old document.
-- [ ] M0: Admit an isolated v2 host, source package and research context for implementation.
+- [x] M0: Isolated `crash_recovery_v2.py` host plus core, not `ok_rsi`/`rsi_v5`/`rsi_modular`. No live enrollment.
 - [x] M1 subset: implement/test absolute closed-candle stress and R0 recovery reducers. Normalized, book/trade and learned methods are explicitly unsupported; no native capability is implied.
-- [ ] M2: pure sealed recipe, causal traces and checkpoint codec implemented/tested; actual v2 baseline and native host qualification remain open.
-- [ ] M3: Prove native admission, acquisition revocation and legacy isolation.
-- [ ] M4: Prove persistent state, funding, management and restore behavior.
-- [ ] M5: Qualify Quants parity and the actual v2 economic-admission boundary.
+- [x] M2 pure subset: sealed recipe, traces, checkpoint codec, `compose_crash_prerequisites`. Overlay-off vs an executing modular v2 baseline remains open.
+- [x] M3 compiled-env subset: policy identity rejects the host; acquisition-only revoke via `_end_entry_acquisition`; late fill owned; filled trailing intact; frozen families not imported. Full `v2_with_controllers` script loader was not run.
+- [x] M4 compiled-env subset: recorder Metadata CAS, restore cannot skip SHOCK_HOLD, missing checkpoint with obligations rejects, host cannot occupy NativeFunding/Reservation. Host has no funding field.
+- [ ] M5: Research OS fail-closed schemas exist. Quants runner argv and economics remain BLOCKED.
 - [ ] M6: Run one separately authorized, preregistered A/B comparison.
 - [ ] M7: Admit only justified recovery/allocation follow-up trials.
 - [ ] M8: Deliver source-bound evidence and a separate promotion handoff.
@@ -124,6 +124,8 @@ A non-economic R0 test vector must pin the low and clock semantics. For example,
 
 **Acceptance:** a capability table separately marking decision parity, native lifecycle fidelity and economics. Economics may remain BLOCKED while engineering completes. No generic executable economic command is supplied here because no compatible crash-recipe runner/admission was established in this review.
 
+Research OS (root `config/research_programs.json` + `research_os` `CONTRACTS` / `backtest_policy`) now admits program `okx_spot_crash_recovery_v2` with owner schemas `crash_recovery_v2.cached_window_data.v1`, `crash_recovery_v2.signal_manifest.v1`, `crash_recovery_v2.episode_comparison.v1` as fail-closed dispatch. Relabeling as `ok_rsi.*` / `okx_spot_dca` is rejected. Schema admission is not economic `SUPPORTED`. Quants runner argv remains HOLD (workspace `quants-lab` is dirty and lacks `native_modular.py`). Cache-byte verification for crash-specific instruments, independent audit, native lifecycle, and M6 A/B remain open. Do not mark this M5 box complete.
+
 ## M6 — first authorized A/B comparison
 
 Proceed only with explicit local research authority, a supported owner command, frozen data and a genuine independent design audit.
@@ -187,3 +189,34 @@ Stop for missing authority, unsupported owner/capital/restore capability, failed
 - Current tests: 84 passed with warnings treated as errors. See the implementation receipt for exact scope and failed-attempt history. Native host/runtime, native regression suite, independent audit, actual economic baseline and deployment remain held/not run.
 
 The continuation also adds the new tests to the existing native CI selection and its path filter. This is test discovery only; hosted CI/native execution is not claimed.
+
+## 2026-09-21 compiled-env continuation
+
+Worktree `/Users/s1kor/dev/trading/rsibot/.worktrees/hummingbot-v2-crash-recovery` on `feat/andrzej_v2_crash_recovery_spec`. Compiled `connector_base.cpython-313-darwin.so` in this worktree. Interpreter `/Users/s1kor/anaconda3/envs/hummingbot/bin/python` 3.13. Dirty checkout `rsibot/hummingbot` was not used.
+
+Architect pick (recorded, not re-run): thin `controllers/generic/crash_recovery_v2.py` wrapping `crash_recovery_v2_core`. Rejected composing into unmerged `spot_recipe_v2` and inheriting `modular_spot`/`ok_rsi`/`rsi_v5`. `is_ok_rsi_policy` and `is_modular_policy` stay unchanged and reject this host.
+
+Capability matrix:
+
+| Capability | Status |
+| Native CONFIG_CLASS loader name | SUPPORTED. `crash_recovery_v2` / `CrashRecoveryV2ControllerConfig`. |
+| RecipeBinding schema 1 | SUPPORTED. `bind_host_recipe` hashes installed host+core bytes. |
+| `execution_authorized` | Always false. `execution_enabled` cannot be true. |
+| Runner risk / `is_modular_policy` | REJECTED. Host is not a modular_spot peer. |
+| NativeFunding / Reservation | REJECTED. Controller id pattern is `crash_recovery_v2_*`. |
+| Acquisition revoke | SUPPORTED. `entry_permission` is false. `ModularPositionExecutor.control_open_order` calls `_end_entry_acquisition`. Not `StopExecutorAction`. |
+| Per-tranche exits / trailing | Native executor keeps filled inventory and trailing. Host emits no actions. |
+| Recorder persist | SUPPORTED. `CheckpointStore` CAS on `crash-recovery-v2:{owner}`. |
+| Quants `native_modular.py` | BLOCKED. Workspace `quants-lab` has no such file. |
+| Research OS program | Fail-closed `okx_spot_crash_recovery_v2`. Relabel as `okx_spot_dca`/`ok_rsi.*` rejects. |
+| Cached May-August economics | NOT RUN. No authorized owner argv. |
+| Live / paper / canary | FORBIDDEN this task. |
+
+Evidence:
+
+```
+PYTHONPATH="$PWD" /Users/s1kor/anaconda3/envs/hummingbot/bin/python -m pytest -q -W error test/crash_recovery_v2
+106 passed in 25.23s
+```
+
+Native import probe of `ConnectorBase`, `MarketsRecorder`, `PositionExecutor`, `crash_recovery_v2` succeeded. Full `.github/workflows/modular-native.yml` native/legacy selection was not run here. Independent audit was not run. No orders, no stack restart, no merge.

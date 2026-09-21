@@ -32,9 +32,11 @@ def recipe(**changes):
 
 
 def checks(*, omit=(), hold=None):
-    return tuple(Prerequisite(name=name, status='HOLD' if name == hold else 'PASS',
-                             evidence_sha256='d' * 64)
-                 for name in ('data', 'risk', 'funding', 'ownership', 'native_admission') if name not in omit)
+    names = ('data', 'risk', 'funding', 'ownership', 'native_admission')
+    return tuple(
+        Prerequisite(name=name, status='HOLD' if name == hold else 'PASS', evidence_sha256='d' * 64)
+        for name in names if name not in omit
+    )
 
 
 def evaluate(state=None, prices=(), *, config=None, present=True, acquire=True, action='acquire',
@@ -126,6 +128,15 @@ def test_external_prerequisite_order_is_deterministic():
     assert a == b
 
 
+def test_compose_crash_prerequisites_exports_acquire_overlay():
+    _, rt = api()
+    x = recover()
+    names = [item.name for item in rt.compose_crash_prerequisites(x)]
+    assert names == ['crash.observation', 'crash.stress', 'crash.recovery']
+    assert rt.compose_crash_prerequisites(evaluate(acquire=False)) == ()
+    assert rt.compose_crash_prerequisites(evaluate(action='reduce', prerequisites=())) == ()
+
+
 def test_caller_cannot_override_crash_prerequisites_or_duplicate_names():
     x = recover()
     with pytest.raises(ValueError):
@@ -135,9 +146,15 @@ def test_caller_cannot_override_crash_prerequisites_or_duplicate_names():
             Prerequisite(name='crash.stress', status='PASS', evidence_sha256='f' * 64),))
 
 
-@pytest.mark.parametrize('field,value', [('execution_enabled', True), ('execution_enabled', 0),
-    ('schema_version', True), ('schema_version', 2), ('mode', 'live'), ('quote_budget', True),
-    ('quote_budget', 'Infinity'), ('capital_model', 'perpetual_margin'), ('lifetime_ms', True)])
+UNSUPPORTED_RECIPE = [
+    ('execution_enabled', True), ('execution_enabled', 0),
+    ('schema_version', True), ('schema_version', 2), ('mode', 'live'),
+    ('quote_budget', True), ('quote_budget', 'Infinity'),
+    ('capital_model', 'perpetual_margin'), ('lifetime_ms', True),
+]
+
+
+@pytest.mark.parametrize('field,value', UNSUPPORTED_RECIPE)
 def test_unsupported_recipe_combinations_reject(field, value):
     with pytest.raises(ValueError):
         recipe(**{field: value})

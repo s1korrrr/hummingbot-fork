@@ -24,16 +24,25 @@ from hummingbot.strategy_v2.components.market_stress_v1 import (
     evaluate_stress,
 )
 from hummingbot.strategy_v2.components.recipe_contract import RecipeBinding, canonical_json, digest
-from hummingbot.strategy_v2.components.recovery_evidence_v1 import (
-    RecoveryEvaluation,
-    RecoveryState,
-    evaluate_recovery,
-)
+from hummingbot.strategy_v2.components.recovery_evidence_v1 import RecoveryEvaluation, RecoveryState, evaluate_recovery
 from hummingbot.strategy_v2.components.strict_json import strict_json
 
 from .recipe import REQUIRED_ACQUISITION_CHECKS, CrashRecoveryRecipe, validate_binding
 
 MAX_CHECKPOINT_BYTES = 2_000_000
+
+
+def _acquire_crash_prerequisites(recipe: CrashRecoveryRecipe, stress: StressEvaluation,
+                                 recovery: RecoveryEvaluation, *, observation_ok: bool) -> tuple[Prerequisite, ...]:
+    evidence = digest(stress.model_dump(mode='json'))
+    items = [Prerequisite(name='crash.observation', status='PASS' if observation_ok else 'HOLD',
+                          evidence_sha256=evidence)]
+    if recipe.mode != 'off':
+        items.append(Prerequisite(name='crash.stress', status=stress.status, evidence_sha256=evidence))
+    if recipe.mode == 'recovery':
+        items.append(Prerequisite(name='crash.recovery', status=recovery.status,
+                                  evidence_sha256=digest(recovery.model_dump(mode='json'))))
+    return tuple(items)
 
 
 class CompositionState(PolicyModel):
@@ -73,6 +82,12 @@ class CompositionResult(PolicyModel):
     recovery: RecoveryEvaluation
     trace: DecisionTrace | None
     execution_authorized: Literal[False] = False
+    crash_prerequisites: tuple[Prerequisite, ...] = ()
+
+
+def compose_crash_prerequisites(result: CompositionResult) -> tuple[Prerequisite, ...]:
+    """crash.* checks already attached during acquire evaluate. Empty for reduce or no opportunity."""
+    return checked(CompositionResult, result).crash_prerequisites
 
 
 def evaluate(state: CompositionState | None, snapshot: ReceivedCandles | None,
@@ -101,6 +116,7 @@ def evaluate(state: CompositionState | None, snapshot: ReceivedCandles | None,
     re = evaluate_recovery(state.recovery, se, recipe.recovery, now_ms)
     cursors = {'acquire_cursor': state.acquire_cursor, 'reduce_cursor': state.reduce_cursor}
     trace = None
+    crash = ()
     if opportunity is not None:
         opportunity = checked(Opportunity, opportunity)
         if opportunity.scope != recipe.scope:
@@ -120,20 +136,15 @@ def evaluate(state: CompositionState | None, snapshot: ReceivedCandles | None,
                 checks.setdefault(name, Prerequisite(name=name, status='UNAVAILABLE'))
             valid_input = (snapshot is not None and opportunity.primary == se.observation
                            and (se.fresh or se.reason in ('seeded', 'already_observed')))
-            checks['crash.observation'] = Prerequisite(
-                name='crash.observation', status='PASS' if valid_input else 'HOLD',
-                evidence_sha256=digest(se.model_dump(mode='json')))
-            if recipe.mode != 'off':
-                checks['crash.stress'] = Prerequisite(name='crash.stress', status=se.status,
-                                                     evidence_sha256=digest(se.model_dump(mode='json')))
-            if recipe.mode == 'recovery':
-                checks['crash.recovery'] = Prerequisite(name='crash.recovery', status=re.status,
-                                                       evidence_sha256=digest(re.model_dump(mode='json')))
+            crash = _acquire_crash_prerequisites(recipe, se, re, observation_ok=valid_input)
+            for item in crash:
+                checks[item.name] = item
         key = 'acquire_cursor' if opportunity.action == 'acquire' else 'reduce_cursor'
         cursors[key], trace = decide(cursors[key], opportunity, now_ms=now_ms, prerequisites=tuple(checks.values()))
     next_state = CompositionState(binding_sha256=identity, clock_ms=now_ms, stress=se.state,
                                   recovery=re.state, **cursors)
-    return CompositionResult(state=next_state, stress=se, recovery=re, trace=trace)
+    return CompositionResult(state=next_state, stress=se, recovery=re, trace=trace,
+                             crash_prerequisites=crash)
 
 
 def encode_checkpoint(state: CompositionState) -> str:

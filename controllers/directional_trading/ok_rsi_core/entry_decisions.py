@@ -42,12 +42,14 @@ class MetadataEntryDecisionStore:
 
 
 class EntryDecisionGate:
-    """A restart burns any queued authorization; it never recreates an attempt."""
+    """Consume a candle only after an Executors row exists for that attempt."""
 
-    def __init__(self, store):
+    def __init__(self, store, executor_exists=None):
         self.store = store
+        self._executor_exists = executor_exists
         self._eligible_candle = None
         self._local_authorization = None
+        self._awaiting_commit = None
 
     def _load(self):
         state = self.store.load()
@@ -65,12 +67,39 @@ class EntryDecisionGate:
         if auth is not None:
             if (not isinstance(auth, dict) or set(auth) != {"executor_id", "fingerprint", "candle", "dispatched"}
                     or any(not isinstance(auth[key], str) or not auth[key] for key in ("executor_id", "fingerprint"))
-                    or type(auth["candle"]) is not int or auth["candle"] != state["consumed_candle"]
-                    or auth["candle"] <= 0 or type(auth["dispatched"]) is not bool):
+                    or type(auth["candle"]) is not int or auth["candle"] <= 0
+                    or type(auth["dispatched"]) is not bool):
+                raise ValueError("Invalid entry authorization")
+            expected = state["consumed_candle"] if state["consumed_candle"] else state["candle"]
+            if auth["candle"] != expected:
                 raise ValueError("Invalid entry authorization")
         elif state["consumed_candle"]:
             raise ValueError("Consumed decision lacks authorization")
         return state
+
+    def _exists(self, executor_id):
+        if self._executor_exists is None:
+            return None
+        return self._executor_exists(executor_id)
+
+    def _reconcile(self, previous):
+        if not previous or not previous["authorization"]:
+            return previous
+        if self._awaiting_commit is not None or self._local_authorization is not None:
+            return previous
+        exists = self._exists(previous["authorization"]["executor_id"])
+        if exists is True:
+            candle = previous["authorization"]["candle"]
+            if previous["consumed_candle"] == candle:
+                return previous
+            current = dict(previous, armed=False, consumed_candle=candle)
+            self.store.save(previous, current)
+            return current
+        if exists is False:
+            current = dict(previous, armed=True, consumed_candle=0, authorization=None)
+            self.store.save(previous, current)
+            return current
+        return previous
 
     def observe(self, data):
         self._eligible_candle = None
@@ -85,14 +114,22 @@ class EntryDecisionGate:
                 or not math.isfinite(timestamp) or timestamp <= 0 or int(timestamp) != timestamp):
             return False
         candle = int(timestamp)
-        previous = self._load()
-        if previous is not None and candle <= previous["candle"]:
+        previous = self._reconcile(self._load())
+        if previous is not None and candle < previous["candle"]:
             return False
+        if previous is not None and candle == previous["candle"]:
+            if previous["consumed_candle"] == candle:
+                return False
+            eligible = previous["armed"] and data.get("signal") == 1
+            self._eligible_candle = candle if eligible else None
+            return eligible
         current = dict(previous) if previous else {
             "version": 1, "candle": candle, "armed": False,
             "consumed_candle": 0, "authorization": None,
         }
         current["candle"] = candle
+        if current["authorization"] is not None and current["consumed_candle"] == 0:
+            current["authorization"] = None
         candidate = signal_state["raw_buy_candidate"]
         if not candidate and data.get("signal") != 1 and not signal_state.get("buy_confirmation_active", False):
             current["armed"] = True
@@ -104,11 +141,12 @@ class EntryDecisionGate:
     def reserve(self, executor_id, fingerprint, candle):
         previous = self._load()
         if (not previous or not previous["armed"] or previous["candle"] != candle
+                or previous["consumed_candle"] == candle
                 or self._eligible_candle != candle):
             return False
         auth = {"executor_id": executor_id, "fingerprint": fingerprint,
                 "candle": candle, "dispatched": False}
-        current = dict(previous, armed=False, consumed_candle=candle, authorization=auth)
+        current = dict(previous, armed=False, authorization=auth)
         self.store.save(previous, current)
         self._eligible_candle = None
         self._local_authorization = (executor_id, fingerprint, candle)
@@ -125,4 +163,34 @@ class EntryDecisionGate:
             return False
         self.store.save(previous, dict(previous, authorization=dict(auth, dispatched=True)))
         self._local_authorization = None
+        self._awaiting_commit = identity
+        return True
+
+    def commit(self, executor_id, fingerprint, candle):
+        identity = (executor_id, fingerprint, candle)
+        previous = self._load()
+        auth = previous["authorization"] if previous else None
+        if (not auth or previous["candle"] != candle
+                or (auth["executor_id"], auth["fingerprint"], auth["candle"]) != identity):
+            return False
+        current = dict(previous, armed=False, consumed_candle=candle,
+                       authorization=dict(auth, dispatched=True))
+        self.store.save(previous, current)
+        self._local_authorization = None
+        self._awaiting_commit = None
+        return True
+
+    def release(self):
+        previous = self._load()
+        if not previous or previous["authorization"] is None:
+            self._local_authorization = None
+            self._awaiting_commit = None
+            return False
+        exists = self._exists(previous["authorization"]["executor_id"])
+        if exists is True:
+            return False
+        current = dict(previous, armed=True, consumed_candle=0, authorization=None)
+        self.store.save(previous, current)
+        self._local_authorization = None
+        self._awaiting_commit = None
         return True

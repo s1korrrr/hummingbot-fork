@@ -832,6 +832,18 @@ class HLRSIController(DirectionalTradingControllerBase):
             min_amount = self._ceil_to_increment(min_amount, increment)
         return max(min_amount, Decimal("0"))
 
+    def _inventory_is_dust(self, amount: Decimal, price: Optional[Decimal] = None) -> bool:
+        if amount <= 0:
+            return True
+        mid = price if price is not None else self._decimal_or_none(self._get_mid_price())
+        if mid is None or mid <= 0:
+            return False
+        min_quote = self._minimum_entry_quote(mid)
+        min_amount = self._minimum_entry_amount(mid)
+        if min_quote <= 0 and min_amount <= 0:
+            return False
+        return amount < min_amount or (min_quote > 0 and amount * mid < min_quote)
+
     def _resolve_recovery_sell_amount(
         self,
         *,
@@ -1431,7 +1443,15 @@ class HLRSIController(DirectionalTradingControllerBase):
         return f"controller={self.config.id} pair={self.config.trading_pair}"
 
     def _held_bag_count(self, side: TradeType = TradeType.BUY) -> int:
-        return self._aggregate_held_inventory(side).bag_count
+        price = self._decimal_or_none(self._get_mid_price())
+        count = 0
+        for position in self._held_positions(side):
+            amount = self._decimal_or_none(getattr(position, "amount", None))
+            if amount is None or amount <= 0:
+                continue
+            if not self._inventory_is_dust(amount, price):
+                count += 1
+        return count
 
     def _position_log_context(self) -> str:
         mid_price = self._get_mid_price()
@@ -1876,7 +1896,8 @@ class HLRSIController(DirectionalTradingControllerBase):
                 price = self._decimal_or_none(self._get_mid_price())
                 if price is None or price <= 0:
                     return Decimal("Infinity")
-                held_value = amount * price
+                if not self._inventory_is_dust(amount, price):
+                    held_value = amount * price
             return held_value + self._get_active_buy_executor_position_value_usd()
         except (InvalidOperation, ValueError, TypeError, AttributeError):
             return Decimal("Infinity")
@@ -2255,7 +2276,7 @@ class HLRSIController(DirectionalTradingControllerBase):
         rsi_buy = float(thresholds.get("rsi_buy", self.config.rsi_buy_threshold))
         mid_price = self._get_mid_price()
         inventory = self._aggregate_held_inventory(TradeType.BUY)
-        has_inventory = inventory.total_amount > 0
+        has_inventory = inventory.total_amount > 0 and not self._inventory_is_dust(inventory.total_amount, mid_price)
         recovery_target_pct = Decimal(str(self.config.bag_recovery_target_pct))
         if self.config.sell_only_if_profitable:
             recovery_target_pct = max(
@@ -3024,6 +3045,8 @@ class HLRSIController(DirectionalTradingControllerBase):
         return pct_gap >= gap_thr
 
     def _has_sufficient_avg_entry_gap_for_buy(self, new_price: Optional[Decimal]) -> bool:
+        if not self._has_buy_inventory():
+            return True
         gap_thr = self._effective_price_gap()
         if gap_thr <= 0:
             return True
@@ -3134,8 +3157,10 @@ class HLRSIController(DirectionalTradingControllerBase):
 
     def _has_buy_inventory(self) -> bool:
         if self.config.trade_mode == "sell_only":
-            return self._get_sellable_inventory_amount() > 0
-        return self._position_amount(TradeType.BUY) > 0
+            amount = self._get_sellable_inventory_amount()
+            return amount > 0 and not self._inventory_is_dust(amount)
+        amount = self._position_amount(TradeType.BUY)
+        return amount > 0 and not self._inventory_is_dust(amount)
 
     def _should_emit_live_buy_reversal(self, buy_signal_on_bar: bool, candle_timestamp: Optional[float]) -> bool:
         if not buy_signal_on_bar:
@@ -5175,7 +5200,8 @@ class HLRSIController(DirectionalTradingControllerBase):
             if (pos.connector_name != self.config.connector_name
                     or pos.trading_pair != self.config.trading_pair
                     or pos.side != TradeType.BUY
-                    or pos.amount <= Decimal("0")):
+                    or pos.amount <= Decimal("0")
+                    or self._inventory_is_dust(pos.amount, current_price)):
                 continue
 
             try:

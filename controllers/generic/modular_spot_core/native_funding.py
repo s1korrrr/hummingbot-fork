@@ -1,6 +1,6 @@
 """Candidate admission only. Native fills, executors and PositionHold own accounting.
 
-One recorder/strategy envelope, at most 50 USDC for this opt-in candidate.
+One recorder/strategy envelope. Allocation and per-position quote are yaml-set.
 The default remains one controller/pair; strategy scope binds every native peer.
 This does not reserve funds from independent processes sharing the wallet.
 """
@@ -24,9 +24,9 @@ ZERO = Decimal('0')
 
 
 class CandidateFundingPolicy(PolicyModel):
-    allocation_quote: Decimal = Field(gt=0, le=50)
+    allocation_quote: Decimal = Field(gt=0, le=101)
     fee_reserve_fraction: Decimal = Field(gt=0, le=Decimal('.1'))
-    max_position_quote: Decimal = Field(default=50, gt=0, le=50)
+    max_position_quote: Decimal = Field(default=50, gt=0, le=101)
     scope: Literal['controller', 'strategy'] = 'controller'
 
 

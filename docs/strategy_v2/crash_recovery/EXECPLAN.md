@@ -162,9 +162,7 @@ PYTHONPATH="$PWD" "$HB_PYTHON" -m pytest -q \
   test/hummingbot/strategy_v2/executors/test_executor_orchestrator.py
 ```
 
-`test/crash_recovery_v2` now contains the 84 passing no-order contract cases. They were run in partial-source staging, not with the full native command above. The full current native/legacy selection and any affected API/root/Quants suites remain required for implementation acceptance. Run no services, install no missing dependencies and send no exchange requests as a test fallback.
-
-For this implementation, validate the complete new no-order suite, syntax, Markdown links, scoped diff and remote blob identities. Native tests, independent audit, economic backtests and installed-runtime acceptance remain NOT RUN. An actual native import probe failed because the compiled native runtime is absent.
+`test/crash_recovery_v2` now contains 106 compiled-env cases (84 no-order plus host/revoke/persist). See the 2026-09-21 receipt for the local modular-native.yml pytest numbers. Independent audit, hosted CI, economic backtests and installed-runtime acceptance remain NOT RUN. Run no services, install no missing dependencies and send no exchange requests as a test fallback.
 
 ## Rollback and stop conditions
 
@@ -219,4 +217,14 @@ PYTHONPATH="$PWD" /Users/s1kor/anaconda3/envs/hummingbot/bin/python -m pytest -q
 106 passed in 25.23s
 ```
 
-Native import probe of `ConnectorBase`, `MarketsRecorder`, `PositionExecutor`, `crash_recovery_v2` succeeded. Full `.github/workflows/modular-native.yml` native/legacy selection was not run here. Independent audit was not run. No orders, no stack restart, no merge.
+Native import probe of `ConnectorBase`, `MarketsRecorder`, `PositionExecutor`, `crash_recovery_v2` succeeded.
+
+Local `.github/workflows/modular-native.yml` native pytest selection (same paths as CI, compiled env):
+
+```
+1 failed, 1479 passed, 162 warnings, 69 subtests passed in 283.20s
+```
+
+The failure is `test_queued_create_rechecks_drawdown_and_operator_events` in `test/test_ok_rsi_restart_safety.py`. That file and `scripts/v2_with_controllers.py` are not in this branch's diff versus `origin/master`. MagicMock(`spec=V2WithControllers`) treats `_funding_scope_owners` as truthy, so `validate_create_action` raises before `process_operator_events`. Do not patch that legacy test in this PR.
+
+Independent audit was not run. Quants `native_modular.py` is absent from workspace `quants-lab` `origin/main`. Cached May-August A/B was not run. No orders, no stack restart, no merge.

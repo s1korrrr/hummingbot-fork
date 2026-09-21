@@ -169,8 +169,10 @@ PYTHONPATH="$PWD" python -m pytest -q -W error test/crash_recovery_v2
 106 passed in 25.23s
 ```
 
-Native import of `hummingbot.connector.connector_base` succeeded. Full
-modular-native.yml suite, independent audit, Quants replay, and cached-window
+Native import of `hummingbot.connector.connector_base` succeeded. Local
+modular-native.yml pytest selection: 1479 passed, 1 failed
+(`test_queued_create_rechecks_drawdown_and_operator_events`, untouched
+ok_rsi/v2 runner files). Independent audit, Quants replay, and cached-window
 economics were not run. Research OS fail-closed program
 `okx_spot_crash_recovery_v2` is a root/`research_os` change, not this nested
 commit.
@@ -178,4 +180,4 @@ commit.
 
 ## CI selection
 
-The existing `.github/workflows/modular-native.yml` now includes `test/crash_recovery_v2` in its native suite and watches the new core/doc paths. Existing jobs, actions, permissions and test selections are retained. YAML and embedded shell syntax are checked locally; the hosted workflow and full native suite were not run here. No new workflow or deployment action was added.
+The existing `.github/workflows/modular-native.yml` now includes `test/crash_recovery_v2` in its native suite and watches the new core/doc paths. Existing jobs, actions, permissions and test selections are retained. YAML and embedded shell syntax are checked locally. The hosted GitHub Actions run is not claimed here. No new workflow or deployment action was added.

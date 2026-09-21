@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
+import pandas as pd
 from pydantic import ConfigDict, Field, model_validator
 
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
@@ -36,7 +37,6 @@ def breakout_features(frame, lookback, atr_period):
     last = frame.iloc[-1]
     prior_high = float(frame['high'].iloc[-lookback - 1:-1].max())
     previous = frame['close'].shift(1)
-    import pandas as pd
     true_range = pd.concat([frame.high - frame.low, (frame.high - previous).abs(),
                             (frame.low - previous).abs()], axis=1).max(axis=1)
     return {'signal': int(float(last.close) > prior_high), 'prior_high': prior_high,
@@ -169,9 +169,11 @@ class ComponentBreakoutController(ControllerBase):
                                   remaining_quote=c.total_amount_quote, available_quote=available, price=price,
                                   amount_step=rules.min_base_amount_increment, minimum_amount=rules.min_order_size,
                                   minimum_notional=rules.min_notional_size, fee_buffer=fee_reserve, cash_reserve=0)
-        except (ValueError, KeyError, PolicyError):
+        except (ValueError, KeyError, PolicyError) as error:
+            self.processed_data.setdefault('data_health', {})['reason'] = f'allocation_unavailable:{error}'
             return []
         if allocation is None:
+            self.processed_data.setdefault('data_health', {})['reason'] = 'allocation_unavailable:no_valid_size'
             return []
         executor = PositionExecutorConfig(timestamp=now, controller_id=c.id,
                                           connector_name=c.connector_name, trading_pair=c.trading_pair, side=TradeType.BUY,

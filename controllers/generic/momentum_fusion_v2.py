@@ -180,6 +180,7 @@ class MomentumFusionV2Controller(ControllerBase):
         now = self.market_data_provider.time()
         held = bool(self.positions_held) or any(item.is_active or not item.is_done for item in self.executors_info)
         try:
+            runtime.reconcile_claims(self._claims, self.executors_info)
             pending_inflight = False
             if self._pending is not None:
                 prior = next((item for item in self.executors_info if item.id == self._pending.id), None)

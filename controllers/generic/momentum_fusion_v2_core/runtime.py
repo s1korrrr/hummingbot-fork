@@ -99,6 +99,37 @@ class ClaimStore:
         return tuple(item for item in self._claims.values() if item.status != 'RECONCILED_TERMINAL')
 
 
+def reconcile_claims(claims: ClaimStore | None, executors) -> None:
+    if claims is None:
+        return
+    by_identity = {}
+    for item in executors:
+        config = getattr(item, 'config', None)
+        if config is None:
+            continue
+        by_identity[identity(config.model_dump(mode='json'))] = item
+    for claim in list(claims.open_claims()):
+        if not claim.executor_identity:
+            continue
+        exe = by_identity.get(claim.executor_identity)
+        if exe is None:
+            if claim.status in {'PARTIAL', 'CANCEL_PENDING'}:
+                claims.put(claim.model_copy(update={'status': 'RECONCILED_TERMINAL'}))
+            continue
+        filled = decimal(getattr(exe, 'filled_amount_quote', 0) or 0, 'filled')
+        shutting = getattr(getattr(exe, 'status', None), 'name', None) == 'SHUTTING_DOWN'
+        if getattr(exe, 'is_done', False):
+            next_status = 'RECONCILED_TERMINAL'
+        elif filled > 0:
+            next_status = 'PARTIAL'
+        elif shutting:
+            next_status = 'CANCEL_PENDING'
+        else:
+            continue
+        if next_status != claim.status:
+            claims.put(claim.model_copy(update={'status': next_status}))
+
+
 def refuse_unsupported_topology(topology: str):
     if topology != 'single_recorder':
         raise PolicyError('unsupported shared-account multi-process topology')
@@ -228,6 +259,19 @@ def claim_id_for(opportunity_id: str, controller_id: str) -> str:
     return identity([opportunity_id, controller_id])
 
 
+def _sell_opportunity_id(view, claims, controller_id: str) -> str:
+    generation = 0
+    while True:
+        opportunity_id = identity({
+            'kind': 'sell', 'executor': view.executor_id,
+            'receipt': view.receipt_sha256, 'generation': generation,
+        })
+        found = claims.get(claim_id_for(opportunity_id, controller_id))
+        if found is None or found.status != 'RECONCILED_TERMINAL':
+            return opportunity_id
+        generation += 1
+
+
 def _skip(reason: str) -> ActionPlan:
     return ActionPlan((), reason)
 
@@ -324,7 +368,7 @@ def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote,
         return _skip('claim_store_required')
     if not data_ready:
         return _skip('data_unready')
-    opportunity_id = identity({'kind': 'sell', 'executor': view.executor_id, 'receipt': view.receipt_sha256})
+    opportunity_id = _sell_opportunity_id(view, claims, controller_id)
     claim_key = claim_id_for(opportunity_id, controller_id)
     existing = next((item for item in claims.open_claims()
                      if item.opportunity_id == opportunity_id or item.claim_id == claim_key), None)

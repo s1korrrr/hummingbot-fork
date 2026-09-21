@@ -183,3 +183,111 @@ def test_host_sell_persists_and_restore_does_not_rearm(tmp_path, monkeypatch):
     again = restored.determine_executor_actions()
     assert again == []
     assert restored.processed_data['action_reason'] == 'claim_already_open'
+
+
+def _info(config, status, *, filled='0'):
+    active = status not in {RunnableStatus.TERMINATED}
+    return ExecutorInfo(
+        id=config.id, timestamp=config.timestamp, type='position_executor', status=status,
+        config=config, net_pnl_pct=D('0'), net_pnl_quote=D('0'), cum_fees_quote=D('0'),
+        filled_amount_quote=D(filled), is_active=active, is_trading=active,
+        custom_info={'side': config.side, 'remaining_position_amount_base': config.amount,
+                     'entry_price': config.entry_price or D('10')})
+
+
+def _claim_rows(tmp_path):
+    return json.loads((tmp_path / 'claims.json').read_text())
+
+
+def test_host_open_sell_stays_claimed_when_restart_clears_pending(tmp_path):
+    controller = _host(tmp_path, kill_switch=True)
+    controller.executors_info = [_buy_held()]
+    first = controller.determine_executor_actions()
+    sell = first[0].executor_config
+    controller._pending = None
+    controller._pending_identity = None
+    controller.executors_info = [_buy_held(), _info(sell, RunnableStatus.RUNNING)]
+    again = controller.determine_executor_actions()
+    assert again == []
+    assert controller.processed_data['action_reason'] == 'claim_already_open'
+    assert _claim_rows(tmp_path)[0]['status'] == 'SUBMITTED_UNACKNOWLEDGED'
+
+
+def test_host_done_sell_allows_new_sell_with_distinct_opportunity(tmp_path):
+    controller = _host(tmp_path, kill_switch=True)
+    controller.executors_info = [_buy_held()]
+    first = controller.determine_executor_actions()
+    sell = first[0].executor_config
+    first_oid = _claim_rows(tmp_path)[0]['opportunity_id']
+    controller.executors_info = [_buy_held(), _info(sell, RunnableStatus.TERMINATED, filled='36')]
+    second = controller.determine_executor_actions()
+    assert second and second[0].executor_config.side == TradeType.SELL
+    rows = _claim_rows(tmp_path)
+    by_oid = {row['opportunity_id']: row['status'] for row in rows}
+    assert by_oid[first_oid] == 'RECONCILED_TERMINAL'
+    assert any(oid != first_oid and status == 'SUBMITTED_UNACKNOWLEDGED' for oid, status in by_oid.items())
+
+
+def test_host_zero_fill_cancelled_sell_allows_new_sell(tmp_path):
+    controller = _host(tmp_path, kill_switch=True)
+    controller.executors_info = [_buy_held()]
+    first = controller.determine_executor_actions()
+    sell = first[0].executor_config
+    controller.executors_info = [_buy_held(), _info(sell, RunnableStatus.TERMINATED, filled='0')]
+    second = controller.determine_executor_actions()
+    assert second and second[0].executor_config.side == TradeType.SELL
+    assert {row['status'] for row in _claim_rows(tmp_path)} >= {
+        'RECONCILED_TERMINAL', 'SUBMITTED_UNACKNOWLEDGED'}
+
+
+def test_host_filled_sell_gone_from_executors_allows_new_sell(tmp_path):
+    controller = _host(tmp_path, kill_switch=True)
+    controller.executors_info = [_buy_held()]
+    first = controller.determine_executor_actions()
+    sell = first[0].executor_config
+    first_oid = _claim_rows(tmp_path)[0]['opportunity_id']
+    controller._pending = None
+    controller._pending_identity = None
+    controller.executors_info = [_buy_held(), _info(sell, RunnableStatus.RUNNING, filled='36')]
+    mid = controller.determine_executor_actions()
+    assert mid == []
+    assert _claim_rows(tmp_path)[0]['status'] == 'PARTIAL'
+    controller.executors_info = [_buy_held()]
+    third = controller.determine_executor_actions()
+    assert third and third[0].executor_config.side == TradeType.SELL
+    by_oid = {row['opportunity_id']: row['status'] for row in _claim_rows(tmp_path)}
+    assert by_oid[first_oid] == 'RECONCILED_TERMINAL'
+
+
+def test_host_cancelled_buy_releases_reserved_quote(tmp_path):
+    controller = _cash_host(tmp_path)
+    first, _ = _drive_buy(controller, 1_700_000_000)
+    buy = first[0].executor_config
+    controller.executors_info = [_info(buy, RunnableStatus.TERMINATED, filled='0')]
+    second, reasons = _drive_buy(controller, 1_700_000_200)
+    assert second and second[0].executor_config.side == TradeType.BUY
+    statuses = {row['status'] for row in _claim_rows(tmp_path)}
+    assert 'RECONCILED_TERMINAL' in statuses
+    assert 'SUBMITTED_UNACKNOWLEDGED' in statuses
+
+
+def test_host_late_fill_after_cancel_pending_is_not_a_new_emit(tmp_path):
+    controller = _host(tmp_path, kill_switch=True)
+    controller.executors_info = [_buy_held()]
+    first = controller.determine_executor_actions()
+    sell = first[0].executor_config
+    controller._pending = None
+    controller._pending_identity = None
+    controller.executors_info = [_buy_held(), _info(sell, RunnableStatus.SHUTTING_DOWN, filled='0')]
+    pending = controller.determine_executor_actions()
+    assert pending == []
+    assert _claim_rows(tmp_path)[0]['status'] == 'CANCEL_PENDING'
+    controller.executors_info = [_buy_held(), _info(sell, RunnableStatus.SHUTTING_DOWN, filled='24')]
+    late = controller.determine_executor_actions()
+    assert late == []
+    assert _claim_rows(tmp_path)[0]['status'] == 'PARTIAL'
+    controller.executors_info = [_buy_held(), _info(sell, RunnableStatus.TERMINATED, filled='24')]
+    done = controller.determine_executor_actions()
+    rows = _claim_rows(tmp_path)
+    assert any(row['status'] == 'RECONCILED_TERMINAL' for row in rows)
+    assert done == [] or done[0].executor_config.side == TradeType.SELL

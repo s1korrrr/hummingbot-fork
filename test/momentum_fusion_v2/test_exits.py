@@ -54,6 +54,9 @@ def test_management_emits_while_acquisition_is_paused(tmp_path):
         connector_name='okx', trading_pair='BNB-USDC', data_ready=True)
     assert plan.actions
     assert plan.reason == 'proposed_reduction'
+    open_rows = store.open_claims()
+    assert len(open_rows) == 1
+    assert open_rows[0].status == 'SUBMITTED_UNACKNOWLEDGED'
     config = plan.actions[0].executor_config
     assert config.side.name == 'SELL'
     barriers = config.triple_barrier_config

@@ -324,6 +324,12 @@ def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote,
         return _skip('claim_store_required')
     if not data_ready:
         return _skip('data_unready')
+    opportunity_id = identity({'kind': 'sell', 'executor': view.executor_id, 'receipt': view.receipt_sha256})
+    claim_key = claim_id_for(opportunity_id, controller_id)
+    existing = next((item for item in claims.open_claims()
+                     if item.opportunity_id == opportunity_id or item.claim_id == claim_key), None)
+    if existing is not None:
+        return _skip('claim_already_open')
     try:
         split = split_or_single(
             total_base=view.remaining_base, harvest_base=harvest_base,
@@ -352,5 +358,18 @@ def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote,
         now=now_ms / 1000, controller_id=controller_id, connector_name=connector_name,
         trading_pair=trading_pair, amount=result.amount_base, price=result.limit_price,
         stop=None, take_profit=None, ttl_seconds=60, side=TradeType.SELL)
+    claim = Claim(
+        claim_id=claim_key, opportunity_id=opportunity_id, controller_id=controller_id,
+        trading_pair=trading_pair, status='RESERVED', reserved_quote=Decimal('0'),
+        reserved_base=result.amount_base)
+    stored = claims.put(claim)
+    if stored.status != 'RESERVED' or stored.claim_id != claim.claim_id:
+        return _skip('claim_mismatch')
+    pending_identity = identity(executor.model_dump(mode='json'))
+    submitted = claims.put(claim.model_copy(update={
+        'status': 'SUBMITTED_UNACKNOWLEDGED', 'executor_identity': pending_identity,
+    }))
+    if submitted.status != 'SUBMITTED_UNACKNOWLEDGED':
+        return _skip('claim_mismatch')
     return ActionPlan((CreateExecutorAction(controller_id=controller_id, executor_config=executor),),
                       'proposed_reduction')

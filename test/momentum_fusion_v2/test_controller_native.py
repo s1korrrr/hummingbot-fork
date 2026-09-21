@@ -1,4 +1,5 @@
 import asyncio
+import json
 from decimal import Decimal as D
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -17,6 +18,7 @@ from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 from controllers.generic.momentum_fusion_v2 import MomentumFusionV2Config, MomentumFusionV2Controller
+from controllers.generic.momentum_fusion_v2_core import runtime
 
 
 def test_source_identity_hold_is_visible_on_the_controller():
@@ -26,11 +28,11 @@ def test_source_identity_hold_is_visible_on_the_controller():
     assert config.execution_enabled is False
 
 
-def _host(tmp_path, *, kill_switch=False):
+def _host(tmp_path, *, kill_switch=False, **config_over):
     claims = tmp_path / 'claims.json'
     config = MomentumFusionV2Config(
         id='mom-v2', execution_enabled=True, execution_mode='paper',
-        claim_store_path=str(claims), manual_kill_switch=kill_switch)
+        claim_store_path=str(claims), manual_kill_switch=kill_switch, **config_over)
     provider = MagicMock()
     provider.initialize_rate_sources.return_value = None
     provider.time.return_value = 1_700_000_180
@@ -101,3 +103,83 @@ def test_management_does_not_double_emit_sell_while_pending(tmp_path):
     second = controller.determine_executor_actions()
     assert second == []
     assert controller.processed_data['action_reason'] == 'pending_inflight'
+
+
+def _cash_host(tmp_path):
+    return _host(tmp_path, total_amount_quote=D('100'), trade_quote=D('60'),
+                 risk_fraction=D('0.05'))
+
+
+def _arm_buy(controller, decision_time, now):
+    controller.market_data_provider.time.return_value = now
+    controller.processed_data = {
+        'signal': 1, 'data_health': {'ready': True}, 'decision_time': decision_time,
+        'close': D('12'), 'atr': D('0.3'), 'setup': 'b0_breakout'}
+
+
+def _drive_buy(controller, start):
+    reasons = []
+    for offset in range(0, 180, 20):
+        _arm_buy(controller, start + offset, start + offset + 5)
+        actions = controller.determine_executor_actions()
+        reason = controller.processed_data.get('action_reason')
+        reasons.append(reason)
+        if actions:
+            return actions, reasons
+        if reason in {'account_limit', 'program_limit', 'available_quote_limit', 'claim_already_open'}:
+            return [], reasons
+    raise AssertionError(reasons)
+
+
+def test_host_second_sixty_holds_via_claims(tmp_path):
+    controller = _cash_host(tmp_path)
+    first, _ = _drive_buy(controller, 1_700_000_000)
+    assert first and first[0].executor_config.side == TradeType.BUY
+    controller._pending = None
+    controller._pending_identity = None
+    second, reasons = _drive_buy(controller, 1_700_000_200)
+    assert second == []
+    assert reasons[-1] in {'account_limit', 'program_limit', 'available_quote_limit'}
+
+
+def test_host_buy_persists_submitted_before_create_action(tmp_path, monkeypatch):
+    on_disk = []
+    original = runtime.CreateExecutorAction
+
+    def wrapped(**kwargs):
+        rows = json.loads((tmp_path / 'claims.json').read_text())
+        on_disk.append(rows[0]['status'])
+        return original(**kwargs)
+
+    monkeypatch.setattr(runtime, 'CreateExecutorAction', wrapped)
+    controller = _cash_host(tmp_path)
+    first, _ = _drive_buy(controller, 1_700_000_000)
+    assert first and first[0].executor_config.side == TradeType.BUY
+    assert on_disk == ['SUBMITTED_UNACKNOWLEDGED']
+    restored = _cash_host(tmp_path)
+    again, reasons = _drive_buy(restored, 1_700_000_200)
+    assert again == []
+    assert reasons[-1] in {
+        'account_limit', 'program_limit', 'available_quote_limit', 'claim_already_open'}
+
+
+def test_host_sell_persists_and_restore_does_not_rearm(tmp_path, monkeypatch):
+    on_disk = []
+    original = runtime.CreateExecutorAction
+
+    def wrapped(**kwargs):
+        rows = json.loads((tmp_path / 'claims.json').read_text())
+        on_disk.append(rows[0]['status'])
+        return original(**kwargs)
+
+    monkeypatch.setattr(runtime, 'CreateExecutorAction', wrapped)
+    first = _host(tmp_path, kill_switch=True)
+    first.executors_info = [_buy_held()]
+    actions = first.determine_executor_actions()
+    assert actions and actions[0].executor_config.side == TradeType.SELL
+    assert on_disk == ['SUBMITTED_UNACKNOWLEDGED']
+    restored = _host(tmp_path, kill_switch=True)
+    restored.executors_info = [_buy_held()]
+    again = restored.determine_executor_actions()
+    assert again == []
+    assert restored.processed_data['action_reason'] == 'claim_already_open'

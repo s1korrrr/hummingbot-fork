@@ -43,6 +43,32 @@ def test_restored_reserved_claim_is_not_a_new_grant(tmp_path):
     assert again.status == 'SUBMITTED_UNACKNOWLEDGED'
 
 
+def test_management_restore_does_not_reemit_sell(tmp_path):
+    store = runtime.ClaimStore(tmp_path / 'claims.json')
+    view = NativeExitView.model_validate(dict(
+        owner_id='mom_v2', executor_id='e1', connector='okx', trading_pair='BNB-USDC',
+        receipt_sha256='a' * 64, observed_at_ms=1000, reconciled=True, fees_complete=True,
+        remaining_base='10', reserved_base='0', base_fee_fraction='0', amount_step='.1',
+        price_step='.01', minimum_amount='.1', minimum_notional='1', bid='12'))
+    proposal = ExitProposal(policy_id='trail', owner_id='mom_v2', executor_id='e1',
+                            receipt_sha256='a' * 64, requested_base='10', minimum_price='0',
+                            expires_at_ms=2000)
+    first = runtime.plan_management(
+        claims=store, acquisition_allowed=False, view=view, proposals=(proposal,),
+        cost_quote='100', harvest_base='10', fee_fraction='0', margin='0', buffer='0',
+        now_ms=1050, controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
+        data_ready=True)
+    assert first.actions
+    restored = runtime.ClaimStore(tmp_path / 'claims.json')
+    again = runtime.plan_management(
+        claims=restored, acquisition_allowed=False, view=view, proposals=(proposal,),
+        cost_quote='100', harvest_base='10', fee_fraction='0', margin='0', buffer='0',
+        now_ms=1050, controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
+        data_ready=True)
+    assert again.actions == ()
+    assert again.reason == 'claim_already_open'
+
+
 def test_corrupt_claim_store_holds_visibly(tmp_path):
     path = tmp_path / 'claims.json'
     path.write_text('{not-json')

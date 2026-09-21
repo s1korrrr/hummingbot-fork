@@ -416,6 +416,7 @@ class NativePaperSession:
     async def _drive_executors(self, fresh_ids):
         await self._control_open_executors(fresh_ids)
         pending = []
+        follow_up = {}
         for key, executors in self.executor_orchestrator.active_executors.items():
             if key not in fresh_ids:
                 continue
@@ -424,10 +425,18 @@ class NativePaperSession:
                     task = getattr(executor, name, None)
                     if task is not None and not task.done():
                         pending.append(task)
+                        follow_up.setdefault(id(executor), (key, executor))
         if not pending:
             return
         await asyncio.gather(*pending, return_exceptions=True)
-        await self._control_open_executors(fresh_ids)
+        # Only task owners need another transition; unrelated executors keep
+        # the same single-pass semantics as a step without reconciliation.
+        for key, executor in follow_up.values():
+            active = self.executor_orchestrator.active_executors.get(key, ())
+            if executor.is_closed or not any(item is executor for item in active):
+                continue
+            await executor.control_task()
+            await self._connector.drain()
 
     def unavailable_exposure(self):
         pairs = {executor.config.trading_pair for executors in self.executor_orchestrator.active_executors.values()

@@ -108,22 +108,21 @@ class ClaimStore:
 def reconcile_claims(claims: ClaimStore | None, executors) -> None:
     if claims is None:
         return
-    by_hash = {}
+    by_config_id = {}
     by_id = {}
     for item in executors:
         item_id = getattr(item, 'id', None)
         if item_id:
             by_id[str(item_id)] = item
-        config = getattr(item, 'config', None)
-        if config is None:
-            continue
-        by_hash[identity(config.model_dump(mode='json'))] = item
+        config_id = getattr(getattr(item, 'config', None), 'id', None)
+        if config_id:
+            by_config_id[str(config_id)] = item
     for claim in list(claims.open_claims()):
         exe = None
         if claim.seen_executor_id:
             exe = by_id.get(claim.seen_executor_id)
-        if exe is None and claim.executor_identity:
-            exe = by_hash.get(claim.executor_identity)
+        elif claim.executor_identity:
+            exe = by_config_id.get(claim.executor_identity)
         if exe is None:
             if claim.seen_executor_id or claim.status in {'PARTIAL', 'CANCEL_PENDING'}:
                 claims.put(claim.model_copy(update={'status': 'RECONCILED_TERMINAL'}))
@@ -366,9 +365,8 @@ def plan_acquisition(*, claims, execution_enabled, acquisition_allowed, recovery
     stored = claims.put(claim)
     if stored.status != 'RESERVED' or stored.claim_id != claim.claim_id:
         return _skip('claim_mismatch')
-    pending_identity = identity(executor.model_dump(mode='json'))
     submitted = claims.put(claim.model_copy(update={
-        'status': 'SUBMITTED_UNACKNOWLEDGED', 'executor_identity': pending_identity,
+        'status': 'SUBMITTED_UNACKNOWLEDGED', 'executor_identity': executor.id,
     }))
     if submitted.status != 'SUBMITTED_UNACKNOWLEDGED':
         return _skip('claim_mismatch')
@@ -426,9 +424,8 @@ def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote,
     stored = claims.put(claim)
     if stored.status != 'RESERVED' or stored.claim_id != claim.claim_id:
         return _skip('claim_mismatch')
-    pending_identity = identity(executor.model_dump(mode='json'))
     submitted = claims.put(claim.model_copy(update={
-        'status': 'SUBMITTED_UNACKNOWLEDGED', 'executor_identity': pending_identity,
+        'status': 'SUBMITTED_UNACKNOWLEDGED', 'executor_identity': executor.id,
     }))
     if submitted.status != 'SUBMITTED_UNACKNOWLEDGED':
         return _skip('claim_mismatch')

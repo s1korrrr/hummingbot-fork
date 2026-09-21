@@ -392,3 +392,26 @@ def test_host_seen_sell_matches_by_executor_id_not_config_hash(tmp_path):
     assert again == []
     assert _claim_rows(tmp_path)[0]['status'] == 'SUBMITTED_UNACKNOWLEDGED'
     assert _claim_rows(tmp_path)[0].get('seen_executor_id') == sell.id
+
+
+def test_host_first_sighting_stamps_when_controller_id_dump_drifts(tmp_path):
+    controller = _host(tmp_path, kill_switch=True)
+    controller.executors_info = [_buy_held()]
+    first = controller.determine_executor_actions()
+    sell = first[0].executor_config
+    mutated = sell.model_copy(update={'controller_id': 'mutated-id'})
+    assert mutated.id == sell.id
+    assert identity(mutated.model_dump(mode='json')) != identity(sell.model_dump(mode='json'))
+    controller.executors_info = [_buy_held(), _info(mutated, RunnableStatus.RUNNING, filled='0')]
+    seen = controller.determine_executor_actions()
+    assert seen == []
+    row = _claim_rows(tmp_path)[0]
+    assert row['status'] == 'SUBMITTED_UNACKNOWLEDGED'
+    assert row.get('seen_executor_id') == sell.id
+    controller._pending = None
+    controller._pending_identity = None
+    controller.executors_info = [_buy_held()]
+    gone = controller.determine_executor_actions()
+    assert gone and gone[0].executor_config.side == TradeType.SELL
+    by_oid = {item['opportunity_id']: item['status'] for item in _claim_rows(tmp_path)}
+    assert by_oid[row['opportunity_id']] == 'RECONCILED_TERMINAL'

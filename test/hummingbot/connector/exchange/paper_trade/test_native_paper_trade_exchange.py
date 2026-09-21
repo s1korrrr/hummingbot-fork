@@ -106,6 +106,23 @@ class NativePaperTradeTests(IsolatedAsyncioTestCase):
         self.assertEqual(target.get_balance('USDC'), D('1000'))
         self.assertEqual(target.in_flight_orders, {})
 
+    async def test_restore_rejects_off_step_order_values_atomically(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        state = market.tracking_states
+        for field, value in (('amount', '1.005'), ('price', '99.005')):
+            corrupted = json.loads(json.dumps(state))
+            corrupted['orders'][oid][field] = value
+            target = paper()
+            with self.assertRaisesRegex(ValueError, 'trading rules'):
+                target.restore_tracking_states(corrupted)
+            self.assertEqual(target.get_balance('USDC'), D('1000'))
+            self.assertEqual(target.in_flight_orders, {})
+        restored = paper()
+        restored.restore_tracking_states(json.loads(json.dumps(state)))
+        self.assertEqual(restored._order_tracker.fetch_order(oid).amount, D('1'))
+
     async def test_market_consumes_depth_partial_ioc_and_no_reuse(self):
         market = paper()
         market.set_order_book(PAIR, 2, 1000, [(D('99'), D('.3'))], [(D('101'), D('.2')), (D('102'), D('.3'))])

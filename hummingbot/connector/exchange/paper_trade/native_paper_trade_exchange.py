@@ -511,8 +511,15 @@ class NativePaperTradeExchange(ExchangeBase):
                     or order.current_state not in (OrderState.OPEN, OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCELED)
                     or order.position != PositionAction.NIL):
                 raise ValueError('Invalid native paper order identity')
-            _decimal(order.amount, positive=True)
-            _decimal(order.price, positive=True)
+            amount = _decimal(order.amount, positive=True)
+            price = _decimal(order.price, positive=True)
+            rule = self._rules[order.trading_pair]
+            if (self.quantize_order_amount(order.trading_pair, amount) != amount
+                    or amount < rule.min_order_size or amount > rule.max_order_size
+                    or amount * price < max(rule.min_notional_size, rule.min_order_value)
+                    or (order.order_type.is_limit_type()
+                        and self.quantize_order_price(order.trading_pair, price) != price)):
+                raise ValueError('Restored paper order violates native trading rules')
             base, quote = ZERO, ZERO
             for fill_id, fill in order.order_fills.items():
                 if (fill.trade_id != fill_id or fill.client_order_id != key or fill.trading_pair != order.trading_pair

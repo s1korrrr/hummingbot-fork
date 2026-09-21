@@ -31,9 +31,13 @@ def test_requires_clear_then_new_qualified_candle_and_persists_before_dispatch(s
     assert not gate.observe(observation(120, False))
     assert gate.observe(observation(180, True, 1))
     assert gate.reserve("executor-1", "fingerprint-1", 180)
+    assert store.load()["consumed_candle"] == 0
     assert not EntryDecisionGate(store).observe(observation(180, True, 1))
     assert gate.dispatch("executor-1", "fingerprint-1", 180)
     assert not gate.dispatch("executor-1", "fingerprint-1", 180)
+    assert gate.commit("executor-1", "fingerprint-1", 180)
+    assert store.load()["consumed_candle"] == 180
+    assert not EntryDecisionGate(store).observe(observation(180, True, 1))
 
 
 def test_pulse_zero_invalid_data_and_persistent_candidate_do_not_rearm(store):
@@ -62,6 +66,41 @@ def test_restart_cannot_dispatch_unsubmitted_pre_restart_authorization(store):
     assert not restarted.observe(observation(180, True, 1))
     restarted.observe(observation(240, False))
     assert restarted.observe(observation(300, True, 1))
+
+
+def test_reserve_then_missing_executor_releases_candle_for_later_dispatch(store):
+    rows = set()
+    gate = EntryDecisionGate(store, executor_exists=lambda executor_id: executor_id in rows)
+    gate.observe(observation(60, False))
+    assert gate.observe(observation(120, True, 1))
+    assert gate.reserve("ghost", "fp", 120)
+    assert gate.dispatch("ghost", "fp", 120)
+    assert store.load()["consumed_candle"] == 0
+    later = EntryDecisionGate(store, executor_exists=lambda executor_id: executor_id in rows)
+    assert later.observe(observation(120, True, 1))
+    assert store.load()["authorization"] is None
+    assert later.reserve("retry", "fp2", 120)
+    assert later.dispatch("retry", "fp2", 120)
+    rows.add("retry")
+    assert later.commit("retry", "fp2", 120)
+    assert store.load()["consumed_candle"] == 120
+    assert not EntryDecisionGate(store, executor_exists=lambda executor_id: executor_id in rows).observe(
+        observation(120, True, 1)
+    )
+
+
+def test_durable_executor_keeps_candle_consumed(store):
+    rows = {"live"}
+    gate = EntryDecisionGate(store, executor_exists=lambda executor_id: executor_id in rows)
+    gate.observe(observation(60, False))
+    assert gate.observe(observation(120, True, 1))
+    assert gate.reserve("live", "fp", 120)
+    assert gate.dispatch("live", "fp", 120)
+    assert gate.commit("live", "fp", 120)
+    restarted = EntryDecisionGate(store, executor_exists=lambda executor_id: executor_id in rows)
+    assert not restarted.observe(observation(120, True, 1))
+    assert not restarted.release()
+    assert store.load()["consumed_candle"] == 120
 
 
 def test_queued_identity_payload_candle_and_once_only_are_checked(store):
@@ -126,7 +165,7 @@ def config_stub(executor_id="first"):
                            model_dump=lambda **kwargs: {"id": executor_id, "amount": "1"})
 
 
-def test_controller_consumes_before_queue_and_original_passes_existing_validation(store):
+def test_controller_reserves_without_consuming_until_commit(store):
     from controllers.directional_trading.hl_rsi import HLRSIController
     controller = controller_stub(store)
     action = SimpleNamespace(executor_config=config_stub())
@@ -136,11 +175,36 @@ def test_controller_consumes_before_queue_and_original_passes_existing_validatio
         controller._last_evaluated_candle_timestamp = 120
         assert controller.create_actions_proposal() == [action]
         assert store.load()["authorization"]["executor_id"] == "first"
+        assert store.load()["consumed_candle"] == 0
         assert controller.create_actions_proposal() == []
     with patch.object(HLRSIController, "validate_executor_config", return_value=True) as existing:
         assert controller.validate_executor_config(action.executor_config)
         assert not controller.validate_executor_config(action.executor_config)
         assert existing.call_count == 2
+        assert store.load()["consumed_candle"] == 0
+        controller.commit_entry_executor(action.executor_config)
+        assert store.load()["consumed_candle"] == 120
+        assert controller.create_actions_proposal() == []
+
+
+def test_controller_validate_failure_releases_candle(store):
+    from controllers.directional_trading.hl_rsi import HLRSIController
+    controller = controller_stub(store)
+    action = SimpleNamespace(executor_config=config_stub())
+    with patch.object(HLRSIController, "create_actions_proposal", return_value=[action]):
+        controller.processed_data = observation(60, False)
+        controller.create_actions_proposal()
+        controller.processed_data = observation(120, True, 1)
+        controller._last_evaluated_candle_timestamp = 120
+        assert controller.create_actions_proposal() == [action]
+    with patch.object(HLRSIController, "validate_executor_config", return_value=False):
+        assert not controller.validate_executor_config(action.executor_config)
+    assert store.load()["consumed_candle"] == 0
+    assert store.load()["authorization"] is None
+    with patch.object(HLRSIController, "create_actions_proposal", return_value=[action]):
+        later = controller.create_actions_proposal()
+        assert later == [action]
+        assert store.load()["authorization"]["executor_id"] == "first"
 
 
 def test_controller_failure_blocks_buy_but_does_not_swallow_existing_gate_rejection(store):
@@ -261,6 +325,9 @@ def test_real_controller_constructor_sizing_queue_validation_and_restart(store):
     assert queued[0] is actions[0]
     assert controller.validate_executor_config(executor)
     assert not controller.validate_executor_config(executor)
+    assert store.load()["consumed_candle"] == 0
+    controller.commit_entry_executor(executor)
+    assert store.load()["consumed_candle"] == 540
     restarted = OKRSIController(config, provider, asyncio.Queue(), entry_decision_store=store)
     restarted._status = RunnableStatus.RUNNING
     restarted.processed_data = observation(540, True, 1)

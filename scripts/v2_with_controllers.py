@@ -100,9 +100,6 @@ class V2WithControllers(StrategyV2Base):
                         self.controllers[cid].set_operator_entry_pause(paused, reason='restored', scope='bot')
                     for cid in self.drawdown_exited_controllers:
                         self.controllers[cid].stop()
-                if (state is not None and state.get('daily_entry_risk') is not None
-                        and self.config.max_daily_loss_quote is None):
-                    raise ValueError('Persisted daily loss limit was removed; explicit reconciliation required')
                 if self.config.max_daily_loss_quote is not None:
                     from hummingbot.strategy_v2.models.daily_entry_risk import DailyEntryRisk
                     self._daily_entry_risk = (DailyEntryRisk.new(self.config.max_daily_loss_quote, time.time())
@@ -331,12 +328,22 @@ class V2WithControllers(StrategyV2Base):
     def _validate_modular_loss_limits(self):
         if not any(is_modular_policy(c.config) for c in self.controllers.values()):
             return
-        limits = [self.config.max_global_drawdown_quote, self.config.max_controller_drawdown_quote]
-        if any(value is None or isinstance(value, bool) for value in limits):
-            raise ValueError('Native modular execution requires finite positive loss limits')
-        limits = [Decimal(str(value)) for value in limits]
-        if any(not value.is_finite() or value <= 0 for value in limits) or limits[1] > limits[0]:
-            raise ValueError('Native modular loss limits must be finite, positive and controller <= global')
+        if any(isinstance(value, bool) for value in (
+                self.config.max_global_drawdown_quote, self.config.max_controller_drawdown_quote,
+                self.config.max_daily_loss_quote)):
+            raise ValueError('Loss limits must be numeric, not boolean')
+        finite = []
+        for value in (self.config.max_global_drawdown_quote, self.config.max_controller_drawdown_quote):
+            if value is None:
+                continue
+            parsed = Decimal(str(value))
+            if not parsed.is_finite() or parsed <= 0:
+                raise ValueError('Native modular loss limits must be finite and positive when set')
+            finite.append(parsed)
+        if (self.config.max_controller_drawdown_quote is not None
+                and self.config.max_global_drawdown_quote is not None
+                and finite[1] > finite[0]):
+            raise ValueError('Native modular loss limits must keep controller <= global when both are set')
         if (self._daily_entry_risk is not None
                 and self.config.max_daily_loss_quote != self._daily_entry_risk.limit_quote):
             raise ValueError('Daily loss limit changed; explicit reconciliation required')

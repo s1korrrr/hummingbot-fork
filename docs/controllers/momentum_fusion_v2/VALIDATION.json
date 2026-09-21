@@ -1,0 +1,234 @@
+{
+  "schema": "momentum_v2.component_verification.v1",
+  "date": "2026-09-20",
+  "base_commit": "0f19b464ccd112b21ac69c6de0e5515250239aac",
+  "scope": "PARTIAL_BYTE_VERIFIED_SOURCE_OVERLAY_NOT_COMPILED_OWNER",
+  "environment": {
+    "python": "3.13.5",
+    "pandas": "2.2.3",
+    "numpy": "2.3.5",
+    "pydantic": "2.13.4",
+    "pytest": "9.0.2",
+    "platform": "Linux"
+  },
+  "commands": [
+    {
+      "command": "PYTHONPATH=. python -m pytest -q -ra test/momentum_fusion_v2",
+      "exit_code": 0,
+      "passed": 71,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "command": "python -m compileall -q controllers/generic/momentum_fusion_v2_core test/momentum_fusion_v2",
+      "exit_code": 0
+    }
+  ],
+  "source": [
+    {
+      "path": "controllers/generic/momentum_fusion_v2_core/__init__.py",
+      "bytes": 86,
+      "sha256": "41077d34968833b06b02450eec2fb97f0752d757592c8d1f055fad5d8bc9cd4b",
+      "git_blob_sha": "af402713fac924e2240641f0a9f150502da0c322"
+    },
+    {
+      "path": "controllers/generic/momentum_fusion_v2_core/features.py",
+      "bytes": 7995,
+      "sha256": "3f6e6071c99065deaa1b39d8c2b19b28f75a6a860df58897e960d4d7b4314e00",
+      "git_blob_sha": "6e0a7553f29530b8bbcc6a8e0f01ef91dbaedbf2"
+    },
+    {
+      "path": "controllers/generic/momentum_fusion_v2_core/recipe.py",
+      "bytes": 6686,
+      "sha256": "93c4ede8dcc606db0c3879c850ef1a787186442d1fe6dab344d9498c49c4ecc5",
+      "git_blob_sha": "eea5d942aece2d4e01b209bb12ca98ed6eeebf4d"
+    },
+    {
+      "path": "controllers/generic/momentum_fusion_v2_core/setups.py",
+      "bytes": 11608,
+      "sha256": "1b3433bb96fa70f53a602da8bc53abe7838cc3d842bb9b8b9a19907e7da593f2",
+      "git_blob_sha": "3b7efe14f64a9ce4c9888202145a23e44b18fd24"
+    },
+    {
+      "path": "test/momentum_fusion_v2/__init__.py",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "git_blob_sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    },
+    {
+      "path": "test/momentum_fusion_v2/conftest.py",
+      "bytes": 91,
+      "sha256": "94b5f500afa24ef0b052ff7ad54b51f35911684d7c4c1e508fbe2f5805ad90b7",
+      "git_blob_sha": "d5df760a1ddc64e06c4184afa26461bd9cad23bf"
+    },
+    {
+      "path": "test/momentum_fusion_v2/fixtures.py",
+      "bytes": 2192,
+      "sha256": "aa3b459c21f9f1efe94ad0f41d4e3ccc11457415336046cfca746bd4f27cb170",
+      "git_blob_sha": "6bca2f6df1ff9551da1f14adf32dc718693ca137"
+    },
+    {
+      "path": "test/momentum_fusion_v2/test_decisions.py",
+      "bytes": 5358,
+      "sha256": "864f1300e4e13f81cae82abf9dea84a33a7d535acf87c4f6a39a0dd55f7fbe19",
+      "git_blob_sha": "197d28b605695d594b4b9da2811fba3f0b6c327a"
+    },
+    {
+      "path": "test/momentum_fusion_v2/test_features.py",
+      "bytes": 4985,
+      "sha256": "3325acb5116713883c4f010924b30584a6e0871bc5e3d35ab5d64060580e2036",
+      "git_blob_sha": "1d7049afed7604bc58c89bddda0917364a3b1e5b"
+    },
+    {
+      "path": "test/momentum_fusion_v2/test_isolation.py",
+      "bytes": 2094,
+      "sha256": "1f5828228face1811f25817b28cc138b37ac0118a3689967b9598f9d02a905f6",
+      "git_blob_sha": "5c66d154c26308a1f375dd9167ac63e7ee6829f3"
+    },
+    {
+      "path": "test/momentum_fusion_v2/test_recipe.py",
+      "bytes": 1908,
+      "sha256": "e6bec23b94ea4fb3e173293e95aa2f9f7fb1db0885f5786f328510a777ca80be",
+      "git_blob_sha": "b2567bfe93bbebb152f9be830c54b00cc06212ae"
+    },
+    {
+      "path": "test/momentum_fusion_v2/test_setups.py",
+      "bytes": 5152,
+      "sha256": "ba877c96aca2a7b8bb312afbdd272d19692745a0a419d6db2bb3185399e00f3c",
+      "git_blob_sha": "fa4b70dc40804a525205faffdb95adb7cc16fc95"
+    },
+    {
+      "path": "test/momentum_fusion_v2/test_stream.py",
+      "bytes": 3542,
+      "sha256": "7d6dee1dc5d87fe28f044c36efb7af65608eb8e9f7580209ec44f17a2d4e299d",
+      "git_blob_sha": "ecbdfbac85c96960da0a57e88a9bc9fc8afb4f8d"
+    }
+  ],
+  "verified_upstream": [
+    {
+      "path": "hb/controllers/__init__.py",
+      "git_blob_sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "hb/controllers/generic/__init__.py",
+      "git_blob_sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "hb/hummingbot/__init__.py",
+      "git_blob_sha": "012045b6a0504d95b34ce3a64d84f2cfd3b871f7",
+      "sha256": "cb4751bd3dadea5ecf108fcadda38abc20544e2614d4f6c5830c26820e5aa3bb",
+      "bytes": 5811
+    },
+    {
+      "path": "hb/hummingbot/logger/__init__.py",
+      "git_blob_sha": "9d518b475a2475e51147394730cabc835b332ce9",
+      "sha256": "cac749442161c3786d67f59917e6000f1f60d370dfd9ada4adfa1ba699f95750",
+      "bytes": 730
+    },
+    {
+      "path": "hb/hummingbot/logger/application_warning.py",
+      "git_blob_sha": "da9927b0508363041e356871bbfb1d8f962872ad",
+      "sha256": "0b54ac59e561d95ab9855758c90f1d789f4cf68571f6b013514311f64c321fda",
+      "bytes": 570
+    },
+    {
+      "path": "hb/hummingbot/logger/logger.py",
+      "git_blob_sha": "11b3a1a57c2cd9883ea3a989314997bb9b64b84f",
+      "sha256": "2e3647db714a5e25212fa87c394d67bf538e0ab93f47845e043c1c3c78479869",
+      "bytes": 3777
+    },
+    {
+      "path": "hb/hummingbot/logger/struct_logger.py",
+      "git_blob_sha": "b77133eb584bf200bb06aabbbd55f7973b784bbf",
+      "sha256": "afa2154ddc00337efeed39c181ab42a299ac8ec031f4162fa85fc54b860092a4",
+      "bytes": 1221
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/__init__.py",
+      "git_blob_sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/__init__.py",
+      "git_blob_sha": "884a57e69f0f09328a6f202481e801b9355283d5",
+      "sha256": "3228c16ce041d7f289733dde18100081a694f16878c8b82146398beabb7679c6",
+      "bytes": 88
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/candle_data.py",
+      "git_blob_sha": "bad900e2b6a337283de34766a0bc79bcbe0174b7",
+      "sha256": "026b69bc4929f1d378c1374654c27315c83533791daf69b35abd145e274574da",
+      "bytes": 16334
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/config.py",
+      "git_blob_sha": "f583feeba4d07a8896b257bfebf2fc08f9410e91",
+      "sha256": "9b86f6745166b8c7f866459af1ffd5912e5fda7db4b76925ffc9b997e3480a18",
+      "bytes": 1828
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/decision_protocol.py",
+      "git_blob_sha": "d743dac6b90ffd458289410e1f93ae460cd41a7c",
+      "sha256": "65d5a28865efad1c48cdeba97aca2aedf31a8d8ec5f8a647c39619bb642f3a08",
+      "bytes": 7812
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/domain.py",
+      "git_blob_sha": "ca2d5f64669a2c0a09011fb7ff6c05abd626ac5c",
+      "sha256": "6aee8f6e832535a2baadacdfaf64e5487d58a75c7c5e251aa23d5b46ad316407",
+      "bytes": 1192
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/feature_cache.py",
+      "git_blob_sha": "2a2f4de440228d74b6c149f7edab0e35a8470eac",
+      "sha256": "603d5b0e58dc2d4a9cbce4c85ad7ed985091a38a0dbd70e1908b26f0f9844284",
+      "bytes": 2236
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/feature_registry.py",
+      "git_blob_sha": "b44648bc7ad5be72131b1a9a0694abc55d964af0",
+      "sha256": "a8b7c01c795d9df4bf2a631791696133eecf231193b4bfc923c85530d82620af",
+      "bytes": 9967
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/recipe_contract.py",
+      "git_blob_sha": "8a2d893a23ea9de678c81556e3b011ef3fddeee2",
+      "sha256": "4ddc7c980842f7de7f113477ab866433f447c4f999a3f412d1489631ee97bed8",
+      "bytes": 4208
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/source_identity.py",
+      "git_blob_sha": "98347399c588f2804292a29d8f6cddb2e6775d63",
+      "sha256": "3e28c1044c02dda4fc66a1c8f28ec8acfff319890b6684fe581cc6cca97963fe",
+      "bytes": 2797
+    },
+    {
+      "path": "hb/hummingbot/strategy_v2/components/strict_json.py",
+      "git_blob_sha": "c6b0c8e5c7560f6943b61c7fefbc994f6b67aabb",
+      "sha256": "d07d3ceb99e1121c8f2d0665bca3d9687d8b086c9701167d42cd8d7f70c5171e",
+      "bytes": 507
+    }
+  ],
+  "regression_cycles": [
+    "missing-package red before implementation",
+    "heartbeat and HTF rejection: 2 red to green",
+    "restore-window constraints: 3 red to green"
+  ],
+  "not_run": [
+    "compiled_native_controller_or_executors",
+    "full_owner_and_legacy_suites",
+    "repository_lint",
+    "native_aggregation_transport",
+    "economic_backtest",
+    "actual_cache_or_supervisor",
+    "independent_audit",
+    "deployment"
+  ],
+  "economic_backtest": false,
+  "execution_authorized": false
+}

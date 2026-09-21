@@ -3,18 +3,19 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from controllers.generic.spot_recipe_v2_core.native_views import assess_exit, capture_native_snapshot
 from hummingbot.strategy_v2.components.exit_policy import ExitProposal, NativeExitView, NativeProfitFloor
-from controllers.generic.spot_recipe_v2_core.native_views import capture_native_snapshot, assess_exit
+
 from .test_lifecycle import pending, scope, snapshot
 
 
 def native_info():
     return NS(id='lot_1', controller_id='spot_v2_owner', is_done=False, is_active=True,
-        config=NS(controller_id='spot_v2_owner', connector_name='okx_paper_trade',
-                  trading_pair='BTC-USDC', side=NS(name='BUY')),
-        custom_info={'execution_receipt': {'accounting_owner': 'executor',
-            'remaining_owned_base': D('2'), 'entry_gross_quote': D('200'), 'exit_gross_base': D('0')},
-            'entry_lifecycle': {'state': 'managing_fill'}})
+              config=NS(controller_id='spot_v2_owner', connector_name='okx_paper_trade',
+                        trading_pair='BTC-USDC', side=NS(name='BUY')),
+              custom_info={'execution_receipt': {'accounting_owner': 'executor',
+                                                 'remaining_owned_base': D('2'), 'entry_gross_quote': D('200'), 'exit_gross_base': D('0')},
+                           'entry_lifecycle': {'state': 'managing_fill'}})
 
 
 def capture(info=None, **changes):
@@ -23,17 +24,18 @@ def capture(info=None, **changes):
     return capture_native_snapshot(native_info() if info is None else info, **args)
 
 
-def exit_inputs(snap=None, **updates):
+def exit_inputs(snap=None, minimum_price=D('100'), **updates):
     snap = snapshot() if snap is None else snap
     common = dict(owner_id=snap.scope.owner_id, executor_id=snap.scope.executor_id,
                   receipt_sha256=snap.receipt_sha256)
     values = dict(**common, connector=snap.scope.connector, trading_pair=snap.scope.trading_pair,
-        observed_at_ms=1000, reconciled=True, fees_complete=True, remaining_base=D('2'), reserved_base=D('0'),
-        base_fee_fraction=D('0'), amount_step=D('.1'), price_step=D('.01'), minimum_amount=D('.1'),
-        minimum_notional=D('10'), bid=D('110')) | updates
+                  observed_at_ms=1000, reconciled=True, fees_complete=True, remaining_base=D('2'), reserved_base=D('0'),
+                  base_fee_fraction=D('0'), amount_step=D('.1'), price_step=D('.01'), minimum_amount=D('.1'),
+                  minimum_notional=D('10'), bid=D('110')) | updates
     view = NativeExitView(**values)
     proposals = tuple(ExitProposal(**common, policy_id=policy, requested_base=D(q),
-        minimum_price=D('100'), expires_at_ms=1010) for policy, q in [('trail', '1.2'), ('exhaustion', '.8')])
+                                   minimum_price=minimum_price, expires_at_ms=1010)
+                      for policy, q in [('trail', '1.2'), ('exhaustion', '.8')])
     floor = NativeProfitFloor(**common, quantity_base=D('1.2'), price=D('100'), observed_at_ms=1000)
     return snap, view, proposals, floor
 

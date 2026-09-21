@@ -8,8 +8,14 @@ import pytest
 
 from hummingbot.strategy_v2.components import source_identity
 from hummingbot.strategy_v2.components.domain import PolicyError
-from hummingbot.strategy_v2.components.recipe_contract import RecipeBinding, configuration_digest, source_digest, verify_binding
+from hummingbot.strategy_v2.components.recipe_contract import (
+    RecipeBinding,
+    configuration_digest,
+    source_digest,
+    verify_binding,
+)
 from hummingbot.strategy_v2.components.spot_lifecycle_v2 import NativeScopeV2, NativeSnapshotV2, decode_snapshot
+
 from .test_lifecycle import scope, snapshot
 from .test_native_views import capture, native_info
 
@@ -50,7 +56,7 @@ def test_added_component_invalidates_existing_seal_instead_of_auto_resealing(tmp
     before = source_digest(native, [controller])
     payload = {'constant': 'preserved'}
     old = RecipeBinding(recipe_id='baseline', recipe_sha256='a' * 64, source_sha256=before,
-                         configuration_sha256=configuration_digest(payload))
+                        configuration_sha256=configuration_digest(payload))
     verify_binding(old, payload, source_sha256=before)
     (components / 'spot_lifecycle_v2.py').write_text('VALUE = 2\n')
     after = source_digest(native, [controller])

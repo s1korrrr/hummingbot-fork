@@ -2,9 +2,10 @@ from decimal import Decimal as D
 
 import pytest
 
-from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, ObservationRef, Opportunity, Prerequisite
 from controllers.generic.spot_recipe_v2_core.acquisition import evaluate_acquisition
-from .test_lifecycle import pending, scope, snapshot
+from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, ObservationRef, Opportunity, Prerequisite
+
+from .test_lifecycle import pending, snapshot
 from .test_native_views import assess, exit_inputs
 
 
@@ -13,9 +14,9 @@ def opportunity(event=1000, **updates):
                    trading_pair='BTC-USDC', recipe_sha256='a' * 64, acquisition_allowed=True)
     binding.update(updates)
     return Opportunity(scope=DecisionScope(**binding), setup='fixture_setup', action='acquire',
-        primary=ObservationRef(dataset_sha256='1' * 64, epoch='fixture', revision=1,
-            content_sha256='2' * 64, event_time_ms=event, available_time_ms=event),
-        created_at_ms=event, lifetime_ms=100)
+                       primary=ObservationRef(dataset_sha256='1' * 64, epoch='fixture', revision=1,
+                                              content_sha256='2' * 64, event_time_ms=event, available_time_ms=event),
+                       created_at_ms=event, lifetime_ms=100)
 
 
 def ready(**updates):
@@ -35,7 +36,7 @@ def evaluate(view, **updates):
 
 def test_real_canonical_cursor_and_trace_are_reused():
     first = evaluate_acquisition(ready(), None, opportunity(999), purpose='initial_entry',
-                                now_ms=1002, max_age_ms=10, prerequisites=())
+                                 now_ms=1002, max_age_ms=10, prerequisites=())
     assert first.trace.reason == 'seeded'
     next_result = evaluate(ready())
     assert next_result.trace.status == 'ELIGIBLE_FOR_NATIVE_ADMISSION'
@@ -78,14 +79,14 @@ def test_same_event_after_hold_or_restart_cannot_be_rearmed():
     blocked = evaluate(ready(reconciled=False))
     restored = type(blocked.cursor).model_validate_json(blocked.cursor.model_dump_json())
     repeated = evaluate_acquisition(ready(), restored, opportunity(), purpose='initial_entry',
-                                   now_ms=1003, max_age_ms=10, prerequisites=())
+                                    now_ms=1003, max_age_ms=10, prerequisites=())
     assert repeated.trace.status == 'HOLD'
     assert repeated.trace.reason == 'already_observed'
 
 
 def test_initial_entry_pause_does_not_block_native_exit_assessment():
     paused = evaluate_acquisition(snapshot(), None, opportunity(acquisition_allowed=False), purpose='initial_entry',
-                                 now_ms=1002, max_age_ms=10, prerequisites=())
+                                  now_ms=1002, max_age_ms=10, prerequisites=())
     assert paused.trace.reason == 'acquisition_forbidden'
     assert assess(exit_inputs()).status == 'PROPOSED_REDUCTION'
 
@@ -127,11 +128,11 @@ def test_shadow_cursor_is_explicit_and_does_not_mutate_the_baseline_cursor():
 def test_permission_change_cannot_silently_rebind_an_existing_cursor():
     with pytest.raises(ValueError, match='cursor scope'):
         evaluate_acquisition(snapshot(), seed(), opportunity(acquisition_allowed=False),
-            purpose='initial_entry', now_ms=1002, max_age_ms=10, prerequisites=())
+                             purpose='initial_entry', now_ms=1002, max_age_ms=10, prerequisites=())
     assert assess(exit_inputs()).status == 'PROPOSED_REDUCTION'
 
 
 def test_invalid_cursor_has_a_typed_failure():
     with pytest.raises(ValueError):
         evaluate_acquisition(ready(), object(), opportunity(), purpose='initial_entry',
-            now_ms=1002, max_age_ms=10, prerequisites=())
+                             now_ms=1002, max_age_ms=10, prerequisites=())

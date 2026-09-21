@@ -5,8 +5,15 @@ from pydantic import ValidationError
 
 from hummingbot.strategy_v2.components.recipe_contract import RecipeBinding
 from hummingbot.strategy_v2.components.spot_lifecycle_v2 import (
-    NativeCommitmentV2, NativeScopeV2, NativeSnapshotV2, NativeTerminalV2,
-    decode_snapshot, encode_snapshot, management_pairs, project_lifecycle, validate_continuity,
+    NativeCommitmentV2,
+    NativeScopeV2,
+    NativeSnapshotV2,
+    NativeTerminalV2,
+    decode_snapshot,
+    encode_snapshot,
+    management_pairs,
+    project_lifecycle,
+    validate_continuity,
 )
 
 
@@ -14,7 +21,7 @@ def scope(**updates):
     values = dict(program_id='fixture_program_v2', owner_id='spot_v2_owner', executor_id='lot_1', connector='okx_paper_trade',
                   trading_pair='BTC-USDC', execution_mode='paper',
                   recipe_binding=RecipeBinding(recipe_id='fixture_v2', recipe_sha256='a' * 64,
-                      source_sha256='b' * 64, configuration_sha256='c' * 64))
+                                               source_sha256='b' * 64, configuration_sha256='c' * 64))
     return NativeScopeV2(**(values | updates))
 
 

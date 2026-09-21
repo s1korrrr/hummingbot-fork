@@ -5,12 +5,20 @@ from pydantic import Field
 
 from hummingbot.strategy_v2.components.config import PolicyModel
 from hummingbot.strategy_v2.components.decision_protocol import (
-    HASH, DecisionCursor, DecisionTrace, Opportunity, Prerequisite, decide,
+    HASH,
+    DecisionCursor,
+    DecisionTrace,
+    Opportunity,
+    Prerequisite,
+    decide,
 )
 from hummingbot.strategy_v2.components.domain import PolicyError
 from hummingbot.strategy_v2.components.recipe_contract import digest
 from hummingbot.strategy_v2.components.spot_lifecycle_v2 import (
-    LifecycleProjectionV2, NativeSnapshotV2, checked_snapshot, project_lifecycle,
+    LifecycleProjectionV2,
+    NativeSnapshotV2,
+    checked_snapshot,
+    project_lifecycle,
 )
 
 
@@ -49,7 +57,7 @@ def evaluate_acquisition(snapshot: NativeSnapshotV2, previous: DecisionCursor | 
     scope, proposed = snapshot.scope, opportunity.scope
     if (proposed.program_id, proposed.owner_id, proposed.connector, proposed.trading_pair,
         proposed.recipe_sha256) != (scope.program_id, scope.owner_id, scope.connector, scope.trading_pair,
-                                     scope.recipe_binding.recipe_sha256):
+                                    scope.recipe_binding.recipe_sha256):
         raise PolicyError('opportunity and native scope differ')
     lifecycle = project_lifecycle(snapshot, now_ms=now_ms, max_age_ms=max_age_ms)
     reason = 'eligible'

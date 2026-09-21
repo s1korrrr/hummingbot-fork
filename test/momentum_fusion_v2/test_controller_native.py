@@ -91,3 +91,13 @@ def test_management_sell_passes_controller_validator_while_entry_paused(tmp_path
     assert sell.side == TradeType.SELL
     assert controller.validate_executor_config(sell) is True
     assert identity(sell.model_dump(mode='json')) == controller._pending_identity
+
+
+def test_management_does_not_double_emit_sell_while_pending(tmp_path):
+    controller = _host(tmp_path, kill_switch=True)
+    controller.executors_info = [_buy_held()]
+    first = controller.determine_executor_actions()
+    assert first and first[0].executor_config.side == TradeType.SELL
+    second = controller.determine_executor_actions()
+    assert second == []
+    assert controller.processed_data['action_reason'] == 'pending_inflight'

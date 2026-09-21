@@ -180,22 +180,25 @@ class MomentumFusionV2Controller(ControllerBase):
         now = self.market_data_provider.time()
         held = bool(self.positions_held) or any(item.is_active or not item.is_done for item in self.executors_info)
         try:
+            pending_inflight = False
+            if self._pending is not None:
+                prior = next((item for item in self.executors_info if item.id == self._pending.id), None)
+                pending_inflight = prior is None or prior.is_active or not prior.is_done
+                if not pending_inflight:
+                    self._pending = None
             if held:
-                data_ready = data.get('data_health', {}).get('ready') is True
-                if not data_ready:
-                    plan = runtime.ActionPlan((), 'data_unready')
+                if pending_inflight and getattr(self._pending, 'side', None) == TradeType.SELL:
+                    plan = runtime.ActionPlan((), 'pending_inflight')
                 else:
-                    view, proposals, extras = self._management_inputs(now)
-                    plan = runtime.plan_management(
-                        claims=self._claims, acquisition_allowed=self._scope().acquisition_allowed,
-                        view=view, proposals=proposals, data_ready=True, **extras)
+                    data_ready = data.get('data_health', {}).get('ready') is True
+                    if not data_ready:
+                        plan = runtime.ActionPlan((), 'data_unready')
+                    else:
+                        view, proposals, extras = self._management_inputs(now)
+                        plan = runtime.plan_management(
+                            claims=self._claims, acquisition_allowed=self._scope().acquisition_allowed,
+                            view=view, proposals=proposals, data_ready=True, **extras)
             else:
-                pending_inflight = False
-                if self._pending is not None:
-                    prior = next((item for item in self.executors_info if item.id == self._pending.id), None)
-                    pending_inflight = prior is None or prior.is_active or not prior.is_done
-                    if not pending_inflight:
-                        self._pending = None
                 rules = self.market_data_provider.get_trading_rules(c.connector_name, c.trading_pair)
                 available = self.market_data_provider.get_available_balance(c.connector_name, 'USDC')
                 if data.get('signal') == 1 and data.get('data_health', {}).get('ready'):
@@ -293,7 +296,7 @@ class MomentumFusionV2Controller(ControllerBase):
         entry = info.get('entry_price') or info.get('current_position_average_price')
         if entry is None:
             raise PolicyError('unknown_cost')
-        cost = Decimal(str(entry)) * Decimal(str(remaining))
+        cost = Decimal(str(entry)) * Decimal(str(harvest))
         extras = dict(
             cost_quote=str(cost), harvest_base=str(harvest), fee_fraction=str(c.fee_buffer),
             margin='0', buffer='0', now_ms=int(now * 1000), controller_id=c.id,

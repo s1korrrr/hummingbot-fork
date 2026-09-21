@@ -331,6 +331,9 @@ def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote,
         qty = split['harvest'] if split['mode'] == 'split' else split['amount']
         uncommitted = net_uncommitted(view.remaining_base, view.reserved_base)
         qty = min(qty, uncommitted)
+        with localcontext() as context:
+            context.prec = 60
+            qty = min(qty, uncommitted / (1 + view.base_fee_fraction))
         qty = (qty / view.amount_step).to_integral_value(rounding=ROUND_FLOOR) * view.amount_step
         if qty < view.minimum_amount:
             return _skip('native_quantity_below_minimum')

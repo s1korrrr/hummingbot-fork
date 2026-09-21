@@ -40,6 +40,7 @@ class Claim(PolicyModel):
     reserved_quote: Decimal = Field(ge=0)
     reserved_base: Decimal = Field(ge=0)
     executor_identity: str | None = None
+    seen_executor_id: str | None = None
     topology: Literal['single_recorder', 'shared_multi_process'] = 'single_recorder'
 
 
@@ -86,7 +87,12 @@ class ClaimStore:
             raise PolicyError('claim id already bound')
         if current.status == 'RECONCILED_TERMINAL' or CLAIM_RANK[claim.status] < CLAIM_RANK[current.status]:
             return current
-        if claim.status == current.status:
+        filling_seen = (
+            claim.status == current.status
+            and not current.seen_executor_id
+            and bool(claim.seen_executor_id)
+        )
+        if claim.status == current.status and not filling_seen:
             return current
         self._claims[claim.claim_id] = claim
         self._persist()
@@ -102,20 +108,27 @@ class ClaimStore:
 def reconcile_claims(claims: ClaimStore | None, executors) -> None:
     if claims is None:
         return
-    by_identity = {}
+    by_hash = {}
+    by_id = {}
     for item in executors:
+        item_id = getattr(item, 'id', None)
+        if item_id:
+            by_id[str(item_id)] = item
         config = getattr(item, 'config', None)
         if config is None:
             continue
-        by_identity[identity(config.model_dump(mode='json'))] = item
+        by_hash[identity(config.model_dump(mode='json'))] = item
     for claim in list(claims.open_claims()):
-        if not claim.executor_identity:
-            continue
-        exe = by_identity.get(claim.executor_identity)
+        exe = None
+        if claim.seen_executor_id:
+            exe = by_id.get(claim.seen_executor_id)
+        if exe is None and claim.executor_identity:
+            exe = by_hash.get(claim.executor_identity)
         if exe is None:
-            if claim.status in {'PARTIAL', 'CANCEL_PENDING'}:
+            if claim.seen_executor_id or claim.status in {'PARTIAL', 'CANCEL_PENDING'}:
                 claims.put(claim.model_copy(update={'status': 'RECONCILED_TERMINAL'}))
             continue
+        seen_id = str(getattr(exe, 'id', '') or '')
         filled = decimal(getattr(exe, 'filled_amount_quote', 0) or 0, 'filled')
         shutting = getattr(getattr(exe, 'status', None), 'name', None) == 'SHUTTING_DOWN'
         if getattr(exe, 'is_done', False):
@@ -125,9 +138,14 @@ def reconcile_claims(claims: ClaimStore | None, executors) -> None:
         elif shutting:
             next_status = 'CANCEL_PENDING'
         else:
-            continue
+            next_status = claim.status
+        updates = {}
+        if seen_id and claim.seen_executor_id != seen_id:
+            updates['seen_executor_id'] = seen_id
         if next_status != claim.status:
-            claims.put(claim.model_copy(update={'status': next_status}))
+            updates['status'] = next_status
+        if updates:
+            claims.put(claim.model_copy(update=updates))
 
 
 def refuse_unsupported_topology(topology: str):
@@ -263,8 +281,7 @@ def _sell_opportunity_id(view, claims, controller_id: str) -> str:
     generation = 0
     while True:
         opportunity_id = identity({
-            'kind': 'sell', 'executor': view.executor_id,
-            'receipt': view.receipt_sha256, 'generation': generation,
+            'kind': 'sell', 'pair': view.trading_pair, 'generation': generation,
         })
         found = claims.get(claim_id_for(opportunity_id, controller_id))
         if found is None or found.status != 'RECONCILED_TERMINAL':

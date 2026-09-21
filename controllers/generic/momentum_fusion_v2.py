@@ -267,10 +267,10 @@ class MomentumFusionV2Controller(ControllerBase):
                 continue
             longs.append(item)
         active = longs[0] if longs else None
+        pos = self.positions_held[0] if self.positions_held else None
         info = dict(getattr(active, 'custom_info', None) or {})
         remaining = info.get('remaining_position_amount_base') or info.get('remaining_owned_base')
-        if remaining is None and self.positions_held:
-            pos = self.positions_held[0]
+        if remaining is None and pos is not None:
             remaining = getattr(pos, 'amount', None) or getattr(pos, 'base_amount', None)
         if remaining is None:
             raise PolicyError('native_exit_view_unavailable')
@@ -278,13 +278,16 @@ class MomentumFusionV2Controller(ControllerBase):
         rules = self.market_data_provider.get_trading_rules(c.connector_name, c.trading_pair)
         bid = self.market_data_provider.get_price_by_type(
             c.connector_name, c.trading_pair, PriceType.BestBid)
-        receipt = identity({'executor': getattr(active, 'id', c.id), 'pair': c.trading_pair})
+        receipt = identity({'pair': c.trading_pair})
         owner = c.id
-        executor_id = str(getattr(active, 'id', None) or 'held-position')
+        executor_id = c.id
+        fees_complete = (
+            getattr(active, 'cum_fees_quote', None) is not None
+            or getattr(pos, 'cum_fees_quote', None) is not None)
         view = NativeExitView(
             owner_id=owner, executor_id=executor_id, connector=c.connector_name,
             trading_pair=c.trading_pair, receipt_sha256=receipt, observed_at_ms=int(now * 1000),
-            reconciled=True, fees_complete=getattr(active, 'cum_fees_quote', None) is not None,
+            reconciled=True, fees_complete=fees_complete,
             remaining_base=str(remaining), reserved_base=str(reserved),
             base_fee_fraction=str(c.fee_buffer),
             amount_step=str(rules.min_base_amount_increment),
@@ -294,7 +297,8 @@ class MomentumFusionV2Controller(ControllerBase):
         proposals = (ExitProposal(
             policy_id='trail', owner_id=owner, executor_id=executor_id, receipt_sha256=receipt,
             requested_base=str(harvest), minimum_price='0', expires_at_ms=int(now * 1000) + 1000),)
-        entry = info.get('entry_price') or info.get('current_position_average_price')
+        entry = (info.get('entry_price') or info.get('current_position_average_price')
+                 or getattr(pos, 'breakeven_price', None))
         if entry is None:
             raise PolicyError('unknown_cost')
         cost = Decimal(str(entry)) * Decimal(str(harvest))

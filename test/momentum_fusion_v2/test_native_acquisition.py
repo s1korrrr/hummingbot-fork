@@ -27,11 +27,12 @@ def test_paper_and_live_identities_stay_distinct():
 def test_native_mapping_is_capped_limit_single_attempt():
     config = runtime.position_config(
         now=1.0, controller_id='mom', connector_name='okx', trading_pair='BNB-USDC',
-        amount='0.1', price='100', stop='0.02', take_profit='0.04', time_limit=3600, ttl_seconds=60)
+        amount='0.1', price='100', stop='0.02', take_profit='0.04', ttl_seconds=60)
     assert config.entry_order_policy == 'single_attempt'
     assert config.triple_barrier_config.open_order_type == OrderType.LIMIT
     assert config.triple_barrier_config.open_order_limit_max_age_seconds == 60
-    assert config.triple_barrier_config.stop_loss_order_type == OrderType.LIMIT
+    assert config.triple_barrier_config.stop_loss_order_type == OrderType.MARKET
+    assert config.triple_barrier_config.time_limit is None
     assert config.leverage == 1
 
 

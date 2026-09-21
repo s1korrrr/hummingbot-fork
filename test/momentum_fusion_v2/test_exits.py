@@ -1,6 +1,7 @@
 from decimal import Decimal as D
 
 from controllers.generic.momentum_fusion_v2_core import runtime
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.strategy_v2.components.exit_policy import ExitProposal, NativeExitView, NativeProfitFloor
 
 
@@ -50,7 +51,7 @@ def test_management_emits_while_acquisition_is_paused(tmp_path):
         claims=store, acquisition_allowed=False, view=view(),
         proposals=(proposal('trail', '7'),), cost_quote='70', harvest_base='7',
         fee_fraction='0', margin='0', buffer='0', now_ms=1050, controller_id='mom-v2',
-        connector_name='okx', trading_pair='BNB-USDC', time_limit=3600)
+        connector_name='okx', trading_pair='BNB-USDC', data_ready=True)
     assert plan.actions
     assert plan.reason == 'proposed_reduction'
     config = plan.actions[0].executor_config
@@ -58,7 +59,9 @@ def test_management_emits_while_acquisition_is_paused(tmp_path):
     barriers = config.triple_barrier_config
     assert barriers.stop_loss is None
     assert barriers.take_profit is None
-    assert barriers.time_limit == 3600
+    assert barriers.stop_loss_order_type == OrderType.MARKET
+    assert barriers.time_limit_order_type == OrderType.MARKET
+    assert barriers.time_limit is None
     assert config.entry_price > 1
 
 
@@ -68,7 +71,7 @@ def test_bid_below_floor_management_does_not_emit(tmp_path):
         claims=store, acquisition_allowed=True, view=view(bid='10'),
         proposals=(proposal('trail', '7'),), cost_quote='77', harvest_base='7',
         fee_fraction='0', margin='0', buffer='0', now_ms=1050, controller_id='mom-v2',
-        connector_name='okx', trading_pair='BNB-USDC', time_limit=3600)
+        connector_name='okx', trading_pair='BNB-USDC', data_ready=True)
     assert plan.actions == ()
     assert plan.reason == 'bid_below_profit_floor'
 
@@ -78,6 +81,33 @@ def test_management_without_claim_store_is_rejected_with_reason():
         claims=None, acquisition_allowed=False, view=view(),
         proposals=(proposal('trail', '7'),), cost_quote='70', harvest_base='7',
         fee_fraction='0', margin='0', buffer='0', now_ms=1050, controller_id='mom-v2',
-        connector_name='okx', trading_pair='BNB-USDC', time_limit=3600)
+        connector_name='okx', trading_pair='BNB-USDC', data_ready=True)
     assert plan.actions == ()
     assert plan.reason == 'claim_store_required'
+
+
+def test_management_without_data_ready_does_not_emit_sell(tmp_path):
+    store = runtime.ClaimStore(tmp_path / 'claims.json')
+    plan = runtime.plan_management(
+        claims=store, acquisition_allowed=False, view=view(),
+        proposals=(proposal('trail', '7'),), cost_quote='70', harvest_base='7',
+        fee_fraction='0', margin='0', buffer='0', now_ms=1050, controller_id='mom-v2',
+        connector_name='okx', trading_pair='BNB-USDC', data_ready=False)
+    assert plan.actions == ()
+    assert plan.reason == 'data_unready'
+
+
+def test_position_config_buy_and_sell_match_frozen_executor_init_guard():
+    buy = runtime.position_config(
+        now=1, controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
+        amount=D('1'), price=D('10'), stop=D('0.02'), take_profit=D('0.04'),
+        ttl_seconds=60)
+    sell = runtime.position_config(
+        now=1, controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
+        amount=D('1'), price=D('12'), stop=None, take_profit=None,
+        ttl_seconds=60, side=TradeType.SELL)
+    for config in (buy, sell):
+        barriers = config.triple_barrier_config
+        assert barriers.stop_loss_order_type == OrderType.MARKET
+        assert barriers.time_limit_order_type == OrderType.MARKET
+        assert barriers.time_limit is None

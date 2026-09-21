@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from controllers.generic.momentum_fusion_v2_core import runtime
+from hummingbot.core.data_type.common import OrderType
 from hummingbot.strategy_v2.components.capital_policy import CapitalLimits, CapitalRequest, CapitalSnapshot
 from hummingbot.strategy_v2.components.domain import PolicyError
 
@@ -80,7 +81,7 @@ def _acquire(tmp_path, **over):
         controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
         available_quote='100', total_amount_quote='100', trade_quote='60', risk_fraction='0.05',
         price='100', atr='1', atr_stop_multiple='2', maximum_stop_fraction='0.10',
-        take_profit='0.04', time_limit=3600, fee_buffer='0.003', amount_step='0.01',
+        take_profit='0.04', fee_buffer='0.003', amount_step='0.01',
         minimum_amount='0.01', minimum_notional='1',
     )
     values.update(over)
@@ -118,3 +119,12 @@ def test_restart_does_not_reemit_submitted_claim(tmp_path):
     again = _acquire(tmp_path, claims=restored, last_decision=None)
     assert again.actions == ()
     assert again.reason == 'claim_already_open'
+
+
+def test_buy_stop_loss_order_type_is_market_for_frozen_position_executor_init(tmp_path):
+    plan = _acquire(tmp_path)
+    assert plan.actions
+    barriers = plan.actions[0].executor_config.triple_barrier_config
+    assert barriers.stop_loss_order_type == OrderType.MARKET
+    assert barriers.time_limit_order_type == OrderType.MARKET
+    assert barriers.time_limit is None

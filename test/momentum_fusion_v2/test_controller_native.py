@@ -51,7 +51,7 @@ def _buy_held():
     buy = PositionExecutorConfig(
         timestamp=1, controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
         side=TradeType.BUY, amount=D('10'), entry_price=D('10'),
-        triple_barrier_config=TripleBarrierConfig(time_limit=3600))
+        triple_barrier_config=TripleBarrierConfig(time_limit=None))
     return ExecutorInfo(
         id='long-1', timestamp=1, type='position_executor', status=RunnableStatus.RUNNING,
         config=buy, net_pnl_pct=D('0'), net_pnl_quote=D('0'), cum_fees_quote=D('0'),
@@ -64,7 +64,7 @@ def _sell_pending():
     sell = PositionExecutorConfig(
         timestamp=1, controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
         side=TradeType.SELL, amount=D('3'), entry_price=D('12'),
-        triple_barrier_config=TripleBarrierConfig(time_limit=3600))
+        triple_barrier_config=TripleBarrierConfig(time_limit=None))
     return ExecutorInfo(
         id='sell-1', timestamp=1, type='position_executor', status=RunnableStatus.RUNNING,
         config=sell, net_pnl_pct=D('0'), net_pnl_quote=D('0'), cum_fees_quote=D('0'),

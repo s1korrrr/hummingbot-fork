@@ -54,7 +54,6 @@ class MomentumFusionV2Config(ControllerConfigBase):
     atr_stop_multiple: Decimal = Field(default=Decimal('2'), gt=0, le=10)
     maximum_stop_fraction: Decimal = Field(default=Decimal('.10'), gt=0, le=Decimal('.25'))
     take_profit: Decimal = Field(default=Decimal('.04'), gt=0, le=Decimal('.5'))
-    time_limit: int = Field(default=3600, ge=60, le=86400, strict=True)
     max_candle_age_seconds: int = Field(default=10, ge=0, le=60, strict=True)
     fee_buffer: Decimal = Field(default=Decimal('.003'), ge=0, le=Decimal('.05'))
     topology: Literal['single_recorder', 'shared_multi_process'] = 'single_recorder'
@@ -182,10 +181,14 @@ class MomentumFusionV2Controller(ControllerBase):
         held = bool(self.positions_held) or any(item.is_active or not item.is_done for item in self.executors_info)
         try:
             if held:
-                view, proposals, extras = self._management_inputs(now)
-                plan = runtime.plan_management(
-                    claims=self._claims, acquisition_allowed=self._scope().acquisition_allowed,
-                    view=view, proposals=proposals, **extras)
+                data_ready = data.get('data_health', {}).get('ready') is True
+                if not data_ready:
+                    plan = runtime.ActionPlan((), 'data_unready')
+                else:
+                    view, proposals, extras = self._management_inputs(now)
+                    plan = runtime.plan_management(
+                        claims=self._claims, acquisition_allowed=self._scope().acquisition_allowed,
+                        view=view, proposals=proposals, data_ready=True, **extras)
             else:
                 pending_inflight = False
                 if self._pending is not None:
@@ -232,7 +235,7 @@ class MomentumFusionV2Controller(ControllerBase):
                         trade_quote=c.trade_quote, risk_fraction=c.risk_fraction,
                         price=data.get('close') or 0, atr=data.get('atr') or 0,
                         atr_stop_multiple=c.atr_stop_multiple, maximum_stop_fraction=c.maximum_stop_fraction,
-                        take_profit=c.take_profit, time_limit=c.time_limit, fee_buffer=c.fee_buffer,
+                        take_profit=c.take_profit, fee_buffer=c.fee_buffer,
                         amount_step=rules.min_base_amount_increment, minimum_amount=rules.min_order_size,
                         minimum_notional=rules.min_notional_size)
         except (PolicyError, ValueError, TypeError, KeyError, AttributeError) as error:
@@ -294,7 +297,7 @@ class MomentumFusionV2Controller(ControllerBase):
         extras = dict(
             cost_quote=str(cost), harvest_base=str(harvest), fee_fraction=str(c.fee_buffer),
             margin='0', buffer='0', now_ms=int(now * 1000), controller_id=c.id,
-            connector_name=c.connector_name, trading_pair=c.trading_pair, time_limit=c.time_limit)
+            connector_name=c.connector_name, trading_pair=c.trading_pair)
         return view, proposals, extras
 
     def get_status_summary(self):

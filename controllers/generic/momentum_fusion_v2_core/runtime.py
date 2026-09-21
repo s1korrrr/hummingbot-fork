@@ -5,7 +5,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, localcontext
 from pathlib import Path
 from typing import Literal
 
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.strategy_v2.components.capital_policy import (
     CapitalAssessment,
     CapitalLimits,
@@ -24,6 +24,7 @@ from hummingbot.strategy_v2.components.exit_policy import (
     arbitrate_exit,
 )
 from hummingbot.strategy_v2.components.portfolio import allocate
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from pydantic import Field
 
@@ -186,7 +187,7 @@ def pending_sale_base(executors):
         if amount is None:
             amount = getattr(getattr(item, 'config', None), 'amount', None)
         if amount is None:
-            continue
+            raise PolicyError('pending_sale_amount_missing')
         total += decimal(amount, 'pending sale')
     return total
 
@@ -210,19 +211,15 @@ def maximum_marked_drawdown(marks):
 
 
 def position_config(*, now, controller_id, connector_name, trading_pair, amount, price, stop, take_profit,
-                    time_limit, ttl_seconds, side=None):
-    # ponytail: compiled executor DTOs; this pin has no Cython objects. Upgrade: import after compile.
-    from hummingbot.core.data_type.common import OrderType, TradeType
-    from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
-
+                    ttl_seconds, side=None):
     return PositionExecutorConfig(
         timestamp=now, controller_id=controller_id, connector_name=connector_name, trading_pair=trading_pair,
         side=TradeType.BUY if side is None else side, amount=amount, entry_price=price, leverage=1,
         entry_order_policy='single_attempt',
         triple_barrier_config=TripleBarrierConfig(
-            stop_loss=stop, take_profit=take_profit, time_limit=time_limit,
+            stop_loss=stop, take_profit=take_profit, time_limit=None,
             open_order_type=OrderType.LIMIT, open_order_limit_max_age_seconds=ttl_seconds,
-            take_profit_order_type=OrderType.LIMIT, stop_loss_order_type=OrderType.LIMIT,
+            take_profit_order_type=OrderType.LIMIT, stop_loss_order_type=OrderType.MARKET,
         ),
     )
 
@@ -239,7 +236,7 @@ def plan_acquisition(*, claims, execution_enabled, acquisition_allowed, recovery
                      signal, last_decision, decision_time, now, max_candle_age_seconds,
                      pending_inflight, controller_id, connector_name, trading_pair, available_quote,
                      total_amount_quote, trade_quote, risk_fraction, price, atr, atr_stop_multiple,
-                     maximum_stop_fraction, take_profit, time_limit, fee_buffer, amount_step,
+                     maximum_stop_fraction, take_profit, fee_buffer, amount_step,
                      minimum_amount, minimum_notional) -> ActionPlan:
     if not execution_enabled:
         return _skip('execution_disabled')
@@ -300,7 +297,7 @@ def plan_acquisition(*, claims, execution_enabled, acquisition_allowed, recovery
     executor = position_config(
         now=now, controller_id=controller_id, connector_name=connector_name,
         trading_pair=trading_pair, amount=allocation.amount, price=price_d, stop=stop,
-        take_profit=take_profit, time_limit=time_limit, ttl_seconds=60)
+        take_profit=take_profit, ttl_seconds=60)
     claim = Claim(
         claim_id=claim_key, opportunity_id=opportunity_id, controller_id=controller_id,
         trading_pair=trading_pair, status='RESERVED', reserved_quote=allocation.reserved_quote,
@@ -320,11 +317,13 @@ def plan_acquisition(*, claims, execution_enabled, acquisition_allowed, recovery
 
 def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote, harvest_base,
                     fee_fraction, margin, buffer, now_ms, controller_id, connector_name,
-                    trading_pair, time_limit) -> ActionPlan:
+                    trading_pair, data_ready) -> ActionPlan:
     if type(acquisition_allowed) is not bool:
         return _skip('invalid_acquisition_flag')
     if claims is None:
         return _skip('claim_store_required')
+    if not data_ready:
+        return _skip('data_unready')
     try:
         split = split_or_single(
             total_base=view.remaining_base, harvest_base=harvest_base,
@@ -349,6 +348,6 @@ def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote,
     executor = position_config(
         now=now_ms / 1000, controller_id=controller_id, connector_name=connector_name,
         trading_pair=trading_pair, amount=result.amount_base, price=result.limit_price,
-        stop=None, take_profit=None, time_limit=time_limit, ttl_seconds=60, side=TradeType.SELL)
+        stop=None, take_profit=None, ttl_seconds=60, side=TradeType.SELL)
     return ActionPlan((CreateExecutorAction(controller_id=controller_id, executor_config=executor),),
                       'proposed_reduction')

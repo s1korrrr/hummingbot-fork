@@ -67,3 +67,8 @@ def test_harvest_equals_remaining_only_when_uncommitted_is_remaining():
 
 def test_open_mark_path_keeps_drawdown_through_recovery():
     assert runtime.maximum_marked_drawdown([100, 90, 100]) == D('-0.1')
+
+
+def test_pending_sale_without_amount_fails_visibly():
+    with pytest.raises(PolicyError, match='pending_sale_amount_missing'):
+        runtime.pending_sale_base((_Exec('SELL', None),))

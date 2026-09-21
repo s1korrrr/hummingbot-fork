@@ -23,7 +23,7 @@ def test_entry_pause_still_emits_management_actions(tmp_path):
         claims=store, acquisition_allowed=False, view=view, proposals=(proposal,),
         cost_quote='70', harvest_base='7', fee_fraction='0', margin='0', buffer='0',
         now_ms=1050, controller_id='mom-v2', connector_name='okx', trading_pair='BNB-USDC',
-        time_limit=3600)
+        data_ready=True)
     assert plan.actions
     assert all(getattr(action, 'keep_position', False) is False for action in plan.actions)
 

@@ -1,0 +1,16 @@
+id: mom_v2_bnb
+controller_name: momentum_fusion_v2
+controller_type: generic
+connector_name: okx
+candles_connector: okx
+trading_pair: BNB-USDC
+execution_mode: observation
+execution_enabled: false
+interval: 1m
+enabled_modules:
+  - b0_breakout
+  - c1_shelf
+total_amount_quote: '50'
+trade_quote: '10'
+risk_fraction: '0.01'
+topology: single_recorder

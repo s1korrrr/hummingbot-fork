@@ -38,6 +38,7 @@ from hummingbot.model.controller_candle_watermark import (
     ControllerCandleWatermarkResult,
     ControllerCandleWatermarkState,
 )
+from hummingbot.model.executors import Executors
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
@@ -943,8 +944,25 @@ class OKRSIController(hl_rsi.HLRSIController):
                     recorder._sql_manager, recorder._config_file_path, self.config.id,
                     self.config.connector_name, self.config.trading_pair, self.config.interval,
                 )
-            self._entry_decision_gate = EntryDecisionGate(store)
+            self._entry_decision_gate = EntryDecisionGate(store, executor_exists=self._executor_row_exists)
         return self._entry_decision_gate
+
+    def _executor_row_exists(self, executor_id):
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is None:
+            return None
+        with recorder._sql_manager.get_new_session() as session:
+            return session.get(Executors, executor_id) is not None
+
+    def _release_entry_decision(self):
+        self._get_entry_decision_gate().release()
+
+    def commit_entry_executor(self, config):
+        if config.side != TradeType.BUY:
+            return
+        from controllers.directional_trading.ok_rsi_core.entry_decisions import executor_fingerprint
+        candle = (self.processed_data or {}).get("candle_timestamp")
+        self._get_entry_decision_gate().commit(config.id, executor_fingerprint(config), int(candle))
 
     def create_actions_proposal(self):
         if self._episode_runtime is not None:
@@ -1008,6 +1026,8 @@ class OKRSIController(hl_rsi.HLRSIController):
                     and not self._episode_runtime.hold_reason
                     and not self._episode_runtime.state.fault)
         if not super().validate_executor_config(config):
+            if config.side == TradeType.BUY:
+                self._release_entry_decision()
             return False
         if config.side != TradeType.BUY:
             if self.config.trade_mode == "sell_only" and self.config.sell_only_strict_fraction:
@@ -1021,6 +1041,7 @@ class OKRSIController(hl_rsi.HLRSIController):
             candle = (self.processed_data or {}).get("candle_timestamp")
             return self._get_entry_decision_gate().dispatch(config.id, executor_fingerprint(config), candle)
         except Exception as exc:
+            self._release_entry_decision()
             self._entry_admission_failed(f"{type(exc).__name__}: {exc}")
             return False
 

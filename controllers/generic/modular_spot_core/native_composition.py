@@ -314,11 +314,22 @@ class NativeComposition:
 
     def validate_executor_config(self, config):
         if self._recovery_hold or self._recovery_fault:
+            if config.side == TradeType.BUY:
+                release = getattr(self, '_release_entry_decision', None)
+                if callable(release):
+                    release()
             return False
         if config.side == TradeType.BUY and (not self.config.execution_enabled or not self._composition_unchanged()
                                              or self.shared_candles is not None and not self.shared_candles.entry_ready()):
+            release = getattr(self, '_release_entry_decision', None)
+            if callable(release):
+                release()
             return False
         if not super().validate_executor_config(config):
+            if config.side == TradeType.BUY:
+                release = getattr(self, '_release_entry_decision', None)
+                if callable(release):
+                    release()
             return False
         if config.side == TradeType.BUY and self.config.funding is not None:
             try:
@@ -332,6 +343,10 @@ class NativeComposition:
                 self._funding_hold = None
             except Exception as error:
                 self._funding_hold = str(error) or type(error).__name__
+                self.logger().warning('Funding admission refused %s: %s', config.id, self._funding_hold)
+                release = getattr(self, '_release_entry_decision', None)
+                if callable(release):
+                    release()
                 return False
         return True
 

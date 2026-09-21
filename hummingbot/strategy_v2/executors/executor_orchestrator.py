@@ -1665,6 +1665,9 @@ class ExecutorOrchestrator:
 
         # Persist intent before starting anything that can submit an order. A failed write must not start execution.
         MarketsRecorder.get_instance().store_or_update_executor(executor)
+        commit = getattr(controller, "commit_entry_executor", None)
+        if callable(commit):
+            commit(executor_config)
         self.active_executors[controller_id].append(executor)
         if self._executor_start is None:
             executor.start()

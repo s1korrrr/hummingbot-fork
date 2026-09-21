@@ -1,5 +1,6 @@
 """Stateless candle features. Setup arming lives in setups.py, not a feature closure."""
 import json
+import math
 from hashlib import sha256
 from pathlib import Path
 
@@ -28,6 +29,29 @@ def is_explicitly_confirmed(row):
     if flag is None:
         return False
     return bool(flag) and flag == flag
+
+
+def closed_native_bars(frame, now):
+    now_s = int(now)
+    if frame is None or len(frame) == 0:
+        return frame.iloc[0:0] if frame is not None else pd.DataFrame()
+    has_confirmed = 'confirmed' in frame.columns
+    keep = []
+    for row in frame.itertuples(index=False):
+        if has_confirmed and not is_explicitly_confirmed(row):
+            keep.append(False)
+            continue
+        try:
+            close = float(row.close)
+            stamp = float(row.timestamp)
+        except (TypeError, ValueError):
+            keep.append(False)
+            continue
+        if not math.isfinite(close) or close <= 0 or stamp != int(stamp):
+            keep.append(False)
+            continue
+        keep.append(is_closed_minute(int(stamp), now_s))
+    return frame.iloc[[i for i, flag in enumerate(keep) if flag]].copy()
 
 
 def prior_channel_break(frame, dependencies, parameters):

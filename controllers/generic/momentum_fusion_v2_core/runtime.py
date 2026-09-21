@@ -170,6 +170,27 @@ def net_uncommitted(remaining_base, reserved_base):
     return remaining - reserved
 
 
+def pending_sale_base(executors):
+    total = Decimal('0')
+    for item in executors:
+        if getattr(item, 'is_done', False):
+            continue
+        side = getattr(item, 'side', None)
+        if side is None:
+            side = getattr(getattr(item, 'config', None), 'side', None)
+        name = getattr(side, 'name', side)
+        if name != 'SELL':
+            continue
+        info = getattr(item, 'custom_info', None) or {}
+        amount = info.get('remaining_position_amount_base')
+        if amount is None:
+            amount = getattr(getattr(item, 'config', None), 'amount', None)
+        if amount is None:
+            continue
+        total += decimal(amount, 'pending sale')
+    return total
+
+
 def one_exit(view: NativeExitView, proposals: tuple[ExitProposal, ...], floor: NativeProfitFloor | None,
              *, now_ms: int, max_age_ms: int = 100) -> ExitAssessment:
     return arbitrate_exit(view, proposals, floor, now_ms=now_ms, max_age_ms=max_age_ms)
@@ -325,11 +346,9 @@ def plan_management(*, claims, acquisition_allowed, view, proposals, cost_quote,
         return _skip(str(error) or 'management_failed')
     if result.status != 'PROPOSED_REDUCTION':
         return _skip(result.reason)
-    # ponytail: dummy barriers so PositionExecutorConfig constructs. Native trail restore is A21.
     executor = position_config(
         now=now_ms / 1000, controller_id=controller_id, connector_name=connector_name,
         trading_pair=trading_pair, amount=result.amount_base, price=result.limit_price,
-        stop=view.price_step / result.limit_price, take_profit=view.price_step / result.limit_price,
-        time_limit=time_limit, ttl_seconds=60, side=TradeType.SELL)
+        stop=None, take_profit=None, time_limit=time_limit, ttl_seconds=60, side=TradeType.SELL)
     return ActionPlan((CreateExecutorAction(controller_id=controller_id, executor_config=executor),),
                       'proposed_reduction')

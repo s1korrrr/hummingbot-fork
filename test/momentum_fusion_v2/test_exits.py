@@ -53,7 +53,13 @@ def test_management_emits_while_acquisition_is_paused(tmp_path):
         connector_name='okx', trading_pair='BNB-USDC', time_limit=3600)
     assert plan.actions
     assert plan.reason == 'proposed_reduction'
-    assert plan.actions[0].executor_config.side.name == 'SELL'
+    config = plan.actions[0].executor_config
+    assert config.side.name == 'SELL'
+    barriers = config.triple_barrier_config
+    assert barriers.stop_loss is None
+    assert barriers.take_profit is None
+    assert barriers.time_limit == 3600
+    assert config.entry_price > 1
 
 
 def test_bid_below_floor_management_does_not_emit(tmp_path):

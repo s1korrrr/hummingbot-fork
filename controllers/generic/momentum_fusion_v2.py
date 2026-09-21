@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import ConfigDict, Field, model_validator
 
 from controllers.generic.momentum_fusion_v2_core import features, recipe, runtime, setups
-from hummingbot.core.data_type.common import PriceType
+from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.components.candle_data import Candle, CandleSnapshot, Dataset
 from hummingbot.strategy_v2.components.data_reader import DataPolicy
@@ -23,6 +23,7 @@ from hummingbot.strategy_v2.components.exit_policy import ExitProposal, NativeEx
 from hummingbot.strategy_v2.components.feature_cache import FeatureCache
 from hummingbot.strategy_v2.components.recipe_contract import configuration_digest, source_digest
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
 
 
@@ -123,17 +124,14 @@ class MomentumFusionV2Controller(ControllerBase):
             frame = self.market_data_provider.get_candles_df(
                 self.config.candles_connector, self.config.trading_pair, '1m', self.config.max_records)
             now_s = int(now)
+            admitted = features.closed_native_bars(frame, now_s)
             rows = []
-            for row in frame.itertuples():
-                if not features.is_explicitly_confirmed(row):
-                    continue
-                open_time = int(row.timestamp) if float(row.timestamp).is_integer() else -1
-                if open_time < 0 or not features.is_closed_minute(open_time, now_s):
-                    continue
+            for row in admitted.itertuples(index=False):
+                open_time = int(row.timestamp)
                 rows.append(Candle(open_time=open_time, open=row.open, high=row.high, low=row.low,
-                                   close=row.close, volume=row.volume, confirmed=True))
+                                   close=row.close, volume=row.volume))
             if not rows:
-                raise DataUnavailable('no confirmed candles')
+                raise DataUnavailable('no closed candles')
             snapshot = CandleSnapshot(
                 dataset=Dataset(connector='okx', trading_pair=self.config.trading_pair, history=self.config.max_records),
                 epoch='native', sequence=1, published_at=now, rows=rows)
@@ -240,15 +238,28 @@ class MomentumFusionV2Controller(ControllerBase):
         except (PolicyError, ValueError, TypeError, KeyError, AttributeError) as error:
             plan = runtime.ActionPlan((), str(error) or 'emit_failed')
         data['action_reason'] = plan.reason
-        if plan.actions and not held:
+        if plan.actions:
             self._pending = plan.actions[0].executor_config
-            self._last_decision = data.get('decision_time')
             self._pending_identity = identity(self._pending.model_dump(mode='json'))
+            if not held:
+                self._last_decision = data.get('decision_time')
         return list(plan.actions)
 
     def _management_inputs(self, now):
         c = self.config
-        active = next((item for item in self.executors_info if item.is_active or not item.is_done), None)
+        reserved = runtime.pending_sale_base(self.executors_info)
+        longs = []
+        for item in self.executors_info:
+            if getattr(item, 'is_done', False):
+                continue
+            side = getattr(item, 'side', None)
+            if side is None:
+                side = getattr(getattr(item, 'config', None), 'side', None)
+            name = getattr(side, 'name', side)
+            if name == 'SELL':
+                continue
+            longs.append(item)
+        active = longs[0] if longs else None
         info = dict(getattr(active, 'custom_info', None) or {})
         remaining = info.get('remaining_position_amount_base') or info.get('remaining_owned_base')
         if remaining is None and self.positions_held:
@@ -256,6 +267,7 @@ class MomentumFusionV2Controller(ControllerBase):
             remaining = getattr(pos, 'amount', None) or getattr(pos, 'base_amount', None)
         if remaining is None:
             raise PolicyError('native_exit_view_unavailable')
+        harvest = runtime.net_uncommitted(remaining, reserved)
         rules = self.market_data_provider.get_trading_rules(c.connector_name, c.trading_pair)
         bid = self.market_data_provider.get_price_by_type(
             c.connector_name, c.trading_pair, PriceType.BestBid)
@@ -266,13 +278,12 @@ class MomentumFusionV2Controller(ControllerBase):
             owner_id=owner, executor_id=executor_id, connector=c.connector_name,
             trading_pair=c.trading_pair, receipt_sha256=receipt, observed_at_ms=int(now * 1000),
             reconciled=True, fees_complete=getattr(active, 'cum_fees_quote', None) is not None,
-            remaining_base=str(remaining), reserved_base='0',
+            remaining_base=str(remaining), reserved_base=str(reserved),
             base_fee_fraction=str(c.fee_buffer),
             amount_step=str(rules.min_base_amount_increment),
             price_step=str(getattr(rules, 'min_price_increment', '0.01')),
             minimum_amount=str(rules.min_order_size),
             minimum_notional=str(rules.min_notional_size), bid=str(bid))
-        harvest = remaining
         proposals = (ExitProposal(
             policy_id='trail', owner_id=owner, executor_id=executor_id, receipt_sha256=receipt,
             requested_base=str(harvest), minimum_price='0', expires_at_ms=int(now * 1000) + 1000),)
@@ -310,13 +321,17 @@ class MomentumFusionV2Controller(ControllerBase):
         }}
 
     def validate_executor_config(self, config):
-        return (super().validate_executor_config(config) and not self.recovery_hold
-                and self.config.execution_enabled and self._pending is not None
-                and self.processed_data.get('data_health', {}).get('ready') is True
+        if (type(config) is not PositionExecutorConfig or self.recovery_hold
+                or not self.config.execution_enabled
+                or self.processed_data.get('data_health', {}).get('ready') is not True
+                or self._pending is None
+                or identity(config.model_dump(mode='json')) != self._pending_identity):
+            return False
+        if config.side == TradeType.SELL:
+            return self.status == RunnableStatus.RUNNING
+        return (super().validate_executor_config(config)
                 and self.processed_data.get('signal') == 1
                 and self.processed_data.get('decision_time') == self._last_decision
-                and type(config) is PositionExecutorConfig
-                and identity(config.model_dump(mode='json')) == self._pending_identity
                 and 0 <= self.market_data_provider.time() - self._last_decision <= self.config.max_candle_age_seconds)
 
 

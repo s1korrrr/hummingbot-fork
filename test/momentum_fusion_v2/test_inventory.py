@@ -36,5 +36,34 @@ def test_reserved_sales_reduce_uncommitted_inventory():
         runtime.remaining_after_partial('10', '11')
 
 
+class _Exec:
+    def __init__(self, side, amount, done=False):
+        self.is_done = done
+        self.side = side
+        self.config = type('C', (), {'amount': amount, 'side': side})()
+        self.custom_info = {}
+
+
+def test_pending_sales_map_ten_three_seven():
+    reserved = runtime.pending_sale_base((_Exec('BUY', '10'), _Exec('SELL', '3')))
+    harvest = runtime.net_uncommitted('10', reserved)
+    assert reserved == D('3')
+    assert harvest == D('7')
+    split = runtime.split_or_single(total_base='10', harvest_base=harvest, amount_step='.1',
+                                    minimum_amount='.1')
+    assert split['mode'] == 'split'
+    assert split['harvest'] == D('7')
+
+
+def test_harvest_equals_remaining_only_when_uncommitted_is_remaining():
+    reserved = runtime.pending_sale_base((_Exec('BUY', '10'),))
+    harvest = runtime.net_uncommitted('10', reserved)
+    assert reserved == D('0')
+    assert harvest == D('10')
+    split = runtime.split_or_single(total_base='10', harvest_base=harvest, amount_step='.1',
+                                    minimum_amount='.1')
+    assert split['mode'] == 'single'
+
+
 def test_open_mark_path_keeps_drawdown_through_recovery():
     assert runtime.maximum_marked_drawdown([100, 90, 100]) == D('-0.1')

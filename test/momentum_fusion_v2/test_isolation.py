@@ -65,6 +65,6 @@ def test_controller_emit_path_calls_native_planners():
     assert 'runtime.plan_management' in source
     assert 'select(tuple(self._states.values()), (),' not in source
     assert "getattr(row, 'confirmed', None) is False" not in source
-    assert 'is_explicitly_confirmed' in source
+    assert 'closed_native_bars' in source
     emit = source.split('def determine_executor_actions')[1].split('def get_status_summary')[0]
     assert 'return []' not in emit

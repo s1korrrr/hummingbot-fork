@@ -60,6 +60,30 @@ def test_missing_confirmed_is_not_treated_as_true():
     assert features.is_explicitly_confirmed(Allowed()) is True
 
 
+def test_okx_schema_without_confirmed_still_yields_closed_bars():
+    data = frame(n=3, start=0)
+    assert 'confirmed' not in data.columns
+    admitted = features.closed_native_bars(data, now=180)
+    assert list(admitted['timestamp']) == [0, 60, 120]
+
+
+def test_explicit_confirmed_false_or_zero_is_dropped():
+    denied = frame(n=3, start=0)
+    denied['confirmed'] = [True, False, 0]
+    admitted = features.closed_native_bars(denied, now=180)
+    assert list(admitted['timestamp']) == [0]
+
+
+def test_forming_last_bar_is_not_decision_time():
+    data = frame(n=3, start=0)
+    admitted = features.closed_native_bars(data, now=150)
+    assert list(admitted['timestamp']) == [0, 60]
+    open_last = frame(n=3, start=0)
+    open_last.loc[2, 'close'] = float('nan')
+    closed = features.closed_native_bars(open_last, now=180)
+    assert list(closed['timestamp']) == [0, 60]
+
+
 def test_unconfirmed_candle_cannot_enter_a_snapshot():
     with pytest.raises(ValueError):
         Candle(open_time=0, open=1, high=1, low=1, close=1, volume=0, confirmed=False)

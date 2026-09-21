@@ -41,3 +41,9 @@ def test_binding_is_not_authority():
     binding = recipe.bind('a' * 64, 'b' * 64)
     assert isinstance(binding, RecipeBinding)
     assert binding.recipe_id == 'mom_v2'
+
+
+def test_binding_hashes_the_actual_enabled_modules():
+    default = recipe.bind('a' * 64, 'b' * 64)
+    later = recipe.bind('a' * 64, 'b' * 64, recipe.RecipeSpec(enabled=('c2_compression',)))
+    assert later.recipe_sha256 != default.recipe_sha256

@@ -57,3 +57,15 @@ def test_durable_claim_survives_restart_without_duplicate(tmp_path):
     assert first.reserved_quote == second.reserved_quote == D('60')
     restored = runtime.ClaimStore(tmp_path / 'claims.json')
     assert restored.get('c' * 64).status == 'RESERVED'
+
+
+def test_claim_status_advances_reserved_to_submitted(tmp_path):
+    store = runtime.ClaimStore(tmp_path / 'claims.json')
+    reserved = runtime.Claim(claim_id='c' * 64, opportunity_id='o' * 64, controller_id='mom',
+                             trading_pair='BNB-USDC', status='RESERVED', reserved_quote='60',
+                             reserved_base='0.07')
+    store.put(reserved)
+    submitted = store.put(reserved.model_copy(update={'status': 'SUBMITTED_UNACKNOWLEDGED',
+                                                      'executor_identity': 'e' * 64}))
+    assert submitted.status == 'SUBMITTED_UNACKNOWLEDGED'
+    assert runtime.ClaimStore(tmp_path / 'claims.json').get('c' * 64).status == 'SUBMITTED_UNACKNOWLEDGED'

@@ -32,6 +32,11 @@ def snapshot(rows=60, now=3600):
     return CandleSnapshot(dataset=dataset, epoch='e', sequence=1, published_at=published, rows=candles)
 
 
+def test_open_minute_is_not_closed():
+    assert features.is_closed_minute(0, 59) is False
+    assert features.is_closed_minute(0, 60) is True
+
+
 def test_prior_channel_excludes_the_candidate_bar():
     data = features.prior_channel_break(frame(last_high=120, last_close=110), {}, {'lookback': 20})
     assert data['break'] == 1

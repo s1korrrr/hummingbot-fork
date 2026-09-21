@@ -19,6 +19,10 @@ def implementation_symbol(function):
     return function.__module__ + '.' + function.__qualname__
 
 
+def is_closed_minute(open_time, now):
+    return int(open_time) + INTERVAL_SECONDS['1m'] <= int(now)
+
+
 def prior_channel_break(frame, dependencies, parameters):
     lookback = int(parameters['lookback'])
     close = decimal(frame['close'].iloc[-1], 'close', positive=True)

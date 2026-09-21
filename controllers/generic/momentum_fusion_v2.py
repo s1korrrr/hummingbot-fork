@@ -91,7 +91,8 @@ class MomentumFusionV2Controller(ControllerBase):
         self._config_identity = identity(config.model_dump(mode='json', exclude={'manual_kill_switch'}))
         self._cache = FeatureCache(8)
         self._source_sha256 = source_digest(source_root(), source_files())
-        self._binding = recipe.bind(self._source_sha256, configuration_digest(config.model_dump(mode='json')))
+        spec = recipe.RecipeSpec(enabled=config.enabled_modules)
+        self._binding = recipe.bind(self._source_sha256, configuration_digest(config.model_dump(mode='json')), spec)
         self._states = {name: setups.idle(name) for name in recipe.PRECEDENCE}
         self._cursors: dict[tuple[str, str, str], DecisionCursor] = {}
         self._pending = None
@@ -118,9 +119,18 @@ class MomentumFusionV2Controller(ControllerBase):
             now = self.market_data_provider.time()
             frame = self.market_data_provider.get_candles_df(
                 self.config.candles_connector, self.config.trading_pair, '1m', self.config.max_records)
-            rows = tuple(Candle(open_time=int(row.timestamp) if float(row.timestamp).is_integer() else -1,
-                                open=row.open, high=row.high, low=row.low, close=row.close, volume=row.volume,
-                                confirmed=getattr(row, 'confirmed', True)) for row in frame.itertuples())
+            now_s = int(now)
+            rows = []
+            for row in frame.itertuples():
+                if getattr(row, 'confirmed', None) is False:
+                    continue
+                open_time = int(row.timestamp) if float(row.timestamp).is_integer() else -1
+                if open_time < 0 or not features.is_closed_minute(open_time, now_s):
+                    continue
+                rows.append(Candle(open_time=open_time, open=row.open, high=row.high, low=row.low,
+                                   close=row.close, volume=row.volume, confirmed=True))
+            if not rows:
+                raise DataUnavailable('no confirmed candles')
             snapshot = CandleSnapshot(
                 dataset=Dataset(connector='okx', trading_pair=self.config.trading_pair, history=self.config.max_records),
                 epoch='native', sequence=1, published_at=now, rows=rows)

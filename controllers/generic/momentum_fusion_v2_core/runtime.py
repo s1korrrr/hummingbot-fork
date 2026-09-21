@@ -39,6 +39,15 @@ class Claim(PolicyModel):
     topology: Literal['single_recorder', 'shared_multi_process'] = 'single_recorder'
 
 
+CLAIM_RANK = {
+    'RESERVED': 0,
+    'SUBMITTED_UNACKNOWLEDGED': 1,
+    'PARTIAL': 2,
+    'CANCEL_PENDING': 2,
+    'RECONCILED_TERMINAL': 3,
+}
+
+
 class ClaimStore:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -55,7 +64,15 @@ class ClaimStore:
 
     def put(self, claim: Claim) -> Claim:
         current = self._claims.get(claim.claim_id)
-        if current is not None and current.opportunity_id == claim.opportunity_id and current.status != 'RECONCILED_TERMINAL':
+        if current is None:
+            self._claims[claim.claim_id] = claim
+            self._persist()
+            return claim
+        if current.opportunity_id != claim.opportunity_id:
+            raise PolicyError('claim id already bound')
+        if current.status == 'RECONCILED_TERMINAL' or CLAIM_RANK[claim.status] < CLAIM_RANK[current.status]:
+            return current
+        if claim.status == current.status:
             return current
         self._claims[claim.claim_id] = claim
         self._persist()

@@ -58,8 +58,9 @@ def initialization_sha256():
     return digest({'parameters': PARAMETERS, 'revision': PARAMETER_REVISION})
 
 
-def bind(source_sha256: str, configuration_sha256: str, recipe_sha256: str | None = None) -> RecipeBinding:
-    body = RecipeSpec().model_dump(mode='json')
+def bind(source_sha256: str, configuration_sha256: str, spec: RecipeSpec | None = None,
+         recipe_sha256: str | None = None) -> RecipeBinding:
+    body = (spec or RecipeSpec()).model_dump(mode='json')
     return RecipeBinding(
         recipe_id=RECIPE_ID,
         recipe_sha256=recipe_sha256 or digest(body),

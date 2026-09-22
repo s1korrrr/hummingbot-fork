@@ -33,6 +33,7 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         pnl_available=True,
         lifecycle_executors=None,
         active_orders=None,
+        balances=None,
     ):
         active_orders = active_orders or []
         snapshot = {
@@ -43,7 +44,11 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
             "active_orders": active_orders,
             "active_orders_status": {"complete": True, "source": "connector_in_flight_orders", "errors": []},
             "controller_reports_valid": True,
-            "controllers": [{"controller_id": controller} for controller in controllers],
+            "balances": balances or [],
+            "controllers": [
+                controller if isinstance(controller, dict) else {"controller_id": controller, "pair": controller}
+                for controller in controllers
+            ],
             "focus_queue": [],
             "summary": {
                 "balance_value_quote": equity,
@@ -290,19 +295,144 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
 
         self.assertIn("🟢 BUY FILLED", message)
+        self.assertIn("⚡ Controller: rsi_v5", message)
         self.assertIn("📍 Pair: 🟣 ETH-USDC", message)
+        self.assertIn("💰 Notional: 73.352844 USDC", message)
+        self.assertIn("🕒 Time:", message)
         self.assertIn("💵 Price: 2144.82 USDC", message)
         self.assertIn("📦 Amount: 0.0342 ETH", message)
-        self.assertIn("💰 Notional: 73.352844 USDC", message)
         self.assertIn("🧾 Fee: 0.21 USDC", message)
         self.assertIn("✅ Status: filled", message)
-        self.assertNotIn("Trade Realized PnL", message)
+        self.assertLess(message.index("⚡ Controller:"), message.index("📍 Pair:"))
+        self.assertLess(message.index("📍 Pair:"), message.index("💰 Notional:"))
+        self.assertLess(message.index("💰 Notional:"), message.index("🕒 Time:"))
+        self.assertLess(message.index("🕒 Time:"), message.index("💵 Price:"))
         self.assertNotIn("🤖 Bot:", message)
-        self.assertNotIn("📁 Config:", message)
         self.assertNotIn("🆔 Instance:", message)
+        self.assertNotIn("📁 Config:", message)
         self.assertNotIn("🧷 Order ID:", message)
         self.assertNotIn("🏦 Exchange Order ID:", message)
         self.assertNotIn("🔁 Exchange Trade ID:", message)
+        self.assertNotIn("Trade Realized PnL", message)
+
+    def test_buy_filled_layout_matches_operator_template(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._format_timestamp = Mock(return_value="2026-09-17 20:45:02")
+        event = events.OrderFilledEvent(
+            timestamp=1,
+            order_id="OID-XRP",
+            trading_pair="XRP-USDC",
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("1.2956"),
+            amount=Decimal("90.947"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.09426474656"))]),
+            exchange_trade_id="TID-XRP",
+            exchange_order_id="EX-XRP",
+        )
+
+        message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
+
+        self.assertEqual(
+            "\n".join([
+                "🟢 BUY FILLED",
+                "⚡ Controller: rsi_v5",
+                "📍 Pair: 🔵 XRP-USDC",
+                "💰 Notional: 117.8309332 USDC",
+                "🕒 Time: 2026-09-17 20:45:02",
+                "💵 Price: 1.2956 USDC",
+                "📦 Amount: 90.947 XRP",
+                "🧾 Fee: 0.09426474656 USDC",
+                "✅ Status: filled",
+            ]),
+            message,
+        )
+        self.assertNotIn("Trade Realized PnL", message)
+
+    def test_sell_filled_layout_matches_buy_with_sell_header(self):
+        notifier = TelegramNotifier(self.hb_app)
+        notifier._format_timestamp = Mock(return_value="2026-09-17 20:45:02")
+        notifier._sell_fill_realized_pnl_quote = Mock(return_value=Decimal("8.91"))
+        event = events.OrderFilledEvent(
+            timestamp=1,
+            order_id="OID-XRP-SELL",
+            trading_pair="XRP-USDC",
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("1.2956"),
+            amount=Decimal("90.947"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.09426474656"))]),
+            exchange_trade_id="TID-XRP-SELL",
+            exchange_order_id="EX-XRP-SELL",
+        )
+
+        message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
+
+        self.assertEqual(
+            "\n".join([
+                "🔴 SELL FILLED",
+                "⚡ Controller: rsi_v5",
+                "📍 Pair: 🔵 XRP-USDC",
+                "💰 Notional: 117.8309332 USDC",
+                "🕒 Time: 2026-09-17 20:45:02",
+                "💵 Price: 1.2956 USDC",
+                "📦 Amount: 90.947 XRP",
+                "🧾 Fee: 0.09426474656 USDC",
+                "📈 Trade Realized PnL: $8.91",
+                "✅ Status: filled",
+            ]),
+            message,
+        )
+
+    def test_fill_controller_markers_distinguish_owners(self):
+        notifier = TelegramNotifier(self.hb_app)
+        event = events.OrderFilledEvent(
+            timestamp=1712745600,
+            order_id="OID-1",
+            trading_pair="ETH-USDC",
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("2144.82"),
+            amount=Decimal("0.0342"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.21"))]),
+            exchange_trade_id="TID-1",
+            exchange_order_id="EX-1",
+        )
+        expected = (
+            ("ok_rsi.yml", "🧿 Controller: ok_rsi"),
+            ("rsi_v5.yml", "⚡ Controller: rsi_v5"),
+            ("ok_rsi_sui_sell_only.yml", "🪙 Controller: ok_rsi_sui_sell_only"),
+        )
+        for file_name, line in expected:
+            self.hb_app.strategy_file_name = file_name
+            message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
+            self.assertIn(line, message)
+
+    def test_fill_controller_uses_script_identity_when_yaml_name_is_shared_ok_rsi(self):
+        notifier = TelegramNotifier(self.hb_app)
+        self.hb_app.strategy_file_name = "ok_rsi_sui_sell_only.yml"
+        self.hb_app.trading_core.strategy = SimpleNamespace(controllers={
+            "ok-rsi-sui-usdc-sell-only": SimpleNamespace(config=SimpleNamespace(
+                controller_name="ok_rsi",
+                trading_pair="SUI-USDC",
+            )),
+        })
+        event = events.OrderFilledEvent(
+            timestamp=1712745600,
+            order_id="OID-1",
+            trading_pair="SUI-USDC",
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("1"),
+            amount=Decimal("1"),
+            trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0"))]),
+            exchange_trade_id="TID-1",
+            exchange_order_id="EX-1",
+        )
+        notifier._sell_fill_realized_pnl_quote = Mock(return_value=None)
+        message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
+        self.assertIn("🪙 Controller: ok_rsi_sui_sell_only", message)
+        self.assertNotIn("🧿 Controller: ok_rsi", message)
 
     def test_format_sell_filled_message_includes_trade_realized_pnl_context(self):
         notifier = TelegramNotifier(self.hb_app)
@@ -324,41 +454,39 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
 
         notifier._sell_fill_realized_pnl_quote.assert_called_once_with(event)
         self.assertIn("🔴 SELL FILLED", message)
+        self.assertIn("⚡ Controller: rsi_v5", message)
+        self.assertIn("📍 Pair: 🟣 ETH-USDC", message)
+        self.assertIn("💰 Notional: 73.352844 USDC", message)
         self.assertIn("📈 Trade Realized PnL: $8.91", message)
         self.assertNotIn("Pair Realized PnL", message)
         self.assertNotIn("Pair Global PnL", message)
         self.assertIn("✅ Status: filled", message)
+        self.assertLess(message.index("🧾 Fee:"), message.index("📈 Trade Realized PnL:"))
+        self.assertLess(message.index("📈 Trade Realized PnL:"), message.index("✅ Status:"))
 
-    def test_format_sell_filled_message_omits_pnl_when_basis_missing(self):
+    def test_format_sell_filled_message_says_pnl_unavailable_when_field_absent(self):
         notifier = TelegramNotifier(self.hb_app)
         notifier._sell_fill_realized_pnl_quote = Mock(return_value=None)
         event = events.OrderFilledEvent(
             timestamp=1712745600,
-            order_id="OID-SELL-FILL-NO-PNL",
+            order_id="OID-SELL-FILL-NONE",
             trading_pair="ETH-USDC",
             trade_type=TradeType.SELL,
             order_type=OrderType.LIMIT,
             price=Decimal("2144.82"),
             amount=Decimal("0.0342"),
             trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount("USDC", Decimal("0.21"))]),
-            exchange_trade_id="TID-SELL-NO-PNL",
-            exchange_order_id="EX-SELL-NO-PNL",
+            exchange_trade_id="TID-SELL-NONE",
+            exchange_order_id="EX-SELL-NONE",
         )
 
         message = notifier.format_market_event(events.MarketEvent.OrderFilled.value, event)
 
-        notifier._sell_fill_realized_pnl_quote.assert_called_once_with(event)
         self.assertIn("🔴 SELL FILLED", message)
-        self.assertIn("📍 Pair: 🟣 ETH-USDC", message)
-        self.assertIn("💵 Price: 2144.82 USDC", message)
-        self.assertIn("📦 Amount: 0.0342 ETH", message)
-        self.assertIn("💰 Notional: 73.352844 USDC", message)
-        self.assertIn("🧾 Fee: 0.21 USDC", message)
-        self.assertIn("✅ Status: filled", message)
-        self.assertNotIn("Trade Realized PnL", message)
-        self.assertNotIn("Pair Realized PnL", message)
-        self.assertNotIn("Pair Global PnL", message)
-        self.assertNotIn("PnL unavailable", message)
+        self.assertIn("📈 Trade Realized PnL: UNAVAILABLE", message)
+        self.assertNotIn("Trade Realized PnL: $", message)
+        self.assertLess(message.index("🧾 Fee:"), message.index("📈 Trade Realized PnL:"))
+        self.assertLess(message.index("📈 Trade Realized PnL:"), message.index("✅ Status:"))
 
     def test_format_sell_completed_message_includes_fee_and_trade_realized_pnl_context(self):
         notifier = TelegramNotifier(self.hb_app)
@@ -457,7 +585,10 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
     def test_trade_realized_helpers_cover_fail_closed_edges(self):
         notifier = TelegramNotifier(self.hb_app)
 
-        self.assertEqual([], notifier._trade_realized_pnl_lines(None))
+        self.assertEqual(
+            ["📈 Trade Realized PnL: UNAVAILABLE"],
+            notifier._trade_realized_pnl_lines(None),
+        )
         self.assertEqual(Decimal("1712745600000"), notifier._normalized_fill_timestamp(1712745600))
         self.assertEqual(Decimal("0"), notifier._normalized_fill_timestamp(object()))
         self.assertEqual("SELL", notifier._trade_fill_side({"trade_type": TradeType.SELL}))
@@ -602,13 +733,13 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         message = await notifier._dispatch_command("status", [])
 
         self.assertIn("📊 STATUS", message)
-        self.assertIn("🤖 Bot: rsi_v5", message)
+        self.assertIn("⚡ Bot: rsi_v5", message)
         self.assertIn("💹 Reporting Net: $17.59", message)
         self.assertIn("📬 Active Orders: 2", message)
         self.assertIn("🎯 Focus Queue", message)
         self.assertIn("• BTC-USDC: 2 buy active", message)
 
-    async def test_status_without_scope_combines_main_and_sui_without_summing_shared_equity(self):
+    async def test_status_without_scope_labels_v1_and_v2_without_summing(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             paths = {
@@ -620,18 +751,59 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
                     "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
                     orders=0, executors=0, positions=1, equity=15000, net=-0.5,
                 )),
+                "v2": self.write_status_snapshot(root, "v2", self.status_snapshot(
+                    "rsi_modular_v2", controllers=["btc"],
+                    orders=1, executors=1, positions=1, equity=80, net=1.5,
+                )),
             }
             with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
                 message = await TelegramNotifier(self.hb_app)._dispatch_command("status", [])
 
-        self.assertIn("📊 STATUS • MAIN + SUI", message)
-        self.assertIn("🤖 MAIN: ok_rsi", message)
-        self.assertIn("🤖 SUI: ok_rsi_sui_sell_only", message)
-        self.assertIn("📬 Orders: 2", message)
-        self.assertIn("🧠 Controllers: 5", message)
-        self.assertIn("🧠 Controllers: 1", message)
+        self.assertIn("📊 STATUS • V1", message)
+        self.assertIn("📊 STATUS • V2", message)
+        self.assertNotIn("STATUS • MAIN + SUI", message)
+        self.assertIn("🧿 MAIN: ok_rsi", message)
+        self.assertIn("🪙 SUI: ok_rsi_sui_sell_only", message)
+        self.assertIn("🧿 V2: rsi_modular_v2", message)
+        self.assertIn("💹 Reporting Net: $12.5", message)
+        self.assertIn("💹 Reporting Net: $-0.5", message)
+        self.assertIn("💹 Reporting Net: $1.5", message)
+        self.assertNotIn("$13.5", message)
+        self.assertNotIn("$14", message)
         self.assertNotIn("Total Equity", message)
-        self.assertLess(message.index("🤖 MAIN"), message.index("🤖 SUI"))
+        self.assertLess(message.index("📊 STATUS • V1"), message.index("📊 STATUS • V2"))
+        self.assertLess(message.index("🧿 MAIN"), message.index("🪙 SUI"))
+
+    async def test_status_without_scope_keeps_rsi_v5_out_of_v1_v2_blocks(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=2, executors=1, positions=5, equity=15000, net=12.5,
+                )),
+                "sui": self.write_status_snapshot(root, "sui", self.status_snapshot(
+                    "ok_rsi_sui_sell_only", controllers=["sui-usdc"],
+                    orders=0, executors=0, positions=1, equity=15000, net=-0.5,
+                )),
+                "rsi-v5": self.write_status_snapshot(root, "rsi-v5", self.status_snapshot(
+                    "rsi_v5", controllers=["btc", "eth", "sol", "xrp", "bnb"],
+                    orders=1, executors=1, positions=2, equity=15000, net=4.25,
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                notifier = TelegramNotifier(self.hb_app)
+                message = await notifier._dispatch_command("status", [])
+                rsi_v5 = await notifier._dispatch_command("status", ["rsi-v5"])
+
+        self.assertIn("📊 STATUS • V1", message)
+        self.assertIn("📊 STATUS • V2", message)
+        self.assertIn("⚠️ V2: UNAVAILABLE", message)
+        self.assertNotIn("RSI-V5", message)
+        self.assertNotIn("Reporting Net: $4.25", message)
+        self.assertIn("📊 STATUS • RSI-V5", rsi_v5)
+        self.assertIn("⚡ Bot: rsi_v5", rsi_v5)
+        self.assertIn("💹 Reporting Net: $4.25", rsi_v5)
 
     async def test_status_scope_selects_configured_main_or_sui_snapshot(self):
         with TemporaryDirectory() as directory:
@@ -652,11 +824,11 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
                 sui = await notifier._dispatch_command("status", ["sui"])
 
         self.assertIn("📊 STATUS • MAIN", main)
-        self.assertIn("🤖 Bot: ok_rsi", main)
+        self.assertIn("🧿 Bot: ok_rsi", main)
         self.assertIn("🧠 Controllers: 5", main)
         self.assertNotIn("ok_rsi_sui_sell_only", main)
         self.assertIn("📊 STATUS • SUI", sui)
-        self.assertIn("🤖 Bot: ok_rsi_sui_sell_only", sui)
+        self.assertIn("🪙 Bot: ok_rsi_sui_sell_only", sui)
         self.assertIn("🧠 Controllers: 1", sui)
 
     async def test_combined_status_keeps_healthy_lane_when_other_snapshot_is_missing(self):
@@ -672,8 +844,10 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
             with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
                 message = await TelegramNotifier(self.hb_app)._dispatch_command("status", [])
 
-        self.assertIn("🤖 MAIN: ok_rsi", message)
+        self.assertIn("🧿 MAIN: ok_rsi", message)
         self.assertIn("⚠️ SUI: UNAVAILABLE", message)
+        self.assertIn("📊 STATUS • V1", message)
+        self.assertIn("⚠️ V2: UNAVAILABLE", message)
 
     async def test_sui_status_preserves_explicitly_unavailable_pnl_instead_of_zero(self):
         with TemporaryDirectory() as directory:
@@ -703,8 +877,86 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
     async def test_status_rejects_unknown_or_extra_scope_arguments(self):
         notifier = TelegramNotifier(self.hb_app)
 
-        self.assertEqual("Usage: /status [main|sui]", await notifier._dispatch_command("status", ["other"]))
-        self.assertEqual("Usage: /status [main|sui]", await notifier._dispatch_command("status", ["main", "sui"]))
+        self.assertEqual("Usage: /status [v1|v2]", await notifier._dispatch_command("status", ["other"]))
+        self.assertEqual("Usage: /status [v1|v2]", await notifier._dispatch_command("status", ["main", "sui"]))
+
+    async def test_status_balances_controllers_accept_v1_v2_or_both_without_merging(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi",
+                    controllers=[{"controller_id": "ok-rsi-btc", "pair": "BTC-USDC", "state": "EXITS",
+                                  "signal": "hold", "price_quote": 98000, "breakeven_price": 97000,
+                                  "unrealized_pnl_pct": 1.25, "execs": "1/1", "exposure_text": "0.001 BTC",
+                                  "gate": "open"}],
+                    orders=2, executors=1, positions=1, equity=100, net=12.5,
+                    balances=[{"exchange": "okx", "asset": "USDC", "total_balance": 100,
+                               "available_balance": 90, "value_quote": 100}],
+                )),
+                "sui": self.write_status_snapshot(root, "sui", self.status_snapshot(
+                    "ok_rsi_sui_sell_only",
+                    controllers=[{"controller_id": "ok-rsi-sui", "pair": "SUI-USDC", "state": "EXITS",
+                                  "signal": "sell", "price_quote": 1.2, "breakeven_price": 1.1,
+                                  "unrealized_pnl_pct": -2.5, "execs": "1/1", "exposure_text": "10 SUI",
+                                  "gate": "open"}],
+                    orders=0, executors=0, positions=1, equity=50, net=-0.5,
+                    balances=[{"exchange": "okx", "asset": "SUI", "total_balance": 10,
+                               "available_balance": 10, "value_quote": 12}],
+                )),
+                "v2": self.write_status_snapshot(root, "v2", self.status_snapshot(
+                    "rsi_modular_v2",
+                    controllers=[{"controller_id": "rsi-mod-btc", "pair": "BTC-USDC", "state": "HUNTING",
+                                  "signal": "buy", "price_quote": 98100, "breakeven_price": None,
+                                  "unrealized_pnl_pct": None, "execs": "0/0", "exposure_text": "flat",
+                                  "gate": "open"}],
+                    orders=1, executors=0, positions=0, equity=80, net=1.5,
+                    balances=[{"exchange": "okx", "asset": "USDC", "total_balance": 80,
+                               "available_balance": 80, "value_quote": 80}],
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                notifier = TelegramNotifier(self.hb_app)
+                both_status = await notifier._dispatch_command("status", [])
+                v1_status = await notifier._dispatch_command("status", ["v1"])
+                v2_status = await notifier._dispatch_command("status", ["v2"])
+                both_balances = await notifier._dispatch_command("balances", [])
+                v1_balances = await notifier._dispatch_command("balances", ["v1"])
+                v2_balances = await notifier._dispatch_command("balances", ["v2"])
+                both_controllers = await notifier._dispatch_command("controllers", [])
+                v1_controllers = await notifier._dispatch_command("controllers", ["v1"])
+                v2_controllers = await notifier._dispatch_command("controllers", ["v2"])
+                usage = await notifier._dispatch_command("balances", ["live"])
+
+        self.assertIn("📊 STATUS • V1", both_status)
+        self.assertIn("📊 STATUS • V2", both_status)
+        self.assertIn("🧿 MAIN: ok_rsi", both_status)
+        self.assertIn("🪙 SUI: ok_rsi_sui_sell_only", both_status)
+        self.assertIn("🧿 V2: rsi_modular_v2", both_status)
+        self.assertNotIn("rsi_modular_v2", v1_status)
+        self.assertNotIn("ok_rsi_sui_sell_only", v2_status)
+        self.assertIn("🏦 Total Equity: $80", v2_status)
+        self.assertNotIn("$180", both_status)
+        self.assertNotIn("$13.5", both_status)
+
+        self.assertIn("💼 BALANCES • V1", both_balances)
+        self.assertIn("💼 BALANCES • V2", both_balances)
+        self.assertIn("value $100", v1_balances)
+        self.assertIn("value $12", v1_balances)
+        self.assertIn("value $80", v2_balances)
+        self.assertNotIn("value $80", v1_balances)
+        self.assertNotIn("value $100", v2_balances)
+        self.assertNotIn("value $192", both_balances)
+        self.assertEqual("Usage: /balances [v1|v2]", usage)
+
+        self.assertIn("🧠 CONTROLLERS • V1", both_controllers)
+        self.assertIn("🧠 CONTROLLERS • V2", both_controllers)
+        self.assertIn("SUI-USDC", v1_controllers)
+        self.assertIn("HUNTING", v2_controllers)
+        self.assertNotIn("HUNTING", v1_controllers)
+        self.assertNotIn("SUI-USDC", v2_controllers)
+        self.assertEqual("Usage: /controllers [v1|v2]", await TelegramNotifier(self.hb_app)._dispatch_command(
+            "controllers", ["paper"]))
 
     async def test_status_distinguishes_active_from_closing_executor_count(self):
         with TemporaryDirectory() as directory:
@@ -826,7 +1078,7 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
                 message = await TelegramNotifier(self.hb_app)._dispatch_command("executors", [])
 
         self.assertIn("⚙️ EXECUTORS • MAIN + SUI", message)
-        self.assertIn("🤖 MAIN: ok_rsi", message)
+        self.assertIn("🧿 MAIN: ok_rsi", message)
         self.assertIn("CREATING", message)
         self.assertIn("CLOSING • trailing stop", message)
         self.assertIn("entry down_only_maker_v1:managing fill", message)
@@ -839,7 +1091,7 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("trigger 2510.25", message)
         self.assertIn("📬 CREATING", message)
         self.assertIn("📬 CANCELING", message)
-        self.assertIn("🤖 SUI: ok_rsi_sui_sell_only", message)
+        self.assertIn("🪙 SUI: ok_rsi_sui_sell_only", message)
         self.assertIn("No in-flight executors or orders.", message)
 
     async def test_executors_scope_selects_snapshot_and_rejects_unknown_scope(self):
@@ -861,9 +1113,9 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
                 usage = await notifier._dispatch_command("executors", ["other"])
 
         self.assertIn("⚙️ EXECUTORS • SUI", message)
-        self.assertIn("🤖 SUI: ok_rsi_sui_sell_only", message)
+        self.assertIn("🪙 SUI: ok_rsi_sui_sell_only", message)
         self.assertNotIn("ok_rsi\n", message)
-        self.assertEqual("Usage: /executors [main|sui]", usage)
+        self.assertEqual("Usage: /executors [main|sui|rsi-v5|v2]", usage)
 
     async def test_run_command_loop_retries_after_transient_failure(self):
         notifier = TelegramNotifier(self.hb_app)
@@ -940,3 +1192,112 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
             with self.assertRaises(TelegramPollingConflict) as raised:
                 notifier._fetch_updates()
         self.assertNotIn('secret-token', str(raised.exception))
+
+    def test_ssl_eof_getupdates_is_recoverable_transport(self):
+        ssl_error = RuntimeError(
+            "Telegram API getUpdates failed: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] "
+            "EOF occurred in violation of protocol (_ssl.c:1032)>"
+        )
+        self.assertTrue(TelegramNotifier._is_recoverable_poll_transport_error(ssl_error))
+        self.assertTrue(TelegramNotifier._is_recoverable_poll_transport_error(
+            RuntimeError("Telegram API getUpdates failed: <urlopen error timed out>")
+        ))
+        self.assertFalse(TelegramNotifier._is_recoverable_poll_transport_error(
+            RuntimeError("Telegram API sendMessage failed: <urlopen error timed out>")
+        ))
+        self.assertFalse(TelegramNotifier._is_recoverable_poll_transport_error(ValueError("unexpected poll bug")))
+
+    async def test_ssl_eof_retry_does_not_log_traceback(self):
+        notifier = TelegramNotifier(self.hb_app)
+        attempts = []
+
+        async def fake_cycle():
+            attempts.append("cycle")
+            if len(attempts) == 1:
+                raise RuntimeError(
+                    "Telegram API getUpdates failed: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] "
+                    "EOF occurred in violation of protocol (_ssl.c:1032)>"
+                )
+            if len(attempts) == 2:
+                return
+            raise asyncio.CancelledError()
+
+        async def fake_sleep(_delay: float):
+            return
+
+        notifier._run_command_cycle = fake_cycle
+        notifier._sleep = fake_sleep
+        with patch.object(TelegramNotifier, "logger") as logger_fn:
+            log = Mock()
+            logger_fn.return_value = log
+            with self.assertRaises(asyncio.CancelledError):
+                await notifier._run_owned_command_loop()
+        log.warning.assert_called_once()
+        self.assertIn("UNEXPECTED_EOF_WHILE_READING", log.warning.call_args.args[0])
+        self.assertFalse(log.warning.call_args.kwargs.get("exc_info"))
+        log.info.assert_called_once()
+        self.assertIn("Telegram command polling recovered", log.info.call_args.args[0])
+
+    async def test_unexpected_poll_error_still_logs_traceback(self):
+        notifier = TelegramNotifier(self.hb_app)
+        attempts = []
+
+        async def fake_cycle():
+            attempts.append("cycle")
+            if len(attempts) == 1:
+                raise ValueError("unexpected poll bug")
+            if len(attempts) == 2:
+                return
+            raise asyncio.CancelledError()
+
+        async def fake_sleep(_delay: float):
+            return
+
+        notifier._run_command_cycle = fake_cycle
+        notifier._sleep = fake_sleep
+        with patch.object(TelegramNotifier, "logger") as logger_fn:
+            log = Mock()
+            logger_fn.return_value = log
+            with self.assertRaises(asyncio.CancelledError):
+                await notifier._run_owned_command_loop()
+        self.assertTrue(log.warning.call_args.kwargs.get("exc_info"))
+        log.info.assert_called_once()
+
+    async def test_owner_label_env_prefixes_outgoing_text_with_instance_id(self):
+        self.hb_app.instance_id = "rsibot-v2-rsi"
+        notifier = TelegramNotifier(self.hb_app)
+        sent = []
+
+        async def capture(message):
+            sent.append(message)
+
+        notifier._send_telegram_text = capture
+        with patch.dict(os.environ, {"HB_TELEGRAM_OWNER_LABEL_ENABLED": "1"}):
+            await notifier._send_message("BUY FILLED")
+        self.assertEqual(["[rsibot-v2-rsi]\nBUY FILLED"], sent)
+
+    async def test_owner_label_env_off_leaves_outgoing_text_unprefixed(self):
+        notifier = TelegramNotifier(self.hb_app)
+        sent = []
+
+        async def capture(message):
+            sent.append(message)
+
+        notifier._send_telegram_text = capture
+        os.environ.pop("HB_TELEGRAM_OWNER_LABEL_ENABLED", None)
+        await notifier._send_message("BUY FILLED")
+        self.assertEqual(["BUY FILLED"], sent)
+
+    async def test_owner_label_env_rejects_invalid_instance_id(self):
+        self.hb_app.instance_id = "rsibot v2"
+        notifier = TelegramNotifier(self.hb_app)
+        sent = []
+
+        async def capture(message):
+            sent.append(message)
+
+        notifier._send_telegram_text = capture
+        with patch.dict(os.environ, {"HB_TELEGRAM_OWNER_LABEL_ENABLED": "1"}):
+            with self.assertRaises(ValueError):
+                await notifier._send_message("BUY FILLED")
+        self.assertEqual([], sent)

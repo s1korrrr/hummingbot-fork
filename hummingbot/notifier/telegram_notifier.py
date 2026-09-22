@@ -54,6 +54,18 @@ class TelegramNotifier(NotifierBase):
     STATUS_LANES = {
         "main": "ok_rsi",
         "sui": "ok_rsi_sui_sell_only",
+        "rsi-v5": "rsi_v5",
+        "v2": "rsi_modular_v2",
+    }
+    STACK_SCOPES = {
+        "v1": ("main", "sui"),
+        "v2": ("v2",),
+    }
+    CONTROLLER_MARKERS = {
+        "ok_rsi": "🧿",
+        "rsi_v5": "⚡",
+        "ok_rsi_sui_sell_only": "🪙",
+        "rsi_modular_v2": "🧿",
     }
     EXECUTOR_LIFECYCLE_LABELS = {
         "not_started": "CREATING",
@@ -72,11 +84,11 @@ class TelegramNotifier(NotifierBase):
         ("start", "bind chat and show command list"),
         ("help", "show all trading desk commands"),
         ("ping", "basic bot health check"),
-        ("status", "portfolio and bot overview"),
-        ("balances", "current balances and USD values"),
-        ("controllers", "controller lanes summary"),
+        ("status", "portfolio overview (v1|v2, or both)"),
+        ("balances", "balances by stack (v1|v2, or both)"),
+        ("controllers", "controller lanes (v1|v2, or both)"),
         ("focus", "attention queue from controllers"),
-        ("executors", "executor and order lifecycle (main|sui)"),
+        ("executors", "executor and order lifecycle (main|sui|rsi-v5|v2)"),
         ("positions", "held positions summary"),
         ("performance", "realized, unrealized, fees, volume"),
         ("orders", "active orders and latest stored orders"),
@@ -169,13 +181,15 @@ class TelegramNotifier(NotifierBase):
         notional = event.price * event.amount
         fee_text = self._format_fee(event.trade_fee, event.trading_pair, event.price, event.amount, quote_asset)
         pair_label = f"{self._pair_marker(event.trading_pair)} {event.trading_pair}"
+        bot_name = self._telegram_bot_name()
         lines = [
             self._title("🟢" if side == "BUY" else "🔴", f"{side} FILLED"),
+            self._kv("Controller", bot_name, self._controller_marker(bot_name)),
             self._kv("Pair", pair_label, "📍"),
+            self._kv("Notional", f"{self._format_decimal(notional)} {quote_asset}", "💰"),
             self._kv("Time", self._format_timestamp(event.timestamp), "🕒"),
             self._kv("Price", f"{self._format_decimal(event.price)} {quote_asset}", "💵"),
             self._kv("Amount", f"{self._format_decimal(event.amount)} {base_asset}", "📦"),
-            self._kv("Notional", f"{self._format_decimal(notional)} {quote_asset}", "💰"),
             self._kv("Fee", fee_text, "🧾"),
             self._kv("Status", "filled", "✅"),
         ]
@@ -199,6 +213,7 @@ class TelegramNotifier(NotifierBase):
         trade_realized_pnl_quote = context.get("trade_realized_pnl_quote")
         lines = [
             self._title("🟢" if side == "BUY" else "🔴", f"{side} COMPLETED"),
+            *self._owner_identity_lines(),
             self._kv("Pair", f"{self._pair_marker(trading_pair)} {trading_pair}", "📍"),
             self._kv("Time", self._format_timestamp(event.timestamp), "🕒"),
             self._kv("Average Price", f"{self._format_decimal(average_price)} {event.quote_asset}", "💵"),
@@ -217,6 +232,7 @@ class TelegramNotifier(NotifierBase):
     def _format_order_failed_message(self, event: events.MarketOrderFailureEvent) -> str:
         lines = [
             self._title("🚨", "ORDER FAILED"),
+            *self._owner_identity_lines(),
             self._kv("Time", self._format_timestamp(event.timestamp), "🕒"),
             self._kv("Status", "failed", "❌"),
         ]
@@ -323,9 +339,20 @@ class TelegramNotifier(NotifierBase):
                 failed_attempts += 1
                 self.logger().warning(
                     f"Telegram command loop iteration failed; retrying in {self.COMMAND_LOOP_RETRY_DELAY:.0f}s: {e}",
-                    exc_info=True,
+                    exc_info=not self._is_recoverable_poll_transport_error(e),
                 )
                 await self._sleep(self.COMMAND_LOOP_RETRY_DELAY)
+
+    @staticmethod
+    def _is_recoverable_poll_transport_error(error: BaseException) -> bool:
+        message = str(error)
+        if not message.startswith("Telegram API getUpdates failed:"):
+            return False
+        return (
+            "UNEXPECTED_EOF_WHILE_READING" in message
+            or "urlopen error" in message
+            or "timed out" in message
+        )
 
     async def _run_command_cycle(self):
         require_polling_admission()
@@ -469,33 +496,96 @@ class TelegramNotifier(NotifierBase):
             f"{self._kv('Time', datetime.now().strftime('%Y-%m-%d %H:%M:%S'), '🕒')}"
         )
 
+    def _telegram_bot_name(self) -> str:
+        raw = str(getattr(self._hb_app, "strategy_file_name", "") or "")
+        name = Path(raw).name
+        if name.endswith(".yml"):
+            return name[:-4]
+        if name.endswith(".yaml"):
+            return name[:-5]
+        return str(getattr(self._hb_app, "strategy_name", "") or "unknown")
+
+    @classmethod
+    def _controller_marker(cls, name: Optional[str]) -> str:
+        return cls.CONTROLLER_MARKERS.get(str(name or ""), "🤖")
+
+    def _owner_identity_lines(self) -> List[str]:
+        name = self._telegram_bot_name()
+        return [
+            self._kv("Bot", name, self._controller_marker(name)),
+            self._kv("Instance", self._hb_app.instance_id, "🆔"),
+        ]
+
+    def _configured_status_lanes(self, configured: Dict[str, Optional[Dict[str, Any]]]) -> List[str]:
+        return [lane for lane in self.STATUS_LANES if lane in configured]
+
+    def _combined_lane_title(self, kind: str, configured: Dict[str, Optional[Dict[str, Any]]]) -> str:
+        return f"{kind} • {' + '.join(lane.upper() for lane in self._configured_status_lanes(configured))}"
+
+    def _command_scope(self, args: List[str], command: str) -> Tuple[Optional[str], Optional[str]]:
+        allowed = set(self.STACK_SCOPES) | set(self.STATUS_LANES)
+        if len(args) > 1 or (args and args[0].lower() not in allowed):
+            return None, f"Usage: /{command} [v1|v2]"
+        return (args[0].lower() if args else None), None
+
+    def _iter_requested_stacks(self, token: Optional[str]):
+        if token is None:
+            yield from self.STACK_SCOPES.items()
+            return
+        if token in self.STACK_SCOPES:
+            yield token, self.STACK_SCOPES[token]
+            return
+        yield token, (token,)
+
+    def _lane_snapshot(self, configured: Optional[Dict[str, Optional[Dict[str, Any]]]], lane: str) -> Optional[Dict[str, Any]]:
+        if configured is None or lane not in configured:
+            return None
+        return configured[lane]
+
     async def _command_status(self, args: List[str]) -> str:
-        if len(args) > 1 or (args and args[0].lower() not in self.STATUS_LANES):
-            return "Usage: /status [main|sui]"
-        scope = args[0].lower() if args else None
+        token, error = self._command_scope(args, "status")
+        if error:
+            return error
         configured = self._configured_status_snapshots()
         if configured is None:
             snapshot = self._runtime_snapshot()
-            if scope is not None and self._status_lane(snapshot) != scope:
-                return f"⚠️ {scope.upper()} status unavailable from this Telegram owner."
+            if token is not None:
+                local = self._status_lane(snapshot)
+                requested = self.STACK_SCOPES.get(token, (token,))
+                if local not in requested:
+                    return f"⚠️ {token.upper()} status unavailable from this Telegram owner."
             if snapshot is None:
                 return self._fallback_status_message()
-            return self._format_status_snapshot(snapshot, "STATUS" if scope is None else f"STATUS • {scope.upper()}")
-        if scope is not None:
-            snapshot = configured[scope]
+            title = "STATUS" if token is None else f"STATUS • {token.upper()}"
+            return self._format_status_snapshot(snapshot, title)
+        if token in self.STATUS_LANES and token not in self.STACK_SCOPES:
+            snapshot = self._lane_snapshot(configured, token)
             if snapshot is None:
-                return f"⚠️ {scope.upper()} status unavailable."
-            return self._format_status_snapshot(snapshot, f"STATUS • {scope.upper()}")
+                return f"⚠️ {token.upper()} status unavailable."
+            return self._format_status_snapshot(snapshot, f"STATUS • {token.upper()}")
 
-        lines = [self._title("📊", "STATUS • MAIN + SUI")]
-        for lane in self.STATUS_LANES:
-            snapshot = configured[lane]
-            if snapshot is None:
-                lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
-            else:
-                lines.extend(self._format_status_overview(lane, snapshot))
-        lines.append("Use /status main or /status sui for full details; /executors for lifecycle details.")
-        return "\n".join(lines)
+        sections: List[str] = []
+        for stack, lanes in self._iter_requested_stacks(token):
+            use_full_snapshot = token is not None and len(lanes) == 1
+            if use_full_snapshot:
+                snapshot = self._lane_snapshot(configured, lanes[0])
+                if snapshot is None:
+                    sections.append(
+                        f"{self._title('📊', f'STATUS • {stack.upper()}')}\n"
+                        f"⚠️ {stack.upper()} status unavailable."
+                    )
+                else:
+                    sections.append(self._format_status_snapshot(snapshot, f"STATUS • {stack.upper()}"))
+                continue
+            lines = [self._title("📊", f"STATUS • {stack.upper()}")]
+            for lane in lanes:
+                snapshot = self._lane_snapshot(configured, lane)
+                if snapshot is None:
+                    lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
+                else:
+                    lines.extend(self._format_status_overview(lane, snapshot))
+            sections.append("\n".join(lines))
+        return "\n".join(sections)
 
     def _format_status_snapshot(self, snapshot: Dict[str, Any], title: str) -> str:
         if snapshot is None:
@@ -504,7 +594,7 @@ class TelegramNotifier(NotifierBase):
         focus_queue = snapshot.get("focus_queue", [])
         lines = [
             self._title("📊", title),
-            self._kv("Bot", snapshot["bot_name"], "🤖"),
+            self._kv("Bot", snapshot["bot_name"], self._controller_marker(snapshot["bot_name"])),
             self._kv("Updated", snapshot["updated_at"], "🕒"),
             self._kv("Total Equity", self._format_status_money(summary.get("balance_value_quote")), "🏦"),
             self._kv("Reporting Net", self._format_status_money(summary.get("net_pnl_quote")), "💹"),
@@ -525,7 +615,7 @@ class TelegramNotifier(NotifierBase):
     def _format_status_overview(self, lane: str, snapshot: Dict[str, Any]) -> List[str]:
         summary = snapshot["summary"]
         return [
-            self._kv(lane.upper(), snapshot["bot_name"], "🤖"),
+            self._kv(lane.upper(), snapshot["bot_name"], self._controller_marker(snapshot["bot_name"])),
             self._kv("Updated", snapshot["updated_at"], "🕒"),
             self._kv("Reporting Net", self._format_status_money(summary.get("net_pnl_quote")), "💹"),
             self._kv("Orders", snapshot["active_orders_count"], "📬"),
@@ -548,11 +638,16 @@ class TelegramNotifier(NotifierBase):
             paths = json.loads(raw)
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError("Invalid Telegram status snapshot configuration") from exc
-        if not isinstance(paths, dict) or set(paths) != set(self.STATUS_LANES):
-            raise ValueError("Telegram status snapshots must configure main and sui")
+        if not isinstance(paths, dict) or not paths:
+            raise ValueError("Telegram status snapshots must configure at least one known lane")
+        unknown = set(paths) - set(self.STATUS_LANES)
+        if unknown:
+            raise ValueError("Telegram status snapshots include unknown lanes")
 
         snapshots = {}
         for lane, expected_bot in self.STATUS_LANES.items():
+            if lane not in paths:
+                continue
             try:
                 snapshots[lane] = self._read_status_snapshot(paths[lane], expected_bot)
             except (OSError, ValueError, TypeError, UnicodeError):
@@ -674,39 +769,105 @@ class TelegramNotifier(NotifierBase):
             return "UNAVAILABLE"
         return f"{cls._format_number(decimal_value, 4)}%"
 
-    async def _command_balances(self, _: List[str]) -> str:
-        snapshot = self._runtime_snapshot()
-        if snapshot is None:
-            return "Balances are unavailable because no V2 strategy is running."
-        balances = sorted(snapshot.get("balances", []), key=lambda row: row.get("value_quote", 0), reverse=True)
-        if not balances:
+    async def _command_balances(self, args: List[str]) -> str:
+        token, error = self._command_scope(args, "balances")
+        if error:
+            return error
+        configured = self._configured_status_snapshots()
+        if configured is None:
+            snapshot = self._runtime_snapshot()
+            if token is not None:
+                local = self._status_lane(snapshot)
+                requested = self.STACK_SCOPES.get(token, (token,))
+                if local not in requested:
+                    return f"⚠️ {token.upper()} balances unavailable from this Telegram owner."
+            if snapshot is None:
+                return "Balances are unavailable because no V2 strategy is running."
+            return self._format_balances_section("BALANCES", snapshot)
+        sections: List[str] = []
+        for stack, lanes in self._iter_requested_stacks(token):
+            lines = [self._title("💼", f"BALANCES • {stack.upper()}")]
+            for lane in lanes:
+                snapshot = self._lane_snapshot(configured, lane)
+                if snapshot is None:
+                    lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
+                    continue
+                lines.extend(self._format_balance_rows(snapshot, lane))
+            sections.append("\n".join(lines))
+        return "\n".join(sections)
+
+    def _format_balances_section(self, title: str, snapshot: Dict[str, Any]) -> str:
+        if not (snapshot.get("balances") or []):
             return "No balances available."
-        lines = [self._title("💼", "BALANCES")]
+        return "\n".join([self._title("💼", title), *self._format_balance_rows(snapshot)])
+
+    def _format_balance_rows(self, snapshot: Dict[str, Any], lane: Optional[str] = None) -> List[str]:
+        balances = sorted(snapshot.get("balances") or [], key=lambda row: row.get("value_quote", 0), reverse=True)
+        if not balances:
+            prefix = f"{lane.upper()}: " if lane else ""
+            return [f"{prefix}No balances available."]
+        lines = []
+        if lane is not None:
+            lines.append(self._kv(lane.upper(), snapshot["bot_name"], self._controller_marker(snapshot["bot_name"])))
         for row in balances:
             lines.append(
                 f"{self.BULLET} {row['exchange']} {row['asset']} | total {self._format_number(row['total_balance'], 6)} | "
                 f"avail {self._format_number(row['available_balance'], 6)} | "
                 f"value ${self._format_number(row['value_quote'], 2)}"
             )
-        return "\n".join(lines)
+        return lines
 
-    async def _command_controllers(self, _: List[str]) -> str:
-        snapshot = self._runtime_snapshot()
-        if snapshot is None:
-            return "Controller summary is unavailable because no V2 strategy is running."
-        controllers = snapshot.get("controllers", [])
-        if not controllers:
+    async def _command_controllers(self, args: List[str]) -> str:
+        token, error = self._command_scope(args, "controllers")
+        if error:
+            return error
+        configured = self._configured_status_snapshots()
+        if configured is None:
+            snapshot = self._runtime_snapshot()
+            if token is not None:
+                local = self._status_lane(snapshot)
+                requested = self.STACK_SCOPES.get(token, (token,))
+                if local not in requested:
+                    return f"⚠️ {token.upper()} controllers unavailable from this Telegram owner."
+            if snapshot is None:
+                return "Controller summary is unavailable because no V2 strategy is running."
+            return self._format_controllers_section("CONTROLLERS", snapshot)
+        sections: List[str] = []
+        for stack, lanes in self._iter_requested_stacks(token):
+            lines = [self._title("🧠", f"CONTROLLERS • {stack.upper()}")]
+            for lane in lanes:
+                snapshot = self._lane_snapshot(configured, lane)
+                if snapshot is None:
+                    lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
+                    continue
+                lines.extend(self._format_controller_rows(snapshot, lane))
+            sections.append("\n".join(lines))
+        return "\n".join(sections)
+
+    def _format_controllers_section(self, title: str, snapshot: Dict[str, Any]) -> str:
+        if not (snapshot.get("controllers") or []):
             return "No controllers are active."
-        lines = [self._title("🧠", "CONTROLLERS")]
+        return "\n".join([self._title("🧠", title), *self._format_controller_rows(snapshot)])
+
+    def _format_controller_rows(self, snapshot: Dict[str, Any], lane: Optional[str] = None) -> List[str]:
+        controllers = snapshot.get("controllers") or []
+        if not controllers:
+            prefix = f"{lane.upper()}: " if lane else ""
+            return [f"{prefix}No controllers are active."]
+        lines = []
+        if lane is not None:
+            lines.append(self._kv(lane.upper(), snapshot["bot_name"], self._controller_marker(snapshot["bot_name"])))
         for row in controllers:
             price = "n/a" if row.get("price_quote") is None else self._format_number(row["price_quote"], 4)
             breakeven = "n/a" if row.get("breakeven_price") is None else self._format_number(row["breakeven_price"], 4)
             upnl_pct = "n/a" if row.get("unrealized_pnl_pct") is None else f"{self._format_number(row['unrealized_pnl_pct'], 2)}%"
+            pair = row.get("pair") or row.get("controller_id") or "n/a"
             lines.append(
-                f"{self.BULLET} {row['pair']} | {row['state']} | signal {row['signal']} | price {price} | "
-                f"breakeven {breakeven} | u% {upnl_pct} | {row['execs']} | {row['exposure_text']} | gate {row['gate']}"
+                f"{self.BULLET} {pair} | {row.get('state', 'n/a')} | signal {row.get('signal', 'n/a')} | price {price} | "
+                f"breakeven {breakeven} | u% {upnl_pct} | {row.get('execs', 'n/a')} | "
+                f"{row.get('exposure_text', 'n/a')} | gate {row.get('gate', 'n/a')}"
             )
-        return "\n".join(lines)
+        return lines
 
     async def _command_focus(self, _: List[str]) -> str:
         snapshot = self._runtime_snapshot()
@@ -722,28 +883,29 @@ class TelegramNotifier(NotifierBase):
 
     async def _command_executors(self, args: List[str]) -> str:
         if len(args) > 1 or (args and args[0].lower() not in self.STATUS_LANES):
-            return "Usage: /executors [main|sui]"
+            return f"Usage: /executors [{'|'.join(self.STATUS_LANES)}]"
         scope = args[0].lower() if args else None
         configured = self._configured_status_snapshots()
         if configured is None:
             return await self._command_local_executors()
 
         if scope is not None:
-            snapshot = configured[scope]
+            snapshot = configured.get(scope)
             if snapshot is None:
                 return f"⚠️ {scope.upper()} executor status unavailable."
             lines = [self._title("⚙️", f"EXECUTORS • {scope.upper()}")]
             lines.extend(self._format_executor_snapshot(scope, snapshot))
             return "\n".join(lines)
 
-        lines = [self._title("⚙️", "EXECUTORS • MAIN + SUI")]
-        for lane in self.STATUS_LANES:
+        lines = [self._title("⚙️", self._combined_lane_title("EXECUTORS", configured))]
+        for lane in self._configured_status_lanes(configured):
             snapshot = configured[lane]
             if snapshot is None:
                 lines.append(f"⚠️ {lane.upper()}: UNAVAILABLE")
             else:
                 lines.extend(self._format_executor_snapshot(lane, snapshot))
-        lines.append("Use /executors main or /executors sui to isolate one owner.")
+        details = " or ".join(f"/executors {lane}" for lane in self._configured_status_lanes(configured))
+        lines.append(f"Use {details} to isolate one owner.")
         return "\n".join(lines)
 
     def _format_executor_snapshot(self, lane: str, snapshot: Dict[str, Any]) -> List[str]:
@@ -752,7 +914,7 @@ class TelegramNotifier(NotifierBase):
             executors = snapshot.get("active_executors", [])
         orders = snapshot.get("active_orders", [])
         lines = [
-            self._kv(lane.upper(), snapshot["bot_name"], "🤖"),
+            self._kv(lane.upper(), snapshot["bot_name"], self._controller_marker(snapshot["bot_name"])),
             self._kv("Updated", snapshot["updated_at"], "🕒"),
             self._kv("In-flight Executors", len(executors), "⚙️"),
             self._kv("Active Orders", snapshot.get("active_orders_count", len(orders)), "📬"),
@@ -1172,7 +1334,7 @@ class TelegramNotifier(NotifierBase):
 
     def _trade_realized_pnl_lines(self, realized_pnl_quote: Optional[Decimal]) -> List[str]:
         if realized_pnl_quote is None:
-            return []
+            return [self._kv("Trade Realized PnL", "UNAVAILABLE", "📈")]
         return [
             self._kv("Trade Realized PnL", f"${self._format_number(realized_pnl_quote, 2)}", "📈"),
         ]

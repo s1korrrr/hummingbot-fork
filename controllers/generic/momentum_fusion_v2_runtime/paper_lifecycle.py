@@ -3,8 +3,11 @@
 This adapter is constructible only by a genuine NativePaperSession. It is not a
 production execution mode, a wallet owner, an economic runner, or a second ledger.
 """
+import fcntl
 import json
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 
 from pydantic import Field
 from sqlalchemy import text
@@ -69,22 +72,25 @@ class MomentumPaperLifecycle:
         self.source = source_digest(source_root(), source_files())
         self.binding = {'source_sha256': self.source, 'recipe_sha256': host.config.recipe.digest,
                         'policy_sha256': digest(policy), 'controller_id': host.config.id,
-                        'account_id': self.evidence.account_id}
+                        'account_id': self.evidence.account_id, 'coordinator': 'native_flat_reseed_v1'}
         self.key = 'momentum-paper-v1:' + host.config.id
         self.pending = None
         self._emitted = False
         self._raw = None
         self._checkpoint = None
         self._load()
-        if self._checkpoint is None:
-            balances = session._connector.get_all_balances()
-            if any(quantity != 0 for asset, quantity in balances.items() if asset != 'USDC'):
-                raise PolicyError('fixture cannot adopt preexisting inventory')
-            self.initial_quote = session._connector.get_balance('USDC')
-        else:
-            self.initial_quote = Decimal(self._checkpoint['initial_quote'])
+        if any(quantity != 0 for asset, quantity in session._initial_balances.items() if asset != 'USDC'):
+            raise PolicyError('fixture cannot adopt preexisting inventory')
+        self.initial_quote = session._initial_balances.get('USDC', Decimal(0))
         if not self.initial_quote.is_finite() or self.initial_quote <= 0:
             raise PolicyError('positive native initial cash required')
+        lease = Path(session._sql.db_path).resolve().with_suffix('.momentum-owner.lock').open('a')
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            lease.close()
+            raise PolicyError('another process owns this native momentum paper account')
+        self._lease = lease
         host._paper_fixture = self
 
     def _load(self):
@@ -92,8 +98,68 @@ class MomentumPaperLifecycle:
             row = db.get(Metadata, self.key)
             self._raw = row.value if row else None
         self._checkpoint = None if self._raw is None else json.loads(self._raw)
-        if self._checkpoint is not None and self._checkpoint['binding'] != self.binding:
-            raise PolicyError('native momentum checkpoint identity changed')
+        if self._checkpoint is not None:
+            if (self._checkpoint['binding'] != self.binding
+                    or type(self._checkpoint['episode']) is not int or self._checkpoint['episode'] < 0
+                    or Decimal(self._checkpoint['initial_quote']) != self.session._initial_balances.get('USDC', Decimal(0))):
+                raise PolicyError('native momentum checkpoint identity or initial cash changed')
+
+    def release(self):
+        if self._lease is not None:
+            self._lease.close()
+            self._lease = None
+
+    def acquisition_paused(self):
+        with self.session._sql.get_new_session() as db:
+            row = db.get(Metadata, self.key + ':entry-pause')
+            value = False if row is None else json.loads(row.value)
+        if type(value) is not bool:
+            raise PolicyError('invalid native acquisition pause state')
+        return value
+
+    def pause_acquisition(self, paused):
+        if type(paused) is not bool or self.session._closed:
+            raise PolicyError('explicit boolean pause on an open native fixture required')
+        with self.session._sql.get_new_session() as db, db.begin():
+            key = self.key + ':entry-pause'
+            row = db.get(Metadata, key)
+            if row is None:
+                db.add(Metadata(key=key, value=json.dumps(paused)))
+            else:
+                row.value = json.dumps(paused)
+
+    def _terminal_history_proven(self, infos, current_id=None):
+        from hummingbot.strategy_v2.models.executors import CloseType
+
+        # Bound replay/admission work. Reaching this lifetime fixture capacity
+        # blocks new acquisitions, never the current executor's protective exit.
+        if len(infos) > 10000:
+            return False
+        current, order_ids = [], set()
+        for info in infos:
+            if (info.controller_id != self.host.config.id or info.config.connector_name != self.session._connector.name
+                    or info.config.trading_pair != self.host.config.trading_pair):
+                return False
+            with self.session._sql.get_new_session() as db:
+                receipt = db.get(Metadata, self.key + ':consumed:' + info.id.removeprefix('momentum-paper-'))
+            if receipt is None:
+                return False
+            admission = json.loads(receipt.value)
+            if (admission['executor_id'] != info.id
+                    or admission['config_sha256'] != digest(info.config.model_dump(mode='json'))):
+                return False
+            order_ids.update(row['client_order_id'] for row in (info.custom_info or {}).get('execution_order_snapshots', []))
+            if info.id == current_id:
+                current.append(info)
+                continue
+            if not info.is_done or info.close_type == CloseType.POSITION_HOLD:
+                return False
+            claim = SimpleNamespace(controller_id=info.controller_id, executor_identity=info.id,
+                                    seen_executor_id=info.id, trading_pair=info.config.trading_pair)
+            if not self.evidence.terminal_claim_receipt(claim):
+                return False
+        orders = self.session.recorder.get_orders_for_config_and_market('native-paper-session', self.session._connector)
+        return len(current) == (0 if current_id is None else 1) and order_ids == {order.id for order in orders}
 
     def observe(self):
         from controllers.generic.momentum_fusion_v2 import source_files, source_root
@@ -110,7 +176,12 @@ class MomentumPaperLifecycle:
         equity = market.get_balance('USDC') + sum((e.marked_inventory_quote or Decimal(0)
                                                    for e in snapshot.exposures), Decimal(0))
         native = s.recorder.get_all_executors()
-        owned = not native and not s.executor_orchestrator.recovery_required.get(host.config.id)
+        flat = not market.in_flight_orders and all(quantity == 0 for asset, quantity in market.get_all_balances().items()
+                                                   if asset != 'USDC')
+        owned = (flat and self._terminal_history_proven(native)
+                 and not s.executor_orchestrator.recovery_required.get(host.config.id))
+        paused = self.acquisition_paused()
+
         risk_ok = self.initial_quote - equity < self.policy.max_loss_quote
         assessment = assess_acquisition(
             CapitalRequest(account_id=snapshot.account_id, program_id=PROGRAM, trading_pair=host.config.trading_pair,
@@ -119,16 +190,23 @@ class MomentumPaperLifecycle:
                           base_quote=self.policy.account_quote, order_quote=self.policy.trade_quote, max_age_ms=100),
             now_ms=int(now * 1000))
         checks = (
-            Prerequisite(name='owner_ready', status='PASS' if owned else 'HOLD',
-                         evidence_sha256=digest({'native_executor_ids': [e.id for e in native], 'binding': self.binding})),
+            Prerequisite(name='owner_ready', status='PASS' if owned and not paused else 'HOLD',
+                         evidence_sha256=digest({'native_executor_ids': [e.id for e in native], 'binding': self.binding, 'paused': paused})),
             Prerequisite(name='risk', status='PASS' if risk_ok else 'HOLD',
                          evidence_sha256=digest({'equity': equity, 'initial': self.initial_quote, 'policy': self.policy})),
             Prerequisite(name='capital', status='PASS' if assessment.status == 'ELIGIBLE_FOR_NATIVE_ADMISSION' else 'HOLD',
                          evidence_sha256=assessment.input_sha256))
         previous = None if self._checkpoint is None else PolicyState.model_validate(self._checkpoint['state'])
+        episode = 0 if self._checkpoint is None else self._checkpoint['episode']
+        if previous is not None and previous.issued and owned and observed.primary.event_time_ms > previous.cursor.last_event_ms:
+            # The pure policy deliberately consumes one episode. Only proven
+            # native flatness can seed another, on a strictly later event. The
+            # immutable consumption receipt below still forbids event replay.
+            previous = None
+            episode += 1
         scope = scope_for(host.config.recipe, program_id='momentum_v2_offline_fixture', owner_id=host.config.id, mode='shadow')
         state, decision = step(host.config.recipe, previous, observed, scope=scope, now_ms=int(now * 1000), prerequisites=checks)
-        payload = dict(binding=self.binding, initial_quote=str(self.initial_quote), state=state.model_dump(mode='json'),
+        payload = dict(binding=self.binding, initial_quote=str(self.initial_quote), episode=episode, state=state.model_dump(mode='json'),
                        decision=decision.model_dump(mode='json'), prerequisites=[p.model_dump(mode='json') for p in checks],
                        admission=None if self._checkpoint is None else self._checkpoint['admission'])
         config = None
@@ -180,9 +258,11 @@ class MomentumPaperLifecycle:
             if (None if row is None else row.value) != self._raw:
                 raise PolicyError('native momentum checkpoint changed concurrently')
             if config is not None:
-                if db.get(Executors, config.id) is not None or (self._checkpoint and self._checkpoint['admission']):
+                consumed_key = self.key + ':consumed:' + payload['admission']['consumption_key']
+                if db.get(Executors, config.id) is not None or db.get(Metadata, consumed_key) is not None:
                     raise PolicyError('native opportunity already has an execution owner')
                 db.add(Executors(**json.loads(executor.executor_info.model_dump_json())))
+                db.add(Metadata(key=consumed_key, value=json.dumps(payload['admission'], sort_keys=True)))
             if row is None:
                 db.add(Metadata(key=self.key, value=raw))
             else:
@@ -225,7 +305,8 @@ class MomentumPaperLifecycle:
         if (self.session._failure is not None or not admission or info.id != admission['executor_id']
                 or info.controller_id != self.host.config.id or info.config.controller_id != self.host.config.id
                 or digest(info.config.model_dump(mode='json')) != admission['config_sha256']
-                or market.in_flight_orders or len(self.session.recorder.get_all_executors()) != 1
+                or market.in_flight_orders or not self._terminal_history_proven(
+                    self.session.recorder.get_all_executors(), current_id=info.id)
                 or self.session.recorder.get_all_position_hold_ledger_entries()):
             raise PolicyError('native intent binding or outstanding order ownership unavailable')
         rows = (info.custom_info or {}).get('execution_order_snapshots')

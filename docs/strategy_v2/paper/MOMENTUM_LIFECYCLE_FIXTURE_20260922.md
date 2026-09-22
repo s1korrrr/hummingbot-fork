@@ -12,8 +12,13 @@ initial cash and explicit sizing, capital, loss and native exit mappings must
 match the recipe's existing policy digests. Prerequisites come from the actual
 native account, recorder and source binding. Missing account valuation, ownership,
 capital, loss allowance or fresh evidence cannot be replaced with a passing flag.
-One fixture owns one controller, one unleveraged USDC account and one acquisition
-episode. The fixture loss ceiling spans its whole lifetime; it does not reset at
+One fixture owns one controller and one unleveraged USDC account. The
+`native_flat_reseed_v1` coordinator admits serial episodes only after every prior
+native executor has durable terminal proof and the account is flat. A strictly
+newer observation first seeds the unchanged canonical policy; a later distinct
+setup may acquire. Immutable consumed-opportunity identities in recorder Metadata
+prevent old events from becoming new acquisitions. The coordinator version is
+part of the checkpoint binding; no recipe is automatically resealed. The fixture loss ceiling spans its whole lifetime; it does not reset at
 a day boundary and is therefore stricter than a same-sized daily allowance.
 
 Canonical policy state, opportunity/consumption identities and prerequisite
@@ -29,8 +34,8 @@ JSON ClaimStore is not used by this executing offline fixture.
 native executor receipts, market tracking state and existing step journal, then
 unregister listeners without cancelling orders or changing native exit intent.
 A matching restore preserves the original executor identity. Qualified recovery
-requires exactly one native executor, no outstanding orders or held-position
-ledger, an intact configuration/source/recipe binding, and a positive native
+requires exactly one current unfinished native executor, fully proven closed
+historical owners, no outstanding orders or held-position ledger, an intact configuration/source/recipe binding, and a positive native
 terminal singleton entry receipt. Both full and terminal partial entries are
 supported. Exact remaining inventory, fees and persisted trailing state must
 match; trailing peaks are never reconstructed from a new quote.
@@ -49,3 +54,11 @@ capital, unknown assets, policy binding changes and unfinished-entry recovery.
 Synthetic execution evidence is not an economic result, production paper
 activation, shared live-wallet qualification or promotion authority. Both
 running rsibot stacks remain unchanged.
+
+A process lease remains held on the canonical database sidecar path for the
+fixture lifetime. A second process cannot restore the same paper account while
+its owner is active. The native metadata acquisition pause persists through
+restart and only blocks admission; native executor cancellation and exits keep
+running. Synthetic resumed-versus-uninterrupted tests compare exact balances,
+fill quantities/prices/fees, executor identities and preserved trailing state
+across two serial episodes. Missing terminal proof blocks the next episode.

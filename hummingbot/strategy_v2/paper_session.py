@@ -200,6 +200,7 @@ class NativePaperSession:
             controller._status = RunnableStatus.RUNNING
             controller.initialize_candles()
         self._connector = connector
+        self._initial_balances = dict(connector.get_all_balances())
         self._closed = False
         self._step_lock = asyncio.Lock()
         self._failure_path = path.with_suffix(path.suffix + '.paper-step.json')
@@ -240,6 +241,9 @@ class NativePaperSession:
             self.executor_orchestrator = ExecutorOrchestrator(self, executor_start=self._start_executor,
                                                               executor_restore=self.momentum_fixture.restore_executor if restore and self.momentum_fixture else None)
         except BaseException:
+            fixture = getattr(self, 'momentum_fixture', None)
+            if fixture is not None:
+                fixture.release()
             if self.recorder is not None:
                 self.recorder.stop()
                 if MarketsRecorder.get_existing_instance() is self.recorder:
@@ -512,6 +516,7 @@ class NativePaperSession:
                 if RateOracle._shared_instance is self._oracle:
                     RateOracle._shared_instance = self._prior_oracle
                 self._closed = True
+                self.momentum_fixture.release()
 
     async def close(self):
         if self._closed:
@@ -594,3 +599,6 @@ class NativePaperSession:
             if RateOracle._shared_instance is self._oracle:
                 RateOracle._shared_instance = self._prior_oracle
             self._closed = True
+            fixture = getattr(self, 'momentum_fixture', None)
+            if fixture is not None:
+                fixture.release()

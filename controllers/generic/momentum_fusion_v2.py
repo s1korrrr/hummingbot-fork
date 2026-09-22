@@ -135,6 +135,7 @@ class MomentumFusionV2Controller(ControllerBase):
             'recipe_sha256': self._binding.recipe_sha256,
             'data_ready': self.processed_data.get('data_health', {}).get('ready') is True,
             'data_reason': self.processed_data.get('data_health', {}).get('reason'),
+            'recovery_hold': getattr(self, '_recovery_hold', None),
             'action_reason': 'native_paper_admission_unqualified', 'execution_authorized': False}}
 
     def get_status_summary(self):

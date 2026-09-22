@@ -177,3 +177,155 @@ async def test_unstarted_checkpoint_with_prior_canceled_order_cannot_replay(tmp_
         assert 'native order history' in session.controllers[config.id]._recovery_hold
     finally:
         await session.close()
+
+
+async def enter_and_close(session, config):
+    from hummingbot.core.data_type.common import TradeType
+    await session.step(T + 1, books=[book(T + 1, 1)], candles=inputs(config))
+    await session.step(T + 61, books=[book(T + 61, 2)], candles=inputs(
+        config, 1, close=D('102'), high=D('103'), low=D('100'), volume=D('1000')))
+    await session.step(T + 62, books=[book(T + 62, 3)], trades=[dict(
+        trading_pair='BNB-USDC', sequence=1, timestamp=T + 62, side=TradeType.SELL, price=D('100'), amount=D('9.9'))])
+    session.momentum_fixture.pause_acquisition(True)
+    await session.step(T + 63, books=[book(T + 63, 4, bid=105, ask=106)])
+    await session.step(T + 64, books=[book(T + 64, 5, bid=102, ask=103)])
+    await session.step(T + 65, books=[book(T + 65, 6, bid=102, ask=103)])
+    assert session._connector.get_balance('BNB') == 0
+    assert session.recorder.get_all_executors()[0].is_done
+
+
+@pytest.mark.asyncio
+async def test_new_episode_requires_flat_terminal_proof_and_never_reuses_consumption(tmp_path):
+    from hummingbot.model.metadata import Metadata
+    market = make_market()
+    config, policy = settings(market)
+    session = NativePaperSession(market, [config], tmp_path / 'native.sqlite', momentum_fixture_policy=policy)
+    try:
+        await enter_and_close(session, config)
+        assert session.momentum_fixture.acquisition_paused()
+        assert not market.in_flight_orders
+        session.momentum_fixture.pause_acquisition(False)
+        seeded = await session.step(T + 121, books=[book(T + 121, 7)], candles=inputs(config, 2))
+        assert seeded['actions'] == []
+        entered = await session.step(T + 181, books=[book(T + 181, 8)], candles=inputs(
+            config, 3, close=D('102'), high=D('103'), low=D('100'), volume=D('1000')))
+        assert len(entered['actions']) == 1
+        again = await session.step(T + 181, books=[book(T + 181, 9)])
+        assert again['actions'] == []
+        rows = session.recorder.get_all_executors()
+        assert len(rows) == 2 and len({row.id for row in rows}) == 2
+        with session._sql.get_new_session() as db:
+            consumed = db.query(Metadata).filter(Metadata.key.like('momentum-paper-v1:%:consumed:%')).all()
+        assert len(consumed) == 2
+        assert session.momentum_fixture._checkpoint['episode'] == 1
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_terminal_receipt_prevents_new_episode(tmp_path):
+    from hummingbot.model.order_status import OrderStatus
+    market = make_market()
+    config, policy = settings(market)
+    session = NativePaperSession(market, [config], tmp_path / 'native.sqlite', momentum_fixture_policy=policy)
+    try:
+        await enter_and_close(session, config)
+        session.momentum_fixture.pause_acquisition(False)
+        with session._sql.get_new_session() as db, db.begin():
+            db.query(OrderStatus).delete()
+        result = await session.step(T + 121, books=[book(T + 121, 7)], candles=inputs(config, 2))
+        assert result['actions'] == []
+        assert len(session.recorder.get_all_executors()) == 1
+        assert session.momentum_fixture._checkpoint['episode'] == 0
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_native_fixture_holds_process_lease_until_closed(tmp_path):
+    import subprocess
+    import sys
+    market = make_market()
+    config, policy = settings(market)
+    path = tmp_path / 'native.sqlite'
+    session = NativePaperSession(market, [config], path, momentum_fixture_policy=policy)
+    code = '''import fcntl,sys
+with open(sys.argv[1], 'a') as lease:
+    try: fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError: sys.exit(23)
+'''
+    try:
+        result = subprocess.run([sys.executable, '-c', code, str(path.with_suffix('.momentum-owner.lock'))], timeout=10)
+        assert result.returncode == 23
+    finally:
+        await session.close()
+    assert subprocess.run([sys.executable, '-c', code, str(path.with_suffix('.momentum-owner.lock'))], timeout=10).returncode == 0
+
+
+async def two_episode_outcome(path, suspend_second):
+    from hummingbot.core.data_type.common import TradeType
+    market = make_market()
+    config, policy = settings(market)
+    session = NativePaperSession(market, [config], path, momentum_fixture_policy=policy)
+    try:
+        await enter_and_close(session, config)
+        session.momentum_fixture.pause_acquisition(False)
+        await session.step(T + 121, books=[book(T + 121, 7)], candles=inputs(config, 2))
+        await session.step(T + 181, books=[book(T + 181, 8)], candles=inputs(
+            config, 3, close=D('102'), high=D('103'), low=D('100'), volume=D('1000')))
+        await session.step(T + 182, books=[book(T + 182, 9)], trades=[dict(
+            trading_pair='BNB-USDC', sequence=2, timestamp=T + 182, side=TradeType.SELL, price=D('100'), amount=D('4'))])
+        await session.step(T + 184, books=[book(T + 184, 10)])
+        session.momentum_fixture.pause_acquisition(True)
+        await session.step(T + 185, books=[book(T + 185, 11, bid=105, ask=106)])
+        active = [e for e in session.executor_orchestrator.active_executors[config.id] if not e.is_closed][0]
+        trigger = active._trailing_stop_trigger_pct
+        if suspend_second:
+            await session.suspend()
+            session = NativePaperSession(make_market(), [config], path, restore=True, momentum_fixture_policy=policy)
+            assert session.momentum_fixture.acquisition_paused()
+            active = session.executor_orchestrator.active_executors[config.id][0]
+            assert active._trailing_stop_trigger_pct == trigger
+            assert not session.executor_orchestrator.recovery_required.get(config.id)
+        await session.step(T + 186, books=[book(T + 186, 12, bid=102, ask=103)])
+        await session.step(T + 187, books=[book(T + 187, 13, bid=102, ask=103)])
+        assert session._connector.get_balance('BNB') == 0
+        infos = session.recorder.get_all_executors()
+        assert len(infos) == 2 and all(info.is_done for info in infos)
+        fills = session.recorder.get_trades_for_config('native-paper-session')
+        return dict(balances=session._connector.get_all_balances(), trigger=trigger,
+                    executors=sorted(info.id for info in infos),
+                    fills=sorted((fill.trade_type, fill.amount_decimal, fill.price_decimal,
+                                  fill.trade_fee_in_quote_decimal) for fill in fills),
+                    episode=session.momentum_fixture._checkpoint['episode'])
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_resumed_second_episode_matches_uninterrupted_native_outcome(tmp_path):
+    uninterrupted = await two_episode_outcome(tmp_path / 'continuous.sqlite', False)
+    resumed = await two_episode_outcome(tmp_path / 'resumed.sqlite', True)
+    assert resumed == uninterrupted
+    assert len(resumed['fills']) == 4 and resumed['episode'] == 1
+
+
+@pytest.mark.asyncio
+async def test_corrupt_initial_cash_checkpoint_cannot_change_loss_allowance(tmp_path):
+    from hummingbot.model.metadata import Metadata
+    market = make_market()
+    config, policy = settings(market)
+    session = NativePaperSession(market, [config], tmp_path / 'native.sqlite', momentum_fixture_policy=policy)
+    try:
+        await session.step(T + 1, books=[book(T + 1, 1)], candles=inputs(config))
+        with session._sql.get_new_session() as db, db.begin():
+            row = db.get(Metadata, session.momentum_fixture.key)
+            payload = json.loads(row.value)
+            payload['initial_quote'] = '1'
+            row.value = json.dumps(payload)
+        result = await session.step(T + 61, books=[book(T + 61, 2)], candles=inputs(
+            config, 1, close=D('102'), high=D('103'), low=D('100'), volume=D('1000')))
+        assert result['actions'] == [] and not market.in_flight_orders
+        assert 'initial cash changed' in session.controllers[config.id].processed_data['data_health']['reason']
+    finally:
+        await session.close()

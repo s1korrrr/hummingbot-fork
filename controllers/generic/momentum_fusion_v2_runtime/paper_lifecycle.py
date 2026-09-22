@@ -231,8 +231,9 @@ class MomentumPaperLifecycle:
         rows = (info.custom_info or {}).get('execution_order_snapshots')
         executor = PositionExecutor(self.session, info.config)
         if info.status == RunnableStatus.NOT_STARTED and rows == []:
-            if self.session.recorder.get_trades_for_config('native-paper-session'):
-                raise PolicyError('unstarted intent has native fills')
+            if (self.session.recorder.get_trades_for_config('native-paper-session')
+                    or self.session.recorder.get_orders_for_config_and_market('native-paper-session', market)):
+                raise PolicyError('unstarted intent has native order history')
             return executor
         custom = info.custom_info
         if (info.status != RunnableStatus.RUNNING or info.close_type is not None or custom.get('exit_trigger_reason')

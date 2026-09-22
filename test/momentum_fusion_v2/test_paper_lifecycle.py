@@ -158,3 +158,22 @@ async def test_unknown_account_asset_blocks_complete_evidence(tmp_path):
         assert not session.controllers[config.id].processed_data['data_health']['ready']
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_unstarted_checkpoint_with_prior_canceled_order_cannot_replay(tmp_path):
+    from hummingbot.strategy_v2.models.base import RunnableStatus
+    market = make_market()
+    config, policy = settings(market)
+    session = NativePaperSession(market, [config], tmp_path / 'native.sqlite', momentum_fixture_policy=policy)
+    try:
+        await session.step(T + 1, books=[book(T + 1, 1)], candles=inputs(config))
+        await session.step(T + 61, books=[book(T + 61, 2)], candles=inputs(
+            config, 1, close=D('102'), high=D('103'), low=D('100'), volume=D('1000')))
+        await market.cancel_all(5)
+        info = session.recorder.get_all_executors()[0].model_copy(update={
+            'status': RunnableStatus.NOT_STARTED, 'custom_info': {'execution_order_snapshots': []}})
+        assert session.momentum_fixture.restore_executor(info) is None
+        assert 'native order history' in session.controllers[config.id]._recovery_hold
+    finally:
+        await session.close()

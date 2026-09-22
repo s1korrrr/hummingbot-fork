@@ -139,6 +139,10 @@ class MarketsRecorder:
             (MarketEvent.RangePositionLiquidityRemoved, self._update_range_position_forwarder),
         ]
         MarketsRecorder._shared_instance = self
+        from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
+        for market in self._markets:
+            if is_native_paper_connector(market):
+                market.bind_terminal_recorder(self)
 
     def _start_market_data_recording(self):
         self._market_data_collection_task = self._ev_loop.create_task(self._record_market_data())

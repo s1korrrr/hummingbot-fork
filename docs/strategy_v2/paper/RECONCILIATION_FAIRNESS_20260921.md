@@ -54,3 +54,30 @@ Source identity changes when the installed paper engine changes; do not bypass
 restore guards, replace a running image, reseal old state or restart execution
 owners from this source publication. Rollback is a reviewed revert retaining
 all later source and recorder evidence. No runtime state was touched.
+
+## Recorder-backed retention repair — 22 September 2026
+
+Terminal paper objects now compact only after a separate recorder read proves
+committed native `Order`, `OrderExact`, `OrderStatus`, `TradeFill` and exact fill
+receipts agree with the order's identity, terminal state and complete fill set.
+No extra ledger or schema is added. Evicted objects and restarted sessions read
+that same native authority by recorder scope, client id and exchange id. Missing
+or inconsistent exact receipts fail closed; caller-missing late fills require
+native reconciliation rather than being relabeled as zero fills.
+
+Snapshots include active orders and unresolved terminal evidence. Confirmed
+terminal history stays in its native tables rather than being copied into every
+MarketState JSON. `max_unresolved_orders` defaults to 1000 and backpressures BUY
+acquisitions when active plus unresolved orders reach capacity. SELL exits,
+cancellation and reconciliation are never refused by that capacity check.
+A recorder query exception remains visible and leaves all unresolved objects
+intact. There is no TTL or deletion of unresolved evidence.
+
+Fresh synthetic native checks: four pre-fix regressions failed; repaired native
+connector/executor/session/expiry/fairness suite passes 69 tests plus 14 subtests.
+Includes committed-row lookup after cache removal and restart, bounded snapshots
+across 80 terminal cycles, missing fills/wrong recorder scope, unavailable recorder,
+SELL admission under pressure, and crash after durable write before compaction.
+An initial wider selection also exposed two existing legacy paper factory tests'
+missing event loop after isolated-async tests; those are outside native paper.
+No economic backtest, installed-state reseal, image change or service restart.

@@ -7,6 +7,8 @@ on:
       - 'controllers/generic/rsi_modular.py'
       - 'controllers/generic/component_breakout.py'
       - 'controllers/generic/modular_spot_core/**'
+      - 'controllers/generic/crash_recovery_v2.py'
+      - 'controllers/generic/crash_recovery_v2_core/**'
       - 'controllers/directional_trading/**'
       - 'hummingbot/strategy_v2/**'
       - 'hummingbot/strategy/strategy_v2_base.py'
@@ -26,6 +28,7 @@ on:
       - 'services/okx-candle-service/**'
       - 'test/**'
       - 'docs/controllers/modular_spot/**'
+      - 'docs/strategy_v2/crash_recovery/**'
       - '.github/workflows/modular-native.yml'
   workflow_dispatch:
 
@@ -89,6 +92,7 @@ jobs:
               "controllers.generic.modular_rsi_v5",
               "controllers.generic.rsi_modular",
               "controllers.generic.component_breakout",
+              "controllers.generic.crash_recovery_v2",
               "hummingbot.strategy_v2.components",
           ):
               importlib.import_module(module)
@@ -97,6 +101,7 @@ jobs:
           PYTHONPATH="$PWD" python -m pytest \
             test/test_strategy_components.py \
             test/test_strategy_component_source_identity.py \
+            test/crash_recovery_v2 \
             test/modular_spot \
             test/hummingbot/strategy_v2/executors/position_executor \
             test/hummingbot/strategy_v2/executors/order_executor \

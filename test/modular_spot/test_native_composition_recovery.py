@@ -60,13 +60,15 @@ def test_real_sqlite_restart_restores_native_peak_before_reduction(recorder):
     assert again._recovery_trails == {}
 
 
-def test_missing_checkpoint_with_native_held_inventory_is_hard_hold(recorder):
+def test_missing_checkpoint_with_native_held_inventory_is_hard_hold(recorder, caplog):
+    caplog.set_level('WARNING')
     result = owner()
     persist_position(recorder, result.config.id)
     observe(result)
     assert result.determine_executor_actions() == []
     assert 'no authoritative recovery checkpoint' in result._recovery_fault
     assert result._recovery_trails == {}
+    assert 'native recovery fault holds actions' in ' '.join(caplog.messages)
 
 
 def test_corrupt_checkpoint_cannot_reset_native_trailing_peak(recorder):

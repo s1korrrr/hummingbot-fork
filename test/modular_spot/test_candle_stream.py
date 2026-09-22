@@ -78,7 +78,8 @@ def test_snapshot_delta_correction_and_recovery_entry_semantics():
     reader.apply(message('candle', sequence=2, at=6060))
     assert reader.replica.entry_ready(key)
     reader.apply(message('candle', sequence=3, at=6060, row=row(6000, '101')))
-    assert not reader.replica.entry_ready(key)
+    assert reader.replica.entry_ready(key)
+    assert reader.replica.frame(key, now=6060, max_age=120).close.iloc[-1] == 101
     reader.apply(message('status', sequence=4, at=6060))
     with pytest.raises(DataUnavailable):
         reader.replica.frame(key, now=6060, max_age=120)

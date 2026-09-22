@@ -116,7 +116,24 @@ class NativeRecoveryStore:
                     raise PolicyError('native recovery key conflates different cost bases')
                 amount += old.amount
             result[key] = HeldIdentity(position_key=key, amount=amount, breakeven_price=basis)
-        return tuple(result[key] for key in sorted(result))
+        held = []
+        for key in sorted(result):
+            item = result[key]
+            if self._below_venue_minimum(item.amount, item.breakeven_price):
+                continue
+            held.append(item)
+        return tuple(held)
+
+    def _below_venue_minimum(self, amount, price):
+        try:
+            rules = self.owner.market_data_provider.get_trading_rules(
+                self.owner.config.connector_name, self.owner.config.trading_pair)
+            min_size = decimal(rules.min_order_size, 'venue min order size', positive=True)
+            raw_notional = getattr(rules, 'min_notional_size', None) or getattr(rules, 'min_order_value', None) or 0
+            min_notional = decimal(raw_notional, 'venue min notional')
+        except (PolicyError, AttributeError, TypeError, ValueError):
+            return False
+        return amount < min_size or min_notional > 0 and amount * price < min_notional
 
     def inventory(self):
         saved = self._positions(self.recorder.get_positions_by_controller(self.owner.config.id))

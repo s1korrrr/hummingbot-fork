@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -56,6 +57,8 @@ class OkxExchange(ExchangePyBase):
         self._trading_pairs = trading_pairs
         self._last_traded_price_source_timestamps = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+        self._spot_ticker_lock = asyncio.Lock()
+        self._spot_ticker_cache = None
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
         if os.environ.get('RSIBOT_V2_DURABLE_ORDER_TRACKING') == '1':
@@ -282,30 +285,44 @@ class OkxExchange(ExchangePyBase):
 
         return final_result
 
-    async def get_last_traded_prices(self, trading_pairs: List[str] = None) -> Dict[str, float]:
-        params = {"instType": "SPOT"}
+    async def _spot_ticker_snapshot(self) -> Tuple[Dict[str, float], Dict[str, Optional[float]]]:
+        # ponytail: 2s all-spot ticker cache; provider-level batch if 5s still times out
+        async with self._spot_ticker_lock:
+            now = time.monotonic()
+            cached = self._spot_ticker_cache
+            if cached is not None and now - cached[0] < 2.0:
+                return cached[1], cached[2]
+            resp_json = await self._api_get(
+                path_url=CONSTANTS.OKX_TICKERS_PATH,
+                params={"instType": "SPOT"},
+            )
+            prices: Dict[str, float] = {}
+            timestamps: Dict[str, Optional[float]] = {}
+            for ticker in resp_json["data"]:
+                last = ticker.get("last")
+                if not last:
+                    continue
+                inst_id = ticker["instId"]
+                prices[inst_id] = float(last)
+                try:
+                    source_timestamp = Decimal(str(ticker.get("ts"))) / Decimal("1000")
+                    timestamps[inst_id] = (
+                        float(source_timestamp)
+                        if source_timestamp.is_finite() and source_timestamp > 0
+                        else None
+                    )
+                except (ArithmeticError, TypeError, ValueError):
+                    timestamps[inst_id] = None
+            self._spot_ticker_cache = (time.monotonic(), prices, timestamps)
+            return prices, timestamps
 
-        if trading_pairs and len(trading_pairs) == 1:
-            return {trading_pairs[0]: await self._get_last_traded_price(trading_pairs[0])}
-        resp_json = await self._api_get(
-            path_url=CONSTANTS.OKX_TICKERS_PATH,
-            params=params,
-        )
-        # some markets have no last traded price, so filter them out
-        last_traded_prices = {ticker["instId"]: float(ticker["last"]) for ticker in resp_json["data"] if ticker["last"]}
-        return last_traded_prices
-
-    async def _get_last_traded_price(self, trading_pair: str) -> float:
+    async def _fetch_single_ticker(self, trading_pair: str) -> float:
         params = {"instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)}
-
         resp_json = await self._api_request(
             path_url=CONSTANTS.OKX_TICKER_PATH,
             params=params,
         )
-
         ticker_data, *_ = resp_json["data"]
-        # Preserve the source event time for observation only; it is not a rate
-        # or order decision input. Missing source evidence must not become "now".
         try:
             source_timestamp = Decimal(str(ticker_data.get("ts"))) / Decimal("1000")
             source_timestamp = float(source_timestamp) if source_timestamp.is_finite() and source_timestamp > 0 else None
@@ -315,6 +332,24 @@ class OkxExchange(ExchangePyBase):
             self._last_traded_price_source_timestamps = {}
         self._last_traded_price_source_timestamps[trading_pair] = source_timestamp
         return float(ticker_data["last"])
+
+    async def get_last_traded_prices(self, trading_pairs: List[str] = None) -> Dict[str, float]:
+        if trading_pairs and len(trading_pairs) == 1:
+            return {trading_pairs[0]: await self._fetch_single_ticker(trading_pairs[0])}
+        prices, _timestamps = await self._spot_ticker_snapshot()
+        if not trading_pairs:
+            return prices
+        return {pair: prices[pair] for pair in trading_pairs if pair in prices}
+
+    async def _get_last_traded_price(self, trading_pair: str) -> float:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        prices, timestamps = await self._spot_ticker_snapshot()
+        if symbol not in prices:
+            raise IOError(f"OKX ticker missing last price for {symbol}")
+        if not hasattr(self, "_last_traded_price_source_timestamps"):
+            self._last_traded_price_source_timestamps = {}
+        self._last_traded_price_source_timestamps[trading_pair] = timestamps.get(symbol)
+        return prices[symbol]
 
     def last_traded_price_source_timestamp(self, trading_pair: str) -> Optional[float]:
         return self._last_traded_price_source_timestamps.get(trading_pair)

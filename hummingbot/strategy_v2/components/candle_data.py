@@ -210,8 +210,12 @@ class Replica:
                         raise PolicyError('conflicting candle snapshot at the same sequence')
                     self.snapshots[key] = snapshot
                     return False
-            if old is None or snapshot.sequence != old.sequence + 1 or latest != old.rows[-1].open_time + snapshot.dataset.seconds:
+            if old is None:
                 self.seed_bars[key] = latest
+            elif latest != old.rows[-1].open_time:
+                if (snapshot.sequence != old.sequence + 1
+                        or latest != old.rows[-1].open_time + snapshot.dataset.seconds):
+                    self.seed_bars[key] = latest
             self.snapshots[key] = snapshot
             return True
         except (PolicyError, ValueError, AttributeError):

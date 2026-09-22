@@ -102,6 +102,53 @@ def test_correction_recomputes_but_does_not_advance_signal_clock():
     assert not replica.entry_ready(dataset().key)
 
 
+def test_forming_bar_same_open_time_does_not_revoke_entry_ready():
+    replica = Replica((dataset(),))
+    replica.begin_session()
+    replica.accept(snapshot(), now=6000)
+    seed = replica.seed_bars[dataset().key]
+    assert not replica.entry_ready(dataset().key)
+    replica.accept(snapshot(seq=2, at=6060, candles=rows(end=6000)), now=6060)
+    assert replica.entry_ready(dataset().key)
+    assert replica.seed_bars[dataset().key] == seed
+    forming = snapshot(seq=3, at=6060, candles=rows(end=6000, price='101'))
+    replica.accept(forming, now=6060)
+    assert replica.entry_ready(dataset().key)
+    assert replica.seed_bars[dataset().key] == seed
+    frame = replica.frame(dataset().key, now=6060, max_age=120)
+    assert frame.close.iloc[-1] == 101
+
+
+def test_first_observation_seeds_and_the_next_closed_bar_is_the_entry():
+    replica = Replica((dataset(),))
+    replica.begin_session()
+    replica.accept(snapshot(), now=6000)
+    assert replica.seed_bars[dataset().key] == 5940
+    assert not replica.entry_ready(dataset().key)
+    assert len(replica.frame(dataset().key, now=6000, max_age=120)) == 60
+    replica.accept(snapshot(seq=2, at=6060, candles=rows(end=6000)), now=6060)
+    assert replica.entry_ready(dataset().key)
+    assert replica.seed_bars[dataset().key] == 5940
+
+
+def test_reconnect_reseed_is_false_on_the_seed_bar_and_true_on_the_next_closed_bar():
+    replica = Replica((dataset(),))
+    replica.begin_session()
+    replica.accept(snapshot(), now=6000)
+    replica.accept(snapshot(seq=2, at=6060, candles=rows(end=6000)), now=6060)
+    assert replica.entry_ready(dataset().key)
+    replica.begin_session()
+    replica.accept(snapshot(epoch='boot-two', seq=1, at=6120, candles=rows(end=6060)), now=6120)
+    assert not replica.entry_ready(dataset().key)
+    rsi_frame = replica.frame(dataset().key, now=6120, max_age=120)
+    assert rsi_frame.close.iloc[-1] == 100
+    replica.accept(snapshot(epoch='boot-two', seq=2, at=6180, candles=rows(end=6120)), now=6180)
+    assert replica.entry_ready(dataset().key)
+    replica.accept(snapshot(epoch='boot-two', seq=3, at=6180, candles=rows(end=6120, price='101')), now=6180)
+    assert replica.entry_ready(dataset().key)
+    assert replica.frame(dataset().key, now=6180, max_age=120).close.iloc[-1] == 101
+
+
 def test_replica_rejects_foreign_source_and_future_publication():
     replica = Replica((dataset(),))
     replica.begin_session()
@@ -346,17 +393,20 @@ def test_epoch_change_disconnects_without_replaying_historical_entry():
     assert not replica.entry_ready(dataset().key)
 
 
-def test_corrected_historical_candle_does_not_rearm_entry():
+def test_corrected_historical_candle_does_not_rearm_or_revoke_entry():
     replica = Replica((dataset(),))
     replica.begin_session()
     replica.accept(snapshot(), now=6000)
+    seed = replica.seed_bars[dataset().key]
     replica.accept(snapshot(seq=2, at=6060, candles=rows(end=6000)), now=6060)
     assert replica.entry_ready(dataset().key)
     candles = list(rows(end=6000, price='100'))
     candles[0] = candles[0].model_copy(update={'close': D('101'), 'high': D('102')})
     replica.accept(snapshot(seq=3, at=6060, candles=tuple(candles)), now=6060)
     assert replica.connected
-    assert not replica.entry_ready(dataset().key)
+    assert replica.entry_ready(dataset().key)
+    assert replica.seed_bars[dataset().key] == seed
+    assert replica.frame(dataset().key, now=6060, max_age=120).close.iloc[0] == 101
 
 
 def test_lost_context_dependency_keeps_unready_and_unframed():

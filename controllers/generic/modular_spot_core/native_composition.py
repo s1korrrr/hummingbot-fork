@@ -268,6 +268,7 @@ class NativeComposition:
 
     def determine_executor_actions(self):
         if self._recovery_fault:
+            self.logger().warning('native recovery fault holds actions: %s', self._recovery_fault)
             return []
         before_trails = None
         try:
@@ -278,6 +279,8 @@ class NativeComposition:
                     raise DataUnavailable('native recorder required for recovery-safe action dispatch')
                 self._recovery_store = NativeRecoveryStore(self, recorder, self._native_source_hash)
             positions = self._recovery_store.prepare()
+            if not positions and self._held_unsellable_dust():
+                self._release_unsellable_entry_fuse()
             before_trails = deepcopy(self._recovery_trails)
             actions = super().determine_executor_actions()
             self._recovery_store.persist(positions, actions)
@@ -287,13 +290,29 @@ class NativeComposition:
             if before_trails is not None:
                 self._recovery_trails = before_trails
             self._recovery_hold = str(exc)
+            self.logger().warning('native recovery hold: %s', self._recovery_hold)
             return []
         except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError) as exc:
             if before_trails is not None:
                 self._recovery_trails = before_trails
             self._recovery_fault = str(exc)
             self._recovery_hold = self._recovery_fault
+            self.logger().warning('native recovery fault holds actions: %s', self._recovery_fault)
             return []
+
+    def _held_unsellable_dust(self):
+        for item in self.positions_held or ():
+            amount = getattr(item, 'amount', 0)
+            if amount is None or amount <= 0:
+                continue
+            return True
+        return False
+
+    def _release_unsellable_entry_fuse(self):
+        getter = getattr(self, '_get_entry_decision_gate', None)
+        if not callable(getter):
+            return
+        getter().abandon()
 
     def get_executor_config(self, *args, **kwargs):
         config = super().get_executor_config(*args, **kwargs)
@@ -307,10 +326,18 @@ class NativeComposition:
         return super().update_config(new_config)
 
     def can_create_executor(self, signal):
-        if signal > 0 and (not self.config.execution_enabled or not self._composition_unchanged()
-                           or self.shared_candles is not None and not self.shared_candles.entry_ready()):
-            return False
-        return super().can_create_executor(signal)
+        if signal <= 0:
+            return super().can_create_executor(signal)
+        if not self.config.execution_enabled:
+            reason = 'execution_enabled'
+        elif not self._composition_unchanged():
+            reason = 'composition_unchanged'
+        elif self.shared_candles is not None and not self.shared_candles.entry_ready():
+            reason = 'entry_ready'
+        else:
+            return super().can_create_executor(signal)
+        self.logger().warning('native executor create refused: %s', reason)
+        return False
 
     def validate_executor_config(self, config):
         if self._recovery_hold or self._recovery_fault:

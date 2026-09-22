@@ -194,3 +194,15 @@ class EntryDecisionGate:
         self._local_authorization = None
         self._awaiting_commit = None
         return True
+
+    def abandon(self):
+        previous = self._load()
+        if not previous or (previous["authorization"] is None and previous["consumed_candle"] == 0):
+            self._local_authorization = None
+            self._awaiting_commit = None
+            return False
+        current = dict(previous, armed=True, consumed_candle=0, authorization=None)
+        self.store.save(previous, current)
+        self._local_authorization = None
+        self._awaiting_commit = None
+        return True

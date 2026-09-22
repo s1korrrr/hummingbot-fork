@@ -311,6 +311,69 @@ def test_rsi_v5_held_recovery_high_water_and_sell_action_match_while_entries_dis
     assert wrapped.can_create_executor(1) is False
 
 
+def _refuse_log(caplog):
+    return ' '.join(caplog.messages)
+
+
+def test_can_create_executor_refusal_reasons_are_distinguishable(caplog):
+    caplog.set_level('WARNING')
+    wrapped, _legacy = controllers(*FAMILIES[0])
+    assert wrapped.can_create_executor(1) is False
+    assert 'execution_enabled' in _refuse_log(caplog)
+    assert 'entry_ready' not in _refuse_log(caplog)
+
+    caplog.clear()
+    data = DataPolicy(mode='shared', transport='stream', origin='http://127.0.0.1:8100', token_file='/unused')
+    wrapped, _legacy = controllers(*FAMILIES[0], data=data, execution_enabled=True)
+    seed_shared(wrapped, base_frame())
+    assert wrapped.can_create_executor(1) is False
+    assert 'entry_ready' in _refuse_log(caplog)
+    assert 'execution_enabled' not in _refuse_log(caplog)
+
+    caplog.clear()
+    wrapped.shared_candles.entry_ready = lambda: True
+    wrapped._composition_digest = '0' * 64
+    assert wrapped.can_create_executor(1) is False
+    assert 'composition_unchanged' in _refuse_log(caplog)
+    assert 'entry_ready' not in _refuse_log(caplog)
+
+
+def test_unsellable_dust_does_not_pin_exits_or_freeze_entry_fuse(recorder):
+    from copy import deepcopy
+
+    class Store:
+        value = {
+            'version': 1, 'candle': 1789975920, 'armed': False,
+            'consumed_candle': 1789975920,
+            'authorization': {'executor_id': 'HrpMkRDi', 'fingerprint': 'a' * 64,
+                              'candle': 1789975920, 'dispatched': True},
+        }
+
+        def load(self):
+            return deepcopy(self.value)
+
+        def save(self, previous, current):
+            assert previous == self.value
+            self.value = deepcopy(current)
+
+    wrapped, _legacy = controllers(*FAMILIES[0], execution_enabled=True)
+    wrapped._entry_decision_store = Store()
+    wrapped._executor_row_exists = lambda executor_id: True
+    persist_position(recorder, wrapped.config.id, amount=D('0.00005'))
+    wrapped.positions_held = [SimpleNamespace(connector_name='okx', trading_pair='BTC-USDC', side=TradeType.BUY,
+                                              amount=D('0.00005'), breakeven_price=D('100'))]
+    wrapped.processed_data = dict(signal=0, candle_timestamp=1789975980, data_health={'ready': True},
+                                  signal_state={'condition_ok': True, 'raw_buy_candidate': False})
+    wrapped._last_evaluated_candle_timestamp = 1789975980
+    wrapped.market_data_provider.time.return_value = 1789976040.0
+    assert wrapped.determine_executor_actions() == []
+    assert wrapped._recovery_fault is None
+    assert wrapped._compute_plan_fields()['plan_mode'] == 'ENTRIES'
+    state = wrapped._entry_decision_store.value
+    assert state['consumed_candle'] == 0
+    assert state['authorization'] is None
+
+
 def persist_position(recorder, owner, *, amount=D('1')):
     from hummingbot.model.position import Position
     with recorder.sql_manager.get_new_session() as session:

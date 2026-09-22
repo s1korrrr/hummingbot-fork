@@ -177,6 +177,44 @@ async def test_native_protective_stop_exits_filled_inventory_when_entries_paused
         assert executor.close_type == CloseType.STOP_LOSS
         assert executor.close_filled_amount == amount
         assert session._connector.get_balance('BTC') == 0
+        assert executor.close_order_side is TradeType.SELL
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_expired_unfilled_entry_unblocks_next_breakout_after_cache_eviction(tmp_path):
+    from hummingbot.strategy_v2.models.executors import CloseType
+    session = NativePaperSession(paper(), [config(execution_enabled=True)], tmp_path / 'expire.sqlite')
+    try:
+        receipt = await session.step(600000, **inputs())
+        assert len(receipt['actions']) == 1
+        first = session.executor_orchestrator.active_executors['breakout_reference'][0]
+        assert first.config.side is TradeType.BUY
+        assert first.open_filled_amount == 0
+        sequence = 3
+        for ts in range(600061, 600200, 15):
+            await session.step(ts, books=[dict(trading_pair=PAIR, sequence=sequence, timestamp=ts,
+                                               bids=[(99, 10)], asks=[(101, 10)])])
+            sequence += 1
+            if first._open_order and first._open_order.order and first._open_order.order.is_cancelled:
+                break
+        assert first._open_order.order.is_cancelled
+        session._connector._order_tracker._cached_orders.clear()
+        for ts in range(ts + 1, ts + 12):
+            await session.step(ts, books=[dict(trading_pair=PAIR, sequence=sequence, timestamp=ts,
+                                               bids=[(99, 10)], asks=[(101, 10)])])
+            sequence += 1
+            if first.is_closed:
+                break
+        assert first.is_closed
+        assert first.close_type == CloseType.EXPIRED
+        assert first.open_filled_amount == 0
+        later = 600240
+        receipt = await session.step(later, **inputs(later, sequence=sequence))
+        assert len(receipt['actions']) == 1
+        assert receipt['actions'][0].executor_config.id != first.config.id
+        assert receipt['actions'][0].executor_config.side is TradeType.BUY
     finally:
         await session.close()
 
@@ -250,6 +288,25 @@ async def test_missing_or_stale_native_book_cannot_emit_reference_create(tmp_pat
         assert not session._connector.ready
         assert not controller.validate_executor_config(actions[0].executor_config)
         assert controller.determine_executor_actions() == []
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_allocation_errors_are_observable(tmp_path):
+    session = NativePaperSession(paper(), [config(execution_enabled=True)], tmp_path / 'alloc.sqlite')
+    try:
+        controller = session.controllers['breakout_reference']
+        session._connector.tick(600000)
+        session._connector.set_order_book(**inputs()['books'][0])
+        session.market_data_provider.set_candles(**inputs()['candles'][0])
+        await controller.update_processed_data()
+        assert controller.processed_data['data_health']['ready']
+        with patch.object(session.market_data_provider, 'get_trading_rules', side_effect=ValueError('no native rules')):
+            assert controller.determine_executor_actions() == []
+        reason = controller.processed_data['data_health']['reason']
+        assert reason.startswith('allocation_unavailable:')
+        assert 'no native rules' in reason
     finally:
         await session.close()
 

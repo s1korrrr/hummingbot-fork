@@ -5,6 +5,7 @@ from unittest import IsolatedAsyncioTestCase
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import NativePaperTradeExchange
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
@@ -208,3 +209,67 @@ class NativePaperTradeTests(IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'actual fee'):
             target.restore_tracking_states(state)
         self.assertEqual(target.get_balance('USDC'), D('1000'))
+
+    async def test_canceled_empty_entry_reconciles_after_tracker_cache_eviction(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        live = market._order_tracker.fetch_order(oid)
+        self.assertTrue(live.is_cancelled)
+        self.assertEqual(live.executed_amount_base, D('0'))
+        market._order_tracker._cached_orders.clear()
+        self.assertIsNone(market._order_tracker.fetch_order(oid))
+        update = await market._request_order_status(live)
+        self.assertEqual(update.new_state, OrderState.CANCELED)
+        self.assertEqual(update.client_order_id, oid)
+        self.assertEqual(update.exchange_order_id, live.exchange_order_id)
+        proof = update.misc_updates['terminal_reconciliation']
+        self.assertEqual(proof['filled_base'], '0')
+        self.assertEqual(proof['state'], 'CANCELED')
+        self.assertEqual(proof['source'], 'native_paper_terminal_v1')
+
+    async def test_terminal_status_matches_order_ids_not_python_identity(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        live = market._order_tracker.fetch_order(oid)
+        clone = type(live).from_json(live.to_json())
+        self.assertIsNot(clone, live)
+        update = await market._request_order_status(clone)
+        self.assertEqual(update.new_state, OrderState.CANCELED)
+        self.assertEqual(update.client_order_id, oid)
+        self.assertEqual(update.misc_updates['terminal_reconciliation']['filled_base'], '0')
+
+    async def test_mismatched_exchange_order_id_fails_closed(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        live = market._order_tracker.fetch_order(oid)
+        clone = type(live).from_json(live.to_json())
+        clone.update_exchange_order_id('paper-other')
+        with self.assertRaisesRegex(ValueError, 'Paper order identity is unavailable for native reconciliation'):
+            await market._request_order_status(clone)
+
+    async def test_tracking_states_keep_canceled_orders_after_cache_eviction(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        market._order_tracker._cached_orders.clear()
+        state = market.tracking_states
+        self.assertIn(oid, state['orders'])
+        restored = paper()
+        restored.restore_tracking_states(state)
+        restored.set_order_book(PAIR, 2, 1000, [(D('99'), D('10'))], [(D('101'), D('10'))])
+        tracked = restored._order_tracker.fetch_order(oid)
+        self.assertIsNotNone(tracked)
+        update = await restored._request_order_status(tracked)
+        self.assertEqual(update.new_state, OrderState.CANCELED)
+        self.assertEqual(update.misc_updates['terminal_reconciliation']['order_id'], oid)

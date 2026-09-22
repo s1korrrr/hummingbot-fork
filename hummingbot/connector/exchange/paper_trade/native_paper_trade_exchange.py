@@ -83,10 +83,12 @@ class NativePaperTradeExchange(ExchangeBase):
     buy/sell/cancel calls. ``process_trade`` accepts monotonic per-pair sequence IDs.
     MARKET orders are IOC: available depth fills, then residual quantity cancels.
     Snapshots emitted through ``tracking_states`` are native recorder compatible.
+    Canceled and filled orders stay authoritative for terminal reconciliation by
+    client and exchange order id after the shared tracker cache expires.
     """
 
     def __init__(self, trading_rules, *, fee_schema=None, name='okx_paper_trade',
-                 max_data_age=5.0, trade_participation=Decimal('.1')):
+                 max_data_age=5.0, trade_participation=Decimal('.1'), max_unresolved_orders=1000):
         if not name.endswith('_paper_trade') or 'perpetual' in name:
             raise ValueError('An explicit spot paper connector name is required')
         self._paper_name = name
@@ -125,6 +127,11 @@ class NativePaperTradeExchange(ExchangeBase):
         self._operation_lock = asyncio.Lock()
         self._restored = False
         self._execution_started = False
+        self._terminal_orders = {}
+        self._terminal_recorder = None
+        if type(max_unresolved_orders) is not int or max_unresolved_orders < 1:
+            raise ValueError('Positive terminal evidence capacity required')
+        self.max_unresolved_orders = max_unresolved_orders
         self._contract = hashlib.sha256(json.dumps({
             'name': name, 'rules': {p: repr(r) for p, r in sorted(self._rules.items())},
             'maker': str(self._fee_policy.maker_percent_fee_decimal),
@@ -237,12 +244,55 @@ class NativePaperTradeExchange(ExchangeBase):
     def supports_terminal_fill_reconciliation(self):
         return True
 
-    async def _request_order_status(self, tracked_order):
-        await self.drain()
+    def bind_terminal_recorder(self, recorder):
+        if self._terminal_recorder is not None and self._terminal_recorder is not recorder:
+            raise ValueError('Paper terminal recorder already bound')
+        self._terminal_recorder = recorder
+
+    def _recorded_terminal(self, order):
+        if self._terminal_recorder is None:
+            return None
+        from .terminal_recorder import recorded_terminal_order
+        return recorded_terminal_order(self._terminal_recorder, self, order)
+
+    def _compact_terminal_orders(self):
+        # Reads use a separate session after event writes commit. Failed/missing
+        # proof retains the object. Protective SELLs and cancels remain possible.
+        for key, order in list(self._terminal_orders.items()):
+            recorded = self._recorded_terminal(order)
+            if recorded is not None:
+                if recorded.current_state != order.current_state:
+                    raise ValueError('Native paper terminal state differs')
+                del self._terminal_orders[key]
+
+    def _remember_terminal(self, order):
+        if order.current_state not in {OrderState.CANCELED, OrderState.FILLED}:
+            raise ValueError('Only canceled or filled paper orders are terminal')
+        existing = self._terminal_orders.get(order.client_order_id)
+        if (existing is not None
+                and existing.exchange_order_id != order.exchange_order_id):
+            raise ValueError('Paper terminal order identity conflict')
+        self._terminal_orders[order.client_order_id] = order
+
+    def _authoritative_order(self, tracked_order):
+        if tracked_order is None or not tracked_order.client_order_id:
+            raise ValueError('Paper order identity is unavailable for native reconciliation')
         order = self._order_tracker.fetch_order(tracked_order.client_order_id)
-        if (order is None or order is not tracked_order
+        if order is None:
+            order = self._terminal_orders.get(tracked_order.client_order_id)
+        if order is None:
+            order = self._recorded_terminal(tracked_order)
+        if (order is None
+                or order.client_order_id != tracked_order.client_order_id
+                or order.exchange_order_id is None
+                or tracked_order.exchange_order_id is None
                 or order.exchange_order_id != tracked_order.exchange_order_id):
             raise ValueError('Paper order identity is unavailable for native reconciliation')
+        return order
+
+    async def _request_order_status(self, tracked_order):
+        await self.drain()
+        order = self._authoritative_order(tracked_order)
         misc = None
         if order.current_state in {OrderState.CANCELED, OrderState.FILLED}:
             misc = {'terminal_reconciliation': terminal_reconciliation(
@@ -335,6 +385,9 @@ class NativePaperTradeExchange(ExchangeBase):
 
     def _submit(self, pair, amount, order_type, price, side, kwargs):
         self._require_fresh(pair)
+        if (side == TradeType.BUY and
+                len(self._terminal_orders) + len(self.in_flight_orders) >= self.max_unresolved_orders):
+            raise ValueError('Unresolved terminal evidence capacity reached; acquisition paused')
         if order_type not in self.supported_order_types() or kwargs.get('leverage', 1) != 1:
             raise ValueError('Only unleveraged spot orders are supported')
         amount = self.quantize_order_amount(pair, _decimal(amount, positive=True))
@@ -367,6 +420,8 @@ class NativePaperTradeExchange(ExchangeBase):
     async def _update(self, order, state):
         await self._order_tracker.process_order_update(OrderUpdate(
             order.trading_pair, self.current_timestamp, state, order.client_order_id, order.exchange_order_id))
+        if order.current_state in {OrderState.CANCELED, OrderState.FILLED}:
+            self._remember_terminal(order)
 
     async def _open(self, order):
         async with self._operation_lock:
@@ -394,6 +449,7 @@ class NativePaperTradeExchange(ExchangeBase):
         while self._pending:
             pending, self._pending = self._pending, []
             await asyncio.gather(*pending)
+        self._compact_terminal_orders()
 
     def cancel(self, trading_pair, client_order_id):
         order = self._order_tracker.fetch_tracked_order(client_order_id)
@@ -478,11 +534,14 @@ class NativePaperTradeExchange(ExchangeBase):
 
     @property
     def tracking_states(self):
+        orders = {key: value.to_json() for key, value in self._order_tracker.all_orders.items() if not value.is_done}
+        for key, value in self._terminal_orders.items():
+            orders.setdefault(key, value.to_json())
         return {
             'schema': 'native_spot_paper_v1', 'contract': self._contract,
             'timestamp': self.current_timestamp,
             'balances': {asset: str(value) for asset, value in self._account_balances.items()},
-            'orders': {key: value.to_json() for key, value in self._order_tracker.all_orders.items()},
+            'orders': orders,
             'trade_sequence': dict(self._trade_sequence), 'book_sequence': dict(self._book_sequence),
         }
 
@@ -555,12 +614,17 @@ class NativePaperTradeExchange(ExchangeBase):
         if any(cost > balances.get(asset, ZERO) for asset, cost in reserved.items()):
             raise ValueError('Restored orders exceed paper balances')
         tracker = ClientOrderTracker(self)
+        terminals = {}
         for order in orders:
             tracker.start_tracking_order(order)
             if order.is_done:
                 tracker.stop_tracking_order(order.client_order_id)
+                if order.current_state not in {OrderState.CANCELED, OrderState.FILLED}:
+                    raise ValueError('Invalid native paper order identity')
+                terminals[order.client_order_id] = order
         self._account_balances = balances
         self._order_tracker = tracker
+        self._terminal_orders = terminals
         self._paper_time = max(timestamp, self._paper_time)
         self._trade_sequence = dict(state['trade_sequence'])
         self._book_sequence = dict(state['book_sequence'])

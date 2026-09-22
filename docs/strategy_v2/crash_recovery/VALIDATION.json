@@ -1,0 +1,152 @@
+{
+  "schema": "crash_recovery_v2.validation.v1",
+  "remote_parent": "fd3592dff2993bb4c7a0ff69bb594d673362b02c",
+  "scope": "partial_source_no_order_contracts",
+  "environment": {
+    "python": "3.13.5",
+    "pydantic": "2.13.4",
+    "pandas": "2.2.3",
+    "native_runtime": "UNAVAILABLE",
+    "parent_packages": "namespace staging, not full native initialization"
+  },
+  "final_tests": {
+    "command": "PYTHONPATH=. python -m pytest -q -W error test/crash_recovery_v2",
+    "exit_code": 0,
+    "passed": 84,
+    "skipped": 0,
+    "failed": 0,
+    "economic": false
+  },
+  "compileall": {
+    "exit_code": 0
+  },
+  "native_import_probe": {
+    "exit_code": 1,
+    "error": "ModuleNotFoundError: No module named 'hummingbot.connector'"
+  },
+  "independent_audit": "NOT_RUN",
+  "economic_backtest": "NOT_RUN",
+  "deployment": "NOT_RUN",
+  "source_files": [
+    {
+      "path": "controllers/generic/crash_recovery_v2_core/__init__.py",
+      "bytes": 80,
+      "sha256": "287c717649d4d5d2f753445db643e2cb35710b72e3c42823bcf809f66339457c",
+      "git_blob_sha1": "f850f688160c037d7c9578f7d12c023719c950eb"
+    },
+    {
+      "path": "controllers/generic/crash_recovery_v2_core/recipe.py",
+      "bytes": 4507,
+      "sha256": "3179f511399263538ec59c2214f827ea304012c93f8c911a2bfba9fb6376cdc3",
+      "git_blob_sha1": "2813a0728493b940b10a14f7b26c2291fc73d50e"
+    },
+    {
+      "path": "controllers/generic/crash_recovery_v2_core/runtime.py",
+      "bytes": 7902,
+      "sha256": "6857bed4e5e5e632bb8c643618963ec42a5f1ca51d14cf6a26c5cac988eb99d2",
+      "git_blob_sha1": "57b24eee3c38bb8ce9ba8f3b1dd4d80e33714467"
+    },
+    {
+      "path": "hummingbot/strategy_v2/components/market_stress_v1.py",
+      "bytes": 11003,
+      "sha256": "4fcd4814d85dbfe59399675773487aaa4203bcc856c40bcd6c982e9e04564cde",
+      "git_blob_sha1": "6dc4a8a1bb4478aa06a130aa8cab2eb363e3d1bf"
+    },
+    {
+      "path": "hummingbot/strategy_v2/components/recovery_evidence_v1.py",
+      "bytes": 7588,
+      "sha256": "bdc7f318197a5894355a075252c339f535ae5c17ffbce583d3e6f7f6034d5e6a",
+      "git_blob_sha1": "b1ce08af8025a61b241bf73dd39d72cc8c368073"
+    },
+    {
+      "path": "test/crash_recovery_v2/__init__.py",
+      "bytes": 72,
+      "sha256": "14985c1668c5d673ab98c0f4d5e1d43579d6e333a01443248e5135c81105f3e8",
+      "git_blob_sha1": "d7ebafb42074c62f309b210ed045f9fb3d08ed60"
+    },
+    {
+      "path": "test/crash_recovery_v2/test_composition.py",
+      "bytes": 9243,
+      "sha256": "90327b77238b8bebaf8d6c453055f5731d5dc44eabad261fa68dd19ce7dcfcc0",
+      "git_blob_sha1": "b2559c90dcd08da30c2cee59c668546b5bbe2894"
+    },
+    {
+      "path": "test/crash_recovery_v2/test_evidence.py",
+      "bytes": 14128,
+      "sha256": "5d489e649300b16e096d9e631f3a341db0e8a78498a48128708a78078cdb2d23",
+      "git_blob_sha1": "b51e67e00ce6f61ae77619570604ed2b78a1abe7"
+    },
+    {
+      "path": "test/crash_recovery_v2/test_isolation.py",
+      "bytes": 5332,
+      "sha256": "99223e6876b82f7d8a925286dd78315e7c6a1e7dc56f623a34bdeb9373ebefc2",
+      "git_blob_sha1": "3578bd5476d8f2a2e77808d725bd17bba44888a1"
+    }
+  ],
+  "unchanged_dependency_blobs": {
+    "config.py": "f583feeba4d07a8896b257bfebf2fc08f9410e91",
+    "domain.py": "ca2d5f64669a2c0a09011fb7ff6c05abd626ac5c",
+    "recipe_contract.py": "8a2d893a23ea9de678c81556e3b011ef3fddeee2",
+    "__init__.py": "884a57e69f0f09328a6f202481e801b9355283d5",
+    "decision_protocol.py": "d743dac6b90ffd458289410e1f93ae460cd41a7c",
+    "source_identity.py": "98347399c588f2804292a29d8f6cddb2e6775d63",
+    "candle_data.py": "bad900e2b6a337283de34766a0bc79bcbe0174b7",
+    "strict_json.py": "c6b0c8e5c7560f6943b61c7fefbc994f6b67aabb"
+  },
+  "retained_attempts": [
+    {
+      "name": "M1 seed RED",
+      "exit_code": 1,
+      "reason": "missing specified component before implementation"
+    },
+    {
+      "name": "M1 transport RED",
+      "exit_code": 1,
+      "reason": "old publication accepted after delayed first receipt; fixed both ages"
+    },
+    {
+      "name": "M2 RED",
+      "exit_code": 1,
+      "reason": "missing composition before implementation"
+    },
+    {
+      "name": "M2 first",
+      "exit_code": 1,
+      "passed": 72,
+      "failed": 1,
+      "reason": "test expected HOLD for canonical event-regression exception; expectation corrected"
+    },
+    {
+      "name": "validation hardening RED",
+      "exit_code": 1,
+      "failed": 2,
+      "reason": "missing price evidence and recovery checkpoint accepted; guards added"
+    },
+    {
+      "name": "subprocess isolation first",
+      "exit_code": 1,
+      "passed": 82,
+      "failed": 1,
+      "reason": "stdlib test package shadowed task helpers; test path fixed"
+    },
+    {
+      "name": "new-shock low RED",
+      "exit_code": 1,
+      "reason": "previous recovered low reused; fresh shock reference added"
+    }
+  ],
+  "ci_selection": {
+    "path": ".github/workflows/modular-native.yml",
+    "source_blob_sha1": "122ccf3039c06e27420318d3e6500cad496cd73e",
+    "candidate_blob_sha1": "455cace5252c3da9f6402c24311d5f2acd266dc1",
+    "change": "three additive lines: two path filters and the new test directory",
+    "hosted_execution": "NOT_RUN",
+    "workflow_syntax": "YAML parse and embedded bash -n passed"
+  },
+  "partial_workspace_all_tests": {
+    "command": "PYTHONPATH=. python -m pytest -q -W error",
+    "passed": 84,
+    "exit_code": 0,
+    "scope": "same partial source workspace, NOT full native repository"
+  }
+}

@@ -169,6 +169,33 @@ class NativePaperExecutorTests(IsolatedAsyncioTestCase):
         self.assertEqual(executor.open_filled_amount, D('.2'))
         self.assertEqual(len(executor._entry_orders()), 1)
 
+    async def test_unfilled_single_attempt_expires_after_tracker_cache_eviction(self):
+        market = paper()
+        executor = PositionExecutor(PaperStrategyBridge(market), PositionExecutorConfig(
+            id='paper-empty-expiry', timestamp=1000, connector_name=market.name, trading_pair=PAIR,
+            side=TradeType.BUY, amount=D('1'), entry_price=D('99'), entry_order_policy='single_attempt',
+            triple_barrier_config=TripleBarrierConfig(open_order_type=OrderType.LIMIT,
+                                                      open_order_limit_max_age_seconds=1)))
+        executor.register_events()
+        self.addCleanup(executor.unregister_events)
+        executor._status = RunnableStatus.RUNNING
+        await executor.control_task()
+        await market.drain()
+        market.tick(1002)
+        await executor.control_task()
+        await market.drain()
+        self.assertTrue(executor._open_order.order.is_cancelled)
+        self.assertEqual(executor.open_filled_amount, D('0'))
+        market._order_tracker._cached_orders.clear()
+        await executor.control_task()
+        task = executor._entry_expiry_reconciliation_task
+        if task is not None:
+            await task
+        await executor.control_task()
+        self.assertTrue(executor._open_order_expiry_reconciled)
+        self.assertEqual(executor.close_type, CloseType.EXPIRED)
+        self.assertTrue(executor.is_closed)
+
     async def test_orchestrator_default_start_and_explicit_scheduler_keep_native_class(self):
         from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
         from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction

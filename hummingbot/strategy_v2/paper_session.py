@@ -101,7 +101,22 @@ class InjectedPaperMarketData(MarketDataProvider):
 
     def set_candles(self, connector_name, trading_pair, interval, frame, *, available_at):
         validated = self.validate_candles_input(connector_name, trading_pair, interval, frame, available_at=available_at)
-        self._frames[(connector_name, trading_pair, interval)] = validated
+        key = (connector_name, trading_pair, interval)
+        self._frames[key] = validated
+        if not hasattr(self, '_frame_publications'):
+            self._frame_publications = {}
+        prior = self._frame_publications.get(key, (0, 0))
+        self._frame_publications[key] = (prior[0] + 1, available_at)
+
+    def get_candle_snapshot(self, dataset):
+        from hummingbot.strategy_v2.components.candle_data import Candle, CandleSnapshot
+        frame = self.get_candles_df(dataset.connector, dataset.trading_pair, dataset.interval, dataset.history)
+        key = (dataset.connector, dataset.trading_pair, dataset.interval)
+        sequence, available = self._frame_publications[key]
+        return CandleSnapshot(dataset=dataset, epoch='injected-paper', sequence=sequence, published_at=available,
+                              rows=tuple(Candle(open_time=int(row.timestamp), open=row.open, high=row.high,
+                                                low=row.low, close=row.close, volume=row.volume)
+                                         for row in frame.itertuples(index=False)))
 
     def get_candles_df(self, connector_name, trading_pair, interval, max_records=500):
         from controllers.generic.modular_spot_core.domain import DataUnavailable
@@ -146,8 +161,9 @@ class NativePaperSession:
             raise RuntimeError('Paper session refuses an existing active rate oracle')
         configs = list(controller_configs)
         from controllers.generic.component_breakout import ComponentBreakoutConfig
+        from controllers.generic.momentum_fusion_v2 import MomentumFusionV2Config
         from controllers.generic.rsi_modular import CONFIG_PROFILES
-        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(), ComponentBreakoutConfig)
+        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(), ComponentBreakoutConfig, MomentumFusionV2Config)
         if not configs or len({c.id for c in configs}) != len(configs):
             raise ValueError('Distinct native paper controller identities required')
         for config in configs:
@@ -385,13 +401,7 @@ class NativePaperSession:
         started, self._started = self._started, []
         for executor in started:
             await executor.on_start()
-        for key, executors in self.executor_orchestrator.active_executors.items():
-            if key not in fresh_ids:
-                continue
-            for executor in list(executors):
-                if not executor.is_closed:
-                    await executor.control_task()
-                    await self._connector.drain()
+        await self._drive_executors(fresh_ids)
         self.executor_orchestrator.sync_live_state_to_db(controller_ids=fresh_ids)
         reports = self._refresh_reports(controller_ids=fresh_ids)
         reasons = []
@@ -409,6 +419,40 @@ class NativePaperSession:
                 reasons.append(f'{key}: unfinished_native_executors_require_reconciliation')
         return {'actions': actions, 'reports': reports, 'market_state': self._connector.tracking_states,
                 'readiness': {'ready': not reasons, 'reasons': reasons}}
+
+    async def _control_open_executors(self, fresh_ids):
+        for key, executors in self.executor_orchestrator.active_executors.items():
+            if key not in fresh_ids:
+                continue
+            for executor in list(executors):
+                if not executor.is_closed:
+                    await executor.control_task()
+                    await self._connector.drain()
+
+    async def _drive_executors(self, fresh_ids):
+        await self._control_open_executors(fresh_ids)
+        pending = []
+        follow_up = {}
+        for key, executors in self.executor_orchestrator.active_executors.items():
+            if key not in fresh_ids:
+                continue
+            for executor in executors:
+                for name in ('_entry_expiry_reconciliation_task', '_funding_entry_reconciliation_task'):
+                    task = getattr(executor, name, None)
+                    if task is not None and not task.done():
+                        pending.append(task)
+                        follow_up.setdefault(id(executor), (key, executor))
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+        # Only task owners need another transition; unrelated executors keep
+        # the same single-pass semantics as a step without reconciliation.
+        for key, executor in follow_up.values():
+            active = self.executor_orchestrator.active_executors.get(key, ())
+            if executor.is_closed or not any(item is executor for item in active):
+                continue
+            await executor.control_task()
+            await self._connector.drain()
 
     def unavailable_exposure(self):
         pairs = {executor.config.trading_pair for executors in self.executor_orchestrator.active_executors.values()

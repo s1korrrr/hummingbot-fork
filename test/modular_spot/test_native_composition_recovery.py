@@ -162,3 +162,29 @@ def test_transient_inventory_change_rolls_back_uncommitted_native_peak_reset(rec
     assert len(actions) == 1 and actions[0].executor_config.side == TradeType.SELL
     assert result._recovery_hold is None
     assert result._recovery_store.previous.pending_reductions[0].prior_peak == D('102')
+
+
+def test_empty_book_source_hash_change_reseals_instead_of_faulting(recorder):
+    first = owner()
+    assert first.determine_executor_actions() == []
+    assert first._recovery_fault is None
+    previous = first._recovery_store.previous
+    assert previous is not None and previous.positions == ()
+    second = owner()
+    second._native_source_hash = 'b' * 64
+    assert second.determine_executor_actions() == []
+    assert second._recovery_fault is None
+    sealed = second._recovery_store.previous
+    assert sealed.source_sha256 == 'b' * 64
+    assert sealed.positions == ()
+    assert sealed.sequence == previous.sequence + 1
+
+
+def test_source_hash_change_with_held_inventory_still_requires_reconciliation(recorder):
+    armed_owner(recorder)
+    result = owner()
+    result._native_source_hash = 'b' * 64
+    observe(result)
+    assert result.determine_executor_actions() == []
+    assert 'source/configuration changed' in result._recovery_fault
+    assert result._recovery_trails == {}

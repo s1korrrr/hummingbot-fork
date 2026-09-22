@@ -318,6 +318,9 @@ class NativeComposition:
         config = super().get_executor_config(*args, **kwargs)
         if self.config.funding is not None and config.side == TradeType.BUY:
             config.require_terminal_entry_reconciliation = True
+            pending = getattr(self, '_down_only_pending_configs', None)
+            if isinstance(pending, dict) and config.id in pending:
+                pending[config.id] = config.model_copy(deep=True)
         return config
 
     def update_config(self, new_config):

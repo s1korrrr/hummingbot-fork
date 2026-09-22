@@ -976,8 +976,12 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     def test_time_synchronizer_related_request_error_detection(self):
         exception = IOError("Error executing request POST https://okx.com/api/v3/order. HTTP status is 401. "
-                            'Error: {"code":"50113","msg":"message"}')
+                            'Error: {"code":"50102","msg":"Timestamp request expired."}')
         self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(exception))
+
+        exception = IOError("Error executing request POST https://okx.com/api/v3/order. HTTP status is 401. "
+                            'Error: {"code":"50113","msg":"Invalid Sign"}')
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(exception))
 
         exception = IOError("Error executing request POST https://okx.com/api/v3/order. HTTP status is 401. "
                             'Error: {"code":"50114","msg":"message"}')

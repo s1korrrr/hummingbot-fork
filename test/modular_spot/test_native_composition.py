@@ -18,7 +18,7 @@ from controllers.generic.modular_spot_core.data_reader import DataPolicy
 from controllers.generic.modular_spot_core.native_composition import required_shared_history, source_files, source_root
 from controllers.generic.modular_spot_core.native_recipe import NativePolicyRecipe
 from controllers.generic.modular_spot_core.recipe_compiler import bind_native_bundle, parse_recipe, write_bundle
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.strategy_v2.models.base import RunnableStatus
 
 recorder = _recorder_fixture
@@ -372,6 +372,66 @@ def test_unsellable_dust_does_not_pin_exits_or_freeze_entry_fuse(recorder):
     state = wrapped._entry_decision_store.value
     assert state['consumed_candle'] == 0
     assert state['authorization'] is None
+
+
+def test_empty_book_source_hash_change_reseals_and_releases_dust_fuse(recorder):
+    from copy import deepcopy
+
+    class Store:
+        value = {
+            'version': 1, 'candle': 1789975920, 'armed': False,
+            'consumed_candle': 1789975920,
+            'authorization': {'executor_id': 'HrpMkRDi', 'fingerprint': 'a' * 64,
+                              'candle': 1789975920, 'dispatched': True},
+        }
+
+        def load(self):
+            return deepcopy(self.value)
+
+        def save(self, previous, current):
+            assert previous == self.value
+            self.value = deepcopy(current)
+
+    first, _legacy = controllers(*FAMILIES[0], execution_enabled=True)
+    assert first.determine_executor_actions() == []
+    assert first._recovery_fault is None
+    prior = first._recovery_store.previous
+    assert prior is not None and prior.positions == ()
+
+    wrapped, _ = controllers(*FAMILIES[0], execution_enabled=True)
+    wrapped._native_source_hash = 'b' * 64
+    wrapped._entry_decision_store = Store()
+    wrapped._executor_row_exists = lambda executor_id: True
+    persist_position(recorder, wrapped.config.id, amount=D('0.00005'))
+    wrapped.positions_held = [SimpleNamespace(connector_name='okx', trading_pair='BTC-USDC', side=TradeType.BUY,
+                                              amount=D('0.00005'), breakeven_price=D('100'))]
+    wrapped.processed_data = dict(signal=0, candle_timestamp=1789975980, data_health={'ready': True},
+                                  signal_state={'condition_ok': True, 'raw_buy_candidate': False})
+    wrapped._last_evaluated_candle_timestamp = 1789975980
+    wrapped.market_data_provider.time.return_value = 1789976040.0
+    assert wrapped.determine_executor_actions() == []
+    assert wrapped._recovery_fault is None
+    sealed = wrapped._recovery_store.previous
+    assert sealed.source_sha256 == 'b' * 64
+    assert sealed.positions == ()
+    assert sealed.sequence == prior.sequence + 1
+    assert wrapped._compute_plan_fields()['plan_mode'] == 'ENTRIES'
+    state = wrapped._entry_decision_store.value
+    assert state['consumed_candle'] == 0
+    assert state['authorization'] is None
+
+
+def test_down_only_pending_configs_tracks_terminal_entry_reconciliation():
+    wrapped, _legacy = controllers(
+        *FAMILIES[0], execution_enabled=True, entry_acquisition_policy='down_only_maker_v1')
+    prices = {PriceType.MidPrice: D('100.005'), PriceType.BestBid: D('100'), PriceType.BestAsk: D('100.01')}
+    wrapped.market_data_provider.get_price_by_type.side_effect = (
+        lambda connector, pair, price_type: prices[price_type])
+    cfg = wrapped.get_executor_config(TradeType.BUY, D('100'), D('.3'))
+    pending = wrapped._down_only_pending_configs[cfg.id]
+    assert cfg.require_terminal_entry_reconciliation is True
+    assert pending.require_terminal_entry_reconciliation is True
+    assert pending.model_dump(mode='python') == cfg.model_dump(mode='python')
 
 
 def persist_position(recorder, owner, *, amount=D('1')):

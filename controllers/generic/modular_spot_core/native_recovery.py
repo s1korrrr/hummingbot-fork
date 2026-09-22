@@ -164,20 +164,24 @@ class NativeRecoveryStore:
                 raise PolicyError('unpersisted native recovery trails cannot initialize a new checkpoint')
         else:
             previous = self.previous
-            if (previous.family != self.owner._native_family or previous.source_sha256 != self.source_hash
-                    or previous.configuration_sha256 != self.owner._composition_digest):
+            if previous.family != self.owner._native_family:
                 raise PolicyError('native held recovery source/configuration changed; explicit reconciliation required')
             if previous.positions != positions:
                 raise PolicyError('native inventory changed across restart; explicit held recovery reconciliation required')
-            self._verify_pending()
-            if self.owner._recovery_trails:
-                raise PolicyError('native recovery state was mutated before checkpoint restoration')
-            if self.owner._native_family == 'ok_rsi':
-                from controllers.directional_trading.hl_rsi import RecoveryTrailState
-            else:
-                from controllers.directional_trading.rsi_v5 import RecoveryTrailState
-            self.owner._recovery_trails = {
-                trail.position_key: RecoveryTrailState(**trail.model_dump()) for trail in previous.trails}
+            source_changed = (previous.source_sha256 != self.source_hash
+                              or previous.configuration_sha256 != self.owner._composition_digest)
+            if source_changed and positions:
+                raise PolicyError('native held recovery source/configuration changed; explicit reconciliation required')
+            if not source_changed:
+                self._verify_pending()
+                if self.owner._recovery_trails:
+                    raise PolicyError('native recovery state was mutated before checkpoint restoration')
+                if self.owner._native_family == 'ok_rsi':
+                    from controllers.directional_trading.hl_rsi import RecoveryTrailState
+                else:
+                    from controllers.directional_trading.rsi_v5 import RecoveryTrailState
+                self.owner._recovery_trails = {
+                    trail.position_key: RecoveryTrailState(**trail.model_dump()) for trail in previous.trails}
         self.restored = True
         return positions
 

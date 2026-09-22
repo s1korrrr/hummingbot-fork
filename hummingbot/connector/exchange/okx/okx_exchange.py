@@ -21,9 +21,17 @@ from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTr
 from hummingbot.core.data_type.terminal_reconciliation import terminal_reconciliation
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+
+
+def _discard_task_result(task: asyncio.Task) -> None:
+    try:
+        task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
 
 
 class OkxOrderRejectedError(IOError):
@@ -59,6 +67,7 @@ class OkxExchange(ExchangePyBase):
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self._spot_ticker_lock = asyncio.Lock()
         self._spot_ticker_cache = None
+        self.check_network_timeout = 30.0
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
         if os.environ.get('RSIBOT_V2_DURABLE_ORDER_TRACKING') == '1':
@@ -125,6 +134,30 @@ class OkxExchange(ExchangePyBase):
     def check_network_request_path(self):
         return CONSTANTS.OKX_SERVER_TIME_PATH
 
+    async def check_network(self) -> NetworkStatus:
+        probe = asyncio.create_task(self._make_network_check_request())
+        try:
+            done, _pending = await asyncio.wait({probe}, timeout=4.0)
+            if probe not in done:
+                probe.cancel()
+                probe.add_done_callback(_discard_task_result)
+                if getattr(self, "_okx_time_ok", False):
+                    return NetworkStatus.CONNECTED
+                return NetworkStatus.NOT_CONNECTED
+            exc = probe.exception()
+            if exc is not None:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc
+                self._okx_time_ok = False
+                return NetworkStatus.NOT_CONNECTED
+            self._okx_time_ok = True
+            return NetworkStatus.CONNECTED
+        except asyncio.CancelledError:
+            if not probe.done():
+                probe.cancel()
+                probe.add_done_callback(_discard_task_result)
+            raise
+
     @property
     def trading_pairs(self):
         return self._trading_pairs
@@ -141,9 +174,21 @@ class OkxExchange(ExchangePyBase):
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
-        error_description = str(request_exception)
-        is_time_synchronizer_related = '"code":"50113"' in error_description
-        return is_time_synchronizer_related
+        # RESTAssistant includes the response body after "Error: ". Only an explicit
+        # timestamp rejection is safe to retry; 50113 means invalid signature.
+        try:
+            response = json.loads(str(request_exception).split("Error: ", 1)[-1])
+        except (TypeError, ValueError):
+            return False
+        return isinstance(response, dict) and response.get("code") == "50102"
+
+    async def _recover_time_synchronizer(self, rejected_generation: int):
+        # Recovery is serialized with initialization, and concurrent rejected
+        # requests reuse a successful replacement instead of flooding public/time.
+        await self._time_synchronizer.reset_server_time_offset_with_time_provider(
+            time_provider=self.web_utils.get_current_server_time(throttler=self._throttler, domain=self.domain),
+            rejected_generation=rejected_generation,
+        )
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
         # Missing history is not a terminal order acknowledgement. Keep ownership until an explicit final state.

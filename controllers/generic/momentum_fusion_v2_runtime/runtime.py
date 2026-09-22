@@ -347,18 +347,6 @@ def claim_id_for(opportunity_id: str, controller_id: str) -> str:
     return identity([opportunity_id, controller_id])
 
 
-def _sell_opportunity_id(view, claims, controller_id: str) -> str:
-    generation = 0
-    while True:
-        opportunity_id = identity({
-            'kind': 'sell', 'pair': view.trading_pair, 'generation': generation,
-        })
-        found = claims.get(claim_id_for(opportunity_id, controller_id))
-        if found is None or found.status != 'RECONCILED_TERMINAL':
-            return opportunity_id
-        generation += 1
-
-
 def _skip(reason: str) -> ActionPlan:
     return ActionPlan((), reason)
 

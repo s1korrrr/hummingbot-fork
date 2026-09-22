@@ -38,7 +38,10 @@ requires exactly one current unfinished native executor, fully proven closed
 historical owners, no outstanding orders or held-position ledger, an intact configuration/source/recipe binding, and a positive native
 terminal singleton entry receipt. Both full and terminal partial entries are
 supported. Exact remaining inventory, fees and persisted trailing state must
-match; trailing peaks are never reconstructed from a new quote.
+match; cumulative base and quote, each fill price/quantity/quote, order and trade
+identities, fee receipts and native millisecond timestamps are checked against
+the durable recorder before an executor is installed. Trailing peaks are never
+reconstructed from a new quote.
 
 Unstarted intents without native orders/fills can resume their original identity.
 An outstanding entry, triggered/in-flight exit, missing receipt, inconsistent
@@ -56,7 +59,9 @@ activation, shared live-wallet qualification or promotion authority. Both
 running rsibot stacks remain unchanged.
 
 A process lease remains held on the canonical database sidecar path for the
-fixture lifetime. A second process cannot restore the same paper account while
+fixture lifetime, acquired before SQL setup, marker/journal reads, connector
+restoration or policy checkpoint reads and released after recorder cleanup.
+Constructor failures also release it. A second process cannot read or restore the same paper account while
 its owner is active. The native metadata acquisition pause persists through
 restart and only blocks admission; native executor cancellation and exits keep
 running. Synthetic resumed-versus-uninterrupted tests compare exact balances,

@@ -7,6 +7,7 @@ accounting. Unfinished executor recovery keeps the native reconciliation hold.
 """
 import asyncio
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -150,6 +151,31 @@ class NativePaperSession:
     """
 
     def __init__(self, connector, controller_configs, db_path, *, restore=False, momentum_fixture_policy=None):
+        # Acquire ownership before SQL construction or any persisted state read.
+        # Resolving the path also prevents symlink aliases from bypassing the lease.
+        self._owner_lease = None
+        try:
+            if momentum_fixture_policy is not None:
+                from hummingbot.strategy_v2.components.domain import PolicyError
+                lease = Path(db_path).resolve().with_suffix('.momentum-owner.lock').open('a')
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BaseException:
+                    lease.close()
+                    raise PolicyError('another process owns this native momentum paper account')
+                self._owner_lease = lease
+            self._initialize(connector, controller_configs, db_path, restore=restore,
+                             momentum_fixture_policy=momentum_fixture_policy)
+        except BaseException:
+            self._release_owner_lease()
+            raise
+
+    def _release_owner_lease(self):
+        if self._owner_lease is not None:
+            self._owner_lease.close()
+            self._owner_lease = None
+
+    def _initialize(self, connector, controller_configs, db_path, *, restore, momentum_fixture_policy):
         from controllers.generic.modular_ok_rsi import ModularOKRSIControllerConfig
         from controllers.generic.modular_rsi_v5 import ModularRSIV5ControllerConfig
         if not is_native_paper_connector(connector):
@@ -241,9 +267,6 @@ class NativePaperSession:
             self.executor_orchestrator = ExecutorOrchestrator(self, executor_start=self._start_executor,
                                                               executor_restore=self.momentum_fixture.restore_executor if restore and self.momentum_fixture else None)
         except BaseException:
-            fixture = getattr(self, 'momentum_fixture', None)
-            if fixture is not None:
-                fixture.release()
             if self.recorder is not None:
                 self.recorder.stop()
                 if MarketsRecorder.get_existing_instance() is self.recorder:
@@ -516,7 +539,7 @@ class NativePaperSession:
                 if RateOracle._shared_instance is self._oracle:
                     RateOracle._shared_instance = self._prior_oracle
                 self._closed = True
-                self.momentum_fixture.release()
+                self._release_owner_lease()
 
     async def close(self):
         if self._closed:
@@ -599,6 +622,4 @@ class NativePaperSession:
             if RateOracle._shared_instance is self._oracle:
                 RateOracle._shared_instance = self._prior_oracle
             self._closed = True
-            fixture = getattr(self, 'momentum_fixture', None)
-            if fixture is not None:
-                fixture.release()
+            self._release_owner_lease()

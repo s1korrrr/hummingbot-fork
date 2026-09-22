@@ -329,3 +329,86 @@ async def test_corrupt_initial_cash_checkpoint_cannot_change_loss_allowance(tmp_
         assert 'initial cash changed' in session.controllers[config.id].processed_data['data_health']['reason']
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field,value', [
+    ('executed_amount_quote', '80'),
+    ('fill_quote_amount', '80'),
+    ('client_order_id', 'different-owner'),
+    ('exchange_order_id', 'different-exchange-order'),
+    ('trade_id', 'different-trade'),
+    ('trading_pair', 'BTC-USDC'),
+    ('fill_timestamp', 0),
+])
+async def test_restore_rejects_snapshot_quote_or_fill_identity_drift(tmp_path, field, value):
+    import copy
+
+    from hummingbot.core.data_type.common import TradeType
+    from hummingbot.model.executors import Executors
+    market = make_market(); config, policy = settings(market); path = tmp_path / 'native.sqlite'
+    session = NativePaperSession(market, [config], path, momentum_fixture_policy=policy)
+    restored = None
+    try:
+        await session.step(T + 1, books=[book(T + 1, 1)], candles=inputs(config))
+        await session.step(T + 61, books=[book(T + 61, 2)], candles=inputs(
+            config, 1, close=D('102'), high=D('103'), low=D('100'), volume=D('1000')))
+        await session.step(T + 62, books=[book(T + 62, 3)], trades=[dict(
+            trading_pair='BNB-USDC', sequence=1, timestamp=T + 62, side=TradeType.SELL, price=D('100'), amount=D('4'))])
+        await session.step(T + 64, books=[book(T + 64, 4)])
+        await session.suspend()
+        with session._sql.get_new_session() as db, db.begin():
+            row = db.query(Executors).one()
+            snapshot = copy.deepcopy(row.custom_info)
+            order = snapshot['execution_order_snapshots'][0]
+            if field == 'executed_amount_quote':
+                order[field] = value
+            else:
+                next(iter(order['order_fills'].values()))[field] = value
+            row.custom_info = snapshot
+        restored = NativePaperSession(make_market(), [config], path, restore=True, momentum_fixture_policy=policy)
+        assert restored.executor_orchestrator.active_executors[config.id] == []
+        assert restored.executor_orchestrator.recovery_required[config.id]
+        assert len(restored.recorder.get_trades_for_config('native-paper-session')) == 1
+    finally:
+        await (restored or session).close()
+
+
+@pytest.mark.asyncio
+async def test_process_lease_precedes_sql_reads_and_releases_on_constructor_failure(tmp_path):
+    import subprocess
+    import sys
+    market = make_market(); config, policy = settings(market); path = tmp_path / 'native.sqlite'
+    session = NativePaperSession(market, [config], path, momentum_fixture_policy=policy)
+    code = '''import sys
+from test.momentum_fusion_v2.test_paper_lifecycle import make_market, settings
+import hummingbot.strategy_v2.paper_session as module
+from hummingbot.strategy_v2.components.domain import PolicyError
+market = make_market(); config, policy = settings(market)
+def forbidden_sql(*args, **kwargs):
+    raise AssertionError('SQL setup/read before ownership acquired')
+module.SQLConnectionManager = forbidden_sql
+try:
+    module.NativePaperSession(market, [config], sys.argv[1], restore=True, momentum_fixture_policy=policy)
+except PolicyError as error:
+    assert 'another process' in str(error)
+    sys.exit(23)
+'''
+    try:
+        result = subprocess.run([sys.executable, '-c', code, str(path)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 23, result.stderr
+        await enter_and_close(session, config)
+        cash = market.get_balance('USDC')
+        await session.suspend()
+        # Identity failure occurs after lock acquisition but must release ownership.
+        marker = path.with_suffix('.sqlite.paper-session.json')
+        identity = marker.read_text()
+        marker.write_text('{}')
+        with pytest.raises(ValueError, match='identity mismatch'):
+            NativePaperSession(make_market(), [config], path, restore=True, momentum_fixture_policy=policy)
+        marker.write_text(identity)
+        session = NativePaperSession(make_market(), [config], path, restore=True, momentum_fixture_policy=policy)
+        assert session._connector.get_balance('USDC') == cash
+        assert not session.executor_orchestrator.recovery_required.get(config.id)
+    finally:
+        await session.close()

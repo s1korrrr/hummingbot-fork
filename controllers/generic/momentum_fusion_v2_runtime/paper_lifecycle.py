@@ -3,10 +3,8 @@
 This adapter is constructible only by a genuine NativePaperSession. It is not a
 production execution mode, a wallet owner, an economic runner, or a second ledger.
 """
-import fcntl
 import json
 from decimal import Decimal
-from pathlib import Path
 from types import SimpleNamespace
 
 from pydantic import Field
@@ -84,13 +82,6 @@ class MomentumPaperLifecycle:
         self.initial_quote = session._initial_balances.get('USDC', Decimal(0))
         if not self.initial_quote.is_finite() or self.initial_quote <= 0:
             raise PolicyError('positive native initial cash required')
-        lease = Path(session._sql.db_path).resolve().with_suffix('.momentum-owner.lock').open('a')
-        try:
-            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BaseException:
-            lease.close()
-            raise PolicyError('another process owns this native momentum paper account')
-        self._lease = lease
         host._paper_fixture = self
 
     def _load(self):
@@ -103,11 +94,6 @@ class MomentumPaperLifecycle:
                     or type(self._checkpoint['episode']) is not int or self._checkpoint['episode'] < 0
                     or Decimal(self._checkpoint['initial_quote']) != self.session._initial_balances.get('USDC', Decimal(0))):
                 raise PolicyError('native momentum checkpoint identity or initial cash changed')
-
-    def release(self):
-        if self._lease is not None:
-            self._lease.close()
-            self._lease = None
 
     def acquisition_paused(self):
         with self.session._sql.get_new_session() as db:

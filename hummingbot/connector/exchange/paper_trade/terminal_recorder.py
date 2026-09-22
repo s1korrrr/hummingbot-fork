@@ -44,13 +44,21 @@ def recorded_terminal_order(recorder, market, tracked):
             expected = tracked.order_fills.get(fill.exchange_trade_id)
             if (values.precision != 'event_exact' or expected is None
                     or values.amount != expected.fill_base_amount or values.price != expected.fill_price
+                    or values.amount * values.price != expected.fill_quote_amount
+                    or expected.trade_id != fill.exchange_trade_id or expected.client_order_id != row.id
+                    or expected.exchange_order_id != row.exchange_order_id or expected.trading_pair != row.symbol
+                    or int(expected.fill_timestamp * 1000) != fill.timestamp
                     or fill.trade_fee != expected.fee.to_json() or fill.trade_type != tracked.trade_type.name):
                 raise ValueError('Native paper terminal fill receipt differs')
-            proof_fills[fill.exchange_trade_id] = SimpleNamespace(fill_base_amount=values.amount)
+            proof_fills[fill.exchange_trade_id] = SimpleNamespace(fill_base_amount=values.amount,
+                                                                  fill_quote_amount=values.amount * values.price)
         cumulative = sum((f.fill_base_amount for f in proof_fills.values()), Decimal('0'))
+        cumulative_quote = sum((f.fill_quote_amount for f in proof_fills.values()), Decimal('0'))
         if (set(proof_fills) != set(tracked.order_fills) or cumulative != tracked.executed_amount_base
+                or cumulative_quote != tracked.executed_amount_quote
                 or cumulative < 0 or cumulative > amount or (state == OrderState.FILLED and cumulative != amount)):
             raise ValueError('Native paper terminal fill coverage differs')
         return SimpleNamespace(client_order_id=row.id, exchange_order_id=row.exchange_order_id,
                                trading_pair=row.symbol, trade_type=tracked.trade_type, amount=amount,
-                               current_state=state, executed_amount_base=cumulative, order_fills=proof_fills)
+                               current_state=state, executed_amount_base=cumulative,
+                               executed_amount_quote=cumulative_quote, order_fills=proof_fills)

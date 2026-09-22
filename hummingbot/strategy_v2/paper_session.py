@@ -7,6 +7,7 @@ accounting. Unfinished executor recovery keeps the native reconciliation hold.
 """
 import asyncio
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -149,7 +150,32 @@ class NativePaperSession:
     executors remain under native reconciliation holds rather than replaying BUYs.
     """
 
-    def __init__(self, connector, controller_configs, db_path, *, restore=False):
+    def __init__(self, connector, controller_configs, db_path, *, restore=False, momentum_fixture_policy=None):
+        # Acquire ownership before SQL construction or any persisted state read.
+        # Resolving the path also prevents symlink aliases from bypassing the lease.
+        self._owner_lease = None
+        try:
+            if momentum_fixture_policy is not None:
+                from hummingbot.strategy_v2.components.domain import PolicyError
+                lease = Path(db_path).resolve().with_suffix('.momentum-owner.lock').open('a')
+                try:
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BaseException:
+                    lease.close()
+                    raise PolicyError('another process owns this native momentum paper account')
+                self._owner_lease = lease
+            self._initialize(connector, controller_configs, db_path, restore=restore,
+                             momentum_fixture_policy=momentum_fixture_policy)
+        except BaseException:
+            self._release_owner_lease()
+            raise
+
+    def _release_owner_lease(self):
+        if self._owner_lease is not None:
+            self._owner_lease.close()
+            self._owner_lease = None
+
+    def _initialize(self, connector, controller_configs, db_path, *, restore, momentum_fixture_policy):
         from controllers.generic.modular_ok_rsi import ModularOKRSIControllerConfig
         from controllers.generic.modular_rsi_v5 import ModularRSIV5ControllerConfig
         if not is_native_paper_connector(connector):
@@ -179,6 +205,11 @@ class NativePaperSession:
                         connector.tracking_states['balances'], sort_keys=True).encode()).hexdigest(),
                     'controllers_sha256': hashlib.sha256(json.dumps(
                         [c.model_dump(mode='json') for c in configs], sort_keys=True).encode()).hexdigest()}
+        if momentum_fixture_policy is not None:
+            from controllers.generic.momentum_fusion_v2_runtime.paper_lifecycle import MomentumPaperPolicy
+            if type(momentum_fixture_policy) is not MomentumPaperPolicy:
+                raise ValueError('exact explicit offline momentum fixture policy required')
+            identity['momentum_fixture_policy'] = momentum_fixture_policy.model_dump(mode='json')
         if path.exists() != restore or not path.parent.is_dir() or marker.exists() != restore:
             raise ValueError('New paper database or explicit existing-state restore required')
         if restore and json.loads(marker.read_text()) != identity:
@@ -195,6 +226,7 @@ class NativePaperSession:
             controller._status = RunnableStatus.RUNNING
             controller.initialize_candles()
         self._connector = connector
+        self._initial_balances = dict(connector.get_all_balances())
         self._closed = False
         self._step_lock = asyncio.Lock()
         self._failure_path = path.with_suffix(path.suffix + '.paper-step.json')
@@ -228,7 +260,12 @@ class NativePaperSession:
             for order in connector._order_tracker.all_orders.values():
                 for fill in order.order_fills.values():
                     self._oracle.set_price(order.trading_pair, fill.fill_price)
-            self.executor_orchestrator = ExecutorOrchestrator(self, executor_start=self._start_executor)
+            self.momentum_fixture = None
+            if momentum_fixture_policy is not None:
+                from controllers.generic.momentum_fusion_v2_runtime.paper_lifecycle import MomentumPaperLifecycle
+                self.momentum_fixture = MomentumPaperLifecycle(self, momentum_fixture_policy)
+            self.executor_orchestrator = ExecutorOrchestrator(self, executor_start=self._start_executor,
+                                                              executor_restore=self.momentum_fixture.restore_executor if restore and self.momentum_fixture else None)
         except BaseException:
             if self.recorder is not None:
                 self.recorder.stop()
@@ -461,6 +498,49 @@ class NativePaperSession:
                      for position in positions)
         return sorted(pair for pair in pairs if not self._connector.pair_ready(pair))
 
+    async def suspend(self):
+        """Persist and detach a qualified offline fixture without changing exits.
+
+        This is neither normal shutdown nor live recovery. Interrupted writes
+        retain the existing step journal and therefore require reconciliation.
+        """
+        if self.momentum_fixture is None:
+            raise ValueError('Explicit momentum qualification fixture required')
+        async with self._step_lock:
+            self._check_connector(self._connector.name)
+            if self._failure is not None or self.unavailable_exposure():
+                raise ValueError('Fresh reconciled offline checkpoint required')
+            receipt = {'schema': 'native_paper_step_v1', 'status': 'suspending', 'identity': self._identity}
+            self._write_step_receipt(receipt)
+            try:
+                await self._connector.drain()
+                for executors in self.executor_orchestrator.active_executors.values():
+                    for executor in executors:
+                        if any(getattr(executor, name, None) is not None and not getattr(executor, name).done()
+                               for name in ('_entry_expiry_reconciliation_task', '_funding_entry_reconciliation_task')):
+                            raise ValueError('Pending native reconciliation cannot be checkpointed')
+                        self.recorder.store_or_update_executor(executor)
+                with self._sql.get_new_session() as db, db.begin():
+                    self.recorder.save_market_states('native-paper-session', self._connector, db)
+                self._failure_path.unlink()
+            except BaseException as error:
+                await self._persist_failure(receipt, error)
+                raise
+            finally:
+                for executors in self.executor_orchestrator.active_executors.values():
+                    for executor in executors:
+                        executor.unregister_events()
+                for controller in self.controllers.values():
+                    controller._status = RunnableStatus.TERMINATED
+                self.recorder.stop()
+                if MarketsRecorder.get_existing_instance() is self.recorder:
+                    MarketsRecorder._shared_instance = None
+                self._sql.engine.dispose()
+                if RateOracle._shared_instance is self._oracle:
+                    RateOracle._shared_instance = self._prior_oracle
+                self._closed = True
+                self._release_owner_lease()
+
     async def close(self):
         if self._closed:
             return
@@ -542,3 +622,4 @@ class NativePaperSession:
             if RateOracle._shared_instance is self._oracle:
                 RateOracle._shared_instance = self._prior_oracle
             self._closed = True
+            self._release_owner_lease()

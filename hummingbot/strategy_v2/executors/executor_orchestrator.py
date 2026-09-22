@@ -239,9 +239,11 @@ class ExecutorOrchestrator:
                  executors_update_interval: float = 1.0,
                  executors_max_retries: int = 10,
                  initial_positions_by_controller: Optional[dict] = None,
-                 executor_start: Optional[Callable] = None):
+                 executor_start: Optional[Callable] = None,
+                 executor_restore: Optional[Callable] = None):
         self.strategy = strategy
         self._executor_start = executor_start
+        self._executor_restore = executor_restore
         self.executors_update_interval = executors_update_interval
         self.executors_max_retries = executors_max_retries
         self.active_executors = {}
@@ -279,12 +281,23 @@ class ExecutorOrchestrator:
             return  # No held reconstruction or ownership mutation before connectors are ready.
         resumed = self._claim_planned_positions(markets_recorder)
         db_executors = markets_recorder.get_all_executors()
+        restored_executors = []
         for executor in db_executors:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
                 continue
             if executor.id in resumed:
                 continue
+            if not executor.is_done and self._executor_restore is not None:
+                restored = self._executor_restore(executor)
+                if restored is not None:
+                    if restored.config != executor.config or restored.status != RunnableStatus.NOT_STARTED:
+                        raise ValueError('Restored executor identity or lifecycle differs')
+                    restored_executors.append((controller_id, restored, self._owned_order_keys(executor)))
+                    self._resume_owned_order_keys.update(self._owned_order_keys(executor))
+                    self._non_hold_order_ids.update(self._owned_order_keys(executor))
+                    resumed.add(executor.id)
+                    continue
             if not executor.is_done:
                 self.recovery_required.setdefault(controller_id, []).append(executor.id)
                 self.logger().error(
@@ -354,10 +367,19 @@ class ExecutorOrchestrator:
             trade_fills=trade_fills,
             protected_position_scopes=self._current_position_scopes(),
         )
+        # A restored paper book is deliberately unavailable until explicit new
+        # input. Defer live objects until history reconstruction has used the
+        # proven native ownership keys, without requesting a fabricated mark.
+        for controller_id, executor, order_keys in restored_executors:
+            self.active_executors[controller_id].append(executor)
+            self._non_hold_order_ids.difference_update(order_keys)
         for executors in self.active_executors.values():
             for executor in executors:
                 if executor.config.id in resumed:
-                    executor.start()
+                    if self._executor_start is None:
+                        executor.start()
+                    else:
+                        self._executor_start(executor)
 
     def resume_planned_positions_if_ready(self):
         if not self._planned_resume_pending:

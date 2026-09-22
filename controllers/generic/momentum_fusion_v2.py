@@ -90,6 +90,10 @@ class MomentumFusionV2Controller(ControllerBase):
             getter = getattr(self.market_data_provider, 'get_candle_snapshot', None)
             if getter is None:
                 raise DataUnavailable('native publication-bound candle snapshots unavailable')
+            fixture = getattr(self, '_paper_fixture', None)
+            if fixture is not None:
+                fixture.observe()
+                return
             snapshots = {d.key: getter(d) for d in self.config.recipe.datasets}
             observed = self._pipeline.evaluate(snapshots, now_ms=int(now * 1000))
             # Paper mode can observe the canonical shadow policy but is never an
@@ -104,11 +108,21 @@ class MomentumFusionV2Controller(ControllerBase):
             self.processed_data['data_health']['reason'] = str(error)
 
     def determine_executor_actions(self):
+        fixture = getattr(self, '_paper_fixture', None)
+        if fixture is not None:
+            return fixture.actions()
         self.processed_data['action_reason'] = 'native_paper_admission_unqualified'
         return []
 
     def validate_executor_config(self, config):
-        return False
+        fixture = getattr(self, '_paper_fixture', None)
+        return fixture is not None and fixture.validate(config)
+
+    def commit_entry_executor(self, config):
+        fixture = getattr(self, '_paper_fixture', None)
+        if fixture is None:
+            raise PolicyError('native offline fixture admission required')
+        fixture.committed(config)
 
     def get_custom_info(self):
         current = source_digest(source_root(), source_files())
@@ -116,10 +130,12 @@ class MomentumFusionV2Controller(ControllerBase):
             'controller_name': self.config.controller_name, 'controller_id': self.config.id,
             'trading_pair': self.config.trading_pair, 'execution_mode': self.config.execution_mode,
             'execution_enabled': False, 'observed_at': self._observed_at,
+            'offline_fixture': getattr(self, '_paper_fixture', None) is not None,
             'source_sha256': current if current == self._source_sha256 else None,
             'recipe_sha256': self._binding.recipe_sha256,
             'data_ready': self.processed_data.get('data_health', {}).get('ready') is True,
             'data_reason': self.processed_data.get('data_health', {}).get('reason'),
+            'recovery_hold': getattr(self, '_recovery_hold', None),
             'action_reason': 'native_paper_admission_unqualified', 'execution_authorized': False}}
 
     def get_status_summary(self):

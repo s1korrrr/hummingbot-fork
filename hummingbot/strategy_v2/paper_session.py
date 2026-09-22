@@ -385,13 +385,7 @@ class NativePaperSession:
         started, self._started = self._started, []
         for executor in started:
             await executor.on_start()
-        for key, executors in self.executor_orchestrator.active_executors.items():
-            if key not in fresh_ids:
-                continue
-            for executor in list(executors):
-                if not executor.is_closed:
-                    await executor.control_task()
-                    await self._connector.drain()
+        await self._drive_executors(fresh_ids)
         self.executor_orchestrator.sync_live_state_to_db(controller_ids=fresh_ids)
         reports = self._refresh_reports(controller_ids=fresh_ids)
         reasons = []
@@ -409,6 +403,40 @@ class NativePaperSession:
                 reasons.append(f'{key}: unfinished_native_executors_require_reconciliation')
         return {'actions': actions, 'reports': reports, 'market_state': self._connector.tracking_states,
                 'readiness': {'ready': not reasons, 'reasons': reasons}}
+
+    async def _control_open_executors(self, fresh_ids):
+        for key, executors in self.executor_orchestrator.active_executors.items():
+            if key not in fresh_ids:
+                continue
+            for executor in list(executors):
+                if not executor.is_closed:
+                    await executor.control_task()
+                    await self._connector.drain()
+
+    async def _drive_executors(self, fresh_ids):
+        await self._control_open_executors(fresh_ids)
+        pending = []
+        follow_up = {}
+        for key, executors in self.executor_orchestrator.active_executors.items():
+            if key not in fresh_ids:
+                continue
+            for executor in executors:
+                for name in ('_entry_expiry_reconciliation_task', '_funding_entry_reconciliation_task'):
+                    task = getattr(executor, name, None)
+                    if task is not None and not task.done():
+                        pending.append(task)
+                        follow_up.setdefault(id(executor), (key, executor))
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+        # Only task owners need another transition; unrelated executors keep
+        # the same single-pass semantics as a step without reconciliation.
+        for key, executor in follow_up.values():
+            active = self.executor_orchestrator.active_executors.get(key, ())
+            if executor.is_closed or not any(item is executor for item in active):
+                continue
+            await executor.control_task()
+            await self._connector.drain()
 
     def unavailable_exposure(self):
         pairs = {executor.config.trading_pair for executors in self.executor_orchestrator.active_executors.values()

@@ -101,7 +101,22 @@ class InjectedPaperMarketData(MarketDataProvider):
 
     def set_candles(self, connector_name, trading_pair, interval, frame, *, available_at):
         validated = self.validate_candles_input(connector_name, trading_pair, interval, frame, available_at=available_at)
-        self._frames[(connector_name, trading_pair, interval)] = validated
+        key = (connector_name, trading_pair, interval)
+        self._frames[key] = validated
+        if not hasattr(self, '_frame_publications'):
+            self._frame_publications = {}
+        prior = self._frame_publications.get(key, (0, 0))
+        self._frame_publications[key] = (prior[0] + 1, available_at)
+
+    def get_candle_snapshot(self, dataset):
+        from hummingbot.strategy_v2.components.candle_data import Candle, CandleSnapshot
+        frame = self.get_candles_df(dataset.connector, dataset.trading_pair, dataset.interval, dataset.history)
+        key = (dataset.connector, dataset.trading_pair, dataset.interval)
+        sequence, available = self._frame_publications[key]
+        return CandleSnapshot(dataset=dataset, epoch='injected-paper', sequence=sequence, published_at=available,
+                              rows=tuple(Candle(open_time=int(row.timestamp), open=row.open, high=row.high,
+                                                low=row.low, close=row.close, volume=row.volume)
+                                         for row in frame.itertuples(index=False)))
 
     def get_candles_df(self, connector_name, trading_pair, interval, max_records=500):
         from controllers.generic.modular_spot_core.domain import DataUnavailable
@@ -146,8 +161,9 @@ class NativePaperSession:
             raise RuntimeError('Paper session refuses an existing active rate oracle')
         configs = list(controller_configs)
         from controllers.generic.component_breakout import ComponentBreakoutConfig
+        from controllers.generic.momentum_fusion_v2 import MomentumFusionV2Config
         from controllers.generic.rsi_modular import CONFIG_PROFILES
-        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(), ComponentBreakoutConfig)
+        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(), ComponentBreakoutConfig, MomentumFusionV2Config)
         if not configs or len({c.id for c in configs}) != len(configs):
             raise ValueError('Distinct native paper controller identities required')
         for config in configs:

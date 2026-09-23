@@ -1,0 +1,231 @@
+{
+  "schema": "mr_context_v2.implementation_receipt.v1",
+  "native_base": "0f19b464ccd112b21ac69c6de0e5515250239aac",
+  "implementation_head": "eeb3c564c78f6d02a867bffac7e796d48f5e2979",
+  "sidecar_commit": "6f9ee48af975c2f97c8a2021bf8d0afc0795e842",
+  "isolated_core_commit": "9066a5882f10eadfbdffe3eef206ae3b4650ce99",
+  "root_plan": "e35b1274acc6d72c18be540aec22fb76524346a0",
+  "companion_pr": "https://github.com/s1korrrr/rsibot/pull/195",
+  "authority": "repository-process-only",
+  "scope": "unconnected initial-entry contract/policy candidate plus candle mapper and pre-CAS helper",
+  "environment": {
+    "python": "3.13.5 (main, Jul 15 2026, 20:25:40) [GCC 14.2.0]",
+    "executable": "/opt/pyvenv/bin/python",
+    "pydantic": "2.13.4",
+    "pytest": "9.0.2",
+    "scope": "exact verified owner dependency subset; not full native runtime",
+    "native_base": "0f19b464ccd112b21ac69c6de0e5515250239aac"
+  },
+  "candidate_files": {
+    "controllers/generic/mr_context_v2_core/__init__.py": {
+      "sha256": "55b091121917ce9497a51e483f43a1c602990827293ea1f0ee05559b4cf08953",
+      "git_blob_sha1": "00654bbc54476432bf2332502b1820e75ff03717",
+      "lines": 1
+    },
+    "controllers/generic/mr_context_v2_core/policy.py": {
+      "sha256": "4c122f895749bc6fc94b1324b896435a8fd4728481748a6f5580762943c8078a",
+      "git_blob_sha1": "dd30b4065842c458a73c0d648a7b237698ab97d1",
+      "lines": 238
+    },
+    "controllers/generic/mr_context_v2_core/recipe.py": {
+      "sha256": "803301e8c6f6f920589db122485426a800f59c4069ef9520e659361f1631898d",
+      "git_blob_sha1": "ebcde28b71f0cbc175f5d33145a9ff829a800b9a",
+      "lines": 70
+    },
+    "controllers/generic/mr_context_v2_core/snapshot.py": {
+      "sha256": "2a575815412606d6aaf17043aa377185189af889cc4e5ef98b200093dc61733c",
+      "git_blob_sha1": "c4290605f8cd6fe18a9b0dff0bd52da82ef1c873",
+      "lines": 224
+    },
+    "controllers/generic/mr_context_v2_core/producer.py": {
+      "sha256": "1a00a6e6d1184f47cb9b9f031f46f5edf71d95cb4cfee2548e981cae2456029a",
+      "git_blob_sha1": "b4e410a4b42126796b3d0ff343aa5760d86fa397",
+      "lines": 239
+    },
+    "controllers/generic/mr_context_v2_core/native_adapter.py": {
+      "sha256": "20d7434b8bbd734efc5b06cc030b4b90ebbf2416b92366fd0d637aa05fecebf1",
+      "git_blob_sha1": "5fee0c8d5b3c76b74ce9b34cfdc0a61e7198051e",
+      "lines": 90
+    },
+    "test/modular_spot/test_mr_context_v2_isolation.py": {
+      "sha256": "730a2d613107866ab1e8014d306b82c43f29c4a2bd95921e63ceba7917dd5a5f",
+      "git_blob_sha1": "7d45ebce7cf9e99aa4d8467435deb3b1c0376e6a",
+      "lines": 99
+    },
+    "test/modular_spot/test_mr_context_v2_policy.py": {
+      "sha256": "5c8237adc98d04e0e0fb18efb4a635d0ce33cfa184301dcca680b12f48d27b57",
+      "git_blob_sha1": "36d989c4a2afd73782adb8e7b37115d2d36c318b",
+      "lines": 346
+    },
+    "test/modular_spot/test_mr_context_v2_snapshot.py": {
+      "sha256": "940ddfc447b1870cededc746c6d601d2b3c1d922738fddc9c3b7c72fb0f166c6",
+      "git_blob_sha1": "880e44005b731546466b7aa74fc3de8e147c8e8e",
+      "lines": 216
+    },
+    "test/modular_spot/test_mr_context_v2_native.py": {
+      "sha256": "f62e5225a4c66b9898411110a193dc096f0954fac0bcd1e2332c34a8ed21d27e",
+      "git_blob_sha1": "3eab51729646bc2c2207ca75cdf46ea6375d4786",
+      "lines": 310
+    },
+    "test/modular_spot/test_mr_context_v2_shadow.py": {
+      "sha256": "143c0bf009daf5ee048c2c6184ac61bf86feb1af17f5504b0df8756ac2fe2901",
+      "git_blob_sha1": "1d84d539af8b82c0aee1090d3188852e931785b0",
+      "lines": 46
+    },
+    "test/modular_spot/test_mr_context_v2_producer.py": {
+      "sha256": "70740c4782a6471223c857de07da74b9909effbb80f660c23d0fb42b7fa4548f",
+      "git_blob_sha1": "59d284d440370c12a428a92c65fb5c331724aebc",
+      "lines": 129
+    }
+  },
+  "verified_unchanged_upstream_subset": {
+    "controllers/__init__.py": {
+      "git_blob_sha1": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "controllers/generic/__init__.py": {
+      "git_blob_sha1": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "hummingbot/strategy_v2/__init__.py": {
+      "git_blob_sha1": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "hummingbot/strategy_v2/components/__init__.py": {
+      "git_blob_sha1": "884a57e69f0f09328a6f202481e801b9355283d5",
+      "sha256": "3228c16ce041d7f289733dde18100081a694f16878c8b82146398beabb7679c6"
+    },
+    "hummingbot/strategy_v2/components/config.py": {
+      "git_blob_sha1": "f583feeba4d07a8896b257bfebf2fc08f9410e91",
+      "sha256": "9b86f6745166b8c7f866459af1ffd5912e5fda7db4b76925ffc9b997e3480a18"
+    },
+    "hummingbot/strategy_v2/components/domain.py": {
+      "git_blob_sha1": "ca2d5f64669a2c0a09011fb7ff6c05abd626ac5c",
+      "sha256": "6aee8f6e832535a2baadacdfaf64e5487d58a75c7c5e251aa23d5b46ad316407"
+    },
+    "hummingbot/strategy_v2/components/recipe_contract.py": {
+      "git_blob_sha1": "8a2d893a23ea9de678c81556e3b011ef3fddeee2",
+      "sha256": "4ddc7c980842f7de7f113477ab866433f447c4f999a3f412d1489631ee97bed8"
+    },
+    "hummingbot/strategy_v2/components/decision_protocol.py": {
+      "git_blob_sha1": "d743dac6b90ffd458289410e1f93ae460cd41a7c",
+      "sha256": "65d5a28865efad1c48cdeba97aca2aedf31a8d8ec5f8a647c39619bb642f3a08"
+    },
+    "hummingbot/__init__.py": {
+      "git_blob_sha1": "012045b6a0504d95b34ce3a64d84f2cfd3b871f7",
+      "sha256": "cb4751bd3dadea5ecf108fcadda38abc20544e2614d4f6c5830c26820e5aa3bb"
+    },
+    "hummingbot/logger/__init__.py": {
+      "git_blob_sha1": "9d518b475a2475e51147394730cabc835b332ce9",
+      "sha256": "cac749442161c3786d67f59917e6000f1f60d370dfd9ada4adfa1ba699f95750"
+    },
+    "hummingbot/logger/struct_logger.py": {
+      "git_blob_sha1": "b77133eb584bf200bb06aabbbd55f7973b784bbf",
+      "sha256": "afa2154ddc00337efeed39c181ab42a299ac8ec031f4162fa85fc54b860092a4"
+    },
+    "hummingbot/logger/application_warning.py": {
+      "git_blob_sha1": "da9927b0508363041e356871bbfb1d8f962872ad",
+      "sha256": "0b54ac59e561d95ab9855758c90f1d789f4cf68571f6b013514311f64c321fda"
+    },
+    "hummingbot/logger/logger.py": {
+      "git_blob_sha1": "11b3a1a57c2cd9883ea3a989314997bb9b64b84f",
+      "sha256": "2e3647db714a5e25212fa87c394d67bf538e0ab93f47845e043c1c3c78479869"
+    },
+    "hummingbot/strategy_v2/components/strict_json.py": {
+      "git_blob_sha1": "c6b0c8e5c7560f6943b61c7fefbc994f6b67aabb",
+      "sha256": "d07d3ceb99e1121c8f2d0665bca3d9687d8b086c9701167d42cd8d7f70c5171e"
+    }
+  },
+  "commands": [
+    {
+      "argv": "PYTHONPATH=. python -m pytest -q --junitxml=../receipts/component-tests.xml",
+      "exit_code": 0,
+      "passed": 104,
+      "skipped": 0,
+      "scope": "all available tests in verified dependency subset; not full native/legacy suite"
+    },
+    {
+      "argv": "PYTHONPATH=. python -m pytest -q --import-mode=importlib test/modular_spot",
+      "exit_code": 0,
+      "passed": 104,
+      "skipped": 0,
+      "scope": "same tests, alternative import mode; counts overlap"
+    },
+    {
+      "argv": "python -m compileall -q controllers/generic/mr_context_v2_core test/modular_spot",
+      "exit_code": 0
+    },
+    {
+      "argv": "PYTHONPATH=. python -c 'from hummingbot.strategy_v2.controllers.controller_base import ControllerBase'",
+      "exit_code": 1,
+      "classification": "UNAVAILABLE_FULL_NATIVE_CHECKOUT",
+      "error": "No module named 'hummingbot.strategy_v2.controllers'"
+    },
+    {
+      "argv": "python -m pre_commit --version",
+      "exit_code": 1,
+      "classification": "UNAVAILABLE_TOOLING",
+      "error": "No module named pre_commit"
+    }
+  ],
+  "logs_sha256": {
+    "final-tests.txt": "0f53655d6d50c8486f5fbc87d52f276fa6de671dc35a7746859da9b739663b05",
+    "expiry-green.txt": "46791369772ab02a181a2bb2eaac1d507e20dd33ba9b9bebc33a7a72526fea1d",
+    "review-green.txt": "3fe126af288e8f4c5cefda409d67bfdd5d9f1553eee2160fb7fac287655b4dd0",
+    "t2-first-green.txt": "ad5f52f5d5e6de8645315786f26a073f784c9d1e0468076d907a3a29445b6528",
+    "review-red.txt": "5f67d18613e7f1ee4e03290ddb72fc690ccb75a1c543f686dc4abb764fa9be26",
+    "isolation-first.txt": "d27f63b25b00220f7232c8122ae73cfc7839a13fe26e88b33f2574b0dbe2ecd0",
+    "t1-red.txt": "15ecc105e9b11e4b6fc92ab43205ceb1f4ff54de498f49eb5ddc99f3cb2e77a2",
+    "import-mode-tests.txt": "2b70c578ffaf2cbd5f94715abf996dc1962b3c51af24f382549a3f65dbe09bc4",
+    "t1-green.txt": "097eecd8b1e615f61a152426f66b8e6ca91a0ab4bbb533a120b2fb438d8b8eb9",
+    "t2-red.txt": "5e84cc60c05dad8029c0725060b7c981c519821af652ab1cce126f4ffd6aaffa",
+    "expiry-red.txt": "6f231e54a17d9a6b90683ef9dc4cb5f664bc1b545fd96cb676ef6f5441e907f2",
+    "lint-unavailable.txt": "0c32e5ec40c9c72e4594895c15c462efeb7700900327d8e7534da7d6bc9a1750",
+    "native-unavailable.txt": "5abf8c8b5ae7b209ba7cb9806375a5ab7e66251b16050c3cd78305b25dbd8830"
+  },
+  "log_location": "Original raw logs are retained in the conversation source bundle; no live/remote owner logs were read.",
+  "independent_audit": "PARTIAL_SEPARATE_ACTOR_EXPLORERS",
+  "full_native_validation": "PARTIAL_PINNED_IMAGE_OVERLAY",
+  "hosted_ci": "NOT_OBSERVED",
+  "producer_adapter": "okx-candle-service cache mapper; disk reconstructed unless replica_ready",
+  "native_action_adapter": "apply_to_actions sidecar plus apply_restrict_to_plan pre-CAS helper; live rsi_modular_v2 does not import them; runtime.py unchanged",
+  "economic_backtest": "NOT_RUN",
+  "t4_status": "UNSUPPORTED_V2_OWNER_ADAPTER",
+  "t5_status": "HOLD",
+  "t6_status": "HOLD",
+  "execution_authorized": false,
+  "legacy_changes": false,
+  "pin_changes": false,
+  "state_changes": false,
+  "source_closures_overlay_only": {
+    "ok_rsi_n": 64,
+    "rsi_v5_n": 64,
+    "modular_spot_n": 37,
+    "components_n": 24,
+    "mr_context_in_source_files": false,
+    "rsi_modular_source_digest_sorted_bytes": "12f8442c5e9fc4f150cb3f474223766392919b654b7f4a632496fd97241ec8ca"
+  },
+  "owner_env_continuation": {
+    "conda_python": "/Users/s1kor/anaconda3/envs/hummingbot/bin/python",
+    "conda_python_version": "3.13.13",
+    "pydantic": "2.13.4",
+    "pytest": "9.0.3",
+    "hashed_implementation_head": "eeb3c564c78f6d02a867bffac7e796d48f5e2979",
+    "conda_mr_context": "134 passed",
+    "conda_mr_context_argv": "PYTHONPATH=$PWD $HB -m pytest -q test/modular_spot/test_mr_context_v2_{snapshot,policy,isolation,native,shadow,producer}.py",
+    "conda_related_suites": "64 passed",
+    "conda_related_argv": "PYTHONPATH=$PWD $HB -m pytest -q test/modular_spot/test_rsi_modular_profiles.py test/modular_spot/test_recipe_compiler.py test/modular_spot/test_native_composition.py test/modular_spot/test_decision_protocol.py",
+    "pinned_image": "sha256:af2fa0526fb58717dc556208b27aff585272e0b8fc6a829c20080c5121f62dc5",
+    "image_python": "3.13.15",
+    "image_overlay_pytest": "178 passed, 1 skipped (context + native_composition + rsi_modular_profiles + recipe_compiler); not rerun on eeb3c564",
+    "rsi_modular_source_digest_sorted_bytes": "12f8442c5e9fc4f150cb3f474223766392919b654b7f4a632496fd97241ec8ca",
+    "rsi_modular_source_n": 64,
+    "mr_context_in_source_files": false,
+    "pre_commit": "passed on candidate files with conda hummingbot python / pre-commit 4.6.0",
+    "executor_orchestrator_suite": "NOT_RUN_ON_eeb3c564",
+    "cython_so": "worktree-local and gitignored",
+    "hummingbot_api_changed": false,
+    "live_process_loads_adapter": false,
+    "next_authorized_step": "thin opt-in ModularRuntime subclass calling apply_restrict_to_plan; do not edit runtime.py; T5 needs v2 owner program plus OKX May-August 2026 cache"
+  }
+}

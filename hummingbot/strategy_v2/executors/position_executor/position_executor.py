@@ -6,6 +6,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Union
 
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
@@ -170,6 +171,7 @@ class PositionExecutor(ExecutorBase):
         self._open_order_entry_expired = False
         self._open_order_expiry_reconciled = False
         self._entry_expiry_reconciliation_task: Optional[asyncio.Task] = None
+        self._entry_expiry_reconciliation_retry_at: float = 0.0
         self._open_order: Optional[TrackedOrder] = None
         self._close_order: Optional[TrackedOrder] = None
         self._take_profit_limit_order: Optional[TrackedOrder] = None
@@ -1102,9 +1104,11 @@ class PositionExecutor(ExecutorBase):
                     self.config.triple_barrier_config.open_order_type):
                 self._end_entry_acquisition("outside_activation_bounds")
             if self._entry_stop_reason is not None:
-                self._entry_lifecycle["state"] = "cancel_pending"
+                cancel_observed = self._entry_lifecycle.get("cancel_event_timestamp") is not None
+                self._entry_lifecycle["state"] = "reconciliation_required" if cancel_observed else "cancel_pending"
                 now = self._strategy.current_timestamp
-                if self._entry_cancel_last_attempt_at is None or now - self._entry_cancel_last_attempt_at >= 5:
+                if (not cancel_observed and
+                        (self._entry_cancel_last_attempt_at is None or now - self._entry_cancel_last_attempt_at >= 5)):
                     self._entry_cancel_last_attempt_at = now
                     self._entry_lifecycle.setdefault("cancel_requested_timestamp", now)
                     self.cancel_open_order()
@@ -1151,7 +1155,9 @@ class PositionExecutor(ExecutorBase):
 
     async def _reconcile_expired_entry(self):
         if (self.config.entry_order_policy == "single_attempt" and self._open_order
-                and self._open_order.order and self._open_order.order.is_cancelled
+                and self._open_order.order
+                and (self._open_order.order.is_cancelled
+                     or self._entry_lifecycle.get("cancel_event_timestamp") is not None)
                 and not self._open_order_expiry_reconciled):
             self._open_order_entry_expired = True
             self._end_entry_acquisition("exchange_canceled")
@@ -1163,8 +1169,12 @@ class PositionExecutor(ExecutorBase):
             return
         task = self._entry_expiry_reconciliation_task
         if task is None:
+            if self._strategy.current_timestamp < self._entry_expiry_reconciliation_retry_at:
+                return
             orders = self._entry_orders()
-            if orders and all(tracked.is_done for tracked in orders):
+            cancel_observed = (self.config.entry_order_policy == "single_attempt"
+                               and self._entry_lifecycle.get("cancel_event_timestamp") is not None)
+            if orders and (all(tracked.is_done for tracked in orders) or cancel_observed):
                 self._entry_expiry_reconciliation_task = asyncio.create_task(
                     self._request_expired_entry_reconciliation(orders))
             return
@@ -1176,6 +1186,7 @@ class PositionExecutor(ExecutorBase):
         except asyncio.CancelledError:
             return
         except Exception as exc:
+            self._entry_expiry_reconciliation_retry_at = self._strategy.current_timestamp + 10.0
             self.logger().warning(self._log_message(
                 f"Expired entry reconciliation pending; retaining ownership: {type(exc).__name__}: {exc}"))
             return
@@ -1210,6 +1221,10 @@ class PositionExecutor(ExecutorBase):
                     or update.client_order_id != order.client_order_id
                     or update.exchange_order_id != order.exchange_order_id):
                 raise ValueError("Expired entry terminal order state is unavailable or mismatched")
+            if (update.new_state == OrderState.FILLED and order.executed_amount_base != order.amount
+                    or order.current_state == OrderState.FILLED and update.new_state != OrderState.FILLED):
+                raise ValueError("Expired entry terminal order state contradicts reconciled fills")
+            order.update_with_order_update(update)
             self.update_tracked_orders_with_order_id(order.client_order_id)
             proof = (update.misc_updates or {}).get('terminal_reconciliation')
             if proof is not None:
@@ -1557,7 +1572,40 @@ class PositionExecutor(ExecutorBase):
         if in_flight_order is not None:
             for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()]):
                 if order.order_id == order_id:
+                    if order.order is not None and order.order.is_done and not in_flight_order.is_done:
+                        # Keep the terminal receipt, but a lagging tracker may still carry a real late fill.
+                        terminal = order.order
+                        if (terminal.client_order_id != in_flight_order.client_order_id
+                                or terminal.exchange_order_id != in_flight_order.exchange_order_id
+                                or terminal.trading_pair != in_flight_order.trading_pair):
+                            self._mark_fill_reconciliation_required("Conflicting tracker order identity")
+                            continue
+                        for trade_id, fill in in_flight_order.order_fills.items():
+                            known = terminal.order_fills.get(trade_id)
+                            if known is not None and known != fill:
+                                self._mark_fill_reconciliation_required("Conflicting tracker fill")
+                                break
+                            if (fill.client_order_id != terminal.client_order_id
+                                    or fill.exchange_order_id != terminal.exchange_order_id
+                                    or fill.trading_pair != terminal.trading_pair):
+                                self._mark_fill_reconciliation_required("Conflicting tracker fill identity")
+                                break
+                        else:
+                            for trade_id, fill in in_flight_order.order_fills.items():
+                                if trade_id not in terminal.order_fills:
+                                    terminal.update_with_trade_update(fill)
+                        continue
                     order.order = in_flight_order
+
+    def _mark_fill_reconciliation_required(self, reason: str):
+        self._resume_conflicting_fill = {"reason": reason}
+        self._entry_lifecycle["state"] = "reconciliation_required"
+        recovery = getattr(getattr(self._strategy, "executor_orchestrator", None), "recovery_required", None)
+        if isinstance(recovery, dict):
+            identities = recovery.setdefault(self.config.controller_id, [])
+            if self.config.id not in identities:
+                identities.append(self.config.id)
+        self.logger().error(self._log_message(f"{reason}; execution requires reconciliation"))
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         """
@@ -1862,6 +1910,8 @@ class PositionExecutor(ExecutorBase):
         return lines
 
     def control_trailing_stop(self):
+        if self._resume_conflicting_fill is not None:
+            return
         if self.config.triple_barrier_config.trailing_stop:
             net_pnl_pct = self.get_net_pnl_pct()
             if self._trailing_stop_trigger_pct is None:
@@ -1873,6 +1923,8 @@ class PositionExecutor(ExecutorBase):
                     self._trailing_floor_hold = False
                     self._trailing_stop_armed_timestamp = self._strategy.current_timestamp
                     self._trailing_stop_last_update_timestamp = self._strategy.current_timestamp
+                    if not self._checkpoint_trailing_state():
+                        return
                     trailing_snapshot = self._trailing_status_snapshot()
                     self.logger().info(
                         self._log_message(
@@ -1921,6 +1973,8 @@ class PositionExecutor(ExecutorBase):
                     self._trailing_stop_trigger_pct = new_trigger
                     self._trailing_stop_move_count += 1
                     self._trailing_stop_last_update_timestamp = self._strategy.current_timestamp
+                    if not self._checkpoint_trailing_state():
+                        return
                     trailing_snapshot = self._trailing_status_snapshot()
                     self.logger().info(
                         self._log_message(
@@ -1930,6 +1984,17 @@ class PositionExecutor(ExecutorBase):
                             f"net_pnl={net_pnl_pct:.5f} moves={self._trailing_stop_move_count}"
                         )
                     )
+
+    def _checkpoint_trailing_state(self) -> bool:
+        """Commit a changed high-water before another tick can use it to authorize an exit."""
+        if self.open_filled_amount <= Decimal("0"):
+            return True
+        try:
+            MarketsRecorder.get_instance().store_or_update_executor(self)
+        except Exception as error:
+            self._mark_fill_reconciliation_required(f"Trailing checkpoint failed: {type(error).__name__}")
+            return False
+        return True
 
     async def validate_sufficient_balance(self):
         if self.is_perpetual:

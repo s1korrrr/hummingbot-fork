@@ -3,7 +3,7 @@ import json
 import re
 from decimal import Decimal
 from typing import Any, Callable, List, Optional, Tuple
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
@@ -19,6 +19,52 @@ from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderCancelledEve
 
 
 class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
+
+    async def test_fill_role_uses_okx_execution_type(self):
+        order = InFlightOrder(
+            client_order_id="maker-entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT_MAKER, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+        with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+            request.return_value = {"code": "0", "data": [fill]}
+            maker = await self.exchange._all_trade_updates_for_order(order)
+            fill["execType"] = "T"
+            taker = await self.exchange._all_trade_updates_for_order(order)
+        self.assertFalse(maker[0].is_taker)
+        self.assertTrue(taker[0].is_taker)
+        self.assertTrue(self.exchange._is_taker_fill({"tradeId": "unknown"}))
+
+    async def test_websocket_maker_fill_role_is_preserved(self):
+        order = InFlightOrder(
+            client_order_id="maker-entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT_MAKER, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        event = self.trade_event_for_full_fill_websocket_update(order)
+        event["data"][0]["state"] = "partially_filled"
+        event["data"][0]["execType"] = "M"
+
+        async def one_event():
+            yield event
+
+        tracker = MagicMock()
+        tracker.all_fillable_orders = {order.client_order_id: order}
+        tracker.all_updatable_orders = {}
+        with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
+                patch.object(self.exchange, "_order_tracker", tracker):
+            await self.exchange._user_stream_event_listener()
+        self.assertFalse(tracker.process_trade_update.call_args.args[0].is_taker)
+
+    async def test_preopen_instrument_is_not_mapped_as_live_rule(self):
+        info = {"instType": "SPOT", "instId": "LAT-USDC", "baseCcy": "LAT", "quoteCcy": "USDC",
+                "state": "preopen", "minSz": "10000", "tickSz": "0.0000001", "lotSz": "1"}
+        with patch.object(self.exchange, "trading_pair_associated_to_exchange_symbol",
+                          new_callable=AsyncMock, side_effect=KeyError("LAT-USDC")) as lookup:
+            rules = await self.exchange._format_trading_rules({"data": [info]})
+        self.assertEqual(rules, [])
+        lookup.assert_not_awaited()
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -254,6 +300,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 {
                     "instType": "SPOT",
                     "instId": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                    "state": "live",
                     "uly": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
                     "category": "1",
                     "baseCcy": self.base_asset,

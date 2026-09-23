@@ -1379,7 +1379,7 @@ class ExecutorOrchestrator:
                 for controller_id, executors in self.active_executors.items():
                     for executor in executors:
                         if not executor.is_closed:
-                            executor.early_stop(keep_position=keep_position_by_controller.get(controller_id, False))
+                            executor.early_stop(keep_position=keep_position_by_controller.get(controller_id, True))
                 for _ in range(max_executors_close_attempts):
                     if all(executor.executor_info.is_done for executors in self.active_executors.values() for executor in executors):
                         break
@@ -1394,7 +1394,7 @@ class ExecutorOrchestrator:
                 return ShutdownResult(False, f"Executor persistence/shutdown failed: {type(error).__name__}")
         # first we stop all active executors
         for controller_id, executors_list in self.active_executors.items():
-            keep_position = keep_position_by_controller.get(controller_id, False)
+            keep_position = keep_position_by_controller.get(controller_id, True)
             for executor in executors_list:
                 if not executor.is_closed:
                     executor.early_stop(keep_position=keep_position)

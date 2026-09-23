@@ -450,7 +450,9 @@ class StrategyV2Base(StrategyPyBase):
         preferences: Dict[str, bool] = {}
         for controller_id, controller in self.controllers.items():
             config = getattr(controller, "config", None)
-            keep_position = False
+            # Shutdown without an explicit controller preference must not
+            # create an exit order while the execution owner is going away.
+            keep_position = True
             for attr_name in ("early_stop_keep_position", "keep_position"):
                 attr_value = getattr(config, attr_name, None)
                 if isinstance(attr_value, bool):

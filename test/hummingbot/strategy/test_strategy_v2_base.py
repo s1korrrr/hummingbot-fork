@@ -276,6 +276,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         for controller in self.strategy.controllers.values():
             controller.stop.assert_called_once()
 
+    def test_shutdown_without_explicit_preference_keeps_position(self):
+        self.strategy.controllers["controller_1"].config = MagicMock(spec=[])
+        self.assertTrue(self.strategy._shutdown_keep_position_preferences()["controller_1"])
+
     def test_parse_markets_str_valid(self):
         test_input = "binance.JASMY-USDT,RLC-USDT:kucoin.BTC-USDT"
         expected_output = {

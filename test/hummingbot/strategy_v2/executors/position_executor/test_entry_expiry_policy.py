@@ -7,10 +7,11 @@ from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_l
     make_executor,
     tracked,
 )
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
@@ -210,7 +211,8 @@ async def test_retained_partial_fill_still_obeys_a_separate_trailing_exit():
     cancel(executor, entry)
     await cycle(executor)
     executor.get_price.return_value = D("105")
-    await cycle(executor)
+    with patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+        await cycle(executor)
     executor.get_price.return_value = D("103")
     await cycle(executor)
     await cycle(executor)
@@ -381,6 +383,7 @@ async def test_single_attempt_native_okx_cancel_ack_waits_for_missing_partial_fi
             assert not executor._entry_terminal_confirmed()
             assert executor._open_order is entry
             fills.return_value = complete
+            executor._strategy.current_timestamp += 10
             await cycle(executor)
             await cycle(executor)
             assert executor._entry_terminal_confirmed()

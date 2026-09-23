@@ -3,6 +3,11 @@
 This is an operator-assisted handover of existing inventory to its original
 PositionExecutor. It is not automatic crash recovery, a new BUY decision, or
 trading authority. Deployment and owner restart require their own authorization.
+An unspecified controller shutdown preference now retains inventory by default;
+an explicit `early_stop_keep_position: false` still requests an exit. Retaining
+inventory does not restore trailing management after restart. Use this handover
+only for its proven scope, and leave other unfinished executors in startup
+reconciliation rather than treating a held position as a resumed executor.
 
 The supported scope is deliberately narrow: one completely FILLED OKX 1x spot
 BUY entry per selected PositionExecutor, no exit order identity or fill, no exit

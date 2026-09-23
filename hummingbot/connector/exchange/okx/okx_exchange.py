@@ -508,10 +508,20 @@ class OkxExchange(ExchangePyBase):
                     fill_quote_amount=Decimal(fill_data["fillSz"]) * Decimal(fill_data["fillPx"]),
                     fill_price=Decimal(fill_data["fillPx"]),
                     fill_timestamp=int(fill_data["ts"]) * 1e-3,
+                    is_taker=self._is_taker_fill(fill_data),
                 )
                 trade_updates.append(trade_update)
 
         return trade_updates
+
+    def _is_taker_fill(self, data: Dict[str, Any]) -> bool:
+        role = data.get("execType")
+        if role == "M":
+            return False
+        if role != "T":
+            self.logger().warning("OKX fill execution role unavailable; treating as taker trade_id=%s",
+                                  data.get("tradeId"))
+        return True
 
     @staticmethod
     def _okx_order_misc_updates(data: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -606,6 +616,7 @@ class OkxExchange(ExchangePyBase):
                                 fill_quote_amount=Decimal(data["fillSz"]) * Decimal(data["fillPx"]),
                                 fill_price=Decimal(data["fillPx"]),
                                 fill_timestamp=int(data["uTime"]) * 1e-3,
+                                is_taker=self._is_taker_fill(data),
                             )
                             self._order_tracker.process_trade_update(trade_update)
 

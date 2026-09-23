@@ -1,6 +1,7 @@
 from decimal import Decimal as D
 from unittest.mock import MagicMock, patch
 
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
@@ -74,7 +75,8 @@ def _executor(price: D, *, max_age=3, close_order_type=OrderType.LIMIT, close_fe
 
 def _arm(executor, peak: D):
     executor.get_price.return_value = peak
-    executor.control_trailing_stop()
+    with patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+        executor.control_trailing_stop()
     assert executor._trailing_stop_trigger_pct is not None
     executor._strategy.sell.reset_mock()
 

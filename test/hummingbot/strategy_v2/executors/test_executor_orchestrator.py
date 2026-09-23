@@ -1161,7 +1161,7 @@ class TestExecutorOrchestrator(unittest.TestCase):
             position_executor.config = MagicMock()
             self.orchestrator.active_executors["test"] = [position_executor]
             await self.orchestrator.stop()
-            position_executor.early_stop.assert_called_once_with(keep_position=False)
+            position_executor.early_stop.assert_called_once_with(keep_position=True)
 
         asyncio.run(test_async())
 

@@ -4,6 +4,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
@@ -685,6 +686,68 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertIn("trigger_price=", trigger_output)
         self.assertIn("current_price=", trigger_output)
         self.assertIn("pair=ETH-USDT", trigger_output)
+
+    def test_trailing_arm_and_move_checkpoint_native_executor(self):
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        recorder = MagicMock()
+        with patch.object(MarketsRecorder, "get_instance", return_value=recorder):
+            executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.10"))
+            executor.control_trailing_stop()
+            self.assertEqual(executor._trailing_stop_trigger_pct, Decimal("0.08"))
+            self.assertEqual(recorder.store_or_update_executor.call_count, 1)
+
+            executor.get_net_pnl_pct.return_value = Decimal("0.13")
+            executor.control_trailing_stop()
+            self.assertEqual(executor._trailing_stop_trigger_pct, Decimal("0.11"))
+            self.assertEqual(recorder.store_or_update_executor.call_count, 2)
+
+    def test_trailing_checkpoint_failure_holds_before_sell(self):
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        recorder = MagicMock()
+        recorder.store_or_update_executor.side_effect = IOError("database unavailable")
+        with patch.object(MarketsRecorder, "get_instance", return_value=recorder):
+            executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.10"))
+            executor.control_trailing_stop()
+            executor.get_net_pnl_pct.return_value = Decimal("0.01")
+            executor.control_trailing_stop()
+
+        self.assertIsNotNone(executor._resume_conflicting_fill)
+        self.strategy.sell.assert_not_called()
+
+    def test_trailing_arm_checkpoint_survives_native_database_reopen(self):
+        from tempfile import TemporaryDirectory
+
+        from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
+        from hummingbot.client.config.config_helpers import ClientConfigAdapter
+        from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.10"))
+        with TemporaryDirectory() as directory:
+            manager = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                                           db_path=directory + "/trailing.sqlite")
+            previous_recorder = MarketsRecorder._shared_instance
+            recorder = MarketsRecorder(manager, [], "trailing.yml", "v2_with_controllers",
+                                       market_data_collection=MarketDataCollectionConfigMap(
+                                           market_data_collection_enabled=False))
+            try:
+                with patch.object(MarketsRecorder, "get_instance", return_value=recorder):
+                    executor.control_trailing_stop()
+                stored = recorder.get_all_executors()[0]
+                self.assertEqual(Decimal(stored.custom_info["trailing_stop_trigger_pct"]), Decimal("0.08"))
+                self.assertEqual(stored.custom_info["trailing_state"], "armed")
+                executor.get_net_pnl_pct.return_value = Decimal("0.13")
+                with patch.object(MarketsRecorder, "get_instance", return_value=recorder):
+                    executor.control_trailing_stop()
+                moved = recorder.get_all_executors()[0]
+                self.assertEqual(Decimal(moved.custom_info["trailing_stop_trigger_pct"]), Decimal("0.11"))
+                self.assertEqual(moved.custom_info["trailing_move_count"], 1)
+            finally:
+                MarketsRecorder._shared_instance = previous_recorder
+                manager.engine.dispose()
 
     @patch.object(PositionExecutor, "get_trading_rules")
     @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
@@ -1567,7 +1630,8 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.strategy.buy.assert_not_called()
         self.strategy.sell.assert_not_called()
         connector.get_price_by_type.return_value = Decimal("110")
-        await self.settle_expiry_reconciliation(executor)
+        with patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+            await self.settle_expiry_reconciliation(executor)
         self.assertIsNotNone(executor._trailing_stop_trigger_pct)
         connector.get_price_by_type.return_value = Decimal("106")
         await self.settle_expiry_reconciliation(executor)
@@ -1605,6 +1669,146 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(executor.close_type, CloseType.EXPIRED)
         self.strategy.buy.assert_not_called()
         self.strategy.sell.assert_not_called()
+
+    async def test_cancel_event_with_stale_open_snapshot_reconciles_zero_fill(self):
+        executor, order, connector = self.expired_entry_fixture()
+        executor.config.entry_order_policy = "single_attempt"
+        executor.process_order_canceled_event(None, None, OrderCancelledEvent(
+            timestamp=1234567921, order_id=order.client_order_id))
+        self.assertEqual(order.current_state, OrderState.OPEN)
+
+        await self.settle_expiry_reconciliation(executor)
+
+        connector._request_order_status.assert_awaited_once()
+        self.assertEqual(order.current_state, OrderState.CANCELED)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual(executor.close_type, CloseType.EXPIRED)
+        self.strategy.buy.assert_not_called()
+        self.strategy.sell.assert_not_called()
+
+    async def test_cancel_reconciliation_keeps_authoritative_snapshot_over_stale_tracker(self):
+        executor, order, connector = self.expired_entry_fixture()
+        executor.config.entry_order_policy = "single_attempt"
+        connector._order_tracker.fetch_order.side_effect = lambda client_order_id: InFlightOrder.from_json(order.to_json())
+        executor.process_order_canceled_event(None, None, OrderCancelledEvent(
+            timestamp=1234567921, order_id=order.client_order_id))
+
+        await self.settle_expiry_reconciliation(executor)
+
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual(executor._open_order.order.current_state, OrderState.CANCELED)
+        self.strategy.sell.assert_not_called()
+
+    async def test_terminal_entry_keeps_late_fill_from_stale_tracker(self):
+        executor, order, connector = self.expired_entry_fixture()
+        late_snapshot = InFlightOrder.from_json(order.to_json())
+        late_snapshot.update_with_trade_update(self.entry_trade(late_snapshot, Decimal("0.2")))
+        late_snapshot.current_state = OrderState.PARTIALLY_FILLED
+        order.current_state = OrderState.CANCELED
+        connector._order_tracker.fetch_order.return_value = late_snapshot
+        connector._order_tracker.fetch_order.side_effect = None
+
+        executor.update_tracked_orders_with_order_id(order.client_order_id)
+
+        self.assertIs(executor._open_order.order, order)
+        self.assertEqual(order.current_state, OrderState.CANCELED)
+        self.assertEqual(order.executed_amount_base, Decimal("0.2"))
+        self.assertEqual(executor.amount_to_close, Decimal("0.1998"))
+        self.strategy.sell.assert_not_called()
+
+    async def test_terminal_entry_holds_on_conflicting_tracker_fill(self):
+        executor, order, connector = self.expired_entry_fixture(Decimal("0.2"))
+        late_snapshot = InFlightOrder.from_json(order.to_json())
+        late_snapshot.order_fills["entry-fill"] = self.entry_trade(late_snapshot, Decimal("0.3"))
+        late_snapshot.current_state = OrderState.PARTIALLY_FILLED
+        order.current_state = OrderState.CANCELED
+        connector._order_tracker.fetch_order.return_value = late_snapshot
+        connector._order_tracker.fetch_order.side_effect = None
+
+        executor.update_tracked_orders_with_order_id(order.client_order_id)
+
+        self.assertIs(executor._open_order.order, order)
+        self.assertEqual(order.executed_amount_base, Decimal("0.2"))
+        self.assertEqual(executor._entry_lifecycle["state"], "reconciliation_required")
+        self.assertIsNotNone(executor._resume_conflicting_fill)
+        self.strategy.sell.assert_not_called()
+
+    async def test_cancel_event_with_stale_open_snapshot_keeps_late_fill_owner(self):
+        executor, order, connector = self.expired_entry_fixture()
+        executor.config.entry_order_policy = "single_attempt"
+        executor.process_order_canceled_event(None, None, OrderCancelledEvent(
+            timestamp=1234567921, order_id=order.client_order_id))
+
+        async def terminal_with_fill(tracked_order):
+            order.update_with_trade_update(self.entry_trade(order, Decimal("0.2")))
+            return connector._request_order_status.return_value
+
+        connector._request_order_status.side_effect = terminal_with_fill
+        await self.settle_expiry_reconciliation(executor)
+
+        self.assertEqual(order.current_state, OrderState.CANCELED)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertTrue(executor.is_trading)
+        self.assertEqual(executor.amount_to_close, Decimal("0.1998"))
+        self.strategy.sell.assert_not_called()
+
+    async def test_cancel_event_with_stale_open_snapshot_retains_on_bad_status(self):
+        for response in [IOError("status unavailable"), OrderUpdate(
+                trading_pair="ETH-USDT", update_timestamp=1234567921,
+                new_state=OrderState.CANCELED, client_order_id="other", exchange_order_id="EOID4")]:
+            with self.subTest(response=response):
+                executor, order, connector = self.expired_entry_fixture()
+                executor.config.entry_order_policy = "single_attempt"
+                executor.process_order_canceled_event(None, None, OrderCancelledEvent(
+                    timestamp=1234567921, order_id=order.client_order_id))
+                if isinstance(response, Exception):
+                    connector._request_order_status.side_effect = response
+                else:
+                    connector._request_order_status.return_value = response
+
+                await self.settle_expiry_reconciliation(executor)
+
+                self.assertEqual(order.current_state, OrderState.OPEN)
+                self.assertEqual(executor.status, RunnableStatus.RUNNING)
+                self.assertEqual(executor.get_custom_info()["entry_lifecycle"]["state"], "reconciliation_required")
+                self.strategy.cancel.assert_not_called()
+                self.strategy.buy.assert_not_called()
+                self.strategy.sell.assert_not_called()
+
+    async def test_restored_cancel_receipt_reconciles_stale_open_snapshot(self):
+        executor, order, connector = self.expired_entry_fixture()
+        executor.config.entry_order_policy = "single_attempt"
+        executor._entry_stop_reason = "exchange_canceled"
+        executor._entry_lifecycle.update({
+            "state": "cancel_pending", "stop_reason": "exchange_canceled",
+            "cancel_event_timestamp": 1234567921,
+        })
+
+        await self.settle_expiry_reconciliation(executor)
+
+        connector._request_order_status.assert_awaited_once()
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.strategy.cancel.assert_not_called()
+
+    async def test_cancel_reconciliation_failure_waits_before_retrying_status(self):
+        executor, order, connector = self.expired_entry_fixture()
+        executor.config.entry_order_policy = "single_attempt"
+        executor.process_order_canceled_event(None, None, OrderCancelledEvent(
+            timestamp=1234567921, order_id=order.client_order_id))
+        connector._request_order_status.side_effect = IOError("venue unavailable")
+
+        await self.settle_expiry_reconciliation(executor)
+        await executor.control_task()
+        if executor._entry_expiry_reconciliation_task is not None:
+            await asyncio.gather(executor._entry_expiry_reconciliation_task, return_exceptions=True)
+        connector._request_order_status.assert_awaited_once()
+        self.strategy.cancel.assert_not_called()
+
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567932)
+        connector._request_order_status.side_effect = None
+        await self.settle_expiry_reconciliation(executor)
+        self.assertEqual(connector._request_order_status.await_count, 2)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
 
     async def test_expired_entry_reconciliation_failure_retains_ownership(self):
         for response in [IOError("fill total unavailable"), TimeoutError("status timed out"), None, OrderUpdate(

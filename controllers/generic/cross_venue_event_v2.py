@@ -122,9 +122,35 @@ class CrossVenueEventV2Controller(ControllerBase):
                           configuration=current_configuration)
             self._state = result.state
             self._last_snapshot = snapshot
+            projection = {
+                'schema': 'cross_venue_event.operator_projection.v2',
+                'recipe_sha256': self._recipe.binding.recipe_sha256,
+                'source_sha256': self._recipe.binding.source_sha256,
+                'configuration_sha256': self._recipe.binding.configuration_sha256,
+                'snapshot_sha256': snapshot.dataset_sha256,
+                'asof_ms': snapshot.asof_ms,
+                'lag_ms': now_ms - snapshot.asof_ms,
+                'generation': snapshot.generation,
+                'sequence': snapshot.sequence,
+                'source_coverage': [
+                    {'source_id': item.source_id, 'coverage_state': item.coverage_state,
+                     'complete_for_entry': item.complete_for_entry, 'complete_for_risk': item.complete_for_risk}
+                    for item in snapshot.completeness],
+                'observation_universe': list(snapshot.observation_universe),
+                'entry_universe': list(snapshot.entry_universe),
+                'management_universe': list(snapshot.management_universe),
+                'decision_reasons': list(result.reasons),
+                'traces': [{'opportunity_id': trace.opportunity_id, 'status': trace.status,
+                            'reason': trace.reason} for trace in result.traces],
+                'risk_projection_sha256': snapshot.binding.risk_projection_sha256,
+                'native_ownership_status': 'UNVERIFIED',
+                'research_status': 'NOT_RUN',
+                'execution_allowed': False,
+            }
             self.processed_data = {
                 'status': 'NO_ORDER_OBSERVER_V2', 'execution_allowed': False, 'decision_ms': now_ms,
-                'reasons': list(result.reasons), 'setups': [item.phase for item in result.state.setups]}
+                'reasons': list(result.reasons), 'setups': [item.phase for item in result.state.setups],
+                'event_projection': projection}
         except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
             self.processed_data = {'status': 'UNAVAILABLE', 'execution_allowed': False,
                                    'error_type': type(exc).__name__, 'reasons': []}

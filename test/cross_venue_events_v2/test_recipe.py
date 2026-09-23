@@ -52,6 +52,10 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(ready.reasons, ('ready_research_only',))
         self.assertIs(ready.execution_authorized, False)
         self.assertIsNone(ready.opportunities[0].expected_return)
+        self.assertEqual(len(ready.traces), 1)
+        self.assertEqual(ready.traces[0].status, 'HOLD')
+        self.assertEqual(ready.traces[0].reason, 'acquisition_forbidden')
+        self.assertIs(ready.traces[0].execution_authorized, False)
 
     def test_same_millisecond_occurrences_stay_distinct(self):
         first = evidence(occurrence_id='notice-a', content_sha256='1' * 64)

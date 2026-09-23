@@ -81,9 +81,17 @@ class NativeAdapterTests(unittest.TestCase):
                 CrossVenueEventV2Config(id='events-v2', snapshot_path=str(path)), clock, asyncio.Queue())
             asyncio.run(controller.update_processed_data())
             self.assertEqual(controller.processed_data['status'], 'NO_ORDER_OBSERVER_V2')
+            projection = controller.processed_data['event_projection']
+            self.assertEqual(projection['recipe_sha256'], controller._recipe.binding.recipe_sha256)
+            self.assertEqual(projection['observation_universe'], [])
+            self.assertEqual(projection['entry_universe'], [])
+            self.assertEqual(projection['management_universe'], [])
+            self.assertEqual(projection['research_status'], 'NOT_RUN')
+            self.assertEqual(projection['native_ownership_status'], 'UNVERIFIED')
             controller.config.snapshot_path = str(path.with_name('changed.json'))
             asyncio.run(controller.update_processed_data())
             self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')
+            self.assertNotIn('event_projection', controller.processed_data)
             controller.config.snapshot_path = str(path)
             rebound = snapshot((), sequence=2, predecessor_sha256=first.dataset_sha256,
                                binding=SnapshotBindingV2(source_session='other', mapping_sha256='a' * 64))

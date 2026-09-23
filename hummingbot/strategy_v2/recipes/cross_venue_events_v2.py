@@ -4,7 +4,14 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from hummingbot.strategy_v2.components.config import PolicyModel
-from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, ObservationRef, Opportunity, Prerequisite
+from hummingbot.strategy_v2.components.decision_protocol import (
+    DecisionScope,
+    DecisionTrace,
+    ObservationRef,
+    Opportunity,
+    Prerequisite,
+    decide,
+)
 from hummingbot.strategy_v2.components.domain import PolicyError
 from hummingbot.strategy_v2.components.events_v2.contracts import EventEvidenceV2, QualifiedEventSnapshotV2
 from hummingbot.strategy_v2.components.events_v2.validation import validate_preexisting_market
@@ -77,6 +84,7 @@ class EventSetupStateV2(PolicyModel):
 class EventStepV2(PolicyModel):
     state: EventSetupStateV2
     opportunities: tuple[Opportunity, ...] = ()
+    traces: tuple[DecisionTrace, ...] = ()
     prerequisites: tuple[Prerequisite, ...] = ()
     reasons: tuple[str, ...] = ()
     execution_authorized: Literal[False] = False
@@ -238,5 +246,7 @@ def step(state: EventSetupStateV2 | None, snapshot: QualifiedEventSnapshotV2, *,
         prereqs = unique
     next_state = EventSetupStateV2(recipe=recipe, last_clock_ms=now_ms, snapshot_sequence=snapshot.sequence,
                                    setups=tuple(setups))
-    return EventStepV2(state=next_state, opportunities=tuple(opportunities), prerequisites=tuple(prereqs),
-                       reasons=tuple(reasons))
+    traces = tuple(decide(None, opportunity, now_ms=now_ms, prerequisites=())[1]
+                   for opportunity in opportunities)
+    return EventStepV2(state=next_state, opportunities=tuple(opportunities), traces=traces,
+                       prerequisites=tuple(prereqs), reasons=tuple(reasons))

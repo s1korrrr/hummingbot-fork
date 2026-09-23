@@ -785,8 +785,9 @@ class StrategyV2Base(StrategyPyBase):
         return config_name or script_name or "strategy_v2"
 
     def _write_runtime_status_snapshot_if_due(self):
-        if (not self._runtime_status_snapshot_enabled() or not self.ready_to_trade
-                or not self._controller_reports_valid):
+        if (not self._runtime_status_snapshot_enabled()
+                or (not self._unattended_restart_hold
+                    and (not self.ready_to_trade or not self._controller_reports_valid))):
             return
         if self.current_timestamp - self._last_runtime_status_snapshot_ts < self._runtime_status_snapshot_interval():
             return

@@ -188,4 +188,6 @@ class CrossVenueEventV2Controller(ControllerBase):
         compact['source_coverage_count'] = len(projection['source_coverage'])
         compact['traces'] = projection['traces'][:2]
         compact['trace_count'] = len(projection['traces'])
+        compact['decision_reasons'] = projection['decision_reasons'][:2]
+        compact['decision_reason_count'] = len(projection['decision_reasons'])
         return {'event_projection': compact}

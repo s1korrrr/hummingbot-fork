@@ -145,6 +145,16 @@ def event_projection_observation(source):
         if type(count) is not int or count < len(rows) or count > 10_000:
             raise ValueError('Invalid event projection count')
         result[key] = count
+    reasons = source.get('decision_reasons', [])
+    if (not isinstance(reasons, list) or len(reasons) > 2
+            or any(not isinstance(reason, str) or re.fullmatch(r'[a-z_]{1,128}', reason) is None
+                   for reason in reasons)):
+        raise ValueError('Invalid event decision reasons')
+    result['decision_reasons'] = list(reasons)
+    count = source.get('decision_reason_count', len(reasons))
+    if type(count) is not int or count < len(reasons) or count > 10_000:
+        raise ValueError('Invalid event reason count')
+    result['decision_reason_count'] = count
     return result
 
 

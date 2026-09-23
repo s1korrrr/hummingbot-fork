@@ -47,13 +47,15 @@ class NativeAdapterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / 'snapshot.json'
-            path.write_text(json.dumps(snapshot((evidence(),)).model_dump(mode='json')))
+            path.write_text(json.dumps(snapshot((evidence(kind='PAIR_REMOVAL'),)).model_dump(mode='json')))
             config = CrossVenueEventV2Config(id='events-v2', snapshot_path=str(path))
             for _ in range(2):
                 controller = CrossVenueEventV2Controller(config, Clock(), asyncio.Queue())
                 asyncio.run(controller.update_processed_data())
                 self.assertEqual(controller.processed_data['status'], 'NO_ORDER_OBSERVER_V2')
                 self.assertEqual(controller.determine_executor_actions(), [])
+                self.assertEqual(controller.get_custom_info()['event_projection']['decision_reasons'],
+                                 ['negative_event_veto'])
                 path.rename(path.with_name('offline.json'))
                 asyncio.run(controller.update_processed_data())
                 self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')

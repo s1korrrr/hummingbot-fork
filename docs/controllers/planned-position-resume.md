@@ -3,6 +3,11 @@
 This is an operator-assisted handover of existing inventory to its original
 PositionExecutor. It is not automatic crash recovery, a new BUY decision, or
 trading authority. Deployment and owner restart require their own authorization.
+An ordinary manual or unexpected restart that finds an unfinished executor
+blocks new executor creation across the stack and suppresses PositionExecutor
+order submission and trailing control until reconciliation. This is a hold,
+not a completed handover or a promise that an already-resting exchange SELL
+cannot fill. Do not clear the unfinished row merely to restart trading.
 An unspecified controller shutdown preference now retains inventory by default;
 an explicit `early_stop_keep_position: false` still requests an exit. Retaining
 inventory does not restore trailing management after restart. Use this handover
@@ -131,3 +136,33 @@ old empty-sidecar schema initialization, and failures after claim. Native OKX
 mocked REST tests separately prove that cancellation ACKs cannot release zero or
 partial-fill ownership without cumulative-fill reconciliation. These tests make
 no authenticated exchange requests and establish no deployment outcome.
+
+## General restart protocol still required
+
+SQLite is a durable local record, but an exchange acknowledgment, fill, or
+cancel may arrive before the corresponding executor row is committed. A saved
+order ID, a local `OPEN` state, or a zero local active-order count does not
+prove the exchange state. The current planned handover rejects active entries
+and exits; no normal startup path yet reattaches them automatically.
+
+For manual and crash restarts alike, the next protocol must keep order emission
+fenced while it reads WAL-inclusive native state and authenticated venue
+orders/fills, validates the configured owner and exact order identities, then
+reattaches each entry, exit, inventory quantity, and persisted trailing trigger.
+Unknown or conflicting evidence remains held with a visible recovery reason.
+The current startup hold also covers unfinished executor rows whose controller
+is absent from the new config, pending planned-resume claims before rows load,
+and BUY/SELL calls through the executor and StrategyV2Base order paths. A
+configured controller must not trade around an unfinished removed controller.
+These guards do not reconcile or cancel orders already resting at the venue.
+Before resuming an owner on the shared V1/V2 OKX wallet, aggregate owned base
+inventory across both stacks so one bot cannot sell inventory owned by the
+other. A resting SELL can fill during downtime or cancellation; its final
+fills must be reconciled before the position can be called held.
+
+Release checks must inject crashes before and after submission, acknowledgment,
+partial fill, cancel, trailing movement, exit submission/fill, and native commit;
+verify no duplicate BUY/SELL, no trailing reset, one owner, and a stable
+fail-closed result under stale or unavailable OKX responses. Until those checks
+and exact-image qualification pass, the startup hold is the safe result rather
+than automatic continuation.

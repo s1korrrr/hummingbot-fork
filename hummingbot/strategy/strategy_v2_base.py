@@ -464,6 +464,13 @@ class StrategyV2Base(StrategyPyBase):
             )
         return preferences
 
+    def _require_reconciled_execution(self):
+        orchestrator = getattr(self, "executor_orchestrator", None)
+        recovery = getattr(orchestrator, "recovery_required", None)
+        if (getattr(orchestrator, "_planned_resume_pending", False) is True
+                or (isinstance(recovery, dict) and any(recovery.values()))):
+            raise RuntimeError("Stack requires startup reconciliation; order submission is blocked")
+
     def buy(self,
             connector_name: str,
             trading_pair: str,
@@ -483,6 +490,7 @@ class StrategyV2Base(StrategyPyBase):
 
         :return: The client assigned id for the new order
         """
+        self._require_reconciled_execution()
         market_pair = self._market_trading_pair_tuple(connector_name, trading_pair)
         self.logger().debug(f"Creating {trading_pair} buy order: price: {price} amount: {amount}.")
         return self.buy_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)
@@ -506,6 +514,7 @@ class StrategyV2Base(StrategyPyBase):
 
         :return: The client assigned id for the new order
         """
+        self._require_reconciled_execution()
         market_pair = self._market_trading_pair_tuple(connector_name, trading_pair)
         self.logger().debug(f"Creating {trading_pair} sell order: price: {price} amount: {amount}.")
         return self.sell_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)

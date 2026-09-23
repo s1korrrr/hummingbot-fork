@@ -716,6 +716,33 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(executor._resume_conflicting_fill)
         self.strategy.sell.assert_not_called()
 
+    def test_other_unfinished_owner_blocks_direct_position_sell(self):
+        executor = self.get_position_executor_running_from_config(
+            self.get_position_config_market_long_with_trailing())
+        self.strategy.executor_orchestrator = MagicMock()
+        self.strategy.executor_orchestrator.recovery_required = {"other-controller": ["unknown-order"]}
+
+        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+            executor.place_order(
+                connector_name="binance", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
+                side=TradeType.SELL, amount=Decimal("1"), price=Decimal("100"))
+
+        self.strategy.sell.assert_not_called()
+
+    async def test_other_unfinished_owner_freezes_existing_trailing_control(self):
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        executor._trailing_stop_trigger_pct = Decimal("0.08")
+        executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.01"))
+        self.strategy.executor_orchestrator = MagicMock()
+        self.strategy.executor_orchestrator.recovery_required = {"other-controller": ["unknown-order"]}
+
+        await executor.control_task()
+
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertIsNone(executor.close_type)
+        self.strategy.sell.assert_not_called()
+
     def test_trailing_arm_checkpoint_survives_native_database_reopen(self):
         from tempfile import TemporaryDirectory
 

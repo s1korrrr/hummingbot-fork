@@ -285,6 +285,13 @@ class ExecutorOrchestrator:
         for executor in db_executors:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
+                if not executor.is_done:
+                    self.recovery_required.setdefault(controller_id, []).append(executor.id)
+                    self.logger().error(
+                        f"Startup reconciliation required | controller={controller_id} executor={executor.id} "
+                        "Persisted execution belongs to a controller absent from current config. "
+                        "New execution is blocked until ownership is reconciled."
+                    )
                 continue
             if executor.id in resumed:
                 continue
@@ -1634,10 +1641,11 @@ class ExecutorOrchestrator:
         executor_config = action.executor_config
         if controller_id in getattr(self.strategy, "_controller_restart_required", {}):
             raise RuntimeError(f"Controller {controller_id} requires a process restart; new execution is blocked")
-        if self.recovery_required.get(controller_id):
+        unresolved = {owner: ids for owner, ids in self.recovery_required.items() if ids}
+        if unresolved:
             raise RuntimeError(
-                f"Controller {controller_id} requires startup reconciliation of executors "
-                f"{self.recovery_required[controller_id]}; execution remains blocked"
+                f"Stack requires startup reconciliation of executors {unresolved}; "
+                "new execution remains blocked"
             )
         if any(executor.config.id == executor_config.id for executor in self.active_executors.get(controller_id, [])):
             raise ValueError(f"Duplicate executor id: {executor_config.id}")

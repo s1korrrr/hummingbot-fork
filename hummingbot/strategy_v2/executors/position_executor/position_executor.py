@@ -846,7 +846,7 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
-        if self._resume_conflicting_fill is not None:
+        if self._resume_conflicting_fill is not None or self._stack_recovery_required():
             return  # Keep ownership; only explicit reconciliation can resolve a sealed receipt conflict.
         if self.status == RunnableStatus.RUNNING:
             self.control_open_order()

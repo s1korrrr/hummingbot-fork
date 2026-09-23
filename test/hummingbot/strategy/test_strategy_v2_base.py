@@ -134,6 +134,14 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.determine_executor_actions.assert_not_called()
         self.strategy._write_runtime_status_snapshot_if_due.assert_called_once()
 
+    def test_unattended_v2_restart_hold_reports_while_connector_is_unready(self):
+        self.strategy._unattended_restart_hold = True
+        self.strategy.ready_to_trade = False
+        self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+        with patch.object(self.strategy, 'connectors', {'unready': MagicMock(ready=False, name='mock')}):
+            self.strategy.tick(self.start_timestamp)
+        self.strategy._write_runtime_status_snapshot_if_due.assert_called_once()
+
     async def test_unattended_v2_restart_hold_discards_queued_actions(self):
         action = CreateExecutorAction(controller_id="controller_1",
                                       executor_config=self.get_position_config_market_short())

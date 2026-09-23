@@ -28,6 +28,17 @@ async def test_unattended_restart_hold_rejects_order_before_durable_commit(monke
 
 
 @pytest.mark.asyncio
+async def test_unattended_restart_hold_rejects_direct_okx_place(monkeypatch):
+    monkeypatch.setenv('RSIBOT_V2_UNATTENDED_RESTART_HOLD', '1')
+    market = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
+    with patch.object(market, '_api_request', new_callable=AsyncMock) as request:
+        with pytest.raises(RuntimeError, match='unattended restart hold'):
+            await market._place_order('owned-client', 'ETH-USDC', Decimal('.09'), TradeType.SELL,
+                                      OrderType.LIMIT_MAKER, Decimal('100'))
+    request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('kind', [OrderType.LIMIT_MAKER, OrderType.MARKET])
 async def test_native_market_state_is_durable_before_venue_submission(tmp_path, monkeypatch, enabled, kind):

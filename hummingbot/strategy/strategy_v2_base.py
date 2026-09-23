@@ -382,6 +382,9 @@ class StrategyV2Base(StrategyPyBase):
 
         :param timestamp: current tick timestamp
         """
+        if self._unattended_restart_hold:
+            self._write_runtime_status_snapshot_if_due()
+            return
         if not self.ready_to_trade:
             self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
             if not self.ready_to_trade:

@@ -269,6 +269,9 @@ class OkxExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
 
+        if os.environ.get('RSIBOT_V2_UNATTENDED_RESTART_HOLD') == '1':
+            raise RuntimeError('V2 unattended restart hold forbids order submission')
+
         data = {
             "clOrdId": order_id,
             "tdMode": "cash",

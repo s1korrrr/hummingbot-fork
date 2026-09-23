@@ -249,6 +249,26 @@ class TestExecutorOrchestrator(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
             restarted.create_executor(CreateExecutorAction(controller_id="ok-rsi-eth", executor_config=config))
 
+    def test_unfinished_owner_blocks_new_execution_on_other_controller(self):
+        config = PositionExecutorConfig(
+            id="new-btc", timestamp=1234, controller_id="safe-btc",
+            connector_name="binance", trading_pair="BTC-USDT", side=TradeType.BUY,
+            entry_price=Decimal("100"), amount=Decimal("1"),
+            triple_barrier_config=TripleBarrierConfig())
+        self.orchestrator.recovery_required = {"unresolved-eth": ["old-entry"]}
+        self.orchestrator.active_executors["safe-btc"] = []
+        type(self.mock_strategy.connectors["binance"]).trading_rules = PropertyMock(return_value={
+            "ETH-USDT": TradingRule(trading_pair="ETH-USDT"),
+            "BTC-USDT": TradingRule(trading_pair="BTC-USDT"),
+        })
+        recorder = MarketsRecorder.get_instance()
+
+        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+            self.orchestrator.create_executor(CreateExecutorAction(
+                controller_id=config.controller_id, executor_config=config))
+
+        recorder.store_or_update_executor.assert_not_called()
+
     @patch.object(PositionExecutor, "start")
     @patch.object(DCAExecutor, "start")
     @patch.object(ArbitrageExecutor, "start")

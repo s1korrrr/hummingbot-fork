@@ -26,6 +26,7 @@ from controllers.directional_trading.ok_rsi_core.trailing import (
     ContinuousTrailingSelection,
     calculate_continuous_adaptive_trailing,
 )
+from controllers.shared import trailing as shared_trailing
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
@@ -123,7 +124,12 @@ class OKRSIController(hl_rsi.HLRSIController):
     @classmethod
     def implementation_source_files(cls):
         directory = Path(__file__).parent
-        return [Path(__file__), Path(hl_rsi.__file__), *(directory / "ok_rsi_core").rglob("*.py")]
+        return [
+            Path(__file__),
+            Path(hl_rsi.__file__),
+            Path(shared_trailing.__file__),
+            *(directory / "ok_rsi_core").rglob("*.py"),
+        ]
     _logger: Optional[HummingbotLogger] = None
 
     @classmethod

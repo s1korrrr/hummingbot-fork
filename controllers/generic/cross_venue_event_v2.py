@@ -22,6 +22,12 @@ def source_files():
     return [Path(__file__).resolve(), recipe]
 
 
+def behavioral_configuration(config):
+    return {'wait_ms': config.wait_ms, 'lifetime_ms': config.lifetime_ms,
+            'recipe_id': config.recipe_id, 'max_snapshot_age_ms': config.max_snapshot_age_ms,
+            'snapshot_path': config.snapshot_path}
+
+
 def load_v2_snapshot(path):
     path = Path(path).absolute()
     if (sys.platform == 'darwin' and path.is_relative_to('/var')
@@ -82,8 +88,7 @@ class CrossVenueEventV2Controller(ControllerBase):
         super().__init__(config, *args, **kwargs)
         self._state = None
         self._last_snapshot = None
-        payload = {'wait_ms': config.wait_ms, 'lifetime_ms': config.lifetime_ms,
-                   'recipe_id': config.recipe_id, 'max_snapshot_age_ms': config.max_snapshot_age_ms}
+        payload = behavioral_configuration(config)
         source_sha256 = source_digest(Path(__file__).resolve().parents[2], source_files())
         self._recipe = bind_observe_recipe(
             source_sha256=source_sha256, configuration=payload, wait_ms=config.wait_ms,
@@ -99,18 +104,22 @@ class CrossVenueEventV2Controller(ControllerBase):
             self.processed_data = {'status': 'OBSERVER_PAUSED', 'execution_allowed': False, 'reasons': []}
             return
         try:
-            verify_binding(self._recipe.binding, self._configuration,
+            current_configuration = behavioral_configuration(self.config)
+            verify_binding(self._recipe.binding, current_configuration,
                            source_sha256=source_digest(Path(__file__).resolve().parents[2], source_files()))
             snapshot = await asyncio.to_thread(load_v2_snapshot, self.config.snapshot_path)
             if snapshot.asof_ms > now_ms or now_ms - snapshot.asof_ms > self.config.max_snapshot_age_ms:
                 raise ValueError('snapshot is stale or from the future')
             if self._last_snapshot is not None:
+                if snapshot.binding != self._last_snapshot.binding:
+                    raise ValueError('snapshot source binding changed')
                 if snapshot.sequence == self._last_snapshot.sequence:
                     if snapshot != self._last_snapshot:
                         raise ValueError('snapshot changed without advancing its sequence')
                 else:
                     validate_snapshot_sequence(self._last_snapshot, snapshot)
-            result = step(self._state, snapshot, now_ms=now_ms, recipe=self._recipe, configuration=self._configuration)
+            result = step(self._state, snapshot, now_ms=now_ms, recipe=self._recipe,
+                          configuration=current_configuration)
             self._state = result.state
             self._last_snapshot = snapshot
             self.processed_data = {

@@ -41,6 +41,8 @@ class NativeAdapterTests(unittest.TestCase):
     def test_native_loader_holds_stale_and_mutated_snapshots_without_actions(self):
         from test.cross_venue_events_v2.test_contracts import T, snapshot
 
+        from hummingbot.strategy_v2.components.events_v2.contracts import SnapshotBindingV2
+
         class Clock:
             now_ms = T + 1
 
@@ -56,6 +58,15 @@ class NativeAdapterTests(unittest.TestCase):
                 CrossVenueEventV2Config(id='events-v2', snapshot_path=str(path)), clock, asyncio.Queue())
             asyncio.run(controller.update_processed_data())
             self.assertEqual(controller.processed_data['status'], 'NO_ORDER_OBSERVER_V2')
+            controller.config.snapshot_path = str(path.with_name('changed.json'))
+            asyncio.run(controller.update_processed_data())
+            self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')
+            controller.config.snapshot_path = str(path)
+            rebound = snapshot((), sequence=2, predecessor_sha256=first.dataset_sha256,
+                               binding=SnapshotBindingV2(source_session='other', mapping_sha256='a' * 64))
+            path.write_text(json.dumps(rebound.model_dump(mode='json')))
+            asyncio.run(controller.update_processed_data())
+            self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')
             changed = snapshot((), dataset_sha256='f' * 64)
             path.write_text(json.dumps(changed.model_dump(mode='json')))
             asyncio.run(controller.update_processed_data())

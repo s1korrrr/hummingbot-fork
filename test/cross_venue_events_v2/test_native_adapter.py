@@ -38,6 +38,29 @@ except ModuleNotFoundError:
 
 class NativeAdapterTests(unittest.TestCase):
     @unittest.skipUnless(NATIVE, 'Exact native Hummingbot dependencies are not installed; no stub replacement')
+    def test_restart_and_source_outage_never_emit_executor_actions(self):
+        from test.cross_venue_events_v2.test_contracts import T, evidence, snapshot
+
+        class Clock:
+            def time(self):
+                return (T + 60_000) / 1000
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / 'snapshot.json'
+            path.write_text(json.dumps(snapshot((evidence(),)).model_dump(mode='json')))
+            config = CrossVenueEventV2Config(id='events-v2', snapshot_path=str(path))
+            for _ in range(2):
+                controller = CrossVenueEventV2Controller(config, Clock(), asyncio.Queue())
+                asyncio.run(controller.update_processed_data())
+                self.assertEqual(controller.processed_data['status'], 'NO_ORDER_OBSERVER_V2')
+                self.assertEqual(controller.determine_executor_actions(), [])
+                path.rename(path.with_name('offline.json'))
+                asyncio.run(controller.update_processed_data())
+                self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')
+                self.assertEqual(controller.determine_executor_actions(), [])
+                path.with_name('offline.json').rename(path)
+
+    @unittest.skipUnless(NATIVE, 'Exact native Hummingbot dependencies are not installed; no stub replacement')
     def test_native_loader_holds_stale_and_mutated_snapshots_without_actions(self):
         from test.cross_venue_events_v2.test_contracts import T, snapshot
 

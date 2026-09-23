@@ -125,6 +125,7 @@ class CrossVenueEventV2Controller(ControllerBase):
             projection = {
                 'schema': 'cross_venue_event.operator_projection.v2',
                 'recipe_sha256': self._recipe.binding.recipe_sha256,
+                'module_graph_sha256': self._recipe.module_graph_sha256,
                 'source_sha256': self._recipe.binding.source_sha256,
                 'configuration_sha256': self._recipe.binding.configuration_sha256,
                 'snapshot_sha256': snapshot.dataset_sha256,
@@ -177,7 +178,8 @@ class CrossVenueEventV2Controller(ControllerBase):
         universes = ('observation_universe', 'entry_universe', 'management_universe')
         compact = {
             key: projection[key] for key in (
-                'schema', 'recipe_sha256', 'snapshot_sha256', 'asof_ms', 'lag_ms',
+                'schema', 'recipe_sha256', 'module_graph_sha256', 'source_sha256',
+                'configuration_sha256', 'snapshot_sha256', 'asof_ms', 'lag_ms',
                 'native_ownership_status', 'research_status', 'execution_allowed')}
         compact['status'] = 'NO_ORDER_OBSERVER_V2'
         for key in universes:

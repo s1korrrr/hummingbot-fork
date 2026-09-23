@@ -87,7 +87,8 @@ def event_projection_observation(source):
     if source.get('status') != 'NO_ORDER_OBSERVER_V2' or source.get('execution_allowed') is not False:
         raise ValueError('Event projection cannot claim execution authority')
     result = {key: source[key] for key in ('schema', 'status', 'execution_allowed')}
-    for key in ('recipe_sha256', 'snapshot_sha256'):
+    for key in ('recipe_sha256', 'module_graph_sha256', 'source_sha256',
+                'configuration_sha256', 'snapshot_sha256'):
         value = source.get(key)
         if not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None:
             raise ValueError('Invalid event projection identity')

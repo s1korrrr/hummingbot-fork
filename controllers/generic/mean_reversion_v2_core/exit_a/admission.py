@@ -19,11 +19,15 @@ from hummingbot.strategy_v2.components.recipe_contract import digest
 
 from .contracts import ExitAResultV2
 
-ClaimState = Literal['ADMITTED', 'CANCEL_PENDING', 'LATE_FILL_RECOVERED']
+ClaimState = Literal['ADMITTED', 'DISPATCH_PENDING', 'CANCEL_PENDING', 'LATE_FILL_RECOVERED']
 _TRANSITIONS = {
     ('ADMITTED', 'ADMITTED'),
+    ('ADMITTED', 'DISPATCH_PENDING'),
     ('ADMITTED', 'CANCEL_PENDING'),
     ('ADMITTED', 'LATE_FILL_RECOVERED'),
+    ('DISPATCH_PENDING', 'DISPATCH_PENDING'),
+    ('DISPATCH_PENDING', 'CANCEL_PENDING'),
+    ('DISPATCH_PENDING', 'LATE_FILL_RECOVERED'),
     ('CANCEL_PENDING', 'CANCEL_PENDING'),
     ('CANCEL_PENDING', 'LATE_FILL_RECOVERED'),
     ('LATE_FILL_RECOVERED', 'LATE_FILL_RECOVERED'),
@@ -127,9 +131,24 @@ class ExitAAdmissionStore:
     def load(self, claim_id: str) -> ExitAClaimV2 | None:
         return self._parse(self._load_raw()).get(claim_id)
 
+    def begin_dispatch(self, claim: ExitAClaimV2) -> ExitAClaimV2 | None:
+        """Claim one placement attempt durably before any uncertain order effect."""
+        raw = self._load_raw()
+        claims = self._parse(raw)
+        current = claims.get(claim.claim_id)
+        if current != claim or current.state != 'ADMITTED':
+            return None
+        pending = ExitAClaimV2.model_validate(current.model_dump(mode='json') | {
+            'state': 'DISPATCH_PENDING',
+        })
+        claims[claim.claim_id] = pending
+        if not self._write(raw, self._encode(claims)):
+            return None
+        return pending
+
 
 def admit(result: ExitAResultV2, view: NativeExitView, floor: NativeProfitFloor | None,
-          store: ExitAAdmissionStore, *, now_ms: int, max_age_ms: int, place=None) -> ExitAClaimV2 | None:
+          store: ExitAAdmissionStore, *, now_ms: int, max_age_ms: int) -> ExitAClaimV2 | None:
     result = ExitAResultV2.model_validate(result.model_dump(mode='json'))
     if result.execution_authorized:
         raise PolicyError('policy result cannot authorize execution')
@@ -144,8 +163,6 @@ def admit(result: ExitAResultV2, view: NativeExitView, floor: NativeProfitFloor 
     persisted = store.persist(claim)
     if store.load(claim.claim_id) != persisted:
         raise PolicyError('exit-a claim missing after persist')
-    if place is not None:
-        place(persisted)
     return persisted
 
 
@@ -155,8 +172,8 @@ def request_cancel(claim: ExitAClaimV2, store: ExitAAdmissionStore) -> ExitAClai
         raise PolicyError('cancel requires the persisted claim')
     if current.state == 'CANCEL_PENDING':
         return current
-    if current.state != 'ADMITTED':
-        raise PolicyError('only an admitted claim can be cancelled')
+    if current.state not in ('ADMITTED', 'DISPATCH_PENDING'):
+        raise PolicyError('only an admitted or pending-dispatch claim can be cancelled')
     updated = ExitAClaimV2.model_validate(current.model_dump(mode='json') | {'state': 'CANCEL_PENDING'})
     return store.persist(updated)
 
@@ -169,7 +186,7 @@ def recover_late_fill(claim: ExitAClaimV2, fill_receipt_sha256: str, store: Exit
         if current.fill_receipt_sha256 != fill_receipt_sha256:
             raise PolicyError('late-fill receipt changed')
         return current
-    if current.state not in ('ADMITTED', 'CANCEL_PENDING'):
+    if current.state not in ('ADMITTED', 'DISPATCH_PENDING', 'CANCEL_PENDING'):
         raise PolicyError('late-fill recovery is not available')
     updated = ExitAClaimV2.model_validate(current.model_dump(mode='json') | {
         'state': 'LATE_FILL_RECOVERED', 'fill_receipt_sha256': fill_receipt_sha256,

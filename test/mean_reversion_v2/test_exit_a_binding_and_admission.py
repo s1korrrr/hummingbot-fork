@@ -95,23 +95,17 @@ def test_store_rejects_compatibility_owner():
         ExitAAdmissionStore(recorder, owner_id='rsi_modular_host')
 
 
-def test_admit_persists_before_place_and_does_not_forward_zero_price(tmp_path):
+def test_admit_persists_claim_without_order_callback_or_zero_price(tmp_path):
     engine, store = metadata_store(tmp_path)
     result, current, floor = reduction()
     assert result.proposal.minimum_price == 0
-    seen = []
-
-    def place(claim):
-        loaded = store.load(claim.claim_id)
-        seen.append((loaded is not None, str(claim.assessment.limit_price)))
-
-    claim = admit(result, current.native, floor, store, now_ms=101, max_age_ms=50, place=place)
+    claim = admit(result, current.native, floor, store, now_ms=101, max_age_ms=50)
     engine.dispose()
     assert claim is not None and claim.state == 'ADMITTED'
     assert claim.inventory_released is False
     assert claim.assessment.execution_authorized is False
     assert claim.assessment.limit_price == floor.price
-    assert seen == [(True, '100')]
+    assert store.load(claim.claim_id) == claim
 
 
 def test_cancel_and_late_fill_keep_inventory(tmp_path):
@@ -129,6 +123,21 @@ def test_cancel_and_late_fill_keep_inventory(tmp_path):
     assert recover_late_fill(recovered, 'c' * 64, store) == recovered
     with pytest.raises(PolicyError):
         recover_late_fill(recovered, 'd' * 64, store)
+
+
+def test_pending_dispatch_can_cancel_and_recover_late_fill(tmp_path):
+    engine, store = metadata_store(tmp_path)
+    result, current, floor = reduction()
+    claim = admit(result, current.native, floor, store, now_ms=101, max_age_ms=50)
+    pending = store.begin_dispatch(claim)
+    assert pending.state == 'DISPATCH_PENDING'
+    assert store.begin_dispatch(claim) is None
+    cancelled = request_cancel(pending, store)
+    assert cancelled.state == 'CANCEL_PENDING' and cancelled.inventory_released is False
+    recovered = recover_late_fill(cancelled, 'c' * 64, store)
+    engine.dispose()
+    assert recovered.state == 'LATE_FILL_RECOVERED'
+    assert recovered.inventory_released is False
 
 
 def test_hold_assessment_does_not_persist_a_claim(tmp_path):

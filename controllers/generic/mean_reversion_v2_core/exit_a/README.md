@@ -31,15 +31,20 @@ Results always have `execution_authorized=false`.
 rejects `ok_rsi`, `rsi_v5`, `rsi_modular`, `okx_spot_dca` and `r11`. Recipe
 identity is not a Research OS registration or a live image pin.
 
-`admit` runs canonical `arbitrate_exit`, persists an `ExitAClaimV2` on native
-Metadata, then may call `place`. A proposal `minimum_price=0` is not an order
+`admit` runs canonical `arbitrate_exit` and persists an `ExitAClaimV2` on native
+Metadata without an order callback. A proposal `minimum_price=0` is not an order
 price. The assessment limit comes from the native floor. `request_cancel` and
 `recover_late_fill` keep `inventory_released=false`.
 
 `dispatch` rechecks the admitted claim against the current `NativeExitView`
-before invoking a caller `place` callback. A changed receipt or
+and atomically moves it to `DISPATCH_PENDING` before invoking a caller `place`
+callback. A repeated call, including through a reloaded store, cannot place
+the same claim again. A changed receipt or
 `native_close_pending` cancels the claim. Dust, incomplete fees and floor
-quantity mismatch hold. Uncertain `place` failures leave the claim admitted.
+quantity mismatch hold. Uncertain `place` failures retain the pending claim
+for native order/fill reconciliation; cancel and late-fill transitions preserve
+inventory ownership. Older source cannot parse a pending claim, so rollback
+after use requires state-compatible recovery rather than a blind code revert.
 Peak price and cost basis are returned unchanged. Entry pause does not block
 a reduction. This still does not import `native_composition` or start a
 compiled `network_iterator` controller.
@@ -69,8 +74,9 @@ From an actual compatible native checkout, run:
 python -m pytest -q test/mean_reversion_v2
 ```
 
-2026-09-23 hummingbot conda env (`Python 3.13.13`) with temporary compiled
-native module links: `pytest -q test/mean_reversion_v2` observed **71 passed**.
+2026-09-23 Hummingbot conda env (`Python 3.13.13`) with temporary compiled
+native module links: the focused `test_exit_a_*.py` suites observed **74 passed**
+after the dispatch-claim correction. The historical 71-test receipt predates it.
 The compiled-loader smoke constructed the existing `rsi_modular` `ok_rsi`
 profile; EXIT-A has no controller entrypoint and no owner startup was run.
 Profile source seals are AST closures over `ok_rsi` /

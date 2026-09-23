@@ -120,10 +120,13 @@ def dispatch(claim: ExitAClaimV2, proposal: ExitProposal, view: NativeExitView,
         receipt_sha256=view.receipt_sha256, inventory_revision=inventory_revision)
     if place is None:
         return done('HOLD', 'place_callback_required', request=None)
+    pending = store.begin_dispatch(current)
+    if pending is None:
+        return done('HOLD', 'dispatch_claim_conflict', persisted=store.load(current.claim_id))
     try:
         place(request)
     except Exception:
-        return done('HOLD', 'submission_uncertain')
-    if store.load(current.claim_id) != current:
-        raise PolicyError('dispatch mutated the admitted claim')
-    return done('DISPATCHED', 'placed', request=request)
+        return done('HOLD', 'submission_uncertain', persisted=pending)
+    if store.load(current.claim_id) != pending:
+        raise PolicyError('dispatch changed the pending claim')
+    return done('DISPATCHED', 'placed', request=request, persisted=pending)

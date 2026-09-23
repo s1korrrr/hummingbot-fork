@@ -3,7 +3,7 @@ from test.mean_reversion_v2.test_exit_a_binding_and_admission import H, metadata
 
 import pytest
 
-from controllers.generic.mean_reversion_v2_core.exit_a.admission import admit
+from controllers.generic.mean_reversion_v2_core.exit_a.admission import ExitAAdmissionStore, admit
 from controllers.generic.mean_reversion_v2_core.exit_a.lifecycle import (
     DispatchRequest,
     RestoreIdentity,
@@ -53,6 +53,39 @@ def test_entry_pause_still_dispatches_and_does_not_reset_peak(tmp_path):
     assert outcome.request.side == 'SELL' and outcome.request.order_type == 'LIMIT'
     assert outcome.request.execution_authorized is False
     assert outcome.request.limit_price == floor.price
+
+
+def test_repeated_dispatch_cannot_place_the_same_claim_twice(tmp_path):
+    engine, store = metadata_store(tmp_path)
+    result, current, floor = reduction()
+    claim = admit(result, current.native, floor, store, now_ms=101, max_age_ms=50)
+    seen = []
+    kwargs = dict(now_ms=101, max_age_ms=50, inventory_revision=current.inventory_revision,
+                  peak_price=Decimal('120'), cost_basis=Decimal('100'), place=seen.append)
+    first = dispatch(claim, result.proposal, current.native, floor, store, **kwargs)
+    reloaded_store = ExitAAdmissionStore(store.recorder, owner_id=store.owner_id, metadata_model=store.model)
+    assert restore(reloaded_store, _identity(), peak_price=Decimal('120'),
+                   cost_basis=Decimal('100')).claims[0].state == 'DISPATCH_PENDING'
+    second = dispatch(claim, result.proposal, current.native, floor, reloaded_store, **kwargs)
+    engine.dispose()
+    assert first.status == 'DISPATCHED'
+    assert second.status == 'HOLD'
+    assert len(seen) == 1
+    assert store.load(claim.claim_id).state == 'DISPATCH_PENDING'
+
+
+def test_dispatch_cas_conflict_cannot_call_place(tmp_path, monkeypatch):
+    engine, store = metadata_store(tmp_path)
+    result, current, floor = reduction()
+    claim = admit(result, current.native, floor, store, now_ms=101, max_age_ms=50)
+    monkeypatch.setattr(store, '_write', lambda old, new: False)
+    seen = []
+    outcome = dispatch(claim, result.proposal, current.native, floor, store, now_ms=101, max_age_ms=50,
+                       inventory_revision=current.inventory_revision, peak_price=Decimal('120'),
+                       cost_basis=Decimal('100'), place=seen.append)
+    engine.dispose()
+    assert outcome.status == 'HOLD' and outcome.reason == 'dispatch_claim_conflict'
+    assert seen == []
 
 
 def test_protective_close_after_proposal_cancels_without_place(tmp_path):
@@ -128,16 +161,23 @@ def test_uncertain_submission_keeps_claim(tmp_path):
     result, current, floor = reduction()
     claim = admit(result, current.native, floor, store, now_ms=101, max_age_ms=50)
 
-    def boom(_request):
+    attempts = []
+
+    def boom(request):
+        attempts.append(request)
         raise RuntimeError('exchange timeout')
 
     outcome = dispatch(claim, result.proposal, current.native, floor, store, now_ms=101, max_age_ms=50,
                        inventory_revision=1, peak_price=Decimal('120'), cost_basis=Decimal('100'),
                        place=boom)
-    engine.dispose()
     assert outcome.status == 'HOLD' and outcome.reason == 'submission_uncertain'
     loaded = store.load(claim.claim_id)
-    assert loaded.state == 'ADMITTED' and loaded.inventory_released is False
+    assert loaded.state == 'DISPATCH_PENDING' and loaded.inventory_released is False
+    repeated = dispatch(claim, result.proposal, current.native, floor, store, now_ms=101, max_age_ms=50,
+                        inventory_revision=1, peak_price=Decimal('120'), cost_basis=Decimal('100'),
+                        place=boom)
+    engine.dispose()
+    assert repeated.status == 'HOLD' and len(attempts) == 1
 
 
 def test_lifecycle_module_does_not_import_native_composition():

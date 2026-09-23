@@ -1,7 +1,10 @@
 import asyncio
+import json
+import tempfile
 import types
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from types import SimpleNamespace
 from typing import List
@@ -141,6 +144,21 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         with patch.object(self.strategy, 'connectors', {'unready': MagicMock(ready=False, name='mock')}):
             self.strategy.tick(self.start_timestamp)
         self.strategy._write_runtime_status_snapshot_if_due.assert_called_once()
+
+    def test_unattended_v2_restart_hold_persists_status_when_market_is_unready(self):
+        self.strategy._unattended_restart_hold = True
+        self.strategy.ready_to_trade = False
+        self.strategy._controller_reports_valid = False
+        self.strategy._last_runtime_status_snapshot_ts = 0
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(self.strategy, '_runtime_status_snapshot_enabled', return_value=True), \
+                patch.object(self.strategy, '_runtime_status_snapshot_dir', return_value=Path(tmp)), \
+                patch.object(self.strategy, '_build_runtime_status_snapshot',
+                             return_value={'bot_name': 'rsi_modular_v2', 'unattended_restart_hold': True}), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock, return_value=100):
+            self.strategy._write_runtime_status_snapshot_if_due()
+            snapshot = json.loads((Path(tmp) / 'rsi_modular_v2.status.json').read_text())
+        self.assertTrue(snapshot['unattended_restart_hold'])
 
     async def test_unattended_v2_restart_hold_discards_queued_actions(self):
         action = CreateExecutorAction(controller_id="controller_1",

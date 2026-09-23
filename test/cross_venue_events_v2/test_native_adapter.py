@@ -88,6 +88,12 @@ class NativeAdapterTests(unittest.TestCase):
             self.assertEqual(projection['management_universe'], [])
             self.assertEqual(projection['research_status'], 'NOT_RUN')
             self.assertEqual(projection['native_ownership_status'], 'UNVERIFIED')
+            self.assertEqual(controller.get_custom_info()['event_projection']['snapshot_sha256'],
+                             projection['snapshot_sha256'])
+            from hummingbot.strategy.native_observability import controller_observation
+            reported = controller_observation({'controller_id': 'events-v2', 'controller': controller})
+            self.assertEqual(reported['custom_info']['event_projection']['snapshot_sha256'],
+                             projection['snapshot_sha256'])
             controller.config.snapshot_path = str(path.with_name('changed.json'))
             asyncio.run(controller.update_processed_data())
             self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')

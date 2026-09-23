@@ -169,3 +169,23 @@ class CrossVenueEventV2Controller(ControllerBase):
         data = self.processed_data
         return [f"Cross-venue events v2: {data.get('status', 'UNAVAILABLE')}; orders disabled",
                 f"Observed reasons: {len(data.get('reasons', []))}"]
+
+    def get_custom_info(self):
+        projection = self.processed_data.get('event_projection')
+        if self.processed_data.get('status') != 'NO_ORDER_OBSERVER_V2' or not isinstance(projection, dict):
+            return {}
+        universes = ('observation_universe', 'entry_universe', 'management_universe')
+        compact = {
+            key: projection[key] for key in (
+                'schema', 'recipe_sha256', 'snapshot_sha256', 'asof_ms', 'lag_ms',
+                'native_ownership_status', 'research_status', 'execution_allowed')}
+        compact['status'] = 'NO_ORDER_OBSERVER_V2'
+        for key in universes:
+            compact[key] = projection[key][:2]
+            compact[key + '_count'] = len(projection[key])
+            compact[key + '_truncated'] = len(projection[key]) > 2
+        compact['source_coverage'] = projection['source_coverage'][:2]
+        compact['source_coverage_count'] = len(projection['source_coverage'])
+        compact['traces'] = projection['traces'][:2]
+        compact['trace_count'] = len(projection['traces'])
+        return {'event_projection': compact}

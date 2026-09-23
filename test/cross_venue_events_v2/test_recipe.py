@@ -71,6 +71,16 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(later.state.setups[0].phase, 'VETO_HOLD')
         self.assertTrue(any(item.status == 'HOLD' and item.name.startswith('veto.') for item in later.prerequisites))
 
+    def test_removed_asset_keeps_risk_veto_outside_entry_and_observation_universes(self):
+        item = evidence(kind='PAIR_REMOVAL')
+        view = snapshot((item,), observation_universe=(), entry_universe=(),
+                        management_universe=(item.asset_id,))
+        result = step(None, view, now_ms=T + 1, recipe=recipe(), configuration=CONFIG)
+        self.assertEqual(result.state.setups[0].phase, 'VETO_HOLD')
+        self.assertEqual(result.reasons, ('negative_event_veto',))
+        self.assertEqual(result.opportunities, ())
+        self.assertIs(result.execution_authorized, False)
+
     def test_empty_veto_set_is_not_an_admission(self):
         result = step(None, snapshot(()), now_ms=T + 1, recipe=recipe(), configuration=CONFIG)
         self.assertEqual(result.prerequisites, ())

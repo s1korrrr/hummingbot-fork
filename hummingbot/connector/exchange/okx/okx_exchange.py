@@ -40,6 +40,7 @@ class OkxOrderRejectedError(IOError):
 
 class OkxExchange(ExchangePyBase):
 
+    UNATTENDED_RESTART_HOLD_CONTRACT_VERSION = 1
     supports_terminal_fill_reconciliation = True
 
     web_utils = web_utils
@@ -70,6 +71,8 @@ class OkxExchange(ExchangePyBase):
         self.check_network_timeout = 30.0
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
+        if os.environ.get('RSIBOT_V2_UNATTENDED_RESTART_HOLD') == '1':
+            raise RuntimeError('V2 unattended restart hold forbids order submission')
         if os.environ.get('RSIBOT_V2_DURABLE_ORDER_TRACKING') == '1':
             from hummingbot.connector.markets_recorder import MarketsRecorder
             recorder = MarketsRecorder.get_existing_instance()

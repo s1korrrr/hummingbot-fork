@@ -294,6 +294,18 @@ class TestExecutorOrchestrator(unittest.TestCase):
             restarted.create_executor(CreateExecutorAction(controller_id="new-btc", executor_config=new_config))
         recorder.store_or_update_executor.assert_not_called()
 
+    def test_unattended_v2_restart_hold_blocks_new_executor(self):
+        self.mock_strategy._unattended_restart_hold = True
+        config = PositionExecutorConfig(
+            id="new-entry", timestamp=1235, controller_id="new-btc",
+            connector_name="binance", trading_pair="BTC-USDT", side=TradeType.BUY,
+            entry_price=Decimal("100"), amount=Decimal("1"))
+        recorder = MarketsRecorder.get_instance()
+
+        with self.assertRaisesRegex(RuntimeError, "unattended restart hold"):
+            self.orchestrator.create_executor(CreateExecutorAction(controller_id="new-btc", executor_config=config))
+        recorder.store_or_update_executor.assert_not_called()
+
     @patch.object(PositionExecutor, "start")
     @patch.object(DCAExecutor, "start")
     @patch.object(ArbitrageExecutor, "start")

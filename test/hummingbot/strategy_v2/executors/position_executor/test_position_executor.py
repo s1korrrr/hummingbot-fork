@@ -743,6 +743,19 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(executor.close_type)
         self.strategy.sell.assert_not_called()
 
+    async def test_unattended_v2_restart_hold_freezes_existing_trailing_control(self):
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        executor._trailing_stop_trigger_pct = Decimal("0.08")
+        executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.01"))
+        self.strategy._unattended_restart_hold = True
+
+        await executor.control_task()
+
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertIsNone(executor.close_type)
+        self.strategy.sell.assert_not_called()
+
     def test_trailing_arm_checkpoint_survives_native_database_reopen(self):
         from tempfile import TemporaryDirectory
 

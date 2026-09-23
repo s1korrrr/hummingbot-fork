@@ -1635,6 +1635,8 @@ class ExecutorOrchestrator:
         """
         Create an executor based on the configuration in the action.
         """
+        if getattr(self.strategy, "_unattended_restart_hold", False) is True:
+            raise RuntimeError("V2 unattended restart hold; executor creation is blocked")
         if self._planned_resume_pending:
             raise RuntimeError("Planned position ownership transfer is pending; execution is blocked")
         controller_id = action.controller_id

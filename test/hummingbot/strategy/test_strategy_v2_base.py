@@ -111,6 +111,44 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                 self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
         sell.assert_not_called()
 
+    def test_unattended_v2_restart_hold_blocks_direct_buy_and_sell(self):
+        self.strategy._unattended_restart_hold = True
+        with patch.object(self.strategy, "buy_with_specific_market") as buy, \
+                patch.object(self.strategy, "sell_with_specific_market") as sell:
+            with self.assertRaisesRegex(RuntimeError, "unattended restart hold"):
+                self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+            with self.assertRaisesRegex(RuntimeError, "unattended restart hold"):
+                self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+        buy.assert_not_called()
+        sell.assert_not_called()
+
+    def test_unattended_v2_restart_hold_does_not_resume_or_dispatch_on_tick(self):
+        self.strategy._unattended_restart_hold = True
+        self.strategy.executor_orchestrator.resume_planned_positions_if_ready = MagicMock(return_value=True)
+        self.strategy.determine_executor_actions = MagicMock()
+        self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+
+        self.strategy.on_tick()
+
+        self.strategy.executor_orchestrator.resume_planned_positions_if_ready.assert_not_called()
+        self.strategy.determine_executor_actions.assert_not_called()
+        self.strategy._write_runtime_status_snapshot_if_due.assert_called_once()
+
+    async def test_unattended_v2_restart_hold_discards_queued_actions(self):
+        action = CreateExecutorAction(controller_id="controller_1",
+                                      executor_config=self.get_position_config_market_short())
+        self.strategy._unattended_restart_hold = True
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[action], asyncio.CancelledError])
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+        self.strategy.update_executors_info = MagicMock()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.strategy.listen_to_executor_actions()
+
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+        self.strategy.update_executors_info.assert_not_called()
+
     async def test_start(self):
         self.assertFalse(self.strategy.ready_to_trade)
         self.strategy.start(Clock(ClockMode.BACKTEST), self.start_timestamp)

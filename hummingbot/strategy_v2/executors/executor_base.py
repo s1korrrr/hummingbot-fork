@@ -309,6 +309,8 @@ class ExecutorBase(RunnableBase):
         :param price: The price for the order.
         :return: The result of the order placement.
         """
+        if getattr(self._strategy, "_unattended_restart_hold", False) is True:
+            raise RuntimeError("V2 unattended restart hold; executor order submission is blocked")
         if self._stack_recovery_required():
             raise RuntimeError("Stack requires startup reconciliation; executor order submission is blocked")
         if side == TradeType.BUY:
@@ -317,6 +319,8 @@ class ExecutorBase(RunnableBase):
             return self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
 
     def _stack_recovery_required(self) -> bool:
+        if getattr(self._strategy, "_unattended_restart_hold", False) is True:
+            return True
         orchestrator = getattr(self._strategy, "executor_orchestrator", None)
         if getattr(orchestrator, "_planned_resume_pending", False) is True:
             return True

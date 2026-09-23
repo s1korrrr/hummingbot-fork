@@ -13,6 +13,21 @@ from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLCon
 
 
 @pytest.mark.asyncio
+async def test_unattended_restart_hold_rejects_order_before_durable_commit(monkeypatch):
+    monkeypatch.setenv('RSIBOT_V2_UNATTENDED_RESTART_HOLD', '1')
+    monkeypatch.setenv('RSIBOT_V2_DURABLE_ORDER_TRACKING', '1')
+    market = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
+    market.start_tracking_order('owned-client', None, 'ETH-USDC', TradeType.SELL,
+                                Decimal('100'), Decimal('.09'), OrderType.LIMIT_MAKER)
+    with patch.object(MarketsRecorder, 'get_existing_instance') as recorder, \
+            patch.object(market, '_place_order', new_callable=AsyncMock) as place:
+        with pytest.raises(RuntimeError, match='unattended restart hold'):
+            await market._place_order_and_process_update(market.in_flight_orders['owned-client'])
+    recorder.assert_not_called()
+    place.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('kind', [OrderType.LIMIT_MAKER, OrderType.MARKET])
 async def test_native_market_state_is_durable_before_venue_submission(tmp_path, monkeypatch, enabled, kind):

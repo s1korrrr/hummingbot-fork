@@ -181,6 +181,14 @@ class TestExecutorBase(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
 
         self.assertEqual(order_id, "OID-BUY-1")
 
+    def test_unattended_v2_restart_hold_blocks_executor_sell(self):
+        self.strategy._unattended_restart_hold = True
+        with self.assertRaisesRegex(RuntimeError, "unattended restart hold"):
+            self.component.place_order(
+                connector_name="connector1", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
+                side=TradeType.SELL, amount=Decimal("1"), price=Decimal("1000"))
+        self.strategy.sell.assert_not_called()
+
     async def test_executor_starts_and_stops(self):
         self.assertEqual(RunnableStatus.NOT_STARTED, self.component.status)
         self.component.start()

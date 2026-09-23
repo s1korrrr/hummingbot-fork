@@ -299,11 +299,48 @@ class PositionExecutor(ExecutorBase):
             return self._single_attempt_spot_close_amount()
 
         base_asset = self.config.trading_pair.split("-")[0]
-        available_base = self._to_decimal(self.get_available_balance(self.config.connector_name, base_asset))
-        if available_base is None:
-            return close_amount
+        previous_reason = getattr(self, "_close_quantity", {}).get("blocked_reason")
+        available_base = None
 
-        capped_amount = min(close_amount, max(available_base, Decimal("0")))
+        def retain_unavailable(detail: str) -> Decimal:
+            self._close_quantity = {
+                "owned_base": close_amount,
+                "available_base": available_base,
+                "order_amount": Decimal("0"),
+                "residual_base": close_amount,
+                "blocked_reason": "available_balance_unavailable",
+            }
+            if previous_reason != "available_balance_unavailable":
+                self.logger().warning(self._log_message(detail))
+            return Decimal("0")
+
+        try:
+            available_base = self._to_decimal(self.get_available_balance(self.config.connector_name, base_asset))
+        except Exception as exc:
+            return retain_unavailable(
+                f"Close available balance read failed; retaining position "
+                f"amount_to_close={close_amount} error={type(exc).__name__}"
+            )
+        if available_base is None or available_base < Decimal("0"):
+            return retain_unavailable(
+                f"Close available balance unavailable; retaining position "
+                f"amount_to_close={close_amount} available_{base_asset}={available_base}"
+            )
+
+        capped_amount = min(close_amount, available_base)
+
+        def retain_quantization(reason: str, detail: str) -> Decimal:
+            self._close_quantity = {
+                "owned_base": close_amount,
+                "available_base": available_base,
+                "order_amount": Decimal("0"),
+                "residual_base": close_amount,
+                "blocked_reason": reason,
+            }
+            if previous_reason != reason:
+                self.logger().error(self._log_message(detail))
+            return Decimal("0")
+
         try:
             quantized_amount = self._to_decimal(
                 self.connectors[self.config.connector_name].quantize_order_amount(
@@ -312,23 +349,23 @@ class PositionExecutor(ExecutorBase):
                 )
             )
         except Exception as exc:
-            self.logger().error(self._log_message(
+            return retain_quantization(
+                "quantity_quantization_failed",
                 f"Close order amount quantization failed; retaining position "
                 f"amount_to_close={close_amount} available_{base_asset}={available_base} "
-                f"error={type(exc).__name__}"
-            ))
-            return Decimal("0")
+                f"error={type(exc).__name__}",
+            )
         if (
             quantized_amount is None
-            or quantized_amount < Decimal("0")
+            or quantized_amount <= Decimal("0")
             or quantized_amount > capped_amount
         ):
-            self.logger().error(self._log_message(
+            return retain_quantization(
+                "quantity_quantization_invalid",
                 f"Close order amount quantization invalid; retaining position "
                 f"amount_to_close={close_amount} available_{base_asset}={available_base} "
-                f"quantized_amount={quantized_amount}"
-            ))
-            return Decimal("0")
+                f"quantized_amount={quantized_amount}",
+            )
         capped_amount = quantized_amount
         if available_base < close_amount:
             self.logger().warning(
@@ -341,6 +378,13 @@ class PositionExecutor(ExecutorBase):
         elif capped_amount < close_amount:
             self.logger().debug(self._log_message(
                 f"Quantizing close order amount amount_to_close={close_amount} order_amount={capped_amount}"))
+        self._close_quantity = {
+            "owned_base": close_amount,
+            "available_base": available_base,
+            "order_amount": capped_amount,
+            "residual_base": close_amount - capped_amount,
+            "blocked_reason": None,
+        }
         return capped_amount
 
     def _single_attempt_spot_close_amount(self) -> Decimal:

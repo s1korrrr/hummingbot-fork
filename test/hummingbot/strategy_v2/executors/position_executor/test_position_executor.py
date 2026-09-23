@@ -44,6 +44,7 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
             "binance": MagicMock(spec=ExchangePyBase),
         }
         strategy.connectors["binance"].get_price_by_type.return_value = Decimal("100")
+        strategy.connectors["binance"].get_available_balance.return_value = Decimal("10")
         strategy.connectors["binance"].trading_rules = {"ETH-USDT": TradingRule("ETH-USDT", min_order_size=Decimal("0.01"), min_notional_size=Decimal("1"))}
         strategy.connectors["binance"]._order_tracker = MagicMock()
         strategy.connectors["binance"]._order_tracker.fetch_order.return_value = None
@@ -122,6 +123,37 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         position_executor = PositionExecutor(self.strategy, position_config)
         position_executor._status = RunnableStatus.RUNNING
         return position_executor
+
+    def _filled_spot_long_executor(self):
+        executor = self.get_position_executor_running_from_config(
+            self.get_position_config_market_long_with_trailing()
+        )
+        executor._open_order = TrackedOrder(order_id="OID-BUY-1")
+        executor._open_order.order = InFlightOrder(
+            client_order_id="OID-BUY-1",
+            exchange_order_id="EOID4",
+            trading_pair="ETH-USDT",
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            price=Decimal("100"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.FILLED,
+        )
+        executor._open_order.order.update_with_trade_update(
+            TradeUpdate(
+                trade_id="1",
+                client_order_id="OID-BUY-1",
+                exchange_order_id="EOID4",
+                trading_pair="ETH-USDT",
+                fill_price=Decimal("100"),
+                fill_base_amount=Decimal("1"),
+                fill_quote_amount=Decimal("100"),
+                fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.2"))]),
+                fill_timestamp=10,
+            )
+        )
+        return executor
 
     @patch.object(PositionExecutor, "get_trading_rules")
     def test_place_open_order_preserves_single_attempt_dispatch_contract(self, trading_rules_mock):
@@ -839,6 +871,105 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
             )
         )
         self.assertFalse(position_executor.open_and_close_volume_match())
+
+    def _prepare_legacy_spot_close_rules(self, mock_get_price, mock_get_trading_rules):
+        mock_get_price.side_effect = lambda connector, pair, price_type=PriceType.MidPrice: (
+            Decimal("109") if price_type == PriceType.BestBid else Decimal("110")
+        )
+        trading_rules = MagicMock(spec=TradingRule)
+        trading_rules.min_order_size = Decimal("0.1")
+        trading_rules.min_notional_size = Decimal("1")
+        mock_get_trading_rules.return_value = trading_rules
+        connector = self.strategy.connectors["binance"]
+        connector.quantize_order_amount.side_effect = lambda trading_pair, amount: amount
+        return self._filled_spot_long_executor(), connector
+
+    def _assert_legacy_spot_close_retained(self, executor):
+        self.assertEqual(executor._close_order_amount(), Decimal("0"))
+        self.assertEqual(executor._close_quantity.get("blocked_reason"), "available_balance_unavailable")
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
+        self.strategy.sell.assert_not_called()
+        self.assertIsNone(executor._close_order)
+        self.assertEqual(executor.amount_to_close, Decimal("1"))
+        self.assertEqual(executor.status, RunnableStatus.SHUTTING_DOWN)
+        self.assertEqual(executor.close_type, CloseType.TRAILING_STOP)
+        self.assertFalse(executor.is_closed)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_legacy_spot_close_blocks_when_available_balance_missing(self, mock_get_price, mock_get_trading_rules):
+        executor, connector = self._prepare_legacy_spot_close_rules(mock_get_price, mock_get_trading_rules)
+        connector.get_available_balance.return_value = None
+        self._assert_legacy_spot_close_retained(executor)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_legacy_spot_close_blocks_when_available_balance_non_finite(self, mock_get_price, mock_get_trading_rules):
+        for value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+            with self.subTest(value=str(value)):
+                self.strategy = self.create_mock_strategy
+                executor, connector = self._prepare_legacy_spot_close_rules(mock_get_price, mock_get_trading_rules)
+                connector.get_available_balance.return_value = value
+                self._assert_legacy_spot_close_retained(executor)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_legacy_spot_close_blocks_when_available_balance_read_raises(self, mock_get_price, mock_get_trading_rules):
+        executor, connector = self._prepare_legacy_spot_close_rules(mock_get_price, mock_get_trading_rules)
+        connector.get_available_balance.side_effect = RuntimeError("balance feed down")
+        self._assert_legacy_spot_close_retained(executor)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_legacy_spot_close_recovers_when_available_balance_returns(self, mock_get_price, mock_get_trading_rules):
+        executor, connector = self._prepare_legacy_spot_close_rules(mock_get_price, mock_get_trading_rules)
+        connector.get_available_balance.side_effect = RuntimeError("balance feed down")
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
+        self.strategy.sell.assert_not_called()
+        self.assertEqual(executor.amount_to_close, Decimal("1"))
+
+        connector.get_available_balance.side_effect = None
+        connector.get_available_balance.return_value = Decimal("0.75")
+        executor.place_close_order_and_cancel_open_orders(close_type=CloseType.TRAILING_STOP)
+
+        self.assertEqual(
+            self.strategy.sell.call_args.args,
+            ("binance", "ETH-USDT", Decimal("0.75"), OrderType.LIMIT, Decimal("109"), PositionAction.CLOSE),
+        )
+        self.assertEqual(executor._close_order.order_id, "OID-SELL-1")
+        self.assertIsNone(executor._close_quantity.get("blocked_reason"))
+        self.assertEqual(executor.amount_to_close, Decimal("1"))
+        self.assertFalse(executor.is_closed)
+
+    @patch.object(PositionExecutor, "get_trading_rules")
+    @patch("hummingbot.strategy_v2.executors.position_executor.position_executor.PositionExecutor.get_price")
+    def test_legacy_close_receipt_tracks_each_recovery_stage(self, mock_get_price, mock_get_trading_rules):
+        executor, connector = self._prepare_legacy_spot_close_rules(mock_get_price, mock_get_trading_rules)
+        connector.get_available_balance.return_value = None
+        self.assertEqual(executor._close_order_amount(), Decimal("0"))
+        self.assertEqual(executor._close_quantity["blocked_reason"], "available_balance_unavailable")
+        self.assertEqual(executor._close_quantity["residual_base"], Decimal("1"))
+
+        connector.get_available_balance.return_value = Decimal("0.75")
+        connector.quantize_order_amount.side_effect = RuntimeError("quantizer unavailable")
+        self.assertEqual(executor._close_order_amount(), Decimal("0"))
+        self.assertEqual(executor._close_quantity["blocked_reason"], "quantity_quantization_failed")
+        self.assertEqual(executor._close_quantity["available_base"], Decimal("0.75"))
+        self.assertEqual(executor._close_quantity["order_amount"], Decimal("0"))
+
+        connector.quantize_order_amount.side_effect = None
+        connector.quantize_order_amount.return_value = Decimal("-0.1")
+        self.assertEqual(executor._close_order_amount(), Decimal("0"))
+        self.assertEqual(executor._close_quantity["blocked_reason"], "quantity_quantization_invalid")
+        self.assertEqual(executor._close_quantity["available_base"], Decimal("0.75"))
+        self.assertEqual(executor._close_quantity["residual_base"], Decimal("1"))
+
+        connector.quantize_order_amount.return_value = Decimal("0.7")
+        self.assertEqual(executor._close_order_amount(), Decimal("0.7"))
+        self.assertIsNone(executor._close_quantity["blocked_reason"])
+        self.assertEqual(executor._close_quantity["order_amount"], Decimal("0.7"))
+        self.assertEqual(executor._close_quantity["residual_base"], Decimal("0.3"))
+        self.strategy.sell.assert_not_called()
 
     @patch.object(PositionExecutor, "_sleep")
     @patch.object(PositionExecutor, "get_trading_rules")

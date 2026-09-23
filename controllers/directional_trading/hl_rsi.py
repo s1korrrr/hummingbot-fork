@@ -2313,6 +2313,9 @@ class HLRSIController(DirectionalTradingControllerBase):
                 if runner_quote is not None
                 else "runner —"
             )
+            if not self._split_entries_enabled():
+                plan_anchor = f"full base {self._status_money_label(usd_per_entry)}"
+                plan_next = "dynamic size on qualifying signal"
             return {
                 "plan_mode": "ENTRIES",
                 "plan_target": f"rsi≤{rsi_buy:.2f}",

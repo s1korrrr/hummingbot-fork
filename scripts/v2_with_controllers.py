@@ -94,6 +94,8 @@ class V2WithControllers(StrategyV2Base):
                     self.max_pnl_by_controller = {key: Decimal(value) for key, value in state['max_pnl_by_controller'].items()}
                     if not self.max_global_pnl.is_finite() or any(not x.is_finite() for x in self.max_pnl_by_controller.values()):
                         raise ValueError('Non-finite persisted risk peak')
+                    if self.config.max_daily_loss_quote is None and state.get('daily_entry_risk') is not None:
+                        raise ValueError('Persisted daily loss limit removed; explicit reconciliation required')
                     self.drawdown_exited_controllers = state['drawdown_exited_controllers']
                     self._is_stop_triggered = state['stopped']
                     for cid, paused in state['operator_paused'].items():

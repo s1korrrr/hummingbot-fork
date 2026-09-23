@@ -3,11 +3,13 @@ import ast
 import asyncio
 import importlib
 from copy import deepcopy
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from typing import ClassVar, Literal
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from sqlalchemy.exc import SQLAlchemyError
 
 from hummingbot.core.data_type.common import PositionMode, TradeType
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
@@ -314,6 +316,26 @@ class NativeComposition:
             return
         getter().abandon()
 
+    def _effective_buy_entry_usd(self, state=None, *, entry_fraction=None):
+        planned = super()._effective_buy_entry_usd(state, entry_fraction=entry_fraction)
+        if self.config.funding is None or not self.config.funding.resize_to_available_quote:
+            return planned
+        try:
+            if self._funding_store is None:
+                from hummingbot.connector.markets_recorder import MarketsRecorder
+                recorder = MarketsRecorder.get_existing_instance()
+                if recorder is None:
+                    raise PolicyError('Native recorder required for candidate funding sizing')
+                self._funding_store = NativeFundingStore(self, recorder)
+            ceiling = self._funding_store.entry_notional_ceiling().quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+            self._funding_size = {'requested_quote': str(planned), 'ceiling_quote': str(ceiling),
+                                  'effective_quote': str(min(planned, ceiling))}
+            self._funding_hold = None
+            return min(planned, ceiling)
+        except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError, SQLAlchemyError) as error:
+            self._funding_hold = str(error) or type(error).__name__
+            return Decimal(0)
+
     def get_executor_config(self, *args, **kwargs):
         config = super().get_executor_config(*args, **kwargs)
         if self.config.funding is not None and config.side == TradeType.BUY:
@@ -343,7 +365,9 @@ class NativeComposition:
         return False
 
     def validate_executor_config(self, config):
-        if self._recovery_hold or self._recovery_fault:
+        sizing_hold = (config.side == TradeType.BUY and self.config.funding is not None
+                       and self.config.funding.resize_to_available_quote and self._funding_hold)
+        if self._recovery_hold or self._recovery_fault or sizing_hold:
             if config.side == TradeType.BUY:
                 release = getattr(self, '_release_entry_decision', None)
                 if callable(release):
@@ -380,8 +404,34 @@ class NativeComposition:
                 return False
         return True
 
+    def _entry_admission_status(self):
+        for label, reason in (('recovery', self._recovery_fault or self._recovery_hold),
+                              ('funding', self._funding_hold),
+                              ('entry_decision', getattr(self, '_entry_decision_error', None))):
+            if reason:
+                return {'state': 'blocked', 'reason': f'{label}: {reason}'}
+        if not self.config.execution_enabled:
+            return {'state': 'blocked', 'reason': 'execution_disabled'}
+        if not self._composition_unchanged():
+            return {'state': 'blocked', 'reason': 'composition_changed'}
+        if self.config.funding is not None and (self._funding_store is None or not self._funding_store.status):
+            return {'state': 'unverified', 'reason': 'funding_unverified'}
+        return {'state': 'conditional', 'reason': None}
+
+    def get_status_summary(self):
+        summary = super().get_status_summary()
+        admission = self._entry_admission_status()
+        if admission['reason']:
+            summary['gate'] = admission['reason']
+        summary['entry_admission'] = admission
+        return summary
+
     def get_custom_info(self):
         info = super().get_custom_info()
+        info['entry_admission'] = self._entry_admission_status()
+        info['native_buy_gate'] = info.get('buy_gate')
+        if info['entry_admission']['reason']:
+            info['buy_gate'] = info['entry_admission']['reason']
         info['modular_composition'] = {'native_family': self._native_family,
                                        'execution_mode': self.config.execution_mode,
                                        'data_mode': self.config.data.mode,
@@ -389,6 +439,7 @@ class NativeComposition:
                                        'execution_enabled': self.config.execution_enabled,
                                        'recovery_hold': self._recovery_hold,
                                        'funding_hold': self._funding_hold,
+                                       'funding_sizing': getattr(self, '_funding_size', None),
                                        'funding': self._funding_store.status if self._funding_store else None}
         if hasattr(self.config, 'profile'):
             info['modular_composition']['profile'] = self.config.profile

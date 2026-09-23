@@ -44,11 +44,12 @@ def test_unknown_fees_legacy_fill_and_wallet_inventory_are_rejected():
 
 
 def test_policy_requires_explicit_fees_and_candidate_ceiling():
-    for values in ({'allocation_quote': '102', 'fee_reserve_fraction': '.003'},
+    for values in ({'allocation_quote': '1001', 'fee_reserve_fraction': '.003'},
                    {'allocation_quote': '50'}, {'allocation_quote': '0', 'fee_reserve_fraction': '.003'}):
         with pytest.raises(ValueError):
             CandidateFundingPolicy(**values)
     CandidateFundingPolicy(allocation_quote='101', fee_reserve_fraction='.003', max_position_quote='101')
+    CandidateFundingPolicy(allocation_quote='1000', fee_reserve_fraction='.003', max_position_quote='105')
 
 
 def test_live_enabled_requires_policy_and_disallows_wallet_adoption():

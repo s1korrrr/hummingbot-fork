@@ -17,7 +17,7 @@ async def test_empty_regular_and_every_spot_algo_type_are_required():
     assert {call.kwargs['params'].get('ordType') for call in calls} == {
         None, 'conditional', 'oco', 'trigger', 'move_order_stop', 'iceberg', 'twap', 'smart_iceberg'}
     assert all(call.kwargs['is_auth_required'] for call in calls)
-    assert all(call.kwargs['params']['instId'] == 'BTC-USDC' for call in calls)
+    assert all('instId' not in call.kwargs['params'] for call in calls)
 
 
 @pytest.mark.asyncio

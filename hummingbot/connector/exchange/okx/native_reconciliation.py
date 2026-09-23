@@ -1,7 +1,7 @@
 """Authoritative, read-only OKX SPOT order reconciliation for opt-in native shutdown.
 
 Protocol: https://my.okx.com/docs-v5/en/#order-book-trading-trade-get-order-list
-and #order-book-trading-algo-trading-get-algo-order-list (checked 2026-09-08).
+and #order-book-trading-algo-trading-get-algo-order-list (checked 2026-09-22).
 """
 from hummingbot.connector.exchange.okx import okx_constants as CONSTANTS
 
@@ -11,6 +11,7 @@ SPOT_ALGO_TYPES = ('conditional', 'oco', 'trigger', 'move_order_stop', 'iceberg'
 async def _pending_records(connector, path, params, id_key):
     records = []
     cursors = set()
+    expected_inst_id = params.get('instId')
     for _ in range(100):
         response = await connector._api_get(path_url=path, params=dict(params), is_auth_required=True)
         if not isinstance(response, dict) or response.get('code') != '0' or not isinstance(response.get('data'), list):
@@ -19,7 +20,9 @@ async def _pending_records(connector, path, params, id_key):
         if len(page) > 100:
             raise ValueError('Unexpected pending-order page size')
         for order in page:
-            if (not isinstance(order, dict) or order.get('instId') != params['instId']
+            inst_id = order.get('instId') if isinstance(order, dict) else None
+            if (not isinstance(inst_id, str) or not inst_id
+                    or (expected_inst_id is not None and inst_id != expected_inst_id)
                     or not isinstance(order.get(id_key), str) or not order[id_key].isdecimal()):
                 raise ValueError('Unrecognized pending-order identity')
         records.extend(page)
@@ -35,17 +38,13 @@ async def _pending_records(connector, path, params, id_key):
 
 async def verify_no_open_orders(connector):
     try:
-        if not connector.trading_pairs:
+        params = {'instType': 'SPOT', 'limit': '100'}
+        if await _pending_records(connector, CONSTANTS.OKX_PENDING_ORDERS_PATH, dict(params), 'ordId'):
             return False
-        for pair in connector.trading_pairs:
-            symbol = await connector.exchange_symbol_associated_to_pair(trading_pair=pair)
-            params = {'instType': 'SPOT', 'instId': symbol, 'limit': '100'}
-            if await _pending_records(connector, CONSTANTS.OKX_PENDING_ORDERS_PATH, dict(params), 'ordId'):
+        for order_type in SPOT_ALGO_TYPES:
+            if await _pending_records(connector, CONSTANTS.OKX_PENDING_ALGO_ORDERS_PATH,
+                                      dict(params, ordType=order_type), 'algoId'):
                 return False
-            for order_type in SPOT_ALGO_TYPES:
-                if await _pending_records(connector, CONSTANTS.OKX_PENDING_ALGO_ORDERS_PATH,
-                                          dict(params, ordType=order_type), 'algoId'):
-                    return False
         return True
     except Exception:
         connector.logger().exception('Native OKX open-order reconciliation unavailable')

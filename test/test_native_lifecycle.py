@@ -336,6 +336,44 @@ async def test_restart_rejects_same_identity_parameter_drift_before_start():
     app.start_check.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_legacy_native_restart_holds_for_other_pair_open_spot_order():
+    from hummingbot.client.native_commands import NativeCommands
+    from hummingbot.connector.exchange.okx import okx_constants as CONSTANTS
+    from hummingbot.connector.exchange.okx.native_reconciliation import verify_no_open_orders
+
+    owner = core()
+    observer = NativeLifecycle('ok-rsi-main')
+    observer.snapshot(owner)
+    owner.strategy = None
+    owner._strategy_running = False
+    observer.transition('stopped', True)
+
+    async def api_get(path_url, params, is_auth_required):
+        assert is_auth_required is True
+        assert params['instType'] == 'SPOT'
+        assert 'instId' not in params
+        if path_url == CONSTANTS.OKX_PENDING_ORDERS_PATH:
+            return {'code': '0', 'data': [{'instId': 'ETH-USDT', 'ordId': '101'}]}
+        return {'code': '0', 'data': []}
+
+    connector = SimpleNamespace(_api_get=AsyncMock(side_effect=api_get), logger=Mock())
+
+    async def reconcile():
+        return await verify_no_open_orders(connector)
+
+    connector.native_orders_reconciled = reconcile
+    observer.reconciliation_connectors = (connector,)
+    app = SimpleNamespace(trading_core=owner, native_lifecycle=observer, start_check=AsyncMock(), logger=Mock())
+
+    response = await NativeCommands(app).execute(native_request(app, 'start'))
+    assert response['accepted'] is True
+    assert response['execution_completed'] is False
+    assert response['state'] == 'unknown'
+    app.start_check.assert_not_awaited()
+    assert connector._api_get.await_count == 1
+
+
 def test_retained_executor_persistence_retry_does_not_credit_performance_twice():
     from unittest.mock import patch
 

@@ -269,6 +269,31 @@ class TestExecutorOrchestrator(unittest.TestCase):
 
         recorder.store_or_update_executor.assert_not_called()
 
+    def test_unfinished_owner_missing_from_current_config_still_blocks_creation(self):
+        old_config = PositionExecutorConfig(
+            id="old-entry", timestamp=1234, controller_id="removed-eth",
+            connector_name="binance", trading_pair="ETH-USDT", side=TradeType.BUY,
+            entry_price=Decimal("100"), amount=Decimal("1"))
+        old_info = ExecutorInfo(
+            id=old_config.id, timestamp=old_config.timestamp, type=old_config.type,
+            status=RunnableStatus.RUNNING, config=old_config, net_pnl_pct=Decimal("0"),
+            net_pnl_quote=Decimal("0"), cum_fees_quote=Decimal("0"),
+            filled_amount_quote=Decimal("0"), is_active=True, is_trading=False,
+            custom_info={}, controller_id="removed-eth")
+        recorder = MarketsRecorder.get_instance()
+        recorder.get_all_executors.return_value = [old_info]
+        self.mock_strategy.controllers = {"new-btc": MagicMock()}
+        restarted = ExecutorOrchestrator(strategy=self.mock_strategy)
+        new_config = PositionExecutorConfig(
+            id="new-entry", timestamp=1235, controller_id="new-btc",
+            connector_name="binance", trading_pair="BTC-USDT", side=TradeType.BUY,
+            entry_price=Decimal("100"), amount=Decimal("1"))
+
+        self.assertEqual(restarted.recovery_required, {"removed-eth": ["old-entry"]})
+        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+            restarted.create_executor(CreateExecutorAction(controller_id="new-btc", executor_config=new_config))
+        recorder.store_or_update_executor.assert_not_called()
+
     @patch.object(PositionExecutor, "start")
     @patch.object(DCAExecutor, "start")
     @patch.object(ArbitrageExecutor, "start")

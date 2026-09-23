@@ -150,6 +150,11 @@ fenced while it reads WAL-inclusive native state and authenticated venue
 orders/fills, validates the configured owner and exact order identities, then
 reattaches each entry, exit, inventory quantity, and persisted trailing trigger.
 Unknown or conflicting evidence remains held with a visible recovery reason.
+The current startup hold also covers unfinished executor rows whose controller
+is absent from the new config, pending planned-resume claims before rows load,
+and BUY/SELL calls through the executor and StrategyV2Base order paths. A
+configured controller must not trade around an unfinished removed controller.
+These guards do not reconcile or cancel orders already resting at the venue.
 Before resuming an owner on the shared V1/V2 OKX wallet, aggregate owned base
 inventory across both stacks so one bot cannot sell inventory owned by the
 other. A resting SELL can fill during downtime or cancellation; its final

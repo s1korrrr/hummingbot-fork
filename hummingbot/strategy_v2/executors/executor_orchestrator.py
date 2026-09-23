@@ -285,6 +285,13 @@ class ExecutorOrchestrator:
         for executor in db_executors:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
+                if not executor.is_done:
+                    self.recovery_required.setdefault(controller_id, []).append(executor.id)
+                    self.logger().error(
+                        f"Startup reconciliation required | controller={controller_id} executor={executor.id} "
+                        "Persisted execution belongs to a controller absent from current config. "
+                        "New execution is blocked until ownership is reconciled."
+                    )
                 continue
             if executor.id in resumed:
                 continue

@@ -859,17 +859,6 @@ class PositionExecutor(ExecutorBase):
             await self.control_shutdown_process()
         self.evaluate_max_retries()
 
-    def _stack_recovery_required(self) -> bool:
-        recovery = getattr(getattr(self._strategy, "executor_orchestrator", None), "recovery_required", None)
-        return isinstance(recovery, dict) and any(recovery.values())
-
-    def place_order(self, connector_name: str, trading_pair: str, order_type: OrderType,
-                    side: TradeType, amount: Decimal, position_action: PositionAction = PositionAction.NIL,
-                    price=Decimal("NaN")):
-        if self._stack_recovery_required():
-            raise RuntimeError("Stack requires startup reconciliation; position order submission is blocked")
-        return super().place_order(connector_name, trading_pair, order_type, side, amount, position_action, price)
-
     def all_orders_completed(self):
         """
         This method is responsible for checking if the open orders are completed.

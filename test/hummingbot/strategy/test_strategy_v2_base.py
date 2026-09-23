@@ -92,6 +92,25 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             status,
         )
 
+    def test_direct_strategy_buy_and_sell_blocked_by_unfinished_executor(self):
+        self.strategy.executor_orchestrator.recovery_required = {"removed-owner": ["entry-1"]}
+        with patch.object(self.strategy, "buy_with_specific_market") as buy, \
+                patch.object(self.strategy, "sell_with_specific_market") as sell:
+            with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+                self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+            with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+                self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+        buy.assert_not_called()
+        sell.assert_not_called()
+
+    def test_direct_strategy_sell_blocked_during_pending_planned_resume(self):
+        self.strategy.executor_orchestrator.recovery_required = {}
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        with patch.object(self.strategy, "sell_with_specific_market") as sell:
+            with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+                self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+        sell.assert_not_called()
+
     async def test_start(self):
         self.assertFalse(self.strategy.ready_to_trade)
         self.strategy.start(Clock(ClockMode.BACKTEST), self.start_timestamp)

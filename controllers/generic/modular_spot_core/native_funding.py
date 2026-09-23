@@ -25,9 +25,9 @@ LEGACY_NEVER_STARTED = {'schema': 1, 'source': 'never_started_intent_v1'}
 
 
 class CandidateFundingPolicy(PolicyModel):
-    allocation_quote: Decimal = Field(gt=0, le=1000)
+    allocation_quote: Decimal = Field(gt=0, le=2500)
     fee_reserve_fraction: Decimal = Field(gt=0, le=Decimal('.1'))
-    max_position_quote: Decimal = Field(default=50, gt=0, le=105)
+    max_position_quote: Decimal = Field(default=50, gt=0, le=505)
     scope: Literal['controller', 'strategy'] = 'controller'
     resize_to_available_quote: bool = False
 

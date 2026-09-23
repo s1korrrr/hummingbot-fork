@@ -320,6 +320,7 @@ class NativeComposition:
         planned = super()._effective_buy_entry_usd(state, entry_fraction=entry_fraction)
         if self.config.funding is None or not self.config.funding.resize_to_available_quote:
             return planned
+        planned = min(planned, self.config.usd_per_entry)
         try:
             if self._funding_store is None:
                 from hummingbot.connector.markets_recorder import MarketsRecorder
@@ -339,6 +340,19 @@ class NativeComposition:
     def get_executor_config(self, *args, **kwargs):
         config = super().get_executor_config(*args, **kwargs)
         if self.config.funding is not None and config.side == TradeType.BUY:
+            if self.config.funding.resize_to_available_quote and config.amount * config.entry_price > self.config.usd_per_entry:
+                rule = self._get_trading_rule()
+                increment = self._base_amount_increment(rule)
+                raw_amount = self.config.usd_per_entry / config.entry_price
+                amount = ((raw_amount / increment).to_integral_value(rounding=ROUND_DOWN) * increment
+                          if increment > 0 else raw_amount.quantize(Decimal('0.00000001'), rounding=ROUND_DOWN))
+                if (amount <= 0 or amount < self._minimum_entry_amount(config.entry_price, rule)
+                        or amount * config.entry_price < self._minimum_entry_quote(config.entry_price, rule)):
+                    self._funding_hold = 'Native minimum exceeds funded per-entry cap'
+                else:
+                    config.amount = amount
+                    if getattr(self, '_funding_size', None) is not None:
+                        self._funding_size['effective_quote'] = str(amount * config.entry_price)
             config.require_terminal_entry_reconciliation = True
             pending = getattr(self, '_down_only_pending_configs', None)
             if isinstance(pending, dict) and config.id in pending:
@@ -365,6 +379,12 @@ class NativeComposition:
         return False
 
     def validate_executor_config(self, config):
+        if (config.side == TradeType.BUY and self.config.funding is not None
+                and self.config.funding.resize_to_available_quote
+                and not self._funding_hold
+                and (getattr(config, 'amount', None) is None or getattr(config, 'entry_price', None) is None
+                     or config.amount * config.entry_price > self.config.usd_per_entry)):
+            self._funding_hold = 'Funded per-entry cap exceeded'
         sizing_hold = (config.side == TradeType.BUY and self.config.funding is not None
                        and self.config.funding.resize_to_available_quote and self._funding_hold)
         if self._recovery_hold or self._recovery_fault or sizing_hold:

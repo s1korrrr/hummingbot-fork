@@ -1,3 +1,6 @@
+from decimal import Decimal
+from unittest.mock import Mock
+
 from test_native_composition import FAMILIES, controllers
 
 
@@ -49,3 +52,51 @@ def test_funding_sizing_database_failure_holds_new_buy():
     assert 'locked' in controller._funding_hold
     assert controller.validate_executor_config(SimpleNamespace(side=TradeType.BUY)) is False
     assert controller.get_status_summary()['gate'].startswith('funding:')
+
+
+def test_funded_buy_never_exceeds_configured_per_entry_quote():
+    controller = owner(execution_enabled=True, usd_per_entry=Decimal('100'), dynamic_position_sizing=True,
+                       max_position_size_multiplier=1.5)
+    controller.config.funding = controller.config.funding.model_copy(update={'resize_to_available_quote': True})
+    controller._funding_store = Mock()
+    controller._funding_store.entry_notional_ceiling.return_value = Decimal('500')
+    state = {'size_multiplier': 1.5, 'buy_entry_role': 'full'}
+    assert controller._effective_buy_entry_usd(state) == Decimal('100')
+
+
+def test_funded_executor_quantization_cannot_exceed_entry_cap():
+    from decimal import ROUND_UP
+
+    from hummingbot.connector.trading_rule import TradingRule
+    from hummingbot.core.data_type.common import TradeType
+
+    controller = owner(execution_enabled=True, usd_per_entry=Decimal('100'))
+    controller.config.funding = controller.config.funding.model_copy(update={'resize_to_available_quote': True})
+    controller._funding_store = Mock()
+    controller._funding_store.entry_notional_ceiling.return_value = Decimal('500')
+    controller._get_trading_rule = Mock(return_value=TradingRule(
+        controller.config.trading_pair, min_order_size=Decimal('.01'),
+        min_base_amount_increment=Decimal('.01'), min_notional_size=Decimal('10')))
+    controller._quantize_amount = Mock(side_effect=lambda amount: amount.quantize(Decimal('.01'), rounding=ROUND_UP))
+    config = controller.get_executor_config(TradeType.BUY, Decimal('90'), Decimal('1'))
+    assert config.amount * config.entry_price <= Decimal('100')
+    assert config.amount * config.entry_price >= Decimal('99')
+    assert controller._funding_hold is None
+
+
+def test_funded_entry_above_venue_minimum_is_held_when_minimum_exceeds_cap():
+    from hummingbot.connector.trading_rule import TradingRule
+    from hummingbot.core.data_type.common import TradeType
+
+    controller = owner(execution_enabled=True, usd_per_entry=Decimal('100'))
+    controller.config.funding = controller.config.funding.model_copy(update={'resize_to_available_quote': True})
+    controller._funding_store = Mock()
+    controller._funding_store.entry_notional_ceiling.return_value = Decimal('500')
+    controller._release_entry_decision = Mock()
+    controller._get_trading_rule = Mock(return_value=TradingRule(
+        controller.config.trading_pair, min_order_size=Decimal('.01'),
+        min_base_amount_increment=Decimal('.01'), min_notional_size=Decimal('120')))
+    config = controller.get_executor_config(TradeType.BUY, Decimal('90'), Decimal('1'))
+    assert 'per-entry' in controller._funding_hold
+    assert controller.validate_executor_config(config) is False
+    controller._release_entry_decision.assert_called_once()

@@ -19,7 +19,7 @@ def test_strategy_scope_requires_shared_explicit_limits_and_exact_native_owners(
     bind_funding_scope(owners)
     assert all(owner._funding_peers == tuple(owners.values()) for owner in owners.values())
     with pytest.raises(ValueError):
-        CandidateFundingPolicy(**(policy | {'max_position_quote': '106'}))
+        CandidateFundingPolicy(**(policy | {'max_position_quote': '506'}))
     owners[next(iter(owners))].config.funding = CandidateFundingPolicy(**(policy | {'allocation_quote': '49'}))
     with pytest.raises(ValueError, match='identical'):
         bind_funding_scope(owners)

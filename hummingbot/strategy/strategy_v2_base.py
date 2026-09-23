@@ -244,6 +244,7 @@ class StrategyV2Base(StrategyPyBase):
     When config is a StrategyV2ConfigBase, controllers are loaded and orchestration runs automatically.
     When config is None or a simple BaseModel, simple scripts can still use executors and market data on demand.
     """
+    UNATTENDED_RESTART_HOLD_CONTRACT_VERSION = 1
     # Class-level markets definition used by both simple scripts and V2 strategies
     markets: Dict[str, Set[str]] = {}
 
@@ -335,6 +336,9 @@ class StrategyV2Base(StrategyPyBase):
         self.ready_to_trade: bool = False
         self.add_markets(list(connectors.values()))
         self.config = config
+        # The V2 claimed-owner restart entrypoint sets this before construction.
+        # A restarted process must stay observable without resuming any order owner.
+        self._unattended_restart_hold = os.environ.get("RSIBOT_V2_UNATTENDED_RESTART_HOLD") == "1"
 
         # Always initialize V2 infrastructure
         self.controllers: Dict[str, ControllerBase] = {}
@@ -378,6 +382,9 @@ class StrategyV2Base(StrategyPyBase):
 
         :param timestamp: current tick timestamp
         """
+        if self._unattended_restart_hold:
+            self._write_runtime_status_snapshot_if_due()
+            return
         if not self.ready_to_trade:
             self.ready_to_trade = all(ex.ready for ex in self.connectors.values())
             if not self.ready_to_trade:
@@ -393,6 +400,9 @@ class StrategyV2Base(StrategyPyBase):
         Simple scripts override this method for custom logic.
         """
         if self.controllers:
+            if self._unattended_restart_hold:
+                self._write_runtime_status_snapshot_if_due()
+                return
             if not self.executor_orchestrator.resume_planned_positions_if_ready():
                 return
             self.update_executors_info()
@@ -465,6 +475,8 @@ class StrategyV2Base(StrategyPyBase):
         return preferences
 
     def _require_reconciled_execution(self):
+        if self._unattended_restart_hold:
+            raise RuntimeError("V2 unattended restart hold; order submission is blocked")
         orchestrator = getattr(self, "executor_orchestrator", None)
         recovery = getattr(orchestrator, "recovery_required", None)
         if (getattr(orchestrator, "_planned_resume_pending", False) is True
@@ -956,6 +968,7 @@ class StrategyV2Base(StrategyPyBase):
         return {
             "schema_version": 1,
             "bot_name": self._runtime_status_snapshot_bot_name(),
+            "unattended_restart_hold": self._unattended_restart_hold,
             "controller_reports_valid": self._controller_reports_valid,
             "updated_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
             "operations": self._build_runtime_operations_snapshot(),
@@ -990,6 +1003,8 @@ class StrategyV2Base(StrategyPyBase):
         In V2 mode, also shows controller reports and performance summary.
         """
         lines = []
+        if self._unattended_restart_hold:
+            lines.append("V2 UNATTENDED RESTART HOLD: BUY/SELL and executor recovery remain blocked.")
         if self._controller_restart_required:
             lines.append("RESTART REQUIRED: new executors blocked.")
             lines.append("Controllers: " + ', '.join(sorted(self._controller_restart_required)))
@@ -1306,7 +1321,8 @@ class StrategyV2Base(StrategyPyBase):
                     self._last_controller_reload_error = error_label
 
     def validate_create_action(self, action: CreateExecutorAction) -> bool:
-        return not self._is_stop_triggered and action.controller_id not in self._controller_restart_required
+        return (not self._unattended_restart_hold and not self._is_stop_triggered
+                and action.controller_id not in self._controller_restart_required)
 
     async def listen_to_executor_actions(self):
         """
@@ -1315,6 +1331,8 @@ class StrategyV2Base(StrategyPyBase):
         while True:
             try:
                 actions = await self.actions_queue.get()
+                if self._unattended_restart_hold:
+                    continue
                 if getattr(self.executor_orchestrator, "_planned_resume_pending", False) is True:
                     continue
                 self.update_executors_info()

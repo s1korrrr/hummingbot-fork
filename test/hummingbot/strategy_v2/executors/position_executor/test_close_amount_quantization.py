@@ -116,3 +116,19 @@ def test_actual_close_preserves_successful_string_quantization_and_available_cap
     connector.quantize_order_amount.assert_called_once_with(trading_pair='ETH-USDT', amount=Decimal('.8'))
     assert executor.place_order.call_args.kwargs['amount'] == Decimal('.79')
     assert executor.amount_to_close == Decimal('1')
+
+
+@pytest.mark.parametrize('owned,expected', [('5.2', '5.2'), ('5', '5')])
+def test_trailing_exit_closes_full_owned_lot_without_sweeping_shared_wallet(owned, expected):
+    executor = make_executor()
+    executor._open_order = tracked('filled-entry', TradeType.BUY, owned, OrderState.FILLED)
+    executor.place_order = MagicMock(return_value='local-close')
+    executor.get_price.return_value = Decimal('110')
+    executor.connectors['okx'].get_available_balance.return_value = Decimal('5.2')
+    executor.connectors['okx'].quantize_order_amount.side_effect = None
+    executor.connectors['okx'].quantize_order_amount.return_value = Decimal(expected)
+
+    executor.place_close_order_and_cancel_open_orders(CloseType.TRAILING_STOP)
+
+    assert executor.place_order.call_args.kwargs['amount'] == Decimal(expected)
+    assert executor.amount_to_close == Decimal(owned)

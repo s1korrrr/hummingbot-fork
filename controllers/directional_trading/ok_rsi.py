@@ -1346,10 +1346,25 @@ class OKRSIController(hl_rsi.HLRSIController):
         available_base: Optional[Decimal] = None,
     ) -> Decimal:
         if self.config.trade_mode != "sell_only" or not self.config.sell_only_strict_fraction:
-            return super()._resolve_recovery_sell_amount(
+            resolved = super()._resolve_recovery_sell_amount(
                 position_amount=position_amount, target_amount=target_amount, price=price,
                 available_base=available_base,
             )
+            if self.config.trade_mode != "buy_sell" or resolved <= target_amount or price <= 0:
+                return resolved
+            # The base resolver may sweep an unsellable remainder regardless of its
+            # size. Keep that behavior for a target below the venue minimum, but
+            # never let it enlarge an already valid partial exit past this cap.
+            if (resolved - target_amount) * price <= self.config.sell_remainder_sweep_max_quote:
+                return resolved
+            rule = self._require_trading_rule()
+            minimum = self._minimum_entry_amount(price, rule)
+            target = self._quantize_amount(target_amount)
+            if (target >= minimum and target * price >= self._minimum_entry_quote(price, rule)
+                    and target <= position_amount
+                    and (available_base is None or target <= available_base)):
+                return target
+            return resolved
         ceiling = min(position_amount, target_amount)
         if available_base is not None:
             ceiling = min(ceiling, available_base)
@@ -1371,7 +1386,12 @@ class OKRSIController(hl_rsi.HLRSIController):
             return self._sell_only_target_amount(position_amount, price)
         multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
         if multiplier > 0:
-            return min(position_amount, self.config.usd_per_entry * multiplier / price)
+            target = min(position_amount, self.config.usd_per_entry * multiplier / price)
+            remainder = position_amount - target
+            if (remainder > 0 and price > 0
+                    and remainder * price <= self.config.sell_remainder_sweep_max_quote):
+                return position_amount
+            return target
         return position_amount
 
     def _recovery_sell_target_amount(self, position_amount: Decimal, price: Decimal) -> Decimal:

@@ -84,6 +84,54 @@ def test_signal_sell_binds_owned_basis_remaining_fees_and_profit_floor():
     assert config.min_sell_price == Decimal("6.32")
 
 
+def test_signal_sell_sweeps_owned_two_dollar_remainder_with_fifty_dollar_target():
+    bot = controller(balance="5.2")
+    bot.positions_held = [position(bot, amount="5.2", fees="0")]
+    config = bot.get_executor_config(TradeType.SELL, Decimal("10"), Decimal("999"))
+    assert config.amount == Decimal("5.2")
+    assert Decimal("52") <= config.amount * config.price <= Decimal("52.1")
+    assert config.min_sell_price is not None
+
+
+def test_signal_sell_keeps_target_when_owned_remainder_exceeds_five_dollars():
+    bot = controller(balance="5.8")
+    bot.positions_held = [position(bot, amount="5.8", fees="0")]
+    config = bot.get_executor_config(TradeType.SELL, Decimal("10"), Decimal("999"))
+    assert config.amount * config.price == Decimal("50")
+    assert Decimal("5") < (Decimal("5.8") - config.amount) * config.price
+
+
+def test_signal_sell_sweeps_exact_five_dollar_remainder_but_zero_limit_disables_it():
+    bot = controller(balance="5.5")
+    assert bot._signal_sell_target_amount(Decimal("5.5"), Decimal("10")) == Decimal("5.5")
+    bot.config.sell_remainder_sweep_max_quote = Decimal("0")
+    assert bot._signal_sell_target_amount(Decimal("5.5"), Decimal("10")) == Decimal("5")
+
+
+def test_venue_minimum_cannot_turn_eight_dollar_remainder_into_dust_sweep():
+    bot = controller(balance="5.8", minimum="10")
+    bot.positions_held = [position(bot, amount="5.8", fees="0")]
+    config = bot.get_executor_config(TradeType.SELL, Decimal("10"), Decimal("999"))
+    assert config.amount * config.price == Decimal("50")
+
+
+def test_signal_sell_never_sweeps_unowned_wallet_surplus_or_unavailable_base():
+    bot = controller(balance="5.2")
+    bot.positions_held = [position(bot, amount="5", fees="0")]
+    assert bot.get_executor_config(TradeType.SELL, Decimal("10"), Decimal("999")).amount == Decimal("5")
+    bot.positions_held = [position(bot, amount="5.2", fees="0")]
+    bot.market_data_provider.get_available_balance.return_value = Decimal("5")
+    assert bot.get_executor_config(TradeType.SELL, Decimal("10"), Decimal("999")).amount == Decimal("5")
+
+
+def test_recovery_sell_sweeps_owned_two_dollar_remainder():
+    bot = controller(balance="5.2")
+    bot.positions_held = [position(bot, amount="5.2", fees="0")]
+    actions = recovery(bot)
+    assert len(actions) == 1
+    assert actions[0].executor_config.amount == Decimal("5.2")
+
+
 @pytest.mark.parametrize("basis,fees", [(None, "1"), ("NaN", "1"), ("5", "NaN"), ("5", "-1")])
 def test_signal_sell_fails_closed_for_unavailable_cost_or_fees(basis, fees):
     bot = controller("sell_only")

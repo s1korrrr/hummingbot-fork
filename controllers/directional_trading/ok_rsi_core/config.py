@@ -135,6 +135,12 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             is_updatable=True,
         ),
     )
+    sell_remainder_sweep_max_quote: Decimal = hl_rsi.Field(
+        default=Decimal("5"),
+        ge=Decimal("0"),
+        description="Maximum extra same-controller owned inventory included in a partial SELL exit.",
+        json_schema_extra={"is_updatable": False},
+    )
 
     use_trailing_exit: bool = hl_rsi.Field(default=True, json_schema_extra={"is_updatable": True})
     trailing_activation_pct: float = hl_rsi.Field(default=0.015, gt=0.0, json_schema_extra={"is_updatable": True})

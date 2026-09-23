@@ -961,8 +961,8 @@ class OKRSIController(hl_rsi.HLRSIController):
         if config.side != TradeType.BUY:
             return
         from controllers.directional_trading.ok_rsi_core.entry_decisions import executor_fingerprint
-        candle = (self.processed_data or {}).get("candle_timestamp")
-        self._get_entry_decision_gate().commit(config.id, executor_fingerprint(config), int(candle))
+        if not self._get_entry_decision_gate().commit_dispatched(config.id, executor_fingerprint(config)):
+            raise RuntimeError("Persisted BUY executor did not match its durable entry authorization")
 
     def create_actions_proposal(self):
         if self._episode_runtime is not None:
@@ -998,8 +998,12 @@ class OKRSIController(hl_rsi.HLRSIController):
                 config = action.executor_config
                 if config.side != TradeType.BUY:
                     admitted.append(action)
-                elif gate.reserve(config.id, executor_fingerprint(config), int(data["candle_timestamp"])):
-                    admitted.append(action)
+                else:
+                    # The orchestrator binds this same owner before persistence.
+                    # Fingerprint the final identity, not the proposal default "main".
+                    config.controller_id = self.config.id
+                    if gate.reserve(config.id, executor_fingerprint(config), int(data["candle_timestamp"])):
+                        admitted.append(action)
             self._entry_decision_error = None
             return admitted
         except Exception as exc:

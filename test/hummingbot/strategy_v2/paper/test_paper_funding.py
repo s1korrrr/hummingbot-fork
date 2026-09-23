@@ -70,11 +70,11 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
             guard.start()
             self.addCleanup(guard.stop)
 
-    async def seed(self, session):
+    async def seed(self, session, ask=90.1):
         for index, frame in enumerate(causal_reversal_frames()):
             now = 600000 + index * 60
             result = await session.step(now, books=[dict(trading_pair=PAIR, sequence=2 + index, timestamp=now,
-                                                         bids=[(90, 10)], asks=[(90.1, 10)])], candles=[dict(
+                                                         bids=[(90, 10)], asks=[(ask, 10)])], candles=[dict(
                                                              connector_name='okx', trading_pair=PAIR, interval='1m', frame=frame, available_at=now)])
         return result
 
@@ -252,6 +252,12 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                 await session.close()
 
     async def test_public_ok_rsi_buy_trailing_sell_then_second_causal_buy_survives_restart(self):
+        await self._run_ok_rsi_roundtrip(down_only=False)
+
+    async def test_down_only_buy_trailing_sell_then_second_causal_buy_survives_restart(self):
+        await self._run_ok_rsi_roundtrip(down_only=True)
+
+    async def _run_ok_rsi_roundtrip(self, down_only):
         """Exercise the public OK-RSI profile through two native entry lifecycles.
 
         This is a synthetic causal execution fixture. It proves that a later
@@ -263,6 +269,7 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
             from controllers.generic.rsi_modular import get_config_class
             profile_config = get_config_class('ok_rsi')(
                 id='modular_spot_public_roundtrip', profile='ok_rsi', execution_mode='paper',
+                entry_acquisition_policy='down_only_maker_v1' if down_only else 'legacy_single_attempt',
                 connector_name='okx_paper_trade', candles_connector='okx', execution_enabled=True,
                 trading_pair=PAIR, strict_hmm_mode=False, trend_confirmation_enabled=False,
                 min_signal_score=1, dynamic_position_sizing=False, usd_per_entry=100,
@@ -273,10 +280,13 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                 owner = next(iter(session.controllers.values()))
                 store = NativeFundingStore(owner, session.recorder)
                 old_reserve = add_legacy_uncertain_reserve(store)
-                await self.seed(session)
+                await self.seed(session, ask=90.01 if down_only else 90.1)
+                if down_only:
+                    await session.step(600061)
                 owner = next(iter(session.controllers.values()))
                 self.assertEqual(owner.config.profile, 'ok_rsi')
                 executor = session.executor_orchestrator.active_executors[owner.config.id][0]
+                self.assertEqual(owner._get_entry_decision_gate().store.load()['consumed_candle'], 600000)
                 buy = executor._open_order.order
                 sizing = owner.get_custom_info()['modular_composition']['funding_sizing']
                 self.assertEqual(D(sizing['requested_quote']), D('100'))
@@ -308,17 +318,20 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                 # controller and dispatch path after the prior executor ends.
                 clear_frame = synthetic_candles(600120)
                 await session.step(600180, books=[dict(trading_pair=PAIR, sequence=8, timestamp=600180,
-                                                       bids=[(90, 10)], asks=[(90.1, 10)])], candles=[dict(
+                                                       bids=[(90, 10)], asks=[(90.01 if down_only else 90.1, 10)])], candles=[dict(
                                                            connector_name='okx', trading_pair=PAIR, interval='1m',
                                                            frame=clear_frame, available_at=600180)])
                 second_candle = 602400  # Outside the native RSI reversal debounce window.
                 second_time = second_candle + 60
                 frame = candles_for_second_reversal(second_candle)
                 receipt = await session.step(second_time, books=[dict(trading_pair=PAIR, sequence=9,
-                                                                      timestamp=second_time, bids=[(90, 10)], asks=[(90.1, 10)])], candles=[dict(
+                                                                      timestamp=second_time, bids=[(90, 10)], asks=[(90.01 if down_only else 90.1, 10)])], candles=[dict(
                                                                           connector_name='okx', trading_pair=PAIR, interval='1m',
                                                                           frame=frame, available_at=second_time)])
-                self.assertTrue(receipt['actions'], owner.get_custom_info())
+                self.assertTrue(receipt['actions'], {
+                    'controller': owner.get_custom_info(),
+                    'entry_decision': owner._get_entry_decision_gate().store.load(),
+                })
                 second = next((item for item in session.executor_orchestrator.active_executors[owner.config.id]
                                if item.config.id != executor.config.id), None)
                 self.assertIsNotNone(second, owner.get_custom_info())

@@ -108,6 +108,7 @@ def test_cross_controller_unsubmitted_orders_reserve_shared_quote_wallet():
 
 def test_queued_create_rechecks_drawdown_and_operator_events():
     strategy = MagicMock(spec=V2WithControllers)
+    strategy._funding_scope_owners = ()
     strategy._is_stop_triggered = False
     strategy.drawdown_exited_controllers = []
     strategy.control_max_drawdown.side_effect = lambda: setattr(strategy, '_is_stop_triggered', True)

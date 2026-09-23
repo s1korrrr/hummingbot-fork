@@ -40,6 +40,51 @@ def test_requires_clear_then_new_qualified_candle_and_persists_before_dispatch(s
     assert not EntryDecisionGate(store).observe(observation(180, True, 1))
 
 
+def test_second_cleared_buy_can_dispatch_and_commit_after_first_buy(store):
+    rows = set()
+    gate = EntryDecisionGate(store, executor_exists=lambda executor_id: executor_id in rows)
+    assert not gate.observe(observation(60, False))
+    assert gate.observe(observation(120, True, 1))
+    assert gate.reserve("first", "first-fingerprint", 120)
+    assert gate.dispatch("first", "first-fingerprint", 120)
+    rows.add("first")
+    assert gate.commit("first", "first-fingerprint", 120)
+
+    assert not gate.observe(observation(180, False))
+    assert gate.observe(observation(240, True, 1))
+    assert gate.reserve("second", "second-fingerprint", 240)
+    assert gate.dispatch("second", "second-fingerprint", 240)
+    rows.add("second")
+    assert gate.commit("second", "second-fingerprint", 240)
+    assert not EntryDecisionGate(store, executor_exists=lambda executor_id: executor_id in rows).observe(
+        observation(240, True, 1)
+    )
+
+
+def test_new_candle_cannot_replace_dispatched_entry_awaiting_commit(store):
+    gate = EntryDecisionGate(store)
+    gate.observe(observation(60, False))
+    assert gate.observe(observation(120, True, 1))
+    assert gate.reserve("pending", "fp", 120)
+    assert gate.dispatch("pending", "fp", 120)
+    assert not gate.observe(observation(180, False))
+    assert not gate.observe(observation(240, True, 1))
+    assert gate.commit("pending", "fp", 120)
+    assert not EntryDecisionGate(store).observe(observation(120, True, 1))
+
+
+def test_float_timestamp_at_dispatch_commits_canonical_integer_candle(store):
+    gate = EntryDecisionGate(store)
+    gate.observe(observation(60, False))
+    assert gate.observe(observation(120, True, 1))
+    assert gate.reserve("entry", "fp", 120)
+    assert gate.dispatch("entry", "fp", 120.0)
+    assert gate.commit_dispatched("entry", "fp")
+    assert type(store.load()["consumed_candle"]) is int
+    assert store.load()["consumed_candle"] == 120
+    assert not gate.observe(observation(120, True, 1))
+
+
 def test_pulse_zero_invalid_data_and_persistent_candidate_do_not_rearm(store):
     gate = EntryDecisionGate(store)
     gate.observe(observation(60, False))
@@ -51,6 +96,8 @@ def test_pulse_zero_invalid_data_and_persistent_candidate_do_not_rearm(store):
     assert not gate.observe(observation(180, True, 1))
     assert not gate.observe(observation(240, False, signal_suppression_reason="non_advancing_candle"))
     assert not gate.observe(observation(300, True, 1))
+    # A dispatched attempt must receive an explicit failed-persistence verdict.
+    assert gate.release()
     gate.observe(observation(360, False))
     assert gate.observe(observation(420, True, 1))
     assert gate.reserve("second", "next", 420)
@@ -64,8 +111,10 @@ def test_restart_cannot_dispatch_unsubmitted_pre_restart_authorization(store):
     restarted = EntryDecisionGate(store)
     assert not restarted.dispatch("first", "same", 120)
     assert not restarted.observe(observation(180, True, 1))
-    restarted.observe(observation(240, False))
-    assert restarted.observe(observation(300, True, 1))
+    assert not restarted.observe(observation(240, False))
+    reconciled = EntryDecisionGate(store, executor_exists=lambda _: False)
+    assert not reconciled.observe(observation(240, False))
+    assert reconciled.observe(observation(300, True, 1))
 
 
 def test_reserve_then_missing_executor_releases_candle_for_later_dispatch(store):
@@ -182,6 +231,7 @@ def test_controller_reserves_without_consuming_until_commit(store):
         assert not controller.validate_executor_config(action.executor_config)
         assert existing.call_count == 2
         assert store.load()["consumed_candle"] == 0
+        controller.processed_data = observation(180, False)
         controller.commit_entry_executor(action.executor_config)
         assert store.load()["consumed_candle"] == 120
         assert controller.create_actions_proposal() == []

@@ -117,6 +117,12 @@ class EntryDecisionGate:
         previous = self._reconcile(self._load())
         if previous is not None and candle < previous["candle"]:
             return False
+        # An unconsumed authorization still needs an executor-row verdict.
+        # Advancing candles must not erase it before commit or reconciliation.
+        if (previous is not None and candle > previous["candle"]
+                and previous["authorization"] is not None
+                and previous["consumed_candle"] == 0):
+            return False
         if previous is not None and candle == previous["candle"]:
             if previous["consumed_candle"] == candle:
                 return False
@@ -146,7 +152,9 @@ class EntryDecisionGate:
             return False
         auth = {"executor_id": executor_id, "fingerprint": fingerprint,
                 "candle": candle, "dispatched": False}
-        current = dict(previous, armed=False, authorization=auth)
+        # The previous candle's consumed marker belongs to its authorization.
+        # Replace both atomically when a later, cleared setup is admitted.
+        current = dict(previous, armed=False, consumed_candle=0, authorization=auth)
         self.store.save(previous, current)
         self._eligible_candle = None
         self._local_authorization = (executor_id, fingerprint, candle)
@@ -163,7 +171,7 @@ class EntryDecisionGate:
             return False
         self.store.save(previous, dict(previous, authorization=dict(auth, dispatched=True)))
         self._local_authorization = None
-        self._awaiting_commit = identity
+        self._awaiting_commit = (executor_id, fingerprint, auth["candle"])
         return True
 
     def commit(self, executor_id, fingerprint, candle):
@@ -179,6 +187,13 @@ class EntryDecisionGate:
         self._local_authorization = None
         self._awaiting_commit = None
         return True
+
+    def commit_dispatched(self, executor_id, fingerprint):
+        """Commit the queued attempt even if processed market data has advanced."""
+        identity = self._awaiting_commit
+        if identity is None or identity[:2] != (executor_id, fingerprint):
+            return False
+        return self.commit(*identity)
 
     def release(self):
         previous = self._load()

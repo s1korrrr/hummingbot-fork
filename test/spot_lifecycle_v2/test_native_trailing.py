@@ -20,7 +20,7 @@ def trailing_info(**updates):
         'trailing_stop_trigger_pct': D('.08'),
         'trailing_trigger_price': D('109'),
         'trailing_current_price': D('112'),
-        'trailing_move_count': 2,
+        'trailing_move_count': 0,
         'trailing_armed_timestamp': 1000.0,
         'trailing_last_update_timestamp': 1001.0,
     })
@@ -28,7 +28,7 @@ def trailing_info(**updates):
     return info
 
 
-def test_native_executor_projection_produces_bound_trailing_view():
+def test_native_executor_projection_produces_bound_threshold_without_fabricating_peak():
     info = trailing_info()
     snap = capture(info)
     view = capture_native_trailing_view(info, snap)
@@ -38,7 +38,7 @@ def test_native_executor_projection_produces_bound_trailing_view():
     assert view.observed_at_ms == snap.observed_at_ms
     assert view.activated is True
     assert view.threshold_price == D('109')
-    assert view.peak_price == D('111')
+    assert view.peak_price is None
     assert view.exit_owner == 'native_executor'
 
 
@@ -57,7 +57,7 @@ def test_unarmed_native_trailing_state_is_not_fabricated_into_a_ratchet():
     {'trailing_trigger_price': None},
     {'trailing_trigger_price': D('-1')},
     {'entry_price': D('0')},
-    {'trailing_move_count': 0},
+    {'trailing_move_count': -1},
     {'trailing_move_count': True},
 ])
 def test_armed_projection_rejects_missing_or_invalid_native_trailing_evidence(updates):
@@ -74,21 +74,21 @@ def test_trailing_projection_is_bound_to_the_same_native_execution_receipt():
         capture_native_trailing_view(info, snap)
 
 
-def test_native_projection_and_lifecycle_share_the_same_ratchet_contract():
+def test_native_projection_and_lifecycle_share_the_same_threshold_ratchet_contract():
     first_info = trailing_info()
     first_snapshot = capture(first_info)
     first = capture_native_trailing_view(first_info, first_snapshot)
     assert bind_trailing_view(first_snapshot, (first,), now_ms=1002, max_age_ms=10, previous=None) == first
 
     second_info = trailing_info(trailing_stop_trigger_pct=D('.09'), trailing_trigger_price=D('110'),
-                                trailing_current_price=D('113'), trailing_move_count=3,
+                                trailing_current_price=D('113'), trailing_move_count=1,
                                 trailing_last_update_timestamp=1002.0)
     second_snapshot = capture(second_info, sequence=2, observed_at_ms=1001, available_at_ms=1002)
     second = capture_native_trailing_view(second_info, second_snapshot)
     assert bind_trailing_view(second_snapshot, (second,), now_ms=1003, max_age_ms=10, previous=first) == second
 
     loosened_info = trailing_info(trailing_stop_trigger_pct=D('.07'), trailing_trigger_price=D('108'),
-                                  trailing_move_count=3, trailing_last_update_timestamp=1002.0)
+                                  trailing_move_count=1, trailing_last_update_timestamp=1002.0)
     loosened_snapshot = capture(loosened_info, sequence=2, observed_at_ms=1001, available_at_ms=1002)
     loosened = capture_native_trailing_view(loosened_info, loosened_snapshot)
     with pytest.raises(PolicyError, match='ratchet loosened'):

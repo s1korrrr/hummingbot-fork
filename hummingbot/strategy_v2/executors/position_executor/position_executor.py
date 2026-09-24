@@ -396,6 +396,31 @@ class PositionExecutor(ExecutorBase):
         """
         return self.open_filled_amount - self.close_filled_amount
 
+    def _closed_residual_dust(self) -> Decimal:
+        """
+        Base residue finer than one exchange lot that remains after every exit order completed.
+
+        Base-denominated entry fees leave net inventory that is not a lot multiple; the exit
+        sells the largest valid lot and the sub-lot remainder can never be ordered. It is not
+        held inventory: the round trip is closed and the executor keeps its accounting.
+
+        :return: The sub-lot residue, or 0 when the residue is tradeable or the exit is not complete.
+        """
+        remaining = self.amount_to_close
+        if (remaining <= Decimal("0") or self.is_perpetual or self.close_order_side != TradeType.SELL
+                or self.close_type == CloseType.POSITION_HOLD  # the held ledger owns that accounting
+                or self.close_filled_amount <= Decimal("0") or not self.all_orders_completed()):
+            return Decimal("0")
+        quantum = self._to_decimal(getattr(self.trading_rules, "min_base_amount_increment", None))
+        if quantum is None or quantum <= Decimal("0") or remaining >= quantum:
+            return Decimal("0")
+        return remaining
+
+    def _exit_complete(self) -> bool:
+        """The whole tradeable position is closed exactly; at most sub-lot fee dust remains."""
+        return (self.close_filled_amount > Decimal("0")
+                and self.amount_to_close - self._closed_residual_dust() == Decimal("0"))
+
     def _close_order_amount(self) -> Decimal:
         close_amount = self.amount_to_close
         if close_amount <= Decimal("0") or self.is_perpetual or self.close_order_side != TradeType.SELL:
@@ -630,7 +655,9 @@ class PositionExecutor(ExecutorBase):
         :return: The close price.
         """
         if self.close_filled_amount > Decimal("0"):
-            remaining = max(self.amount_to_close, Decimal("0"))
+            remaining = max(self.amount_to_close - self._closed_residual_dust(), Decimal("0"))
+            if remaining == Decimal("0"):
+                return self.close_filled_amount_quote / self.close_filled_amount
             return (self.close_filled_amount_quote + remaining * self.current_market_price) / (self.close_filled_amount + remaining)
         elif self._close_order and self._close_order.is_done:
             return self._close_order.average_executed_price
@@ -870,6 +897,8 @@ class PositionExecutor(ExecutorBase):
         :return: The trade pnl percentage.
         """
         if self.open_filled_amount != Decimal("0") and self.close_type not in [CloseType.FAILED, CloseType.POSITION_HOLD]:
+            if self._exit_complete() and self.open_filled_amount_quote != Decimal("0"):
+                return self._realized_trade_pnl_quote() / self.open_filled_amount_quote
             if self.config.side == TradeType.BUY:
                 return (self.close_price - self.entry_price) / self.entry_price
             else:
@@ -884,7 +913,20 @@ class PositionExecutor(ExecutorBase):
 
         :return: The trade pnl in quote asset.
         """
+        if (self.open_filled_amount != Decimal("0") and self.close_type not in [CloseType.FAILED, CloseType.POSITION_HOLD]
+                and self._exit_complete()):
+            return self._realized_trade_pnl_quote()
         return self.trade_pnl_pct * self.open_filled_amount * self.entry_price
+
+    def _realized_trade_pnl_quote(self) -> Decimal:
+        """
+        Trade pnl of a completed exit from the actual fills: quote received against the
+        fee-net cost basis. Sub-lot fee dust is written off at zero, so with the fees in
+        cum_fees_quote this equals quote received minus quote paid minus the exit fee.
+        """
+        if self.config.side == TradeType.BUY:
+            return self.close_filled_amount_quote - self.open_filled_amount_quote
+        return self.open_filled_amount_quote - self.close_filled_amount_quote
 
     def get_net_pnl_quote(self) -> Decimal:
         """
@@ -1013,7 +1055,7 @@ class PositionExecutor(ExecutorBase):
         await self._sleep(1.0)
 
     def open_and_close_volume_match(self):
-        return self.amount_to_close <= Decimal("0") and self.all_orders_completed()
+        return self.amount_to_close - self._closed_residual_dust() <= Decimal("0") and self.all_orders_completed()
 
     async def control_close_order(self):
         """
@@ -1227,7 +1269,8 @@ class PositionExecutor(ExecutorBase):
         self._entry_lifecycle.setdefault("terminal_observed_timestamp", self._strategy.current_timestamp)
         if self.open_filled_amount > Decimal("0"):
             self._entry_lifecycle["state"] = "managing_fill"
-            if not self.is_perpetual and self.config.side == TradeType.BUY:
+            # Once the exit consumed the tradeable lot, sub-lot fee dust is not an unsellable acquisition.
+            if not self.is_perpetual and self.config.side == TradeType.BUY and not self._exit_complete():
                 quantum = self._to_decimal(self.trading_rules.min_base_amount_increment)
                 price = self._to_decimal(self.current_market_price)
                 if quantum is not None and quantum > 0 and price is not None and price > 0:
@@ -1479,6 +1522,8 @@ class PositionExecutor(ExecutorBase):
         if self._close_order or not self._entry_terminal_confirmed() or (
                 self._take_profit_limit_order and not self._take_profit_limit_order.is_done):
             return
+        if self._exit_complete():
+            return  # Only sub-lot fee dust remains; the shutdown loop finalizes the executor.
         close_amount = self._close_order_amount()
         if (self._close_quantity.get("blocked_reason") == "owned_residual_below_exchange_minimum"
                 and self.all_orders_completed()):
@@ -1889,6 +1934,9 @@ class PositionExecutor(ExecutorBase):
         level_id = self.config.level_id
         role = level_id if level_id in {"scout", "runner"} else None
         trailing_snapshot = self._trailing_status_snapshot()
+        # Sub-lot fee dust after a complete exit is written off: it is not remaining inventory.
+        residual_dust = self._closed_residual_dust()
+        remaining_base = self.amount_to_close - residual_dust
         custom_info = {
             "planned_position_resume": self._planned_resume_id,
             "planned_position_resume_compatibility_v1": copy.deepcopy(self._planned_resume_compatibility),
@@ -1917,7 +1965,7 @@ class PositionExecutor(ExecutorBase):
             ),
             "order_ids": [order.order_id for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()])],
             "close_order_filled_amount_base": self.close_filled_amount,
-            "remaining_position_amount_base": self.amount_to_close,
+            "remaining_position_amount_base": remaining_base,
             "held_position_orders": self._held_position_orders,
             "entry_reconciliation": copy.deepcopy(self._entry_reconciliation),
             "entry_lifecycle": {"policy": self.config.entry_order_policy, **self._entry_lifecycle},
@@ -1931,7 +1979,8 @@ class PositionExecutor(ExecutorBase):
                 "exit_gross_base": self.close_filled_amount,
                 "exit_gross_quote": self.close_filled_amount_quote,
                 "fees_quote": self.cum_fees_quote,
-                "remaining_owned_base": self.amount_to_close,
+                "remaining_owned_base": remaining_base,
+                "residual_dust_base": residual_dust,
                 "accounting_owner": "held_position" if self.close_type == CloseType.POSITION_HOLD else "executor",
             },
             "entry_order_snapshot": self._open_order.order.to_json()

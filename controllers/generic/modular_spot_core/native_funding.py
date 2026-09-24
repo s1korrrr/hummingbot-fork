@@ -366,8 +366,13 @@ class NativeFundingStore:
             proofs = receipt['orders']
         else:
             proofs = [receipt]
-        if info.config.entry_order_policy == 'single_attempt' and len(proofs) != 1:
-            raise PolicyError('Single-attempt reconciliation contains multiple entry orders')
+        if info.config.entry_order_policy == 'single_attempt':
+            # A down-only maker intent may replace an unfilled order (post-only
+            # repair, downward reprice); it never replaces after any fill.
+            filled = [proof for proof in proofs if isinstance(proof, dict)
+                      and decimal(proof.get('filled_base'), 'terminal entry total') > ZERO]
+            if len(filled) > 1:
+                raise PolicyError('Single-attempt reconciliation contains multiple filled entry orders')
         snapshots = (info.custom_info or {}).get('execution_order_snapshots')
         if not isinstance(snapshots, list):
             raise PolicyError('Native entry order snapshots unavailable')

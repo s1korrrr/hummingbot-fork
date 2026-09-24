@@ -175,7 +175,8 @@ class MarketDataProvider:
                                 gateway_task_metadata.append((connector_pair, connector_pair.trading_pair))
 
                             except Exception as e:
-                                self.logger().warning(f"Error preparing price request for {connector_pair.trading_pair}: {e}")
+                                self.logger().warning(
+                                    f"Error preparing price request for {connector_pair.trading_pair}: {e}")
                                 continue
                     else:
                         # Non-gateway connector
@@ -203,7 +204,8 @@ class MarketDataProvider:
                             timeout=self._rates_request_timeout)
                         for connector_pair in connector_pairs:
                             pair = connector_pair.trading_pair
-                            self._ticker_rates[(connector, pair)] = (prices[pair], time.monotonic()) if pair in prices else None
+                            self._ticker_rates[(connector, pair)] = (
+                                prices[pair], time.monotonic()) if pair in prices else None
                         for pair, rate in prices.items():
                             rate_oracle.set_price(pair, rate)
                     except Exception as e:
@@ -836,7 +838,7 @@ class MarketDataProvider:
             inverse = f"{counter}-{base}"
             prices.pop(source_pair, None)
             prices.pop(inverse, None)
-            if any(quote is None or now - quote[1] > max_age for quote in quotes):
+            if any(quote is None or not 0 <= now - quote[1] <= max_age for quote in quotes):
                 blocked.update((source_pair, inverse))
         for source_pair, quotes in grouped.items():
             if source_pair not in blocked:
@@ -893,16 +895,26 @@ class MarketDataProvider:
         """Expose failed and expired refreshes without claiming cached rates are current."""
         now = self.time()
         health = []
-        for (connector, pair), entry in sorted(self._rate_refresh_state.items()):
+        for connector, pair in sorted(self._rate_refresh_state.keys() | self._ticker_rates.keys()):
+            entry = self._rate_refresh_state.get((connector, pair),
+                                                 {'last_success': None, 'error': None, 'failures': 0})
             age = None if entry.get('last_success') is None else now - entry['last_success']
+            managed = (connector, pair) in self._ticker_rates
+            max_age = (self._rates_update_interval + self._rates_request_timeout
+                       if managed else self._rates_update_interval * 2)
+            if managed:
+                quote = self._ticker_rates[(connector, pair)]
+                age = None if quote is None else time.monotonic() - quote[1]
             if age is None:
                 state = 'unavailable'
-            elif not 0 <= age <= self._rates_update_interval * 2:
+            elif not 0 <= age <= max_age:
                 state = 'stale'
             else:
                 state = 'degraded' if entry['error'] is not None else 'ready'
             health.append({'connector': connector, 'trading_pair': pair, 'state': state,
-                           'age_seconds': age, 'error': entry['error'], 'consecutive_failures': entry['failures']})
+                           'age_seconds': age, 'max_age_seconds': max_age,
+                           'source': 'registered_ticker' if managed else 'cached_conversion',
+                           'error': entry['error'], 'consecutive_failures': entry['failures']})
         return health
 
     async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=5):
@@ -935,7 +947,9 @@ class MarketDataProvider:
             if error_label:
                 self.logger().warning(
                     f"Price refresh incomplete for {connector_name}: {error_label}; retrying on the next refresh. "
-                    f"Cached conversion rates expire after {self._rates_update_interval * 2}s."
+                    f"Registered ticker rates are unavailable after a failed refresh and expire after "
+                    f"{self._rates_update_interval + self._rates_request_timeout}s; "
+                    f"legacy cached conversion rates expire after {self._rates_update_interval * 2}s."
                 )
             else:
                 self.logger().info(f"Price refresh recovered for {connector_name}.")

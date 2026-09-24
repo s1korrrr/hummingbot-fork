@@ -69,7 +69,7 @@ class ModularSpotControllerConfig(ControllerConfigBase):
             raise ValueError('unverified inventory adoption is not supported')
         if self.interval not in CandlesBase.interval_to_seconds:
             raise ValueError('unsupported native candle interval')
-        required = max(60, 2 * self.signal.rsi_length + 2, self.signal.breakout_lookback + 2)
+        required = self.signal.required_history
         if self.max_records < required + 1:
             raise ValueError('insufficient feature history plus open candle')
         if self.signal.kind == 'breakout' and len(self.acquisition.fractions) != 1:

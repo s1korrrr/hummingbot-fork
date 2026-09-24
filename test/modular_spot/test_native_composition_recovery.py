@@ -7,7 +7,7 @@ import pytest
 from test_native_composition import FAMILIES, controllers, persist_position
 from test_native_lifecycle import recorder as _recorder_fixture
 
-from controllers.generic.modular_spot_core.domain import PolicyError
+from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError
 from controllers.generic.modular_spot_core.native_recovery import NativeRecoveryStore
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.model.metadata import Metadata
@@ -94,6 +94,25 @@ def test_native_report_database_lag_is_transient_without_rearming(recorder):
     assert result.determine_executor_actions() == []
     assert result._recovery_hold is None
     assert next(iter(result._recovery_trails.values())).peak_price == D('101')
+
+
+def test_native_report_six_decimal_projection_preserves_exact_inventory(recorder):
+    result = owner()
+    persist_position(recorder, result.config.id, amount=D('.079976'))
+    from hummingbot.model.position import Position
+    with recorder.sql_manager.get_new_session() as session, session.begin():
+        session.get(Position, 'native-held').breakeven_price = D('100.123456')
+    result.positions_held = [SimpleNamespace(
+        connector_name='okx', trading_pair='BTC-USDC', side=TradeType.BUY,
+        amount=D('.0799764904'), breakeven_price=D('100.123456789'))]
+    store = NativeRecoveryStore(result, recorder, result._native_source_hash)
+    assert store.inventory()[0].amount == D('.0799764904')
+    assert store.inventory()[0].breakeven_price == D('100.123456789')
+    with pytest.raises(PolicyError, match='no authoritative recovery checkpoint'):
+        store.prepare()
+    result.positions_held[0].amount = D('.0799784904')
+    with pytest.raises(DataUnavailable, match='not reconciled'):
+        store.inventory()
 
 
 def test_stale_writer_cas_and_unsanctioned_peak_regression_are_rejected(recorder):

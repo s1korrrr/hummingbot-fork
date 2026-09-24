@@ -1,7 +1,7 @@
 """Persist native held-recovery policy state; native recorder remains inventory truth."""
 import json
 from dataclasses import asdict
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from types import SimpleNamespace
 from typing import Literal
 
@@ -88,6 +88,8 @@ def decode(raw):
 
 
 class NativeRecoveryStore:
+    POSITION_REPORT_SCALE = Decimal('0.000001')
+
     def __init__(self, owner, recorder, source_hash):
         self.owner, self.recorder = owner, recorder
         self.source_hash = source_hash
@@ -138,9 +140,25 @@ class NativeRecoveryStore:
     def inventory(self):
         saved = self._positions(self.recorder.get_positions_by_controller(self.owner.config.id))
         current = self._positions(self.owner.positions_held)
-        if current != saved:
+        # Position.amount/breakeven_price use SqliteDecimal(6). The owner is
+        # reconstructed from exact native fills and must retain that precision;
+        # compare only the lossy recorder projection at its actual storage scale.
+        def projected(items):
+            rows = []
+            for item in items:
+                basis = item.breakeven_price.quantize(self.POSITION_REPORT_SCALE, rounding=ROUND_DOWN)
+                key = self.owner._recovery_position_key(SimpleNamespace(
+                    connector_name=self.owner.config.connector_name,
+                    trading_pair=self.owner.config.trading_pair, side=TradeType.BUY,
+                    breakeven_price=basis))
+                rows.append((key, item.amount.quantize(self.POSITION_REPORT_SCALE, rounding=ROUND_DOWN), basis))
+            if len({row[0] for row in rows}) != len(rows):
+                raise DataUnavailable('native held inventory report has conflated position keys')
+            return tuple(sorted(rows))
+
+        if projected(current) != projected(saved):
             raise DataUnavailable('native held inventory report and recorder have not reconciled')
-        return saved
+        return current
 
     def _load(self):
         try:

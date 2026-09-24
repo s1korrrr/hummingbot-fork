@@ -237,6 +237,7 @@ class NativeComposition:
         self._composition_digest = configuration_digest(config.model_dump(mode='json'))
         self._funding_store = None
         self._funding_hold = None
+        self._funding_assessment_hold = None
         self._recovery_store = None
         self._recovery_hold = None
         self._recovery_fault = None
@@ -268,10 +269,34 @@ class NativeComposition:
             self.processed_data = {'signal': 0, 'features': pd.DataFrame(),
                                    'data_health': {'ready': False, 'reason': type(exc).__name__}}
 
+    def _refresh_funding_assessment(self):
+        """Assess funding before a signal arrives, without changing native state."""
+        if self.config.funding is None:
+            return
+        now = self.market_data_provider.time()
+        previous = getattr(self, '_funding_assessed_at', None)
+        if previous is not None and 0 <= now - previous < 5:
+            return
+        self._funding_assessed_at = now
+        try:
+            if self._funding_store is None:
+                from hummingbot.connector.markets_recorder import MarketsRecorder
+                recorder = MarketsRecorder.get_existing_instance()
+                if recorder is None:
+                    raise DataUnavailable('Native recorder required for funding assessment')
+                self._funding_store = NativeFundingStore(self, recorder)
+            self._funding_store.status = self._funding_store.assess()
+            self._funding_store.status['observed_at'] = now
+            self._funding_assessment_hold = None
+        except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError, SQLAlchemyError) as error:
+            self._funding_assessment_hold = str(error) or type(error).__name__
+
     def determine_executor_actions(self):
+        self._refresh_funding_assessment()
         if self._recovery_fault:
             self.logger().warning('native recovery fault holds actions: %s', self._recovery_fault)
             return []
+
         before_trails = None
         try:
             if self._recovery_store is None:
@@ -387,7 +412,8 @@ class NativeComposition:
             self._funding_hold = 'Funded per-entry cap exceeded'
         sizing_hold = (config.side == TradeType.BUY and self.config.funding is not None
                        and self.config.funding.resize_to_available_quote and self._funding_hold)
-        if self._recovery_hold or self._recovery_fault or sizing_hold:
+        assessment_hold = config.side == TradeType.BUY and self._funding_assessment_hold
+        if self._recovery_hold or self._recovery_fault or sizing_hold or assessment_hold:
             if config.side == TradeType.BUY:
                 release = getattr(self, '_release_entry_decision', None)
                 if callable(release):
@@ -426,7 +452,7 @@ class NativeComposition:
 
     def _entry_admission_status(self):
         for label, reason in (('recovery', self._recovery_fault or self._recovery_hold),
-                              ('funding', self._funding_hold),
+                              ('funding', self._funding_assessment_hold or self._funding_hold),
                               ('entry_decision', getattr(self, '_entry_decision_error', None))):
             if reason:
                 return {'state': 'blocked', 'reason': f'{label}: {reason}'}
@@ -459,6 +485,7 @@ class NativeComposition:
                                        'execution_enabled': self.config.execution_enabled,
                                        'recovery_hold': self._recovery_hold,
                                        'funding_hold': self._funding_hold,
+                                       'funding_assessment_hold': self._funding_assessment_hold,
                                        'funding_sizing': getattr(self, '_funding_size', None),
                                        'funding': self._funding_store.status if self._funding_store else None}
         if hasattr(self.config, 'profile'):

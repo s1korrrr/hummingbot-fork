@@ -139,9 +139,13 @@ class NativeFundingStore:
         header = {'schema': 1, 'binding': self.binding, 'revision': 0,
                   'audit_sha256': identity([[], []])} if raw is None else json.loads(raw)
         if (not isinstance(header, dict) or set(header) != {'schema', 'binding', 'revision', 'audit_sha256'}
-                or type(header['schema']) is not int or header['schema'] != 1 or header['binding'] != binding
                 or type(header['revision']) is not int or header['revision'] < 0):
-            raise PolicyError('Funding checkpoint identity/schema changed')
+            raise PolicyError('Funding checkpoint header corrupt (FUNDING_AUDIT_CORRUPT)')
+        if type(header['schema']) is not int or header['schema'] != 1:
+            raise PolicyError('Funding checkpoint schema unsupported (FUNDING_SCHEMA_UNSUPPORTED)')
+        if header['binding'] != binding:
+            raise PolicyError('Funding checkpoint identity changed (FUNDING_BINDING_MISMATCH): '
+                              f"persisted={header['binding']} current={binding} revision={header['revision']}")
         if raw is None and rows:
             raise PolicyError('Funding checkpoint missing with existing admissions')
         claims, fills, releases = {}, {}, {}
@@ -463,6 +467,22 @@ class NativeFundingStore:
                         self.policy.max_position_quote - projection['used_by_pair'][pair]
                         - projection['pending_by_pair'][pair])
         return max(ZERO, available / (1 + self.policy.fee_reserve_fraction))
+
+    def assess(self):
+        """Inspect current native evidence without writing a claim or release.
+
+        This is readiness evidence only. Admission rechecks the actual proposal
+        against fresh evidence and persists its reservation before execution.
+        """
+        if any(not owner._composition_unchanged() for owner in self.owners.values()):
+            raise PolicyError('Funding owner configuration changed')
+        raw, state = self._load()
+        projection, pending, _ = self._evidence(state, raw, reconcile=False)
+        return {'assessment': 'read_only_native_evidence', 'binding': self.binding,
+                'revision': state['revision'], 'pending_quote': str(pending),
+                'inventory_cost': str(projection['inventory_cost']),
+                'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
+                'available_quote': str(max(ZERO, self.policy.allocation_quote - projection['used'] - pending))}
 
     def admit(self, executor_config):
         config = self.owner.config

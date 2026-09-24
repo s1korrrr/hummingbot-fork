@@ -188,3 +188,34 @@ def test_source_hash_change_with_held_inventory_still_requires_reconciliation(re
     assert result.determine_executor_actions() == []
     assert 'source/configuration changed' in result._recovery_fault
     assert result._recovery_trails == {}
+
+
+def test_event_observer_outage_does_not_suppress_native_inventory_reduction(recorder, tmp_path):
+    """An independent no-order observer cannot replace the native owner's exit path."""
+    import asyncio
+
+    from controllers.generic.cross_venue_event_v2 import CrossVenueEventV2Config, CrossVenueEventV2Controller
+
+    class Clock:
+        def time(self):
+            return 1780000000
+
+    snapshot_path = tmp_path / 'missing-events-v2.json'
+    observer = CrossVenueEventV2Controller(
+        CrossVenueEventV2Config(id='events-v2', snapshot_path=str(snapshot_path)), Clock(), asyncio.Queue())
+    native_owner = armed_owner(recorder)
+    observe(native_owner, '101.6', reversal=True)
+
+    asyncio.run(observer.update_processed_data())
+    assert observer.processed_data['status'] == 'UNAVAILABLE'
+    assert observer.determine_executor_actions() == []
+    actions = native_owner.determine_executor_actions()
+    assert len(actions) == 1 and actions[0].executor_config.side == TradeType.SELL
+    assert native_owner._recovery_store.previous.pending_reductions[0].prior_peak == D('102')
+
+    # Restart holds an unconfirmed reduction independently of the observer.
+    restarted_owner = owner()
+    observe(restarted_owner, '101.6', reversal=True)
+    assert restarted_owner.determine_executor_actions() == []
+    assert 'reduction receipt pending' in restarted_owner._recovery_hold
+    assert observer.determine_executor_actions() == []

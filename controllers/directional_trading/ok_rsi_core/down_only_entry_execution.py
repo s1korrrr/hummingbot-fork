@@ -133,7 +133,9 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         if isinstance(archived_lifecycle, dict):
             self._entry_child_lifecycles.setdefault(self._open_order.order_id, copy.deepcopy(archived_lifecycle))
         self._entry_reprice_count = len(self._entry_chain_children) - 1
-        self._entry_stop_reason = "planned_resume_sealed_entry"
+        self._entry_stop_reason = (position.get("entry_terminal_reason")
+                                   or self._entry_lifecycle.get("stop_reason")
+                                   or "planned_resume_sealed_entry")
         self._entry_submission_uncertain = False
         self._clear_replacement()
         self._entry_lifecycle.update(order_id=self._open_order.order_id,

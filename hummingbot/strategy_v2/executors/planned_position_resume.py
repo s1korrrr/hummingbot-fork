@@ -326,6 +326,7 @@ def _validate_chained_position_receipts(preflight, stopped, config, custom):
         'acquisition_chain': chain,
         'entry_child_lifecycles': custom.get('entry_child_lifecycles', {}),
         'entry_lifecycle': custom.get('entry_lifecycle', {}),
+        'entry_terminal_reason': acquisition.get('terminal_reason'),
         'trailing': trailing, 'net_base': str(net),
         'stopped_digest': digest(stopped), 'preflight': preflight,
     }
@@ -827,8 +828,12 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
             else:
                 position = validate_position(before, after)
             if position.get('acquisition_chain'):
-                # Native chain proof is sealed into the position manifest. Venue
-                # GET evidence remains independently checked below.
+                # Native chain proof is sealed into the position manifest. The
+                # venue GET comparison above ran against the evidence's copy, so
+                # the sealed set must be that same set, child for child.
+                supplied = proof.get('entry_reconciliation')
+                require(supplied is None or supplied == position['entry_reconciliation'],
+                        'venue-checked terminal proof set differs from the sealed owner set')
                 proof['entry_reconciliation'] = position['entry_reconciliation']
             native_config = connection.execute('SELECT config_file_path FROM "Order" WHERE id=?',
                                                (position['entry']['client_order_id'],)).fetchone()

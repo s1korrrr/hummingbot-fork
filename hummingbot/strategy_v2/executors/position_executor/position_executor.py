@@ -314,7 +314,12 @@ class PositionExecutor(ExecutorBase):
                 "entry_order_ids": [child["order_id"] for child in chain["children"]],
             }
         self._entry_submitted = True
-        self._entry_lifecycle = {"state": "managing_fill", "stop_reason": "planned_resume_sealed_entry"}
+        # A resume restores the owner's own terminal facts; the manifest id is
+        # already recorded separately, so the original stop reason survives.
+        archived_lifecycle = position.get("entry_lifecycle") if isinstance(position.get("entry_lifecycle"), dict) else {}
+        self._entry_lifecycle = {"state": "managing_fill",
+                                 "stop_reason": archived_lifecycle.get("stop_reason") or "planned_resume_sealed_entry",
+                                 "resume_sealed_entry": True}
         trailing = position["trailing"]
         trigger = trailing["trailing_stop_trigger_pct"]
         self._trailing_stop_trigger_pct = Decimal(str(trigger)) if trigger is not None else None

@@ -65,3 +65,44 @@ Static checks: `flake8` and `isort --check-only` on every changed/new Python fil
 An earlier concurrent source edit correctly invalidated the paper runtime identity midway through one restart test (66 passed, one subtest failed). That run is replaced by the final frozen 105-test run. The old unittest order test class requires a separate process after async test suites because its class-level `asyncio.get_event_loop()` initialization otherwise finds a closed/no loop; separate 24-test validation passed without changing the fixture. The pre-existing native market-health connector fixture failure recorded above remains outside the passing groups.
 
 Final state: local candidate implemented, regression tested and independently reviewed. No push/PR/merge, deployment, engine restart or live DB write. Read-only final Docker inspection still showed the original execution image and `2026-09-24T06:21:32.001678007Z` start. Process-kill crash matrix and live cutover evidence remain open; this plan stays active for that qualification.
+
+
+## Edge-case and restart campaign (24 September, second pass)
+
+Objective: test the repair beyond unit tests from every side and prove restart preservation. Authority unchanged: live-adjacent source and network-disabled containers only; no live restart, DB write, order, push or deploy. Image under test remains `sha256:b1d0865fc9405631522e91d01ae5a31041f002da8be8bd23902e339c45b9062c` with candidate modules overlaid read-only.
+
+### New test surfaces (all under `test/acquisition_chain_v2/`)
+
+- `test_paper_lifecycle_restart.py`: whole lifecycle in the offline native paper session (real orchestrator, recorder, funding store, controllers, executors, fake venue): zero-fill cancel, post-only repair, two base-fee fills, trailing arm and one exact SELL; clean restart after the closed chain; clean stop mid-chain (replacement resting, and partially filled) with funding release and re-admission; crash restarts from consistent SQLite snapshots at six distinct chain phases.
+- `crash_kill_driver.py` plus `scripts/validation/run_crash_kill_matrix.py`: real process kills (`os._exit`) in disposable containers at three boundaries, each followed by a fresh-process restore and verification.
+- `test_chain_edges.py`: three-child downward chain, reprice budget exhaustion, partial-then-cancel closure, duplicate fill event, foreign cancel, late predecessor cancel after closure, ten validator rejections, JSON-native persistence at every phase, real recorder round trip, legacy single-attempt regression.
+- `test_funding_edges.py`: three-child release, full reserve during a pending successor with a competing admission, changed proofs after release, gross-fill release with base fees, legacy two- and three-proof holds, tampered rows without `acquisition_chain`.
+- `test_restart_preservation.py`: orchestrator round trip for two- and three-child chains with armed trailing (orders, fills, fees, chain, reconciliation, trailing state, exact SELL, no BUY), persist idempotence after resume, second handover, seven prepare-time tamper rejections with database bytes unchanged, seven both-capture chain-damage rejections, unfinished chain rejection and plain-restart hold, duplicate fill and late predecessor fill after resume.
+
+### Defects found and fixed in this pass
+
+1. Planned resume replaced the owner's terminal reason with the marker `planned_resume_sealed_entry` (`position_executor.py` hydrate and the down-only override). The original stop reason now survives via `entry_terminal_reason` in the manifest position and the archived lifecycle; the marker is recorded as `resume_sealed_entry: True`.
+2. `prepare` venue-checked the evidence's terminal proof set but sealed the stopped row's copy without binding the two, so a reordered persisted set could be sealed unchecked. `prepare` now requires the supplied set to equal the sealed set child for child.
+
+No other source change. Legacy single-attempt behaviour verified unchanged.
+
+### Restart facts established
+
+- Clean stop (`early_stop(keep_position=True)`), then prepare, claim and hydrate restores a closed chain exactly: both children with states and fills, fees, terminal proofs, chain, stop reason, trailing trigger, move count and timestamps; no BUY is placed and the exit sells the exact net amount.
+- A crash at any observed phase (initial resting, cancel reconciliation pending, child authorized with no order, replacement resting, partial fill, closed chain managing) leaves the persisted row intact, restores venue orders and fills, latches `recovery_required`, holds readiness and never creates a BUY. A mid-step kill also leaves the paper step receipt, which holds the session until explicit reconciliation.
+- Operational boundary, unchanged by design: a crashed owner leaves the executor row RUNNING, and `prepare` refuses any database with unfinished executors. Automatic recreation stays unsupported (lifecycle repair runbook). Resuming trailing management after a crash therefore still needs the documented authorized reconciliation; there is no sealing tool for a crashed row.
+- Partially filled chains are not planned-resume candidates (only zero-fill predecessors then one full fill); their inventory persists as a held bag and the strategy's average-entry gap governs re-entry.
+
+### Frozen results (candidate source, network-disabled image)
+
+| Arguments | Observed |
+| --- | --- |
+| `test/acquisition_chain_v2 test/modular_spot/test_down_only_planned_resume.py test/hummingbot/strategy_v2/executors/test_planned_position_resume.py -q` | 141 passed, 5 subtests (`edge-campaign-final.log`) |
+| `test/acquisition_chain_v2/test_paper_lifecycle_restart.py -q` | 5 passed (`paper-lifecycle-restart.log`) |
+| `scripts/validation/run_crash_kill_matrix.py --image <id>` | 3 phases killed with exit 137, 3 verifies ok, PASS (`process-kill-matrix.log`) |
+| execution, data-feed, funding, composition and crash-recovery groups (see `regression-groups-final.log`) | 300 passed, 29 subtests |
+| `test/hummingbot/core/data_type/test_in_flight_order.py -q` | 24 passed |
+
+Static checks: `flake8` and `isort --check-only` clean on the three changed source files and six new test/script files; `git diff --check` clean.
+
+Still open: live cutover evidence (fresh venue receipts for every child of the held BTC position, WAL-consistent backup, legacy funding transition review, manifest preparation, image qualification, controlled restart with the trailing high-water reset accepted). Hold alerting (push a Telegram alert on `entry_admission` blocked or `reconciliation_required`) remains a recommended follow-up outside this candidate.

@@ -408,6 +408,7 @@ class PositionExecutor(ExecutorBase):
         """
         remaining = self.amount_to_close
         if (remaining <= Decimal("0") or self.is_perpetual or self.close_order_side != TradeType.SELL
+                or self.close_type == CloseType.POSITION_HOLD  # the held ledger owns that accounting
                 or self.close_filled_amount <= Decimal("0") or not self.all_orders_completed()):
             return Decimal("0")
         quantum = self._to_decimal(getattr(self.trading_rules, "min_base_amount_increment", None))
@@ -416,9 +417,9 @@ class PositionExecutor(ExecutorBase):
         return remaining
 
     def _exit_complete(self) -> bool:
-        """The whole tradeable position is closed; at most sub-lot fee dust remains."""
+        """The whole tradeable position is closed exactly; at most sub-lot fee dust remains."""
         return (self.close_filled_amount > Decimal("0")
-                and self.amount_to_close - self._closed_residual_dust() <= Decimal("0"))
+                and self.amount_to_close - self._closed_residual_dust() == Decimal("0"))
 
     def _close_order_amount(self) -> Decimal:
         close_amount = self.amount_to_close
@@ -1100,12 +1101,7 @@ class PositionExecutor(ExecutorBase):
             else:
                 self.logger().error(self._log_message("Close order state unavailable; retaining reservation until reconciled"))
         else:
-            dust = self._closed_residual_dust()
-            remaining = self.amount_to_close - dust
-            if remaining <= Decimal("0") and dust > Decimal("0"):
-                self.logger().info(self._log_message(f'Exit complete; sub-lot fee residue written off residual_base={dust}'))
-                self.stop()
-                return
+            remaining = self.amount_to_close
             if (not self.is_perpetual and remaining > 0 and self.all_orders_completed()
                     and (remaining < self.trading_rules.min_order_size
                          or remaining * self.current_market_price < self.trading_rules.min_notional_size)):
@@ -1938,6 +1934,9 @@ class PositionExecutor(ExecutorBase):
         level_id = self.config.level_id
         role = level_id if level_id in {"scout", "runner"} else None
         trailing_snapshot = self._trailing_status_snapshot()
+        # Sub-lot fee dust after a complete exit is written off: it is not remaining inventory.
+        residual_dust = self._closed_residual_dust()
+        remaining_base = self.amount_to_close - residual_dust
         custom_info = {
             "planned_position_resume": self._planned_resume_id,
             "planned_position_resume_compatibility_v1": copy.deepcopy(self._planned_resume_compatibility),
@@ -1966,7 +1965,7 @@ class PositionExecutor(ExecutorBase):
             ),
             "order_ids": [order.order_id for order in self._unique_orders([*self._entry_orders(), *self._exit_orders()])],
             "close_order_filled_amount_base": self.close_filled_amount,
-            "remaining_position_amount_base": self.amount_to_close,
+            "remaining_position_amount_base": remaining_base,
             "held_position_orders": self._held_position_orders,
             "entry_reconciliation": copy.deepcopy(self._entry_reconciliation),
             "entry_lifecycle": {"policy": self.config.entry_order_policy, **self._entry_lifecycle},
@@ -1980,8 +1979,8 @@ class PositionExecutor(ExecutorBase):
                 "exit_gross_base": self.close_filled_amount,
                 "exit_gross_quote": self.close_filled_amount_quote,
                 "fees_quote": self.cum_fees_quote,
-                "remaining_owned_base": self.amount_to_close,
-                "residual_dust_base": self._closed_residual_dust(),
+                "remaining_owned_base": remaining_base,
+                "residual_dust_base": residual_dust,
                 "accounting_owner": "held_position" if self.close_type == CloseType.POSITION_HOLD else "executor",
             },
             "entry_order_snapshot": self._open_order.order.to_json()

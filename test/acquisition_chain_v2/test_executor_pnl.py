@@ -7,8 +7,9 @@ bought with base-denominated maker fees, so the net inventory was finer than the
 such an exit into POSITION_HOLD, which zeroed the trade PnL and recorded the
 profitable round trip as minus the fees (-0.0721 and -0.0760 USDC).
 
-Every scenario drives public entry points only; nothing here sends orders or
-touches a live stack.
+Entry state is seeded the way the chain-edge tests do it; the exit then runs
+through place_close_order_and_cancel_open_orders, the order event handlers and
+control_task. Nothing here sends orders or touches a live stack.
 """
 from decimal import Decimal
 from test.acquisition_chain_v2.test_child_state import proof_for
@@ -21,7 +22,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, DeductedFromReturnsTradeFee, TokenAmount
-from hummingbot.core.event.events import OrderFilledEvent, SellOrderCompletedEvent
+from hummingbot.core.event.events import OrderCancelledEvent, OrderFilledEvent, SellOrderCompletedEvent
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1
 from hummingbot.strategy_v2.executors.position_executor.data_types import TrailingStop, TripleBarrierConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -147,15 +148,19 @@ async def test_full_lot_exit_with_sub_lot_fee_dust_realizes_cash_pnl(executor_id
     assert executor.cum_fees_quote == base_fee * case['entry_price'] + case['exit_fee']
     assert abs(executor.net_pnl_quote - expected_net) < D('1e-12')
     assert abs(executor.trade_pnl_quote - (expected_net + executor.cum_fees_quote)) < D('1e-12')
-    assert executor.net_pnl_pct == executor.net_pnl_quote / executor.open_filled_amount_quote
+    assert abs(executor.net_pnl_pct - expected_net / (executor.open_filled_amount * case['entry_price'])) < D('1e-12')
 
     custom = executor.get_custom_info()
     assert custom['exit_trigger_reason'] == 'TRAILING_STOP'
     assert custom['held_position_orders'] == []
-    assert custom['remaining_position_amount_base'] == case['dust']
+    # The write-off is visible in the receipt, and the executor reports itself flat:
+    # program budget and inventory views gate on remaining_owned_base == 0.
+    assert custom['remaining_position_amount_base'] == D('0')
     receipt = custom['execution_receipt']
     assert receipt['accounting_owner'] == 'executor'
+    assert receipt['remaining_owned_base'] == D('0')
     assert receipt['residual_dust_base'] == case['dust']
+    assert receipt['exit_gross_base'] == case['exit_amount']
     assert receipt['exit_gross_quote'] == proceeds
 
 
@@ -167,6 +172,7 @@ async def test_residual_of_a_whole_lot_below_minimum_still_holds_inventory():
     partial = case['exit_amount'] - D('0.00000500')
     trailing_exit(executor, connector, prices, case['exit_price'], case['exit_fee'], partial)
     executor._close_order.order.current_state = OrderState.CANCELED
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(102, 'exit'))
 
     for _ in range(3):
         await executor.control_task()
@@ -175,6 +181,7 @@ async def test_residual_of_a_whole_lot_below_minimum_still_holds_inventory():
     assert executor.close_type == CloseType.POSITION_HOLD
     custom = executor.get_custom_info()
     assert custom['remaining_position_amount_base'] == D('0.00000500') + case['dust']
+    assert custom['execution_receipt']['remaining_owned_base'] == D('0.00000500') + case['dust']
     assert custom['execution_receipt']['accounting_owner'] == 'held_position'
     assert custom['execution_receipt']['residual_dust_base'] == D('0')
     assert [order['trade_type'] for order in custom['held_position_orders']] == ['BUY', 'SELL']

@@ -187,7 +187,7 @@ def test_runner_unknown_cost_exception_requires_trusted_native_policy(policy, al
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('global_limit,controller_limit', [(None, 20), (0, 20), (float('nan'), 20), (float('inf'), 20), (100, None), (100, 0), (100, float('nan')), (100, 101)])
+@pytest.mark.parametrize('global_limit,controller_limit', [(0, 20), (float('nan'), 20), (float('inf'), 20), (100, 0), (100, float('nan')), (100, 101)])
 async def test_direct_native_runner_invalid_loss_rails_hold_before_dispatch(recorder, global_limit, controller_limit):
     connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
@@ -202,6 +202,29 @@ async def test_direct_native_runner_invalid_loss_rails_hold_before_dispatch(reco
             assert strategy._risk_reconciliation_error
             assert not strategy.validate_create_action(SimpleNamespace(controller_id=OWNER))
             assert recorder.load_strategy_risk_state() is None
+            assert not connector.in_flight_orders
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('global_limit,controller_limit', [(None, 20), (100, None), (None, None)])
+async def test_direct_native_runner_optional_loss_rails_remain_unset(recorder, global_limit, controller_limit):
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize_modular), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            max_global_drawdown_quote=global_limit, max_controller_drawdown_quote=controller_limit))
+        try:
+            assert not strategy._is_stop_triggered
+            assert strategy._risk_reconciliation_error is None
+            assert strategy.config.max_global_drawdown_quote == global_limit
+            assert strategy.config.max_controller_drawdown_quote == controller_limit
+            assert recorder.load_strategy_risk_state() is not None
             assert not connector.in_flight_orders
         finally:
             strategy.listen_to_executor_actions_task.cancel()

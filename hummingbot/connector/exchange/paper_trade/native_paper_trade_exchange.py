@@ -3,6 +3,9 @@
 The injected book is a consumable snapshot. Resting orders use price/time priority
 against a configured fraction of each *new* public trade; real queue position is
 unknown. This is an execution test model, never exchange-equivalence evidence.
+The opt-in ``delayed_observed_v1`` mode accepts completed-second low/high/base
+volume through ``process_observed_second`` for offline research. It delays native
+order acknowledgements one second and shares one floored volume cap by submit order.
 """
 import asyncio
 import copy
@@ -28,6 +31,7 @@ from hummingbot.core.data_type.trade_fee import TradeFeeBase, TradeFeeSchema
 from hummingbot.core.network_iterator import NetworkStatus
 
 ZERO = Decimal('0')
+RESEARCH_EXECUTION_MODE = 'delayed_observed_v1'
 
 
 def _decimal(value, *, positive=False):
@@ -85,10 +89,13 @@ class NativePaperTradeExchange(ExchangeBase):
     Snapshots emitted through ``tracking_states`` are native recorder compatible.
     Canceled and filled orders stay authoritative for terminal reconciliation by
     client and exchange order id after the shared tracker cache expires.
+    ``research_execution_mode='delayed_observed_v1'`` is an offline timing and
+    volume adapter; no transport, policy or account implementation is added.
     """
 
     def __init__(self, trading_rules, *, fee_schema=None, name='okx_paper_trade',
-                 max_data_age=5.0, trade_participation=Decimal('.1'), max_unresolved_orders=1000):
+                 max_data_age=5.0, trade_participation=None, max_unresolved_orders=1000,
+                 research_execution_mode=None):
         if not name.endswith('_paper_trade') or 'perpetual' in name:
             raise ValueError('An explicit spot paper connector name is required')
         self._paper_name = name
@@ -112,9 +119,16 @@ class NativePaperTradeExchange(ExchangeBase):
         if not math.isfinite(max_data_age) or max_data_age <= 0:
             raise ValueError('A bounded data age is required')
         self.max_data_age = float(max_data_age)
+        if research_execution_mode not in (None, RESEARCH_EXECUTION_MODE):
+            raise ValueError('Unknown offline research execution mode')
+        self.research_execution_mode = research_execution_mode
+        if trade_participation is None:
+            trade_participation = Decimal('.01') if research_execution_mode else Decimal('.1')
         self.trade_participation = _decimal(trade_participation, positive=True)
         if self.trade_participation > 1:
             raise ValueError('Trade participation cannot exceed one')
+        if research_execution_mode and self.trade_participation != Decimal('.01'):
+            raise ValueError('Delayed observed-volume research mode requires one-percent participation')
         self._paper_time = 0.0
         self._books = {}
         self._depth = {}
@@ -124,6 +138,9 @@ class NativePaperTradeExchange(ExchangeBase):
         self._order_tracker = ClientOrderTracker(self)
         self._paper_budget_checker = _PaperBudgetChecker(self)
         self._pending = []
+        self._research_events = []
+        self._observed_buckets = {}
+        self._research_order_sequence = {}
         self._operation_lock = asyncio.Lock()
         self._restored = False
         self._execution_started = False
@@ -132,13 +149,16 @@ class NativePaperTradeExchange(ExchangeBase):
         if type(max_unresolved_orders) is not int or max_unresolved_orders < 1:
             raise ValueError('Positive terminal evidence capacity required')
         self.max_unresolved_orders = max_unresolved_orders
-        self._contract = hashlib.sha256(json.dumps({
+        contract = {
             'name': name, 'rules': {p: repr(r) for p, r in sorted(self._rules.items())},
             'maker': str(self._fee_policy.maker_percent_fee_decimal),
             'taker': str(self._fee_policy.taker_percent_fee_decimal),
             'buy_base_fee': self._fee_policy.buy_percent_fee_deducted_from_returns,
             'max_data_age': self.max_data_age, 'participation': str(self.trade_participation),
-        }, sort_keys=True).encode()).hexdigest()
+        }
+        if self.research_execution_mode:
+            contract['research_execution_mode'] = self.research_execution_mode
+        self._contract = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
 
     @property
     def name(self):
@@ -403,7 +423,7 @@ class NativePaperTradeExchange(ExchangeBase):
         if amount <= 0 or amount < rule.min_order_size or amount > rule.max_order_size or amount * price < max(rule.min_notional_size, rule.min_order_value):
             raise ValueError('Order violates native trading rules')
         crosses = available and (price >= available[0][0] if side == TradeType.BUY else price <= available[0][0])
-        if order_type == OrderType.LIMIT_MAKER and crosses:
+        if order_type == OrderType.LIMIT_MAKER and crosses and not self.research_execution_mode:
             raise ValueError('Post-only order crosses the injected book')
         order = _PaperInFlightOrder(f'paper-{uuid4().hex}', pair, order_type, side, amount,
                                     self.current_timestamp, price=price,
@@ -414,7 +434,11 @@ class NativePaperTradeExchange(ExchangeBase):
             raise ValueError('Insufficient unreserved paper balance including fees')
         self._execution_started = True
         self._order_tracker.start_tracking_order(order)
-        self._pending.append(asyncio.create_task(self._open(order)))
+        if self.research_execution_mode:
+            self._research_events.append(('open', order.client_order_id, self.current_timestamp + 1))
+            self._research_order_sequence[order.client_order_id] = max(self._research_order_sequence.values(), default=-1) + 1
+        else:
+            self._pending.append(asyncio.create_task(self._open(order)))
         return order.client_order_id
 
     async def _update(self, order, state):
@@ -451,12 +475,95 @@ class NativePaperTradeExchange(ExchangeBase):
             await asyncio.gather(*pending)
         self._compact_terminal_orders()
 
+    async def settle_research_events(self):
+        """Apply only due offline acknowledgements before observed public prints."""
+        if not self.research_execution_mode:
+            return
+        due = [event for event in self._research_events if event[2] <= self.current_timestamp]
+        self._research_events = [event for event in self._research_events if event[2] > self.current_timestamp]
+        # A pending cancel acknowledged at this clock cannot fill from the
+        # completed-second print batch presented at the same clock.
+        due.sort(key=lambda event: (event[2], event[0] != 'cancel'))
+        async with self._operation_lock:
+            for kind, order_id, _ in due:
+                order = self._order_tracker.fetch_tracked_order(order_id)
+                if order is None or order.is_done:
+                    continue
+                if kind == 'open' and order.order_type == OrderType.LIMIT_MAKER:
+                    depth = self._depth.get(order.trading_pair)
+                    if depth is None or not self._fresh(order.trading_pair):
+                        await self._update(order, OrderState.CANCELED)
+                        continue
+                    bid, ask = depth[0][0][0], depth[1][0][0]
+                    crosses = order.price >= ask if order.trade_type == TradeType.BUY else order.price <= bid
+                    if crosses:
+                        order.cancel_source = '31'
+                        await self._update(order, OrderState.CANCELED)
+                        continue
+                await self._update(order, OrderState.CANCELED if kind == 'cancel' else OrderState.OPEN)
+
+    def validate_observed_second_input(self, trading_pair, timestamp, low, high, volume, *, current_timestamp=None):
+        """Require a completed previous second, with no intrasecond ordering claim."""
+        now = self.current_timestamp if current_timestamp is None else float(current_timestamp)
+        if not self.research_execution_mode or trading_pair not in self._rules or type(timestamp) not in (int, float):
+            raise ValueError('Observed second requires an offline research pair and clock')
+        if not math.isfinite(timestamp) or timestamp != now - 1:
+            raise ValueError('Observed second must be the completed preceding second')
+        low, high, volume = _decimal(low, positive=True), _decimal(high, positive=True), _decimal(volume)
+        if low > high:
+            raise ValueError('Observed second low exceeds high')
+        previous = self._observed_buckets.get(trading_pair)
+        if previous is not None and timestamp <= previous['second']:
+            raise ValueError('Observed second repeated or regressed')
+        return low, high, volume
+
+    async def process_observed_second(self, trading_pair, timestamp, low, high, volume):
+        """Apply one shared pair-second volume cap to native orders in submit order."""
+        low, high, volume = self.validate_observed_second_input(trading_pair, timestamp, low, high, volume)
+        self._require_fresh(trading_pair)
+        await self.drain()
+        await self.settle_research_events()
+        async with self._operation_lock:
+            quantum = self._rules[trading_pair].min_base_amount_increment
+            remaining = (volume * self.trade_participation // quantum) * quantum
+            cap = remaining
+            bid, ask = self._depth[trading_pair][0][0][0], self._depth[trading_pair][1][0][0]
+            orders = sorted(self.in_flight_orders.values(),
+                            key=lambda order: self._research_order_sequence[order.client_order_id])
+            for order in orders:
+                if order.trading_pair != trading_pair or not order.is_open or self.current_timestamp < order.creation_timestamp + 2:
+                    continue
+                if order.order_type == OrderType.MARKET:
+                    touched = True
+                    price = ask if order.trade_type == TradeType.BUY else bid
+                elif order.order_type == OrderType.LIMIT_MAKER:
+                    touched = low <= order.price if order.trade_type == TradeType.BUY else high >= order.price
+                    price = order.price
+                else:
+                    touched = ask <= order.price if order.trade_type == TradeType.BUY else bid >= order.price
+                    price = order.price
+                if not touched or remaining < quantum:
+                    continue
+                amount = min(order.amount - order.executed_amount_base, remaining)
+                amount = (amount // quantum) * quantum
+                if amount > 0:
+                    await self._fill(order, amount, price, order.order_type != OrderType.MARKET,
+                                     f'observed:{timestamp}:{order.client_order_id}')
+                    remaining -= amount
+            self._observed_buckets[trading_pair] = {
+                'second': float(timestamp), 'total': volume, 'used': cap - remaining,
+            }
+
     def cancel(self, trading_pair, client_order_id):
         order = self._order_tracker.fetch_tracked_order(client_order_id)
         if order is not None and order.trading_pair != trading_pair:
             raise ValueError('Cancellation pair mismatch')
         if order is not None:
-            self._pending.append(asyncio.create_task(self._cancel(order)))
+            if self.research_execution_mode:
+                if not any(kind == 'cancel' and key == client_order_id for kind, key, _ in self._research_events):
+                    self._research_events.append(('cancel', client_order_id, self.current_timestamp + 1))
+            else:
+                self._pending.append(asyncio.create_task(self._cancel(order)))
         return client_order_id
 
     async def _cancel(self, order):
@@ -466,6 +573,15 @@ class NativePaperTradeExchange(ExchangeBase):
 
     async def cancel_all(self, timeout_seconds):
         orders = list(self.in_flight_orders.values())
+        if self.research_execution_mode:
+            # Explicit session teardown is outside the scored event clock.
+            async with self._operation_lock:
+                for order in orders:
+                    if not order.is_done:
+                        await self._update(order, OrderState.CANCELED)
+            self._research_events.clear()
+            await self.drain()
+            return [CancellationResult(o.client_order_id, o.is_cancelled or o.is_filled) for o in orders]
         for order in orders:
             self.cancel(order.trading_pair, order.client_order_id)
         await asyncio.wait_for(self.drain(), timeout_seconds)
@@ -488,6 +604,8 @@ class NativePaperTradeExchange(ExchangeBase):
         return price, amount
 
     async def process_trade(self, trading_pair, sequence, timestamp, side, price, amount):
+        if self.research_execution_mode:
+            raise ValueError('Research execution requires one completed-second observation')
         price, amount = self.validate_trade_input(trading_pair, sequence, timestamp, side, price, amount)
         await self.drain()
         async with self._operation_lock:
@@ -498,7 +616,8 @@ class NativePaperTradeExchange(ExchangeBase):
             orders = [o for o in self.in_flight_orders.values() if o.trading_pair == trading_pair
                       and o.trade_type != side and o.order_type.is_limit_type() and not o.is_done
                       and o.creation_timestamp <= timestamp]
-            orders.sort(key=lambda o: ((-o.price if o.trade_type == TradeType.BUY else o.price), o.creation_timestamp))
+            orders.sort(key=lambda o: ((-o.price if o.trade_type == TradeType.BUY else o.price),
+                                       o.creation_timestamp, o.client_order_id))
             for order in orders:
                 crosses = price <= order.price if order.trade_type == TradeType.BUY else price >= order.price
                 if amount <= 0:
@@ -537,13 +656,19 @@ class NativePaperTradeExchange(ExchangeBase):
         orders = {key: value.to_json() for key, value in self._order_tracker.all_orders.items() if not value.is_done}
         for key, value in self._terminal_orders.items():
             orders.setdefault(key, value.to_json())
-        return {
+        state = {
             'schema': 'native_spot_paper_v1', 'contract': self._contract,
             'timestamp': self.current_timestamp,
             'balances': {asset: str(value) for asset, value in self._account_balances.items()},
             'orders': orders,
             'trade_sequence': dict(self._trade_sequence), 'book_sequence': dict(self._book_sequence),
         }
+        if self.research_execution_mode:
+            state['research_events'] = list(self._research_events)
+            state['observed_buckets'] = {pair: {key: str(value) for key, value in bucket.items()}
+                                         for pair, bucket in self._observed_buckets.items()}
+            state['research_order_sequence'] = {key: self._research_order_sequence[key] for key in orders}
+        return state
 
     def restore_tracking_states(self, saved_states):
         if self._order_tracker.all_orders or self._pending or self._restored:
@@ -567,7 +692,8 @@ class NativePaperTradeExchange(ExchangeBase):
                     or order.trade_type not in (TradeType.BUY, TradeType.SELL)
                     or not math.isfinite(order.creation_timestamp)
                     or not 0 <= order.creation_timestamp <= timestamp
-                    or order.current_state not in (OrderState.OPEN, OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCELED)
+                    or order.current_state not in ((OrderState.PENDING_CREATE,) if self.research_execution_mode else ())
+                    + (OrderState.OPEN, OrderState.PARTIALLY_FILLED, OrderState.FILLED, OrderState.CANCELED)
                     or order.position != PositionAction.NIL):
                 raise ValueError('Invalid native paper order identity')
             amount = _decimal(order.amount, positive=True)
@@ -613,6 +739,38 @@ class NativePaperTradeExchange(ExchangeBase):
                     reserved[asset] = reserved.get(asset, ZERO) + cost
         if any(cost > balances.get(asset, ZERO) for asset, cost in reserved.items()):
             raise ValueError('Restored orders exceed paper balances')
+        restored_events, restored_buckets = [], {}
+        if self.research_execution_mode:
+            events = state.get('research_events')
+            buckets = state.get('observed_buckets')
+            order_sequence = state.get('research_order_sequence')
+            if not isinstance(events, list) or not isinstance(buckets, dict) or not isinstance(order_sequence, dict):
+                raise ValueError('Research execution state missing')
+            if (set(order_sequence) != set(state['orders'])
+                    or len(set(order_sequence.values())) != len(order_sequence)
+                    or any(type(value) is not int or value < 0 for value in order_sequence.values())):
+                raise ValueError('Research submission order changed')
+            for event in events:
+                if (not isinstance(event, (list, tuple)) or len(event) != 3 or event[0] not in ('open', 'cancel')
+                        or event[1] not in state['orders'] or not isinstance(event[2], (int, float))
+                        or not math.isfinite(event[2]) or event[2] < timestamp):
+                    raise ValueError('Invalid research acknowledgement state')
+                restored_events.append(tuple(event))
+            for order in orders:
+                if (order.current_state == OrderState.PENDING_CREATE
+                        and not any(kind == 'open' and key == order.client_order_id
+                                    for kind, key, _ in restored_events)):
+                    raise ValueError('Pending paper create lacks acknowledgement')
+            for pair, bucket in buckets.items():
+                if pair not in self._rules or not isinstance(bucket, dict) or set(bucket) != {'second', 'total', 'used'}:
+                    raise ValueError('Invalid observed-volume checkpoint')
+                second = float(bucket['second'])
+                total, used = _decimal(bucket['total']), _decimal(bucket['used'])
+                quantum = self._rules[pair].min_base_amount_increment
+                if (not math.isfinite(second) or not second.is_integer() or second > timestamp
+                        or used > (total * self.trade_participation // quantum) * quantum):
+                    raise ValueError('Invalid observed-volume checkpoint')
+                restored_buckets[pair] = {'second': second, 'total': total, 'used': used}
         tracker = ClientOrderTracker(self)
         terminals = {}
         for order in orders:
@@ -628,6 +786,10 @@ class NativePaperTradeExchange(ExchangeBase):
         self._paper_time = max(timestamp, self._paper_time)
         self._trade_sequence = dict(state['trade_sequence'])
         self._book_sequence = dict(state['book_sequence'])
+        if self.research_execution_mode:
+            self._research_events = restored_events
+            self._observed_buckets = restored_buckets
+            self._research_order_sequence = dict(order_sequence)
         self._books, self._depth, self._book_time = {}, {}, {}
         self._restored = True
 

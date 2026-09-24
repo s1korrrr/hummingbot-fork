@@ -64,6 +64,10 @@ async def test_actual_native_pairs_share_budget_and_retain_partial_fill_across_r
             assert sum(e.config.amount * e.config.entry_price * D('1.003') for e in active) <= 50
             assert all(e.config.amount * e.config.entry_price * D('1.003') <= 25 for e in active)
             assert 'exhausted' in session.controllers['modular_spot_sol']._funding_hold
+            pending = session.controllers['modular_spot_btc']._funding_store.assess()
+            assert pending['revision'] >= 2
+            assert D('40') < D(pending['pending_quote']) <= D('50')
+            assert D(pending['available_quote']) == D('50') - D(pending['pending_quote'])
             from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
             owner = session.controllers['modular_spot_btc']
             extra = PositionExecutorConfig(timestamp=600060, connector_name='okx_paper_trade', trading_pair='BTC-USDC',
@@ -73,6 +77,16 @@ async def test_actual_native_pairs_share_budget_and_retain_partial_fill_across_r
             await session.step(600061, trades=[dict(trading_pair='BTC-USDC', sequence=1, timestamp=600061,
                                                     side=TradeType.SELL, price=active[0].config.entry_price - D('.01'), amount=D('.1'))])
             assert session._connector.get_balance('BTC') == D('.1')
+            # The filled BTC owner retains native trailing state while the
+            # other owners still share the pending strategy allocation.
+            await session.step(600062, books=[dict(trading_pair='BTC-USDC', sequence=4,
+                                                   timestamp=600062, bids=[(100, 10)], asks=[(100.1, 10)])])
+            btc_executor = session.executor_orchestrator.active_executors['modular_spot_btc'][0]
+            armed_trigger = btc_executor._trailing_stop_trigger_pct
+            assert armed_trigger is not None
+            after_fill = session.controllers['modular_spot_btc']._funding_store.assess()
+            assert after_fill['revision'] >= pending['revision']
+            assert D(after_fill['pending_quote']) > 0
         finally:
             await session.close()
         restored = NativePaperSession(market(), configs, tmp_path / 'shared.sqlite', restore=True)
@@ -85,6 +99,9 @@ async def test_actual_native_pairs_share_budget_and_retain_partial_fill_across_r
             assert len({s['available_quote'] for s in statuses}) == 1
             assert D('40') < D(statuses[0]['available_quote']) < D('42')
             assert all(s['released_intents'] == 2 for s in statuses)
+            assert all(store.assess()['revision'] >= after_fill['revision'] for store in stores)
+            restored_btc = restored.recorder.get_executors_by_controller('modular_spot_btc')[0]
+            assert D(str(restored_btc.custom_info['trailing_stop_trigger_pct'])) == armed_trigger
             assert not restored._connector.in_flight_orders
         finally:
             await restored.close()

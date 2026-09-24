@@ -190,7 +190,8 @@ def test_source_hash_change_with_held_inventory_still_requires_reconciliation(re
     assert result._recovery_trails == {}
 
 
-def test_event_observer_outage_does_not_suppress_native_inventory_reduction(recorder, tmp_path):
+@pytest.mark.parametrize('observer_mode', ('source_outage', 'paused'))
+def test_event_observer_hold_does_not_suppress_native_inventory_reduction(recorder, tmp_path, observer_mode):
     """An independent no-order observer cannot replace the native owner's exit path."""
     import asyncio
 
@@ -203,11 +204,14 @@ def test_event_observer_outage_does_not_suppress_native_inventory_reduction(reco
     snapshot_path = tmp_path / 'missing-events-v2.json'
     observer = CrossVenueEventV2Controller(
         CrossVenueEventV2Config(id='events-v2', snapshot_path=str(snapshot_path)), Clock(), asyncio.Queue())
+    if observer_mode == 'paused':
+        observer.config.manual_kill_switch = True
     native_owner = armed_owner(recorder)
     observe(native_owner, '101.6', reversal=True)
 
     asyncio.run(observer.update_processed_data())
-    assert observer.processed_data['status'] == 'UNAVAILABLE'
+    assert observer.processed_data['status'] == (
+        'OBSERVER_PAUSED' if observer_mode == 'paused' else 'UNAVAILABLE')
     assert observer.determine_executor_actions() == []
     actions = native_owner.determine_executor_actions()
     assert len(actions) == 1 and actions[0].executor_config.side == TradeType.SELL

@@ -1,7 +1,15 @@
 from decimal import Decimal
 from unittest.mock import Mock
 
+import pytest
 from test_native_composition import FAMILIES, controllers
+
+
+@pytest.fixture(autouse=True)
+def isolated_controller_status(monkeypatch):
+    # Pure status fixtures must not inherit another test's disposed recorder.
+    from hummingbot.connector.markets_recorder import MarketsRecorder
+    monkeypatch.setattr(MarketsRecorder, '_shared_instance', None)
 
 
 def owner(**kwargs):

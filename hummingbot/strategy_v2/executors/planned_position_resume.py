@@ -20,6 +20,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
+from hummingbot.strategy_v2.executors.position_executor.position_executor import validate_planned_entry_reconciliation
 from hummingbot.strategy_v2.models.executors import CloseType
 
 TABLE = 'PlannedPositionResume'
@@ -144,6 +145,8 @@ def validate_position_receipts(preflight, stopped):
         require(decimal(fee.get('percent', 0)) >= 0 and fee.get('percent_token') in (None, base, quote)
                 and all(f['token'] in (base, quote) and decimal(f['amount']) >= 0 for f in fee.get('flat_fees', [])),
                 'unsupported fee currency or rebate')
+    reconciliation = validate_planned_entry_reconciliation(
+        config, order, custom.get('entry_reconciliation'))
     net = order.executed_amount_base - base_fee_amount(entry, config.trading_pair.split('-')[0])
     require(net > 0 and decimal(custom['remaining_position_amount_base']) == net
             and decimal(custom['open_order_filled_amount_base']) == net
@@ -169,7 +172,8 @@ def validate_position_receipts(preflight, stopped):
         require(trailing['trailing_stop_trigger_pct'] is None and trailing['trailing_armed_timestamp'] is None
                 and trailing['trailing_last_update_timestamp'] is None and moves == 0, 'inconsistent unarmed trailing state')
     return {'executor_id': config.id, 'controller_id': config.controller_id, 'config': stopped['config'],
-            'entry': entry, 'trailing': trailing, 'net_base': str(net), 'stopped_digest': digest(stopped),
+            'entry': entry, 'entry_reconciliation': reconciliation, 'trailing': trailing,
+            'net_base': str(net), 'stopped_digest': digest(stopped),
             'preflight': preflight}
 
 

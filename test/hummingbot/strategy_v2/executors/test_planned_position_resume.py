@@ -89,6 +89,62 @@ class ResumeValidationTests(TestCase):
         with self.assertRaisesRegex(ValueError, 'trailing'):
             validate_position(self.preflight, self.row)
 
+    def test_funded_resume_retains_stopped_terminal_entry_proof(self):
+        self.config.require_terminal_entry_reconciliation = True
+        self.row['config'] = json.loads(self.config.model_dump_json())
+        self.preflight['config'] = self.row['config']
+        proof = {'schema': 1, 'source': 'okx_terminal_status_v1', 'order_id': 'entry-1',
+                 'exchange_order_id': 'venue-1', 'trading_pair': 'ETH-USDT', 'side': 'BUY',
+                 'amount': '1', 'filled_base': '1', 'state': 'FILLED', 'trade_ids': ['fill-1']}
+        self.custom['entry_reconciliation'] = proof
+        position = validate_position(self.preflight, self.row)
+        self.assertEqual(position['entry_reconciliation'], proof)
+        strategy = MagicMock()
+        strategy.connectors = {'okx': MagicMock()}
+        strategy.connectors['okx'].get_price_by_type.return_value = Decimal('100')
+        with patch.object(PositionExecutor, 'get_trading_rules', return_value=MagicMock()):
+            restored = PositionExecutor(strategy, self.config)
+        restored.hydrate_planned_position(position, 'sealed')
+        self.assertEqual(restored.get_custom_info()['entry_reconciliation'], proof)
+        proof['filled_base'] = '0'
+        self.assertEqual(restored.get_custom_info()['entry_reconciliation']['filled_base'], '1')
+        position['entry_reconciliation']['filled_base'] = '0'
+        with patch.object(PositionExecutor, 'get_trading_rules', return_value=MagicMock()):
+            changed = PositionExecutor(strategy, self.config)
+        with self.assertRaisesRegex(ValueError, 'terminal entry reconciliation'):
+            changed.hydrate_planned_position(position, 'sealed')
+
+    def test_funded_resume_rejects_missing_or_changed_terminal_proof(self):
+        self.config.require_terminal_entry_reconciliation = True
+        self.row['config'] = json.loads(self.config.model_dump_json())
+        self.preflight['config'] = self.row['config']
+        proof = {'schema': 1, 'source': 'okx_terminal_status_v1', 'order_id': 'entry-1',
+                 'exchange_order_id': 'venue-1', 'trading_pair': 'ETH-USDT', 'side': 'BUY',
+                 'amount': '1', 'filled_base': '1', 'state': 'FILLED', 'trade_ids': ['fill-1']}
+        with self.assertRaisesRegex(ValueError, 'terminal entry reconciliation'):
+            validate_position(self.preflight, self.row)
+        for change in ({'exchange_order_id': 'different'}, {'filled_base': '0'},
+                       {'trade_ids': ['different']}, {'source': 'invented'},
+                       {'source': 'native_paper_terminal_v1'}):
+            self.custom['entry_reconciliation'] = proof | change
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'terminal entry reconciliation'):
+                validate_position(self.preflight, self.row)
+
+    def test_funded_single_attempt_accepts_one_terminal_proof_in_entry_set(self):
+        self.config.require_terminal_entry_reconciliation = True
+        self.config.entry_order_policy = 'single_attempt'
+        self.row['config'] = json.loads(self.config.model_dump_json())
+        self.preflight['config'] = self.row['config']
+        proof = {'schema': 1, 'source': 'okx_terminal_status_v1', 'order_id': 'entry-1',
+                 'exchange_order_id': 'venue-1', 'trading_pair': 'ETH-USDT', 'side': 'BUY',
+                 'amount': '1', 'filled_base': '1', 'state': 'FILLED', 'trade_ids': ['fill-1']}
+        wrapped = {'schema': 1, 'source': 'native_terminal_entry_set_v1', 'orders': [proof]}
+        self.custom['entry_reconciliation'] = wrapped
+        self.assertEqual(validate_position(self.preflight, self.row)['entry_reconciliation'], wrapped)
+        self.custom['entry_reconciliation'] = {**wrapped, 'orders': [proof, proof]}
+        with self.assertRaisesRegex(ValueError, 'terminal entry reconciliation'):
+            validate_position(self.preflight, self.row)
+
 
 async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_pair='ETH-USDT', controller_id='owner'):
     db = tmp_path / 'stopped.sqlite'

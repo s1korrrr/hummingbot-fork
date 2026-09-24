@@ -62,6 +62,16 @@ def capture_native_trailing_view(info, snapshot: NativeSnapshotV2) -> NativeTrai
     if type(state) is not str:
         raise PolicyError('native trailing state required')
     if state in _UNARMED_STATES:
+        try:
+            unarmed = (
+                custom['trailing_stop_trigger_pct'], custom['trailing_trigger_price'],
+                custom['trailing_move_count'], custom['trailing_armed_timestamp'],
+                custom['trailing_last_update_timestamp'])
+        except KeyError as error:
+            raise PolicyError('native trailing projection unavailable') from error
+        if (unarmed[0] is not None or unarmed[1] is not None or type(unarmed[2]) is not int
+                or type(unarmed[2]) is bool or unarmed[2] != 0 or unarmed[3] is not None or unarmed[4] is not None):
+            raise PolicyError('unarmed native trailing state is inconsistent')
         return None
     if state not in _ARMED_STATES:
         raise PolicyError('unsupported native trailing state')

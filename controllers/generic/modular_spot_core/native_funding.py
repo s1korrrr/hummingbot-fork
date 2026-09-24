@@ -468,11 +468,12 @@ class NativeFundingStore:
                                     and getattr(info.config, 'entry_chain_contract', None) is None
                                     and isinstance(legacy_orders, list) and len(legacy_orders) > 1
                                     and (info.custom_info or {}).get('planned_position_resume_compatibility_v1') is None)
-            if defer_legacy_release:
-                if not allow_quiescent_legacy:
-                    raise PolicyError('Unclaimed legacy acquisition chain requires explicit compatibility transition')
-                if quantity != authorized:
-                    raise PolicyError('Legacy acquisition transition requires fully consumed authorization')
+            # Only an explicit quiescent transition retains a legacy multi-order
+            # set unreleased; ordinary reconciliation releases it through the
+            # single-filled-order rule with full per-order checks.
+            defer_legacy_release = defer_legacy_release and allow_quiescent_legacy
+            if defer_legacy_release and quantity != authorized:
+                raise PolicyError('Legacy acquisition transition requires fully consumed authorization')
             chain = None
             if info is not None and getattr(info.config, 'entry_chain_contract', None) == ACQUISITION_CHAIN_V1:
                 # An in-progress parent keeps its entire remaining commitment,
@@ -492,7 +493,7 @@ class NativeFundingStore:
                 projection['pending_by_pair'][info.config.trading_pair] += reserved
         return projection, pending, infos
 
-    def _validate_release(self, info, receipt, quantity, fills, orders, claim):
+    def _validate_release(self, info, receipt, quantity, fills, orders, claim=None):
         if info is None or not isinstance(receipt, dict):
             raise PolicyError('Native terminal reconciliation scope or quantity differs')
         if receipt.get('source') == 'native_terminal_entry_set_v1':
@@ -505,9 +506,15 @@ class NativeFundingStore:
         if getattr(info.config, 'entry_chain_contract', None) == ACQUISITION_CHAIN_V1:
             validate_acquisition_chain(info.config, info.custom_info, proofs)
         elif info.config.entry_order_policy == 'single_attempt' and len(proofs) != 1:
-            if len(proofs) != 2:
-                raise PolicyError('Single-attempt reconciliation contains multiple entry orders')
-            self._legacy_chain_compatibility(info, claim)
+            # A legacy down-only maker intent may replace an unfilled order
+            # (post-only repair, downward reprice); it never replaces after any
+            # fill. A claimed offline migration additionally binds its marker.
+            if (info.custom_info or {}).get('planned_position_resume_compatibility_v1') is not None:
+                self._legacy_chain_compatibility(info, claim)
+            filled = [proof for proof in proofs if isinstance(proof, dict)
+                      and decimal(proof.get('filled_base'), 'terminal entry total') > ZERO]
+            if len(filled) > 1:
+                raise PolicyError('Single-attempt reconciliation contains multiple filled entry orders')
         snapshots = (info.custom_info or {}).get('execution_order_snapshots')
         if not isinstance(snapshots, list):
             raise PolicyError('Native entry order snapshots unavailable')

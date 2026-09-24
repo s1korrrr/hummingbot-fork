@@ -153,8 +153,10 @@ async def assert_explicit_legacy_transition_keeps_claim_unreleased(session, owne
         peer.executors_info = session.recorder.get_executors_by_controller(peer.config.id)
     owner._native_source_hash = 'a' * 64
     upgraded = NativeFundingStore(owner, session.recorder)
-    with pytest.raises(ValueError, match='legacy acquisition chain'):
-        upgraded.plan_binding_transition(old_binding)
+    # Without legacy evidence the plan reconciles normally: the merged
+    # single-filled-order rule releases the legacy set on its own.
+    plain = upgraded.plan_binding_transition(old_binding)
+    assert executor.config.id in plain['state']['releases']
     evidence = dict(executor_id=executor.config.id, order_ids=before['custom_info']['order_ids'], preflight=before)
     proposal = upgraded.plan_binding_transition(old_binding, legacy_evidence=evidence)
     assert proposal['legacy_retained_unreleased']['executor_id'] == executor.config.id
@@ -163,5 +165,8 @@ async def assert_explicit_legacy_transition_keeps_claim_unreleased(session, owne
     _, current = upgraded._load()
     assert current['claims'][executor.config.id] == original_claim
     assert executor.config.id not in current['releases']
-    with pytest.raises(ValueError, match='legacy acquisition chain'):
-        upgraded.reconcile()
+    # Ordinary reconciliation then releases the legacy set under the merged
+    # single-filled-order rule; the transition itself never released it.
+    assert upgraded.reconcile()['released_intents'] == 1
+    _, released = upgraded._load()
+    assert executor.config.id in released['releases']

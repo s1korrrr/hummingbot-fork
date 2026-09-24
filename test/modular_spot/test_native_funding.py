@@ -81,3 +81,31 @@ def test_base_fee_inventory_uses_native_remaining_fee_attribution():
     projected = funding_projection([buy, fill('sell', '2', 'SELL', '.495', '100')], 'okx', 'BTC-USDC')
     assert projected['cash_used'] == D('-9.5')
     assert projected['inventory_cost'] == D('20')
+
+
+def test_single_attempt_release_accepts_post_only_repair_entry_set():
+    """One post-only cancel plus one filled replacement releases under single_attempt.
+
+    Uses the real recorder-backed legacy fixture so every per-order check
+    (snapshot, recorder rows, fees, tracker) runs against complete receipts.
+    """
+    from test.acquisition_chain_v2.test_funding_edges import claim_for, legacy_case
+    store, info, _ = legacy_case(2)
+    assert store.reconcile()['released_intents'] == 1
+    fills = store.recorder.get_trades_for_config('modular.yml')
+    orders = store.recorder.get_orders_for_config_and_market('modular.yml', None)
+    store._validate_release(info, info.custom_info['entry_reconciliation'], D('1'), fills, orders, claim_for(info.config))
+
+
+def test_single_attempt_release_rejects_two_filled_entry_orders():
+    import copy
+    from test.acquisition_chain_v2.test_funding_edges import claim_for, legacy_case
+
+    from controllers.generic.modular_spot_core.domain import PolicyError
+    store, info, _ = legacy_case(2)
+    fills = store.recorder.get_trades_for_config('modular.yml')
+    orders = store.recorder.get_orders_for_config_and_market('modular.yml', None)
+    receipt = copy.deepcopy(info.custom_info['entry_reconciliation'])
+    receipt['orders'][0].update(filled_base='0.5', trade_ids=['ghost'])
+    with pytest.raises(PolicyError, match='multiple filled entry orders'):
+        store._validate_release(info, receipt, D('1.5'), fills, orders, claim_for(info.config))

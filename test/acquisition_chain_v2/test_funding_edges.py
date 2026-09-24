@@ -280,33 +280,30 @@ def legacy_case(child_count):
     return store, info, orders
 
 
-def test_unclaimed_legacy_two_child_chain_requires_explicit_transition():
+def test_unclaimed_legacy_two_child_receipt_releases_under_single_filled_rule():
+    """Legacy rows without the chain contract follow the merged single-filled-order rule."""
     store, info, _ = legacy_case(2)
-    with pytest.raises(PolicyError) as error:
-        store.reconcile()
-    assert str(error.value) == 'Unclaimed legacy acquisition chain requires explicit compatibility transition'
+    status = store.reconcile()
     _, state = store._load()
-    assert state['releases'] == {}
+    assert info.id in state['releases']
+    assert status['released_intents'] == 1
     fills, orders = store.recorder.get_trades_for_config('modular.yml'), store.recorder.get_orders_for_config_and_market('modular.yml', None)
-    with pytest.raises(PolicyError) as direct:
-        store._validate_release(info, info.custom_info['entry_reconciliation'], Decimal('1'), fills, orders,
-                                claim_for(info.config))
-    assert str(direct.value) == 'Legacy acquisition compatibility receipt missing or invalid'
+    store._validate_release(info, info.custom_info['entry_reconciliation'], Decimal('1'), fills, orders,
+                            claim_for(info.config))
 
 
-def test_legacy_three_child_receipt_is_never_a_single_attempt_release():
+def test_legacy_three_child_receipt_releases_with_one_filled_and_rejects_two_filled():
     store, info, _ = legacy_case(3)
-    assert len(info.custom_info['entry_reconciliation']['orders']) == 3
-    with pytest.raises(PolicyError) as error:
-        store.reconcile()
-    assert str(error.value) == 'Unclaimed legacy acquisition chain requires explicit compatibility transition'
-    _, state = store._load()
-    assert state['releases'] == {}
+    receipt = info.custom_info['entry_reconciliation']
+    assert len(receipt['orders']) == 3
+    assert store.reconcile()['released_intents'] == 1
     fills, orders = store.recorder.get_trades_for_config('modular.yml'), store.recorder.get_orders_for_config_and_market('modular.yml', None)
+    store._validate_release(info, receipt, Decimal('1'), fills, orders, claim_for(info.config))
+    two_filled = copy.deepcopy(receipt)
+    two_filled['orders'][0].update(filled_base='0.5', trade_ids=['ghost'])
     with pytest.raises(PolicyError) as direct:
-        store._validate_release(info, info.custom_info['entry_reconciliation'], Decimal('1'), fills, orders,
-                                claim_for(info.config))
-    assert str(direct.value) == 'Single-attempt reconciliation contains multiple entry orders'
+        store._validate_release(info, two_filled, Decimal('1.5'), fills, orders, claim_for(info.config))
+    assert str(direct.value) == 'Single-attempt reconciliation contains multiple filled entry orders'
 
 
 @pytest.mark.parametrize('damage', ['missing', 'null'])

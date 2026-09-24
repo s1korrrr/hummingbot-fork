@@ -190,10 +190,12 @@ def test_source_hash_change_with_held_inventory_still_requires_reconciliation(re
     assert result._recovery_trails == {}
 
 
-@pytest.mark.parametrize('observer_mode', ('source_outage', 'paused'))
+@pytest.mark.parametrize('observer_mode', ('source_outage', 'paused', 'removed_asset'))
 def test_event_observer_hold_does_not_suppress_native_inventory_reduction(recorder, tmp_path, observer_mode):
     """An independent no-order observer cannot replace the native owner's exit path."""
     import asyncio
+    import json
+    from test.cross_venue_events_v2.test_contracts import evidence, snapshot
 
     from controllers.generic.cross_venue_event_v2 import CrossVenueEventV2Config, CrossVenueEventV2Controller
 
@@ -202,6 +204,9 @@ def test_event_observer_hold_does_not_suppress_native_inventory_reduction(record
             return 1780000000
 
     snapshot_path = tmp_path / 'missing-events-v2.json'
+    if observer_mode == 'removed_asset':
+        snapshot_path.write_text(json.dumps(snapshot((evidence(kind='PAIR_REMOVAL',
+                                                               instrument_pair='BTC-USDC'),)).model_dump(mode='json')))
     observer = CrossVenueEventV2Controller(
         CrossVenueEventV2Config(id='events-v2', snapshot_path=str(snapshot_path)), Clock(), asyncio.Queue())
     if observer_mode == 'paused':
@@ -211,7 +216,10 @@ def test_event_observer_hold_does_not_suppress_native_inventory_reduction(record
 
     asyncio.run(observer.update_processed_data())
     assert observer.processed_data['status'] == (
-        'OBSERVER_PAUSED' if observer_mode == 'paused' else 'UNAVAILABLE')
+        'OBSERVER_PAUSED' if observer_mode == 'paused' else
+        'NO_ORDER_OBSERVER_V2' if observer_mode == 'removed_asset' else 'UNAVAILABLE')
+    if observer_mode == 'removed_asset':
+        assert 'negative_event_veto' in observer.processed_data['reasons']
     assert observer.determine_executor_actions() == []
     actions = native_owner.determine_executor_actions()
     assert len(actions) == 1 and actions[0].executor_config.side == TradeType.SELL

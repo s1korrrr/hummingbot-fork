@@ -112,8 +112,11 @@ class ModularSpotControllerConfig(ControllerConfigBase):
         data = dict(values['data'])
         data['symbols'] = []
         values['data'] = data
-        sources = source_records(source_root(), source_files())
-        return identity({'configuration': values, 'sources': sources, 'policy_version': 2})
+        return identity({'configuration': values, 'sources': self.source_manifest(), 'policy_version': 2})
+
+    def source_manifest(self):
+        """Source records bound into the decision fingerprint; a binding module extends this closure."""
+        return source_records(source_root(), source_files())
 
     def update_markets(self, markets):
         return markets.add_or_update(self.connector_name, self.trading_pair)
@@ -143,10 +146,14 @@ class ModularSpotController(ControllerBase):
 
     def __init__(self, config: ModularSpotControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.runtime = ModularRuntime(self)
+        self.runtime = ModularRuntime(self, bindings=self._runtime_bindings())
         self._operator_entry_paused = False
         self._operator_state = {'entry_paused': False, 'reason': None, 'scope': None,
                                 'updated_at': None, 'last_command_id': None}
+
+    def _runtime_bindings(self):
+        """Native effect bindings for the runtime; None selects the deployment defaults."""
+        return None
 
     def set_operator_entry_pause(self, enabled, *, reason=None, scope=None, command_id=None, updated_at=None):
         if type(enabled) is not bool:
@@ -192,6 +199,7 @@ class ModularSpotController(ControllerBase):
         self.runtime.start_data()
         market = self.runtime.observe()
         self.processed_data = {'modular_status': self.runtime.reason,
+                               'data_health': {'ready': market is not None, 'reason': self.runtime.reason},
                                'candle_open': None if market is None else market.candle_open,
                                'execution_enabled': self.config.execution_enabled,
                                'acquisition_enabled': self.config.acquisition_enabled,

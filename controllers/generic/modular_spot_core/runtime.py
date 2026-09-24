@@ -85,7 +85,9 @@ class ModularRuntime:
                     max_age=c.max_candle_age_seconds, compute=compute)
                 self.input_identity = snapshot.digest
             else:
-                frame = p.get_candles_df(c.connector_name, c.trading_pair, c.interval, c.max_records)
+                # A research binding may read public candles under a separate owner namespace.
+                frame = p.get_candles_df(getattr(c, 'candles_connector', None) or c.connector_name,
+                                         c.trading_pair, c.interval, c.max_records)
                 self.market = compute(frame)
                 closed = frame.loc[frame.timestamp + c.interval_seconds() <= now,
                                    ['timestamp', 'open', 'high', 'low', 'close', 'volume']]

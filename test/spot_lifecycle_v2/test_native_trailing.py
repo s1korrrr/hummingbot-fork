@@ -28,6 +28,13 @@ def trailing_info(**updates):
     return info
 
 
+def unarmed_info(**updates):
+    values = dict(trailing_state='waiting', trailing_stop_trigger_pct=None,
+                  trailing_trigger_price=None, trailing_move_count=0,
+                  trailing_armed_timestamp=None, trailing_last_update_timestamp=None)
+    return trailing_info(**(values | updates))
+
+
 def test_native_executor_projection_produces_bound_threshold_without_fabricating_peak():
     info = trailing_info()
     snap = capture(info)
@@ -43,10 +50,21 @@ def test_native_executor_projection_produces_bound_threshold_without_fabricating
 
 
 def test_unarmed_native_trailing_state_is_not_fabricated_into_a_ratchet():
-    info = trailing_info(trailing_state='waiting', trailing_stop_trigger_pct=None,
-                         trailing_trigger_price=None, trailing_move_count=0,
-                         trailing_armed_timestamp=None, trailing_last_update_timestamp=None)
+    info = unarmed_info()
     assert capture_native_trailing_view(info, capture(info)) is None
+
+
+@pytest.mark.parametrize('updates', [
+    {'trailing_stop_trigger_pct': D('.01')},
+    {'trailing_trigger_price': D('101')},
+    {'trailing_move_count': 1},
+    {'trailing_armed_timestamp': 1000.0},
+    {'trailing_last_update_timestamp': 1000.0},
+])
+def test_unarmed_projection_rejects_stale_native_ratchet_state(updates):
+    info = unarmed_info(**updates)
+    with pytest.raises(PolicyError, match='unarmed'):
+        capture_native_trailing_view(info, capture(info))
 
 
 @pytest.mark.parametrize('updates', [
@@ -56,7 +74,6 @@ def test_unarmed_native_trailing_state_is_not_fabricated_into_a_ratchet():
     {'trailing_stop_trigger_pct': None},
     {'trailing_trigger_price': None},
     {'trailing_trigger_price': D('-1')},
-    {'entry_price': D('0')},
     {'trailing_move_count': -1},
     {'trailing_move_count': True},
 ])

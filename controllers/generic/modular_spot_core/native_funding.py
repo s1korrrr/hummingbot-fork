@@ -11,10 +11,11 @@ from typing import Literal
 
 from pydantic import Field
 from sqlalchemy import update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.model.metadata import Metadata
+from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1, validate_acquisition_chain
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator, PositionHold
 
 from .config import PolicyModel
@@ -80,7 +81,8 @@ def funding_projection(fills, connector, pair):
         key = identity([fill.market, fill.order_id, str(fill.exchange_trade_id)])
         if key in fingerprints:
             raise ValueError('Duplicate native funding fill')
-        fingerprints[key] = identity(json.loads(json.dumps([fill.config_file_path, fill.timestamp, record, fill.trade_fee], default=str)))
+        fingerprints[key] = identity(json.loads(json.dumps(
+            [fill.config_file_path, fill.timestamp, record, fill.trade_fee], default=str)))
         if fill.trade_type == 'BUY':
             by_order[fill.order_id] = by_order.get(fill.order_id, ZERO) + amount
         position.add_order_record(record)
@@ -98,6 +100,12 @@ def funding_projection(fills, connector, pair):
 
 def _config_identity(config, controller_id):
     payload = config.model_dump(mode='json')
+    # The V2 opt-in field did not exist in historical down-only executor
+    # payloads. Its default None is not a change to that immutable intent.
+    # A concrete V2 contract remains part of the hash.
+    if (getattr(config, 'entry_acquisition_policy', None) == 'down_only_maker_v1'
+            and payload.get('entry_chain_contract') is None):
+        payload.pop('entry_chain_contract', None)
     if payload.get('controller_id') not in (None, '', 'main', controller_id):
         raise PolicyError('Funding executor owner differs')
     payload['controller_id'] = controller_id
@@ -226,7 +234,8 @@ class NativeFundingStore:
                     session.add(Metadata(key=self.key, value=encoded))
                     session.flush()
                 else:
-                    result = session.execute(update(Metadata).where(Metadata.key == self.key, Metadata.value == raw).values(value=encoded))
+                    result = session.execute(update(Metadata).where(Metadata.key == self.key,
+                                             Metadata.value == raw).values(value=encoded))
                     if result.rowcount != 1:
                         return False
                 # Immutable admission facts and fill hashes, not another native
@@ -242,7 +251,102 @@ class NativeFundingStore:
         except IntegrityError:
             return False
 
-    def _evidence(self, state, raw, *, reconcile=False):
+    def _legacy_chain_compatibility(self, info, claim):
+        """Verify an explicit, claimed offline migration of one old BTC chain.
+
+        The marker is only a pointer. The claimed planned-resume manifest binds
+        original and resume configs, every native child, and the closed chain.
+        No legacy order set is inferred or upgraded from its shape alone.
+        """
+        marker = (info.custom_info or {}).get('planned_position_resume_compatibility_v1')
+        fields = {'schema', 'kind', 'manifest_id', 'executor_id', 'original_config_sha256',
+                  'resume_config_sha256', 'acquisition_chain_sha256', 'entry_order_ids'}
+        if (not isinstance(marker, dict) or set(marker) != fields
+                or type(marker['schema']) is not int or marker['schema'] != 1
+                or marker['kind'] != 'legacy_single_post_only_repair_v1'
+                or marker['executor_id'] != info.id
+                or not isinstance(marker['manifest_id'], str) or not marker['manifest_id']
+                or not isinstance(marker['entry_order_ids'], list)
+                or len(marker['entry_order_ids']) != 2
+                or len(set(marker['entry_order_ids'])) != 2
+                or any(not isinstance(value, str) or not re.fullmatch('[a-f0-9]{64}', value)
+                       for value in (marker['original_config_sha256'], marker['resume_config_sha256'],
+                                     marker['acquisition_chain_sha256']))
+                or not isinstance(claim, dict)):
+            raise PolicyError('Legacy acquisition compatibility receipt missing or invalid')
+        try:
+            with self.recorder.sql_manager.get_new_session() as session:
+                row = session.connection().exec_driver_sql(
+                    'SELECT state, payload FROM PlannedPositionResume WHERE id=?',
+                    (marker['manifest_id'],)).fetchone()
+        except SQLAlchemyError as error:
+            raise PolicyError('Legacy acquisition compatibility manifest is unavailable') from error
+        if row is None or row[0] != 'claimed':
+            raise PolicyError('Legacy acquisition compatibility manifest is not claimed')
+        try:
+            manifest = json.loads(row[1])
+            positions = [position for position in manifest['positions'] if position['executor_id'] == info.id]
+            current_reference = (info.custom_info or {}).get('planned_position_resume')
+            if manifest['id'] != marker['manifest_id'] or len(positions) != 1 or not current_reference:
+                raise ValueError('manifest identity')
+            position = positions[0]
+            if current_reference != manifest['id']:
+                # Later handovers reference their own claimed manifest while the
+                # immutable compatibility bridge remains anchored to the first.
+                with self.recorder.sql_manager.get_new_session() as session:
+                    current_row = session.connection().exec_driver_sql(
+                        'SELECT state, payload FROM PlannedPositionResume WHERE id=?',
+                        (current_reference,)).fetchone()
+                if current_row is None or current_row[0] != 'claimed':
+                    raise ValueError('current handover is not claimed')
+                current_manifest = json.loads(current_row[1])
+                current_positions = [row for row in current_manifest['positions'] if row['executor_id'] == info.id]
+                if current_manifest['id'] != current_reference or len(current_positions) != 1:
+                    raise ValueError('current handover identity')
+                current_position = current_positions[0]
+                if (current_position.get('planned_position_resume_compatibility_v1') != marker
+                        or current_position.get('entry_orders') != position['entry_orders']
+                        or current_position.get('entry_reconciliation') != position['entry_reconciliation']
+                        or current_position.get('acquisition_chain') != position['acquisition_chain']
+                        or current_position.get('resume_config', current_position['config']) != position['resume_config']):
+                    raise ValueError('current handover compatibility archive differs')
+            old_raw, resume_raw = position['config'], position['resume_config']
+            chain = position['acquisition_chain']
+            if (identity(old_raw) != marker['original_config_sha256']
+                    or identity(resume_raw) != marker['resume_config_sha256']
+                    or identity(chain) != marker['acquisition_chain_sha256']
+                    or [child['order_id'] for child in chain['children']] != marker['entry_order_ids']
+                    or chain['children'][1]['purpose'] != 'post_only_repair'
+                    or (info.custom_info or {}).get('entry_reconciliation') != position['entry_reconciliation']):
+                raise ValueError('manifest evidence')
+            from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
+            original = parse_position_config(old_raw)
+            resume = parse_position_config(resume_raw)
+            expected_resume = original.model_dump(mode='json')
+            expected_resume['entry_chain_contract'] = ACQUISITION_CHAIN_V1
+            if (resume.model_dump(mode='json') != expected_resume
+                    or getattr(original, 'entry_chain_contract', None) is not None
+                    or getattr(resume, 'entry_chain_contract', None) != ACQUISITION_CHAIN_V1
+                    or _config_identity(original, info.controller_id) != claim['config']
+                    or _config_identity(info.config, info.controller_id) not in {
+                        _config_identity(original, info.controller_id),
+                        _config_identity(resume, info.controller_id)}):
+                raise ValueError('configuration transition')
+            snapshots = position['entry_orders']
+            current_snapshots = (info.custom_info or {}).get('execution_order_snapshots')
+            if (not isinstance(snapshots, list) or not isinstance(current_snapshots, list)
+                    or any(not isinstance(item, dict) for item in current_snapshots)
+                    or [item for item in current_snapshots if item.get('trade_type') == 'BUY'] != snapshots
+                    or snapshots[0].get('cancel_source') != '31'):
+                raise ValueError('native order archive')
+            compatible_info = dict(info.custom_info or {}, acquisition_chain=chain,
+                                   execution_order_snapshots=snapshots)
+            validate_acquisition_chain(resume, compatible_info, position['entry_reconciliation'])
+            return marker
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError, json.JSONDecodeError, SQLAlchemyError) as error:
+            raise PolicyError('Legacy acquisition compatibility manifest differs') from error
+
+    def _evidence(self, state, raw, *, reconcile=False, allow_quiescent_legacy=False):
         config = self.owner.config
         if self.policy.scope == 'strategy':
             bind_funding_scope(self.owners)
@@ -261,7 +365,14 @@ class NativeFundingStore:
                 seen.add(info.id)
                 previous = infos.get(info.id)
                 if previous is not None and _config_identity(previous.config, info.controller_id) != _config_identity(info.config, info.controller_id):
-                    raise PolicyError('Saved/current native executor configuration conflict')
+                    if not (getattr(previous.config, 'entry_acquisition_policy', None) == 'down_only_maker_v1'
+                            and getattr(info.config, 'entry_acquisition_policy', None) == 'down_only_maker_v1'
+                            and (previous.custom_info or {}).get('planned_position_resume_compatibility_v1')
+                            and (info.custom_info or {}).get('planned_position_resume_compatibility_v1')):
+                        raise PolicyError('Saved/current native executor configuration conflict')
+                    claim = state['claims'].get(info.id)
+                    self._legacy_chain_compatibility(previous, claim)
+                    self._legacy_chain_compatibility(info, claim)
                 infos[info.id] = info
         fills = self.recorder.get_trades_for_config(self.recorder.config_file_path)
         connector = self.owner.market_data_provider.connectors[config.connector_name]
@@ -276,8 +387,13 @@ class NativeFundingStore:
                 raise PolicyError('Foreign native executor scope in funding recorder')
             if cfg.side == TradeType.BUY:
                 claim = state['claims'].get(info.id)
-                if claim is None or claim['config'] != _config_identity(cfg, info.controller_id):
+                if claim is None:
                     raise PolicyError('Native BUY lacks immutable funding admission')
+                if claim['config'] != _config_identity(cfg, info.controller_id):
+                    if not ((info.custom_info or {}).get('planned_position_resume_compatibility_v1')
+                            and getattr(cfg, 'entry_acquisition_policy', None) == 'down_only_maker_v1'):
+                        raise PolicyError('Native BUY lacks immutable funding admission')
+                    self._legacy_chain_compatibility(info, claim)
             for _, _, order_id in ExecutorOrchestrator._owned_order_keys(info):
                 if order_id in owned and owned[order_id] != info.id:
                     raise PolicyError('Native order has ambiguous funding owner')
@@ -345,18 +461,38 @@ class NativeFundingStore:
                     projection['pending_by_pair'][pair] += reserved
                 continue
             receipt = (info.custom_info or {}).get('entry_reconciliation') if info is not None else None
-            if released is not None or (reconcile and receipt is not None):
-                self._validate_release(info, receipt, quantity, fills, orders)
+            legacy_orders = (receipt.get('orders') if isinstance(receipt, dict)
+                             and receipt.get('source') == 'native_terminal_entry_set_v1' else None)
+            defer_legacy_release = (info is not None
+                                    and getattr(info.config, 'entry_acquisition_policy', None) == 'down_only_maker_v1'
+                                    and getattr(info.config, 'entry_chain_contract', None) is None
+                                    and isinstance(legacy_orders, list) and len(legacy_orders) > 1
+                                    and (info.custom_info or {}).get('planned_position_resume_compatibility_v1') is None)
+            if defer_legacy_release:
+                if not allow_quiescent_legacy:
+                    raise PolicyError('Unclaimed legacy acquisition chain requires explicit compatibility transition')
+                if quantity != authorized:
+                    raise PolicyError('Legacy acquisition transition requires fully consumed authorization')
+            chain = None
+            if info is not None and getattr(info.config, 'entry_chain_contract', None) == ACQUISITION_CHAIN_V1:
+                # An in-progress parent keeps its entire remaining commitment,
+                # even when the previous child is terminal and the next child
+                # has been authorized but has no exchange order ID yet.
+                chain = validate_acquisition_chain(info.config, info.custom_info, receipt, require_closed=False)
+            if released is not None or (reconcile and receipt is not None and not defer_legacy_release
+                                        and (chain is None or chain['membership_closed'])):
+                self._validate_release(info, receipt, quantity, fills, orders, state['claims'][executor_id])
                 if released is not None and released != receipt:
                     raise PolicyError('Native terminal reconciliation changed after funding release')
                 state['releases'][executor_id] = receipt
             else:
-                reserved = (authorized - quantity) * decimal(claim['price'], 'funded price') * (1 + self.policy.fee_reserve_fraction)
+                reserved = (authorized - quantity) * \
+                    decimal(claim['price'], 'funded price') * (1 + self.policy.fee_reserve_fraction)
                 pending += reserved
                 projection['pending_by_pair'][info.config.trading_pair] += reserved
         return projection, pending, infos
 
-    def _validate_release(self, info, receipt, quantity, fills, orders):
+    def _validate_release(self, info, receipt, quantity, fills, orders, claim):
         if info is None or not isinstance(receipt, dict):
             raise PolicyError('Native terminal reconciliation scope or quantity differs')
         if receipt.get('source') == 'native_terminal_entry_set_v1':
@@ -366,8 +502,12 @@ class NativeFundingStore:
             proofs = receipt['orders']
         else:
             proofs = [receipt]
-        if info.config.entry_order_policy == 'single_attempt' and len(proofs) != 1:
-            raise PolicyError('Single-attempt reconciliation contains multiple entry orders')
+        if getattr(info.config, 'entry_chain_contract', None) == ACQUISITION_CHAIN_V1:
+            validate_acquisition_chain(info.config, info.custom_info, proofs)
+        elif info.config.entry_order_policy == 'single_attempt' and len(proofs) != 1:
+            if len(proofs) != 2:
+                raise PolicyError('Single-attempt reconciliation contains multiple entry orders')
+            self._legacy_chain_compatibility(info, claim)
         snapshots = (info.custom_info or {}).get('execution_order_snapshots')
         if not isinstance(snapshots, list):
             raise PolicyError('Native entry order snapshots unavailable')
@@ -382,7 +522,8 @@ class NativeFundingStore:
                     or decimal(snapshot.get('amount'), 'native submitted amount', positive=True)
                     != decimal(proof.get('amount'), 'terminal submitted amount', positive=True)):
                 raise PolicyError('Native terminal entry snapshot differs')
-            self._validate_order_release(info, proof, decimal(proof['filled_base'], 'terminal fill total'), fills, orders)
+            self._validate_order_release(info, proof, decimal(
+                proof['filled_base'], 'terminal fill total'), fills, orders)
 
     def _validate_order_release(self, info, receipt, quantity, fills, orders):
         fields = {'schema', 'source', 'order_id', 'exchange_order_id', 'trading_pair',
@@ -403,6 +544,26 @@ class NativeFundingStore:
                 or sum((fill.amount_decimal for fill in rows), ZERO) != quantity
                 or receipt['trade_ids'] != sorted(str(fill.exchange_trade_id) for fill in rows)):
             raise PolicyError('Native terminal reconciliation trade coverage differs')
+        snapshots = (info.custom_info or {}).get('execution_order_snapshots') or []
+        native = [item for item in snapshots if isinstance(item, dict) and item.get('client_order_id') == order_id]
+        if len(native) != 1:
+            raise PolicyError('Native terminal entry snapshot is unavailable or ambiguous')
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder
+        order = InFlightOrder.from_json(native[0])
+        base, quote = info.config.trading_pair.split('-')
+        for fill in rows:
+            trade = order.order_fills.get(str(fill.exchange_trade_id))
+            if (trade is None or trade.fill_base_amount != fill.amount_decimal
+                    or trade.fill_price != fill.price_decimal
+                    or trade.fill_quote_amount != fill.amount_decimal * fill.price_decimal
+                    or trade.fee.to_json() != fill.trade_fee):
+                raise PolicyError('Native terminal entry fill or fee differs from recorder')
+            valued_fee = sum((decimal(fee.amount, 'actual entry fee') *
+                              (trade.fill_price if fee.token == base else Decimal('1'))
+                              for fee in trade.fee.flat_fees if fee.token in (base, quote)), ZERO)
+            if (len(trade.fee.flat_fees) != sum(fee.token in (base, quote) for fee in trade.fee.flat_fees)
+                    or trade.fee.percent != ZERO or valued_fee != fill.trade_fee_in_quote_decimal):
+                raise PolicyError('Native terminal entry valued fee differs from recorder')
         mode = self.owner.config.execution_mode
         source = receipt['source']
         rejected = source == 'okx_submission_rejected_v1'
@@ -420,6 +581,19 @@ class NativeFundingStore:
                              or recorded_order.symbol != receipt['trading_pair']
                              or recorded_order.market != self.owner.config.connector_name):
             raise PolicyError('Native recorded order conflicts with terminal funding release')
+        if getattr(info.config, 'entry_chain_contract', None) == ACQUISITION_CHAIN_V1:
+            if rejected:
+                if (recorded_order is not None
+                        and (recorded_order.last_status != 'OrderFailure'
+                             or recorded_order.exchange_order_id not in (None, '')
+                             or recorded_order.symbol != receipt['trading_pair']
+                             or recorded_order.market != self.owner.config.connector_name)):
+                    raise PolicyError('Native recorded child status conflicts with terminal funding release')
+            else:
+                expected_statuses = ({'OrderCancelled', 'OrderCanceled'} if receipt['state'] == 'CANCELED'
+                                     else {'BuyOrderCompleted'})
+                if recorded_order.last_status not in expected_statuses:
+                    raise PolicyError('Native recorded child status conflicts with terminal funding release')
         # Terminal proof seals a single native submission. A later changed fill
         # is a contradiction and blocks new risk; exits continue independently.
         tracker = self.owner.market_data_provider.connectors[self.owner.config.connector_name]._order_tracker
@@ -428,10 +602,10 @@ class NativeFundingStore:
                                     or tracked.exchange_order_id != receipt['exchange_order_id']):
             raise PolicyError('Native tracker conflicts with terminal funding release')
 
-    def plan_binding_transition(self, expected_binding):
+    def plan_binding_transition(self, expected_binding, *, legacy_evidence=None):
         """Read-only proposal; never called by automatic entry admission."""
         from .native_funding_transition import plan_transition
-        return plan_transition(self, expected_binding)
+        return plan_transition(self, expected_binding, legacy_evidence=legacy_evidence)
 
     def apply_binding_transition(self, transition_id):
         """Explicit maintenance operation, requiring an unchanged reviewed plan."""
@@ -489,6 +663,10 @@ class NativeFundingStore:
         if (executor_config.side != TradeType.BUY or executor_config.type != 'position_executor'
                 or executor_config.connector_name != config.connector_name or executor_config.trading_pair != config.trading_pair):
             raise PolicyError('Unsupported funded acquisition')
+        if (getattr(self.owner, '_native_family', None) == 'ok_rsi'
+                and getattr(executor_config, 'entry_acquisition_policy', None) == 'down_only_maker_v1'
+                and getattr(executor_config, 'entry_chain_contract', None) != ACQUISITION_CHAIN_V1):
+            raise PolicyError('V2 bounded acquisition funding contract is unavailable')
         amount = decimal(executor_config.amount, 'candidate acquisition', positive=True)
         price = decimal(executor_config.entry_price, 'candidate limit price', positive=True)
         order_type = executor_config.triple_barrier_config.open_order_type

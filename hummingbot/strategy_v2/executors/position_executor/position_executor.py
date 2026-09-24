@@ -1,5 +1,7 @@
 import asyncio
 import copy
+import hashlib
+import json
 import logging
 import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
@@ -23,6 +25,7 @@ from hummingbot.core.event.events import (
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1, validate_acquisition_chain
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
@@ -227,6 +230,7 @@ class PositionExecutor(ExecutorBase):
         self._trailing_floor_hold: bool = False
         self._resume_entry_sealed = False
         self._planned_resume_id = None
+        self._planned_resume_compatibility = None
         self._resume_conflicting_fill = None
         self._entry_submitted: bool = False
         self._entry_stop_reason: Optional[str] = None
@@ -246,19 +250,70 @@ class PositionExecutor(ExecutorBase):
         """Restore the original terminal receipt; caller must atomically claim before start."""
         if self.status != RunnableStatus.NOT_STARTED or self._open_order is not None:
             raise ValueError("Position must be new and unstarted before hydration")
-        if self.config != parse_position_config(position["config"]):
+        resume_config = position.get("resume_config", position["config"])
+        if self.config != parse_position_config(resume_config):
             raise ValueError("Planned position configuration differs")
-        order = InFlightOrder.from_json(position["entry"])
-        if order.current_state != OrderState.FILLED or order.executed_amount_base != order.amount:
-            raise ValueError("Planned position entry must be fully filled")
-        terminal_receipt = validate_planned_entry_reconciliation(
-            self.config, order, position.get("entry_reconciliation"))
-        self._open_order = TrackedOrder(order_id=order.client_order_id)
-        self._open_order.order = order
+        chain = position.get("acquisition_chain")
+        if isinstance(chain, dict):
+            if self.config.entry_chain_contract != ACQUISITION_CHAIN_V1:
+                raise ValueError("Planned acquisition chain configuration differs")
+            orders = [InFlightOrder.from_json(row) for row in position.get("entry_orders", [])]
+            if not orders or orders[-1].client_order_id != position["entry"]["client_order_id"]:
+                raise ValueError("Planned acquisition chain entry order differs")
+            if (orders[-1].current_state != OrderState.FILLED
+                    or orders[-1].executed_amount_base != orders[-1].amount
+                    or orders[-1].amount != self.config.amount
+                    or any(order.current_state != OrderState.CANCELED or order.executed_amount_base != 0
+                           for order in orders[:-1])):
+                raise ValueError("Planned acquisition chain must be zero-fill cancellations followed by one full fill")
+            custom = {
+                "acquisition_chain": chain,
+                "execution_order_snapshots": [order.to_json() for order in orders],
+                "order_ids": [order.client_order_id for order in orders],
+                "entry_acquisition": {
+                    "intent_id": self.config.id,
+                    "policy": self.config.entry_acquisition_policy,
+                    "order_ids": [order.client_order_id for order in orders],
+                },
+            }
+            validate_acquisition_chain(self.config, custom, position.get("entry_reconciliation"), require_closed=True)
+            if any(order.trade_type is not TradeType.BUY for order in orders):
+                raise ValueError("Planned acquisition chain may contain BUY children only")
+            tracked = []
+            for order in orders:
+                item = TrackedOrder(order_id=order.client_order_id)
+                item.order = order
+                tracked.append(item)
+            self._completed_open_orders = tracked[:-1]
+            self._open_order = tracked[-1]
+            self._entry_reconciliation = copy.deepcopy(position.get("entry_reconciliation"))
+        else:
+            order = InFlightOrder.from_json(position["entry"])
+            if order.current_state != OrderState.FILLED or order.executed_amount_base != order.amount:
+                raise ValueError("Planned position entry must be fully filled")
+            terminal_receipt = validate_planned_entry_reconciliation(
+                self.config, order, position.get("entry_reconciliation"))
+            self._open_order = TrackedOrder(order_id=order.client_order_id)
+            self._open_order.order = order
+            self._entry_reconciliation = terminal_receipt
         self._resume_entry_sealed = True
         self._planned_resume_id = manifest_id
+        self._planned_resume_compatibility = copy.deepcopy(position.get("planned_position_resume_compatibility_v1"))
+        if self._planned_resume_compatibility is None and position.get("legacy_transition"):
+            chain = position["acquisition_chain"]
+            self._planned_resume_compatibility = {
+                "schema": 1, "kind": "legacy_single_post_only_repair_v1",
+                "manifest_id": manifest_id, "executor_id": self.config.id,
+                "original_config_sha256": position["legacy_transition"]["original_config_sha256"],
+                "resume_config_sha256": hashlib.sha256(
+                    json.dumps(position["resume_config"], sort_keys=True, separators=(",", ":"),
+                               allow_nan=False).encode()).hexdigest(),
+                "acquisition_chain_sha256": hashlib.sha256(
+                    json.dumps(chain, sort_keys=True, separators=(",", ":"),
+                               allow_nan=False).encode()).hexdigest(),
+                "entry_order_ids": [child["order_id"] for child in chain["children"]],
+            }
         self._entry_submitted = True
-        self._entry_reconciliation = terminal_receipt
         self._entry_lifecycle = {"state": "managing_fill", "stop_reason": "planned_resume_sealed_entry"}
         trailing = position["trailing"]
         trigger = trailing["trailing_stop_trigger_pct"]
@@ -1196,11 +1251,14 @@ class PositionExecutor(ExecutorBase):
             else:
                 task.cancel()
 
+    def _entry_cancel_observed(self):
+        return self._entry_lifecycle.get("cancel_event_timestamp") is not None
+
     async def _reconcile_expired_entry(self):
         if (self.config.entry_order_policy == "single_attempt" and self._open_order
                 and self._open_order.order
                 and (self._open_order.order.is_cancelled
-                     or self._entry_lifecycle.get("cancel_event_timestamp") is not None)
+                     or self._entry_cancel_observed())
                 and not self._open_order_expiry_reconciled):
             self._open_order_entry_expired = True
             self._end_entry_acquisition("exchange_canceled")
@@ -1216,7 +1274,7 @@ class PositionExecutor(ExecutorBase):
                 return
             orders = self._entry_orders()
             cancel_observed = (self.config.entry_order_policy == "single_attempt"
-                               and self._entry_lifecycle.get("cancel_event_timestamp") is not None)
+                               and self._entry_cancel_observed())
             if orders and (all(tracked.is_done for tracked in orders) or cancel_observed):
                 self._entry_expiry_reconciliation_task = asyncio.create_task(
                     self._request_expired_entry_reconciliation(orders))
@@ -1273,8 +1331,11 @@ class PositionExecutor(ExecutorBase):
             if proof is not None:
                 reconciled.append(copy.deepcopy(proof))
         if len(orders) == len(reconciled) and reconciled:
-            self._entry_reconciliation = (reconciled[0] if len(reconciled) == 1 else
-                                          {'schema': 1, 'source': 'native_terminal_entry_set_v1', 'orders': reconciled})
+            self._store_entry_reconciliation(orders, reconciled)
+
+    def _store_entry_reconciliation(self, orders, reconciled):
+        self._entry_reconciliation = (reconciled[0] if len(reconciled) == 1 else
+                                      {'schema': 1, 'source': 'native_terminal_entry_set_v1', 'orders': reconciled})
 
     async def _reconcile_funding_entries(self):
         """Opt-in shutdown proof; native exits keep running while reads are pending."""
@@ -1825,6 +1886,7 @@ class PositionExecutor(ExecutorBase):
         trailing_snapshot = self._trailing_status_snapshot()
         custom_info = {
             "planned_position_resume": self._planned_resume_id,
+            "planned_position_resume_compatibility_v1": copy.deepcopy(self._planned_resume_compatibility),
             "resume_entry_sealed": self._resume_entry_sealed,
             "resume_conflicting_fill": self._resume_conflicting_fill,
             "level_id": level_id,

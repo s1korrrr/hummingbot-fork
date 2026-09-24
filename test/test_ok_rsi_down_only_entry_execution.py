@@ -1003,7 +1003,13 @@ async def test_operator_pause_partial_fill_ack_keeps_managing_fill_owner():
 
     prices[PriceType.BestBid] = Decimal("102")
     prices[PriceType.BestAsk] = Decimal("102.01")
-    executor.control_trailing_stop()
+    # This test exercises pause/ownership, not SQLite durability. Supply the
+    # successful recorder boundary; checkpoint failure has its own native test.
+    recorder = MagicMock()
+    with patch("hummingbot.strategy_v2.executors.position_executor.position_executor.MarketsRecorder.get_instance",
+               return_value=recorder):
+        executor.control_trailing_stop()
+    recorder.store_or_update_executor.assert_called_once_with(executor)
 
     assert executor._open_order is owner
     assert executor.open_filled_amount == Decimal("0.4")

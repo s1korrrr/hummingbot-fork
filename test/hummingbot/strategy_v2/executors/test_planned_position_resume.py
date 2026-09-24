@@ -59,6 +59,67 @@ class ResumeValidationTests(TestCase):
         self.preflight = {**self.row, 'status': 2, 'close_type': None, 'is_active': 1,
                           'custom_info': {**self.custom, 'held_position_orders': []}}
 
+    def test_prepare_scopes_legacy_transition_to_named_executor_in_mixed_manifest(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in ('conf/scripts', 'conf/controllers', 'conf/connectors'):
+                (root / path).mkdir(parents=True, exist_ok=True)
+            (root / 'conf/scripts/owner.yml').write_text(
+                'script_file_name: v2_with_controllers.py\ncontrollers_config: [legacy.yml, singleton.yml]\n')
+            (root / 'conf/controllers/legacy.yml').write_text(
+                'id: legacy-owner\nconnector_name: okx\ntrading_pair: ETH-USDT\n')
+            (root / 'conf/controllers/singleton.yml').write_text(
+                'id: singleton-owner\nconnector_name: okx\ntrading_pair: BTC-USDT\n')
+            for path in ('conf/conf_client.yml', 'conf/connectors/okx.yml'):
+                (root / path).write_text('fixture: true\n')
+            evidence = {
+                'schema': 1, 'owner_stopped': True, 'venue_open_orders': [],
+                'observed_at': 1000, 'expires_at': 1800, 'owner': 'test-owner',
+                'script_config': 'owner.yml',
+                'config_paths': ['conf/scripts/owner.yml', 'conf/controllers/legacy.yml',
+                                 'conf/controllers/singleton.yml', 'conf/conf_client.yml',
+                                 'conf/connectors/okx.yml'],
+                'executors': [{'executor_id': 'legacy', 'entry_reconciliation': {'source': 'legacy-proof'}},
+                              {'executor_id': 'singleton'}],
+                'reconciliation': {'controller_pairs': {'legacy-owner': 'ETH-USDT',
+                                                        'singleton-owner': 'BTC-USDT'}},
+            }
+            db, preflight = root / 'stopped.sqlite', root / 'preflight.sqlite'
+            for path, status in ((db, 4), (preflight, 2)):
+                with sqlite3.connect(path) as connection:
+                    connection.execute('CREATE TABLE Executors (id TEXT, controller_id TEXT, timestamp REAL, '
+                                       'config TEXT, custom_info TEXT, type TEXT, status INTEGER, is_active INTEGER, '
+                                       'close_type TEXT)')
+                    connection.execute('CREATE TABLE "Order" (id TEXT, config_file_path TEXT)')
+                    for executor_id, controller_id in (('legacy', 'legacy-owner'),
+                                                       ('singleton', 'singleton-owner')):
+                        connection.execute('INSERT INTO Executors VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                           (executor_id, controller_id, 100, '{}', '{}', 'position_executor',
+                                            status, int(status == 2), None if status == 2 else 'POSITION_HOLD'))
+                        connection.execute('INSERT INTO "Order" VALUES (?, ?)', (f'{executor_id}-entry', 'owner.yml'))
+            calls = []
+
+            def validate_position(
+                    _before, after, *, allow_legacy_post_only_repair_transition=False, terminal_proofs=None):
+                calls.append((after['id'], allow_legacy_post_only_repair_transition, terminal_proofs))
+                return {'executor_id': after['id'], 'controller_id': after['controller_id'],
+                        'entry': {'client_order_id': f"{after['id']}-entry"},
+                        'entry_reconciliation': {'source': f"{after['id']}-proof"},
+                        'acquisition_chain': {'children': []} if allow_legacy_post_only_repair_transition else None}
+
+            with patch.object(resume, 'validate_reconciliation'), \
+                    patch.object(resume, 'bound_files', return_value={}), \
+                    patch.object(resume, 'validate_position', side_effect=validate_position), \
+                    patch.object(resume, 'validate_receipts', return_value={}):
+                manifest = resume.prepare(db, preflight, evidence, now=1000, root=root,
+                                          legacy_transition_executor_ids=('legacy',))
+            self.assertEqual([(row[0], row[1]) for row in calls], [('legacy', True), ('singleton', False)])
+            self.assertEqual([position['executor_id'] for position in manifest['positions']],
+                             ['legacy', 'singleton'])
+
     def test_valid_terminal_receipt_preserves_original_config(self):
         result = validate_position(self.preflight, self.row)
         self.assertEqual(result['config']['timestamp'], 100)
@@ -88,6 +149,37 @@ class ResumeValidationTests(TestCase):
         self.custom['trailing_armed_timestamp'] = None
         with self.assertRaisesRegex(ValueError, 'trailing'):
             validate_position(self.preflight, self.row)
+
+    def test_trailing_high_water_cannot_regress_after_preflight(self):
+        before = {'trailing_state': 'armed', 'trailing_stop_trigger_pct': '.04',
+                  'trailing_move_count': 3, 'trailing_armed_timestamp': 110,
+                  'trailing_last_update_timestamp': 120}
+        lowered = before | {'trailing_stop_trigger_pct': '.03'}
+        with self.assertRaisesRegex(ValueError, 'high-water regressed'):
+            resume._validate_trailing_evolution(self.config, before, lowered)
+        waiting = {'trailing_state': 'waiting', 'trailing_stop_trigger_pct': None,
+                   'trailing_move_count': 0, 'trailing_armed_timestamp': None,
+                   'trailing_last_update_timestamp': None}
+        with self.assertRaisesRegex(ValueError, 'state regressed'):
+            resume._validate_trailing_evolution(self.config, before, waiting)
+
+    def test_trailing_high_water_can_advance_after_preflight(self):
+        before = {'trailing_state': 'armed', 'trailing_stop_trigger_pct': '.04',
+                  'trailing_move_count': 3, 'trailing_armed_timestamp': 110,
+                  'trailing_last_update_timestamp': 120}
+        advanced = before | {'trailing_stop_trigger_pct': '.05', 'trailing_move_count': 4,
+                             'trailing_last_update_timestamp': 130}
+        self.assertEqual(resume._validate_trailing_evolution(self.config, before, advanced), advanced)
+        impossible = advanced | {'trailing_move_count': 3}
+        with self.assertRaisesRegex(ValueError, 'move count disagree'):
+            resume._validate_trailing_evolution(self.config, before, impossible)
+        waiting = {'trailing_state': 'waiting', 'trailing_stop_trigger_pct': None,
+                   'trailing_move_count': 0, 'trailing_armed_timestamp': None,
+                   'trailing_last_update_timestamp': None}
+        armed = {'trailing_state': 'armed', 'trailing_stop_trigger_pct': '.02',
+                 'trailing_move_count': 1, 'trailing_armed_timestamp': 115,
+                 'trailing_last_update_timestamp': 115}
+        self.assertEqual(resume._validate_trailing_evolution(self.config, waiting, armed), armed)
 
     def test_funded_resume_retains_stopped_terminal_entry_proof(self):
         self.config.require_terminal_entry_reconciliation = True
@@ -145,6 +237,67 @@ class ResumeValidationTests(TestCase):
         with self.assertRaisesRegex(ValueError, 'terminal entry reconciliation'):
             validate_position(self.preflight, self.row)
 
+    def test_legacy_post_only_repair_transition_requires_exact_persisted_lifecycle(self):
+        from test.test_ok_rsi_down_only_entry_execution import make_config
+
+        config = make_config(id='legacy-chain', controller_id='owner', timestamp=100,
+                             trading_pair='ETH-USDT', entry_chain_contract=None,
+                             triple_barrier_config=TripleBarrierConfig(
+                                 trailing_stop=TrailingStop(activation_price=Decimal('.05'),
+                                                            trailing_delta=Decimal('.02')),
+                                 open_order_type=OrderType.LIMIT_MAKER))
+        predecessor = InFlightOrder('entry-old', 'ETH-USDT', OrderType.LIMIT_MAKER, TradeType.BUY,
+                                    Decimal('1'), 100, Decimal('100'), exchange_order_id='venue-old')
+        predecessor.current_state = OrderState.CANCELED
+        predecessor.cancel_source = 31
+        final = InFlightOrder('entry-new', 'ETH-USDT', OrderType.LIMIT_MAKER, TradeType.BUY,
+                              Decimal('1'), 100, Decimal('100'), exchange_order_id='venue-new')
+        final.update_with_trade_update(TradeUpdate('fill-new', 'entry-new', 'venue-new', 'ETH-USDT', 101,
+                                                   Decimal('100'), Decimal('1'), Decimal('100'), AddedToCostTradeFee()))
+        final.current_state = OrderState.FILLED
+        old_ids = ['entry-old', 'entry-new']
+        custom = {
+            'order_ids': old_ids,
+            'execution_order_snapshots': [predecessor.to_json(), final.to_json()],
+            'entry_acquisition': {'intent_id': config.id, 'policy': 'down_only_maker_v1',
+                                  'order_ids': old_ids, 'reprice_count': 1},
+            'entry_lifecycle': {'cancel_source': '31', 'replacement_purpose': 'post_only_repair',
+                                'replacement_of_order_id': 'entry-old', 'order_id': 'entry-new',
+                                'reprice_count': 1, 'cancel_event_timestamp': 200},
+            'held_position_orders': [final.to_json()],
+            'remaining_position_amount_base': '1', 'open_order_filled_amount_base': '1',
+            'open_order_filled_amount_quote': '100', 'close_order_filled_amount_base': '0',
+            'exit_trigger_reason': None, 'trailing_state': 'waiting', 'trailing_stop_trigger_pct': None,
+            'trailing_move_count': 0, 'trailing_armed_timestamp': None, 'trailing_last_update_timestamp': None,
+        }
+        row = {'id': config.id, 'controller_id': config.controller_id, 'timestamp': config.timestamp,
+               'config': json.loads(config.model_dump_json()), 'custom_info': custom,
+               'type': 'position_executor', 'status': 4, 'is_active': 0,
+               'close_type': CloseType.POSITION_HOLD.value}
+        before = {**row, 'status': 2, 'is_active': 1, 'close_type': None,
+                  'custom_info': json.loads(json.dumps(custom))}
+        result = resume.validate_legacy_post_only_repair_transition(before, row)
+        self.assertEqual(result['acquisition_chain']['children'][1]['predecessor_id'], 'entry-old')
+        self.assertEqual(result['resume_config']['entry_chain_contract'], resume.ACQUISITION_CHAIN_V1)
+        self.assertEqual(result['entry_child_lifecycles'], {})
+        terminal = {'schema': 1, 'source': 'native_terminal_entry_set_v1', 'orders': [
+            {'schema': 1, 'source': 'okx_terminal_status_v1', 'order_id': 'entry-old',
+             'exchange_order_id': 'venue-old', 'trading_pair': 'ETH-USDT', 'side': 'BUY',
+             'amount': '1', 'filled_base': '0', 'state': 'CANCELED', 'trade_ids': []},
+            {'schema': 1, 'source': 'okx_terminal_status_v1', 'order_id': 'entry-new',
+             'exchange_order_id': 'venue-new', 'trading_pair': 'ETH-USDT', 'side': 'BUY',
+             'amount': '1', 'filled_base': '1', 'state': 'FILLED', 'trade_ids': ['fill-new']},
+        ]}
+        with self.assertRaisesRegex(ValueError, 'singleton'):
+            validate_position(before, row)
+        resumed = validate_position(before, row, allow_legacy_post_only_repair_transition=True,
+                                    terminal_proofs=terminal)
+        self.assertEqual(resumed['config'], row['config'])
+        self.assertEqual(resumed['resume_config']['entry_chain_contract'], resume.ACQUISITION_CHAIN_V1)
+        row['custom_info']['entry_lifecycle']['cancel_source'] = '1'
+        with self.assertRaisesRegex(ValueError, 'source-31'):
+            resume.validate_legacy_post_only_repair_transition(before, row)
+
 
 async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_pair='ETH-USDT', controller_id='owner'):
     db = tmp_path / 'stopped.sqlite'
@@ -175,6 +328,36 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
         return result
 
     executor._open_order = pair_tracked('entry', TradeType.BUY, '1', OrderState.FILLED)
+    if getattr(executor.config, 'entry_chain_contract', None) == resume.ACQUISITION_CHAIN_V1:
+        predecessor = pair_tracked('entry-old', TradeType.BUY, '0', OrderState.CANCELED)
+        predecessor.order.order_type = OrderType.LIMIT_MAKER
+        predecessor.order.price = Decimal('100')
+        predecessor.order.exchange_order_id = 'venue-old'
+        predecessor.order.cancel_source = 31
+        executor._open_order.order.order_type = OrderType.LIMIT_MAKER
+        executor._completed_open_orders = [predecessor]
+        executor._entry_reprice_count = 1
+        executor._entry_stop_reason = 'fully_acquired'
+        executor._entry_chain_children = [
+            {'generation': 0, 'order_id': 'entry-old', 'predecessor_id': None, 'purpose': 'initial',
+             'submitted_base': '1', 'limit_price': '100'},
+            {'generation': 1, 'order_id': 'entry', 'predecessor_id': 'entry-old',
+             'purpose': 'post_only_repair', 'submitted_base': '1', 'limit_price': '100'},
+        ]
+        executor._entry_lifecycle.update(state='managing_fill', order_id='entry', generation=1)
+        executor._entry_child_lifecycles = {
+            'entry-old': {'cancel_source': 31, 'replacement_purpose': 'post_only_repair'}}
+        terminal = []
+        for tracked_order in (predecessor, executor._open_order):
+            order = tracked_order.order
+            terminal.append({'schema': 1, 'source': 'okx_terminal_status_v1',
+                             'order_id': order.client_order_id, 'exchange_order_id': order.exchange_order_id,
+                             'trading_pair': trading_pair, 'side': 'BUY', 'amount': str(order.amount),
+                             'filled_base': str(order.executed_amount_base),
+                             'state': 'CANCELED' if order.current_state is OrderState.CANCELED else 'FILLED',
+                             'trade_ids': sorted(str(key) for key in order.order_fills)})
+        executor._entry_reconciliation = {
+            'schema': 1, 'source': 'native_terminal_entry_set_v1', 'orders': terminal}
     if armed:
         executor._trailing_stop_trigger_pct = Decimal('.035')
         executor._trailing_stop_move_count = 4
@@ -195,6 +378,12 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
         recorder.store_or_update_position_hold_ledger_entries(controller_id, 'other-executor', 'okx', trading_pair, [unrelated])
     with manager.get_new_session() as session:
         receipts = [executor._held_position_orders[0]] + ([unrelated] if Decimal(unrelated_amount) else [])
+        if getattr(executor.config, 'entry_chain_contract', None) == resume.ACQUISITION_CHAIN_V1:
+            session.add(Order(id='entry-old', config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
+                              symbol=trading_pair, base_asset='ETH', quote_asset=trading_pair.split('-')[1],
+                              creation_timestamp=1000, order_type='LIMIT', amount=Decimal('1'), leverage=1,
+                              price=Decimal('100'), last_status='OrderCancelled', last_update_timestamp=2000,
+                              exchange_order_id='venue-old', position='NIL'))
         for receipt in receipts:
             oid = receipt['client_order_id']
             session.add(Order(id=oid, config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
@@ -248,6 +437,16 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
                                                                 'fee': '0', 'feeCcy': 'ETH'}],
                                                  'receipt': {'blockers': []},
                                                  'local_fill_comparisons': [{'matched': True}]}]}]}
+    if getattr(executor.config, 'entry_chain_contract', None) == resume.ACQUISITION_CHAIN_V1:
+        proof = evidence['executors'][0]
+        proof['entry_reconciliation'] = executor.get_custom_info()['entry_reconciliation']
+        proof['child_fills'] = {'entry': proof['fills']}
+        selected = evidence['reconciliation']['selected_executors'][0]
+        selected['venue_orders'].insert(0, {
+            'raw_order': {'clOrdId': 'entry-old', 'ordId': 'venue-old', 'instId': trading_pair,
+                          'side': 'buy', 'state': 'canceled', 'tdMode': 'cash', 'sz': '1', 'accFillSz': '0'},
+            'raw_fills': [], 'receipt': {'blockers': []}, 'local_fill_comparisons': [],
+        })
     return db, preflight, root, recorder, executor, evidence
 
 

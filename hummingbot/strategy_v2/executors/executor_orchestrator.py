@@ -423,7 +423,7 @@ class ExecutorOrchestrator:
         instances = []
         required_base = {}
         for position in manifest["positions"]:
-            config = parse_position_config(position["config"])
+            config = parse_position_config(position.get("resume_config", position["config"]))
             controller = self.strategy.controllers.get(position["controller_id"])
             if (controller is None or position["controller_id"] in self.initial_positions_by_controller
                     or config.connector_name not in self.strategy.connectors

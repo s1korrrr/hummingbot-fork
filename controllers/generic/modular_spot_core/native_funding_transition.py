@@ -18,7 +18,8 @@ from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrche
 from .domain import PolicyError, identity
 
 NATIVE_TABLES = ('Executors', 'Order', 'OrderStatus', 'OrderExact', 'TradeFill',
-                 'TradeFillExact', 'Position', 'PositionHoldLedger', 'MarketState')
+                 'TradeFillExact', 'Position', 'PositionHoldLedger', 'MarketState',
+                 'PlannedPositionResume')
 
 
 def _json(value):
@@ -123,7 +124,54 @@ def _check_persisted_submissions(store, session, infos, orders, connector):
                 raise PolicyError('Funding transition terminal fill or fee differs from native recorder')
 
 
-def _proposal(store, session, expected_binding):
+def _legacy_evidence(view, session, evidence, infos, orders):
+    """Attest one explicitly selected old fully filled repair while retaining its claim."""
+    if (not isinstance(evidence, dict) or set(evidence) != {'executor_id', 'order_ids', 'preflight'}
+            or not isinstance(evidence['executor_id'], str) or not evidence['executor_id']
+            or not isinstance(evidence['order_ids'], list) or len(evidence['order_ids']) != 2
+            or len(set(evidence['order_ids'])) != 2
+            or not isinstance(evidence['preflight'], dict)):
+        raise PolicyError('Funding legacy transition requires one exact reviewed executor and preflight')
+    executor_id = evidence['executor_id']
+    info = next((item for item in infos if item.id == executor_id), None)
+    if info is None or info.is_active or info.is_trading:
+        raise PolicyError('Funding legacy transition executor is not quiescent')
+    row = session.connection().exec_driver_sql('SELECT * FROM Executors WHERE id=?', (executor_id,)).mappings().first()
+    if row is None:
+        raise PolicyError('Funding legacy transition executor row is missing')
+    from hummingbot.strategy_v2.executors.planned_position_resume import (
+        decode_row,
+        validate_legacy_post_only_repair_transition,
+    )
+    from hummingbot.strategy_v2.models.executors import CloseType
+    preflight, stopped = decode_row(evidence['preflight']), decode_row(dict(row))
+    if (preflight.get('id') != executor_id or preflight.get('status') != 2
+            or not preflight.get('is_active') or preflight.get('close_type') is not None
+            or stopped.get('status') != 4 or stopped.get('is_active')
+            or stopped.get('close_type') != CloseType.POSITION_HOLD.value):
+        raise PolicyError('Funding legacy transition requires exact running-to-held evidence')
+    transition = validate_legacy_post_only_repair_transition(preflight, stopped)
+    chain = transition['acquisition_chain']
+    child_ids = [child['order_id'] for child in chain['children']]
+    if child_ids != evidence['order_ids']:
+        raise PolicyError('Funding legacy transition reviewed child ids differ')
+    receipt = (info.custom_info or {}).get('entry_reconciliation')
+    if (not isinstance(receipt, dict) or receipt.get('source') != 'native_terminal_entry_set_v1'
+            or receipt.get('schema') != 1 or len(receipt.get('orders', [])) != 2
+            or [proof.get('order_id') for proof in receipt['orders']] != child_ids):
+        raise PolicyError('Funding legacy transition terminal child proof set differs')
+    fills = view.recorder.get_trades_for_config(view.recorder.config_file_path)
+    for proof in receipt['orders']:
+        quantity = sum((fill.amount_decimal for fill in fills if fill.order_id == proof['order_id']), 0)
+        view._validate_order_release(info, proof, quantity, fills, orders)
+    return {'executor_id': executor_id, 'order_ids': child_ids,
+            'preflight_sha256': identity(preflight), 'stopped_sha256': identity(stopped),
+            'original_config_sha256': identity(stopped['config']),
+            'resume_config_sha256': identity(transition['resume_config']),
+            'acquisition_chain_sha256': identity(chain), 'terminal_proofs_sha256': identity(receipt)}
+
+
+def _proposal(store, session, expected_binding, legacy_evidence=None):
     if not isinstance(expected_binding, str) or expected_binding == store.binding:
         raise PolicyError('Funding transition requires the exact previous binding')
     from .native_funding import NativeFundingStore
@@ -146,7 +194,18 @@ def _proposal(store, session, expected_binding):
            for order in orders):
         raise PolicyError('Funding transition requires terminal native order records')
     _check_persisted_submissions(view, session, infos, orders, connector)
-    projection, pending, _ = view._evidence(state, raw, reconcile=True)
+    legacy = (_legacy_evidence(view, session, legacy_evidence, infos, orders)
+              if legacy_evidence is not None else None)
+    projection, pending, _ = view._evidence(
+        state, raw, reconcile=legacy is None, allow_quiescent_legacy=legacy is not None)
+    if legacy is not None:
+        unresolved = [info.id for info in infos if info.config.side.name == 'BUY'
+                      and isinstance((info.custom_info or {}).get('entry_reconciliation'), dict)
+                      and (info.custom_info or {})['entry_reconciliation'].get('source') == 'native_terminal_entry_set_v1'
+                      and len((info.custom_info or {})['entry_reconciliation'].get('orders', [])) > 1
+                      and info.id not in state['releases']]
+        if unresolved != [legacy['executor_id']]:
+            raise PolicyError('Funding legacy transition has other unresolved acquisition chains')
     if pending != projection['legacy_uncertain_quote']:
         raise PolicyError('Funding transition retains unresolved commitments; reconcile terminal evidence first')
     if (projection['used'] + pending > store.policy.allocation_quote
@@ -162,16 +221,18 @@ def _proposal(store, session, expected_binding):
                 'inventory_cost': str(projection['inventory_cost']), 'cash_used': str(projection['cash_used']),
                 'pending_quote': str(pending), 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
                 'available_quote': str(store.policy.allocation_quote - projection['used'] - pending)}
+    if legacy is not None:
+        proposal['legacy_retained_unreleased'] = legacy
     proposal['transition_id'] = identity(proposal)
     return proposal
 
 
-def plan_transition(store, expected_binding):
+def plan_transition(store, expected_binding, *, legacy_evidence=None):
     with store.recorder.sql_manager.get_new_session() as session:
         session.connection().exec_driver_sql('BEGIN')
-        proposal = _proposal(store, session, expected_binding)
+        proposal = _proposal(store, session, expected_binding, legacy_evidence)
     plans = getattr(store, '_binding_transition_plans', {})
-    plans[proposal['transition_id']] = expected_binding
+    plans[proposal['transition_id']] = (expected_binding, legacy_evidence)
     store._binding_transition_plans = plans
     return proposal
 
@@ -189,10 +250,11 @@ def apply_transition(store, transition_id):
                     or header is None or json.loads(header.value).get('binding') != store.binding):
                 raise PolicyError('Funding transition receipt conflicts with current identity')
             return receipt
-        expected = getattr(store, '_binding_transition_plans', {}).get(transition_id)
-        if expected is None:
+        planned = getattr(store, '_binding_transition_plans', {}).get(transition_id)
+        if planned is None:
             raise PolicyError('Funding transition plan unavailable; prepare and review again')
-        proposal = _proposal(store, session, expected)
+        expected, legacy_evidence = planned if isinstance(planned, tuple) else (planned, None)
+        proposal = _proposal(store, session, expected, legacy_evidence)
         if proposal['transition_id'] != transition_id:
             raise PolicyError('Funding transition plan is stale; native evidence or audit changed')
         state = proposal['state']

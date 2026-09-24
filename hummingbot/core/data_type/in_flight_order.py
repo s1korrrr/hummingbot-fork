@@ -63,6 +63,9 @@ class TradeUpdate(NamedTuple):
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]):
+        is_taker = data.get("is_taker", True)
+        if type(is_taker) is not bool:
+            raise ValueError("TradeUpdate is_taker must be a boolean")
         instance = TradeUpdate(
             trade_id=data["trade_id"],
             client_order_id=data["client_order_id"],
@@ -73,6 +76,7 @@ class TradeUpdate(NamedTuple):
             fill_base_amount=Decimal(data["fill_base_amount"]),
             fill_quote_amount=Decimal(data["fill_quote_amount"]),
             fee=TradeFeeBase.from_json(data["fee"]),
+            is_taker=is_taker,
         )
 
         return instance

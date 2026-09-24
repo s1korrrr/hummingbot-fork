@@ -103,3 +103,53 @@ class ModularSpotResearchPaperTests(IsolatedAsyncioTestCase):
                 self.assertNotIn('duplicate', restored.controllers[OWNER].runtime.reason)
             finally:
                 await restored.close()
+
+    async def _rest_entry(self, session, frames):
+        await session.step(600000, books=[dict(**BOOK, sequence=2, timestamp=600000)], candles=[candle(frames[0], 600000)])
+        receipt = await session.step(600060, books=[dict(**BOOK, sequence=3, timestamp=600060)], candles=[candle(frames[1], 600060)])
+        self.assertEqual(len(receipt['actions']), 1)
+        return session.executor_orchestrator.active_executors[OWNER][0]
+
+    @staticmethod
+    def _extend(frame, close=96.0):
+        last = frame.iloc[-1]
+        row = dict(timestamp=int(last.timestamp) + 60, open=close, high=close + .1, low=close - .1, close=close, volume=10.0)
+        return pd.concat([frame, pd.DataFrame([row])], ignore_index=True)
+
+    async def test_resting_entry_outlives_new_candles_until_its_own_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [research_config(acquisition={'entry_timeout_seconds': 240})], Path(directory) / 'paper.sqlite')
+            frames = rebound_frames()
+            try:
+                executor = await self._rest_entry(session, frames)
+                frame = frames[1]
+                for index in range(2, 5):
+                    frame = self._extend(frame)
+                    now = 600000 + 60 * index
+                    await session.step(now, books=[dict(**BOOK, sequence=2 + index, timestamp=now)], candles=[candle(frame, now)])
+                    self.assertIsNone(executor._entry_stop_reason, session.controllers[OWNER].runtime.reason)
+                    self.assertEqual(len(session._connector.in_flight_orders), 1)
+                fill = await session.step(600241, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600241,
+                                                               side=TradeType.SELL, price=D('94.99'), amount=D('2'))])
+                self.assertEqual(session._connector.get_balance('BTC'), D('1.04'))
+                self.assertGreater(fill['reports'][OWNER]['executors'][0].filled_amount_quote, 0)
+                frame = self._extend(frame)
+                await session.step(600360, books=[dict(**BOOK, sequence=9, timestamp=600360)], candles=[candle(frame, 600360)])
+                self.assertEqual(len(session._connector.in_flight_orders), 0)
+            finally:
+                await session.close()
+
+    async def test_revised_decision_candle_revokes_the_resting_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [research_config(acquisition={'entry_timeout_seconds': 240})], Path(directory) / 'paper.sqlite')
+            frames = rebound_frames()
+            try:
+                executor = await self._rest_entry(session, frames)
+                revised = self._extend(frames[1])
+                revised.loc[revised.index[-2], 'close'] = 95.5  # the decision candle now reads differently
+                await session.step(600120, books=[dict(**BOOK, sequence=4, timestamp=600120)], candles=[candle(revised, 600120)])
+                self.assertEqual(executor._entry_stop_reason, 'modular_entry_permission_revoked')
+                self.assertEqual(session.controllers[OWNER].runtime.reason, 'entry_input_revision_changed')
+                self.assertEqual(len(session._connector.in_flight_orders), 0)
+            finally:
+                await session.close()

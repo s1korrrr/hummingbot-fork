@@ -34,6 +34,7 @@ class ModularRuntime:
         self.feature_implementation = sha256(Path(__file__).with_name("market.py").read_bytes()).hexdigest()
         self.store = self.budget = self.selection_store = None
         self.market = self.input_identity = None
+        self.closed_rows = {}
         self.pending, self.pending_inputs = {}, {}
         self.dispatched = set()
         self.fault = None
@@ -65,9 +66,30 @@ class ModularRuntime:
                                           metadata_model=self.bindings.metadata_model)
         return self.store
 
+    def decision_inputs(self, candle_open):
+        """Digests of the closed candles a decision at `candle_open` consumed, keyed by open time."""
+        return {stamp: digest for stamp, digest in self.closed_rows.items() if stamp <= candle_open}
+
+    def inputs_revised(self, recorded):
+        """True when the candles a pending entry decided on no longer read the same.
+
+        `recorded` is the `decision_inputs` mapping stored at proposal time; the current
+        view is `decision_inputs(recorded candle)`. Later candles are new observations, not
+        revisions: a resting entry outlives them until its own timeout.
+        """
+        if not isinstance(recorded, dict) or 'candle' not in recorded or 'rows' not in recorded:
+            return True
+        current = self.decision_inputs(recorded['candle'])
+        rows = recorded['rows']
+        if any(stamp not in rows for stamp in current):
+            return True  # a backfilled candle the decision never saw
+        # Candles that scrolled out of the bounded window cannot be re-read; only re-readable ones count.
+        return any(current[stamp] != digest for stamp, digest in rows.items() if stamp in current)
+
     def observe(self):
         c, p = self.controller.config, self.controller.market_data_provider
         self.market = self.input_identity = None
+        self.closed_rows = {}
         try:
             now = p.time()
 
@@ -84,14 +106,18 @@ class ModularRuntime:
                     initialization='closed-bar-complete-window', now=now,
                     max_age=c.max_candle_age_seconds, compute=compute)
                 self.input_identity = snapshot.digest
+                frame = snapshot.frame(now=now, max_age=c.max_candle_age_seconds)
             else:
                 # A research binding may read public candles under a separate owner namespace.
                 frame = p.get_candles_df(getattr(c, 'candles_connector', None) or c.connector_name,
                                          c.trading_pair, c.interval, c.max_records)
                 self.market = compute(frame)
-                closed = frame.loc[frame.timestamp + c.interval_seconds() <= now,
-                                   ['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-                self.input_identity = identity(pd.util.hash_pandas_object(closed, index=False).astype(str).tolist())
+            closed = frame.loc[frame.timestamp + c.interval_seconds() <= now,
+                               ['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            self.closed_rows = dict(zip(closed.timestamp.astype(int).tolist(),
+                                        pd.util.hash_pandas_object(closed, index=False).astype(str).tolist()))
+            if c.data.mode != 'shared':
+                self.input_identity = identity(list(self.closed_rows.values()))
             self.reason = 'observed' if c.execution_enabled else 'execution_disabled'
         except ERRORS as exc:
             self.reason = f'market_unavailable:{type(exc).__name__}:{exc}'
@@ -236,7 +262,8 @@ class ModularRuntime:
         try:
             if c.fingerprint() != self.fingerprint:
                 raise PolicyError('implementation/configuration changed')
-            if self.observe() is None:
+            market = self.observe()
+            if market is None:
                 return []
             allowed = self.acquisition_permitted()
             permission_reason = self.reason
@@ -271,7 +298,7 @@ class ModularRuntime:
                                          metadata_model=self.bindings.metadata_model)
             freezer.freeze(executor_id=config.id, trading_pair=c.trading_pair, policy_hash=self.fingerprint)
             self.pending[config.id] = config.model_copy(deep=True)
-            self.pending_inputs[config.id] = self.input_identity
+            self.pending_inputs[config.id] = dict(candle=market.candle_open, rows=self.decision_inputs(market.candle_open))
             return [self.bindings.action(c.id, config)]
         except DataUnavailable as exc:
             self.reason = f'data_hold:{exc}'
@@ -306,7 +333,7 @@ class ModularRuntime:
                 return False
             if self.observe() is None or not self.acquisition_permitted():
                 return False
-            if self.pending_inputs.get(config.id) != self.input_identity:
+            if self.inputs_revised(self.pending_inputs.get(config.id)):
                 self.reason = 'entry_input_revision_changed'
                 return False
             assessment = risk_update(c.risk, budget=c.total_amount_quote, pnl=snapshot['pnl'], day=int(now // 86400),

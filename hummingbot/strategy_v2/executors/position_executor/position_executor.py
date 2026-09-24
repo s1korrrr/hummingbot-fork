@@ -34,6 +34,46 @@ from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 
+def validate_planned_entry_reconciliation(config: PositionExecutorConfig, order: InFlightOrder, receipt: Dict) -> Optional[Dict]:
+    """Seal only the stopped executor's terminal proof for a fully filled entry."""
+    error = "Planned terminal entry reconciliation differs from the sealed entry"
+    if receipt is None:
+        if config.require_terminal_entry_reconciliation:
+            raise ValueError(error)
+        return None
+    if not isinstance(receipt, dict):
+        raise ValueError(error)
+    if receipt.get("source") == "native_terminal_entry_set_v1":
+        if (set(receipt) != {"schema", "source", "orders"} or type(receipt["schema"]) is not int
+                or receipt["schema"] != 1 or not isinstance(receipt["orders"], list)
+                or len(receipt["orders"]) != 1):
+            raise ValueError(error)
+        proof = receipt["orders"][0]
+    else:
+        proof = receipt
+    fields = {"schema", "source", "order_id", "exchange_order_id", "trading_pair",
+              "side", "amount", "filled_base", "state", "trade_ids"}
+    if not isinstance(proof, dict) or set(proof) != fields or type(proof["schema"]) is not int or proof["schema"] != 1:
+        raise ValueError(error)
+    try:
+        amount = Decimal(str(proof["amount"]))
+        filled = Decimal(str(proof["filled_base"]))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError(error) from None
+    expected_source = {"okx": "okx_terminal_status_v1",
+                       "okx_paper_trade": "native_paper_terminal_v1"}.get(config.connector_name)
+    if (not amount.is_finite() or not filled.is_finite() or amount <= 0
+            or expected_source is None or proof["source"] != expected_source
+            or proof["state"] != "FILLED" or proof["side"] != "BUY"
+            or proof["order_id"] != order.client_order_id
+            or proof["exchange_order_id"] != order.exchange_order_id
+            or proof["trading_pair"] != config.trading_pair
+            or amount != order.amount or filled != order.executed_amount_base
+            or proof["trade_ids"] != sorted(str(key) for key in order.order_fills)):
+        raise ValueError(error)
+    return copy.deepcopy(receipt)
+
+
 class PositionExecutor(ExecutorBase):
     _logger = None
 
@@ -211,11 +251,14 @@ class PositionExecutor(ExecutorBase):
         order = InFlightOrder.from_json(position["entry"])
         if order.current_state != OrderState.FILLED or order.executed_amount_base != order.amount:
             raise ValueError("Planned position entry must be fully filled")
+        terminal_receipt = validate_planned_entry_reconciliation(
+            self.config, order, position.get("entry_reconciliation"))
         self._open_order = TrackedOrder(order_id=order.client_order_id)
         self._open_order.order = order
         self._resume_entry_sealed = True
         self._planned_resume_id = manifest_id
         self._entry_submitted = True
+        self._entry_reconciliation = terminal_receipt
         self._entry_lifecycle = {"state": "managing_fill", "stop_reason": "planned_resume_sealed_entry"}
         trailing = position["trailing"]
         trigger = trailing["trailing_stop_trigger_pct"]

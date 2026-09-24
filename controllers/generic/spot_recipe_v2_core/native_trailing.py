@@ -37,11 +37,12 @@ def _timestamp(value, name):
 
 
 def capture_native_trailing_view(info, snapshot: NativeSnapshotV2) -> NativeTrailingViewV2 | None:
-    """Bind the native PositionExecutor trailing projection to the exact execution snapshot.
+    """Bind PositionExecutor's persisted ratchet threshold to the exact execution snapshot.
 
     The executor remains the only trailing owner. Unarmed state returns ``None`` rather than
-    inventing a threshold. Once armed, the native trigger price is the ratchet threshold and the
-    corresponding peak is reconstructed from the executor's own entry-price/delta representation.
+    inventing a threshold. PositionExecutor persists the trigger/threshold but not its historical
+    peak, so the adapter reports that peak as unavailable instead of reconstructing unsupported
+    evidence. The threshold is the native value that actually gates the executor's trailing exit.
     """
     snapshot = checked_snapshot(snapshot)
     recaptured = capture_native_snapshot(
@@ -65,31 +66,26 @@ def capture_native_trailing_view(info, snapshot: NativeSnapshotV2) -> NativeTrai
     if state not in _ARMED_STATES:
         raise PolicyError('unsupported native trailing state')
     try:
-        delta = _decimal(custom['trailing_delta_pct'], 'trailing delta', positive=True)
+        _decimal(custom['trailing_delta_pct'], 'trailing delta', positive=True)
         _decimal(custom['trailing_stop_trigger_pct'], 'trailing trigger')
         threshold = _decimal(custom['trailing_trigger_price'], 'trailing trigger price', positive=True)
-        entry = _decimal(custom['entry_price'], 'entry price', positive=True)
-        average = _decimal(custom['current_position_average_price'], 'position average price', positive=True)
         move_count = custom['trailing_move_count']
         armed_at = custom['trailing_armed_timestamp']
         updated_at = custom['trailing_last_update_timestamp']
     except KeyError as error:
         raise PolicyError('native trailing projection unavailable') from error
-    if average != entry:
-        raise PolicyError('native trailing entry price projection is inconsistent')
-    if type(move_count) is not int or type(move_count) is bool or move_count < 1:
+    if type(move_count) is not int or type(move_count) is bool or move_count < 0:
         raise PolicyError('native trailing move count is invalid')
-    _timestamp(armed_at, 'trailing armed timestamp')
-    _timestamp(updated_at, 'trailing update timestamp')
-    if float(updated_at) < float(armed_at):
+    armed_at = _timestamp(armed_at, 'trailing armed timestamp')
+    updated_at = _timestamp(updated_at, 'trailing update timestamp')
+    if updated_at < armed_at:
         raise PolicyError('native trailing update clock regressed')
-    peak = threshold + entry * delta
     return NativeTrailingViewV2(
         owner_id=snapshot.scope.owner_id,
         executor_id=snapshot.scope.executor_id,
         receipt_sha256=snapshot.receipt_sha256,
         observed_at_ms=snapshot.observed_at_ms,
         activated=True,
-        peak_price=peak,
+        peak_price=None,
         threshold_price=threshold,
         exit_owner='native_executor')

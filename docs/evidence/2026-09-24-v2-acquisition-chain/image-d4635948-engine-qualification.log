@@ -1,0 +1,17 @@
+........................................................................ [ 16%]
+................................................................... [ 31%]
+........................................................................ [ 47%]
+......................................................... [ 60%]
+........................................................................ [ 76%]
+.......................................................................................................                            [100%]
+=============================== warnings summary ===============================
+test/acquisition_chain_v2/test_native_chain_funding.py: 144 warnings
+test/acquisition_chain_v2/test_paper_lifecycle_restart.py: 812 warnings
+test/modular_spot/test_funding_transition.py: 108 warnings
+test/modular_spot/test_strategy_funding_scope.py: 108 warnings
+test/hummingbot/strategy_v2/paper/test_paper_funding.py: 900 warnings
+test/modular_spot/test_native_composition.py: 156 warnings
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+443 passed, 2228 warnings, 34 subtests passed in 195.87s (0:03:15)
+34 passed, 4 warnings in 3.75s

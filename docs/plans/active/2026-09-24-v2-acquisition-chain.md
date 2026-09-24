@@ -106,3 +106,14 @@ No other source change. Legacy single-attempt behaviour verified unchanged.
 Static checks: `flake8` and `isort --check-only` clean on the three changed source files and six new test/script files; `git diff --check` clean.
 
 Still open: live cutover evidence (fresh venue receipts for every child of the held BTC position, WAL-consistent backup, legacy funding transition review, manifest preparation, image qualification, controlled restart with the trailing high-water reset accepted). Hold alerting (push a Telegram alert on `entry_admission` blocked or `reconciliation_required`) remains a recommended follow-up outside this candidate.
+
+
+## Live cutover, 24 September 13:42-13:44 UTC (executed)
+
+Authorized by the user after a parallel session had stopped `execution-rsi` at 12:43:35 UTC with a plain SIGTERM (exit 143, no native strict stop, three RUNNING rows, no open venue orders). Coordination: that session held all live actions from 12:5x UTC and deferred the restart to this one.
+
+Source: hummingbot master `ac5571987` (this branch merged with PR #84; chain contract kept, legacy single-attempt sets follow the single-filled-order rule), root main `ff0935dd` then `ea23f725` (chain-aware `recovery_reconcile.py` with `--legacy-transition-executor-id` and an OKX fills-history fallback for orders older than three days, `v2_recovery.py` forwarding legacy ids, `seal_stopped_owner.py`). Image `sha256:7329dedbe38bbf7b527d587fde0f00837580b4a4da7a11786eb012c615277f82` (base `b1d0865f…` plus the qualified modules and tools; engine seal `78536457…`; 193 in-image tests, 443+34 engine tests on the same module set, kill matrix pass). The seal tool used live carried one later fix (event loop binding, `ea23f725`) mounted over the image copy; it is not part of the launch identity.
+
+Sequence and receipts (`~/.local/share/rsibot-stack-v2/recovery/v2-chain-20260924/receipts/`): precheck and backups while running (12:41-12:42Z); dead-owner seal of ETH `7YsZ…`, BTC `59Np…`, BTC chain `AUDG…` with GET-only venue proof against the 12:43:30Z preflight whose table content matched the dead database exactly (13:42:20Z); upgrade receipt; venue evidence `EVIDENCE_COMPLETE` (13:42:55Z); funding transition `c0364c63… -> 69be04e7…` revision 23 (13:43:08Z); fresh evidence (13:43:33Z); prepare, manifest `95a45bc1…` (13:43:40Z); scoped `up -d --no-deps --pull never execution-rsi` (13:43:40Z). Manifest claimed at 13:44:09Z. All three positions resumed as live executors with trailing waiting; AUDG resumed under the chain contract through the legacy transition with both children; BNB and SOL held bags recovered from the ledger behind their existing held-recovery gate; XRP gate `ready`; no orders placed by the restart.
+
+Dead-database backup: `dead-backup/rsi_modular_v2.sqlite` (pre-seal), `pre-cutover-backup/` (running, 12:42Z), `stopped-backup/` unused (owner was not stopped by this session).

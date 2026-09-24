@@ -1,0 +1,10 @@
+........................................................................ [ 37%]
+........................................................................ [ 74%]
+.................................................                   [100%]
+=============================== warnings summary ===============================
+work/tests/test_v2_recovery_funding.py: 36 warnings
+home/hummingbot/test/acquisition_chain_v2/test_native_chain_funding.py: 144 warnings
+home/hummingbot/test/acquisition_chain_v2/test_paper_lifecycle_restart.py: 812 warnings
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+193 passed, 992 warnings, 5 subtests passed in 66.06s (0:01:06)

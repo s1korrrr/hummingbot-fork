@@ -36,13 +36,13 @@ class NativeTrailingViewV2(PolicyModel):
     receipt_sha256: str = Field(pattern=HASH)
     observed_at_ms: int = Field(ge=0, le=2 ** 63 - 1, strict=True)
     activated: StrictBool
-    peak_price: Price
+    peak_price: Price | None = None
     threshold_price: Price
     exit_owner: Literal['native_executor', 'recipe_proposal']
 
     @model_validator(mode='after')
     def ratcheted_below_peak(self):
-        if self.threshold_price > self.peak_price:
+        if self.peak_price is not None and self.threshold_price > self.peak_price:
             raise ValueError('native trailing threshold exceeds the observed peak')
         return self
 
@@ -130,9 +130,13 @@ def bind_trailing_view(snapshot: NativeSnapshotV2, views: tuple[NativeTrailingVi
             raise PolicyError('native trailing exit owner changed')
         if previous.observed_at_ms > view.observed_at_ms:
             raise PolicyError('native trailing observation clock regressed')
-        # Widening volatility may raise the peak; neither peak nor threshold may fall back.
-        if view.peak_price < previous.peak_price or view.threshold_price < previous.threshold_price:
+        if view.threshold_price < previous.threshold_price:
             raise PolicyError('native trailing ratchet loosened')
+        if previous.peak_price is not None:
+            if view.peak_price is None:
+                raise PolicyError('native trailing peak evidence disappeared')
+            if view.peak_price < previous.peak_price:
+                raise PolicyError('native trailing ratchet loosened')
         if previous.activated and not view.activated:
             raise PolicyError('native trailing activation withdrawn')
     return view

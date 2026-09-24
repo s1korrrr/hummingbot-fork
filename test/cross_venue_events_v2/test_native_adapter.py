@@ -117,6 +117,32 @@ class NativeAdapterTests(unittest.TestCase):
             self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')
 
     @unittest.skipUnless(NATIVE, 'Exact native Hummingbot dependencies are not installed; no stub replacement')
+    def test_malformed_snapshot_after_valid_read_clears_operator_projection(self):
+        from test.cross_venue_events_v2.test_contracts import T, snapshot
+
+        class Clock:
+            def time(self):
+                return (T + 1) / 1000
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / 'snapshot.json'
+            path.write_text(json.dumps(snapshot(()).model_dump(mode='json')))
+            controller = CrossVenueEventV2Controller(
+                CrossVenueEventV2Config(id='events-v2', snapshot_path=str(path)), Clock(), asyncio.Queue())
+            asyncio.run(controller.update_processed_data())
+            self.assertEqual(controller.processed_data['status'], 'NO_ORDER_OBSERVER_V2')
+            self.assertIn('event_projection', controller.get_custom_info())
+
+            path.write_text('{"schema":"broken", "schema":"duplicate"}')
+            asyncio.run(controller.update_processed_data())
+            self.assertEqual(controller.processed_data['status'], 'UNAVAILABLE')
+            self.assertEqual(controller.get_custom_info(), {})
+            self.assertEqual(controller.determine_executor_actions(), [])
+            self.assertFalse(controller.validate_executor_config(object()))
+            with self.assertRaises(PermissionError):
+                asyncio.run(controller.send_actions([object()]))
+
+    @unittest.skipUnless(NATIVE, 'Exact native Hummingbot dependencies are not installed; no stub replacement')
     def test_config_cannot_enable_execution_or_adopt_inventory(self):
         from pydantic import ValidationError
         for changes in ({'execution_enabled': True}, {'total_amount_quote': 1},

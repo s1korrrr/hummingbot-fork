@@ -55,6 +55,26 @@ class ConfigHelpersTest(unittest.TestCase):
         self.assertIsInstance(cm.hb_config, AvellanedaMarketMakingConfigMap)
         self.assertFalse(hasattr(cm, "market"))  # uninitialized instance
 
+    def test_save_to_yml_legacy_skips_unchanged_read_only_file(self):
+        from decimal import Decimal
+
+        from hummingbot.client.config.config_helpers import save_to_yml_legacy
+        from hummingbot.client.config.config_var import ConfigVar
+
+        cm = {"okx_maker_percent_fee": ConfigVar(key="okx_maker_percent_fee", prompt="", default=Decimal("0.08"))}
+        cm["okx_maker_percent_fee"].value = Decimal("0.08")
+        with TemporaryDirectory() as d:
+            path = Path(d) / "conf_fee_overrides.yml"
+            path.write_text("# fees\nokx_maker_percent_fee: 0.08\n", encoding="utf-8")
+            path.chmod(0o444)
+            with self.assertNoLogs(level="ERROR"):
+                save_to_yml_legacy(str(path), cm)
+            self.assertEqual("# fees\nokx_maker_percent_fee: 0.08\n", path.read_text(encoding="utf-8"))
+            path.chmod(0o644)
+            cm["okx_maker_percent_fee"].value = Decimal("0.1")
+            save_to_yml_legacy(str(path), cm)
+            self.assertEqual("# fees\nokx_maker_percent_fee: 0.1\n", path.read_text(encoding="utf-8"))
+
     def test_save_to_yml(self):
         class DummyStrategy(BaseStrategyConfigMap):
             class Config:

@@ -1,5 +1,6 @@
 import contextlib
 import inspect
+import io
 import json
 import logging
 import shutil
@@ -832,15 +833,22 @@ def save_to_yml_legacy(yml_path: str, cm: Dict[str, ConfigVar]):
     """
     try:
         with open(yml_path, encoding="utf-8") as stream:
-            data = yaml_parser.load(stream) or {}
-            for key in cm:
-                cvar = cm.get(key)
-                if isinstance(cvar.value, Decimal):
-                    data[key] = float(cvar.value)
-                else:
-                    data[key] = cvar.value
-            with open(yml_path, "w+", encoding="utf-8") as outfile:
-                yaml_parser.dump(data, outfile)
+            original = stream.read()
+        data = yaml_parser.load(original) or {}
+        for key in cm:
+            cvar = cm.get(key)
+            if isinstance(cvar.value, Decimal):
+                data[key] = float(cvar.value)
+            else:
+                data[key] = cvar.value
+        rendered = io.StringIO()
+        yaml_parser.dump(data, rendered)
+        if rendered.getvalue() == original:
+            # Unchanged content never rewrites the file, so a read-only conf
+            # mount stays silent instead of logging a write error at boot.
+            return
+        with open(yml_path, "w+", encoding="utf-8") as outfile:
+            outfile.write(rendered.getvalue())
     except Exception as e:
         logging.getLogger().error("Error writing configs: %s" % (str(e),), exc_info=True)
 

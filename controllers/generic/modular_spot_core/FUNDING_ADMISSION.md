@@ -73,7 +73,10 @@ exposes `funding_hold`, `pending_quote`, `available_quote`, `native_cash_used`,
 There is no automatic/manual capacity-reset endpoint in this slice. Safe future
 release requires an explicit native reconciliation transaction proving final
 exchange quantity/fills, no remaining child/replacement authority, and complete
-recorder coverage, then atomically retiring the unused admission. Restarting,
+recorder coverage, then atomically retiring the unused admission. A single-attempt
+intent may prove several terminal entry orders when the down-only maker replaced
+an unfilled order (post-only repair or downward reprice); at most one of those
+orders may carry fills, and every order needs its own terminal proof. Restarting,
 deleting Metadata, or setting a new controller ID is not that reconciliation.
 
 This is a candidate-local spending boundary. It does not lock shared OKX cash,

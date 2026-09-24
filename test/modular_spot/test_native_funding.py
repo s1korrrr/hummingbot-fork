@@ -81,3 +81,57 @@ def test_base_fee_inventory_uses_native_remaining_fee_attribution():
     projected = funding_projection([buy, fill('sell', '2', 'SELL', '.495', '100')], 'okx', 'BTC-USDC')
     assert projected['cash_used'] == D('-9.5')
     assert projected['inventory_cost'] == D('20')
+
+
+def _release_fixture(order_amount='0.00047461'):
+    """Live single-attempt down-only intent: one post-only cancel, one filled replacement."""
+    from types import SimpleNamespace as NS
+    canceled_id, filled_id = 'BTCUC1repair', 'BTCUCa4final'
+    fills = [fill(filled_id, '5541826', 'BUY', '0.00011', '84105.6', '0.0074'),
+             fill(filled_id, '5541827', 'BUY', '0.00036461', '84105.6', '0.0245')]
+    proofs = [{'schema': 1, 'source': 'okx_terminal_status_v1', 'order_id': canceled_id, 'exchange_order_id': 'venue-1',
+               'trading_pair': 'BTC-USDC', 'side': 'BUY', 'amount': order_amount, 'filled_base': '0',
+               'state': 'CANCELED', 'trade_ids': []},
+              {'schema': 1, 'source': 'okx_terminal_status_v1', 'order_id': filled_id, 'exchange_order_id': 'venue-2',
+               'trading_pair': 'BTC-USDC', 'side': 'BUY', 'amount': order_amount, 'filled_base': order_amount,
+               'state': 'FILLED', 'trade_ids': ['5541826', '5541827']}]
+    snapshots = [{'client_order_id': proof['order_id'], 'exchange_order_id': proof['exchange_order_id'],
+                  'trade_type': 'BUY', 'amount': order_amount} for proof in proofs]
+    info = NS(connector_name='okx', trading_pair='BTC-USDC', is_active=True,
+              config=NS(entry_order_policy='single_attempt', trading_pair='BTC-USDC', amount=D(order_amount)),
+              custom_info={'order_ids': [canceled_id, filled_id], 'execution_order_snapshots': snapshots})
+    orders = [NS(id=proof['order_id'], exchange_order_id=proof['exchange_order_id'], symbol='BTC-USDC', market='okx')
+              for proof in proofs]
+    from controllers.generic.modular_spot_core.native_funding import NativeFundingStore
+    store = NativeFundingStore.__new__(NativeFundingStore)
+    store.owner = NS(config=NS(execution_mode='live', connector_name='okx'),
+                     market_data_provider=NS(connectors={'okx': NS(_order_tracker=NS(all_orders={}))}))
+    receipt = {'schema': 1, 'source': 'native_terminal_entry_set_v1', 'orders': proofs}
+    return store, info, receipt, fills, orders
+
+
+def test_single_attempt_release_accepts_post_only_repair_entry_set():
+    from controllers.generic.modular_spot_core.native_funding import NativeFundingStore
+    store, info, receipt, fills, orders = _release_fixture()
+    NativeFundingStore._validate_release(store, info, receipt, D('0.00047461'), fills, orders)
+    single = {**receipt, 'orders': receipt['orders'][1:]}
+    info.custom_info['order_ids'] = info.custom_info['order_ids'][1:]
+    info.custom_info['execution_order_snapshots'] = info.custom_info['execution_order_snapshots'][1:]
+    NativeFundingStore._validate_release(store, info, receipt['orders'][1], D('0.00047461'), fills, orders)
+    NativeFundingStore._validate_release(store, info, single, D('0.00047461'), fills, orders)
+
+
+def test_single_attempt_release_rejects_two_filled_entry_orders():
+    from controllers.generic.modular_spot_core.domain import PolicyError
+    from controllers.generic.modular_spot_core.native_funding import NativeFundingStore
+    store, info, receipt, fills, orders = _release_fixture()
+    first, second = receipt['orders']
+    fills = [fill(first['order_id'], '1', 'BUY', '0.00011', '84115.5'),
+             fill(second['order_id'], '2', 'BUY', '0.00036461', '84105.6')]
+    first.update(filled_base='0.00011', trade_ids=['1'])
+    second.update(filled_base='0.00036461', trade_ids=['2'])
+    with pytest.raises(PolicyError, match='multiple filled entry orders'):
+        NativeFundingStore._validate_release(store, info, receipt, D('0.00047461'), fills, orders)
+    info.config.entry_order_policy = 'retry'
+    info.is_active = False
+    NativeFundingStore._validate_release(store, info, receipt, D('0.00047461'), fills, orders)

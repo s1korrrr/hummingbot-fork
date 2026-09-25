@@ -9,8 +9,10 @@ from decimal import Decimal as D
 from test.modular_spot.test_capital_admission import metadata_engine
 from types import SimpleNamespace as NS
 
+import pytest
+
 from controllers.generic.modular_spot import ModularSpotController, ModularSpotControllerConfig
-from controllers.generic.modular_spot_core.bag import BagConfig, BagFeatures
+from controllers.generic.modular_spot_core.bag import BagConfig, BagFeatures, LiveCapitalConfig
 from controllers.generic.modular_spot_core.market import MarketFeatures
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy, BudgetStore
 from hummingbot.core.data_type.common import TradeType
@@ -61,10 +63,10 @@ class Venue:
                breakeven_price=self.positions[0].breakeven_price, remaining_fees_quote=D('0'), cum_fees_quote=D('0'))]
 
 
-def _controller(venue, store, pair=PAIR):
+def _controller(venue, store, pair=PAIR, capital=None):
     cfg = ModularSpotControllerConfig(
         id=f'modular_spot_{pair.replace("-", "_").lower()}', connector_name='okx', trading_pair=pair,
-        execution_enabled=True, account='paper-okx', max_records=1276, bag=BagConfig(),
+        execution_enabled=True, account='paper-okx', max_records=1276, bag=BagConfig(), capital=capital,
         budget={'group': 'desk', 'max_quote': '1000', 'max_assets': 3}, total_amount_quote=D('500'),
         universe={'mode': 'fixed', 'symbols': [pair], 'max_candidates': 1},
         acquisition={'fractions': ['1'], 'minimum_drop': '.008', 'cooldown_seconds': 1, 'entry_timeout_seconds': 60})
@@ -139,11 +141,12 @@ def _bag_cycle(controller, venue, store, first_candle, *, gapped=False):
     return candle, config, sell_config
 
 
-def test_two_complete_bag_cycles_release_capital_and_keep_the_controller_running(tmp_path):
+@pytest.mark.parametrize('capital', [None, LiveCapitalConfig()])
+def test_two_complete_bag_cycles_release_capital_and_keep_the_controller_running(tmp_path, capital):
     venue = Venue(tmp_path)
     store = BudgetStore(venue.recorder, BudgetPolicy(group='desk', max_quote=D('1000'), max_assets=3),
                         connector='okx', quote='USDC', account='paper-okx', metadata_model=venue.Metadata)
-    controller = _controller(venue, store)
+    controller = _controller(venue, store, capital=capital)
     rt = controller.runtime
     assert _tick(controller, venue, mid=D('100'), rsi=D('31'), prev=D('29'), candle=0) == []  # seed checkpoint
 

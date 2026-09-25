@@ -110,6 +110,52 @@ class AdaptiveTrailingConfig(PolicyModel):
         return selection.activation, selection.delta
 
 
+class LiveCapitalConfig(PolicyModel):
+    """Live OK RSI capital model (HLRSIController buy gates), replacing the fixed allocation.
+
+    Every buy spends ``slice_quote`` (``usd_per_entry``). A buy is admitted only while
+    ``held bag + active buys`` marked at mid plus the new slice stays within
+    ``position_cap_quote`` (``max_total_position_usd``), and while fewer than
+    ``max_active_tranches`` buys are active (``max_executors_per_side``). The slice is then
+    resized to the wallet's available quote (V2 ``resize_to_available_quote``).
+    Live defaults: V2 BNB is 100 / 500 / 8, V1 BNB is 200 / 2500 / 8.
+    """
+    slice_quote: Decimal = Field(default=Decimal('100'), gt=0)
+    position_cap_quote: Decimal = Field(default=Decimal('500'), gt=0)
+    max_active_tranches: int = Field(default=8, ge=1, le=64, strict=True)
+
+    @model_validator(mode='after')
+    def slice_within_cap(self):
+        if self.slice_quote > self.position_cap_quote:
+            raise ValueError('slice_quote must not exceed position_cap_quote (live usd_per_entry <= max_total_position_usd)')
+        return self
+
+
+def live_capital_quote(cap: LiveCapitalConfig, *, held_amount: Decimal, held_dust: bool, mid: Decimal, active,
+                       available_quote: Decimal):
+    """Quote for the next buy under live capital, or ``(None, reason)``.
+
+    ``active`` holds one ``(owned_base, outstanding_base, commitment_price)`` per active buy
+    (live ``_get_active_buy_executor_position_value_usd``). A dust bag is not exposure
+    (live ``_total_position_value_usd``). Reasons mirror the live gate labels.
+    """
+    mid = decimal(mid, 'mid', positive=True)
+    rows = tuple(active)
+    if len(rows) >= cap.max_active_tranches:
+        return None, 'max_executors'
+    exposure = Decimal('0') if held_dust else decimal(held_amount, 'held amount') * mid
+    for owned, outstanding, price in rows:
+        exposure += decimal(owned, 'owned base') * mid
+        if decimal(outstanding, 'outstanding base') > 0:
+            exposure += outstanding * decimal(price, 'commitment price', positive=True)
+    if exposure + cap.slice_quote > cap.position_cap_quote:
+        return None, 'max_position'
+    quote = min(cap.slice_quote, decimal(available_quote, 'available quote'))
+    if quote <= 0:
+        return None, 'cash_exhausted'
+    return quote, 'admitted'
+
+
 @dataclass(frozen=True)
 class BagFeatures:
     """Closed-candle inputs of the live bag/sell/trailing decisions."""

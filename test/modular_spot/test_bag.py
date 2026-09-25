@@ -356,3 +356,65 @@ def test_live_no_loss_exit_floor_is_the_plain_after_fee_floor(monkeypatch):
     protected = floor('protected')
     assert protected is not None and protected > D('100.5')  # locks the trailing minimum profit
     assert floor(None) == protected  # a missing controller falls back to the stricter floor
+
+
+# ---------------------------------------------------------------- live capital model
+def test_live_capital_marks_the_held_bag_and_active_buys_at_mid_against_the_position_cap():
+    from controllers.generic.modular_spot_core.bag import LiveCapitalConfig, live_capital_quote
+
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8)
+    # The bag cost ~498 but is worth 0.696 * 560 = 389.76 at mid: 389.76 + 100 <= 500 -> a buy is admitted.
+    assert live_capital_quote(cap, held_amount=D('0.696'), held_dust=False, mid=D('560'), active=(),
+                              available_quote=D('1000')) == (D('100'), 'admitted')
+    # At 650 the bag is worth 452.40: the next $100 would breach the cap (live gate 'max_position').
+    assert live_capital_quote(cap, held_amount=D('0.696'), held_dust=False, mid=D('650'), active=(),
+                              available_quote=D('1000')) == (None, 'max_position')
+    # Active buys count owned base at mid plus the unfilled remainder at its commitment price.
+    active = ((D('0.15'), D('0'), D('0')), (D('0'), D('0.15'), D('600')))
+    assert live_capital_quote(cap, held_amount=D('0'), held_dust=True, mid=D('600'), active=active,
+                              available_quote=D('1000')) == (D('100'), 'admitted')  # 90 + 90 + 100 <= 500
+    # A dust bag is not exposure; the active-executor limit binds before the cap.
+    eight = ((D('0'), D('0'), D('0')),) * 8
+    assert live_capital_quote(cap, held_amount=D('0.0004'), held_dust=True, mid=D('600'), active=eight,
+                              available_quote=D('1000')) == (None, 'max_executors')
+    # The buy is resized to the wallet's available quote (live V2 resize_to_available_quote).
+    assert live_capital_quote(cap, held_amount=D('0'), held_dust=True, mid=D('600'), active=(),
+                              available_quote=D('37.5')) == (D('37.5'), 'admitted')
+    assert live_capital_quote(cap, held_amount=D('0'), held_dust=True, mid=D('600'), active=(),
+                              available_quote=D('0')) == (None, 'cash_exhausted')
+    with pytest.raises(ValueError):
+        LiveCapitalConfig(slice_quote=D('600'), position_cap_quote=D('500'))
+
+
+def test_bag_mode_planner_uses_live_capital_instead_of_the_fixed_allocation():
+    from controllers.generic.modular_spot_core.bag import LiveCapitalConfig
+    from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy
+    from controllers.generic.modular_spot_core.market import MarketFeatures
+    from controllers.generic.modular_spot_core.planner import plan
+    from controllers.generic.modular_spot_core.state import DecisionState
+
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8)
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    base = dict(fingerprint='a' * 64, budget=D('500'), now=1200,
+                market=MarketFeatures(1140, D('560'), D('29'), D('31'), False, False),
+                bid=D('560'), ask=D('560.1'), available_quote=D('1000'), amount_step=D('.001'),
+                minimum_amount=D('.001'), minimum_notional=D('1'), pnl=D('0'), signal=SignalPolicy(),
+                acquisition=AcquisitionPolicy(fractions=(D('.2'),) * 5, minimum_drop=D('.008')), risk=RiskPolicy())
+    bag = HeldBag(D('0.696'), D('715.5'), D('1.5'))  # ~498 at cost, 389.8 at mid
+    fixed = plan(state, {}, **base, bag=bag)
+    assert fixed[1] is None and fixed[2] == 'allocation_below_minimum'  # the bag at cost leaves 0.5 of 500
+    live = plan(state, {}, **base, bag=bag, capital=cap)
+    assert live[2] == 'entry_proposed' and live[1].amount == D('0.177')  # floor(100/560) after the native fee reserve
+    capped = plan(state, {}, **{**base, 'bid': D('650'), 'ask': D('650.1')}, bag=bag, capital=cap)
+    assert capped[2] == 'max_position'
+
+
+def test_controller_config_admits_live_capital_only_with_bags():
+    from controllers.generic.modular_spot import ModularSpotControllerConfig
+    from controllers.generic.modular_spot_core.bag import LiveCapitalConfig
+
+    base = dict(id='modular_spot_bag', connector_name='okx', trading_pair='BNB-USDC', max_records=1276)
+    live = ModularSpotControllerConfig(**base, bag=BagConfig(), capital=LiveCapitalConfig())
+    assert live.capital == LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8)
+    with pytest.raises(ValueError, match='bag lifecycle'):
+        ModularSpotControllerConfig(**base, capital=LiveCapitalConfig())

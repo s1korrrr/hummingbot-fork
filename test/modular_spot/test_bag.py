@@ -415,7 +415,7 @@ def test_controller_config_admits_live_capital_only_with_bags():
 
     base = dict(id='modular_spot_bag', connector_name='okx', trading_pair='BNB-USDC', max_records=1276)
     live = ModularSpotControllerConfig(**base, bag=BagConfig(), capital=LiveCapitalConfig())
-    assert live.capital == LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8)
+    assert live.capital == LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=None, max_active_tranches=8)
     with pytest.raises(ValueError, match='bag lifecycle'):
         ModularSpotControllerConfig(**base, capital=LiveCapitalConfig())
 

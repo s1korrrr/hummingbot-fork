@@ -141,7 +141,7 @@ def _bag_cycle(controller, venue, store, first_candle, *, gapped=False):
     return candle, config, sell_config
 
 
-@pytest.mark.parametrize('capital', [None, LiveCapitalConfig()])
+@pytest.mark.parametrize('capital', [None, LiveCapitalConfig(position_cap_quote=D('500'))])
 def test_two_complete_bag_cycles_release_capital_and_keep_the_controller_running(tmp_path, capital):
     venue = Venue(tmp_path)
     store = BudgetStore(venue.recorder, BudgetPolicy(group='desk', max_quote=D('1000'), max_assets=3),

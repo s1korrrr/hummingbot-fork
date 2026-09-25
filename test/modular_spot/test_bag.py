@@ -552,7 +552,12 @@ def test_controller_config_admits_the_buy_gap_only_with_live_capital():
 
 
 def test_depth_budget_unlocks_capital_with_depth_below_the_recent_high():
-    from controllers.generic.modular_spot_core.bag import DepthBudgetConfig, depth_budget_allowed, depth_budget_decision
+    from controllers.generic.modular_spot_core.bag import (
+        DepthBudgetConfig,
+        depth_budget_allowed,
+        depth_budget_decision,
+        depth_reference,
+    )
 
     cfg = DepthBudgetConfig(budget_quote=D('5000'), lookback_minutes=1440, full_depth=D('0.3'), base_fraction=D('0.2'))
     assert depth_budget_allowed(cfg, reference_high=D('700'), price=D('700')) == (D('0'), D('1000'))
@@ -560,6 +565,8 @@ def test_depth_budget_unlocks_capital_with_depth_below_the_recent_high():
     assert depth == D('0.15') and allowed == D('3000')
     assert depth_budget_allowed(cfg, reference_high=D('700'), price=D('400'))[1] == D('5000')  # past full depth
     assert depth_budget_allowed(cfg, reference_high=D('700'), price=D('720'))[0] == 0  # above the high
+    assert depth_reference(D('600'), D('650')) == D('650') and depth_reference(D('600'), None) == D('600')
+    assert depth_reference(D('600'), D('550')) == D('600')
     assert depth_budget_decision(cfg, D('100'), deployed_quote=D('2900'), reference_high=D('700'),
                                  price=D('595')) == (D('100'), 'admitted')
     assert depth_budget_decision(cfg, D('100'), deployed_quote=D('2901'), reference_high=D('700'),
@@ -583,14 +590,23 @@ def test_planner_refuses_a_buy_past_the_depth_budget_and_counts_the_bag_at_cost(
                 acquisition=AcquisitionPolicy(), risk=RiskPolicy())
     state = DecisionState(fingerprint='a' * 64, candle=1080)
     bag = HeldBag(D('10'), D('100'), D('0'))  # 1000 deployed at cost
+    shallow_bag = HeldBag(D('17'), D('95'), D('0'))  # 1615 at cost, breakeven 95 above the 90.5 high
     at_high = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False,
                              bag=replace(bag_features_, recent_high=D('90.5')))
-    assert plan(state, {}, **base, market=at_high, bid=D('90'), ask=D('90.1'), bag=bag, capital=cap,
-                depth_budget=depth)[2] == 'depth_budget'  # 0.55% down: 1000 + 100 > 1036
+    assert plan(state, {}, **base, market=at_high, bid=D('90'), ask=D('90.1'), bag=shallow_bag, capital=cap,
+                depth_budget=depth)[2] == 'depth_budget'  # 5.3% below 95: 1615 + 100 > 1702
     deep = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False,
                           bag=replace(bag_features_, recent_high=D('100')))
     assert plan(state, {}, **base, market=deep, bid=D('90'), ask=D('90.1'), bag=bag, capital=cap,
                 depth_budget=depth)[2] == 'entry_proposed'  # 10% down: 1000 + 100 <= 2333
+    # The held bag's breakeven is the reference when it is above the recent high: 10% below the
+    # 100 high allows 2333, 18.2% below a 110 breakeven allows 3424.
+    high_cost = HeldBag(D('40'), D('110'), D('0'))  # 4400 at cost, above 3424: refused
+    assert plan(state, {}, **base, market=deep, bid=D('90'), ask=D('90.1'), bag=high_cost, capital=cap,
+                depth_budget=depth)[2] == 'depth_budget'
+    below = HeldBag(D('24'), D('110'), D('0'))  # 2640 at cost + 100 fits under 3424, not under 2333
+    assert plan(state, {}, **base, market=deep, bid=D('90'), ask=D('90.1'), bag=below, capital=cap,
+                depth_budget=depth)[2] == 'entry_proposed'
     with pytest.raises(PolicyError, match='recent high'):
         plan(state, {}, **base, market=MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=bag_features_),
              bid=D('90'), ask=D('90.1'), bag=bag, capital=cap, depth_budget=depth)

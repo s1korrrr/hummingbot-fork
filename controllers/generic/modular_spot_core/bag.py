@@ -170,11 +170,14 @@ class DepthBudgetConfig(PolicyModel):
     """Research capital pacing by depth: the capital deployed at cost may grow with the drawdown
     below the recent high, so a long down-leg cannot spend the whole budget early.
 
-    depth = max(0, 1 - price / highest closed-candle high over ``lookback_minutes``);
-    allowed = budget_quote * min(1, base_fraction + (1 - base_fraction) * depth / full_depth).
-    A buy is refused (``depth_budget``) when the at-cost capital already deployed plus its
-    quote would exceed ``allowed``. It needs no crash classification: shallow dips keep
-    ``base_fraction`` of the budget, deeper legs unlock the rest. Not a live OK RSI setting.
+    depth = max(0, 1 - price / reference), the reference being the higher of the highest
+    closed-candle high over ``lookback_minutes`` and the held (non-dust) bag's breakeven, so a
+    long down-leg is still measured from where the capital went in after the rolling high has
+    followed the price down; allowed = budget_quote * min(1, base_fraction + (1 - base_fraction)
+    * depth / full_depth). A buy is refused (``depth_budget``) when the at-cost capital already
+    deployed plus its quote would exceed ``allowed``. It needs no crash classification: shallow
+    dips keep ``base_fraction`` of the budget, deeper legs unlock the rest, and averaging down
+    lowers the breakeven so each further buy needs a deeper price. Not a live OK RSI setting.
     """
     budget_quote: Decimal = Field(gt=0)
     lookback_minutes: int = Field(ge=60, le=20160, strict=True)
@@ -182,8 +185,14 @@ class DepthBudgetConfig(PolicyModel):
     base_fraction: Decimal = Field(ge=0, le=1)
 
 
+def depth_reference(recent_high, breakeven_price=None) -> Decimal:
+    """The higher of the lookback high and the held bag's breakeven (None when no bag is held)."""
+    high = decimal(recent_high, 'recent high', positive=True)
+    return high if breakeven_price is None else max(high, decimal(breakeven_price, 'breakeven', positive=True))
+
+
 def depth_budget_allowed(cfg: DepthBudgetConfig, *, reference_high, price) -> Tuple[Decimal, Decimal]:
-    """(depth, allowed deployed quote) at ``price`` below the lookback high."""
+    """(depth, allowed deployed quote) at ``price`` below the reference (see depth_reference)."""
     high = decimal(reference_high, 'reference high', positive=True)
     depth = max(Decimal('0'), 1 - decimal(price, 'price', positive=True) / high)
     fraction = min(Decimal('1'), cfg.base_fraction + (1 - cfg.base_fraction) * depth / cfg.full_depth)

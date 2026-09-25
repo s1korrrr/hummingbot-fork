@@ -23,7 +23,7 @@ OK RSI recovery slice. Parity is pinned by tests against those methods.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from typing import Optional, Tuple
 
 ZERO = Decimal("0")
@@ -130,6 +130,26 @@ def recovery_min_sell_price(breakeven_price: Decimal, amount: Decimal, remaining
     if not policy.sell_only_if_profitable or amount <= 0:
         return None
     return breakeven_price * (1 + policy.min_profit_pct_for_sell) + remaining_fees_quote / amount
+
+
+def maker_sell_price(mid_price: Decimal, best_ask: Decimal, tick: Decimal) -> Decimal:
+    """Mirror of ``_shade_limit_maker_price`` for SELL: ceil(max(mid, ask)) to tick, one tick above the touch."""
+    if tick is None or tick <= 0:
+        return best_ask
+    aligned = (max(mid_price, best_ask) / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+    price = aligned + tick if aligned <= best_ask else aligned
+    return price if price > 0 else best_ask
+
+
+def sell_trend_hold(strong_bullish_trend: bool, price: Decimal, rsi: Optional[float], rsi_prev: Optional[float],
+                    ema_fast: Optional[float], sell_rsi_rollover_delta: float) -> bool:
+    """Mirror of ``_sell_trend_hold_active`` on the recovery path (the evaluated trail has no reversal):
+    hold a sell signal only in a strong bullish trend without an RSI rollover below the fast EMA."""
+    if not strong_bullish_trend:
+        return False
+    rollover = rsi is not None and rsi_prev is not None and (rsi_prev - rsi) >= sell_rsi_rollover_delta
+    below_ema = ema_fast is not None and price < Decimal(str(ema_fast))
+    return not (rollover and below_ema)
 
 
 def has_sell_price_gap(price: Decimal, last_sell_price: Optional[Decimal], policy: BagRecoveryPolicy) -> bool:

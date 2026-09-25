@@ -414,10 +414,10 @@ def test_controller_config_admits_live_capital_only_with_bags():
     from controllers.generic.modular_spot_core.bag import LiveCapitalConfig
 
     base = dict(id='modular_spot_bag', connector_name='okx', trading_pair='BNB-USDC', max_records=1276)
-    live = ModularSpotControllerConfig(**base, bag=BagConfig(), capital=LiveCapitalConfig())
+    live = ModularSpotControllerConfig(**base, bag=BagConfig(), capital=LiveCapitalConfig(position_cap_quote=None))
     assert live.capital == LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=None, max_active_tranches=8)
     with pytest.raises(ValueError, match='bag lifecycle'):
-        ModularSpotControllerConfig(**base, capital=LiveCapitalConfig())
+        ModularSpotControllerConfig(**base, capital=LiveCapitalConfig(position_cap_quote=None))
 
 
 def test_live_sell_reference_expires_after_twenty_newer_stored_executors():
@@ -514,3 +514,26 @@ def test_live_buy_gap_is_absolute_from_the_last_active_buy_and_the_bag():
     assert above[2] == 'entry_proposed'  # live gap is absolute: 0.7% above the last buy qualifies
     with pytest.raises(PolicyError):
         plan(state, view, **base, bid=D('100.7'), ask=D('100.8'), bag=empty, buy_gap=BuyGapConfig())
+
+
+def test_live_capital_cap_must_be_explicit_and_the_buy_gap_also_spaces_from_the_bag():
+    from controllers.generic.modular_spot_core.bag import BuyGapConfig, LiveCapitalConfig
+    from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy
+    from controllers.generic.modular_spot_core.market import MarketFeatures
+    from controllers.generic.modular_spot_core.planner import plan
+    from controllers.generic.modular_spot_core.state import DecisionState
+
+    with pytest.raises(ValueError):
+        LiveCapitalConfig()  # omitting the cap is not 'no cap'
+    cap = LiveCapitalConfig(position_cap_quote=None)
+    _, feats_ = feats()  # atr 0.002 -> gap 0.6%
+    market = MarketFeatures(1140, D('100'), D('29'), D('31'), False, False, bag=feats_)
+    base = dict(fingerprint='a' * 64, budget=D('5000'), now=1200, market=market, available_quote=D('5000'),
+                amount_step=D('.001'), minimum_amount=D('.001'), minimum_notional=D('1'), pnl=D('0'),
+                signal=SignalPolicy(), acquisition=AcquisitionPolicy(), risk=RiskPolicy())
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    bag = HeldBag(D('1'), D('100'), D('0.3'))
+    assert plan(state, {}, **base, bid=D('100.5'), ask=D('100.6'), bag=bag, capital=cap,
+                buy_gap=BuyGapConfig())[2] == 'bag_gap_not_met'  # 0.5% from the bag cost basis < 0.6%
+    assert plan(state, {}, **base, bid=D('99.3'), ask=D('99.4'), bag=bag, capital=cap,
+                buy_gap=BuyGapConfig())[2] == 'entry_proposed'  # 0.7% below the cost basis

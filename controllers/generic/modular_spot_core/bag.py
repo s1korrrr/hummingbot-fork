@@ -126,7 +126,8 @@ class LiveCapitalConfig(PolicyModel):
     sizing are entry-side behaviour, not modelled here.
     """
     slice_quote: Decimal = Field(default=Decimal('100'), gt=0)
-    position_cap_quote: Optional[Decimal] = Field(default=None, gt=0)  # None: no position cap (live V2 BNB: 500)
+    # Required so no config loses its cap by omission: a quote, or None for no position cap (live V2 BNB: 500).
+    position_cap_quote: Optional[Decimal] = Field(..., gt=0)
     max_active_tranches: int = Field(default=8, ge=1, le=64, strict=True)
     funded_cap_quote: Optional[Decimal] = Field(default=None, gt=0)
     funding_fee_reserve: Decimal = Field(default=Decimal('0.003'), ge=0, lt=1)

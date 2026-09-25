@@ -33,15 +33,44 @@ class HeldInventoryPolicyTest(unittest.TestCase):
 
     def test_held_inventory_blends_bags_like_position_hold(self):
         bag = HeldInventory().add_buy(D("1"), D("100"), D("0.1")).add_buy(D("1"), D("90"), D("0.09"))
-        self.assertEqual(bag.amount, D("2"))
-        self.assertEqual(bag.breakeven_price, D("95"))
+        self.assertEqual((bag.amount, bag.breakeven_price, bag.remaining_fees_quote), (D("2"), D("95"), D("0.19")))
         bag = bag.add_sell(D("0.5"), D("50"), D("0.05"))
-        self.assertEqual(bag.amount, D("1.5"))
-        self.assertEqual(bag.breakeven_price, D("95"))
+        self.assertEqual((bag.amount, bag.breakeven_price), (D("1.5"), D("95")))
         self.assertEqual(bag.realized_pnl_quote, D("2.5"))
-        self.assertEqual(bag.fees_quote, D("0.24"))
+        self.assertEqual(bag.remaining_fees_quote, D("0.1425"))
+        self.assertEqual(bag.fees_paid_quote, D("0.24"))
         with self.assertRaises(ValueError):
             bag.add_sell(D("2"), D("1"))
+
+    def test_running_average_resets_when_flat_like_live(self):
+        # Live PositionHold: buy 1@100, sell .5@110, buy .5@80 -> breakeven 90 (not lifetime 93.33).
+        bag = HeldInventory().add_buy(D("1"), D("100")).add_sell(D("0.5"), D("55")).add_buy(D("0.5"), D("40"))
+        self.assertEqual(bag.breakeven_price, D("90"))
+        flat = HeldInventory().add_buy(D("1"), D("600"), D("0.6")).add_sell(D("1"), D("650"))
+        self.assertEqual((flat.amount, flat.breakeven_price, flat.remaining_fees_quote), (D("0"), D("0"), D("0")))
+        again = flat.add_buy(D("1"), D("850"), D("0.85"))
+        self.assertEqual((again.breakeven_price, again.remaining_fees_quote), (D("850"), D("0.85")))
+        self.assertEqual(again.pnl_quote(D("850")), D("50") - D("1.45"))
+
+    def test_matches_live_position_hold_summary(self):
+        from hummingbot.core.data_type.common import TradeType as T
+        from hummingbot.strategy_v2.executors.executor_orchestrator import PositionHold
+
+        live = PositionHold("binance", "BNB-USDC", T.BUY)
+        ours = HeldInventory()
+        fills = [("BUY", "1", "100", "0.1"), ("BUY", "2", "180", "0.18"), ("SELL", "1.5", "150", "0.15"),
+                 ("BUY", "0.5", "40", "0.04"), ("SELL", "2", "210", "0.21"), ("BUY", "1", "95", "0.095")]
+        for index, (side, base, quote, fee) in enumerate(fills):
+            live.add_order_record({"client_order_id": f"o{index}", "trade_type": side, "executed_amount_base": base,
+                                   "executed_amount_quote": quote, "cumulative_fee_paid_quote": fee,
+                                   "actual_base_fee": "0"})
+            ours = (ours.add_buy if side == "BUY" else ours.add_sell)(D(base), D(quote), D(fee))
+            summary = live.get_position_summary(D("100"))
+            self.assertEqual(summary.amount, ours.amount)
+            self.assertEqual(summary.breakeven_price.quantize(D("1e-12")), ours.breakeven_price.quantize(D("1e-12")))
+            self.assertEqual(summary.realized_pnl_quote.quantize(D("1e-12")), ours.realized_pnl_quote.quantize(D("1e-12")))
+            self.assertEqual(summary.remaining_fees_quote.quantize(D("1e-12")),
+                             ours.remaining_fees_quote.quantize(D("1e-12")))
 
     def test_net_pnl_floor_gap_and_slice(self):
         policy = BagRecoveryPolicy()
@@ -53,8 +82,13 @@ class HeldInventoryPolicyTest(unittest.TestCase):
         self.assertFalse(has_sell_price_gap(D("100.5"), D("100"), policy))
         self.assertTrue(has_sell_price_gap(D("99"), D("100"), policy))
         self.assertEqual(recovery_slice_amount(D("5"), D("100"), policy), D("2"))
-        self.assertEqual(recovery_slice_amount(D("2.05"), D("100"), policy, min_quote=D("10")), D("2.05"))
+        self.assertEqual(recovery_slice_amount(D("2.05"), D("100"), policy, min_quote=D("10")), D("2"))
         self.assertEqual(recovery_slice_amount(D("0.05"), D("100"), policy, min_quote=D("10")), D("0"))
+        # OK RSI: a remainder worth <= the sweep cap is taken; a larger sweep falls back to the valid slice.
+        self.assertEqual(recovery_slice_amount(D("2.04"), D("100"), policy, min_quote=D("10"),
+                                               remainder_sweep_quote=D("5")), D("2.04"))
+        self.assertEqual(recovery_slice_amount(D("2.08"), D("100"), policy, min_quote=D("10"),
+                                               remainder_sweep_quote=D("5")), D("2"))
 
     def test_trail_disarms_below_target_and_restarts_on_breakeven_change(self):
         policy = BagRecoveryPolicy()

@@ -26,6 +26,9 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 class BacktestingEngineBase:
     __controller_class_cache = LazyDict[tuple, Type[ControllerBase]]()
+    # Opt-in: when True, StopExecutorAction(keep_position=True) keeps inventory in
+    # held_positions instead of the legacy behaviour of realising the executor.
+    hold_kept_positions: bool = False
 
     def __init__(self):
         self.controller = None
@@ -119,6 +122,7 @@ class BacktestingEngineBase:
             List[ExecutorInfo]: List of executor information objects detailing the simulation results.
         """
         processed_features = self.prepare_market_data()
+        self.held_positions = {}  # never carry holds between runs of a reused engine
         self.active_executor_simulations: List[ExecutorSimulation] = []
         self.stopped_executors_info: List[ExecutorInfo] = []
         for i, row in processed_features.iterrows():
@@ -233,11 +237,13 @@ class BacktestingEngineBase:
         """
         Handles stop actions for executors, terminating them as required.
 
-        With ``keep_position=True`` nothing is sold, as in live trading: the
-        executor closes with ``POSITION_HOLD`` and its filled inventory, entry
-        quote and fees already charged move into ``held_positions``. The
-        executor's own PnL becomes zero so equity is continuous; the held
-        position carries the economics from then on.
+        When ``hold_kept_positions`` is enabled and ``keep_position=True``,
+        nothing is sold, as in live trading: the executor closes with
+        ``POSITION_HOLD`` and its filled inventory, fill quote and fees already
+        charged move into ``held_positions``. The executor's own PnL becomes zero
+        so equity is continuous; the held position carries the economics and the
+        caller owns selling and reporting it. Otherwise the legacy behaviour
+        (the stop realises the executor at this timestamp) is unchanged.
 
         Args:
             action (StopExecutorAction): The action indicating which executor to stop.
@@ -253,7 +259,8 @@ class BacktestingEngineBase:
             executor_info.is_active = False
             executor_info.close_timestamp = timestamp
             # An executor already closed by its own barrier has nothing left to hold.
-            if action.keep_position and was_active and executor_info.filled_amount_quote > 0:
+            if (self.hold_kept_positions and action.keep_position and was_active
+                    and executor_info.filled_amount_quote > 0):
                 self._hold_executor_position(executor_info)
             self.stopped_executors_info.append(executor_info)
             self.active_executor_simulations.remove(executor)
@@ -262,14 +269,13 @@ class BacktestingEngineBase:
         config = executor_info.config
         if getattr(config, "side", None) != TradeType.BUY:
             raise ValueError("backtest position hold supports long BUY executors only")
-        entry_price = Decimal(str(config.entry_price))
-        if entry_price <= 0:
-            raise ValueError("backtest position hold requires a positive entry price")
-        # PositionExecutorSimulator fills the full amount at the entry close, so the
-        # configured amount and entry price are the position (the simulator doubles
-        # filled_amount_quote on its closing row, which must not be read here).
+        # PositionExecutorSimulator fills the configured amount at its first close;
+        # an active row's filled_amount_quote is that simulated fill (the closing
+        # row, which doubles it, is never active and never held).
         base = Decimal(str(config.amount))
-        quote = base * entry_price
+        quote = Decimal(str(executor_info.filled_amount_quote))
+        if base <= 0 or quote <= 0:
+            raise ValueError("backtest position hold requires a positive simulated fill")
         key = (config.connector_name, config.trading_pair)
         held = self.held_positions.get(key, HeldInventory())
         self.held_positions[key] = held.add_buy(base, quote, Decimal(str(executor_info.cum_fees_quote)))
@@ -291,12 +297,7 @@ class BacktestingEngineBase:
 
     def held_positions_pnl_quote(self, prices: Dict[tuple, Decimal]) -> Decimal:
         """Realized minus all fees plus mark-to-market of remaining held inventory."""
-        total = Decimal(0)
-        for key, held in self.held_positions.items():
-            total += held.realized_pnl_quote - held.fees_quote
-            if held.amount > 0:
-                total += (prices[key] - held.breakeven_price) * held.amount
-        return total
+        return sum((held.pnl_quote(prices[key]) for key, held in self.held_positions.items()), Decimal(0))
 
     @staticmethod
     def summarize_results(executors_info: List, total_amount_quote: float = 1000):

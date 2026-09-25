@@ -28,8 +28,9 @@ def _config(identifier="tranche", side=TradeType.BUY):
 
 
 class PositionHoldBacktestTest(unittest.TestCase):
-    def _engine(self, prices, config):
+    def _engine(self, prices, config, hold=True):
         engine = BacktestingEngineBase()
+        engine.hold_kept_positions = hold
         engine.stopped_executors_info = []
         simulation = engine.position_executor_simulator.simulate(_frame(prices), config, 0.003)
         engine.active_executor_simulations = [simulation]
@@ -64,6 +65,19 @@ class PositionHoldBacktestTest(unittest.TestCase):
         engine = self._engine([100.0, 98.0, 96.0], _config())
         engine.handle_stop_action(StopExecutorAction(controller_id="c", executor_id="tranche", keep_position=True), 5)
         self.assertEqual(engine.held_positions, {})
+
+    def test_keep_position_without_opt_in_keeps_legacy_realisation(self):
+        engine = self._engine([100.0, 98.0, 96.0, 95.0], _config(), hold=False)
+        engine.handle_stop_action(StopExecutorAction(controller_id="c", executor_id="tranche", keep_position=True), 2)
+        info = engine.stopped_executors_info[-1]
+        self.assertEqual(info.close_type, CloseType.EARLY_STOP)
+        self.assertNotEqual(info.net_pnl_quote, D(0))
+        self.assertEqual(engine.held_positions, {})
+
+    def test_hold_cost_is_the_simulated_fill_not_the_configured_price(self):
+        engine = self._engine([101.0, 98.0, 96.0, 95.0], _config())
+        engine.handle_stop_action(StopExecutorAction(controller_id="c", executor_id="tranche", keep_position=True), 1)
+        self.assertEqual(engine.held_positions[("binance", "BNB-USDC")].breakeven_price, D("101"))
 
     def test_hold_rejects_short_side(self):
         engine = self._engine([100.0, 101.0, 102.0, 103.0], _config(side=TradeType.SELL))

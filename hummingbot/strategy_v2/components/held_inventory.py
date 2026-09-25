@@ -7,8 +7,8 @@ controllers and research simulators share one definition:
    position basis is stopped with ``keep_position=True``: nothing is sold, the
    executor slot is freed and its inventory joins the held position.
 2. Held inventory is one blended long position per market (``HeldInventory``,
-   mirroring ``PositionHold``): breakeven is buy quote / buy base; fees are kept
-   separately and subtracted in net PnL.
+   mirroring live ``PositionHold`` sequential accounting): running-average
+   breakeven, remaining fees scaled down by sells, reset when flat.
 3. Recovery: once net PnL reaches ``max(recovery_target_pct, min_profit)`` the
    bag waits for RSI >= ``recovery_arm_rsi`` to arm a trail, tracks new peaks,
    and sells a slice on an ``recovery_trail_pullback_pct`` pullback or on an RSI
@@ -77,44 +77,41 @@ def should_hold_as_bag(basis_price: Decimal, price: Decimal, policy: BagRecovery
 
 @dataclass(frozen=True)
 class HeldInventory:
-    """Blended long held position (buy side of ``PositionHold``) with explicit fees."""
-    buy_base: Decimal = ZERO
-    buy_quote: Decimal = ZERO
-    sell_base: Decimal = ZERO
-    sell_quote: Decimal = ZERO
-    fees_quote: Decimal = ZERO
+    """Blended long held position with the sequential semantics of live ``PositionHold``.
 
-    @property
-    def amount(self) -> Decimal:
-        return self.buy_base - self.sell_base
-
-    @property
-    def breakeven_price(self) -> Decimal:
-        if self.amount <= 0 or self.buy_base <= 0:
-            return ZERO
-        buy_be = self.buy_quote / self.buy_base
-        remaining_quote = self.buy_quote - min(self.buy_base, self.sell_base) * buy_be
-        return remaining_quote / self.amount
-
-    @property
-    def realized_pnl_quote(self) -> Decimal:
-        """Gross matched PnL as in ``PositionHold.get_position_summary`` (fees excluded)."""
-        matched = min(self.buy_base, self.sell_base)
-        if matched <= 0:
-            return ZERO
-        return (self.sell_quote / self.sell_base - self.buy_quote / self.buy_base) * matched
+    Mirrors ``PositionHold.get_position_summary`` when order records exist: buys
+    move a running-average breakeven and add their fees to remaining fees; sells
+    realize ``(price - breakeven) * amount``, scale remaining fees by the unsold
+    fraction and reset breakeven and remaining fees when the position is flat.
+    ``fees_paid_quote`` keeps every fee for total PnL.
+    """
+    amount: Decimal = ZERO
+    breakeven_price: Decimal = ZERO
+    remaining_fees_quote: Decimal = ZERO
+    realized_pnl_quote: Decimal = ZERO
+    fees_paid_quote: Decimal = ZERO
 
     def add_buy(self, base: Decimal, quote: Decimal, fee_quote: Decimal = ZERO) -> "HeldInventory":
         if base <= 0 or quote <= 0 or fee_quote < 0:
             raise ValueError("held buy requires positive base/quote and nonnegative fee")
-        return replace(self, buy_base=self.buy_base + base, buy_quote=self.buy_quote + quote,
-                       fees_quote=self.fees_quote + fee_quote)
+        amount = self.amount + base
+        return replace(self, amount=amount, breakeven_price=(self.amount * self.breakeven_price + quote) / amount,
+                       remaining_fees_quote=self.remaining_fees_quote + fee_quote,
+                       fees_paid_quote=self.fees_paid_quote + fee_quote)
 
     def add_sell(self, base: Decimal, quote: Decimal, fee_quote: Decimal = ZERO) -> "HeldInventory":
         if base <= 0 or quote <= 0 or fee_quote < 0 or base > self.amount:
             raise ValueError("held sell must be positive and within held amount")
-        return replace(self, sell_base=self.sell_base + base, sell_quote=self.sell_quote + quote,
-                       fees_quote=self.fees_quote + fee_quote)
+        amount = self.amount - base
+        realized = self.realized_pnl_quote + (quote / base - self.breakeven_price) * base
+        remaining_fees = self.remaining_fees_quote * amount / self.amount
+        return replace(self, amount=amount, breakeven_price=self.breakeven_price if amount else ZERO,
+                       remaining_fees_quote=remaining_fees if amount else ZERO, realized_pnl_quote=realized,
+                       fees_paid_quote=self.fees_paid_quote + fee_quote)
+
+    def pnl_quote(self, price: Decimal) -> Decimal:
+        """Total held PnL: realized minus every fee paid plus mark of the remaining inventory."""
+        return self.realized_pnl_quote - self.fees_paid_quote + (price - self.breakeven_price) * self.amount
 
 
 def net_pnl_pct(amount: Decimal, breakeven_price: Decimal, remaining_fees_quote: Decimal,
@@ -150,25 +147,37 @@ def has_sell_price_gap(price: Decimal, last_sell_price: Optional[Decimal], polic
 def recovery_slice_amount(position_amount: Decimal, price: Decimal, policy: BagRecoveryPolicy, *,
                           min_amount: Decimal = ZERO, min_quote: Decimal = ZERO,
                           remainder_sweep_quote: Decimal = ZERO) -> Decimal:
-    """OK RSI recovery slice: min(position, slice_quote / price), sweeping unsellable or small remainders."""
+    """OK RSI buy_sell recovery sizing.
+
+    Target = min(position, slice_quote / price), taking the whole position when the
+    remainder is worth at most ``remainder_sweep_quote`` (``_signal_sell_target_amount``).
+    The base resolver (``HLRSIController._resolve_recovery_sell_amount``) lifts a
+    sub-minimum target to the minimum and sweeps an unsellable remainder; OK RSI keeps
+    that sweep only while it adds at most ``remainder_sweep_quote`` and otherwise falls
+    back to a valid target (``OKRSIController._resolve_recovery_sell_amount``).
+    """
     if position_amount <= 0 or price <= 0:
         return ZERO
 
     def unsellable(amount):
         return amount < min_amount or (min_quote > 0 and amount * price < min_quote)
 
-    if unsellable(position_amount):
-        return ZERO
     target = min(position_amount, policy.slice_quote / price) if policy.slice_quote > 0 else position_amount
     remainder = position_amount - target
     if remainder > 0 and remainder * price <= remainder_sweep_quote:
         target = position_amount
-    if unsellable(target):
-        target = min_amount
-    remainder = position_amount - target
+    if target <= 0 or unsellable(position_amount):
+        return ZERO
+    resolved = min_amount if unsellable(target) else target
+    remainder = position_amount - resolved
     if remainder > 0 and unsellable(remainder):
-        target = position_amount
-    return min(target, position_amount)
+        resolved = position_amount
+    resolved = min(resolved, position_amount)
+    if resolved <= target or (resolved - target) * price <= remainder_sweep_quote:
+        return resolved
+    if not unsellable(target) and target <= position_amount:
+        return target
+    return resolved
 
 
 @dataclass(frozen=True)

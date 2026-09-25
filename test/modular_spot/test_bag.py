@@ -429,3 +429,22 @@ def test_live_sell_reference_expires_after_twenty_newer_stored_executors():
     assert live_sell_reference([sell, *newer]) == D('110')  # 20 visible: still the reference
     assert live_sell_reference([sell, *newer, ((40, 0), None)]) is None  # 21st newer executor pushes it out
     assert live_sell_reference([((5, 0), D('100')), sell, ((12, 1), D('120'))]) == D('120')  # newest filled sell
+
+
+def test_live_v2_funding_resizes_the_buy_before_the_mid_cap_check():
+    from controllers.generic.modular_spot_core.bag import LiveCapitalConfig, live_capital_decision, live_capital_quote
+
+    v1 = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8)
+    v2 = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8,
+                           funded_cap_quote=D('505'))
+    held = dict(held_amount=D('0.696'), held_dust=False, mid=D('604'), active=(), available_quote=D('1000'))
+    # Bag worth 420.38 at mid: the full 100 slice breaches the cap, so V1-style refuses.
+    assert live_capital_quote(v1, **held) == (None, 'max_position')
+    # V2 first shrinks the buy to the funding ceiling (505 - 480) / 1.003, which then fits under the cap.
+    quote, reason = live_capital_quote(v2, **held, funded_used_quote=D('480'))
+    assert reason == 'admitted' and quote == (D('25') / D('1.003'))
+    assert live_capital_quote(v2, **held, funded_used_quote=D('505')) == (None, 'funding_exhausted')
+    with pytest.raises(PolicyError):
+        live_capital_quote(v2, **held)
+    # The pure decision recomputes from recorded facts (verifier path).
+    assert live_capital_decision(v1, active_count=8, exposure=D('0'), available_quote=D('1000')) == (None, 'max_executors')

@@ -113,16 +113,20 @@ class AdaptiveTrailingConfig(PolicyModel):
 class LiveCapitalConfig(PolicyModel):
     """Live OK RSI capital model (HLRSIController buy gates), replacing the fixed allocation.
 
-    Every buy spends ``slice_quote`` (``usd_per_entry``). A buy is admitted only while
-    ``held bag + active buys`` marked at mid plus the new slice stays within
-    ``position_cap_quote`` (``max_total_position_usd``), and while fewer than
-    ``max_active_tranches`` buys are active (``max_executors_per_side``). The slice is then
-    resized to the wallet's available quote (V2 ``resize_to_available_quote``).
-    Live defaults: V2 BNB is 100 / 500 / 8, V1 BNB is 200 / 2500 / 8.
+    Every buy plans ``slice_quote`` (``usd_per_entry``). With ``funded_cap_quote`` set (live
+    V2 ``funding.max_position_quote``, at cost), the plan is first resized to the per-pair
+    funding ceiling ``(funded_cap - used - pending) / (1 + funding_fee_reserve)``. The
+    (resized) buy is admitted only while ``held bag + active buys`` marked at mid plus the buy
+    stays within ``position_cap_quote`` (``max_total_position_usd``) and fewer than
+    ``max_active_tranches`` buys are active (``max_executors_per_side``). Without funding
+    (V1 style) the buy is finally resized to available wallet quote.
+    Live BNB: V2 is 100 / 500 / 8 with funding 505 at cost; V1 is 200 / 2500 / 8, unfunded.
     """
     slice_quote: Decimal = Field(default=Decimal('100'), gt=0)
     position_cap_quote: Decimal = Field(default=Decimal('500'), gt=0)
     max_active_tranches: int = Field(default=8, ge=1, le=64, strict=True)
+    funded_cap_quote: Optional[Decimal] = Field(default=None, gt=0)
+    funding_fee_reserve: Decimal = Field(default=Decimal('0.003'), ge=0, lt=1)
 
     @model_validator(mode='after')
     def slice_within_cap(self):
@@ -147,29 +151,49 @@ def live_sell_reference(stored, *, window: int = STORED_EXECUTOR_WINDOW) -> Opti
     return None
 
 
-def live_capital_quote(cap: LiveCapitalConfig, *, held_amount: Decimal, held_dust: bool, mid: Decimal, active,
-                       available_quote: Decimal):
-    """Quote for the next buy under live capital, or ``(None, reason)``.
-
-    ``active`` holds one ``(owned_base, outstanding_base, commitment_price)`` per active buy
-    (live ``_get_active_buy_executor_position_value_usd``). A dust bag is not exposure
-    (live ``_total_position_value_usd``). Reasons mirror the live gate labels.
-    """
+def live_capital_exposure(*, held_amount: Decimal, held_dust: bool, mid: Decimal, active) -> Decimal:
+    """Live ``_total_position_value_usd``: the non-dust held bag at mid plus active buys
+    (owned base at mid, unfilled remainder at its commitment price)."""
     mid = decimal(mid, 'mid', positive=True)
-    rows = tuple(active)
-    if len(rows) >= cap.max_active_tranches:
-        return None, 'max_executors'
     exposure = Decimal('0') if held_dust else decimal(held_amount, 'held amount') * mid
-    for owned, outstanding, price in rows:
+    for owned, outstanding, price in active:
         exposure += decimal(owned, 'owned base') * mid
         if decimal(outstanding, 'outstanding base') > 0:
             exposure += outstanding * decimal(price, 'commitment price', positive=True)
-    if exposure + cap.slice_quote > cap.position_cap_quote:
+    return exposure
+
+
+def live_capital_decision(cap: LiveCapitalConfig, *, active_count: int, exposure: Decimal, available_quote: Decimal,
+                          funded_used_quote: Optional[Decimal] = None):
+    """Quote for the next buy, or ``(None, reason)``, in the live gate order. Pure, so the
+    research verifier can recompute every recorded capital decision."""
+    if active_count >= cap.max_active_tranches:
+        return None, 'max_executors'
+    quote = cap.slice_quote
+    if cap.funded_cap_quote is not None:
+        if funded_used_quote is None:
+            raise PolicyError('funded capital requires the funding used quote')
+        ceiling = (cap.funded_cap_quote - decimal(funded_used_quote, 'funded used')) / (1 + cap.funding_fee_reserve)
+        quote = min(quote, max(ceiling, Decimal('0')))
+        if quote <= 0:
+            return None, 'funding_exhausted'
+    if decimal(exposure, 'exposure') + quote > cap.position_cap_quote:
         return None, 'max_position'
-    quote = min(cap.slice_quote, decimal(available_quote, 'available quote'))
-    if quote <= 0:
-        return None, 'cash_exhausted'
+    if cap.funded_cap_quote is None:
+        quote = min(quote, decimal(available_quote, 'available quote'))
+        if quote <= 0:
+            return None, 'cash_exhausted'
     return quote, 'admitted'
+
+
+def live_capital_quote(cap: LiveCapitalConfig, *, held_amount: Decimal, held_dust: bool, mid: Decimal, active,
+                       available_quote: Decimal, funded_used_quote: Optional[Decimal] = None):
+    """``live_capital_exposure`` then ``live_capital_decision``; ``active`` holds one
+    ``(owned_base, outstanding_base, commitment_price)`` per active buy."""
+    rows = tuple(active)
+    exposure = live_capital_exposure(held_amount=held_amount, held_dust=held_dust, mid=mid, active=rows)
+    return live_capital_decision(cap, active_count=len(rows), exposure=exposure, available_quote=available_quote,
+                                 funded_used_quote=funded_used_quote)
 
 
 @dataclass(frozen=True)

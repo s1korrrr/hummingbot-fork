@@ -52,6 +52,8 @@ class BudgetStore:
         # each claim; a second namespace would not segregate exchange quote cash.
         self.key = 'modular-program-budget:v1:' + identity([recorder.config_file_path, connector, quote, policy.group])
         self.policy_hash = identity(policy.model_dump(mode='json'))
+        # Controllers proven (by the calling public method) to have an empty held position.
+        self._held_flat = frozenset()
 
     def _member_probe(self, owner, pair):
         return Reservation(
@@ -128,8 +130,9 @@ class BudgetStore:
         if claim.trading_pair.split('-')[1] != self.quote:
             raise PolicyError('reservation quote differs from program')
 
-    def contains(self, claim: Reservation, *, native_executors=()) -> bool:
+    def contains(self, claim: Reservation, *, native_executors=(), flat_held_controllers=frozenset()) -> bool:
         self._bind(claim)
+        self._held_flat = frozenset(flat_held_controllers)
         try:
             reservations, members = self._parse(self._load())
             evidence = self._evidence(native_executors)
@@ -139,7 +142,8 @@ class BudgetStore:
         except (SQLAlchemyError, AttributeError) as exc:
             raise PolicyError('program reservation store unavailable') from exc
 
-    def occupied_pairs(self, *, native_executors=()):
+    def occupied_pairs(self, *, native_executors=(), flat_held_controllers=frozenset()):
+        self._held_flat = frozenset(flat_held_controllers)
         try:
             reservations, members = self._parse(self._load())
             evidence = self._evidence(native_executors)
@@ -157,12 +161,28 @@ class BudgetStore:
             raise PolicyError('program receipt ownership differs')
         return self._is_terminal_flat(info)
 
+    @staticmethod
+    def _is_reduce_only_sell(info):
+        """A SELL order executor closing held inventory never spends quote capital."""
+        config = info.config
+        return (getattr(config, 'type', None) == 'order_executor' and getattr(config.side, 'name', None) == 'SELL'
+                and getattr(getattr(config, 'position_action', None), 'name', None) == 'CLOSE')
+
     def _is_terminal_flat(self, info):
+        if self._is_reduce_only_sell(info):
+            return True
         if info.is_done is not True or info.is_active is not False:
             return False
         try:
             receipt = info.custom_info.get('execution_receipt')
-            if not isinstance(receipt, dict) or receipt.get('accounting_owner') != 'executor':
+            if not isinstance(receipt, dict):
+                return False
+            owner = receipt.get('accounting_owner')
+            if owner == 'held_position':
+                # Held (bagged) inventory keeps its reservation until the controller's
+                # blended held position is empty; the caller proves that explicitly.
+                return info.controller_id in self._held_flat
+            if owner != 'executor':
                 return False
             return decimal(receipt.get('remaining_owned_base'), 'remaining native inventory') == 0
         except (PolicyError, AttributeError, TypeError):
@@ -217,8 +237,9 @@ class BudgetStore:
                 return True
         return False
 
-    def reserve(self, claim: Reservation, *, native_executors) -> bool:
+    def reserve(self, claim: Reservation, *, native_executors, flat_held_controllers=frozenset()) -> bool:
         self._bind(claim)
+        self._held_flat = frozenset(flat_held_controllers)
         try:
             evidence = self._evidence(native_executors)
             self._reject_foreign(evidence)

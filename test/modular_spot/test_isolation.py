@@ -24,6 +24,8 @@ def test_legacy_imports_are_confined_to_explicit_composition_seams_without_regis
                                                   'controllers.directional_trading.ok_rsi_core.context'},
                         'native_recovery.py': {'controllers.directional_trading.hl_rsi',
                                                'controllers.directional_trading.rsi_v5'},
+                        # Live OK RSI continuous adaptive trailing, shared rather than copied.
+                        'bag.py': {'controllers.shared.trailing'},
                     }
                     public_recipe_import = (
                         path.name in {'native_recipe.py', 'recipe_compiler.py'}

@@ -21,7 +21,11 @@ class EntryProposal:
 
 
 def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, available_quote,
-         amount_step, minimum_amount, minimum_notional, pnl, signal, acquisition, risk, allow_acquisition=True):
+         amount_step, minimum_amount, minimum_notional, pnl, signal, acquisition, risk, allow_acquisition=True,
+         bag=None):
+    """``bag`` (a HeldBag) selects live OK RSI capacity: active tranches only, slots and
+    capital free as tranches close or are held, and a new buy keeps the live gap from the
+    bag's breakeven. Without it the frozen B0 campaign semantics apply."""
     budget = decimal(budget, 'budget', positive=True)
     bid, ask = decimal(bid, 'bid', positive=True), decimal(ask, 'ask', positive=True)
     now = decimal(now, 'now')
@@ -42,10 +46,11 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
                              day_start=state.risk_day_start, paused=state.risk_paused)
     updated = state.model_copy(update={'risk_peak': assessment.peak, 'risk_day': assessment.day,
                                        'risk_day_start': assessment.day_start, 'risk_paused': assessment.paused})
-    revised, reconciliation = reconcile_claims(updated, inventory)
+    revised, reconciliation = reconcile_claims(updated, inventory,
+                                               bag_amount=None if bag is None else bag.amount)
     if reconciliation not in {'reconciled', 'campaign_flat'}:
         return updated, None, reconciliation
-    if revised.committed_quote > budget:
+    if bag is None and revised.committed_quote > budget:
         raise PolicyError('committed quote exceeds allocation')
     if reconciliation == 'campaign_flat':
         return revised, None, 'campaign_flat'
@@ -66,6 +71,11 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
         return revised, None, 'spread_limit'
     signal_result = signal_decision(signal, previous_rsi=market.previous_rsi, rsi=market.rsi,
                                     breakout=market.breakout, trend_up=market.trend_up)
+    if bag is not None:
+        return _bag_entry(revised, inventory, bag, fingerprint=fingerprint, budget=budget, now=now, market=market,
+                          bid=bid, available_quote=available_quote, amount_step=amount_step,
+                          minimum_amount=minimum_amount, minimum_notional=minimum_notional,
+                          fresh_signal=signal_result.enter, acquisition=acquisition, risk=risk)
     owned = [inventory[x] for x in revised.claims]
     acquired = [value for value in owned if value.entry_quote > 0]
     fraction = next_stage(acquisition, stage=len(owned), bid=bid,
@@ -86,4 +96,37 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     revised = revised.model_copy(update={'claims': (*revised.claims, identifier),
                                          'committed_quote': revised.committed_quote + allocation.reserved_quote,
                                          'last_entry_time': now})
+    return revised, proposal, 'entry_proposed'
+
+
+def _bag_entry(state, inventory, bag, *, fingerprint, budget, now, market, bid, available_quote, amount_step,
+               minimum_amount, minimum_notional, fresh_signal, acquisition, risk):
+    """Live OK RSI admission: capacity counts active tranches; capital is what is tied up now."""
+    active = [inventory[x] for x in state.claims if not inventory[x].terminal]
+    acquired = [value for value in active if value.entry_quote > 0]
+    fraction = next_stage(acquisition, stage=len(active), bid=bid,
+                          last_fill_price=acquired[-1].entry_price if acquired else None,
+                          fresh_signal=fresh_signal, entry_terminal=all(x.entry_terminal for x in active),
+                          distribution_started=False)
+    if fraction is None:
+        return state, None, 'acquisition_not_eligible'
+    if bag.amount > 0 and abs(bid - bag.breakeven_price) / bag.breakeven_price < acquisition.minimum_drop:
+        return state, None, 'bag_gap_not_met'
+    fee = 1 + risk.fee_reserve_fraction
+    tied_up = sum((max(value.planned_quote, value.entry_quote) * fee for value in active), Decimal('0'))
+    tied_up += bag.amount * bag.breakeven_price + bag.remaining_fees_quote
+    if tied_up >= budget:
+        return state, None, 'bag_capital_exhausted'
+    allocation = allocate(stage_quote=budget * fraction, remaining_quote=budget - tied_up,
+                          available_quote=available_quote, price=bid, amount_step=amount_step,
+                          minimum_amount=minimum_amount, minimum_notional=minimum_notional,
+                          fee_buffer=risk.fee_reserve_fraction, cash_reserve=risk.cash_reserve_quote)
+    if allocation is None:
+        return state, None, 'allocation_below_minimum'
+    # Claims only grow inside a cycle, so identity uses the claim count, not the stage.
+    identifier = identity([fingerprint, market.candle_open, state.cycle, len(state.claims)])
+    proposal = EntryProposal(identifier, bid, allocation.amount, float(now), state.cycle, len(active))
+    revised = state.model_copy(update={'claims': (*state.claims, identifier),
+                                       'committed_quote': state.committed_quote + allocation.reserved_quote,
+                                       'last_entry_time': now})
     return revised, proposal, 'entry_proposed'

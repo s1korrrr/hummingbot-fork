@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field, StrictBool, model_validator
 
+from controllers.generic.modular_spot_core.bag import AdaptiveTrailingConfig, BagConfig
 from controllers.generic.modular_spot_core.candle_data import FIRST_DELIVERY
 from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy, TrailingPolicy
 from controllers.generic.modular_spot_core.data_reader import DataPolicy, attach_pool, dataset_for
@@ -61,6 +62,12 @@ class ModularSpotControllerConfig(ControllerConfigBase):
     program_revision: str = Field(default='0', pattern=r'^[A-Za-z0-9._-]{1,64}$')
     policy_revision: str = Field(default='0', pattern=r'^[A-Za-z0-9._-]{1,64}$')
     recipe_binding: RecipeBinding | None = None
+    # Live OK RSI parity (opt-in): held-inventory bags and continuous adaptive trailing.
+    bag: BagConfig | None = None
+    adaptive_trailing: AdaptiveTrailingConfig | None = None
+    # 'protected' keeps the modular no-loss floor raised by activation - delta; 'live_no_loss'
+    # uses the plain after-fee no-loss price like live OK RSI.
+    exit_floor: Literal['protected', 'live_no_loss'] = 'protected'
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
 
     @model_validator(mode='after')
@@ -72,6 +79,14 @@ class ModularSpotControllerConfig(ControllerConfigBase):
         required = max(60, 2 * self.signal.rsi_length + 2, self.signal.breakout_lookback + 2)
         if self.max_records < required + 1:
             raise ValueError('insufficient feature history plus open candle')
+        if self.bag is not None or self.adaptive_trailing is not None:
+            if self.signal.kind != 'rsi_rebound' or self.universe.mode != 'fixed':
+                raise ValueError('bag and adaptive trailing require the fixed rsi_rebound profile')
+            if self.interval != '1m':
+                raise ValueError('live OK RSI parity features are defined on 1m candles')
+            records = (self.bag or BagConfig()).required_records()
+            if self.max_records < records + 1:
+                raise ValueError(f'bag/adaptive features need max_records >= {records + 1}')
         if self.signal.kind == 'breakout' and len(self.acquisition.fractions) != 1:
             raise ValueError('breakout profile does not permit dip averaging')
         if self.budget is not None and self.total_amount_quote > self.budget.max_quote:
@@ -237,6 +252,9 @@ class ModularSpotController(ControllerBase):
     def validate_executor_config(self, config):
         if config is None or config.id in self.runtime.dispatched:
             return False
+        from controllers.generic.modular_spot_core.bag import is_recovery_sell
+        if is_recovery_sell(config):
+            return super().validate_executor_config(config) and self.runtime.recovery_permission(config)
         if self.config.universe.mode == 'sell_only':
             return super().validate_executor_config(config) and self.runtime.reduction_permission(config)
         return self.entry_permission(config)

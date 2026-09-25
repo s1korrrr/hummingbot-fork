@@ -104,3 +104,30 @@ def test_existing_group_member_cannot_switch_instrument_ownership(budget):
                           expires_at=D('0'))
     with pytest.raises(PolicyError):
         budget.reserve(changed, native_executors=[receipt()])
+
+
+def test_held_bag_releases_its_reservation_only_when_the_controller_bag_is_empty(budget):
+    assert budget.reserve(reservation(amount='100'), native_executors=[])
+    held = receipt(remaining='.5', owner='held_position')
+    # Bag still holds inventory: capital stays reserved (conservative vs live mark-to-market).
+    assert not budget.reserve(reservation(2, '1'), native_executors=[held])
+    assert not budget.reserve(reservation(2, '1'), native_executors=[held],
+                              flat_held_controllers=frozenset({'modular_spot_other'}))
+    # The controller proves its blended held position is empty: the held tranche is flat.
+    assert budget.reserve(reservation(2, '100'), native_executors=[held],
+                          flat_held_controllers=frozenset({'modular_spot_1'}))
+
+
+def test_reduce_only_recovery_sell_is_capital_neutral_and_not_unreserved_inventory(budget):
+    assert budget.reserve(reservation(amount='50'), native_executors=[])
+    sell = NS(id='bag-sell-1', controller_id='modular_spot_1', is_done=False, is_active=True,
+              config=NS(type='order_executor', side=NS(name='SELL'), position_action=NS(name='CLOSE'),
+                        controller_id='modular_spot_1', connector_name='okx', trading_pair='BTC-USDC'),
+              custom_info={})
+    assert budget.reserve(reservation(2, '50', 'BTC-USDC'), native_executors=[sell])
+    buy = NS(id='bare-buy', controller_id='modular_spot_1', is_done=False, is_active=True,
+             config=NS(type='order_executor', side=NS(name='BUY'), position_action=NS(name='OPEN'),
+                       controller_id='modular_spot_1', connector_name='okx', trading_pair='BTC-USDC'),
+             custom_info={})
+    with pytest.raises(PolicyError):
+        budget.contains(reservation(), native_executors=[buy])

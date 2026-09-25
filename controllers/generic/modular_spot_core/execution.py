@@ -15,7 +15,14 @@ from .domain import PolicyError, decimal
 from .trailing import protected_sell_price
 
 
-def native_config(config, *, identifier, timestamp, price, amount, cycle, stage):
+def native_config(config, *, identifier, timestamp, price, amount, cycle, stage, market=None):
+    activation, delta = config.trailing.activation, config.trailing.delta
+    adaptive = getattr(config, 'adaptive_trailing', None)
+    if adaptive is not None:
+        # Live OK RSI selects the tranche geometry from the entry decision candle's ATR.
+        if market is None or market.bag is None:
+            raise PolicyError('adaptive trailing requires closed-candle ATR')
+        activation, delta = adaptive.select(market.bag.atr_pct, activation, delta)
     return PositionExecutorConfig(
         id=identifier, controller_id=config.id, timestamp=timestamp,
         connector_name=config.connector_name, trading_pair=config.trading_pair,
@@ -24,8 +31,7 @@ def native_config(config, *, identifier, timestamp, price, amount, cycle, stage)
         triple_barrier_config=TripleBarrierConfig(
             open_order_type=OrderType.LIMIT,
             open_order_limit_max_age_seconds=config.acquisition.entry_timeout_seconds,
-            trailing_stop=TrailingStop(activation_price=config.trailing.activation,
-                                       trailing_delta=config.trailing.delta),
+            trailing_stop=TrailingStop(activation_price=activation, trailing_delta=delta),
             trailing_stop_order_type=OrderType.LIMIT, trailing_stop_limit_max_age_seconds=0,
             stop_loss=None, time_limit=None, take_profit=None,
         ),
@@ -43,6 +49,10 @@ class ModularPositionExecutor(PositionExecutor):
         floor = super()._min_no_loss_sell_price()
         if floor is None:
             return None
+        strategy = getattr(self, '_strategy', None)
+        controller = None if strategy is None else strategy.controllers.get(self.config.controller_id)
+        if controller is not None and controller.config.exit_floor == 'live_no_loss':
+            return floor  # live OK RSI: the after-fee no-loss price only
         trailing = self.config.triple_barrier_config.trailing_stop
         try:
             return protected_sell_price(floor, TrailingPolicy(

@@ -151,7 +151,7 @@ def _runtime(recorder, *, positions, executors=(), market_close='106'):
     runtime.store = DecisionStore(recorder, cfg.id, 'okx', 'BNB-USDC')
     runtime.pending, runtime.dispatched, runtime.fault = {}, set(), None
     _, bag = feats()
-    runtime.market = MarketFeatures(1_800_000_000, D(market_close), D('80.2'), D('80'), False, False, bag)
+    runtime.market = MarketFeatures(1_800_000_000, D(market_close), D('80.2'), D('80'), False, False, bag=bag)
     return runtime
 
 
@@ -192,7 +192,7 @@ def test_runtime_bag_tick_holds_losers_places_one_recovery_sell_and_persists_the
     assert [type(a) for a in armed] == [StopExecutorAction] and armed[0].keep_position is True
     assert runtime.bag_reason == 'armed'
     runtime.market = runtime.market.__class__(1_800_000_060, D('108'), D('80.2'), D('80'), False, False,
-                                              runtime.market.bag)
+                                              bag=runtime.market.bag)
     runtime._bag_actions({}, state.model_copy(update={'claims': ()}), held, _snapshot(D('108')))
     sell = runtime._bag_actions({}, state.model_copy(update={'claims': ()}), held, _snapshot(D('107.1')))
     create = [a for a in sell if isinstance(a, CreateExecutorAction)]
@@ -222,8 +222,8 @@ def test_runtime_stale_cancel_and_single_signal_per_candle(bag_recorder):
                                identifier='sell-1', timestamp=1.0))
     runtime = _runtime(bag_recorder, positions=[_position()], executors=[live])
     runtime.market = runtime.market.__class__(1_800_000_000, D('105.6'), D('80'), D('80'), False, False,
-                                              BagFeatures(D('80'), D('90'), D('0.1'), D('0'), D('0.002'), 'up',
-                                                          D('0.9')))
+                                              bag=BagFeatures(D('80'), D('90'), D('0.1'), D('0'), D('0.002'), 'up',
+                                                              D('0.9')))
     runtime._recovery_executors = lambda: {'sell-1': live}
     actions = runtime._bag_actions({}, state, held, _snapshot(D('105.6')))
     assert [a.executor_id for a in actions if isinstance(a, StopExecutorAction)] == ['sell-1']
@@ -271,6 +271,11 @@ def test_controller_config_requires_live_history_and_the_fixed_rsi_profile():
                                        exit_floor='live_no_loss').exit_floor == 'live_no_loss'
     with pytest.raises(ValueError):
         ModularSpotControllerConfig(**base, exit_floor='anything')
+    turn = ModularSpotControllerConfig(**base, max_records=1276, bag=BagConfig(), signal={'kind': 'rsi_turn'})
+    assert turn.signal.kind == 'rsi_turn'  # the OK RSI reversal entry composes with live bags
+    with pytest.raises(ValueError, match='RSI entry profile'):
+        ModularSpotControllerConfig(**base, max_records=1276, bag=BagConfig(), signal={'kind': 'breakout'},
+                                    acquisition={'fractions': ['1']})
 
 
 def test_native_entry_uses_live_adaptive_geometry_from_the_decision_candle_atr():

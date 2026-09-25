@@ -76,12 +76,12 @@ class ModularSpotControllerConfig(ControllerConfigBase):
             raise ValueError('unverified inventory adoption is not supported')
         if self.interval not in CandlesBase.interval_to_seconds:
             raise ValueError('unsupported native candle interval')
-        required = max(60, 2 * self.signal.rsi_length + 2, self.signal.breakout_lookback + 2)
+        required = self.signal.required_history
         if self.max_records < required + 1:
             raise ValueError('insufficient feature history plus open candle')
         if self.bag is not None or self.adaptive_trailing is not None:
-            if self.signal.kind != 'rsi_rebound' or self.universe.mode != 'fixed':
-                raise ValueError('bag and adaptive trailing require the fixed rsi_rebound profile')
+            if self.signal.kind not in {'rsi_rebound', 'rsi_turn'} or self.universe.mode != 'fixed':
+                raise ValueError('bag and adaptive trailing require a fixed-universe RSI entry profile')
             if self.interval != '1m':
                 raise ValueError('live OK RSI parity features are defined on 1m candles')
             records = (self.bag or BagConfig()).required_records()

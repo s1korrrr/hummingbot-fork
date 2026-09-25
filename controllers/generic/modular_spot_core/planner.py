@@ -70,7 +70,9 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     if (ask - bid) / bid > risk.max_spread_fraction:
         return revised, None, 'spread_limit'
     signal_result = signal_decision(signal, previous_rsi=market.previous_rsi, rsi=market.rsi,
-                                    breakout=market.breakout, trend_up=market.trend_up)
+                                    breakout=market.breakout, trend_up=market.trend_up,
+                                    turn=getattr(market, 'turn', False), score=getattr(market, 'score', 0),
+                                    atr_fraction=getattr(market, 'atr_fraction', None))
     if bag is not None:
         return _bag_entry(revised, inventory, bag, fingerprint=fingerprint, budget=budget, now=now, market=market,
                           bid=bid, available_quote=available_quote, amount_step=amount_step,

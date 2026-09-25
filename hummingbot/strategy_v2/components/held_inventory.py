@@ -316,20 +316,28 @@ def recovery_step(trail: Optional[RecoveryTrail], *, amount: Decimal, breakeven_
     if price > trail.peak_price:
         peak_rsi = rsi if rsi is not None and (trail.peak_rsi is None or rsi > trail.peak_rsi) else trail.peak_rsi
         return replace(trail, peak_price=price, peak_rsi=peak_rsi), "new_peak"
-    pullback = max((trail.peak_price - price) / trail.peak_price, ZERO) if trail.peak_price > 0 else ZERO
-    pullback_ready = trail.peak_price > 0 and pullback >= policy.recovery_trail_pullback_pct
-    rollover = (rsi is not None and trail.peak_rsi is not None
-                and rsi <= trail.peak_rsi - policy.recovery_rsi_rollover_delta)
-    below_ema = ema_fast is not None and price < Decimal(str(ema_fast))
+    pullback_ready, rollover_ready = trail_reversal(trail, price, rsi, ema_fast, policy)
     if pullback_ready:
         reason = "pullback-trail"
-    elif rollover and below_ema:
+    elif rollover_ready:
         reason = "rsi-rollover"
     elif sell_signal and not trend_hold:
         reason = "sell-signal"
     else:
         return trail, "hold"
     return trail, f"sell:{reason}"
+
+
+def trail_reversal(trail: Optional[RecoveryTrail], price: Decimal, rsi: Optional[float],
+                   ema_fast: Optional[float], policy: BagRecoveryPolicy) -> Tuple[bool, bool]:
+    """Mirror of ``_recovery_reversal_details``: (pullback from peak, RSI rollover below the fast EMA)."""
+    if trail is None or price is None or price <= 0 or trail.peak_price <= 0:
+        return False, False
+    pullback = max((trail.peak_price - price) / trail.peak_price, ZERO)
+    rollover = (rsi is not None and trail.peak_rsi is not None
+                and rsi <= trail.peak_rsi - policy.recovery_rsi_rollover_delta)
+    below_ema = ema_fast is not None and price < Decimal(str(ema_fast))
+    return pullback >= policy.recovery_trail_pullback_pct, bool(rollover and below_ema)
 
 
 def reanchor_after_sell(trail: RecoveryTrail, price: Decimal, rsi: Optional[float]) -> RecoveryTrail:

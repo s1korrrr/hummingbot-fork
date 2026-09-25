@@ -180,7 +180,7 @@ class DepthBudgetConfig(PolicyModel):
     lowers the breakeven so each further buy needs a deeper price. Not a live OK RSI setting.
     """
     budget_quote: Decimal = Field(gt=0)
-    lookback_minutes: int = Field(ge=60, le=20160, strict=True)
+    lookback_minutes: int = Field(ge=60, le=2999, strict=True)  # the controller keeps <= 3000 candles
     full_depth: Decimal = Field(gt=0, lt=1)
     base_fraction: Decimal = Field(ge=0, le=1)
 

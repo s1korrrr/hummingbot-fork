@@ -1,4 +1,5 @@
 """Native read/decision adapter. Persistence contains claims, never fill accounting."""
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ class ModularRuntime:
         self.fault = None
         self.reason = 'execution_disabled'
         self.coverage = None
+        self.bag_status = None  # last bag tick: reason, trail, held amount/breakeven, release state
         self.bindings.guard_resume(controller, self.bindings.recorder())
         self.pool = attach_pool(controller.market_data_provider, controller.config)
 
@@ -93,15 +95,20 @@ class ModularRuntime:
         try:
             now = p.time()
 
+            bag_config = self.bag_feature_config()
+
             def compute(frame):
                 return features(frame, now=now, interval=c.interval_seconds(), max_age=c.max_candle_age_seconds,
-                                policy=c.signal, trend_analyzer=self.bindings.trend)
+                                policy=c.signal, trend_analyzer=self.bindings.trend, bag_config=bag_config)
             if c.data.mode == 'shared':
                 if self.pool is None:
                     raise DataUnavailable('shared candle reader is stopped')
                 snapshot = self.pool.snapshot(dataset_for(c), now=now, max_age=c.max_candle_age_seconds)
+                spec = c.signal.model_dump(mode='json')
+                if bag_config is not None:  # other controllers keep their existing cache keys
+                    spec = {**spec, 'live_bag_features': bag_config.model_dump(mode='json')}
                 self.market = self.pool.features.get(
-                    snapshot, spec=c.signal.model_dump(mode='json'),
+                    snapshot, spec=spec,
                     implementation='modular-closed-features-v1:' + self.feature_implementation,
                     initialization='closed-bar-complete-window', now=now,
                     max_age=c.max_candle_age_seconds, compute=compute)
@@ -126,10 +133,23 @@ class ModularRuntime:
     def snapshot(self):
         return self.bindings.snapshot(self.controller)
 
+    def bag_mode(self):
+        return self.controller.config.bag is not None
+
+    def bag_feature_config(self):
+        c = self.controller.config
+        if c.bag is not None:
+            return c.bag
+        if c.adaptive_trailing is not None:
+            from .bag import BagConfig
+            return BagConfig()  # adaptive trailing needs the same closed-candle ATR features
+        return None
+
     def inventory(self):
         c = self.controller.config
         recorder = self.ensure_store().recorder
         kwargs = dict(controller_id=c.id, connector=c.connector_name, pair=c.trading_pair)
+        kwargs['bag_mode'] = self.bag_mode()
         saved = inventory_view(recorder.get_executors_by_controller(c.id), recorder.get_positions_by_controller(c.id), **kwargs)
         current = inventory_view(self.controller.executors_info, self.controller.positions_held, **kwargs)
         for key, value in current.items():
@@ -264,33 +284,48 @@ class ModularRuntime:
                 raise PolicyError('implementation/configuration changed')
             market = self.observe()
             if market is None:
-                return []
+                return self._bag_stops_only()
             allowed = self.acquisition_permitted()
             permission_reason = self.reason
             store = self.ensure_store()
             state, raw = store.load()
+            snapshot = self.snapshot()
+            inventory = self.inventory()
+            held = None
+            if self.bag_mode():
+                from .bag import HeldBag
+                held = HeldBag.from_positions(self.controller.positions_held, connector=c.connector_name,
+                                              pair=c.trading_pair)
             revised, proposal, reason = plan(
-                state, self.inventory(), fingerprint=self.fingerprint, budget=c.total_amount_quote,
+                state, inventory, fingerprint=self.fingerprint, budget=c.total_amount_quote,
                 now=self.controller.market_data_provider.time(), market=self.market,
                 signal=c.signal, acquisition=c.acquisition, risk=c.risk,
-                allow_acquisition=allowed, **self.snapshot())
-            config = self.bindings.config(c, proposal) if proposal is not None else None
+                allow_acquisition=allowed, bag=held, **snapshot)
+            # Live order: held-inventory stop/recovery proposals precede the entry proposal.
+            bag_actions = [] if held is None else self._bag_actions(inventory, state or revised, held, snapshot)
+            config = None
+            if proposal is not None:
+                # Only adaptive trailing needs the decision candle; other bindings keep (config, proposal).
+                config = (self.bindings.config(c, proposal, market=self.market) if c.adaptive_trailing is not None
+                          else self.bindings.config(c, proposal))
             if config is not None:
                 if self.budget is None:
                     self.reason = 'topology_unproven'
-                    return []
+                    return bag_actions
                 if not self.budget.reserve(self.reservation(config), native_executors=store.recorder.get_all_executors()):
                     self.reason = 'program_capital_or_asset_limit'
-                    return []
+                    return bag_actions
             # A group claim remains reserved if this second persistence boundary fails.
             if revised != state and not store.compare_and_swap(raw, revised):
                 raise PolicyError('decision CAS conflict; no dispatch')
             self.reason = permission_reason if reason == 'acquisition_disabled' else reason
-            self.pending = {key: value for key, value in self.pending.items() if key in revised.claims}
+            recovery = self._pending_recovery_ids()
+            self.pending = {key: value for key, value in self.pending.items()
+                            if key in revised.claims or key in recovery}
             self.pending_inputs = {key: value for key, value in self.pending_inputs.items() if key in revised.claims}
-            self.dispatched.intersection_update(revised.claims)
+            self.dispatched.intersection_update(set(revised.claims) | self._pending_recovery_ids())
             if config is None:
-                return []
+                return bag_actions
             group = c.budget.group if c.budget is not None else c.id
             freezer = self.selection_store
             if freezer is None:
@@ -299,15 +334,192 @@ class ModularRuntime:
             freezer.freeze(executor_id=config.id, trading_pair=c.trading_pair, policy_hash=self.fingerprint)
             self.pending[config.id] = config.model_copy(deep=True)
             self.pending_inputs[config.id] = dict(candle=market.candle_open, rows=self.decision_inputs(market.candle_open))
-            return [self.bindings.action(c.id, config)]
+            return [*bag_actions, self.bindings.action(c.id, config)]
         except DataUnavailable as exc:
             self.reason = f'data_hold:{exc}'
-            return []
+            return self._bag_stops_only()
         except ERRORS as exc:
             self.fault = f'{type(exc).__name__}:{exc}'
             self.reason = f'admission_hold:{self.fault}'
             self.controller.logger().error(self.reason)
             return []
+
+    # ------------------------------------------------------------------ held-inventory bag
+    RECOVERY_DISPATCH_SECONDS = 30  # an admitted recovery sell must appear as an executor within this bound
+
+    def _bag_store(self):
+        if getattr(self, '_bag_trail_store', None) is None:
+            from .bag import BagTrailStore
+            c = self.controller.config
+            self._bag_trail_store = BagTrailStore(self.ensure_store().recorder, c.id, c.connector_name,
+                                                  c.trading_pair, metadata_model=self.bindings.metadata_model)
+        return self._bag_trail_store
+
+    def _pending_recovery_ids(self):
+        from .bag import is_recovery_sell
+        return {key for key, value in self.pending.items() if is_recovery_sell(value)}
+
+    def _recovery_executors(self):
+        from .bag import is_recovery_sell
+        recorder = self.ensure_store().recorder
+        rows = {info.id: info for info in recorder.get_executors_by_controller(self.controller.config.id)
+                if is_recovery_sell(info.config)}
+        rows.update({info.id: info for info in self.controller.executors_info if is_recovery_sell(info.config)})
+        return rows
+
+    def _bag_actions(self, inventory, state, held, snapshot):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+        from .bag import LiveSell, decide, recovery_sell_config
+
+        c, now = self.controller.config, self.controller.market_data_provider.time()
+        recovery = self._recovery_executors()
+        for key in list(self.pending):  # created, or never dispatched within the bound
+            value = self.pending[key]
+            if key in self._pending_recovery_ids() and (
+                    key in recovery or now - float(value.timestamp) > self.RECOVERY_DISPATCH_SECONDS):
+                del self.pending[key]
+        live = [LiveSell(info.id, decimal(info.config.price, 'recovery proposal', positive=True))
+                for info in recovery.values() if info.is_active]
+        live += [LiveSell(key, decimal(value.price, 'recovery proposal', positive=True))
+                 for key, value in self.pending.items() if key in self._pending_recovery_ids()]
+        mid = (snapshot['bid'] + snapshot['ask']) / 2
+        store = self._bag_store()
+        trail, evaluated, raw = store.load()
+        market = self.market
+        result = decide(
+            c.bag, trail=trail, held=held, tranches=self._active_tranches(inventory, state), live_sells=live,
+            last_sell_price=self._last_sell_price(), mid=mid, best_ask=snapshot['ask'], features=market,
+            bag=market.bag, first_tick_after_close=evaluated is None or market.candle_open > evaluated,
+            tick=self._price_tick(), amount_step=snapshot['amount_step'],
+            minimum_amount=snapshot['minimum_amount'], minimum_notional=snapshot['minimum_notional'])
+        # The trail and the evaluated candle persist before any bag action is dispatched.
+        if not store.compare_and_swap(raw, result.trail, market.candle_open):
+            raise PolicyError('bag trail CAS conflict; no dispatch')
+        actions = [StopExecutorAction(controller_id=c.id, executor_id=key, keep_position=True)
+                   for key in dict.fromkeys((*result.cancels, *result.stops))]
+        if result.sell is not None:
+            identifier = identity([self.fingerprint, 'bag-sell', market.candle_open, now, str(result.sell.amount)])
+            config = recovery_sell_config(c, result.sell, identifier=identifier, timestamp=now)
+            self.pending[config.id] = config.model_copy(deep=True)
+            actions.append(self.bindings.action(c.id, config))
+        release = None if live or result.sell is not None else self._release_bag(held, mid, snapshot)
+        self.bag_status = {'reason': result.reason, 'held_amount': str(held.amount),
+                           'breakeven_price': str(held.breakeven_price),
+                           'trail_armed': result.trail is not None,
+                           'trail_peak': None if result.trail is None else str(result.trail.peak_price),
+                           'release': release or (self.bag_status or {}).get('release')}
+        return actions
+
+    @staticmethod
+    def _active_tranches(inventory, state):
+        from .bag import ActiveTranche
+        return [ActiveTranche(key, inventory[key].entry_price) for key in state.claims
+                if key in inventory and not inventory[key].terminal and inventory[key].remaining_base > 0]
+
+    def _last_sell_price(self):
+        """Live ``_last_same_side_ref_price(SELL)``: the newest SELL that is active or filled among
+        the orchestrator's executors for this controller (active plus its 20 most recent stored)."""
+        from .bag import is_recovery_sell
+        candidates = [info for info in self.controller.executors_info if is_recovery_sell(info.config)
+                      and (info.is_active or decimal(getattr(info, 'filled_amount_quote', 0) or 0, 'sell fill') > 0)]
+        latest = max(candidates, key=lambda info: float(info.close_timestamp or info.timestamp or 0), default=None)
+        return None if latest is None else decimal(latest.config.price, 'last sell', positive=True)
+
+    def _bag_stops_only(self):
+        """Live stops a tranche 3% under its fill basis every tick from mid alone, so candle or
+        feature outages never suspend bag creation. Nothing else runs without features."""
+        c = self.controller.config
+        if c.bag is None or not c.execution_enabled or c.manual_kill_switch or self.fault:
+            return []
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+        from .bag import should_hold_as_bag
+        try:
+            state, _ = self.ensure_store().load()
+            if state is None:
+                return []
+            # Live needs only the book: a stale native report must not suspend bag creation.
+            getter = self.controller.market_data_provider.get_price_by_type
+            bid = decimal(getter(c.connector_name, c.trading_pair, PriceType.BestBid), 'bid', positive=True)
+            ask = decimal(getter(c.connector_name, c.trading_pair, PriceType.BestAsk), 'ask', positive=True)
+            if ask < bid:
+                return []
+            mid = (bid + ask) / 2
+            policy = c.bag.policy()
+            return [StopExecutorAction(controller_id=c.id, executor_id=t.executor_id, keep_position=True)
+                    for t in self._active_tranches(self.inventory(), state)
+                    if should_hold_as_bag(t.fill_basis, mid, policy)]
+        except (DataUnavailable, *ERRORS) as exc:
+            self.controller.logger().warning(f'bag stop check unavailable: {type(exc).__name__}:{exc}')
+            return []
+
+    def _release_bag(self, held, mid, snapshot):
+        """Durably release held tranches once the bag is empty (dust), but only when the
+        unreleased held receipts minus the finished recovery sells agree with the held
+        position. Disagreement keeps the capital reserved and is reported, never guessed."""
+        from hummingbot.strategy_v2.components.held_inventory import held_is_dust
+
+        from .bag import is_recovery_sell
+        c = self.controller.config
+        if self.budget is None:
+            return None
+        min_amount = max(snapshot['amount_step'], snapshot['minimum_amount'])
+        if not held_is_dust(held.amount, mid, min_amount=min_amount, min_notional=snapshot['minimum_notional']):
+            return None
+        released = self.budget.released()
+        evidence = self.ensure_store().recorder.get_all_executors()
+        own = [info for info in evidence if info.controller_id == c.id and info.id not in released]
+        rows, sells = [], []
+        for info in own:
+            if is_recovery_sell(info.config):
+                if info.is_active or info.is_done is not True:
+                    return 'unproven:recovery_sell_live'
+                sells.append(info)
+                continue
+            receipt = (info.custom_info or {}).get('execution_receipt') or {}
+            if (info.is_done is True and receipt.get('accounting_owner') == 'held_position'
+                    and decimal(receipt.get('remaining_owned_base'), 'held receipt') > 0):
+                rows.append(info)
+        if not rows:
+            return None
+        residual = (sum((decimal(i.custom_info['execution_receipt']['remaining_owned_base'], 'held receipt')
+                         for i in rows), Decimal('0'))
+                    - sum((decimal(i.custom_info.get('executed_amount_base', 0), 'sold base') for i in sells),
+                          Decimal('0')))
+        tolerance = max(min_amount, snapshot['minimum_notional'] / mid)
+        if abs(residual - held.amount) > tolerance:
+            self.controller.logger().warning(
+                f'bag release unproven: receipts leave {residual}, held position {held.amount}')
+            return 'unproven:receipts_disagree'
+        self.budget.release_held(c.id, [i.id for i in (*rows, *sells)], native_executors=evidence)
+        return f'released:{len(rows)}_held:{len(sells)}_sells'
+
+    def _price_tick(self):
+        c = self.controller.config
+        connector = self.controller.market_data_provider.connectors[c.connector_name]
+        return decimal(connector.trading_rules[c.trading_pair].min_price_increment, 'price increment', positive=True)
+
+    def recovery_permission(self, config):
+        from .bag import HeldBag, is_recovery_sell
+        c = self.controller.config
+        if (c.bag is None or not c.execution_enabled or c.manual_kill_switch or self.fault or config is None
+                or not is_recovery_sell(config) or self.pending.get(config.id) != config):
+            return False
+        try:
+            if c.fingerprint() != self.fingerprint:
+                raise PolicyError('implementation/configuration changed')
+            if any(info.id != config.id and info.is_active for info in self._recovery_executors().values()):
+                return False  # one live recovery sell per bag, as in live OK RSI
+            held = HeldBag.from_positions(self.controller.positions_held, connector=c.connector_name,
+                                          pair=c.trading_pair)
+            return (config.min_sell_price is not None and config.connector_name == c.connector_name
+                    and config.trading_pair == c.trading_pair and 0 < config.amount <= held.amount)
+        except ERRORS as exc:
+            self.fault = f'{type(exc).__name__}:{exc}'
+            self.reason = f'recovery_permission_hold:{self.fault}'
+            self.controller.logger().error(self.reason)
+            return False
 
     def entry_permission(self, config, *, check_funds=True):
         c = self.controller.config
@@ -323,8 +535,7 @@ class ModularRuntime:
                 return False
             if self.budget is None:
                 return False
-            if not self.budget.contains(
-                    self.reservation(config), native_executors=store.recorder.get_all_executors()):
+            if not self.budget.contains(self.reservation(config), native_executors=store.recorder.get_all_executors()):
                 raise PolicyError('group capital reservation is unavailable')
             snapshot = self.snapshot()
             now = decimal(self.controller.market_data_provider.time(), 'now')
@@ -376,6 +587,13 @@ class ModularRuntime:
                 raise PolicyError('sell-only factory refuses buy, short, or ungranted requests')
             self.dispatched.add(config.id)
             return sell_only.ModularReduceExecutor
+        from .bag import is_recovery_sell
+        if is_recovery_sell(config):
+            if not self.recovery_permission(config):
+                raise PolicyError('ungranted recovery sell request')
+            self.dispatched.add(config.id)
+            from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
+            return OrderExecutor
         if not self.entry_permission(config):
             raise PolicyError('ungranted or already consumed modular executor request')
         self.dispatched.add(config.id)

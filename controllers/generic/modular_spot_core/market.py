@@ -1,7 +1,7 @@
 """Causal, controller-local candle features; the shared feed is never mutated."""
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,7 @@ class MarketFeatures:
     turn: bool = False
     score: int = 0
     atr_fraction: Decimal | None = None
+    bag: Optional[object] = None  # BagFeatures when live OK RSI parity features are enabled
 
 
 def wilder_rsi(close: np.ndarray, length: int) -> np.ndarray:
@@ -83,7 +84,7 @@ def atr_fraction(data: pd.DataFrame, length: int) -> Decimal | None:
 
 
 def features(frame: pd.DataFrame, *, now: float, interval: int, max_age: int,
-             policy: SignalPolicy, trend_analyzer: Callable) -> MarketFeatures:
+             policy: SignalPolicy, trend_analyzer: Callable, bag_config=None) -> MarketFeatures:
     now = float(decimal(now, 'now'))
     if type(interval) is not int or interval <= 0 or type(max_age) is not int or max_age <= 0:
         raise PolicyError('invalid candle clock')
@@ -114,9 +115,16 @@ def features(frame: pd.DataFrame, *, now: float, interval: int, max_age: int,
     if trend is None or trend.is_valid is not True or trend.direction.value not in {'up', 'down', 'range'}:
         raise PolicyError('native trend context unavailable')
     prior_high = data.high.iloc[-policy.breakout_lookback - 1:-1].max()
+    bag = None
+    if bag_config is not None:
+        from .bag import bag_features
+        if len(data) < bag_config.required_records() - 1:
+            raise PolicyError('bag feature history unavailable')
+        bag = bag_features(data, rsi_prev=values[-2], now=now, short_records=bag_config.trend_short_records,
+                           higher_records=bag_config.trend_higher_records, adx_threshold=bag_config.trend_adx_threshold)
     rsi = pd.Series(values)
     return MarketFeatures(int(data.timestamp.iloc[-1]), Decimal(str(data.close.iloc[-1])),
                           Decimal(str(values[-2])), Decimal(str(values[-1])),
                           bool(data.close.iloc[-1] > prior_high), trend.direction.value == 'up',
                           turn=reversal_turn(rsi, policy), score=confluence_score(data, rsi, policy),
-                          atr_fraction=atr_fraction(data, policy.atr_length))
+                          atr_fraction=atr_fraction(data, policy.atr_length), bag=bag)

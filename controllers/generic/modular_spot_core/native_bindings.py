@@ -91,10 +91,11 @@ class NativeBindings:
         return rate <= controller.config.risk.fee_reserve_fraction
 
     @staticmethod
-    def config(controller_config, proposal):
+    def config(controller_config, proposal, market=None):
         from .execution import native_config
         return native_config(controller_config, identifier=proposal.identifier, timestamp=proposal.timestamp,
-                             price=proposal.price, amount=proposal.amount, cycle=proposal.cycle, stage=proposal.stage)
+                             price=proposal.price, amount=proposal.amount, cycle=proposal.cycle, stage=proposal.stage,
+                             market=market)
 
     @staticmethod
     def action(controller_id, config):

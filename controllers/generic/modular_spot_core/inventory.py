@@ -14,16 +14,27 @@ class InventoryView:
     terminal: bool
     entry_terminal: bool
     held: bool
+    planned_quote: Decimal = Decimal('0')  # config amount * entry price; capital a live tranche may still use
 
 
-def inventory_view(executors, positions, *, controller_id: str, connector: str, pair: str):
+def inventory_view(executors, positions, *, controller_id: str, connector: str, pair: str, bag_mode: bool = False):
+    """Owned BUY tranche receipts. In bag mode the controller's held position is its bag
+    (read separately) and its own recovery SELL executors are not tranches."""
+    from .bag import is_recovery_sell
+
     result = {}
-    for position in positions:
-        if decimal(position.amount, 'held amount') > 0:
-            raise PolicyError('held_inventory_requires_reconciliation')
+    if not bag_mode:
+        for position in positions:
+            if decimal(position.amount, 'held amount') > 0:
+                raise PolicyError('held_inventory_requires_reconciliation')
     for info in executors:
         try:
             config = info.config
+            if bag_mode and is_recovery_sell(config):
+                if (info.controller_id != controller_id or config.connector_name != connector
+                        or config.trading_pair != pair):
+                    raise PolicyError('native executor ownership mismatch')
+                continue
             if (info.controller_id != controller_id or config.controller_id != controller_id
                     or config.connector_name != connector or config.trading_pair != pair
                     or config.side.name != 'BUY' or not str(config.level_id).startswith('modular_spot:v1:')):
@@ -45,6 +56,8 @@ def inventory_view(executors, positions, *, controller_id: str, connector: str, 
                 remaining, spent, entry_price, sold, info.is_done,
                 info.is_done or lifecycle in {'managing_fill', 'ended_no_fill', 'held_residual'},
                 owner == 'held_position' and remaining > 0,
+                (decimal(config.amount, 'planned amount') * decimal(config.entry_price, 'planned price'))
+                if bag_mode else Decimal('0'),
             )
         except (KeyError, TypeError, AttributeError) as exc:
             raise PolicyError('native execution receipt unavailable') from exc

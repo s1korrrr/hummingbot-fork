@@ -143,6 +143,8 @@ class V2WithControllers(StrategyV2Base):
         if getattr(self, '_risk_reconciliation_error', None) is not None:
             self._is_stop_triggered = True
             return False
+        if getattr(self, '_controller_reports_valid', True) is False:
+            return False  # ported from live V1: never size a new entry from an invalid report
         try:
             if self._funding_scope_owners and (
                     set(self.controllers) != {owner.config.id for owner in self._funding_scope_owners}
@@ -359,7 +361,11 @@ class V2WithControllers(StrategyV2Base):
             self.check_max_global_drawdown()
 
     def _drawdown_pnl(self, controller_id):
+        if getattr(self, "_controller_reports_valid", True) is False:
+            return None
         report = self.get_performance_report(controller_id)
+        if report is None:
+            return None
         value = getattr(report, "global_pnl_quote", None)
         if getattr(report, "pnl_available", True) and value is not None:
             if not value.is_finite():

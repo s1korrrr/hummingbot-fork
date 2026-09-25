@@ -142,10 +142,12 @@ def maker_sell_price(mid_price: Decimal, best_ask: Decimal, tick: Decimal) -> De
 
 
 def sell_trend_hold(strong_bullish_trend: bool, price: Decimal, rsi: Optional[float], rsi_prev: Optional[float],
-                    ema_fast: Optional[float], sell_rsi_rollover_delta: float) -> bool:
-    """Mirror of ``_sell_trend_hold_active`` on the recovery path (the evaluated trail has no reversal):
-    hold a sell signal only in a strong bullish trend without an RSI rollover below the fast EMA."""
-    if not strong_bullish_trend:
+                    ema_fast: Optional[float], sell_rsi_rollover_delta: float, *,
+                    trail_reversal_ready: bool = False) -> bool:
+    """Mirror of ``_sell_trend_hold_active``: hold only in a strong bullish trend when no recovery
+    trail (including one frozen behind a live sell) is reversal-ready and there is no RSI rollover
+    below the fast EMA."""
+    if not strong_bullish_trend or trail_reversal_ready:
         return False
     rollover = rsi is not None and rsi_prev is not None and (rsi_prev - rsi) >= sell_rsi_rollover_delta
     below_ema = ema_fast is not None and price < Decimal(str(ema_fast))

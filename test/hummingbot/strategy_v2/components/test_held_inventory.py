@@ -401,7 +401,12 @@ class EarlyStopAndStaleCancelParityTest(unittest.TestCase):
         self.assertGreater(stops, 50)
 
     def test_stale_cancel_matches_live(self):
-        from hummingbot.strategy_v2.components.held_inventory import sell_trend_hold, stale_recovery_sell
+        from hummingbot.strategy_v2.components.held_inventory import (
+            RecoveryTrail,
+            sell_trend_hold,
+            stale_recovery_sell,
+            trail_reversal,
+        )
         from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
 
         helper = OKRSIRecoveryParityTest()
@@ -416,6 +421,20 @@ class EarlyStopAndStaleCancelParityTest(unittest.TestCase):
                 bot.executors_info = [SimpleNamespace(
                     id="sell", is_active=True, connector_name="okx", trading_pair="BNB-USDC", side=TradeType.SELL,
                     type="order_executor", config=SimpleNamespace(price=proposal), custom_info={"level_id": "recovery_exit:k"})]
-                live = any(isinstance(a, StopExecutorAction) for a in bot._maybe_cancel_stale_recovery_sell_executors(price))
-                hold = sell_trend_hold(strong_up, price, 80.0, 79.0, 600.0, bot.config.sell_rsi_rollover_delta)
-                self.assertEqual(live, stale_recovery_sell(hold, price, proposal, D("0.005")), (strong_up, move))
+                for reversing in (False, True):
+                    bot._recovery_trails = {}
+                    trail = None
+                    if reversing:  # a frozen trail whose peak is 1% above: pullback reversal ready
+                        from controllers.directional_trading.hl_rsi import RecoveryTrailState
+                        peak = price * D("1.01")
+                        bot._recovery_trails = {"k": RecoveryTrailState(
+                            position_key="k", armed_timestamp=0.0, arm_price=peak, peak_price=peak,
+                            tracked_amount=D("1"), peak_rsi=80.0, target_profit_pct=D("0.04"), last_reason="armed")}
+                        trail = RecoveryTrail(D("600"), peak, peak, 80.0, D("1"))
+                    live = any(isinstance(a, StopExecutorAction)
+                               for a in bot._maybe_cancel_stale_recovery_sell_executors(price))
+                    ready = any(trail_reversal(trail, price, 80.0, 600.0, BagRecoveryPolicy()))
+                    hold = sell_trend_hold(strong_up, price, 80.0, 79.0, 600.0, bot.config.sell_rsi_rollover_delta,
+                                           trail_reversal_ready=ready)
+                    self.assertEqual(live, stale_recovery_sell(hold, price, proposal, D("0.005")),
+                                     (strong_up, move, reversing))

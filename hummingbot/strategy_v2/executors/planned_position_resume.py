@@ -44,6 +44,7 @@ SOURCES = (
     'controllers/directional_trading/ok_rsi_core/down_only_entry.py',
     'controllers/directional_trading/ok_rsi_core/execution.py',
 )
+STARTUP_SEALED_RESTORE = 'startup-sealed-restore'  # legacy V1 marker written by local sealed restore
 TRAILING_KEYS = ('trailing_state', 'trailing_stop_trigger_pct', 'trailing_move_count',
                  'trailing_armed_timestamp', 'trailing_last_update_timestamp')
 BOUND_TABLES = ('Executors', 'Order', 'OrderStatus', 'TradeFill', 'OrderExact', 'TradeFillExact',
@@ -744,7 +745,8 @@ def consumed_history(connection, pending_id=None):
         for executor in connection.execute('SELECT id, custom_info FROM Executors'):
             custom = json.loads(executor['custom_info'] or '{}')
             reference = custom.get('planned_position_resume') if isinstance(custom, dict) else None
-            if reference is not None:
+            # V1's local startup sealed restore marker is not a consumed PlannedPositionResume receipt.
+            if reference is not None and reference != STARTUP_SEALED_RESTORE:
                 require(reference in payloads and any(position.get('executor_id') == executor['id']
                         for position in payloads[reference]['positions']),
                         'executor references missing or mismatched consumed manifest history')

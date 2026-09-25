@@ -33,6 +33,14 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
     TrailingStop,
     parse_position_config,
 )
+from hummingbot.strategy_v2.executors.restart_continuity import (
+    RESTART_ENTRY_STOP_REASON,
+    RESTART_RESTORE_KEY,
+    RESTART_SUSPEND_KEY,
+    TERMINAL_STATES,
+    ContinuityPlan,
+    RestartContinuityError,
+)
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
@@ -241,6 +249,15 @@ class PositionExecutor(ExecutorBase):
         self._entry_lifecycle: Dict = {"state": "awaiting_submission", "stop_reason": None}
         self._close_quantity: Dict = {}
         self._exit_trigger_reason: Optional[str] = None
+        # Restart continuity: a planned restart suspends (row stays RUNNING);
+        # a restored executor resumes its persisted lifecycle exactly.
+        self._restart_suspend_requested: bool = False
+        self._restart_suspended: Optional[Dict] = None
+        self._restart_restored: Optional[Dict] = None
+        self._restart_stop_entry_pending: bool = False
+        self._restart_target_status: Optional[RunnableStatus] = None
+        self._restart_target_close_type: Optional[CloseType] = None
+        self._restart_demote_to_hold: Optional[str] = None
 
         self._total_executed_amount_backup: Decimal = Decimal("0")
         self._current_retries = 0
@@ -328,6 +345,152 @@ class PositionExecutor(ExecutorBase):
         self._trailing_stop_last_update_timestamp = trailing["trailing_last_update_timestamp"]
         if self.amount_to_close != Decimal(position["net_base"]):
             raise ValueError("Hydrated owned inventory differs from sealed receipt")
+
+    def _continuity_tracked(self, order: InFlightOrder) -> TrackedOrder:
+        """Bind a persisted order to the connector's live tracker object.
+
+        A non-terminal snapshot is handed back to the tracker so venue status and
+        fill polling reconcile what happened while the process was down.
+        """
+        tracked = TrackedOrder(order_id=order.client_order_id)
+        live = self.get_in_flight_order(self.config.connector_name, order.client_order_id)
+        if live is not None:
+            if (live.trading_pair != order.trading_pair or live.trade_type != order.trade_type
+                    or (order.exchange_order_id and live.exchange_order_id
+                        and live.exchange_order_id != order.exchange_order_id)):
+                raise RestartContinuityError("Tracked order identity differs from executor snapshot")
+            if live.executed_amount_base < order.executed_amount_base:
+                raise RestartContinuityError("Tracked order has fewer fills than executor snapshot")
+            tracked.order = live
+            return tracked
+        if order.current_state not in TERMINAL_STATES:
+            tracker = getattr(self.connectors[self.config.connector_name], "_order_tracker", None)
+            if tracker is None or not callable(getattr(tracker, "start_tracking_order", None)):
+                raise RestartContinuityError("Open order cannot be handed back to the connector tracker")
+            tracker.start_tracking_order(order)
+        tracked.order = order
+        return tracked
+
+    def hydrate_restart_continuity(self, plan: ContinuityPlan):
+        """Rebuild this unstarted executor from its persisted row (planned or crash restart)."""
+        if self.status != RunnableStatus.NOT_STARTED or self._open_order is not None:
+            raise RestartContinuityError("Executor must be new and unstarted before continuity hydration")
+        if plan.executor_id != self.config.id:
+            raise RestartContinuityError("Continuity plan belongs to another executor")
+        custom = plan.custom_info
+        entries = [self._continuity_tracked(order) for order in plan.entry_orders]
+        exits = [self._continuity_tracked(order) for order in plan.exit_orders]
+        self._completed_open_orders = entries[:-1]
+        self._open_order = entries[-1] if entries else None
+        open_exit = plan.open_exit_order
+        self._completed_close_orders = [item for item in exits
+                                        if open_exit is None or item.order_id != open_exit.client_order_id]
+        self._close_order = next((item for item in exits
+                                  if open_exit is not None and item.order_id == open_exit.client_order_id), None)
+        if self._close_order is not None and plan.close_type is None:
+            # A resting exit while RUNNING is the take-profit limit order, not a triggered close.
+            self._take_profit_limit_order, self._close_order = self._close_order, None
+        self._entry_submitted = bool(entries)
+        lifecycle = custom.get("entry_lifecycle")
+        if isinstance(lifecycle, dict):
+            self._entry_lifecycle = {key: value for key, value in copy.deepcopy(lifecycle).items() if key != "policy"}
+            self._entry_lifecycle.setdefault("state", "managing_fill")
+            self._entry_stop_reason = lifecycle.get("stop_reason")
+        self._entry_reconciliation = copy.deepcopy(custom.get("entry_reconciliation"))
+        self._open_order_entry_expired = bool(custom.get("open_order_entry_expired"))
+        self._open_order_expiry_reconciled = bool(custom.get("open_order_expiry_reconciled"))
+        self._planned_resume_id = custom.get("planned_position_resume")
+        self._planned_resume_compatibility = copy.deepcopy(custom.get("planned_position_resume_compatibility_v1"))
+        retries = custom.get("current_retries") or 0
+        self._current_retries = retries if isinstance(retries, int) and not isinstance(retries, bool) else 0
+        self._exit_trigger_reason = custom.get("exit_trigger_reason")
+        self._close_quantity = copy.deepcopy(custom.get("close_quantity") or {})
+        self._held_position_orders = copy.deepcopy(custom.get("held_position_orders") or [])
+        trailing = plan.trailing
+        self._trailing_stop_trigger_pct = trailing["trailing_stop_trigger_pct"]
+        self._trailing_stop_move_count = trailing["trailing_move_count"]
+        self._trailing_stop_armed_timestamp = trailing["trailing_armed_timestamp"]
+        self._trailing_stop_last_update_timestamp = trailing["trailing_last_update_timestamp"]
+        last_entry = self._open_order.order if self._open_order is not None else None
+        entry_fully_filled = (last_entry is not None and last_entry.current_state == OrderState.FILLED
+                              and last_entry.executed_amount_base == last_entry.amount)
+        if entry_fully_filled and all(item.order.current_state in TERMINAL_STATES for item in entries):
+            # Terminal entry facts are sealed: late tracker events cannot rewrite them.
+            self._resume_entry_sealed = True
+            self._entry_lifecycle["state"] = "managing_fill"
+        elif not plan.entry_terminal or not entries:
+            # An open entry, or a row checkpointed before its entry order was recorded
+            # (crash window): never submit a new entry for this intent.
+            self._restart_stop_entry_pending = True
+        self._restart_target_status = plan.status
+        self._restart_target_close_type = plan.close_type
+        self._restart_restored = {
+            "suspended": plan.suspended,
+            "prior_status": plan.status.name,
+            "prior_close_type": plan.close_type.name if plan.close_type is not None else None,
+            "restored_at": self._strategy.current_timestamp,
+            "trailing_stop_trigger_pct": (str(self._trailing_stop_trigger_pct)
+                                          if self._trailing_stop_trigger_pct is not None else None),
+            "notes": list(plan.notes),
+        }
+        persisted_remaining = custom.get("remaining_position_amount_base")
+        if persisted_remaining is not None and plan.entry_terminal and plan.open_exit_order is None:
+            if Decimal(str(persisted_remaining)) != self.amount_to_close - self._closed_residual_dust():
+                raise RestartContinuityError("Rebuilt inventory differs from persisted remaining position")
+
+    def demote_restored_to_hold(self, reason: str):
+        """Hand an unprovable restored position to the held ledger on its first tick."""
+        self._restart_demote_to_hold = reason
+
+    def stop_entry_acquisition(self, reason: str):
+        """Stop buying without touching the filled position or its exit barriers."""
+        if self.is_closed or self.status == RunnableStatus.SHUTTING_DOWN:
+            return
+        if self._open_order is None and self._entry_submitted is False and self.open_filled_amount <= 0:
+            # Nothing was ever recorded for this intent: end it without an order.
+            self._end_entry_acquisition(reason)
+            self._entry_lifecycle["state"] = "ended_no_fill"
+            self.close_type = CloseType.EXPIRED
+            self.stop()
+            return
+        if self._entry_terminal_confirmed():
+            return  # nothing left to acquire; the filled position keeps its exit barriers
+        self._end_entry_acquisition(reason)
+        if self.config.entry_order_policy != "single_attempt":
+            self._open_order_entry_expired = True  # retry policy cancels the resting entry and never replaces it
+
+    def suspend_for_restart(self) -> bool:
+        """Request a planned-restart suspension; the row stays RUNNING for exact restore."""
+        if self.is_closed or self.status != RunnableStatus.RUNNING:
+            return False
+        self._restart_suspend_requested = True
+        return True
+
+    @property
+    def is_restart_suspended(self) -> bool:
+        return self._restart_suspended is not None
+
+    def _advance_restart_suspend(self):
+        if not self._restart_suspend_requested or self.status != RunnableStatus.RUNNING or self.is_closed:
+            return
+        if not self._entry_terminal_confirmed():
+            self.stop_entry_acquisition(RESTART_ENTRY_STOP_REASON)
+            return  # wait for the venue to acknowledge the entry cancel (or fill)
+        if self._close_order is not None and not self._close_order.is_done:
+            return  # an exit in flight settles before suspension
+        self._restart_suspended = {
+            "timestamp": self._strategy.current_timestamp,
+            "wall_timestamp": time.time(),
+            "reason": "planned_restart",
+            "remaining_position_amount_base": str(self.amount_to_close),
+        }
+        MarketsRecorder.get_instance().store_or_update_executor(self)
+        self.logger().info(self._log_message(
+            f"Suspended for restart remaining_base={self.amount_to_close} "
+            f"trailing_trigger={self._trailing_stop_trigger_pct} moves={self._trailing_stop_move_count}"
+        ))
+        self.terminated.set()
+        self.unregister_events()
 
     def stop(self):
         task = self._funding_entry_reconciliation_task
@@ -993,6 +1156,15 @@ class PositionExecutor(ExecutorBase):
         """
         if self._resume_conflicting_fill is not None or self._stack_recovery_required():
             return  # Keep ownership; only explicit reconciliation can resolve a sealed receipt conflict.
+        if (self._restart_demote_to_hold is not None
+                and self.status in (RunnableStatus.RUNNING, RunnableStatus.SHUTTING_DOWN)):
+            self.logger().warning(self._log_message(
+                f"Restored position handed to held ledger reason={self._restart_demote_to_hold}"))
+            self._restart_demote_to_hold = None
+            self.early_stop(keep_position=True)
+        if self._restart_stop_entry_pending and self.status == RunnableStatus.RUNNING:
+            self._restart_stop_entry_pending = False
+            self.stop_entry_acquisition(RESTART_ENTRY_STOP_REASON)
         if self.status == RunnableStatus.RUNNING:
             self.control_open_order()
             await self._reconcile_expired_entry()
@@ -1002,7 +1174,9 @@ class PositionExecutor(ExecutorBase):
                 self.control_barriers()
         elif self.status == RunnableStatus.SHUTTING_DOWN:
             await self.control_shutdown_process()
-        self.evaluate_max_retries()
+        self._advance_restart_suspend()
+        if not self.terminated.is_set():
+            self.evaluate_max_retries()
 
     def all_orders_completed(self):
         """
@@ -1133,6 +1307,11 @@ class PositionExecutor(ExecutorBase):
 
         :return: None
         """
+        if self._restart_restored is not None:
+            if self._restart_target_status == RunnableStatus.SHUTTING_DOWN:
+                self.close_type = self._restart_target_close_type
+                self._status = RunnableStatus.SHUTTING_DOWN
+            return  # The entry was submitted before the restart; its balance check already ran.
         if self._resume_entry_sealed:
             return  # Native barriers retain original end_time; entry balance/expiry checks do not apply.
         await super().on_start()
@@ -1942,6 +2121,8 @@ class PositionExecutor(ExecutorBase):
             "planned_position_resume_compatibility_v1": copy.deepcopy(self._planned_resume_compatibility),
             "resume_entry_sealed": self._resume_entry_sealed,
             "resume_conflicting_fill": self._resume_conflicting_fill,
+            RESTART_SUSPEND_KEY: copy.deepcopy(self._restart_suspended),
+            RESTART_RESTORE_KEY: copy.deepcopy(self._restart_restored),
             "level_id": level_id,
             "role": role,
             "current_position_average_price": self.entry_price,

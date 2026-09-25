@@ -291,9 +291,9 @@ class OKRSIController(hl_rsi.HLRSIController):
         actions = super().stop_actions_proposal()
         if self._entry_acquisition_policy != "down_only_maker_v1":
             return actions
-        # Operator pause refuses new BUY in can_create_executor. It must not
-        # POSITION_HOLD a filled trailing owner or an empty unfilled remainder.
-        # Kill and opposing signal stay broader and still stop the executor.
+        # Operator pause refuses new BUY in can_create_executor. Kill switch and
+        # opposing signal stop only the entry acquisition: the resting remainder
+        # is cancelled, filled inventory keeps its trailing exit and no-loss floor.
         invalidated = (
             (self.processed_data or {}).get("signal", 0) < 0
             or bool(getattr(self.config, "manual_kill_switch", False))
@@ -314,13 +314,25 @@ class OKRSIController(hl_rsi.HLRSIController):
                 getattr(executor, "is_active", False)
                 and isinstance(executor_config, DownOnlyMakerPositionExecutorConfig)
                 and executor.id not in existing_ids
+                and self._entry_acquisition_open(executor)
             ):
                 actions.append(StopExecutorAction(
                     controller_id=self.config.id,
                     executor_id=executor.id,
                     keep_position=True,
+                    acquisition_only=True,
                 ))
         return actions
+
+    @staticmethod
+    def _entry_acquisition_open(executor) -> bool:
+        custom = getattr(executor, "custom_info", None) or {}
+        acquisition = custom.get("entry_acquisition") if isinstance(custom.get("entry_acquisition"), dict) else {}
+        lifecycle = custom.get("entry_lifecycle") if isinstance(custom.get("entry_lifecycle"), dict) else {}
+        if acquisition.get("terminal_reason") is not None or lifecycle.get("stop_reason") is not None:
+            return False
+        state = acquisition.get("state", lifecycle.get("state"))
+        return state not in {"managing_fill", "ended_no_fill", "held_residual"}
 
     def get_executor_class_for_config(self, config):
         runtime = self._episode_runtime

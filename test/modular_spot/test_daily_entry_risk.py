@@ -54,6 +54,7 @@ async def test_genuine_runner_persists_daily_entry_pause_without_stopping_native
             owner._status = RunnableStatus.RUNNING
             report = SimpleNamespace(pnl_available=True, global_pnl_quote=D('0'))
             strategy.controller_reports = {OWNER: {'performance': report}}
+            strategy._controller_reports_valid = True  # fresh reports, as on every live tick
             buy = SimpleNamespace(controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.BUY))
             sell = SimpleNamespace(controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.SELL))
             assert strategy.validate_create_action(buy)

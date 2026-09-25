@@ -33,10 +33,10 @@ async def test_assessment_is_read_only_and_exposes_binding_failure_before_signal
             assert [(row.key, row.value) for row in sql.query(Metadata).all()] == before
         raw, state = store._load()
         assert store._write(raw, state)
-        owner._native_source_hash = 'e' * 64
+        owner._composition_digest = 'e' * 64  # a trading-configuration change is never carried forward
         owner._funding_store = None
         owner._refresh_funding_assessment()
-        assert 'FUNDING_BINDING_MISMATCH' in owner._funding_assessment_hold
+        assert owner._funding_assessment_hold  # configuration change: refused, never carried forward
         assert owner.get_custom_info()['entry_admission']['state'] == 'blocked'
         assert session.recorder.get_all_executors() == []
         assert session._connector.in_flight_orders == {}

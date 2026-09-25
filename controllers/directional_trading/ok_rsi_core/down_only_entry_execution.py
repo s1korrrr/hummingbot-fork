@@ -141,6 +141,37 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         self._entry_lifecycle.update(order_id=self._open_order.order_id,
                                      generation=self._entry_reprice_count)
 
+    def hydrate_restart_continuity(self, plan):
+        super().hydrate_restart_continuity(plan)
+        custom = plan.custom_info
+        acquisition = custom.get("entry_acquisition") if isinstance(custom.get("entry_acquisition"), dict) else {}
+        if acquisition.get("current_order_price") not in (None, "None"):
+            self._entry_current_price = Decimal(str(acquisition["current_order_price"]))
+        reprice_count = acquisition.get("reprice_count")
+        if isinstance(reprice_count, int) and not isinstance(reprice_count, bool) and reprice_count >= 0:
+            self._entry_reprice_count = reprice_count
+        if acquisition.get("terminal_reason") is not None:
+            self._entry_stop_reason = acquisition["terminal_reason"]
+        if self._v2_chain:
+            chain = custom.get("acquisition_chain")
+            if isinstance(chain, dict):
+                self._entry_chain_children = copy.deepcopy(chain.get("children") or [])
+            self._entry_child_lifecycles = copy.deepcopy(custom.get("entry_child_lifecycles") or {})
+        self._entry_submission_uncertain = False
+        self._clear_replacement()
+
+    def stop_entry_acquisition(self, reason: str):
+        """Stop the maker acquisition only; filled inventory keeps its trailing exit."""
+        if self.is_closed or self.status == RunnableStatus.SHUTTING_DOWN:
+            return
+        if (self._open_order is None and not self._entry_submitted
+                and self._cumulative_entry_filled_base() <= Decimal("0")):
+            self._request_terminal_cancel(reason)  # no recorded order: end the intent, never submit one
+            return
+        if self._entry_terminal_confirmed():
+            return  # nothing left to acquire; never cancel a terminal (filled) entry
+        self._request_terminal_cancel(reason)
+
     @property
     def _v2_chain(self):
         return self.config.entry_chain_contract == "v2_bounded_acquisition_v1"

@@ -129,14 +129,108 @@ class NativeFundingStore:
                 raise PolicyError('Strategy funding requires runner-bound owners')
             self.owners = {peer.config.id: peer for peer in peers}
             bind_funding_scope(self.owners)
-            self.binding = identity(['strategy', self.policy.model_dump(mode='json'),
-                                     [[peer.config.id, peer.config.connector_name, peer.config.trading_pair,
-                                       peer._composition_digest, peer._native_source_hash] for peer in peers]])
+            self._binding_peers = tuple(peers)
         else:
             self.owners = {owner.config.id: owner}
-            self.binding = identity([owner.config.id, owner.config.connector_name, owner.config.trading_pair,
-                                     owner._composition_digest, owner._native_source_hash])
+            self._binding_peers = (owner,)
+        self.binding = self._binding_for_source(None)
+        self._code_upgrade_checked = False
         self.status = {}
+
+    def _binding_for_source(self, source_sha256):
+        """The binding formula; ``source_sha256`` overrides every owner's native source hash."""
+        def source(peer):
+            return peer._native_source_hash if source_sha256 is None else source_sha256
+        if self.policy.scope == 'strategy':
+            return identity(['strategy', self.policy.model_dump(mode='json'),
+                             [[peer.config.id, peer.config.connector_name, peer.config.trading_pair,
+                               peer._composition_digest, source(peer)] for peer in self._binding_peers]])
+        owner = self._binding_peers[0]
+        return identity([owner.config.id, owner.config.connector_name, owner.config.trading_pair,
+                         owner._composition_digest, source(owner)])
+
+    @property
+    def _source_key(self):
+        return 'modular-funding-source:v1:' + identity([self.key])
+
+    def _source_record(self):
+        return json.dumps({'binding': self.binding,
+                           'source_sha256': sorted({peer._native_source_hash for peer in self._binding_peers})},
+                          sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+    def _previous_source_hashes(self, session):
+        """Native source hashes these owners ran under before.
+
+        The funding store records its own (written with every ledger write);
+        held-recovery checkpoints are a second witness for older ledgers.
+        """
+        hashes = set()
+        row = session.get(Metadata, self._source_key)
+        try:
+            recorded = None if row is None else json.loads(row.value).get('source_sha256')
+        except (TypeError, ValueError, AttributeError):
+            recorded = None
+        if isinstance(recorded, list):
+            hashes.update(value for value in recorded if isinstance(value, str) and re.fullmatch('[a-f0-9]{64}', value))
+        for owner in self.owners.values():
+            key = 'modular-native-held:v1:' + identity([
+                self.recorder.config_file_path, owner.config.id, owner.config.connector_name, owner.config.trading_pair])
+            row = session.get(Metadata, key)
+            try:
+                value = None if row is None else json.loads(row.value).get('source_sha256')
+            except (TypeError, ValueError, AttributeError):
+                value = None
+            if isinstance(value, str) and re.fullmatch('[a-f0-9]{64}', value):
+                hashes.add(value)
+        return hashes
+
+    def _rebind_after_code_upgrade(self, persisted_binding):
+        """Carry the funding ledger across a pure code upgrade of the same owners.
+
+        Only when the persisted binding recomputes exactly from a previously
+        checkpointed native source hash (same owners, pairs, policy and
+        composition): every claim, fill and release stays byte-identical except
+        its binding, the prior rows are archived in a receipt, and entry
+        admission continues. Any other identity change is still refused.
+        """
+        with self.recorder.sql_manager.get_new_session() as session, session.begin():
+            session.connection().exec_driver_sql('BEGIN IMMEDIATE')
+            header_row = session.get(Metadata, self.key)
+            if header_row is None:
+                return False
+            header = json.loads(header_row.value)
+            if not isinstance(header, dict) or header.get('binding') != persisted_binding:
+                return False
+            previous = next((source for source in sorted(self._previous_source_hashes(session))
+                             if self._binding_for_source(source) == persisted_binding), None)
+            if previous is None:
+                return False
+            rows = session.query(Metadata).filter(Metadata.key.like(self.key + ':%')).all()
+            before = {self.key: header_row.value, **{row.key: row.value for row in rows}}
+            for row in rows:
+                value = json.loads(row.value)
+                if isinstance(value, dict) and value.get('binding') == persisted_binding:
+                    value['binding'] = self.binding
+                    row.value = json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
+            header['binding'] = self.binding
+            header['revision'] = header['revision'] + 1
+            header_row.value = json.dumps(header, sort_keys=True, separators=(',', ':'), allow_nan=False)
+            receipt = {'schema': 1, 'kind': 'native_code_upgrade_v1', 'from_binding': persisted_binding,
+                       'to_binding': self.binding, 'from_source_sha256': previous,
+                       'to_source_sha256': sorted({peer._native_source_hash for peer in self._binding_peers}),
+                       'before': before}
+            source_row = session.get(Metadata, self._source_key)
+            if source_row is None:
+                session.add(Metadata(key=self._source_key, value=self._source_record()))
+            else:
+                source_row.value = self._source_record()
+            session.add(Metadata(key='modular-funding-code-upgrade:v1:' + identity([self.key, persisted_binding,
+                                                                                   self.binding]),
+                                 value=json.dumps(receipt, sort_keys=True, separators=(',', ':'), allow_nan=False)))
+        self.owner.logger().warning(
+            'Funding ledger carried across native code upgrade | from_source=%s binding=%s->%s revision=%s',
+            previous, persisted_binding, self.binding, header['revision'])
+        return True
 
     def _load(self, *, expected_binding=None):
         binding = self.binding if expected_binding is None else expected_binding
@@ -151,6 +245,12 @@ class NativeFundingStore:
             raise PolicyError('Funding checkpoint header corrupt (FUNDING_AUDIT_CORRUPT)')
         if type(header['schema']) is not int or header['schema'] != 1:
             raise PolicyError('Funding checkpoint schema unsupported (FUNDING_SCHEMA_UNSUPPORTED)')
+        if (header['binding'] != binding and expected_binding is None and raw is not None
+                and not self._code_upgrade_checked):
+            rebound = self._rebind_after_code_upgrade(header['binding'])  # a lock error retries next time
+            self._code_upgrade_checked = True
+            if rebound:
+                return self._load()
         if header['binding'] != binding:
             raise PolicyError('Funding checkpoint identity changed (FUNDING_BINDING_MISMATCH): '
                               f"persisted={header['binding']} current={binding} revision={header['revision']}")
@@ -238,6 +338,12 @@ class NativeFundingStore:
                                              Metadata.value == raw).values(value=encoded))
                     if result.rowcount != 1:
                         return False
+                if getattr(self, '_binding_peers', None):
+                    source_row = session.get(Metadata, self._source_key)
+                    if source_row is None:
+                        session.add(Metadata(key=self._source_key, value=self._source_record()))
+                    else:
+                        source_row.value = self._source_record()
                 # Immutable admission facts and fill hashes, not another native
                 # ledger. No lifetime order/fill count causes an artificial stop.
                 for key, value in records:

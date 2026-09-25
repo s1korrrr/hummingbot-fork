@@ -716,18 +716,18 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(executor._resume_conflicting_fill)
         self.strategy.sell.assert_not_called()
 
-    def test_other_unfinished_owner_blocks_direct_position_sell(self):
+    def test_other_unfinished_owner_never_blocks_direct_position_sell(self):
         executor = self.get_position_executor_running_from_config(
             self.get_position_config_market_long_with_trailing())
         self.strategy.executor_orchestrator = MagicMock()
         self.strategy.executor_orchestrator.recovery_required = {"other-controller": ["unknown-order"]}
+        self.strategy.executor_orchestrator._planned_resume_pending = False
 
-        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
-            executor.place_order(
-                connector_name="binance", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
-                side=TradeType.SELL, amount=Decimal("1"), price=Decimal("100"))
+        executor.place_order(
+            connector_name="binance", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
+            side=TradeType.SELL, amount=Decimal("1"), price=Decimal("100"))
 
-        self.strategy.sell.assert_not_called()
+        self.strategy.sell.assert_called_once()
 
     async def test_other_unfinished_owner_freezes_existing_trailing_control(self):
         executor, order, _ = self.expired_entry_fixture(Decimal("1"))
@@ -2065,7 +2065,7 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(task.cancelled())
         self.assertIsNone(executor._entry_expiry_reconciliation_task)
 
-    async def test_expired_filled_owner_persists_and_blocks_fresh_execution_after_restart(self):
+    async def test_expired_filled_retry_owner_persists_and_is_reported_after_restart(self):
         from tempfile import TemporaryDirectory
         from types import SimpleNamespace
 
@@ -2074,7 +2074,6 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         from hummingbot.connector.markets_recorder import MarketsRecorder
         from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
         from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
-        from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 
         executor, order, connector = self.expired_entry_fixture(Decimal("0.2"))
         executor.config.controller_id = "expiry-controller"
@@ -2099,10 +2098,10 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
                 self.assertEqual(stored.custom_info["order_ids"], [order.client_order_id])
                 with patch.object(MarketsRecorder, "get_instance", return_value=recorder):
                     restarted = ExecutorOrchestrator(self.strategy)
-                    self.assertEqual(restarted.recovery_required, {"expiry-controller": [executor.config.id]})
-                    with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
-                        restarted.create_executor(CreateExecutorAction(
-                            controller_id="expiry-controller", executor_config=executor.config))
+                # Retry-policy rows persist no order snapshots, so they cannot be rebuilt;
+                # they are reported and never fence other order flow (single_attempt owners are restored).
+                self.assertFalse(restarted._planned_resume_pending)
+                self.assertEqual(restarted.recovery_required, {"expiry-controller": [executor.config.id]})
                 self.strategy.buy.assert_not_called()
                 self.strategy.sell.assert_not_called()
             finally:

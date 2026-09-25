@@ -6,6 +6,7 @@ import grp
 import logging
 import os
 import pwd
+import signal
 import subprocess
 from pathlib import Path
 from typing import Coroutine, List
@@ -249,9 +250,69 @@ async def load_and_start_strategy(hb: HummingbotApplication, args: argparse.Name
     return True
 
 
+RESTART_STOP_TIMEOUT_SECONDS = 50.0  # below the execution containers' stop grace period
+
+
+async def graceful_signal_stop(hb, exit_process=os._exit, timeout: float = RESTART_STOP_TIMEOUT_SECONDS):
+    """SIGTERM/SIGINT: suspend executors for an exact restart, persist, then exit.
+
+    Resting orders are not cancelled here: executors already cancelled their
+    entry remainders during suspension, and anything still resting is re-tracked
+    and reconciled by restart continuity on the next boot.
+    """
+    logger = logging.getLogger(__name__)
+    logger.warning("Stop signal received; suspending executors for restart")
+    code = 0
+    try:
+        result = await asyncio.wait_for(hb.stop_loop(skip_order_cancellation=True), timeout=timeout)
+        if not stop_succeeded(result):
+            code = 1
+            logger.error(f"Native stop refused or incomplete ({stop_detail(result)}); suspending directly")
+            strategy = getattr(getattr(hb, "trading_core", None), "strategy", None)
+            if strategy is not None and callable(getattr(strategy, "on_stop", None)):
+                await asyncio.wait_for(strategy.on_stop(), timeout=timeout)
+        else:
+            logger.warning("Graceful restart stop complete")
+    except Exception:
+        code = 1
+        logger.exception("Graceful restart stop incomplete; restart continuity restores from the last checkpoint")
+    finally:
+        logging.shutdown()
+        exit_process(code)
+
+
+def stop_succeeded(result) -> bool:
+    """stop_loop returns None directly, or a native command response / ShutdownResult."""
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return not result.get("error")
+    return getattr(result, "reconciliation_complete", False) is True
+
+
+def stop_detail(result) -> str:
+    if isinstance(result, dict):
+        return str(result.get("error"))
+    return str(getattr(result, "reason", result))
+
+
+def install_signal_stop(hb, loop: asyncio.AbstractEventLoop):
+    state = {"stopping": False}
+
+    def request_stop():
+        if state["stopping"]:
+            return
+        state["stopping"] = True
+        loop.create_task(graceful_signal_stop(hb))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_stop)
+
+
 async def run_application(hb: HummingbotApplication, args: argparse.Namespace, client_config_map):
     """Run the application in headless or UI mode."""
     if args.headless:
+        install_signal_stop(hb, asyncio.get_running_loop())
         # Re-initialize logging with proper strategy file name for headless mode
         from hummingbot import init_logging
         log_file_name = hb.strategy_file_name.split(".")[0] if hb.strategy_file_name else "hummingbot"

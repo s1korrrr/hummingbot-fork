@@ -234,8 +234,10 @@ async def test_supported_native_resume_retains_class_config_trailing_and_no_buy(
             patch.object(PositionExecutor, 'start') as start:
         orchestrator = ExecutorOrchestrator(strategy)
         if owner_kind == 'spoof':
-            assert not orchestrator.resume_planned_positions_if_ready()
+            # Refused and reported; the manifest stays prepared and order flow is never fenced.
+            assert orchestrator.resume_planned_positions_if_ready()
             assert 'native owner policy differs' in orchestrator._planned_resume_failure
+            assert orchestrator.active_executors['modular_spot_resume'] == []
             start.assert_not_called()
             assert resume.inspect_manifest(db)[0]['state'] == 'prepared'
             return

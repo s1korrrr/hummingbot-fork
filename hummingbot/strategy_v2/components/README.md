@@ -12,6 +12,7 @@ their existing explicit state, input validation and I/O contracts.
 | `decision_protocol` | Immutable proposal, veto and composition records |
 | `capital_policy`, `portfolio`, `program_budget` | Read-only exposure assessment, bounded sizing and existing recorder-scoped reservations |
 | `exit_policy`, `trailing`, `acquisition`, `risk` | Pure existing exit, floor, schedule and loss-limit calculations |
+| `regime` | Causal market regime (`regime_v1`): higher-timeframe volatility buckets or a UTC-grid refit HMM, one code path for replay and live evaluation, explicit `Unavailable` results; not wired into any controller |
 | `universe`, `screener`, `selection_state` | Explicit symbol selection, eligibility and persisted selection state |
 | `config`, `domain`, `recipe_contract`, `strict_json` | Strict neutral models, values/errors, binding identities and unambiguous JSON |
 

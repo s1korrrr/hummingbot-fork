@@ -209,6 +209,9 @@ class OKRSIRecoveryParityTest(unittest.TestCase):
             sell_rsi_overbought=78.0, recovery_trail_pullback_pct=0.008, recovery_rsi_rollover_delta=2.0,
             sell_executor_price_gap_threshold=D("0.01"), sell_rsi_rollover_delta=0.5,
             trend_confirmation_enabled=True, sell_trend_hold_min_confidence=0.2,
+            # Live BNB values (V1/V2 mounted configs, 2026-09-25 ground truth).
+            early_stop_drawdown_pct=0.03, early_stop_keep_position=True, recovery_cancel_stale_order_pct=0.005,
+            trend_sell_threshold_boost=4.0,
         ), market_data_provider=provider, actions_queue=asyncio.Queue())
         bot.executors_info = []
         return bot, provider
@@ -285,3 +288,134 @@ class OKRSIRecoveryParityTest(unittest.TestCase):
                 self.assertEqual(live, expected, f"seed={seed} step={step} decision={decision}")
         self.assertGreater(total_sells, 20, "randomized fixture must exercise many live recovery sells")
         self.assertTrue(all(count > 0 for count in branches.values()), branches)
+
+
+class OKRSISellSignalParityTest(unittest.TestCase):
+    """The component's bag sell signal and threshold match the live methods on randomized states."""
+
+    def test_threshold_and_signal_match_live(self):
+        import random
+
+        from hummingbot.strategy_v2.components.held_inventory import bag_sell_signal, net_pnl_pct, sell_signal_threshold
+        from hummingbot.strategy_v2.utils.market_analysis import MultiTimeframeTrend, TrendDirection
+
+        helper = OKRSIRecoveryParityTest()
+        policy = BagRecoveryPolicy()
+        fired = 0
+        rng = random.Random(7)
+        for case in range(3000):
+            bot, provider = helper._bot()
+            price = D(str(round(rng.uniform(560, 700), 2)))
+            breakeven = D(str(round(rng.uniform(540, 660), 2)))
+            amount, fees = D(str(rng.choice([0.5, 2, 4.2]))), D(str(rng.choice([0, 0.3, 1.2])))
+            bot.positions_held = [SimpleNamespace(connector_name="okx", trading_pair="BNB-USDC", side=TradeType.BUY,
+                                                  amount=amount, breakeven_price=breakeven,
+                                                  remaining_fees_quote=fees)]
+            provider.get_price_by_type.return_value = price
+            regime = rng.choice([None, "Range_LV", "Trend_Up_HV", "Trend_Down_LV", "Unknown"])
+            regime_conf = rng.random()
+            direction = rng.choice([TrendDirection.UP, TrendDirection.DOWN, TrendDirection.RANGE])
+            trend_conf = rng.random()
+            trend = MultiTimeframeTrend(direction=direction, confidence=trend_conf, alignment_score=0.0)
+            _, live_sell = bot._get_dynamic_rsi_thresholds(regime, regime_conf)
+            _, live_sell = bot._apply_trend_confirmation_to_thresholds(
+                rsi_buy_eff=32.0, rsi_sell_eff=live_sell, trend_confirmation=trend)
+            ours = sell_signal_threshold(78.0, regime_label=regime, regime_confidence=regime_conf,
+                                         trend_direction=direction.value, trend_confidence=trend_conf)
+            self.assertAlmostEqual(live_sell, ours, places=12, msg=f"case={case}")
+            rsi, rsi_prev = rng.uniform(60, 99), rng.uniform(60, 99)
+            ema = float(price) * (1 + rng.gauss(0, 0.003))
+            macd, macd_prev = rng.gauss(0, 1), rng.gauss(0, 1)
+            bot.processed_data = {"signal": 0, "signal_state": {"rsi": rsi, "rsi_prev": rsi_prev, "ema_fast": ema},
+                                  "trend_confirmation": {"direction": direction.value, "confidence": trend_conf}}
+            live = bot._determine_signal(rsi, 0, 32.0, live_sell, float(price), rsi_prev=rsi_prev, ema_fast=ema,
+                                         macd_hist=macd, macd_hist_prev=macd_prev)
+            strong_up = direction == TrendDirection.UP and trend_conf >= bot.config.sell_trend_hold_min_confidence
+            component = bag_sell_signal(rsi=rsi, rsi_prev=rsi_prev, sell_threshold=ours, price=price, ema_fast=ema,
+                                        macd_hist=macd, macd_hist_prev=macd_prev,
+                                        inventory_net_pnl=net_pnl_pct(amount, breakeven, fees, price),
+                                        strong_bullish_trend=strong_up, trail_reversal_ready=False, policy=policy)
+            self.assertEqual(live == -1, component, f"case={case}")
+            fired += component
+        self.assertGreater(fired, 50)
+
+
+class ChaserParityTest(unittest.TestCase):
+    def test_chaser_price_and_refresh_match_order_executor(self):
+        import random
+
+        from hummingbot.strategy_v2.components.held_inventory import chaser_needs_refresh, chaser_sell_price
+        from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, LimitChaserConfig
+        from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
+
+        rng = random.Random(3)
+        for case in range(500):
+            market = D(str(round(rng.uniform(500, 800), 2)))
+            floor = D(str(round(rng.uniform(480, 820), 4))) if rng.random() < 0.8 else None
+            rate = D(str(rng.choice([0, 0.0008, 0.001])))
+            fee = SimpleNamespace(percent=rate, fee_amount_in_token=lambda pair, price, amount, token, exchange: price * amount * rate)
+            config = SimpleNamespace(execution_strategy=ExecutionStrategy.LIMIT_CHASER, side=TradeType.SELL,
+                                     chaser_config=LimitChaserConfig(distance=D("0.002"), refresh_threshold=D("0.003")),
+                                     min_sell_price=floor, amount=D("0.6"), connector_name="okx", trading_pair="BNB-USDC")
+            fake = SimpleNamespace(config=config, current_market_price=market,
+                                   connectors={"okx": SimpleNamespace(get_fee=lambda **kwargs: fee)},
+                                   _all_orders=lambda: [], get_order_type=lambda: None,
+                                   get_trading_rules=lambda connector, pair: SimpleNamespace(min_price_increment=D("0.01")))
+            fake._unbounded_order_price = lambda f=fake: OrderExecutor._unbounded_order_price(f)
+            fake._to_price_tick = OrderExecutor._to_price_tick
+            live = OrderExecutor.get_order_price(fake)
+            ours = chaser_sell_price(market, distance=D("0.002"), min_sell_price=floor, fee_rate=rate, tick=D("0.01"))
+            self.assertEqual(live, ours, f"case={case}")
+            order_price = D(str(round(float(ours) * rng.uniform(0.99, 1.01), 2)))
+            live_refresh = abs(live - order_price) > market * config.chaser_config.refresh_threshold
+            self.assertEqual(live_refresh, chaser_needs_refresh(order_price, ours, market, D("0.003")))
+
+
+class EarlyStopAndStaleCancelParityTest(unittest.TestCase):
+    def test_early_stop_matches_live_drawdown_stop_on_fill_basis(self):
+        import random
+
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+        helper = OKRSIRecoveryParityTest()
+        policy = BagRecoveryPolicy()
+        rng = random.Random(11)
+        stops = 0
+        for case in range(400):
+            bot, provider = helper._bot()
+            fill = D(str(round(rng.uniform(550, 700), 2)))
+            price = (fill * D(str(rng.uniform(0.95, 1.01)))).quantize(D("0.01"))
+            executor = SimpleNamespace(
+                id=f"buy{case}", controller_id=bot.config.id, connector_name="okx", trading_pair="BNB-USDC",
+                side=TradeType.BUY, is_active=True, is_done=False, type="position_executor", timestamp=1.0,
+                filled_amount_quote=fill * D("0.3"), net_amount_quote=fill * D("0.3"),
+                config=SimpleNamespace(side=TradeType.BUY, entry_price=fill * D("1.002"), amount=D("0.3"),
+                                       connector_name="okx", trading_pair="BNB-USDC", price=None),
+                custom_info={"current_position_average_price": str(fill), "held_position_orders": [],
+                             "open_order_filled_amount_base": "0.3", "open_order_filled_amount_quote": str(fill * D("0.3"))})
+            bot.executors_info = [executor]
+            actions = bot._check_active_executor_drawdown_stop(price)
+            live = any(isinstance(a, StopExecutorAction) and a.keep_position for a in actions)
+            self.assertEqual(live, should_hold_as_bag(fill, price, policy), f"case={case} fill={fill} price={price}")
+            stops += live
+        self.assertGreater(stops, 50)
+
+    def test_stale_cancel_matches_live(self):
+        from hummingbot.strategy_v2.components.held_inventory import sell_trend_hold, stale_recovery_sell
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+
+        helper = OKRSIRecoveryParityTest()
+        for strong_up in (True, False):
+            for move in (D("1.004"), D("1.005"), D("1.02")):
+                bot, provider = helper._bot()
+                proposal = D("650.00")
+                price = proposal * move
+                bot.processed_data = {"signal": 0, "signal_state": {"rsi": 80.0, "rsi_prev": 79.0, "ema_fast": 600.0},
+                                      "trend_confirmation": {"direction": "up" if strong_up else "range",
+                                                             "confidence": 0.9 if strong_up else 0.0}}
+                bot.executors_info = [SimpleNamespace(
+                    id="sell", is_active=True, connector_name="okx", trading_pair="BNB-USDC", side=TradeType.SELL,
+                    type="order_executor", config=SimpleNamespace(price=proposal), custom_info={"level_id": "recovery_exit:k"})]
+                live = any(isinstance(a, StopExecutorAction) for a in bot._maybe_cancel_stale_recovery_sell_executors(price))
+                hold = sell_trend_hold(strong_up, price, 80.0, 79.0, 600.0, bot.config.sell_rsi_rollover_delta)
+                self.assertEqual(live, stale_recovery_sell(hold, price, proposal, D("0.005")), (strong_up, move))

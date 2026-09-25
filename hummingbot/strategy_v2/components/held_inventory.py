@@ -152,6 +152,84 @@ def sell_trend_hold(strong_bullish_trend: bool, price: Decimal, rsi: Optional[fl
     return not (rollover and below_ema)
 
 
+def sell_signal_threshold(base_sell: float, *, regime_label: Optional[str] = None, regime_confidence: float = 0.0,
+                          trend_direction: Optional[str] = None, trend_confidence: float = 0.0,
+                          trend_sell_threshold_boost: float = 4.0, trend_confirmation_enabled: bool = True) -> float:
+    """Mirror of ``_get_dynamic_rsi_thresholds`` (sell side) then ``_apply_trend_confirmation_to_thresholds``."""
+    sell = float(base_sell)
+    if regime_label is not None:
+        adjust = 3.0 * max(0.0, min(1.0, float(regime_confidence)))
+        if "Range" in regime_label:
+            sell += adjust
+        elif "Trend_Up" in regime_label:
+            sell += adjust * 0.7
+        elif "Trend_Down" in regime_label:
+            sell -= adjust
+        if any(label in regime_label for label in ("Range", "Trend_Up", "Trend_Down")):
+            sell = max(60.0, min(80.0, sell))
+    if trend_confirmation_enabled and trend_direction is not None:
+        boost = float(trend_sell_threshold_boost) * max(0.0, min(1.0, float(trend_confidence or 0.0)))
+        if trend_direction == "up":
+            sell = min(88.0, sell + boost)
+        elif trend_direction == "down":
+            sell = max(60.0, sell - boost * 0.5)
+    return float(sell)
+
+
+def bag_sell_signal(*, rsi: Optional[float], rsi_prev: Optional[float], sell_threshold: float, price: Decimal,
+                    ema_fast: Optional[float], macd_hist: Optional[float], macd_hist_prev: Optional[float],
+                    inventory_net_pnl: Optional[Decimal], strong_bullish_trend: bool, trail_reversal_ready: bool,
+                    policy: BagRecoveryPolicy, sell_rsi_rollover_delta: float = 0.5) -> bool:
+    """Mirror of the SELL (-1) branch of ``_determine_signal`` for a non-dust held bag.
+
+    RSI at/above the dynamic threshold, a reversal (RSI rollover below the fast EMA,
+    or a falling MACD histogram), no trend hold, and (if profit-constrained) net
+    inventory PnL >= min profit. Live emits it only on the first tick after a
+    candle closes.
+    """
+    if rsi is None or rsi < sell_threshold or price is None or price <= 0:
+        return False
+    rollover = rsi_prev is not None and (rsi_prev - rsi) >= sell_rsi_rollover_delta
+    below_ema = ema_fast is not None and price < Decimal(str(ema_fast))
+    macd_rollover = macd_hist is not None and macd_hist_prev is not None and macd_hist < macd_hist_prev
+    if not ((rollover and below_ema) or macd_rollover):
+        return False
+    if strong_bullish_trend and not (trail_reversal_ready or (rollover and below_ema)):
+        return False
+    if policy.sell_only_if_profitable and (inventory_net_pnl is None or inventory_net_pnl < policy.min_profit_pct_for_sell):
+        return False
+    return True
+
+
+def chaser_sell_price(market_price: Decimal, *, distance: Decimal, min_sell_price: Optional[Decimal],
+                      fee_rate: Decimal, tick: Optional[Decimal]) -> Decimal:
+    """Mirror of ``OrderExecutor.get_order_price`` for a LIMIT_CHASER SELL with a percentage fee.
+
+    Target = market * (1 + distance); with a floor it is at least floor / (1 - fee rate),
+    rounded up to the price tick.
+    """
+    price = market_price * (1 + distance)
+    if min_sell_price is None:
+        return price
+    if not 0 <= fee_rate < 1:
+        raise ValueError("fee rate must be in [0, 1)")
+    price = max(price, min_sell_price / (1 - fee_rate))
+    if tick is not None and tick > 0:
+        price = (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+    return price
+
+
+def chaser_needs_refresh(order_price: Decimal, target_price: Decimal, market_price: Decimal,
+                         refresh_threshold: Decimal) -> bool:
+    """Mirror of ``OrderExecutor.control_limit_chaser``: renew when the target drifted past the threshold."""
+    return abs(target_price - order_price) > market_price * refresh_threshold
+
+
+def stale_recovery_sell(trend_hold: bool, price: Decimal, proposal_price: Decimal, stale_pct: Decimal) -> bool:
+    """Mirror of ``_maybe_cancel_stale_recovery_sell_executors`` for one recovery sell."""
+    return trend_hold and stale_pct > 0 and proposal_price > 0 and price >= proposal_price * (1 + stale_pct)
+
+
 def has_sell_price_gap(price: Decimal, last_sell_price: Optional[Decimal], policy: BagRecoveryPolicy) -> bool:
     """Mirror of ``_has_sufficient_price_gap`` for SELL: either direction from the last sell."""
     gap = policy.sell_price_gap_pct

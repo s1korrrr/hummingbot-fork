@@ -286,8 +286,7 @@ class ExecutorOrchestrator:
         markets_recorder = MarketsRecorder.get_instance()
         db_path = getattr(getattr(markets_recorder, "sql_manager", None), "db_path", None)
         if not allow_planned_resume and (
-                (isinstance(db_path, (str, Path)) and pending_manifest(db_path) is not None)
-                or self._has_continuity_candidates(markets_recorder)):
+                self._manifest_pending(db_path) or self._has_continuity_candidates(markets_recorder)):
             self._planned_resume_pending = True
             return  # No held reconstruction or ownership mutation before connectors are ready.
         try:
@@ -417,6 +416,16 @@ class ExecutorOrchestrator:
                         executor.start()
                     else:
                         self._executor_start(executor)
+
+    def _manifest_pending(self, db_path) -> bool:
+        if not isinstance(db_path, (str, Path)):
+            return False
+        try:
+            return pending_manifest(db_path) is not None
+        except Exception as error:
+            # Manifest history problems are reported; they never stop the owner from booting.
+            self.logger().error(f"Planned position manifest history unreadable; ignored at boot: {error}")
+            return False
 
     def _has_continuity_candidates(self, recorder) -> bool:
         if self._executor_restore is not None or not self._restart_continuity:

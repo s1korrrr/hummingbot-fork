@@ -14,6 +14,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+from hummingbot.strategy_v2.executors import planned_position_resume as resume
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.executors.restart_continuity import (
@@ -298,3 +299,28 @@ def test_unresolved_rows_do_not_fence_executor_orders():
     executor._strategy.executor_orchestrator = SimpleNamespace(
         recovery_required={'other': ['stale']}, _planned_resume_pending=False)
     assert executor._stack_recovery_required() is False
+
+
+def test_legacy_v1_sealed_restore_marker_does_not_break_boot(recorder):
+    finished = live_executor()
+    finished.config.id = 'legacy-sealed'
+    finished._planned_resume_id = 'startup-sealed-restore'
+    finished.close_type = CloseType.TRAILING_STOP
+    finished._status = RunnableStatus.TERMINATED
+    running = live_executor(trigger='.01', moves=1)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(finished)
+        recorder.store_or_update_executor(running)
+    assert resume.pending_manifest(recorder.sql_manager.db_path) is None  # the marker is not manifest history
+    orchestrator, _ = boot(recorder, booting_strategy())
+    assert restored(orchestrator).config.id == running.config.id
+
+
+def test_unreadable_manifest_history_never_stops_boot(recorder):
+    running = live_executor(trigger='.01', moves=1)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(running)
+    with patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+               side_effect=ValueError('executor references missing or mismatched consumed manifest history')):
+        orchestrator, _ = boot(recorder, booting_strategy())
+    assert restored(orchestrator).config.id == running.config.id

@@ -537,3 +537,14 @@ def test_live_capital_cap_must_be_explicit_and_the_buy_gap_also_spaces_from_the_
                 buy_gap=BuyGapConfig())[2] == 'bag_gap_not_met'  # 0.5% from the bag cost basis < 0.6%
     assert plan(state, {}, **base, bid=D('99.3'), ask=D('99.4'), bag=bag, capital=cap,
                 buy_gap=BuyGapConfig())[2] == 'entry_proposed'  # 0.7% below the cost basis
+
+
+def test_controller_config_admits_the_buy_gap_only_with_live_capital():
+    from controllers.generic.modular_spot import ModularSpotControllerConfig
+    from controllers.generic.modular_spot_core.bag import BuyGapConfig, LiveCapitalConfig
+
+    base = dict(id='modular_spot_bag', connector_name='okx', trading_pair='BNB-USDC', max_records=1276, bag=BagConfig())
+    with pytest.raises(ValueError, match='requires live capital'):
+        ModularSpotControllerConfig(**base, buy_gap=BuyGapConfig())
+    ok = ModularSpotControllerConfig(**base, capital=LiveCapitalConfig(position_cap_quote=None), buy_gap=BuyGapConfig())
+    assert ok.buy_gap == BuyGapConfig()

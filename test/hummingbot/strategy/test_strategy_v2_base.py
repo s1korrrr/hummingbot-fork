@@ -95,16 +95,15 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             status,
         )
 
-    def test_direct_strategy_buy_and_sell_blocked_by_unfinished_executor(self):
+    def test_direct_strategy_orders_are_never_fenced_by_reported_unfinished_executor(self):
         self.strategy.executor_orchestrator.recovery_required = {"removed-owner": ["entry-1"]}
+        self.strategy.executor_orchestrator._planned_resume_pending = False
         with patch.object(self.strategy, "buy_with_specific_market") as buy, \
                 patch.object(self.strategy, "sell_with_specific_market") as sell:
-            with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
-                self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
-            with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
-                self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
-        buy.assert_not_called()
-        sell.assert_not_called()
+            self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+            self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+        buy.assert_called_once()
+        sell.assert_called_once()
 
     def test_direct_strategy_sell_blocked_during_pending_planned_resume(self):
         self.strategy.executor_orchestrator.recovery_required = {}

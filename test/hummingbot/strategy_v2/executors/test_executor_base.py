@@ -145,18 +145,19 @@ class TestExecutorBase(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         )
         self.assertEqual(sell_order_id, "OID-SELL-1")
 
-    def test_recovery_fence_blocks_buy_and_sell_for_non_position_executors(self):
+    def test_reported_recovery_rows_never_fence_non_position_executor_orders(self):
         self.strategy.executor_orchestrator = MagicMock()
         self.strategy.executor_orchestrator.recovery_required = {"other-controller": ["unfinished"]}
+        self.strategy.executor_orchestrator._planned_resume_pending = False
 
         for side in (TradeType.BUY, TradeType.SELL):
-            with self.subTest(side=side), self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+            with self.subTest(side=side):
                 self.component.place_order(
                     connector_name="connector1", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
                     side=side, amount=Decimal("1"), price=Decimal("1000"))
 
-        self.strategy.buy.assert_not_called()
-        self.strategy.sell.assert_not_called()
+        self.strategy.buy.assert_called_once()
+        self.strategy.sell.assert_called_once()
 
     def test_pending_planned_resume_blocks_order_before_recovery_rows_load(self):
         self.strategy.executor_orchestrator = MagicMock()

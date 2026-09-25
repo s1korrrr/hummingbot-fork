@@ -175,7 +175,7 @@ class TestExecutorOrchestrator(unittest.TestCase):
             self.orchestrator.create_executor(action)
         self.assertEqual(start_mock.call_count, 1)
 
-    def test_unfinished_down_only_executor_blocks_restart_and_retains_receipt(self):
+    def test_unfinished_legacy_down_only_executor_is_reported_and_retains_receipt(self):
         config = DownOnlyMakerPositionExecutorConfig(
             id="intent-1",
             timestamp=1_000,
@@ -246,10 +246,12 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(restarted.stored_executors["ok-rsi-eth"], [])
         persisted = recorder.get_all_executors.return_value[0]
         self.assertEqual(persisted.custom_info["entry_acquisition"], receipt)
-        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
-            restarted.create_executor(CreateExecutorAction(controller_id="ok-rsi-eth", executor_config=config))
+        # A legacy row without order snapshots cannot be rebuilt: it is reported and retained,
+        # but it never fences order flow (restart continuity D2).
+        self.assertFalse(restarted._planned_resume_pending)
+        self.assertEqual(restarted.active_executors["ok-rsi-eth"], [])
 
-    def test_unfinished_owner_blocks_new_execution_on_other_controller(self):
+    def test_unfinished_owner_never_blocks_new_execution_on_other_controller(self):
         config = PositionExecutorConfig(
             id="new-btc", timestamp=1234, controller_id="safe-btc",
             connector_name="binance", trading_pair="BTC-USDT", side=TradeType.BUY,
@@ -262,14 +264,15 @@ class TestExecutorOrchestrator(unittest.TestCase):
             "BTC-USDT": TradingRule(trading_pair="BTC-USDT"),
         })
         recorder = MarketsRecorder.get_instance()
+        self.orchestrator._resolve_executor_class = MagicMock(return_value=MagicMock())
 
-        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
-            self.orchestrator.create_executor(CreateExecutorAction(
-                controller_id=config.controller_id, executor_config=config))
+        self.orchestrator.create_executor(CreateExecutorAction(
+            controller_id=config.controller_id, executor_config=config))
 
-        recorder.store_or_update_executor.assert_not_called()
+        recorder.store_or_update_executor.assert_called_once()
+        self.assertEqual(self.orchestrator.recovery_required, {"unresolved-eth": ["old-entry"]})
 
-    def test_unfinished_owner_missing_from_current_config_still_blocks_creation(self):
+    def test_unfinished_owner_missing_from_current_config_is_reported_without_blocking(self):
         old_config = PositionExecutorConfig(
             id="old-entry", timestamp=1234, controller_id="removed-eth",
             connector_name="binance", trading_pair="ETH-USDT", side=TradeType.BUY,
@@ -290,9 +293,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
             entry_price=Decimal("100"), amount=Decimal("1"))
 
         self.assertEqual(restarted.recovery_required, {"removed-eth": ["old-entry"]})
-        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
-            restarted.create_executor(CreateExecutorAction(controller_id="new-btc", executor_config=new_config))
-        recorder.store_or_update_executor.assert_not_called()
+        restarted._resolve_executor_class = MagicMock(return_value=MagicMock())
+        restarted.active_executors["new-btc"] = []
+        restarted.create_executor(CreateExecutorAction(controller_id="new-btc", executor_config=new_config))
+        recorder.store_or_update_executor.assert_called_once()
 
     def test_unattended_v2_restart_hold_blocks_new_executor(self):
         self.mock_strategy._unattended_restart_hold = True
@@ -1218,7 +1222,9 @@ class TestExecutorOrchestrator(unittest.TestCase):
             position_executor.config = MagicMock()
             self.orchestrator.active_executors["test"] = [position_executor]
             await self.orchestrator.stop()
-            position_executor.early_stop.assert_called_once_with(keep_position=True)
+            # A held-position preference suspends for exact restart instead of demoting.
+            position_executor.suspend_for_restart.assert_called_once_with()
+            position_executor.early_stop.assert_not_called()
 
         asyncio.run(test_async())
 
@@ -1236,6 +1242,7 @@ class TestExecutorOrchestrator(unittest.TestCase):
             position_executor.config = MagicMock()
             self.orchestrator.active_executors["rsi-v5"] = [position_executor]
 
+            position_executor.suspend_for_restart.return_value = False  # not suspendable (e.g. already exiting)
             await self.orchestrator.stop(
                 keep_position_by_controller={"rsi-v5": True}
             )

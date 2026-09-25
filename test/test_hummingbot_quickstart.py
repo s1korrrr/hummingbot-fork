@@ -93,3 +93,33 @@ class HummingbotQuickstartTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_signal_stop_suspends_without_cancelling_and_exits_cleanly():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    quickstart = quickstart_module
+
+    hb = MagicMock()
+    hb.stop_loop = AsyncMock()
+    exits = []
+    asyncio.run(quickstart.graceful_signal_stop(hb, exit_process=exits.append, timeout=1))
+    hb.stop_loop.assert_awaited_once_with(skip_order_cancellation=True)
+    assert exits == [0]
+
+
+def test_signal_stop_timeout_still_exits_for_checkpoint_restore():
+    import asyncio
+    from unittest.mock import MagicMock
+
+    quickstart = quickstart_module
+
+    async def hang(**_):
+        await asyncio.sleep(10)
+
+    hb = MagicMock()
+    hb.stop_loop = hang
+    exits = []
+    asyncio.run(quickstart.graceful_signal_stop(hb, exit_process=exits.append, timeout=0.01))
+    assert exits == [1]

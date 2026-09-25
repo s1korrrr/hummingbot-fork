@@ -265,7 +265,8 @@ class NativePaperSession:
                 from controllers.generic.momentum_fusion_v2_runtime.paper_lifecycle import MomentumPaperLifecycle
                 self.momentum_fixture = MomentumPaperLifecycle(self, momentum_fixture_policy)
             self.executor_orchestrator = ExecutorOrchestrator(self, executor_start=self._start_executor,
-                                                              executor_restore=self.momentum_fixture.restore_executor if restore and self.momentum_fixture else None)
+                                                              executor_restore=self.momentum_fixture.restore_executor if restore and self.momentum_fixture else None,
+                                                              restart_continuity=False)
         except BaseException:
             if self.recorder is not None:
                 self.recorder.stop()

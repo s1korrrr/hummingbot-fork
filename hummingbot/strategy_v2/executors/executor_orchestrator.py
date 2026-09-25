@@ -19,6 +19,11 @@ from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.planned_position_resume import claim, pending_manifest
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
+from hummingbot.strategy_v2.executors.restart_continuity import (
+    RestartContinuityError,
+    continuity_plan,
+    is_continuity_candidate,
+)
 
 if TYPE_CHECKING:
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -240,10 +245,14 @@ class ExecutorOrchestrator:
                  executors_max_retries: int = 10,
                  initial_positions_by_controller: Optional[dict] = None,
                  executor_start: Optional[Callable] = None,
-                 executor_restore: Optional[Callable] = None):
+                 executor_restore: Optional[Callable] = None,
+                 restart_continuity: bool = True):
         self.strategy = strategy
         self._executor_start = executor_start
         self._executor_restore = executor_restore
+        # Live owners rebuild unfinished executors after a restart; paper sessions
+        # keep their own fail-closed restart contract.
+        self._restart_continuity = restart_continuity
         self.executors_update_interval = executors_update_interval
         self.executors_max_retries = executors_max_retries
         self.active_executors = {}
@@ -276,10 +285,18 @@ class ExecutorOrchestrator:
                 self.positions_held[controller_id] = []
         markets_recorder = MarketsRecorder.get_instance()
         db_path = getattr(getattr(markets_recorder, "sql_manager", None), "db_path", None)
-        if not allow_planned_resume and isinstance(db_path, (str, Path)) and pending_manifest(db_path) is not None:
+        if not allow_planned_resume and (
+                (isinstance(db_path, (str, Path)) and pending_manifest(db_path) is not None)
+                or self._has_continuity_candidates(markets_recorder)):
             self._planned_resume_pending = True
             return  # No held reconstruction or ownership mutation before connectors are ready.
-        resumed = self._claim_planned_positions(markets_recorder)
+        try:
+            resumed = self._claim_planned_positions(markets_recorder)
+        except Exception as error:
+            # A stale or inconsistent manifest never blocks trading: its positions
+            # stay in the held ledger and the manifest remains for inspection.
+            self.logger().exception(f"Planned position manifest not claimed; held ledger retained: {error}")
+            resumed = set()
         db_executors = markets_recorder.get_all_executors()
         restored_executors = []
         for executor in db_executors:
@@ -290,7 +307,7 @@ class ExecutorOrchestrator:
                     self.logger().error(
                         f"Startup reconciliation required | controller={controller_id} executor={executor.id} "
                         "Persisted execution belongs to a controller absent from current config. "
-                        "New execution is blocked until ownership is reconciled."
+                        "Reported only; other executors keep trading."
                     )
                 continue
             if executor.id in resumed:
@@ -305,11 +322,22 @@ class ExecutorOrchestrator:
                     self._non_hold_order_ids.update(self._owned_order_keys(executor))
                     resumed.add(executor.id)
                     continue
+            if not executor.is_done and self._executor_restore is None and self._restart_continuity:
+                restored = self._restore_continuity_executor(controller_id, executor)
+                if restored is not None:
+                    keys = self._owned_order_keys(executor)
+                    restored_executors.append((controller_id, restored, keys))
+                    self._resume_owned_order_keys.update(keys)
+                    self._non_hold_order_ids.update(keys)
+                    resumed.add(executor.id)
+                    continue
             if not executor.is_done:
-                self.recovery_required.setdefault(controller_id, []).append(executor.id)
+                if executor.id not in self.recovery_required.get(controller_id, []):
+                    self.recovery_required.setdefault(controller_id, []).append(executor.id)
                 self.logger().error(
                     f"Startup reconciliation required | controller={controller_id} executor={executor.id} "
-                    "Persisted execution is unfinished. New execution is blocked until order ownership is reconciled."
+                    "Persisted execution is unfinished and could not be restored. Reported only; "
+                    "other executors keep trading."
                 )
             else:
                 self._update_cached_performance(controller_id, executor)
@@ -377,6 +405,8 @@ class ExecutorOrchestrator:
         # A restored paper book is deliberately unavailable until explicit new
         # input. Defer live objects until history reconstruction has used the
         # proven native ownership keys, without requesting a fabricated mark.
+        self._check_continuity_inventory([executor for _, executor, _ in restored_executors
+                                          if hasattr(executor, "hydrate_restart_continuity")])
         for controller_id, executor, order_keys in restored_executors:
             self.active_executors[controller_id].append(executor)
             self._non_hold_order_ids.difference_update(order_keys)
@@ -387,6 +417,90 @@ class ExecutorOrchestrator:
                         executor.start()
                     else:
                         self._executor_start(executor)
+
+    def _has_continuity_candidates(self, recorder) -> bool:
+        if self._executor_restore is not None or not self._restart_continuity:
+            return False  # an injected restore hook or a paper session owns unfinished rows
+        getter = getattr(recorder, "get_all_executors", None)
+        infos = getter() if callable(getter) else None
+        if not isinstance(infos, (list, tuple)):
+            return False
+        return any(not info.is_done and info.controller_id in self.strategy.controllers
+                   and is_continuity_candidate(info) for info in infos)
+
+    def _continuity_executor_class(self, controller, config):
+        if getattr(config, 'entry_acquisition_policy', None) != 'down_only_maker_v1':
+            return PositionExecutor
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+        trusted_owner = (type(controller.config) is OKRSIControllerConfig
+                         or getattr(controller.config, 'controller_name', None) != 'ok_rsi'
+                         and is_ok_rsi_policy(controller.config))
+        if (not trusted_owner
+                or getattr(controller.config, 'entry_acquisition_policy', None) != 'down_only_maker_v1'):
+            raise RestartContinuityError('Down-only owner policy differs from persisted executor')
+        from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import DownOnlyMakerPositionExecutor
+        return DownOnlyMakerPositionExecutor
+
+    def _restore_continuity_executor(self, controller_id: str, info: ExecutorInfo):
+        """Rebuild an unfinished persisted executor exactly; None when not a candidate or unprovable."""
+        try:
+            plan = continuity_plan(info)
+            if plan is None:
+                return None
+            controller = self.strategy.controllers[controller_id]
+            config = info.config
+            if (controller_id in self.initial_positions_by_controller
+                    or config.connector_name not in self.strategy.connectors
+                    or config.trading_pair not in self.strategy.markets.get(config.connector_name, set())):
+                raise RestartContinuityError("Persisted executor market is unavailable or overridden")
+            if (getattr(controller.config, "connector_name", None) != config.connector_name
+                    or getattr(controller.config, "trading_pair", None) != config.trading_pair):
+                raise RestartContinuityError("Persisted executor controller identity differs")
+            executor_class = self._continuity_executor_class(controller, config)
+            executor = executor_class(self.strategy, config, self.executors_update_interval, self.executors_max_retries)
+            executor.hydrate_restart_continuity(plan)
+        except Exception as error:
+            self.recovery_required.setdefault(controller_id, [])
+            if info.id not in self.recovery_required[controller_id]:
+                self.recovery_required[controller_id].append(info.id)
+            self.logger().error(
+                f"Restart continuity unavailable | controller={controller_id} executor={info.id} "
+                f"reason={type(error).__name__}: {error}. Reported only; trading continues."
+            )
+            return None
+        self.logger().info(
+            f"Restored executor after restart | controller={controller_id} executor={info.id} "
+            f"suspended={plan.suspended} status={plan.status.name} "
+            f"remaining_base={executor.amount_to_close} trailing_trigger={plan.trailing['trailing_stop_trigger_pct']} "
+            f"trailing_moves={plan.trailing['trailing_move_count']} open_entry={not plan.entry_terminal} "
+            f"open_exit={plan.open_exit_order is not None}"
+        )
+        return executor
+
+    def _check_continuity_inventory(self, executors):
+        """Restored spot inventory must still be in the wallet; otherwise hand it to the held ledger."""
+        required: Dict[Tuple[str, str], Decimal] = {}
+        for executor in executors:
+            config = executor.config
+            key = config.connector_name, config.trading_pair.split("-")[0]
+            required[key] = required.get(key, Decimal("0")) + max(executor.amount_to_close, Decimal("0"))
+        for (connector_name, base), amount in required.items():
+            if amount <= 0:
+                continue
+            try:
+                total = Decimal(str(self.strategy.connectors[connector_name].get_balance(base)))
+            except Exception:
+                total = None
+            if total is not None and total.is_finite() and total >= amount:
+                continue
+            for executor in executors:
+                config = executor.config
+                if (config.connector_name, config.trading_pair.split("-")[0]) == (connector_name, base):
+                    executor.demote_restored_to_hold(f"wallet_{base}_below_restored_{amount}")
+            self.logger().error(
+                f"Restored inventory not covered by wallet | connector={connector_name} asset={base} "
+                f"required={amount} total={total}. Positions handed to held ledger; trading continues."
+            )
 
     def resume_planned_positions_if_ready(self):
         if not self._planned_resume_pending:
@@ -408,8 +522,9 @@ class ExecutorOrchestrator:
                 # The claim already persisted unfinished ownership. Quiesced
                 # objects must never overwrite that row as a completed exit.
                 executors.clear()
-            self.logger().exception("Planned resume failed; restart reconciliation required; execution blocked")
-            return False
+            self.logger().exception("Startup position restore failed; unresolved rows reported, trading continues")
+            self._planned_resume_pending = False
+            return True
         self._planned_resume_pending = False
         return True
 
@@ -1383,15 +1498,17 @@ class ExecutorOrchestrator:
         keep_position_by_controller = keep_position_by_controller or {}
         if strict:
             try:
+                suspending = False
                 for controller_id, executors in self.active_executors.items():
                     for executor in executors:
                         if not executor.is_closed:
-                            executor.early_stop(keep_position=keep_position_by_controller.get(controller_id, True))
-                for _ in range(max_executors_close_attempts):
-                    if all(executor.executor_info.is_done for executors in self.active_executors.values() for executor in executors):
+                            suspending |= self._begin_executor_shutdown(
+                                executor, keep_position_by_controller.get(controller_id, True))
+                for _ in range(self._shutdown_attempts(max_executors_close_attempts, suspending)):
+                    if all(self._shutdown_settled(executor) for executors in self.active_executors.values() for executor in executors):
                         break
                     await asyncio.sleep(2.0)
-                if any(not executor.executor_info.is_done for executors in self.active_executors.values() for executor in executors):
+                if any(not self._shutdown_settled(executor) for executors in self.active_executors.values() for executor in executors):
                     return ShutdownResult(False, "Executor shutdown timed out; runtime collections retained")
                 self.store_all_positions(clear=False, strict=True)
                 self.store_all_executors(clear=False)
@@ -1399,21 +1516,23 @@ class ExecutorOrchestrator:
             except Exception as error:
                 self.logger().exception("Strict executor shutdown failed; runtime collections retained")
                 return ShutdownResult(False, f"Executor persistence/shutdown failed: {type(error).__name__}")
-        # first we stop all active executors
+        # first we stop all active executors; a held-position preference suspends
+        # position executors for exact restore instead of demoting them.
+        suspending = False
         for controller_id, executors_list in self.active_executors.items():
             keep_position = keep_position_by_controller.get(controller_id, True)
             for executor in executors_list:
                 if not executor.is_closed:
-                    executor.early_stop(keep_position=keep_position)
-        for _ in range(max_executors_close_attempts):
-            if all([executor.executor_info.is_done for executors_list in self.active_executors.values()
+                    suspending |= self._begin_executor_shutdown(executor, keep_position)
+        for _ in range(self._shutdown_attempts(max_executors_close_attempts, suspending)):
+            if all([self._shutdown_settled(executor) for executors_list in self.active_executors.values()
                     for executor in executors_list]):
                 break
             await asyncio.sleep(2.0)
         else:
             pending_executors = [
                 executor.config.id for executors_list in self.active_executors.values()
-                for executor in executors_list if not executor.executor_info.is_done
+                for executor in executors_list if not self._shutdown_settled(executor)
             ]
             if pending_executors:
                 self.logger().warning(
@@ -1424,6 +1543,24 @@ class ExecutorOrchestrator:
         self.store_all_executors()
         # Clear executors and trigger garbage collection
         self.active_executors.clear()
+
+    RESTART_SUSPEND_ATTEMPTS = 15  # x 2s: time for a resting entry cancel to be acknowledged
+
+    @staticmethod
+    def _begin_executor_shutdown(executor, keep_position: bool) -> bool:
+        """Suspend when a position is to be kept and the executor supports exact restore."""
+        suspend = getattr(executor, "suspend_for_restart", None)
+        if keep_position and callable(suspend) and suspend():
+            return True
+        executor.early_stop(keep_position=keep_position)
+        return False
+
+    @staticmethod
+    def _shutdown_settled(executor) -> bool:
+        return executor.executor_info.is_done or getattr(executor, "is_restart_suspended", False) is True
+
+    def _shutdown_attempts(self, requested: int, suspending: bool) -> int:
+        return max(requested, self.RESTART_SUSPEND_ATTEMPTS) if suspending else requested
 
     def store_all_positions(self, *, clear: bool = True, strict: bool = False, controller_ids: Optional[Set[str]] = None):
         """
@@ -1643,12 +1780,6 @@ class ExecutorOrchestrator:
         executor_config = action.executor_config
         if controller_id in getattr(self.strategy, "_controller_restart_required", {}):
             raise RuntimeError(f"Controller {controller_id} requires a process restart; new execution is blocked")
-        unresolved = {owner: ids for owner, ids in self.recovery_required.items() if ids}
-        if unresolved:
-            raise RuntimeError(
-                f"Stack requires startup reconciliation of executors {unresolved}; "
-                "new execution remains blocked"
-            )
         if any(executor.config.id == executor_config.id for executor in self.active_executors.get(controller_id, [])):
             raise ValueError(f"Duplicate executor id: {executor_config.id}")
 
@@ -1783,6 +1914,10 @@ class ExecutorOrchestrator:
             None)
         if not executor:
             self.logger().error(f"Executor ID {executor_id} not found for controller {controller_id}.")
+            return
+        stop_acquisition = getattr(executor, "stop_entry_acquisition", None)
+        if getattr(action, "acquisition_only", False) and callable(stop_acquisition):
+            stop_acquisition("external_invalidation")
             return
         executor.early_stop(action.keep_position)
 

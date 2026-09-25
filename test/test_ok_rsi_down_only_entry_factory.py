@@ -196,11 +196,11 @@ KEEP_POSITION_STOP_CONDITIONS = ("opposing", "kill", "unavailable")
 
 
 @pytest.mark.parametrize("condition", [*KEEP_POSITION_STOP_CONDITIONS, "pause"])
-def test_active_entry_invalidation_emits_keep_position_stop(condition) -> None:
-    """Kill, opposing signal, and unusable book still POSITION_HOLD the owner.
+def test_active_entry_invalidation_emits_acquisition_only_stop(condition) -> None:
+    """Kill, opposing signal, and unusable book stop only the entry acquisition.
 
-    Operator entry pause does not. Pause must not emit StopExecutorAction, even
-    for an unfilled down-only executor. Unfilled cancel is the executor's job.
+    The filled part keeps its trailing exit (never POSITION_HOLD). Operator entry
+    pause emits nothing; unfilled cancel is the executor's job.
     """
     controller, _, prices = make_controller()
     config = buy_config(controller)
@@ -222,7 +222,20 @@ def test_active_entry_invalidation_emits_keep_position_stop(condition) -> None:
         controller_id=controller.config.id,
         executor_id=config.id,
         keep_position=True,
+        acquisition_only=True,
     )]
+
+
+@pytest.mark.parametrize("state", ["managing_fill", "ended_no_fill", "held_residual"])
+def test_invalidation_leaves_finished_acquisitions_alone(state) -> None:
+    controller, _, _ = make_controller()
+    config = buy_config(controller)
+    info = active_info(config)
+    info.custom_info = {"entry_acquisition": {"state": state, "terminal_reason": None}}
+    controller.executors_info = [info]
+    controller.processed_data["signal"] = -1
+    with patch.object(hl_rsi.HLRSIController, "stop_actions_proposal", return_value=[]):
+        assert controller.stop_actions_proposal() == []
 
 
 def test_operator_pause_does_not_stop_a_filled_trailing_owner_and_refuses_new_buy() -> None:
@@ -247,6 +260,7 @@ def test_operator_pause_does_not_stop_a_filled_trailing_owner_and_refuses_new_bu
         controller_id=controller.config.id,
         executor_id=config.id,
         keep_position=True,
+        acquisition_only=True,
     )]
 
 

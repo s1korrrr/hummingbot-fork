@@ -607,7 +607,7 @@ async def test_old_database_missing_empty_sidecars_survives_new_schema_creation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['start', 'restore'])
-async def test_post_claim_failure_is_latched_and_never_retried(tmp_path, failure):
+async def test_post_claim_failure_is_reported_never_retried_and_never_blocks(tmp_path, failure):
     db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
     resume.prepare(db, before, evidence, now=1000, root=root)
     strategy = old._strategy
@@ -630,22 +630,22 @@ async def test_post_claim_failure_is_latched_and_never_retried(tmp_path, failure
             patch.object(PositionExecutor, 'get_trading_rules', return_value=old.trading_rules), \
             patch.object(target, method, side_effect=RuntimeError('injected after claim')) as broken:
         orchestrator = ExecutorOrchestrator(strategy)
-        assert not orchestrator.resume_planned_positions_if_ready()
+        assert orchestrator.resume_planned_positions_if_ready()  # reported; trading is not fenced
         assert broken.call_count == 1
-        assert not orchestrator.resume_planned_positions_if_ready()
+        assert orchestrator.resume_planned_positions_if_ready()
         assert broken.call_count == 1
         assert 'injected after claim' in orchestrator._planned_resume_failure
+        assert orchestrator._planned_resume_pending is False
         assert resume.inspect_manifest(db)[0]['state'] == 'claimed'
         orchestrator.store_all_executors(clear=False)
         orchestrator.sync_live_executors_to_db()
         assert not recorder.get_all_executors()[0].is_done
-        stopped = await orchestrator.stop(strict=True)
-        assert not stopped.reconciliation_complete
-        assert not recorder.get_all_executors()[0].is_done
-        with pytest.raises(RuntimeError, match='pending'):
-            orchestrator.create_executor(CreateExecutorAction(controller_id='owner', executor_config=old.config))
+        await orchestrator.stop(strict=True)
+        assert not recorder.get_all_executors()[0].is_done  # the claimed row survives for the next boot
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
         after_crash = ExecutorOrchestrator(strategy)
+        # The claimed row has no order snapshots to rebuild from: reported, never a fence.
+        assert after_crash._planned_resume_pending is False
         assert after_crash.active_executors['owner'] == []
         assert after_crash.recovery_required['owner'] == [old.config.id]
     strategy.buy.assert_not_called()

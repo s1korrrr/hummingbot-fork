@@ -322,10 +322,9 @@ class ExecutorBase(RunnableBase):
         if getattr(self._strategy, "_unattended_restart_hold", False) is True:
             return True
         orchestrator = getattr(self._strategy, "executor_orchestrator", None)
-        if getattr(orchestrator, "_planned_resume_pending", False) is True:
-            return True
-        recovery = getattr(orchestrator, "recovery_required", None)
-        return isinstance(recovery, dict) and any(recovery.values())
+        # Startup ownership transfer is the only order gate. An unresolved persisted
+        # row is reported (recovery_required) but never blocks other executors' orders.
+        return getattr(orchestrator, "_planned_resume_pending", False) is True
 
     def get_price(self, connector_name: str, trading_pair: str, price_type: PriceType = PriceType.MidPrice):
         """

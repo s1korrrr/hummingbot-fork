@@ -682,28 +682,39 @@ async def test_unfinished_chain_is_rejected_by_validate_position(tmp_path, stopp
 
 
 @pytest.mark.asyncio
-async def test_plain_restart_with_unfinished_chain_requires_recovery_and_creates_no_executor(tmp_path, stopped_recorder_scope):
+async def test_plain_restart_with_unfinished_chain_restores_owner_and_stops_acquisition(tmp_path, stopped_recorder_scope):
+    """Restart continuity: the same owner comes back, its resting child is re-tracked and cancelled, no new BUY."""
     db = tmp_path / 'running.sqlite'
     recorder = make_recorder(db)
     executor = make_mid_chain_executor()
     recorder.store_or_update_executor(executor)
     assert not recorder.get_all_executors()[0].is_done
     strategy = ready_strategy(executor)
+    connector = strategy.connectors[executor.config.connector_name]
+    connector._order_tracker.fetch_order.return_value = None
+    connector.get_balance.return_value = D('10')
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
             patch.object(PositionExecutor, 'get_trading_rules', return_value=RULE), \
             patch.object(PositionExecutor, 'start') as start, \
             patch.object(DownOnlyMakerPositionExecutor, 'hydrate_planned_position') as hydrate:
         orchestrator = ExecutorOrchestrator(strategy)
-        assert orchestrator.recovery_required == {OWNER: [executor.config.id]}
+        assert orchestrator._planned_resume_pending is True
         assert orchestrator.active_executors[OWNER] == []
         assert orchestrator.resume_planned_positions_if_ready()
-        assert orchestrator.recovery_required == {OWNER: [executor.config.id]}
-        assert orchestrator.active_executors[OWNER] == []
-        start.assert_not_called()
+        assert orchestrator.recovery_required == {}
+        [restored] = orchestrator.active_executors[OWNER]
+        start.assert_called_once()
         hydrate.assert_not_called()
-        from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
-        with pytest.raises(RuntimeError, match='reconciliation'):
-            orchestrator.create_executor(CreateExecutorAction(controller_id=OWNER, executor_config=executor.config))
+    assert restored.config.id == executor.config.id
+    assert [order.order_id for order in restored._entry_orders()] == ['entry-old', 'entry']
+    assert restored._entry_chain_children == executor._entry_chain_children
+    assert restored._restart_stop_entry_pending is True
+    tracked = connector._order_tracker.start_tracking_order.call_args.args[0]
+    assert tracked.client_order_id == 'entry'
+    restored._status = RunnableStatus.RUNNING
+    restored.cancel_open_order = MagicMock()
+    restored.stop_entry_acquisition('restart_continuity')
+    restored.cancel_open_order.assert_called_once()
     strategy.buy.assert_not_called()
     assert resume.inspect_manifest(db) == []
     assert not recorder.get_all_executors()[0].is_done

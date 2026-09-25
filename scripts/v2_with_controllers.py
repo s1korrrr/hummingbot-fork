@@ -303,7 +303,8 @@ class V2WithControllers(StrategyV2Base):
             elif action == "bot_cancel_pending_entries":
                 target_controller_ids = {controller.config.id for controller in target_controllers}
                 actions = [
-                    StopExecutorAction(executor_id=executor.id, controller_id=executor.controller_id, keep_position=True)
+                    StopExecutorAction(executor_id=executor.id, controller_id=executor.controller_id,
+                                       keep_position=True, acquisition_only=True)
                     for executor in self.get_all_executors()
                     if executor.controller_id in target_controller_ids
                     and executor.side == TradeType.BUY

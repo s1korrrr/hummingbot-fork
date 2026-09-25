@@ -478,10 +478,10 @@ class StrategyV2Base(StrategyPyBase):
         if self._unattended_restart_hold:
             raise RuntimeError("V2 unattended restart hold; order submission is blocked")
         orchestrator = getattr(self, "executor_orchestrator", None)
-        recovery = getattr(orchestrator, "recovery_required", None)
-        if (getattr(orchestrator, "_planned_resume_pending", False) is True
-                or (isinstance(recovery, dict) and any(recovery.values()))):
-            raise RuntimeError("Stack requires startup reconciliation; order submission is blocked")
+        # Only the startup ownership transfer (seconds, until connectors are ready)
+        # gates orders. Unresolved rows are reported, never an order fence.
+        if getattr(orchestrator, "_planned_resume_pending", False) is True:
+            raise RuntimeError("Stack requires startup reconciliation (position restore pending); order submission waits for connectors")
 
     def buy(self,
             connector_name: str,

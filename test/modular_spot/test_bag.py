@@ -377,9 +377,9 @@ def test_live_capital_marks_the_held_bag_and_active_buys_at_mid_against_the_posi
     eight = ((D('0'), D('0'), D('0')),) * 8
     assert live_capital_quote(cap, held_amount=D('0.0004'), held_dust=True, mid=D('600'), active=eight,
                               available_quote=D('1000')) == (None, 'max_executors')
-    # The buy is resized to the wallet's available quote (live V2 resize_to_available_quote).
+    # Unfunded (V1): a buy the wallet cannot pay for is refused (live balance_low), never shrunk.
     assert live_capital_quote(cap, held_amount=D('0'), held_dust=True, mid=D('600'), active=(),
-                              available_quote=D('37.5')) == (D('37.5'), 'admitted')
+                              available_quote=D('37.5')) == (None, 'cash_exhausted')
     assert live_capital_quote(cap, held_amount=D('0'), held_dust=True, mid=D('600'), active=(),
                               available_quote=D('0')) == (None, 'cash_exhausted')
     with pytest.raises(ValueError):
@@ -448,3 +448,25 @@ def test_live_v2_funding_resizes_the_buy_before_the_mid_cap_check():
         live_capital_quote(v2, **held)
     # The pure decision recomputes from recorded facts (verifier path).
     assert live_capital_decision(v1, active_count=8, exposure=D('0'), available_quote=D('1000')) == (None, 'max_executors')
+
+
+def test_bag_mode_planner_funded_v2_resizes_to_the_funding_ceiling():
+    from controllers.generic.modular_spot_core.bag import LiveCapitalConfig
+    from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy
+    from controllers.generic.modular_spot_core.market import MarketFeatures
+    from controllers.generic.modular_spot_core.planner import plan
+    from controllers.generic.modular_spot_core.state import DecisionState
+
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8,
+                            funded_cap_quote=D('505'), funding_fee_reserve=D('0.003'))
+    base = dict(fingerprint='a' * 64, budget=D('500'), now=1200,
+                market=MarketFeatures(1140, D('560'), D('29'), D('31'), False, False),
+                bid=D('560'), ask=D('560.1'), available_quote=D('1000'), amount_step=D('.001'),
+                minimum_amount=D('.001'), minimum_notional=D('1'), pnl=D('0'), signal=SignalPolicy(),
+                acquisition=AcquisitionPolicy(fractions=(D('.2'),) * 5, minimum_drop=D('.008')), risk=RiskPolicy())
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    bag = HeldBag(D('0.6'), D('700'), D('1'))  # 421 at cost: ceiling (505 - 421) / 1.003 = 83.75
+    revised, proposal, reason = plan(state, {}, **base, bag=bag, capital=cap)
+    assert reason == 'entry_proposed' and proposal.amount * D('560') <= D('84')
+    spent = HeldBag(D('0.72'), D('700'), D('1'))  # 505 at cost: the funding ceiling is exhausted
+    assert plan(state, {}, **base, bag=spent, capital=cap)[2] == 'funding_exhausted'

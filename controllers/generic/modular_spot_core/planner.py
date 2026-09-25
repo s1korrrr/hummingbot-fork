@@ -168,10 +168,13 @@ def _live_capital_entry(state, active, acquired, bag, bag_empty, capital, *, fin
     mid = (bid + ask) / 2
     rows = [(value.remaining_base, max(value.planned_quote - value.entry_quote, Decimal('0')) / value.entry_price
              if not value.entry_terminal else Decimal('0'), value.entry_price) for value in active]
-    # Live V2 funding counts the bag and active buys at cost, pending entries included.
+    # Live V2 funding counts the bag and active buys at cost with fees, pending entries included.
+    # Net realized losses also count live; native has no fill ledger here, and the no-loss exit
+    # floor keeps realized PnL nonnegative, so inventory cost is the binding term.
     funded_used = None if capital.funded_cap_quote is None else (
         bag.amount * bag.breakeven_price + bag.remaining_fees_quote
-        + sum((max(value.planned_quote, value.entry_quote) for value in active), Decimal('0')))
+        + sum((max(value.planned_quote, value.entry_quote) for value in active), Decimal('0'))
+        * (1 + risk.fee_reserve_fraction))
     quote, reason = live_capital_quote(capital, held_amount=bag.amount, held_dust=bag_empty, mid=mid, active=rows,
                                        available_quote=available_quote, funded_used_quote=funded_used)
     if quote is None:

@@ -119,8 +119,11 @@ class LiveCapitalConfig(PolicyModel):
     (resized) buy is admitted only while ``held bag + active buys`` marked at mid plus the buy
     stays within ``position_cap_quote`` (``max_total_position_usd``) and fewer than
     ``max_active_tranches`` buys are active (``max_executors_per_side``). Without funding
-    (V1 style) the buy is finally resized to available wallet quote.
-    Live BNB: V2 is 100 / 500 / 8 with funding 505 at cost; V1 is 200 / 2500 / 8, unfunded.
+    (V1) a buy the wallet cannot pay for is refused (live ``balance_low``), never shrunk.
+    Live BNB: V2 is 100 / 500 / 8 with funding 505 at cost (and a strategy-wide 2500
+    allocation across pairs, not modelled per pair); V1 is 200 / 2500 / 8, unfunded.
+    Every buy plans the full slice: the live scout/runner split and dynamic signal-strength
+    sizing are entry-side behaviour, not modelled here.
     """
     slice_quote: Decimal = Field(default=Decimal('100'), gt=0)
     position_cap_quote: Decimal = Field(default=Decimal('500'), gt=0)
@@ -179,10 +182,8 @@ def live_capital_decision(cap: LiveCapitalConfig, *, active_count: int, exposure
             return None, 'funding_exhausted'
     if decimal(exposure, 'exposure') + quote > cap.position_cap_quote:
         return None, 'max_position'
-    if cap.funded_cap_quote is None:
-        quote = min(quote, decimal(available_quote, 'available quote'))
-        if quote <= 0:
-            return None, 'cash_exhausted'
+    if cap.funded_cap_quote is None and decimal(available_quote, 'available quote') < quote:
+        return None, 'cash_exhausted'  # live V1 balance_low: refused, not resized
     return quote, 'admitted'
 
 

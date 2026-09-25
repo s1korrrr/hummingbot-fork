@@ -1,4 +1,5 @@
 """A source upgrade must preserve real native fills and terminal admission proof."""
+import json
 from decimal import Decimal as D
 from test.hummingbot.strategy_v2.paper import test_paper_funding as fixtures
 from test.hummingbot.strategy_v2.paper.test_paper_funding import funded_config, paper
@@ -29,6 +30,7 @@ async def test_explicit_transition_preserves_partial_fill_and_admits_next_buy(tm
             old_binding = old.binding
             owner._native_source_hash = 'a' * 64
             new = NativeFundingStore(owner, session.recorder)
+            new._previous_source_hashes = lambda _session: set()  # no provable prior source: explicit path
             with pytest.raises(ValueError, match='identity'):
                 new.reconcile()
             with pytest.raises(ValueError, match='active|quiescent'):
@@ -264,3 +266,59 @@ async def test_terminal_snapshot_fill_contradiction_blocks_transition(tmp_path, 
     finally:
         await session.close()
         MarketsRecorder._shared_instance = prior
+
+
+@pytest.mark.asyncio
+async def test_code_upgrade_carries_funding_ledger_forward_exactly(tmp_path):
+    """A pure native code change (same owners, pairs, policy, composition) keeps admitting entries."""
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    with patch('socket.socket.connect', side_effect=AssertionError('network forbidden')):
+        session = NativePaperSession(paper(), [funded_config()], tmp_path / 'funding.sqlite')
+        try:
+            await fixtures.NativePaperFundingTests.seed(None, session)
+            owner = next(iter(session.controllers.values()))
+            executor = session.executor_orchestrator.active_executors[owner.config.id][0]
+            await session.step(600061, trades=[dict(trading_pair='BTC-USDC', sequence=1, timestamp=600061,
+                                                    side=TradeType.SELL, price=executor.config.entry_price, amount=D('.1'))])
+            old = NativeFundingStore(owner, session.recorder)
+            _, before_state = old._load()
+            old_source = owner._native_source_hash
+            old_binding = old.binding
+            owner._native_source_hash = 'a' * 64
+            new = NativeFundingStore(owner, session.recorder)
+            new._previous_source_hashes = lambda _session: {old_source}
+            _, state = new._load()
+            assert state['claims'] == before_state['claims'] and state['fills'] == before_state['fills']
+            assert state['releases'] == before_state['releases']
+            with session.recorder.sql_manager.get_new_session() as sql:
+                receipts = [row for row in sql.query(Metadata).all()
+                            if row.key.startswith('modular-funding-code-upgrade:v1:')]
+            assert len(receipts) == 1
+            assert json.loads(receipts[0].value)['from_binding'] == old_binding
+            assert json.loads(receipts[0].value)['to_binding'] == new.binding
+            assert NativeFundingStore(owner, session.recorder)._load()[1]['claims'] == state['claims']
+        finally:
+            await session.close()
+            MarketsRecorder._shared_instance = prior
+
+
+@pytest.mark.asyncio
+async def test_configuration_change_is_never_carried_forward_automatically(tmp_path):
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    with patch('socket.socket.connect', side_effect=AssertionError('network forbidden')):
+        session = NativePaperSession(paper(), [funded_config()], tmp_path / 'funding.sqlite')
+        try:
+            await fixtures.NativePaperFundingTests.seed(None, session)
+            owner = next(iter(session.controllers.values()))
+            old_source = owner._native_source_hash
+            owner._native_source_hash = 'a' * 64
+            owner._composition_digest = 'c' * 64  # the trading configuration changed too
+            new = NativeFundingStore(owner, session.recorder)
+            new._previous_source_hashes = lambda _session: {old_source}
+            with pytest.raises(ValueError, match='FUNDING_BINDING_MISMATCH'):
+                new._load()
+        finally:
+            await session.close()
+            MarketsRecorder._shared_instance = prior

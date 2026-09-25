@@ -244,6 +244,7 @@ class ModularSpotController(ControllerBase):
             'data_source': self.config.data.mode,
             'recipe_binding': None if self.config.recipe_binding is None
             else self.config.recipe_binding.model_dump(mode='json'),
+            'bag': self.runtime.bag_status,
         }
 
     def entry_permission(self, config, *, check_funds=True):
@@ -268,4 +269,5 @@ class ModularSpotController(ControllerBase):
         return [f'Modular spot | {self.config.id} | {self.config.connector_name}:{self.config.trading_pair}',
                 f'Execution: {self.config.execution_enabled} | Acquisitions: {self.config.acquisition_enabled}',
                 f'Data: {self.config.data.mode} | {self.runtime.reason} | Coverage: {self.runtime.coverage}',
-                'Native per-tranche ownership; held inventory requires explicit reconciliation.']
+                'Native per-tranche ownership; held inventory requires explicit reconciliation.'
+                if self.config.bag is None else f'Bag: {self.runtime.bag_status}']

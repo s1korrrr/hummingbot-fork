@@ -22,6 +22,7 @@ from hummingbot.strategy_v2.components.held_inventory import (
     RecoveryTrail,
     bag_sell_signal,
     has_sell_price_gap,
+    held_is_dust,
     maker_sell_price,
     net_pnl_pct,
     reanchor_after_sell,
@@ -34,11 +35,12 @@ from hummingbot.strategy_v2.components.held_inventory import (
     stale_recovery_sell,
     trail_reversal,
 )
+from hummingbot.strategy_v2.components.program_budget import BAG_RECOVERY_LEVEL
 
 from .config import PolicyModel
 from .domain import PolicyError, decimal, identity
 
-RECOVERY_LEVEL = 'modular_spot:v1:bag:recovery'
+RECOVERY_LEVEL = BAG_RECOVERY_LEVEL  # the program budget recognises member bag sells by this level
 
 
 class BagConfig(PolicyModel):
@@ -208,7 +210,7 @@ class BagTick:
 
 
 def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tranches, live_sells,
-           last_sell_price: Optional[Decimal], mid: Decimal, features, bag: BagFeatures,
+           last_sell_price: Optional[Decimal], mid: Decimal, best_ask: Decimal, features, bag: BagFeatures,
            first_tick_after_close: bool, tick: Decimal, amount_step: Decimal, minimum_amount: Decimal,
            minimum_notional: Decimal, trend=None) -> BagTick:
     """One live OK RSI tick for held inventory: stale cancel, recovery, then early stops.
@@ -220,9 +222,11 @@ def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tra
     """
     policy = cfg.policy()
     mid = decimal(mid, 'mid', positive=True)
+    best_ask = decimal(best_ask, 'best ask', positive=True)
     rsi, rsi_prev, ema = float(features.rsi), float(bag.rsi_prev), float(bag.ema_fast)
-    if trail is not None and (held.amount <= 0 or trail.breakeven_price != held.breakeven_price.quantize(Decimal('1e-8'))):
-        trail = None  # live _sync_recovery_trails drops a trail whose breakeven key disappeared
+    dust = held_is_dust(held.amount, mid, min_amount=max(amount_step, minimum_amount), min_notional=minimum_notional)
+    if trail is not None and (dust or trail.breakeven_price != held.breakeven_price.quantize(Decimal('1e-8'))):
+        trail = None  # live _sync_recovery_trails drops the trail of a bag that is gone (dust is no bag)
     cached = []
 
     def trend_state():
@@ -243,8 +247,7 @@ def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tra
                     if mid >= sell.proposal_price * (1 + cfg.stale_cancel_pct)
                     and stale_recovery_sell(trend_hold(), mid, sell.proposal_price, cfg.stale_cancel_pct))
     sell, reason = None, 'no_bag'
-    dust = held.amount < max(amount_step, minimum_amount) or held.amount * mid < minimum_notional
-    if held.amount > 0 and not live_sells and not dust:
+    if not live_sells and not dust:
         signal = False
         if first_tick_after_close:
             common = dict(rsi=rsi, rsi_prev=rsi_prev, price=mid, ema_fast=ema, macd_hist=float(bag.macd_hist),
@@ -252,8 +255,10 @@ def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tra
                           inventory_net_pnl=net_pnl_pct(held.amount, held.breakeven_price,
                                                         held.remaining_fees_quote, mid),
                           sell_rsi_rollover_delta=float(cfg.sell_rsi_rollover_delta))
-            # The dynamic threshold is clamped to >= 60; only then does the trend matter.
-            if bag_sell_signal(sell_threshold=60.0, strong_bullish_trend=False, trail_reversal_ready=False, **common):
+            # The trend only moves the threshold up, or down to no lower than 60, so a signal that
+            # fails even at min(60, base) cannot fire whatever the trend; only then is it evaluated.
+            floor = min(60.0, float(policy.recovery_arm_rsi))
+            if bag_sell_signal(sell_threshold=floor, strong_bullish_trend=False, trail_reversal_ready=False, **common):
                 direction, confidence = trend_state()
                 threshold = sell_signal_threshold(
                     float(policy.recovery_arm_rsi), trend_direction=direction, trend_confidence=float(confidence),
@@ -266,7 +271,7 @@ def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tra
             remaining_fees_quote=held.remaining_fees_quote, price=mid, rsi=rsi, ema_fast=ema, policy=policy,
             sell_signal=signal, trend_hold=trend_hold() if signal else False)
         if reason.startswith('sell:'):
-            proposal = maker_sell_price(mid, mid, tick)
+            proposal = maker_sell_price(mid, best_ask, tick)
             amount = recovery_slice_amount(held.amount, proposal, policy, min_amount=max(amount_step, minimum_amount),
                                            min_quote=minimum_notional, remainder_sweep_quote=cfg.remainder_sweep_quote)
             amount = (amount / amount_step).to_integral_value(rounding='ROUND_FLOOR') * amount_step

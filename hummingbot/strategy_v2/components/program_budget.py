@@ -40,7 +40,16 @@ class Reservation(PolicyModel):
         return self
 
 
+BAG_RECOVERY_LEVEL = 'modular_spot:v1:bag:recovery'
+MAX_RELEASED = 65536
+
+
 class BudgetStore:
+    """Program commitments. Schema 1 holds reservations and members. Schema 2 adds the
+    append-only ``released`` executor ids: held (bagged) tranches and bag recovery sells a
+    member proved flat through :meth:`release_held`. A checkpoint with nothing released
+    keeps the schema 1 bytes."""
+
     def __init__(self, recorder, policy: BudgetPolicy, *, connector: str, quote: str, account: str,
                  metadata_model=None):
         if metadata_model is None:
@@ -52,8 +61,6 @@ class BudgetStore:
         # each claim; a second namespace would not segregate exchange quote cash.
         self.key = 'modular-program-budget:v1:' + identity([recorder.config_file_path, connector, quote, policy.group])
         self.policy_hash = identity(policy.model_dump(mode='json'))
-        # Controllers proven (by the calling public method) to have an empty held position.
-        self._held_flat = frozenset()
 
     def _member_probe(self, owner, pair):
         return Reservation(
@@ -63,14 +70,21 @@ class BudgetStore:
 
     def _parse(self, raw):
         if raw is None:
-            return {}, {}
+            return {}, {}, frozenset()
         try:
             value = json.loads(raw)
-            if (not isinstance(value, dict) or set(value) != {'schema_version', 'policy_hash', 'reservations', 'members'}
-                    or type(value['schema_version']) is not int or value['schema_version'] != 1
+            base_keys = {'schema_version', 'policy_hash', 'reservations', 'members'}
+            version = value.get('schema_version') if isinstance(value, dict) else None
+            if (not isinstance(value, dict) or type(version) is not int
+                    or set(value) != (base_keys if version == 1 else base_keys | {'released'} if version == 2 else None)
                     or value['policy_hash'] != self.policy_hash or not isinstance(value['reservations'], list)
                     or not isinstance(value['members'], dict) or len(value['members']) > 1000):
                 raise PolicyError('program budget schema or policy changed')
+            released = value.get('released', [])
+            if (not isinstance(released, list) or (version == 2 and not released) or len(released) > MAX_RELEASED
+                    or any(not isinstance(x, str) or not x for x in released)
+                    or released != sorted(set(released))):
+                raise PolicyError('program released executors invalid')
             members = value['members']
             for owner, pair in members.items():
                 self._member_probe(owner, pair)
@@ -90,14 +104,18 @@ class BudgetStore:
                 raise PolicyError('persisted asset limit violated')
             if len({(r.slot, r.trading_pair) for r in reservations}) != len({r.slot for r in reservations}):
                 raise PolicyError('persisted base-asset concentration violated')
-            return {r.executor_id: r for r in reservations}, members
+            if any(r.executor_id in released for r in reservations):
+                raise PolicyError('released executor still reserved')
+            return {r.executor_id: r for r in reservations}, members, frozenset(released)
         except (ValueError, TypeError, KeyError) as exc:
             raise PolicyError('program budget checkpoint invalid') from exc
 
-    def _encode(self, reservations, members):
-        return json.dumps({'schema_version': 1, 'policy_hash': self.policy_hash, 'members': members,
-                           'reservations': [r.model_dump(mode='json') for _, r in sorted(reservations.items())]},
-                          sort_keys=True, separators=(',', ':'), allow_nan=False)
+    def _encode(self, reservations, members, released=frozenset()):
+        value = {'schema_version': 1, 'policy_hash': self.policy_hash, 'members': members,
+                 'reservations': [r.model_dump(mode='json') for _, r in sorted(reservations.items())]}
+        if released:
+            value.update(schema_version=2, released=sorted(released))
+        return json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
 
     def _load(self):
         with self.recorder.sql_manager.get_new_session() as session:
@@ -130,72 +148,69 @@ class BudgetStore:
         if claim.trading_pair.split('-')[1] != self.quote:
             raise PolicyError('reservation quote differs from program')
 
-    def contains(self, claim: Reservation, *, native_executors=(), flat_held_controllers=frozenset()) -> bool:
+    def contains(self, claim: Reservation, *, native_executors=()) -> bool:
         self._bind(claim)
-        self._held_flat = frozenset(flat_held_controllers)
         try:
-            reservations, members = self._parse(self._load())
+            reservations, members, released = self._parse(self._load())
             evidence = self._evidence(native_executors)
             self._reject_foreign(evidence)
-            self._check_unreserved(reservations, members, evidence)
+            self._check_unreserved(reservations, members, evidence, released)
             return reservations.get(claim.executor_id) == claim
         except (SQLAlchemyError, AttributeError) as exc:
             raise PolicyError('program reservation store unavailable') from exc
 
-    def occupied_pairs(self, *, native_executors=(), flat_held_controllers=frozenset()):
-        self._held_flat = frozenset(flat_held_controllers)
+    def occupied_pairs(self, *, native_executors=()):
         try:
-            reservations, members = self._parse(self._load())
+            reservations, members, released = self._parse(self._load())
             evidence = self._evidence(native_executors)
             self._reject_foreign(evidence)
-            self._check_unreserved(reservations, members, evidence)
+            self._check_unreserved(reservations, members, evidence, released)
             pairs = {r.trading_pair for r in reservations.values()}
-            pairs.update(self._active_modular_pairs(evidence))
+            pairs.update(self._active_modular_pairs(evidence, released))
             return tuple(sorted(pairs))
         except (SQLAlchemyError, AttributeError) as exc:
             raise PolicyError('program reservation store unavailable') from exc
 
-    def _flat(self, owner, pair, info):
+    def _flat(self, owner, pair, info, released=frozenset()):
         if (info.controller_id != owner or info.config.controller_id != owner
                 or info.config.connector_name != self.connector or info.config.trading_pair != pair):
             raise PolicyError('program receipt ownership differs')
-        return self._is_terminal_flat(info)
+        # A member's own bag recovery sell only reduces held inventory: it never spends quote.
+        return self._is_member_bag_sell(info) or self._is_terminal_flat(info, released)
 
     @staticmethod
-    def _is_reduce_only_sell(info):
-        """A SELL order executor closing held inventory never spends quote capital."""
+    def _is_member_bag_sell(info):
         config = info.config
-        return (getattr(config, 'type', None) == 'order_executor' and getattr(config.side, 'name', None) == 'SELL'
-                and getattr(getattr(config, 'position_action', None), 'name', None) == 'CLOSE')
+        return (isinstance(info.controller_id, str) and info.controller_id.startswith('modular_spot_')
+                and getattr(config, 'type', None) == 'order_executor'
+                and getattr(getattr(config, 'side', None), 'name', None) == 'SELL'
+                and getattr(getattr(config, 'position_action', None), 'name', None) == 'CLOSE'
+                and str(getattr(config, 'level_id', '')).startswith(BAG_RECOVERY_LEVEL + ':')
+                and getattr(config, 'min_sell_price', None) is not None)
 
-    def _is_terminal_flat(self, info):
-        if self._is_reduce_only_sell(info):
+    def _is_terminal_flat(self, info, released=frozenset()):
+        if info.id in released:
             return True
         if info.is_done is not True or info.is_active is not False:
             return False
+        if self._is_member_bag_sell(info):
+            return True  # a finished bag sell no longer occupies its pair
         try:
             receipt = info.custom_info.get('execution_receipt')
-            if not isinstance(receipt, dict):
-                return False
-            owner = receipt.get('accounting_owner')
-            if owner == 'held_position':
-                # Held (bagged) inventory keeps its reservation until the controller's
-                # blended held position is empty; the caller proves that explicitly.
-                return info.controller_id in self._held_flat
-            if owner != 'executor':
+            if not isinstance(receipt, dict) or receipt.get('accounting_owner') != 'executor':
                 return False
             return decimal(receipt.get('remaining_owned_base'), 'remaining native inventory') == 0
         except (PolicyError, AttributeError, TypeError):
             return False
 
-    def _active_modular_pairs(self, evidence):
+    def _active_modular_pairs(self, evidence, released=frozenset()):
         pairs = set()
         for info in evidence.values():
             cid = info.controller_id
             if not isinstance(cid, str) or not cid.startswith('modular_spot_'):
                 continue
             pair = getattr(info.config, 'trading_pair', None)
-            if isinstance(pair, str) and '-' in pair and not self._is_terminal_flat(info):
+            if isinstance(pair, str) and '-' in pair and not self._is_terminal_flat(info, released):
                 pairs.add(pair)
         return pairs
 
@@ -223,23 +238,22 @@ class BudgetStore:
             evidence[info.id] = info
         return evidence
 
-    def _check_unreserved(self, reservations, members, evidence):
+    def _check_unreserved(self, reservations, members, evidence, released=frozenset()):
         for key, info in evidence.items():
             pair = members.get(info.controller_id)
-            if pair is not None and key not in reservations and not self._flat(info.controller_id, pair, info):
+            if pair is not None and key not in reservations and not self._flat(info.controller_id, pair, info, released):
                 raise PolicyError('unreserved or reappearing native inventory requires reconciliation')
 
-    def _concentration_blocked(self, revised, claim, evidence):
+    def _concentration_blocked(self, revised, claim, evidence, released=frozenset()):
         if any(r.slot == claim.slot and r.trading_pair != claim.trading_pair for r in revised.values()):
             return True
-        for pair in self._active_modular_pairs(evidence):
+        for pair in self._active_modular_pairs(evidence, released):
             if pair.split('-')[0] == claim.slot and pair != claim.trading_pair:
                 return True
         return False
 
-    def reserve(self, claim: Reservation, *, native_executors, flat_held_controllers=frozenset()) -> bool:
+    def reserve(self, claim: Reservation, *, native_executors) -> bool:
         self._bind(claim)
-        self._held_flat = frozenset(flat_held_controllers)
         try:
             evidence = self._evidence(native_executors)
             self._reject_foreign(evidence)
@@ -247,7 +261,7 @@ class BudgetStore:
                 return False  # Native ownership already exists; this is not a new admission.
             for _ in range(32):
                 raw = self._load()
-                current, members = self._parse(raw)
+                current, members, released = self._parse(raw)
                 if raw is None and any(
                         str(info.controller_id).startswith('modular_spot_')
                         and info.config.connector_name == self.connector
@@ -261,11 +275,12 @@ class BudgetStore:
                 existing = current.get(claim.executor_id)
                 if existing is not None and existing != claim:
                     raise PolicyError('program reservation identity mutated')
-                self._check_unreserved(current, members, evidence)
+                self._check_unreserved(current, members, evidence, released)
                 # Expiry, process absence, recovery labels and unconfirmed cancels never drop rows here.
                 revised = {key: value for key, value in current.items()
-                           if key not in evidence or not self._flat(value.controller_id, value.trading_pair, evidence[key])}
-                if self._concentration_blocked(revised, claim, evidence):
+                           if key not in evidence
+                           or not self._flat(value.controller_id, value.trading_pair, evidence[key], released)}
+                if self._concentration_blocked(revised, claim, evidence, released):
                     return False
                 revised[claim.executor_id] = claim
                 total = sum((r.reserved_quote for r in revised.values()), Decimal('0'))
@@ -273,8 +288,54 @@ class BudgetStore:
                     return False
                 if len(revised) > 4096:
                     raise PolicyError('program commitment capacity exceeded')
-                if self._write(raw, self._encode(revised, members)):
+                if self._write(raw, self._encode(revised, members, released)):
                     return True
             raise PolicyError('program reservation CAS contention; no dispatch')
         except (SQLAlchemyError, AttributeError, IndexError) as exc:
             raise PolicyError('program reservation evidence or store unavailable') from exc
+
+    def released(self):
+        """Executor ids already proven flat through :meth:`release_held`."""
+        try:
+            return self._parse(self._load())[2]
+        except (SQLAlchemyError, AttributeError) as exc:
+            raise PolicyError('program reservation store unavailable') from exc
+
+    def release_held(self, controller_id: str, executor_ids, *, native_executors) -> frozenset:
+        """Durably release a member's terminal held tranches and bag recovery sells.
+
+        The caller proves its held position is empty and that these receipts account
+        for it. Released executors are flat for every member and every later call;
+        their reservations are dropped in the same CAS write."""
+        ids = frozenset(executor_ids)
+        if not ids or any(not isinstance(x, str) or not x for x in ids):
+            raise PolicyError('release requires explicit executor ids')
+        try:
+            evidence = self._evidence(native_executors)
+            for _ in range(32):
+                raw = self._load()
+                current, members, released = self._parse(raw)
+                pair = members.get(controller_id)
+                if pair is None:
+                    raise PolicyError('release requires a program member')
+                for key in ids - released:
+                    info = evidence.get(key)
+                    if (info is None or info.controller_id != controller_id or info.config.controller_id != controller_id
+                            or info.config.connector_name != self.connector or info.config.trading_pair != pair
+                            or info.is_done is not True or info.is_active is not False):
+                        raise PolicyError('release target is not a terminal executor of this member')
+                    receipt = (info.custom_info or {}).get('execution_receipt')
+                    held = isinstance(receipt, dict) and receipt.get('accounting_owner') == 'held_position'
+                    if not held and not self._is_member_bag_sell(info):
+                        raise PolicyError('only held tranches and bag recovery sells can be released')
+                merged = released | ids
+                if merged == released:
+                    return released
+                if len(merged) > MAX_RELEASED:
+                    raise PolicyError('program released capacity exceeded')
+                revised = {key: value for key, value in current.items() if key not in merged}
+                if self._write(raw, self._encode(revised, members, merged)):
+                    return merged
+            raise PolicyError('program release CAS contention')
+        except (SQLAlchemyError, AttributeError, TypeError) as exc:
+            raise PolicyError('program release evidence or store unavailable') from exc

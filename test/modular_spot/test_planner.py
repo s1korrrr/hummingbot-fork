@@ -140,6 +140,28 @@ def test_bag_mode_campaign_resets_only_when_every_claim_is_terminal_and_the_bag_
     assert kept[0].claims == ('held',) and kept[2] != 'campaign_flat'
     flat = plan(state, view, **inputs(), bag=HeldBag(D('0'), D('0'), D('0')))
     assert flat[2] == 'campaign_flat' and flat[0].claims == () and flat[0].cycle == 1
+    # The next candle: the retired held tranche's receipt still reports its base (the bag, not
+    # the tranche, sold it). It must not fault as unclaimed execution; a new cycle can enter.
+    next_candle = MarketFeatures(1200, D('100'), D('29'), D('31'), False, False)
+    later = plan(flat[0], view, **inputs(now=1260, market=next_candle), bag=HeldBag(D('0'), D('0'), D('0')))
+    assert later[2] == 'entry_proposed' and later[0].claims == (later[1].identifier,) and later[0].cycle == 1
+    # Legacy mode still refuses the same unclaimed receipt.
+    with pytest.raises(PolicyError, match='unclaimed'):
+        plan(flat[0], view, **inputs(now=1260, market=next_candle))
+
+
+def test_bag_mode_off_grid_dust_counts_as_an_empty_bag():
+    from controllers.generic.modular_spot_core.bag import HeldBag
+
+    state = DecisionState(fingerprint='a' * 64, candle=1080, claims=('held',), committed_quote=D('50'))
+    view = {'held': _view('.5', '50', '100', True, held=True)}
+    dust = HeldBag(D('.0004'), D('100'), D('0'))  # a sweep rounded to the .001 lot leaves this behind
+    assert plan(state, view, **inputs(), bag=dust)[2] == 'campaign_flat'
+    notional = HeldBag(D('.009'), D('100'), D('0'))  # .9 USDC is under the 1 USDC minimum notional
+    assert plan(state, view, **inputs(), bag=notional)[2] == 'campaign_flat'
+    # A dust bag does not block a buy near its breakeven either.
+    fresh = DecisionState(fingerprint='a' * 64, candle=1080)
+    assert plan(fresh, {}, **inputs(), bag=dust)[2] == 'entry_proposed'
 
 
 def test_legacy_mode_still_holds_on_held_inventory():

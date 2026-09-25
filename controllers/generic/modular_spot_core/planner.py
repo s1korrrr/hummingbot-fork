@@ -2,6 +2,8 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
+from hummingbot.strategy_v2.components.held_inventory import held_is_dust
+
 from .acquisition import next_stage
 from .domain import PolicyError, decimal, identity
 from .portfolio import allocate
@@ -38,16 +40,21 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     state = state or DecisionState(fingerprint=fingerprint, candle=market.candle_open)
     if state.fingerprint != fingerprint or market.candle_open < state.candle:
         raise PolicyError('configuration or candle identity regression')
+    # In bag mode a terminal held tranche's inventory belongs to the controller's held
+    # position (the bag), which is read and sold separately; its receipt keeps the base.
     if any((not value.terminal or value.remaining_base > 0) and key not in state.claims
+           and not (bag is not None and value.terminal and value.held)
            for key, value in inventory.items()):
         raise PolicyError('unclaimed native execution')
+    bag_empty = None if bag is None else held_is_dust(
+        bag.amount, bid, min_amount=max(decimal(amount_step, 'amount step'), decimal(minimum_amount, 'minimum amount')),
+        min_notional=decimal(minimum_notional, 'minimum notional'))
     assessment = risk_update(risk, budget=budget, pnl=pnl, day=int(now // 86400),
                              peak=state.risk_peak, previous_day=state.risk_day,
                              day_start=state.risk_day_start, paused=state.risk_paused)
     updated = state.model_copy(update={'risk_peak': assessment.peak, 'risk_day': assessment.day,
                                        'risk_day_start': assessment.day_start, 'risk_paused': assessment.paused})
-    revised, reconciliation = reconcile_claims(updated, inventory,
-                                               bag_amount=None if bag is None else bag.amount)
+    revised, reconciliation = reconcile_claims(updated, inventory, bag_empty=bag_empty)
     if reconciliation not in {'reconciled', 'campaign_flat'}:
         return updated, None, reconciliation
     if bag is None and revised.committed_quote > budget:
@@ -74,7 +81,7 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
                                     turn=getattr(market, 'turn', False), score=getattr(market, 'score', 0),
                                     atr_fraction=getattr(market, 'atr_fraction', None))
     if bag is not None:
-        return _bag_entry(revised, inventory, bag, fingerprint=fingerprint, budget=budget, now=now, market=market,
+        return _bag_entry(revised, inventory, bag, bag_empty, fingerprint=fingerprint, budget=budget, now=now, market=market,
                           bid=bid, available_quote=available_quote, amount_step=amount_step,
                           minimum_amount=minimum_amount, minimum_notional=minimum_notional,
                           fresh_signal=signal_result.enter, acquisition=acquisition, risk=risk)
@@ -101,7 +108,7 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     return revised, proposal, 'entry_proposed'
 
 
-def _bag_entry(state, inventory, bag, *, fingerprint, budget, now, market, bid, available_quote, amount_step,
+def _bag_entry(state, inventory, bag, bag_empty, *, fingerprint, budget, now, market, bid, available_quote, amount_step,
                minimum_amount, minimum_notional, fresh_signal, acquisition, risk):
     """Live OK RSI admission: capacity counts active tranches; capital is what is tied up now."""
     active = [inventory[x] for x in state.claims if not inventory[x].terminal]
@@ -112,7 +119,7 @@ def _bag_entry(state, inventory, bag, *, fingerprint, budget, now, market, bid, 
                           distribution_started=False)
     if fraction is None:
         return state, None, 'acquisition_not_eligible'
-    if bag.amount > 0 and abs(bid - bag.breakeven_price) / bag.breakeven_price < acquisition.minimum_drop:
+    if not bag_empty and abs(bid - bag.breakeven_price) / bag.breakeven_price < acquisition.minimum_drop:
         return state, None, 'bag_gap_not_met'
     fee = 1 + risk.fee_reserve_fraction
     tied_up = sum((max(value.planned_quote, value.entry_quote) * fee for value in active), Decimal('0'))

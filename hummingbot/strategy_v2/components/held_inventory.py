@@ -75,6 +75,16 @@ def should_hold_as_bag(basis_price: Decimal, price: Decimal, policy: BagRecovery
     return (price - basis_price) / basis_price <= -threshold
 
 
+def held_is_dust(amount: Decimal, price: Decimal, *, min_amount: Decimal, min_notional: Decimal) -> bool:
+    """Live ``_inventory_is_dust``: empty, below the venue minimum size, or below minimum notional.
+
+    A dust bag is not a bag: it is never sold, never counts as held inventory and never
+    blocks a campaign from being flat."""
+    if amount <= 0:
+        return True
+    return amount < min_amount or (min_notional > 0 and price > 0 and amount * price < min_notional)
+
+
 @dataclass(frozen=True)
 class HeldInventory:
     """Blended long held position with the sequential semantics of live ``PositionHold``.

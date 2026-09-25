@@ -34,7 +34,8 @@ def tick(**changes):
     values = dict(trail=None, held=HELD, tranches=(), live_sells=(), last_sell_price=None, mid=D('106'),
                   features=market, bag=bag, first_tick_after_close=False, tick=D('0.01'), amount_step=D('0.001'),
                   minimum_amount=D('0.001'), minimum_notional=D('1'))
-    return decide(CFG, **{**values, **changes})
+    values['best_ask'] = changes.pop('best_ask', changes.get('mid', values['mid']))
+    return decide(changes.pop('cfg', CFG), **{**values, **changes})
 
 
 def test_recovery_arms_peaks_and_sells_a_live_style_slice_with_floor():
@@ -81,6 +82,28 @@ def test_stale_cancel_early_stop_gap_and_dust():
     assert gapped.sell is None and gapped.reason == 'price-gap'
     dust = tick(held=HeldBag(D('0.005'), D('100'), D('0')), mid=D('106'))
     assert dust.reason == 'no_bag' and dust.trail is None
+    # A whole-bag sweep leaves an off-grid residual below one lot: that residual is dust, not a bag.
+    residual = tick(held=HeldBag(D('0.0004'), D('100'), D('0')), mid=D('106'), amount_step=D('0.001'))
+    assert residual.reason == 'no_bag' and residual.sell is None
+    # The trail of a sold-out bag does not survive on its dust, even at the same breakeven.
+    armed = tick().trail
+    assert tick(trail=armed, held=HeldBag(D('0.0004'), D('100'), D('0.3'))).trail is None
+
+
+def test_recovery_proposal_is_one_tick_above_the_best_ask_like_live():
+    armed = tick().trail
+    peak = tick(trail=armed, mid=D('108')).trail
+    sold = tick(trail=peak, mid=D('107.095'), best_ask=D('107.105'))
+    assert sold.sell.proposal_price == D('107.11')  # live _shade_limit_maker_price: ceil(max(mid, ask))
+    assert tick(trail=peak, mid=D('107.095')).sell.proposal_price == D('107.10')  # mid as ask is half a spread low
+
+
+def test_lazy_trend_precheck_keeps_signals_for_a_low_arm_threshold():
+    cfg = BagConfig(recovery_arm_rsi=55)
+    armed = tick(cfg=cfg, features={'rsi': 58.0}).trail
+    reversal = {'rsi': 58.0, 'rsi_prev': 58.2, 'ema': 106.5, 'macd': -0.1, 'macd_prev': 0.2}
+    fired = tick(cfg=cfg, trail=armed, mid=D('105.9'), first_tick_after_close=True, features=reversal)
+    assert fired.sell is not None and fired.sell.reason == 'sell-signal'
 
 
 def test_trail_store_roundtrip_and_rejects_corruption():
@@ -147,9 +170,10 @@ def _runtime(recorder, *, positions, executors=(), market_close='106'):
     bindings = SimpleNamespace(metadata_model=None, action=lambda cid, config: CreateExecutorAction(
         controller_id=cid, executor_config=config))
     runtime = object.__new__(ModularRuntime)
-    runtime.controller, runtime.bindings, runtime.fingerprint = controller, bindings, 'f' * 64
+    runtime.controller, runtime.bindings, runtime.fingerprint = controller, bindings, cfg.fingerprint()
     runtime.store = DecisionStore(recorder, cfg.id, 'okx', 'BNB-USDC')
     runtime.pending, runtime.dispatched, runtime.fault = {}, set(), None
+    runtime.budget, runtime.bag_status = None, None
     _, bag = feats()
     runtime.market = MarketFeatures(1_800_000_000, D(market_close), D('80.2'), D('80'), False, False, bag=bag)
     return runtime
@@ -190,17 +214,17 @@ def test_runtime_bag_tick_holds_losers_places_one_recovery_sell_and_persists_the
     armed = runtime._bag_actions(inventory, state, held, _snapshot(D('106')))
     # 106 vs the 110 fill is -3.6%: the live tranche is held (keep_position), and the bag arms.
     assert [type(a) for a in armed] == [StopExecutorAction] and armed[0].keep_position is True
-    assert runtime.bag_reason == 'armed'
+    assert runtime.bag_status['reason'] == 'armed'
     runtime.market = runtime.market.__class__(1_800_000_060, D('108'), D('80.2'), D('80'), False, False,
                                               bag=runtime.market.bag)
     runtime._bag_actions({}, state.model_copy(update={'claims': ()}), held, _snapshot(D('108')))
     sell = runtime._bag_actions({}, state.model_copy(update={'claims': ()}), held, _snapshot(D('107.1')))
     create = [a for a in sell if isinstance(a, CreateExecutorAction)]
-    assert len(create) == 1 and runtime.bag_reason == 'sell:pullback-trail'
+    assert len(create) == 1 and runtime.bag_status['reason'] == 'sell:pullback-trail'
     config = create[0].executor_config
     assert runtime.recovery_permission(config) and runtime.executor_class(config) is OrderExecutor
     frozen = runtime._bag_actions({}, state.model_copy(update={'claims': ()}), held, _snapshot(D('115')))
-    assert frozen == [] and runtime.bag_reason == 'recovery_sell_live'
+    assert frozen == [] and runtime.bag_status['reason'] == 'recovery_sell_live'
     # A fresh runtime (restart) restores the persisted trail and evaluated candle.
     restarted = _runtime(bag_recorder, positions=[_position()])
     trail, candle, _ = restarted._bag_store().load()
@@ -308,3 +332,27 @@ def test_trend_is_only_evaluated_when_a_decision_depends_on_it():
     reversal = {'rsi': 80.0, 'rsi_prev': 80.2, 'ema': 106.5, 'macd': -0.1, 'macd_prev': 0.2}
     tick(trend=trend, first_tick_after_close=True, trail=tick().trail, mid=D('105.9'), features=reversal)
     assert calls == [1]  # evaluated once per tick, and only for the sell signal
+
+
+def test_live_no_loss_exit_floor_is_the_plain_after_fee_floor(monkeypatch):
+    from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
+    from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+
+    monkeypatch.setattr(PositionExecutor, '_min_no_loss_sell_price', lambda self: D('100.5'))
+    trailing = SimpleNamespace(activation_price=D('0.015'), trailing_delta=D('0.004'))
+    executor = object.__new__(ModularPositionExecutor)
+    executor.config = SimpleNamespace(controller_id='modular_spot_bag',
+                                      triple_barrier_config=SimpleNamespace(trailing_stop=trailing))
+    monkeypatch.setattr(ModularPositionExecutor, 'trading_rules', SimpleNamespace(min_price_increment=D('0.01')),
+                        raising=False)
+
+    def floor(mode):
+        controllers = {} if mode is None else {'modular_spot_bag': SimpleNamespace(
+            config=SimpleNamespace(exit_floor=mode))}
+        executor._strategy = SimpleNamespace(controllers=controllers)
+        return executor._min_no_loss_sell_price()
+
+    assert floor('live_no_loss') == D('100.5')
+    protected = floor('protected')
+    assert protected is not None and protected > D('100.5')  # locks the trailing minimum profit
+    assert floor(None) == protected  # a missing controller falls back to the stricter floor

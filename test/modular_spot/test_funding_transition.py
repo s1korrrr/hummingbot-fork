@@ -322,3 +322,38 @@ async def test_configuration_change_is_never_carried_forward_automatically(tmp_p
         finally:
             await session.close()
             MarketsRecorder._shared_instance = prior
+
+
+@pytest.mark.asyncio
+async def test_code_upgrade_proof_from_real_checkpoints_and_lock_retry(tmp_path):
+    """No stubs: the proof comes from the funding source record, and a lock failure retries."""
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    with patch('socket.socket.connect', side_effect=AssertionError('network forbidden')):
+        session = NativePaperSession(paper(), [funded_config()], tmp_path / 'funding.sqlite')
+        try:
+            await fixtures.NativePaperFundingTests.seed(None, session)
+            owner = next(iter(session.controllers.values()))
+            old = NativeFundingStore(owner, session.recorder)
+            raw, state = old._load()
+            assert old._write(raw, state)  # records the source hash alongside the ledger
+            owner._native_source_hash = 'a' * 64
+            new = NativeFundingStore(owner, session.recorder)
+            original = new._rebind_after_code_upgrade
+            calls = []
+
+            def flaky(binding):
+                calls.append(binding)
+                if len(calls) == 1:
+                    raise RuntimeError('database is locked')
+                return original(binding)
+
+            new._rebind_after_code_upgrade = flaky
+            with pytest.raises(RuntimeError, match='locked'):
+                new._load()
+            assert new._code_upgrade_checked is False
+            _, rebound = new._load()
+            assert rebound['claims'] == state['claims'] and len(calls) == 2
+        finally:
+            await session.close()
+            MarketsRecorder._shared_instance = prior

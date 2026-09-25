@@ -387,6 +387,9 @@ class PositionExecutor(ExecutorBase):
                                         if open_exit is None or item.order_id != open_exit.client_order_id]
         self._close_order = next((item for item in exits
                                   if open_exit is not None and item.order_id == open_exit.client_order_id), None)
+        if self._close_order is not None and plan.close_type is None:
+            # A resting exit while RUNNING is the take-profit limit order, not a triggered close.
+            self._take_profit_limit_order, self._close_order = self._close_order, None
         self._entry_submitted = bool(entries)
         lifecycle = custom.get("entry_lifecycle")
         if isinstance(lifecycle, dict):
@@ -415,7 +418,9 @@ class PositionExecutor(ExecutorBase):
             # Terminal entry facts are sealed: late tracker events cannot rewrite them.
             self._resume_entry_sealed = True
             self._entry_lifecycle["state"] = "managing_fill"
-        elif not plan.entry_terminal:
+        elif not plan.entry_terminal or not entries:
+            # An open entry, or a row checkpointed before its entry order was recorded
+            # (crash window): never submit a new entry for this intent.
             self._restart_stop_entry_pending = True
         self._restart_target_status = plan.status
         self._restart_target_close_type = plan.close_type
@@ -439,7 +444,16 @@ class PositionExecutor(ExecutorBase):
 
     def stop_entry_acquisition(self, reason: str):
         """Stop buying without touching the filled position or its exit barriers."""
-        if self.is_closed or self.status == RunnableStatus.SHUTTING_DOWN or self._entry_terminal_confirmed():
+        if self.is_closed or self.status == RunnableStatus.SHUTTING_DOWN:
+            return
+        if self._open_order is None and self._entry_submitted is False and self.open_filled_amount <= 0:
+            # Nothing was ever recorded for this intent: end it without an order.
+            self._end_entry_acquisition(reason)
+            self._entry_lifecycle["state"] = "ended_no_fill"
+            self.close_type = CloseType.EXPIRED
+            self.stop()
+            return
+        if self._entry_terminal_confirmed():
             return  # nothing left to acquire; the filled position keeps its exit barriers
         self._end_entry_acquisition(reason)
         if self.config.entry_order_policy != "single_attempt":
@@ -1142,7 +1156,8 @@ class PositionExecutor(ExecutorBase):
         """
         if self._resume_conflicting_fill is not None or self._stack_recovery_required():
             return  # Keep ownership; only explicit reconciliation can resolve a sealed receipt conflict.
-        if self._restart_demote_to_hold is not None and self.status == RunnableStatus.RUNNING:
+        if (self._restart_demote_to_hold is not None
+                and self.status in (RunnableStatus.RUNNING, RunnableStatus.SHUTTING_DOWN)):
             self.logger().warning(self._log_message(
                 f"Restored position handed to held ledger reason={self._restart_demote_to_hold}"))
             self._restart_demote_to_hold = None

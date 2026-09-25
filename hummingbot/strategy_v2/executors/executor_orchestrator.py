@@ -269,6 +269,7 @@ class ExecutorOrchestrator:
         self._resume_position_scopes = set()
         self._planned_resume_pending = False
         self._planned_resume_failure = None
+        self._restored_pending_bind = []
         self.initial_positions_by_controller = initial_positions_by_controller or {}
         self._initialize_cached_performance()
 
@@ -294,6 +295,7 @@ class ExecutorOrchestrator:
         except Exception as error:
             # A stale or inconsistent manifest never blocks trading: its positions
             # stay in the held ledger and the manifest remains for inspection.
+            self._planned_resume_failure = f"{type(error).__name__}: {error}"
             self.logger().exception(f"Planned position manifest not claimed; held ledger retained: {error}")
             resumed = set()
         db_executors = markets_recorder.get_all_executors()
@@ -329,8 +331,15 @@ class ExecutorOrchestrator:
                     self._resume_owned_order_keys.update(keys)
                     self._non_hold_order_ids.update(keys)
                     resumed.add(executor.id)
+                    self._restored_pending_bind = restored_executors
                     continue
             if not executor.is_done:
+                # A position executor restart continuity could not rebuild: its order
+                # ownership is unproven, so never rebuild its fills into held bags
+                # (a still-live exit could otherwise sell the same base twice).
+                if (self._restart_continuity and self._executor_restore is None
+                        and executor.type == "position_executor"):
+                    self._non_hold_order_ids.update(self._owned_order_keys(executor))
                 if executor.id not in self.recovery_required.get(controller_id, []):
                     self.recovery_required.setdefault(controller_id, []).append(executor.id)
                 self.logger().error(
@@ -405,10 +414,13 @@ class ExecutorOrchestrator:
         # input. Defer live objects until history reconstruction has used the
         # proven native ownership keys, without requesting a fabricated mark.
         self._check_continuity_inventory([executor for _, executor, _ in restored_executors
-                                          if hasattr(executor, "hydrate_restart_continuity")])
+                                          if getattr(executor, "_restart_restored", None) is not None])
         for controller_id, executor, order_keys in restored_executors:
             self.active_executors[controller_id].append(executor)
             self._non_hold_order_ids.difference_update(order_keys)
+        self._restored_pending_bind = []
+        if self._restart_continuity and self._executor_restore is None:
+            self._cancel_unowned_tracked_orders()
         for executors in self.active_executors.values():
             for executor in executors:
                 if executor.config.id in resumed:
@@ -511,6 +523,51 @@ class ExecutorOrchestrator:
                 f"required={amount} total={total}. Positions handed to held ledger; trading continues."
             )
 
+    def _bind_restored_after_failure(self):
+        """Executors already rebuilt before a later boot step failed keep managing their orders.
+
+        Their orders were handed to the connector tracker; leaving them unowned
+        would strand an open entry or exit. They are started and reported.
+        """
+        pending, self._restored_pending_bind = self._restored_pending_bind, []
+        for controller_id, executor, order_keys in pending:
+            self.active_executors.setdefault(controller_id, []).append(executor)
+            self._non_hold_order_ids.difference_update(order_keys)
+            self.recovery_required.setdefault(controller_id, [])
+            if executor.config.id not in self.recovery_required[controller_id]:
+                self.recovery_required[controller_id].append(executor.config.id)
+            if self._executor_start is None:
+                executor.start()
+            else:
+                self._executor_start(executor)
+
+    def _cancel_unowned_tracked_orders(self):
+        """Cancel tracked orders on configured pairs that no executor owns (crash before checkpoint).
+
+        Cancelling never sells inventory; an unowned order could otherwise fill
+        with no exit or duplicate an entry. Fills already received stay in the
+        native trade record.
+        """
+        owned = {order.order_id for executors in self.active_executors.values() for executor in executors
+                 for order in (getattr(executor, "_entry_orders", lambda: [])()
+                               + getattr(executor, "_exit_orders", lambda: [])())
+                 if order is not None}
+        for connector_name, pairs in (self.strategy.markets or {}).items():
+            connector = self.strategy.connectors.get(connector_name)
+            in_flight = getattr(connector, "in_flight_orders", None)
+            if not isinstance(in_flight, dict):
+                continue
+            for order_id, order in list(in_flight.items()):
+                if order_id in owned or getattr(order, "trading_pair", None) not in pairs or order.is_done:
+                    continue
+                self.logger().error(
+                    f"Unowned tracked order after restart cancelled | connector={connector_name} "
+                    f"pair={order.trading_pair} order={order_id} side={order.trade_type.name}")
+                self.recovery_required.setdefault("unowned_orders", [])
+                if order_id not in self.recovery_required["unowned_orders"]:
+                    self.recovery_required["unowned_orders"].append(order_id)
+                self.strategy.cancel(connector_name, order.trading_pair, order_id)
+
     def resume_planned_positions_if_ready(self):
         if not self._planned_resume_pending:
             return True
@@ -531,6 +588,7 @@ class ExecutorOrchestrator:
                 # The claim already persisted unfinished ownership. Quiesced
                 # objects must never overwrite that row as a completed exit.
                 executors.clear()
+            self._bind_restored_after_failure()
             self.logger().exception("Startup position restore failed; unresolved rows reported, trading continues")
             self._planned_resume_pending = False
             return True
@@ -1557,10 +1615,18 @@ class ExecutorOrchestrator:
 
     @staticmethod
     def _begin_executor_shutdown(executor, keep_position: bool) -> bool:
-        """Suspend when a position is to be kept and the executor supports exact restore."""
+        """Suspend when a position is to be kept and the executor supports exact restore.
+
+        A position executor already exiting (SHUTTING_DOWN with a real close type)
+        is left to settle its exit instead of being demoted to a held bag.
+        """
         suspend = getattr(executor, "suspend_for_restart", None)
-        if keep_position and callable(suspend) and suspend():
-            return True
+        if keep_position and callable(suspend):
+            if suspend():
+                return True
+            if (getattr(executor, "status", None) == RunnableStatus.SHUTTING_DOWN
+                    and getattr(executor, "close_type", None) not in (None, CloseType.POSITION_HOLD)):
+                return True
         executor.early_stop(keep_position=keep_position)
         return False
 

@@ -324,3 +324,102 @@ def test_unreadable_manifest_history_never_stops_boot(recorder):
                side_effect=ValueError('executor references missing or mismatched consumed manifest history')):
         orchestrator, _ = boot(recorder, booting_strategy())
     assert restored(orchestrator).config.id == running.config.id
+
+
+def test_unowned_tracked_order_is_cancelled_after_restart(recorder):
+    running = live_executor(trigger='.01', moves=1)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(running)
+    strategy = booting_strategy()
+    orphan = tracked('orphan-buy', TradeType.BUY, '0', OrderState.OPEN).order  # placed just before a crash
+    strategy.connectors['okx'].in_flight_orders = {'orphan-buy': orphan}
+    orchestrator, _ = boot(recorder, strategy)
+    strategy.cancel.assert_called_once_with('okx', 'ETH-USDT', 'orphan-buy')
+    assert orchestrator.recovery_required['unowned_orders'] == ['orphan-buy']
+    assert restored(orchestrator).config.id == running.config.id
+
+
+def test_restored_owner_orders_are_not_cancelled(recorder):
+    running = live_executor(entry_fill='.2', entry_state=OrderState.PARTIALLY_FILLED)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(running)
+    strategy = booting_strategy()
+    live = tracked('entry', TradeType.BUY, '.2', OrderState.PARTIALLY_FILLED).order
+    strategy.connectors['okx'].in_flight_orders = {'entry': live}
+    strategy.connectors['okx']._order_tracker.fetch_order.return_value = live
+    boot(recorder, strategy)
+    strategy.cancel.assert_not_called()
+
+
+def test_later_boot_failure_still_binds_restored_executors(recorder):
+    running = live_executor(trigger='.01', moves=1)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(running)
+    strategy = booting_strategy()
+    with patch.object(ExecutorOrchestrator, '_create_initial_positions', side_effect=RuntimeError('boom')):
+        orchestrator, start = boot(recorder, strategy)
+    again = restored(orchestrator)
+    assert again.config.id == running.config.id
+    assert running.config.id in orchestrator.recovery_required['controller']
+    start.assert_called_once()
+
+
+def test_row_checkpointed_before_its_entry_order_never_submits_a_new_entry(recorder):
+    running = make_executor()
+    running.config.controller_id = 'controller'
+    running.config.entry_order_policy = 'single_attempt'  # crash before the order snapshot was written
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(running)
+    orchestrator, _ = boot(recorder, booting_strategy())
+    again = restored(orchestrator)
+    again._status = RunnableStatus.RUNNING
+    again.place_order = MagicMock()
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        asyncio.get_event_loop().run_until_complete(again.control_task())
+    again.place_order.assert_not_called()
+    assert again.close_type == CloseType.EXPIRED
+
+
+def test_wallet_shortfall_also_demotes_a_restored_exit(recorder):
+    executor = live_executor(trigger='.02', moves=2)
+    executor._close_order = tracked('exit', TradeType.SELL, '0', OrderState.OPEN)
+    executor.close_type = CloseType.TRAILING_STOP
+    executor._status = RunnableStatus.SHUTTING_DOWN
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(executor)
+    orchestrator, _ = boot(recorder, booting_strategy(balance='.5'))
+    again = restored(orchestrator)
+    asyncio.get_event_loop().run_until_complete(again.on_start())
+    again.control_shutdown_process = MagicMock(side_effect=lambda: asyncio.sleep(0))
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        asyncio.get_event_loop().run_until_complete(again.control_task())
+    assert again.close_type == CloseType.POSITION_HOLD
+
+
+def test_resting_take_profit_is_restored_as_take_profit_not_close(recorder):
+    executor = live_executor()
+    executor._take_profit_limit_order = tracked('tp', TradeType.SELL, '0', OrderState.OPEN)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(executor)
+    orchestrator, _ = boot(recorder, booting_strategy())
+    again = restored(orchestrator)
+    assert again._take_profit_limit_order.order_id == 'tp' and again._close_order is None
+
+
+def test_shutdown_lets_an_exiting_executor_settle():
+    executor = live_executor(trigger='.02', moves=1)
+    executor.close_type = CloseType.TRAILING_STOP
+    executor._status = RunnableStatus.SHUTTING_DOWN
+    executor.early_stop = MagicMock()
+    assert ExecutorOrchestrator._begin_executor_shutdown(executor, keep_position=True) is True
+    executor.early_stop.assert_not_called()
+
+
+def test_unrestorable_row_fills_are_not_rebuilt_into_held_bags(recorder):
+    broken = live_executor()
+    broken._completed_close_orders = [tracked('x1', TradeType.SELL, '1', OrderState.FILLED),
+                                      tracked('x2', TradeType.SELL, '1', OrderState.FILLED)]
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(broken)
+    orchestrator, _ = boot(recorder, booting_strategy())
+    assert ('okx', 'ETH-USDT', 'entry') in orchestrator._non_hold_order_ids

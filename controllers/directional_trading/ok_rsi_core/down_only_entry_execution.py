@@ -164,6 +164,10 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         """Stop the maker acquisition only; filled inventory keeps its trailing exit."""
         if self.is_closed or self.status == RunnableStatus.SHUTTING_DOWN:
             return
+        if (self._open_order is None and not self._entry_submitted
+                and self._cumulative_entry_filled_base() <= Decimal("0")):
+            self._request_terminal_cancel(reason)  # no recorded order: end the intent, never submit one
+            return
         if self._entry_terminal_confirmed():
             return  # nothing left to acquire; never cancel a terminal (filled) entry
         self._request_terminal_cancel(reason)

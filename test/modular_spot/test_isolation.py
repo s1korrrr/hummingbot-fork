@@ -21,7 +21,9 @@ def test_legacy_imports_are_confined_to_explicit_composition_seams_without_regis
                 if node.module.startswith('controllers.'):
                     permitted = {
                         'native_composition.py': {'controllers.directional_trading.ok_rsi_core.candles',
-                                                  'controllers.directional_trading.ok_rsi_core.context'},
+                                                  'controllers.directional_trading.ok_rsi_core.context',
+                                                  # master 9b59a22dd: down-only planned resume seam
+                                                  'controllers.directional_trading.ok_rsi_core.down_only_entry_execution'},
                         'native_recovery.py': {'controllers.directional_trading.hl_rsi',
                                                'controllers.directional_trading.rsi_v5'},
                         # Live OK RSI continuous adaptive trailing, shared rather than copied.

@@ -1,4 +1,5 @@
 """Native modular_spot bag lifecycle: per-tick decisions, persistence and configuration."""
+from dataclasses import replace
 from decimal import Decimal as D
 from types import SimpleNamespace
 
@@ -548,3 +549,84 @@ def test_controller_config_admits_the_buy_gap_only_with_live_capital():
         ModularSpotControllerConfig(**base, buy_gap=BuyGapConfig())
     ok = ModularSpotControllerConfig(**base, capital=LiveCapitalConfig(position_cap_quote=None), buy_gap=BuyGapConfig())
     assert ok.buy_gap == BuyGapConfig()
+
+
+def test_depth_budget_unlocks_capital_with_depth_below_the_recent_high():
+    from controllers.generic.modular_spot_core.bag import DepthBudgetConfig, depth_budget_allowed, depth_budget_decision
+
+    cfg = DepthBudgetConfig(budget_quote=D('5000'), lookback_minutes=1440, full_depth=D('0.3'), base_fraction=D('0.2'))
+    assert depth_budget_allowed(cfg, reference_high=D('700'), price=D('700')) == (D('0'), D('1000'))
+    depth, allowed = depth_budget_allowed(cfg, reference_high=D('700'), price=D('595'))  # 15% down
+    assert depth == D('0.15') and allowed == D('3000')
+    assert depth_budget_allowed(cfg, reference_high=D('700'), price=D('400'))[1] == D('5000')  # past full depth
+    assert depth_budget_allowed(cfg, reference_high=D('700'), price=D('720'))[0] == 0  # above the high
+    assert depth_budget_decision(cfg, D('100'), deployed_quote=D('2900'), reference_high=D('700'),
+                                 price=D('595')) == (D('100'), 'admitted')
+    assert depth_budget_decision(cfg, D('100'), deployed_quote=D('2901'), reference_high=D('700'),
+                                 price=D('595')) == (None, 'depth_budget')
+    with pytest.raises(ValueError):
+        DepthBudgetConfig(budget_quote=D('5000'), lookback_minutes=30, full_depth=D('0.3'), base_fraction=D('0.2'))
+
+
+def test_planner_refuses_a_buy_past_the_depth_budget_and_counts_the_bag_at_cost():
+    from controllers.generic.modular_spot_core.bag import DepthBudgetConfig, LiveCapitalConfig
+    from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy
+    from controllers.generic.modular_spot_core.market import MarketFeatures
+    from controllers.generic.modular_spot_core.planner import plan
+    from controllers.generic.modular_spot_core.state import DecisionState
+
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=None, max_active_tranches=8)
+    depth = DepthBudgetConfig(budget_quote=D('5000'), lookback_minutes=1440, full_depth=D('0.3'), base_fraction=D('0.2'))
+    _, bag_features_ = feats()
+    base = dict(fingerprint='a' * 64, budget=D('5000'), now=1200, available_quote=D('5000'), amount_step=D('.001'),
+                minimum_amount=D('.001'), minimum_notional=D('1'), pnl=D('0'), signal=SignalPolicy(),
+                acquisition=AcquisitionPolicy(), risk=RiskPolicy())
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    bag = HeldBag(D('10'), D('100'), D('0'))  # 1000 deployed at cost
+    at_high = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False,
+                             bag=replace(bag_features_, recent_high=D('90.5')))
+    assert plan(state, {}, **base, market=at_high, bid=D('90'), ask=D('90.1'), bag=bag, capital=cap,
+                depth_budget=depth)[2] == 'depth_budget'  # 0.55% down: 1000 + 100 > 1036
+    deep = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False,
+                          bag=replace(bag_features_, recent_high=D('100')))
+    assert plan(state, {}, **base, market=deep, bid=D('90'), ask=D('90.1'), bag=bag, capital=cap,
+                depth_budget=depth)[2] == 'entry_proposed'  # 10% down: 1000 + 100 <= 2333
+    with pytest.raises(PolicyError, match='recent high'):
+        plan(state, {}, **base, market=MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=bag_features_),
+             bid=D('90'), ask=D('90.1'), bag=bag, capital=cap, depth_budget=depth)
+    with pytest.raises(PolicyError, match='requires live capital'):
+        plan(state, {}, **base, market=deep, bid=D('90'), ask=D('90.1'), bag=bag, depth_budget=depth)
+
+
+def test_depth_feature_is_the_highest_closed_high_over_the_lookback():
+    import numpy as np
+    import pandas as pd
+
+    from controllers.generic.modular_spot_core.bag import bag_features
+
+    n = 1400
+    stamps = np.arange(n) * 60
+    close = np.linspace(100, 80, n)
+    frame = pd.DataFrame({'timestamp': stamps, 'open': close, 'high': close + 1, 'low': close - 1, 'close': close,
+                          'volume': np.ones(n)})
+    kwargs = dict(rsi_prev=30, now=float(n * 60), short_records=500, higher_records=85, adx_threshold=18)
+    assert bag_features(frame, **kwargs).recent_high is None
+    assert bag_features(frame, **kwargs, depth_lookback=60).recent_high == D(str(float(close[-60] + 1)))
+    with pytest.raises(PolicyError, match='depth budget history'):
+        bag_features(frame, **kwargs, depth_lookback=n + 1)
+
+
+def test_controller_config_depth_budget_needs_capital_and_history():
+    from controllers.generic.modular_spot import ModularSpotControllerConfig
+    from controllers.generic.modular_spot_core.bag import DepthBudgetConfig, LiveCapitalConfig
+
+    depth = DepthBudgetConfig(budget_quote=D('5000'), lookback_minutes=1440, full_depth=D('0.3'), base_fraction=D('0.2'))
+    base = dict(id='modular_spot_bag', connector_name='okx', trading_pair='BNB-USDC', bag=BagConfig())
+    with pytest.raises(ValueError, match='requires live capital'):
+        ModularSpotControllerConfig(**base, max_records=1500, depth_budget=depth)
+    with pytest.raises(ValueError, match='max_records >= 1441'):
+        ModularSpotControllerConfig(**base, max_records=1300, capital=LiveCapitalConfig(position_cap_quote=None),
+                                    depth_budget=depth)
+    ok = ModularSpotControllerConfig(**base, max_records=1500, capital=LiveCapitalConfig(position_cap_quote=None),
+                                     depth_budget=depth)
+    assert ok.depth_budget == depth

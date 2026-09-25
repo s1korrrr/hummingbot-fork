@@ -9,7 +9,7 @@ controller's orchestrator PositionHold built from its own keep_position stops.
 import json
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -166,6 +166,38 @@ def live_buy_gap(cfg: BuyGapConfig, atr_pct: Optional[Decimal]) -> Decimal:
     return min(max(gap, cfg.min_gap), cfg.max_gap)
 
 
+class DepthBudgetConfig(PolicyModel):
+    """Research capital pacing by depth: the capital deployed at cost may grow with the drawdown
+    below the recent high, so a long down-leg cannot spend the whole budget early.
+
+    depth = max(0, 1 - price / highest closed-candle high over ``lookback_minutes``);
+    allowed = budget_quote * min(1, base_fraction + (1 - base_fraction) * depth / full_depth).
+    A buy is refused (``depth_budget``) when the at-cost capital already deployed plus its
+    quote would exceed ``allowed``. It needs no crash classification: shallow dips keep
+    ``base_fraction`` of the budget, deeper legs unlock the rest. Not a live OK RSI setting.
+    """
+    budget_quote: Decimal = Field(gt=0)
+    lookback_minutes: int = Field(ge=60, le=20160, strict=True)
+    full_depth: Decimal = Field(gt=0, lt=1)
+    base_fraction: Decimal = Field(ge=0, le=1)
+
+
+def depth_budget_allowed(cfg: DepthBudgetConfig, *, reference_high, price) -> Tuple[Decimal, Decimal]:
+    """(depth, allowed deployed quote) at ``price`` below the lookback high."""
+    high = decimal(reference_high, 'reference high', positive=True)
+    depth = max(Decimal('0'), 1 - decimal(price, 'price', positive=True) / high)
+    fraction = min(Decimal('1'), cfg.base_fraction + (1 - cfg.base_fraction) * depth / cfg.full_depth)
+    return depth, cfg.budget_quote * fraction
+
+
+def depth_budget_decision(cfg: DepthBudgetConfig, quote, *, deployed_quote, reference_high, price):
+    """``(quote, 'admitted')`` or ``(None, 'depth_budget')``; pure, for the research verifier."""
+    _, allowed = depth_budget_allowed(cfg, reference_high=reference_high, price=price)
+    if decimal(deployed_quote, 'deployed quote') + decimal(quote, 'quote', positive=True) > allowed:
+        return None, 'depth_budget'
+    return quote, 'admitted'
+
+
 STORED_EXECUTOR_WINDOW = 20  # ExecutorOrchestrator keeps each controller's 20 most recent stored executors
 
 
@@ -235,10 +267,11 @@ class BagFeatures:
     atr_pct: Decimal
     trend_direction: str
     trend_confidence: Decimal
+    recent_high: Optional[Decimal] = None  # highest closed high over the depth-budget lookback
 
 
 def bag_features(closed: pd.DataFrame, *, rsi_prev, now: float, short_records: int,
-                 higher_records: int, adx_threshold) -> BagFeatures:
+                 higher_records: int, adx_threshold, depth_lookback: Optional[int] = None) -> BagFeatures:
     """EMA9, MACD(14,22,9), Wilder ATR14 and the live multi-timeframe trend on closed candles.
 
     Live OK RSI reads ``short_records`` rows including the forming candle, so it keeps
@@ -268,8 +301,13 @@ def bag_features(closed: pd.DataFrame, *, rsi_prev, now: float, short_records: i
     # Same call as live rsi_signals.analyze_rsi_trend_confirmation (short/medium/long labels).
     trend = analyze_multi_timeframe_trend({'short': short_df, 'medium': medium, 'long': long},
                                           adx_length=14, adx_threshold=float(adx_threshold))
+    recent_high = None
+    if depth_lookback is not None:
+        if len(closed) < depth_lookback:
+            raise PolicyError('depth budget history unavailable')
+        recent_high = Decimal(str(float(high.iloc[-depth_lookback:].max())))
     return BagFeatures(Decimal(str(rsi_prev)), *(Decimal(str(v)) for v in values),
-                       trend.direction.value, Decimal(str(float(trend.confidence or 0.0))))
+                       trend.direction.value, Decimal(str(float(trend.confidence or 0.0))), recent_high)
 
 
 @dataclass(frozen=True)

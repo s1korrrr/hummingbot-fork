@@ -96,10 +96,12 @@ class ModularRuntime:
             now = p.time()
 
             bag_config = self.bag_feature_config()
+            depth_lookback = None if c.depth_budget is None else c.depth_budget.lookback_minutes
 
             def compute(frame):
                 return features(frame, now=now, interval=c.interval_seconds(), max_age=c.max_candle_age_seconds,
-                                policy=c.signal, trend_analyzer=self.bindings.trend, bag_config=bag_config)
+                                policy=c.signal, trend_analyzer=self.bindings.trend, bag_config=bag_config,
+                                depth_lookback=depth_lookback)
             if c.data.mode == 'shared':
                 if self.pool is None:
                     raise DataUnavailable('shared candle reader is stopped')
@@ -107,6 +109,8 @@ class ModularRuntime:
                 spec = c.signal.model_dump(mode='json')
                 if bag_config is not None:  # other controllers keep their existing cache keys
                     spec = {**spec, 'live_bag_features': bag_config.model_dump(mode='json')}
+                if depth_lookback is not None:
+                    spec = {**spec, 'depth_lookback_minutes': depth_lookback}
                 self.market = self.pool.features.get(
                     snapshot, spec=spec,
                     implementation='modular-closed-features-v1:' + self.feature_implementation,
@@ -300,7 +304,8 @@ class ModularRuntime:
                 state, inventory, fingerprint=self.fingerprint, budget=c.total_amount_quote,
                 now=self.controller.market_data_provider.time(), market=self.market,
                 signal=c.signal, acquisition=c.acquisition, risk=c.risk,
-                allow_acquisition=allowed, bag=held, capital=c.capital, buy_gap=c.buy_gap, **snapshot)
+                allow_acquisition=allowed, bag=held, capital=c.capital, buy_gap=c.buy_gap,
+                depth_budget=c.depth_budget, **snapshot)
             # Live order: held-inventory stop/recovery proposals precede the entry proposal.
             bag_actions = [] if held is None else self._bag_actions(inventory, state or revised, held, snapshot)
             config = None

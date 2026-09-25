@@ -288,3 +288,18 @@ def test_native_entry_uses_live_adaptive_geometry_from_the_decision_candle_atr()
     assert (trailing.activation_price, trailing.trailing_delta) == expected
     with pytest.raises(PolicyError):
         native_config(cfg, identifier='x', timestamp=1, price=D('100'), amount=D('1'), cycle=0, stage=0)
+
+
+def test_trend_is_only_evaluated_when_a_decision_depends_on_it():
+    calls = []
+
+    def trend():
+        calls.append(1)
+        return 'range', D('0')
+
+    tick(trend=trend)  # plain recovery arming: no signal tick, no live sell
+    tick(trend=trend, live_sells=(LiveSell('s', D('200')),))  # live sell far above: no stale check needed
+    assert calls == []
+    reversal = {'rsi': 80.0, 'rsi_prev': 80.2, 'ema': 106.5, 'macd': -0.1, 'macd_prev': 0.2}
+    tick(trend=trend, first_tick_after_close=True, trail=tick().trail, mid=D('105.9'), features=reversal)
+    assert calls == [1]  # evaluated once per tick, and only for the sell signal

@@ -210,41 +210,57 @@ class BagTick:
 def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tranches, live_sells,
            last_sell_price: Optional[Decimal], mid: Decimal, features, bag: BagFeatures,
            first_tick_after_close: bool, tick: Decimal, amount_step: Decimal, minimum_amount: Decimal,
-           minimum_notional: Decimal) -> BagTick:
+           minimum_notional: Decimal, trend=None) -> BagTick:
     """One live OK RSI tick for held inventory: stale cancel, recovery, then early stops.
 
     Mirrors HLRSIController.stop_actions_proposal order. ``features.rsi`` is the last
     closed RSI; the sell signal exists only on the first tick after a candle close.
+    ``trend`` optionally supplies (direction, confidence) lazily; it is only called when
+    a decision depends on it, otherwise ``bag.trend_direction/trend_confidence`` are used.
     """
     policy = cfg.policy()
     mid = decimal(mid, 'mid', positive=True)
     rsi, rsi_prev, ema = float(features.rsi), float(bag.rsi_prev), float(bag.ema_fast)
     if trail is not None and (held.amount <= 0 or trail.breakeven_price != held.breakeven_price.quantize(Decimal('1e-8'))):
         trail = None  # live _sync_recovery_trails drops a trail whose breakeven key disappeared
-    strong_up = (bag.trend_direction == 'up' and bag.trend_confidence >= cfg.sell_trend_hold_min_confidence)
+    cached = []
+
+    def trend_state():
+        if not cached:
+            cached.append(trend() if trend is not None else (bag.trend_direction, bag.trend_confidence))
+        return cached[0]
+
+    def strong_up():
+        direction, confidence = trend_state()
+        return direction == 'up' and Decimal(str(confidence)) >= cfg.sell_trend_hold_min_confidence
 
     def trend_hold():
         ready = any(trail_reversal(trail, mid, rsi, ema, policy))
-        return sell_trend_hold(strong_up, mid, rsi, rsi_prev, ema, float(cfg.sell_rsi_rollover_delta),
+        return sell_trend_hold(strong_up(), mid, rsi, rsi_prev, ema, float(cfg.sell_rsi_rollover_delta),
                                trail_reversal_ready=ready)
 
     cancels = tuple(sell.executor_id for sell in live_sells
-                    if stale_recovery_sell(trend_hold(), mid, sell.proposal_price, cfg.stale_cancel_pct))
+                    if mid >= sell.proposal_price * (1 + cfg.stale_cancel_pct)
+                    and stale_recovery_sell(trend_hold(), mid, sell.proposal_price, cfg.stale_cancel_pct))
     sell, reason = None, 'no_bag'
     dust = held.amount < max(amount_step, minimum_amount) or held.amount * mid < minimum_notional
     if held.amount > 0 and not live_sells and not dust:
         signal = False
         if first_tick_after_close:
-            threshold = sell_signal_threshold(
-                float(policy.recovery_arm_rsi), trend_direction=bag.trend_direction,
-                trend_confidence=float(bag.trend_confidence),
-                trend_sell_threshold_boost=float(cfg.trend_sell_threshold_boost))
-            signal = bag_sell_signal(
-                rsi=rsi, rsi_prev=rsi_prev, sell_threshold=threshold, price=mid, ema_fast=ema,
-                macd_hist=float(bag.macd_hist), macd_hist_prev=float(bag.macd_hist_prev),
-                inventory_net_pnl=net_pnl_pct(held.amount, held.breakeven_price, held.remaining_fees_quote, mid),
-                strong_bullish_trend=strong_up, trail_reversal_ready=any(trail_reversal(trail, mid, rsi, ema, policy)),
-                policy=policy, sell_rsi_rollover_delta=float(cfg.sell_rsi_rollover_delta))
+            common = dict(rsi=rsi, rsi_prev=rsi_prev, price=mid, ema_fast=ema, macd_hist=float(bag.macd_hist),
+                          macd_hist_prev=float(bag.macd_hist_prev), policy=policy,
+                          inventory_net_pnl=net_pnl_pct(held.amount, held.breakeven_price,
+                                                        held.remaining_fees_quote, mid),
+                          sell_rsi_rollover_delta=float(cfg.sell_rsi_rollover_delta))
+            # The dynamic threshold is clamped to >= 60; only then does the trend matter.
+            if bag_sell_signal(sell_threshold=60.0, strong_bullish_trend=False, trail_reversal_ready=False, **common):
+                direction, confidence = trend_state()
+                threshold = sell_signal_threshold(
+                    float(policy.recovery_arm_rsi), trend_direction=direction, trend_confidence=float(confidence),
+                    trend_sell_threshold_boost=float(cfg.trend_sell_threshold_boost))
+                signal = bag_sell_signal(sell_threshold=threshold, strong_bullish_trend=strong_up(),
+                                         trail_reversal_ready=any(trail_reversal(trail, mid, rsi, ema, policy)),
+                                         **common)
         trail, reason = recovery_step(
             trail, amount=held.amount, breakeven_price=held.breakeven_price,
             remaining_fees_quote=held.remaining_fees_quote, price=mid, rsi=rsi, ema_fast=ema, policy=policy,

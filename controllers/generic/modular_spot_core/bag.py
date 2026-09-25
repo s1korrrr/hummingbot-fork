@@ -126,16 +126,43 @@ class LiveCapitalConfig(PolicyModel):
     sizing are entry-side behaviour, not modelled here.
     """
     slice_quote: Decimal = Field(default=Decimal('100'), gt=0)
-    position_cap_quote: Decimal = Field(default=Decimal('500'), gt=0)
+    position_cap_quote: Optional[Decimal] = Field(default=Decimal('500'), gt=0)  # None: no position cap
     max_active_tranches: int = Field(default=8, ge=1, le=64, strict=True)
     funded_cap_quote: Optional[Decimal] = Field(default=None, gt=0)
     funding_fee_reserve: Decimal = Field(default=Decimal('0.003'), ge=0, lt=1)
 
     @model_validator(mode='after')
     def slice_within_cap(self):
-        if self.slice_quote > self.position_cap_quote:
+        if self.position_cap_quote is not None and self.slice_quote > self.position_cap_quote:
             raise ValueError('slice_quote must not exceed position_cap_quote (live usd_per_entry <= max_total_position_usd)')
         return self
+
+
+class BuyGapConfig(PolicyModel):
+    """Live OK RSI ``_effective_price_gap`` (use_adaptive_filters): an ATR-scaled buy gap.
+
+    gap = clamp(atr_pct * atr_multiplier, min_gap, max_gap), falling back to ``base_gap``
+    without ATR. A new buy needs an absolute gap of at least ``gap`` from the last active buy
+    (``_has_sufficient_price_gap``) and from the held cost basis
+    (``_has_sufficient_avg_entry_gap_for_buy``), in either direction.
+    Live BNB: base 0.8%, x3 ATR, clamped 0.5-1.8%.
+    """
+    base_gap: Decimal = Field(default=Decimal('0.008'), gt=0, lt=1)
+    atr_multiplier: Decimal = Field(default=Decimal('3'), ge=0, le=100)
+    min_gap: Decimal = Field(default=Decimal('0.005'), ge=0, lt=1)
+    max_gap: Decimal = Field(default=Decimal('0.018'), gt=0, lt=1)
+
+    @model_validator(mode='after')
+    def ordered(self):
+        if self.min_gap > self.max_gap:
+            raise ValueError('min_gap must not exceed max_gap')
+        return self
+
+
+def live_buy_gap(cfg: BuyGapConfig, atr_pct: Optional[Decimal]) -> Decimal:
+    dynamic = None if atr_pct is None else decimal(atr_pct, 'ATR fraction') * cfg.atr_multiplier
+    gap = dynamic if dynamic is not None and dynamic > 0 else cfg.base_gap
+    return min(max(gap, cfg.min_gap), cfg.max_gap)
 
 
 STORED_EXECUTOR_WINDOW = 20  # ExecutorOrchestrator keeps each controller's 20 most recent stored executors
@@ -180,7 +207,7 @@ def live_capital_decision(cap: LiveCapitalConfig, *, active_count: int, exposure
         quote = min(quote, max(ceiling, Decimal('0')))
         if quote <= 0:
             return None, 'funding_exhausted'
-    if decimal(exposure, 'exposure') + quote > cap.position_cap_quote:
+    if cap.position_cap_quote is not None and decimal(exposure, 'exposure') + quote > cap.position_cap_quote:
         return None, 'max_position'
     if cap.funded_cap_quote is None and decimal(available_quote, 'available quote') < quote:
         return None, 'cash_exhausted'  # live V1 balance_low: refused, not resized

@@ -470,3 +470,47 @@ def test_bag_mode_planner_funded_v2_resizes_to_the_funding_ceiling():
     assert reason == 'entry_proposed' and proposal.amount * D('560') <= D('84')
     spent = HeldBag(D('0.72'), D('700'), D('1'))  # 505 at cost: the funding ceiling is exhausted
     assert plan(state, {}, **base, bag=spent, capital=cap)[2] == 'funding_exhausted'
+
+
+def test_uncapped_capital_and_the_live_atr_buy_gap():
+    from controllers.generic.modular_spot_core.bag import (
+        BuyGapConfig,
+        LiveCapitalConfig,
+        live_buy_gap,
+        live_capital_decision,
+    )
+
+    uncapped = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=None, max_active_tranches=8)
+    assert live_capital_decision(uncapped, active_count=0, exposure=D('100000'), available_quote=D('5000')) == (
+        D('100'), 'admitted')
+    gap = BuyGapConfig()  # live BNB: 0.8% base, x3 ATR, 0.5-1.8%
+    assert live_buy_gap(gap, D('0.002')) == D('0.006')
+    assert live_buy_gap(gap, D('0.0001')) == D('0.005') and live_buy_gap(gap, D('0.01')) == D('0.018')
+    assert live_buy_gap(gap, None) == D('0.008')
+    with pytest.raises(ValueError):
+        BuyGapConfig(min_gap=D('0.02'), max_gap=D('0.01'))
+
+
+def test_live_buy_gap_is_absolute_from_the_last_active_buy_and_the_bag():
+    from controllers.generic.modular_spot_core.bag import BuyGapConfig, LiveCapitalConfig
+    from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy
+    from controllers.generic.modular_spot_core.inventory import InventoryView
+    from controllers.generic.modular_spot_core.market import MarketFeatures
+    from controllers.generic.modular_spot_core.planner import plan
+    from controllers.generic.modular_spot_core.state import DecisionState
+
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=None, max_active_tranches=8)
+    _, feats_ = feats()  # atr_pct 0.002 -> gap 0.6%
+    market = MarketFeatures(1140, D('100'), D('29'), D('31'), False, False, bag=feats_)
+    state = DecisionState(fingerprint='a' * 64, candle=1080, claims=('a1',), committed_quote=D('100'))
+    view = {'a1': InventoryView(D('1'), D('100'), D('100'), D('0'), False, True, False, D('100'))}
+    base = dict(fingerprint='a' * 64, budget=D('5000'), now=1200, market=market, available_quote=D('5000'),
+                amount_step=D('.001'), minimum_amount=D('.001'), minimum_notional=D('1'), pnl=D('0'),
+                signal=SignalPolicy(), acquisition=AcquisitionPolicy(), risk=RiskPolicy())
+    empty = HeldBag(D('0'), D('0'), D('0'))
+    near = plan(state, view, **base, bid=D('100.4'), ask=D('100.5'), bag=empty, capital=cap, buy_gap=BuyGapConfig())
+    assert near[2] == 'acquisition_not_eligible'  # 0.4% from the last buy < 0.6%
+    above = plan(state, view, **base, bid=D('100.7'), ask=D('100.8'), bag=empty, capital=cap, buy_gap=BuyGapConfig())
+    assert above[2] == 'entry_proposed'  # live gap is absolute: 0.7% above the last buy qualifies
+    with pytest.raises(PolicyError):
+        plan(state, view, **base, bid=D('100.7'), ask=D('100.8'), bag=empty, buy_gap=BuyGapConfig())

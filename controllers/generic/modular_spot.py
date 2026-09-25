@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field, StrictBool, model_validator
 
-from controllers.generic.modular_spot_core.bag import AdaptiveTrailingConfig, BagConfig, LiveCapitalConfig
+from controllers.generic.modular_spot_core.bag import AdaptiveTrailingConfig, BagConfig, BuyGapConfig, LiveCapitalConfig
 from controllers.generic.modular_spot_core.candle_data import FIRST_DELIVERY
 from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy, TrailingPolicy
 from controllers.generic.modular_spot_core.data_reader import DataPolicy, attach_pool, dataset_for
@@ -66,6 +66,7 @@ class ModularSpotControllerConfig(ControllerConfigBase):
     bag: BagConfig | None = None
     adaptive_trailing: AdaptiveTrailingConfig | None = None
     capital: LiveCapitalConfig | None = None  # live OK RSI capital model; requires bag
+    buy_gap: BuyGapConfig | None = None  # live ATR-scaled buy gap; requires capital
     # 'protected' keeps the modular no-loss floor raised by activation - delta; 'live_no_loss'
     # uses the plain after-fee no-loss price like live OK RSI.
     exit_floor: Literal['protected', 'live_no_loss'] = 'protected'
@@ -82,6 +83,8 @@ class ModularSpotControllerConfig(ControllerConfigBase):
             raise ValueError('insufficient feature history plus open candle')
         if self.capital is not None and self.bag is None:
             raise ValueError('live capital requires the bag lifecycle')
+        if self.buy_gap is not None and self.capital is None:
+            raise ValueError('the live buy gap requires live capital')
         if self.bag is not None or self.adaptive_trailing is not None:
             if self.signal.kind not in {'rsi_rebound', 'rsi_turn'} or self.universe.mode != 'fixed':
                 raise ValueError('bag and adaptive trailing require a fixed-universe RSI entry profile')

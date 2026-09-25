@@ -300,7 +300,7 @@ class ModularRuntime:
                 state, inventory, fingerprint=self.fingerprint, budget=c.total_amount_quote,
                 now=self.controller.market_data_provider.time(), market=self.market,
                 signal=c.signal, acquisition=c.acquisition, risk=c.risk,
-                allow_acquisition=allowed, bag=held, capital=c.capital, **snapshot)
+                allow_acquisition=allowed, bag=held, capital=c.capital, buy_gap=c.buy_gap, **snapshot)
             # Live order: held-inventory stop/recovery proposals precede the entry proposal.
             bag_actions = [] if held is None else self._bag_actions(inventory, state or revised, held, snapshot)
             config = None

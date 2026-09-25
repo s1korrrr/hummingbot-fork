@@ -24,7 +24,7 @@ class EntryProposal:
 
 def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, available_quote,
          amount_step, minimum_amount, minimum_notional, pnl, signal, acquisition, risk, allow_acquisition=True,
-         bag=None, capital=None):
+         bag=None, capital=None, buy_gap=None):
     """``bag`` (a HeldBag) selects live OK RSI capacity: active tranches only, slots and
     capital free as tranches close or are held, and a new buy keeps the live gap from the
     bag's breakeven. Without it the frozen B0 campaign semantics apply. ``capital`` (a
@@ -32,6 +32,8 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     cap marked at mid, the live active-buy limit and per-buy ``slice_quote``."""
     if capital is not None and bag is None:
         raise PolicyError('live capital requires bag mode')
+    if buy_gap is not None and capital is None:
+        raise PolicyError('the live buy gap requires live capital')
     budget = decimal(budget, 'budget', positive=True)
     bid, ask = decimal(bid, 'bid', positive=True), decimal(ask, 'ask', positive=True)
     now = decimal(now, 'now')
@@ -88,7 +90,8 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
         return _bag_entry(revised, inventory, bag, bag_empty, fingerprint=fingerprint, budget=budget, now=now, market=market,
                           bid=bid, ask=ask, available_quote=available_quote, amount_step=amount_step,
                           minimum_amount=minimum_amount, minimum_notional=minimum_notional,
-                          fresh_signal=signal_result.enter, acquisition=acquisition, risk=risk, capital=capital)
+                          fresh_signal=signal_result.enter, acquisition=acquisition, risk=risk, capital=capital,
+                          buy_gap=buy_gap)
     owned = [inventory[x] for x in revised.claims]
     acquired = [value for value in owned if value.entry_quote > 0]
     fraction = next_stage(acquisition, stage=len(owned), bid=bid,
@@ -114,7 +117,7 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
 
 def _bag_entry(state, inventory, bag, bag_empty, *, fingerprint, budget, now, market, bid, ask, available_quote,
                amount_step,
-               minimum_amount, minimum_notional, fresh_signal, acquisition, risk, capital=None):
+               minimum_amount, minimum_notional, fresh_signal, acquisition, risk, capital=None, buy_gap=None):
     """Live OK RSI admission: capacity counts active tranches; capital is what is tied up now."""
     active = [inventory[x] for x in state.claims if not inventory[x].terminal]
     acquired = [value for value in active if value.entry_quote > 0]
@@ -123,7 +126,7 @@ def _bag_entry(state, inventory, bag, bag_empty, *, fingerprint, budget, now, ma
                                    now=now, market=market, bid=bid, ask=ask, available_quote=available_quote,
                                    amount_step=amount_step, minimum_amount=minimum_amount,
                                    minimum_notional=minimum_notional, fresh_signal=fresh_signal,
-                                   acquisition=acquisition, risk=risk)
+                                   acquisition=acquisition, risk=risk, buy_gap=buy_gap)
     fraction = next_stage(acquisition, stage=len(active), bid=bid,
                           last_fill_price=acquired[-1].entry_price if acquired else None,
                           fresh_signal=fresh_signal, entry_terminal=all(x.entry_terminal for x in active),
@@ -154,16 +157,23 @@ def _bag_entry(state, inventory, bag, bag_empty, *, fingerprint, budget, now, ma
 
 def _live_capital_entry(state, active, acquired, bag, bag_empty, capital, *, fingerprint, now, market, bid, ask,
                         available_quote, amount_step, minimum_amount, minimum_notional, fresh_signal,
-                        acquisition, risk):
+                        acquisition, risk, buy_gap=None):
     """Live OK RSI admission under the live capital model (see bag.LiveCapitalConfig)."""
-    from .bag import live_capital_quote
+    from .bag import live_buy_gap, live_capital_quote
 
     # Same entry evidence as next_stage, with the live active-buy limit instead of a stage count.
     if not fresh_signal or not all(x.entry_terminal for x in active):
         return state, None, 'acquisition_not_eligible'
-    if acquired and bid > acquired[-1].entry_price * (1 - acquisition.minimum_drop):
-        return state, None, 'acquisition_not_eligible'
-    if not bag_empty and abs(bid - bag.breakeven_price) / bag.breakeven_price < acquisition.minimum_drop:
+    if buy_gap is None:
+        if acquired and bid > acquired[-1].entry_price * (1 - acquisition.minimum_drop):
+            return state, None, 'acquisition_not_eligible'
+        gap = acquisition.minimum_drop
+    else:  # live ATR-scaled absolute gap from the last active buy and from the held cost basis
+        features = getattr(market, 'bag', None)
+        gap = live_buy_gap(buy_gap, None if features is None else features.atr_pct)
+        if acquired and abs(bid - acquired[-1].entry_price) / acquired[-1].entry_price < gap:
+            return state, None, 'acquisition_not_eligible'
+    if not bag_empty and abs(bid - bag.breakeven_price) / bag.breakeven_price < gap:
         return state, None, 'bag_gap_not_met'
     mid = (bid + ask) / 2
     rows = [(value.remaining_base, max(value.planned_quote - value.entry_quote, Decimal('0')) / value.entry_price

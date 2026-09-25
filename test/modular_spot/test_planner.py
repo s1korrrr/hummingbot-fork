@@ -94,3 +94,77 @@ def test_unfilled_stage_is_not_a_new_fill_reference():
     revised, proposal, reason = plan(state, view, **inputs(
         acquisition=AcquisitionPolicy(fractions=(D('.3'), D('.3'), D('.4')))))
     assert proposal is not None and revised.committed_quote <= D('100')
+
+
+def _view(remaining, spent, price, terminal, held=False, planned=None):
+    return InventoryView(D(remaining), D(spent), D(price), D('0'), terminal, True, held,
+                         D(planned if planned is not None else spent))
+
+
+def test_bag_mode_counts_active_tranches_and_frees_slots_as_tranches_close_or_are_held():
+    from controllers.generic.modular_spot_core.bag import HeldBag
+
+    acquisition = AcquisitionPolicy(fractions=(D('.5'), D('.5')))
+    state = DecisionState(fingerprint='a' * 64, candle=1080, claims=('closed', 'held', 'live'),
+                          committed_quote=D('150'))
+    view = {'closed': _view('0', '50', '101', True), 'held': _view('.5', '50', '100', True, held=True),
+            'live': _view('.5', '50', '102', False)}
+    bag = HeldBag(D('.5'), D('105'), D('.1'))  # bid 99 is >= 2% (minimum_drop) away from the bag
+    market = MarketFeatures(1140, D('99'), D('29'), D('31'), False, False)
+    revised, proposal, reason = plan(state, view, **inputs(bid=D('99'), ask=D('99.1'), acquisition=acquisition,
+                                                           market=market, budget=D('200'),
+                                                           available_quote=D('200')), bag=bag)
+    # One active tranche: stage 1 of 2, dip from its 102 fill, capital = live tranche + bag cost.
+    assert reason == 'entry_proposed' and proposal.stage == 1
+    assert revised.claims[:3] == state.claims and revised.claims[-1] == proposal.identifier
+    tied = D('50') * D('1.005') + D('.5') * D('105') + D('.1')
+    assert proposal.amount * proposal.price * D('1.005') <= D('200') - tied
+
+
+def test_bag_mode_vetoes_buys_too_close_to_bag_breakeven_and_exhausted_capital():
+    from controllers.generic.modular_spot_core.bag import HeldBag
+
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    near = plan(state, {}, **inputs(), bag=HeldBag(D('1'), D('100.2'), D('0')))
+    assert near[1] is None and near[2] == 'bag_gap_not_met'
+    broke = plan(state, {}, **inputs(), bag=HeldBag(D('1'), D('90'), D('11')))
+    assert broke[1] is None and broke[2] == 'bag_capital_exhausted'
+
+
+def test_bag_mode_campaign_resets_only_when_every_claim_is_terminal_and_the_bag_is_empty():
+    from controllers.generic.modular_spot_core.bag import HeldBag
+
+    state = DecisionState(fingerprint='a' * 64, candle=1080, claims=('held',), committed_quote=D('50'))
+    view = {'held': _view('.5', '50', '100', True, held=True)}
+    kept = plan(state, view, **inputs(), bag=HeldBag(D('.5'), D('100'), D('0')))
+    assert kept[0].claims == ('held',) and kept[2] != 'campaign_flat'
+    flat = plan(state, view, **inputs(), bag=HeldBag(D('0'), D('0'), D('0')))
+    assert flat[2] == 'campaign_flat' and flat[0].claims == () and flat[0].cycle == 1
+    # The next candle: the retired held tranche's receipt still reports its base (the bag, not
+    # the tranche, sold it). It must not fault as unclaimed execution; a new cycle can enter.
+    next_candle = MarketFeatures(1200, D('100'), D('29'), D('31'), False, False)
+    later = plan(flat[0], view, **inputs(now=1260, market=next_candle), bag=HeldBag(D('0'), D('0'), D('0')))
+    assert later[2] == 'entry_proposed' and later[0].claims == (later[1].identifier,) and later[0].cycle == 1
+    # Legacy mode still refuses the same unclaimed receipt.
+    with pytest.raises(PolicyError, match='unclaimed'):
+        plan(flat[0], view, **inputs(now=1260, market=next_candle))
+
+
+def test_bag_mode_off_grid_dust_counts_as_an_empty_bag():
+    from controllers.generic.modular_spot_core.bag import HeldBag
+
+    state = DecisionState(fingerprint='a' * 64, candle=1080, claims=('held',), committed_quote=D('50'))
+    view = {'held': _view('.5', '50', '100', True, held=True)}
+    dust = HeldBag(D('.0004'), D('100'), D('0'))  # a sweep rounded to the .001 lot leaves this behind
+    assert plan(state, view, **inputs(), bag=dust)[2] == 'campaign_flat'
+    notional = HeldBag(D('.009'), D('100'), D('0'))  # .9 USDC is under the 1 USDC minimum notional
+    assert plan(state, view, **inputs(), bag=notional)[2] == 'campaign_flat'
+    # A dust bag does not block a buy near its breakeven either.
+    fresh = DecisionState(fingerprint='a' * 64, candle=1080)
+    assert plan(fresh, {}, **inputs(), bag=dust)[2] == 'entry_proposed'
+
+
+def test_legacy_mode_still_holds_on_held_inventory():
+    state = DecisionState(fingerprint='a' * 64, candle=1080, claims=('held',), committed_quote=D('50'))
+    view = {'held': _view('.5', '50', '100', True, held=True)}
+    assert plan(state, view, **inputs())[2] == 'held_inventory_requires_reconciliation'

@@ -102,10 +102,19 @@ class DecisionStore:
             raise PolicyError('decision persistence failed; no dispatch') from exc
 
 
-def reconcile_claims(state: DecisionState, inventory):
+def reconcile_claims(state: DecisionState, inventory, *, bag_empty=None):
+    """Legacy mode holds on any held inventory. In bag mode (``bag_empty`` given) held
+    claims are bag members; the campaign is flat only when every claim is terminal and
+    the controller's held position is empty or dust."""
     if any(identifier not in inventory for identifier in state.claims):
         return state, 'execution_receipt_missing'
     claimed = [inventory[x] for x in state.claims]
+    if bag_empty is not None:
+        if claimed and all(x.terminal for x in claimed) and bag_empty:
+            return state.model_copy(update={'claims': (), 'committed_quote': Decimal('0'),
+                                            'cycle': state.cycle + 1}), 'campaign_flat'
+        return state, 'reconciled'
+
     if any(x.held or (x.terminal and x.remaining_base > 0) for x in claimed):
         return state, 'held_inventory_requires_reconciliation'
     if claimed and all(x.terminal and x.remaining_base == 0 for x in claimed):

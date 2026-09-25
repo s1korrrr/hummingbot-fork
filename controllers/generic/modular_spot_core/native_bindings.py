@@ -38,14 +38,20 @@ class NativeBindings:
         return calculate_trend_state(frame, **kwargs)
 
     @staticmethod
-    def snapshot(controller):
+    def spot_connector(controller):
+        """The registered native centralized spot connector; the only market snapshot owner."""
         from hummingbot.client.settings import AllConnectorSettings, ConnectorType
-        from hummingbot.core.data_type.common import PriceType
         c, p = controller.config, controller.market_data_provider
         setting = AllConnectorSettings.get_connector_settings().get(c.connector_name)
         if setting is None or setting.type != ConnectorType.Exchange:
             raise PolicyError('only native centralized spot connectors are supported')
-        connector = p.connectors[c.connector_name]
+        return p.connectors[c.connector_name]
+
+    @classmethod
+    def snapshot(cls, controller):
+        from hummingbot.core.data_type.common import PriceType
+        c, p = controller.config, controller.market_data_provider
+        connector = cls.spot_connector(controller)
         if p.ready is not True or connector.ready is not True:
             raise DataUnavailable('native market/account provider not ready')
         if getattr(connector, 'supports_terminal_fill_reconciliation', False) is not True:
@@ -85,10 +91,11 @@ class NativeBindings:
         return rate <= controller.config.risk.fee_reserve_fraction
 
     @staticmethod
-    def config(controller_config, proposal):
+    def config(controller_config, proposal, market=None):
         from .execution import native_config
         return native_config(controller_config, identifier=proposal.identifier, timestamp=proposal.timestamp,
-                             price=proposal.price, amount=proposal.amount, cycle=proposal.cycle, stage=proposal.stage)
+                             price=proposal.price, amount=proposal.amount, cycle=proposal.cycle, stage=proposal.stage,
+                             market=market)
 
     @staticmethod
     def action(controller_id, config):

@@ -271,7 +271,7 @@ def proposed_native(rt, cfg, *, now=1200):
 
 def admit_executor(rt, native, revised):
     rt.pending[native.id] = native.model_copy(deep=True)
-    rt.pending_inputs[native.id] = 'inputs'
+    rt.pending_inputs[native.id] = dict(candle=0, rows={})
     rt.input_identity = 'inputs'
     store_decision = NS(load=lambda: (revised, 'raw'), compare_and_swap=lambda *a, **k: True,
                         recorder=NS(get_all_executors=lambda: []))
@@ -331,7 +331,7 @@ def test_proposal_dispatch_and_executor_admission_all_require_the_reservation(tm
     assert store.contains(reserved, native_executors=[])
     assert rt.acquisition_permitted() is True
     rt.pending[native.id] = native.model_copy(deep=True)
-    rt.pending_inputs[native.id] = 'inputs'
+    rt.pending_inputs[native.id] = dict(candle=0, rows={})
     rt.input_identity = 'inputs'
     store_decision = NS(load=lambda: (revised, 'raw'), compare_and_swap=lambda *a, **k: True,
                         recorder=NS(get_all_executors=lambda: []))
@@ -344,7 +344,7 @@ def test_proposal_dispatch_and_executor_admission_all_require_the_reservation(tm
     other = native_config(cfg, identifier='unreserved', timestamp=proposal.timestamp,
                           price=proposal.price, amount=proposal.amount, cycle=0, stage=0)
     rt.pending[other.id] = other.model_copy(deep=True)
-    rt.pending_inputs[other.id] = 'inputs'
+    rt.pending_inputs[other.id] = dict(candle=0, rows={})
     store_decision.load = lambda: (revised.model_copy(update={'claims': (*revised.claims, other.id)}), 'raw')
     assert rt.entry_permission(other, check_funds=False) is False
     assert 'reservation' in rt.reason

@@ -27,7 +27,104 @@ def paper():
     return result
 
 
+def delayed_research_paper():
+    rule = TradingRule(PAIR, min_order_size=D('.01'), min_price_increment=D('.01'),
+                       min_base_amount_increment=D('.01'), min_notional_size=D('1'))
+    result = NativePaperTradeExchange({PAIR: rule}, fee_schema=TradeFeeSchema(
+        maker_percent_fee_decimal=D('.001'), taker_percent_fee_decimal=D('.002')),
+        trade_participation=D('.01'), research_execution_mode='delayed_observed_v1')
+    result.set_balance('BTC', D('5'))
+    result.set_balance('USDC', D('1000'))
+    result.tick(1000)
+    result.set_order_book(PAIR, 1, 1000, [(D('99'), D('10'))], [(D('101'), D('10'))])
+    return result
+
+
 class NativePaperTradeTests(IsolatedAsyncioTestCase):
+    def test_default_connector_keeps_prior_persisted_contract_identity(self):
+        state = paper().tracking_states
+        self.assertEqual(state['contract'], 'd0ed12c44b355b75d42a1714c7003b95bb07453c612e4f31c432cbe4f8922c88')  # noqa: mock
+        self.assertNotIn('research_events', state)
+        self.assertNotIn('observed_buckets', state)
+        self.assertNotIn('research_order_sequence', state)
+
+    async def test_research_open_ack_and_completed_second_delay_without_crossing_book(self):
+        market = delayed_research_paper()
+        oid = market.buy(PAIR, D('2'), OrderType.LIMIT, D('101'))
+        await market.drain()
+        order = market._order_tracker.fetch_order(oid)
+        self.assertEqual(order.executed_amount_base, D('0'))
+        self.assertEqual(order.current_state, OrderState.PENDING_CREATE)
+        market.tick(1001)
+        await market.process_observed_second(PAIR, 1000, D('100'), D('102'), D('100'))
+        self.assertEqual(order.current_state, OrderState.OPEN)
+        self.assertEqual(order.executed_amount_base, D('0'))
+        market.tick(1002)
+        await market.process_observed_second(PAIR, 1001, D('100'), D('102'), D('100'))
+        self.assertEqual(order.executed_amount_base, D('1'))
+        self.assertEqual(market.get_balance('BTC'), D('6'))
+
+    async def test_research_cancel_ack_precedes_same_clock_bucket_and_fifo_shares_both_sides(self):
+        market = delayed_research_paper()
+        buy = market.buy(PAIR, D('2'), OrderType.LIMIT_MAKER, D('99'))
+        sell = market.sell(PAIR, D('2'), OrderType.LIMIT_MAKER, D('101'))
+        market.tick(1001)
+        await market.settle_research_events()
+        market.tick(1002)
+        await market.process_observed_second(PAIR, 1001, D('98'), D('102'), D('100'))
+        self.assertEqual(market._order_tracker.fetch_order(buy).executed_amount_base, D('1'))
+        self.assertEqual(market._order_tracker.fetch_order(sell).executed_amount_base, D('0'))
+        market.cancel(PAIR, sell)
+        market.tick(1003)
+        await market.process_observed_second(PAIR, 1002, D('100'), D('102'), D('100'))
+        self.assertTrue(market._order_tracker.fetch_order(sell).is_cancelled)
+        self.assertEqual(market._order_tracker.fetch_order(sell).executed_amount_base, D('0'))
+
+    async def test_research_empty_or_sub_quantum_bucket_never_fills(self):
+        market = delayed_research_paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT_MAKER, D('99'))
+        market.tick(1002)
+        await market.settle_research_events()
+        await market.process_observed_second(PAIR, 1001, D('98'), D('102'), D('.9'))
+        self.assertEqual(market._order_tracker.fetch_order(oid).executed_amount_base, D('0'))
+        market.tick(1003)
+        await market.process_observed_second(PAIR, 1002, D('98'), D('102'), D('0'))
+        self.assertEqual(market._order_tracker.fetch_order(oid).executed_amount_base, D('0'))
+
+    async def test_research_pending_ack_and_bucket_restore_without_extra_capacity(self):
+        market = delayed_research_paper()
+        oid = market.buy(PAIR, D('2'), OrderType.LIMIT_MAKER, D('99'))
+        restored = delayed_research_paper()
+        restored.restore_tracking_states(json.loads(json.dumps(market.tracking_states)))
+        self.assertEqual(restored._order_tracker.fetch_order(oid).current_state, OrderState.PENDING_CREATE)
+        restored.tick(1001)
+        restored.set_order_book(PAIR, 2, 1001, [(99, 10)], [(101, 10)])
+        await restored.settle_research_events()
+        self.assertEqual(restored._order_tracker.fetch_order(oid).current_state, OrderState.OPEN)
+        restored.tick(1002)
+        await restored.process_observed_second(PAIR, 1001, D('98'), D('102'), D('100'))
+        self.assertEqual(restored._order_tracker.fetch_order(oid).executed_amount_base, D('1'))
+        again = delayed_research_paper()
+        again.restore_tracking_states(json.loads(json.dumps(restored.tracking_states)))
+        again.set_order_book(PAIR, 3, 1002, [(99, 10)], [(101, 10)])
+        with self.assertRaisesRegex(ValueError, 'repeated'):
+            await again.process_observed_second(PAIR, 1001, D('98'), D('102'), D('100'))
+        self.assertEqual(again._order_tracker.fetch_order(oid).executed_amount_base, D('1'))
+
+    async def test_research_post_only_reject_and_pending_cancel_settle_before_fills(self):
+        market = delayed_research_paper()
+        crossing = market.buy(PAIR, D('1'), OrderType.LIMIT_MAKER, D('101'))
+        canceled = market.buy(PAIR, D('1'), OrderType.LIMIT_MAKER, D('99'))
+        market.cancel(PAIR, canceled)
+        market.tick(1001)
+        await market.process_observed_second(PAIR, 1000, D('98'), D('102'), D('100'))
+        rejected_order = market._order_tracker.fetch_order(crossing)
+        canceled_order = market._order_tracker.fetch_order(canceled)
+        self.assertTrue(rejected_order.is_cancelled)
+        self.assertEqual(rejected_order.cancel_source, '31')
+        self.assertTrue(canceled_order.is_cancelled)
+        self.assertEqual(canceled_order.executed_amount_base, D('0'))
+
     async def test_partial_fill_charges_fee_and_reserves_remaining_cash(self):
         market = paper()
         oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))

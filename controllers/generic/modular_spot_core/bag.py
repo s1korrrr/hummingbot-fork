@@ -131,6 +131,22 @@ class LiveCapitalConfig(PolicyModel):
         return self
 
 
+STORED_EXECUTOR_WINDOW = 20  # ExecutorOrchestrator keeps each controller's 20 most recent stored executors
+
+
+def live_sell_reference(stored, *, window: int = STORED_EXECUTOR_WINDOW) -> Optional[Decimal]:
+    """Live ``_last_same_side_ref_price(SELL)`` over the orchestrator's stored window.
+
+    ``stored`` holds one ``(order_key, filled_sell_price_or_None)`` per terminal executor of
+    the controller, of any kind. Only the ``window`` most recent by ``order_key`` are visible
+    (live ``executors_info``); the newest filled sell among them is the reference.
+    """
+    for _, price in sorted(stored, key=lambda row: row[0], reverse=True)[:window]:
+        if price is not None:
+            return decimal(price, 'sell reference', positive=True)
+    return None
+
+
 def live_capital_quote(cap: LiveCapitalConfig, *, held_amount: Decimal, held_dust: bool, mid: Decimal, active,
                        available_quote: Decimal):
     """Quote for the next buy under live capital, or ``(None, reason)``.

@@ -418,3 +418,14 @@ def test_controller_config_admits_live_capital_only_with_bags():
     assert live.capital == LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('500'), max_active_tranches=8)
     with pytest.raises(ValueError, match='bag lifecycle'):
         ModularSpotControllerConfig(**base, capital=LiveCapitalConfig())
+
+
+def test_live_sell_reference_expires_after_twenty_newer_stored_executors():
+    from controllers.generic.modular_spot_core.bag import live_sell_reference
+
+    sell = ((10, 0), D('110'))
+    assert live_sell_reference([sell]) == D('110')
+    newer = [((11 + i, 0), None) for i in range(19)]
+    assert live_sell_reference([sell, *newer]) == D('110')  # 20 visible: still the reference
+    assert live_sell_reference([sell, *newer, ((40, 0), None)]) is None  # 21st newer executor pushes it out
+    assert live_sell_reference([((5, 0), D('100')), sell, ((12, 1), D('120'))]) == D('120')  # newest filled sell

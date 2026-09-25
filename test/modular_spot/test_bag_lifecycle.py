@@ -195,9 +195,13 @@ def test_bag_stops_run_from_mid_when_candle_features_are_unavailable(tmp_path):
     _, config = _dispatch(controller, entry)
     venue.tranche(config, filled_base=D('0.9992'), price=config.entry_price)
     controller.runtime.observe = lambda: None  # stale feed / warmup / bag feature failure
-    controller.runtime.snapshot = lambda: dict(bid=D('96.895'), ask=D('96.905'), available_quote=D('1000'),
-                                               pnl=D('0'), amount_step=D('0.001'), minimum_amount=D('0.001'),
-                                               minimum_notional=D('1'))
+
+    def stale_report():
+        raise AssertionError('the mid-only stop path must not need the native performance snapshot')
+
+    controller.runtime.snapshot = stale_report
+    book = {'BestBid': D('96.895'), 'BestAsk': D('96.905')}
+    controller.market_data_provider.get_price_by_type = lambda connector, pair, kind: book[kind.name]
     actions = controller.determine_executor_actions()
     assert [(a.executor_id, a.keep_position) for a in actions] == [(config.id, True)]
     controller.config.manual_kill_switch = True
@@ -233,5 +237,11 @@ def test_recovery_permission_refuses_unsafe_or_foreign_sells(tmp_path):
     controller.config.execution_enabled = False
     assert not controller.validate_executor_config(request)
     controller.config.execution_enabled = True
+    controller.config.manual_kill_switch = True
+    assert not controller.validate_executor_config(request)
+    controller.config.manual_kill_switch = False
+    rt.fault = 'earlier fault'
+    assert not controller.validate_executor_config(request)
+    rt.fault = None
     assert controller.validate_executor_config(request)
     venue.engine.dispose()

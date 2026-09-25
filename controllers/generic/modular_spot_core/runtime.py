@@ -439,8 +439,13 @@ class ModularRuntime:
             state, _ = self.ensure_store().load()
             if state is None:
                 return []
-            snapshot = self.snapshot()
-            mid = (snapshot['bid'] + snapshot['ask']) / 2
+            # Live needs only the book: a stale native report must not suspend bag creation.
+            getter = self.controller.market_data_provider.get_price_by_type
+            bid = decimal(getter(c.connector_name, c.trading_pair, PriceType.BestBid), 'bid', positive=True)
+            ask = decimal(getter(c.connector_name, c.trading_pair, PriceType.BestAsk), 'ask', positive=True)
+            if ask < bid:
+                return []
+            mid = (bid + ask) / 2
             policy = c.bag.policy()
             return [StopExecutorAction(controller_id=c.id, executor_id=t.executor_id, keep_position=True)
                     for t in self._active_tranches(self.inventory(), state)

@@ -196,7 +196,7 @@ def _live_capital_entry(state, active, acquired, bag, bag_empty, capital, *, fin
     if depth_budget is not None:
         features = getattr(market, 'bag', None)
         if features is None or features.recent_high is None:
-            raise PolicyError('the depth budget requires the recent high feature')
+            return state, None, 'depth_history_unavailable'  # entries only; exits are planned elsewhere
         deployed = (bag.amount * bag.breakeven_price + bag.remaining_fees_quote
                     + sum((max(value.planned_quote, value.entry_quote) for value in active), Decimal('0')))
         reference = depth_reference(features.recent_high, None if bag_empty else bag.breakeven_price)

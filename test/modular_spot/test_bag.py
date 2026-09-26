@@ -607,9 +607,8 @@ def test_planner_refuses_a_buy_past_the_depth_budget_and_counts_the_bag_at_cost(
     below = HeldBag(D('24'), D('110'), D('0'))  # 2640 at cost + 100 fits under 3424, not under 2333
     assert plan(state, {}, **base, market=deep, bid=D('90'), ask=D('90.1'), bag=below, capital=cap,
                 depth_budget=depth)[2] == 'entry_proposed'
-    with pytest.raises(PolicyError, match='recent high'):
-        plan(state, {}, **base, market=MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=bag_features_),
-             bid=D('90'), ask=D('90.1'), bag=bag, capital=cap, depth_budget=depth)
+    assert plan(state, {}, **base, market=MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=bag_features_),
+                bid=D('90'), ask=D('90.1'), bag=bag, capital=cap, depth_budget=depth)[2] == 'depth_history_unavailable'
     with pytest.raises(PolicyError, match='requires live capital'):
         plan(state, {}, **base, market=deep, bid=D('90'), ask=D('90.1'), bag=bag, depth_budget=depth)
 
@@ -628,8 +627,7 @@ def test_depth_feature_is_the_highest_closed_high_over_the_lookback():
     kwargs = dict(rsi_prev=30, now=float(n * 60), short_records=500, higher_records=85, adx_threshold=18)
     assert bag_features(frame, **kwargs).recent_high is None
     assert bag_features(frame, **kwargs, depth_lookback=60).recent_high == D(str(float(close[-60] + 1)))
-    with pytest.raises(PolicyError, match='depth budget history'):
-        bag_features(frame, **kwargs, depth_lookback=n + 1)
+    assert bag_features(frame, **kwargs, depth_lookback=n + 1).recent_high is None  # short history: entries only refuse
 
 
 def test_controller_config_depth_budget_needs_capital_and_history():

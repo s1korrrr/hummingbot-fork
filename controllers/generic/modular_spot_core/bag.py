@@ -311,9 +311,9 @@ def bag_features(closed: pd.DataFrame, *, rsi_prev, now: float, short_records: i
     trend = analyze_multi_timeframe_trend({'short': short_df, 'medium': medium, 'long': long},
                                           adx_length=14, adx_threshold=float(adx_threshold))
     recent_high = None
-    if depth_lookback is not None:
-        if len(closed) < depth_lookback:
-            raise PolicyError('depth budget history unavailable')
+    if depth_lookback is not None and len(closed) >= depth_lookback:
+        # Short history leaves it None: the planner refuses only new entries (depth_history_unavailable)
+        # so bag recovery sells and exits keep running (review nit: never suspend sells for an entry gate).
         recent_high = Decimal(str(float(high.iloc[-depth_lookback:].max())))
     return BagFeatures(Decimal(str(rsi_prev)), *(Decimal(str(v)) for v in values),
                        trend.direction.value, Decimal(str(float(trend.confidence or 0.0))), recent_high)

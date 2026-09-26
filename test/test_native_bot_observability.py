@@ -18,6 +18,46 @@ def test_controller_episode_and_pending_sell_are_read_only_and_allowlisted():
     assert progress.filled_base == Decimal('1')
 
 
+def test_event_projection_is_allowlisted_only_for_v2_observer():
+    from hummingbot.strategy.native_observability import controller_observation
+    projection = {
+        'schema': 'cross_venue_event.operator_projection.v2',
+        'status': 'NO_ORDER_OBSERVER_V2',
+        'recipe_sha256': 'a' * 64,
+        'module_graph_sha256': 'c' * 64,
+        'source_sha256': 'd' * 64,
+        'configuration_sha256': 'e' * 64,
+        'snapshot_sha256': 'b' * 64,
+        'asof_ms': 1780000000000,
+        'lag_ms': 1000,
+        'observation_universe': ['eip155:1/erc20:0xabc'],
+        'entry_universe': [],
+        'management_universe': [],
+        'native_ownership_status': 'UNVERIFIED',
+        'research_status': 'NOT_RUN',
+        'execution_allowed': False,
+        'private': 'never publish',
+    }
+    observer = Obj(config=Obj(controller_name='cross_venue_event_v2', connector_name='okx'),
+                   get_custom_info=lambda: {'event_projection': projection})
+    result = controller_observation({'controller_id': 'events-v2', 'controller': observer})
+    assert result['custom_info']['event_projection']['recipe_sha256'] == 'a' * 64
+    assert 'private' not in str(result)
+    legacy = Obj(config=Obj(controller_name='ok_rsi', connector_name='okx'),
+                 get_custom_info=lambda: {'event_projection': projection})
+    assert 'event_projection' not in controller_observation({'controller_id': 'legacy', 'controller': legacy})['custom_info']
+
+
+def test_event_projection_rejects_malformed_claims():
+    from hummingbot.strategy.native_observability import controller_observation
+    controller = Obj(config=Obj(controller_name='cross_venue_event_v2', connector_name='okx'),
+                     get_custom_info=lambda: {'event_projection': {'schema': 'cross_venue_event.operator_projection.v2',
+                                                                   'execution_allowed': True}})
+    result = controller_observation({'controller_id': 'events-v2', 'controller': controller})
+    assert result['observation_status'] == 'unavailable'
+    assert result['custom_info'] == {}
+
+
 def test_orders_keep_remaining_and_unknown_attribution_and_report_failure():
     from hummingbot.strategy.native_observability import active_order_observations
     order = Obj(client_order_id='o1', exchange_order_id='venue1', trading_pair='BTC-USDT', trade_type=Obj(name='SELL'),

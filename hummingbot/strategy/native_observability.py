@@ -80,6 +80,85 @@ def strategy_components_observation(source):
     return result
 
 
+def event_projection_observation(source):
+    """Allowlist the opt-in observer's compact, explicitly no-order status."""
+    if not isinstance(source, dict) or source.get('schema') != 'cross_venue_event.operator_projection.v2':
+        raise ValueError('Invalid event projection schema')
+    if source.get('status') != 'NO_ORDER_OBSERVER_V2' or source.get('execution_allowed') is not False:
+        raise ValueError('Event projection cannot claim execution authority')
+    result = {key: source[key] for key in ('schema', 'status', 'execution_allowed')}
+    for key in ('recipe_sha256', 'module_graph_sha256', 'source_sha256',
+                'configuration_sha256', 'snapshot_sha256'):
+        value = source.get(key)
+        if not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None:
+            raise ValueError('Invalid event projection identity')
+        result[key] = value
+    for key in ('asof_ms', 'lag_ms'):
+        value = source.get(key)
+        if type(value) is not int or value < 0 or value > 10**15:
+            raise ValueError('Invalid event projection clock')
+        result[key] = value
+    if source.get('native_ownership_status') not in ('UNVERIFIED', 'VERIFIED'):
+        raise ValueError('Invalid event ownership status')
+    if source.get('research_status') not in ('NOT_RUN', 'HELD', 'VALIDATED'):
+        raise ValueError('Invalid event research status')
+    result['native_ownership_status'] = source['native_ownership_status']
+    result['research_status'] = source['research_status']
+    for key in ('observation_universe', 'entry_universe', 'management_universe'):
+        values = source.get(key)
+        if (not isinstance(values, list) or len(values) > 2
+                or any(not isinstance(value, str) or not 0 < len(value) <= 128 for value in values)
+                or len(set(values)) != len(values)):
+            raise ValueError('Invalid event universe projection')
+        result[key] = list(values)
+        count = source.get(key + '_count', len(values))
+        truncated = source.get(key + '_truncated', False)
+        if type(count) is not int or count < len(values) or count > 10_000 or type(truncated) is not bool:
+            raise ValueError('Invalid event universe count')
+        result[key + '_count'] = count
+        result[key + '_truncated'] = truncated
+    coverage = source.get('source_coverage', [])
+    if not isinstance(coverage, list) or len(coverage) > 2:
+        raise ValueError('Invalid event source coverage')
+    result['source_coverage'] = []
+    for row in coverage:
+        if (not isinstance(row, dict) or not isinstance(row.get('source_id'), str)
+                or not 0 < len(row['source_id']) <= 128
+                or row.get('coverage_state') not in ('COMPLETE', 'PARTIAL', 'UNAVAILABLE', 'UNVERIFIED')
+                or type(row.get('complete_for_entry')) is not bool
+                or type(row.get('complete_for_risk')) is not bool):
+            raise ValueError('Invalid event source coverage row')
+        result['source_coverage'].append({key: row[key] for key in (
+            'source_id', 'coverage_state', 'complete_for_entry', 'complete_for_risk')})
+    traces = source.get('traces', [])
+    if not isinstance(traces, list) or len(traces) > 2:
+        raise ValueError('Invalid event decision traces')
+    result['traces'] = []
+    for row in traces:
+        if (not isinstance(row, dict) or row.get('status') != 'HOLD'
+                or not isinstance(row.get('reason'), str) or not 0 < len(row['reason']) <= 128
+                or not isinstance(row.get('opportunity_id'), str)
+                or re.fullmatch(r'[0-9a-f]{64}', row['opportunity_id']) is None):
+            raise ValueError('Invalid event decision trace')
+        result['traces'].append({key: row[key] for key in ('opportunity_id', 'status', 'reason')})
+    for key, rows in (('source_coverage_count', coverage), ('trace_count', traces)):
+        count = source.get(key, len(rows))
+        if type(count) is not int or count < len(rows) or count > 10_000:
+            raise ValueError('Invalid event projection count')
+        result[key] = count
+    reasons = source.get('decision_reasons', [])
+    if (not isinstance(reasons, list) or len(reasons) > 2
+            or any(not isinstance(reason, str) or re.fullmatch(r'[a-z_]{1,128}', reason) is None
+                   for reason in reasons)):
+        raise ValueError('Invalid event decision reasons')
+    result['decision_reasons'] = list(reasons)
+    count = source.get('decision_reason_count', len(reasons))
+    if type(count) is not int or count < len(reasons) or count > 10_000:
+        raise ValueError('Invalid event reason count')
+    result['decision_reason_count'] = count
+    return result
+
+
 def controller_observation(entry):
     controller = entry['controller']
     result = {'controller_id': entry['controller_id'],
@@ -101,6 +180,8 @@ def controller_observation(entry):
                 result['custom_info'][name] = {key: scalar(source[key]) for key in fields if key in source}
         if 'strategy_components' in custom:
             result['custom_info']['strategy_components'] = strategy_components_observation(custom['strategy_components'])
+        if getattr(controller.config, 'controller_name', None) == 'cross_venue_event_v2' and 'event_projection' in custom:
+            result['custom_info']['event_projection'] = event_projection_observation(custom['event_projection'])
         runtime = getattr(controller, '_episode_runtime', None)
         requests = []
         if runtime is not None:

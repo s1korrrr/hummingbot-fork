@@ -732,3 +732,18 @@ def test_live_capital_pending_buy_is_reserved_at_at_least_current_mid():
     # A limit above mid still binds; owned base and pending base are separate.
     assert live_capital_exposure(held_amount=D('1'), held_dust=False, mid=D('90'),
                                  active=((D('0.5'), D('0.5'), D('100')),)) == D('185')
+
+
+def test_knife_gate_blocks_entries_only_inside_the_falling_knife_zone():
+    from controllers.generic.modular_spot_core.bag import KnifeGateConfig, knife_gate
+
+    cfg = KnifeGateConfig(lower=D('0.10'), upper=D('0.20'), lookback_minutes=43200)
+    assert knife_gate(cfg, reference_high=D('100'), price=D('95')) == (D('0.05'), False)  # shallow dip: buy
+    assert knife_gate(cfg, reference_high=D('100'), price=D('90')) == (D('0.10'), True)  # knife zone starts at 10%
+    assert knife_gate(cfg, reference_high=D('100'), price=D('81')) == (D('0.19'), True)
+    assert knife_gate(cfg, reference_high=D('100'), price=D('80')) == (D('0.20'), False)  # capitulation: buy again
+    assert knife_gate(cfg, reference_high=D('100'), price=D('105')) == (D('0'), False)  # above the high
+    with pytest.raises(ValueError):
+        KnifeGateConfig(lower=D('0.2'), upper=D('0.1'), lookback_minutes=43200)
+    with pytest.raises(ValueError):
+        KnifeGateConfig(lower=D('0.1'), upper=D('0.2'), lookback_minutes=30)

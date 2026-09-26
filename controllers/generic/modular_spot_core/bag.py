@@ -259,6 +259,31 @@ def distribution_gate_price(cfg: DistributionGateConfig, *, breakeven, anchor) -
     return base + cfg.retrace * max(Decimal('0'), decimal(anchor, 'cycle anchor', positive=True) - base)
 
 
+class KnifeGateConfig(PolicyModel):
+    """Research entry gate: no new buy while price is ``lower`` to ``upper`` below the highest closed-candle high over
+    ``lookback_minutes`` (the "falling knife" zone); buys resume below ``upper`` (capitulation). Statistics on 2025-26
+    hourly data: forward returns are below average in the 10-20% zone of the 30-day high and above it at >= 20%.
+    It only refuses entries; bag recovery sells and exits are unaffected. Live use needs a candle feed covering the
+    lookback (e.g. 1h candles for 30 days). Not a live OK RSI setting.
+    """
+    lower: Decimal = Field(gt=0, lt=1)
+    upper: Decimal = Field(gt=0, lt=1)
+    lookback_minutes: int = Field(ge=60, le=100000, strict=True)
+
+    @model_validator(mode='after')
+    def ordered(self):
+        if self.lower >= self.upper:
+            raise ValueError('knife gate lower must be below upper')
+        return self
+
+
+def knife_gate(cfg: KnifeGateConfig, *, reference_high, price) -> Tuple[Decimal, bool]:
+    """(depth below the lookback high, whether a new entry is refused)."""
+    high = decimal(reference_high, 'knife reference high', positive=True)
+    depth = max(Decimal('0'), 1 - decimal(price, 'price', positive=True) / high)
+    return depth, cfg.lower <= depth < cfg.upper
+
+
 STORED_EXECUTOR_WINDOW = 20  # ExecutorOrchestrator keeps each controller's 20 most recent stored executors
 
 

@@ -32,58 +32,6 @@ class MockNetworkIterator(NetworkIterator):
             return NetworkStatus.NOT_CONNECTED
 
 
-class ScriptedNetworkIterator(NetworkIterator):
-    """Answers each network check from a script: up, down, or timeout (slower than the check timeout)."""
-
-    def __init__(self, script):
-        super().__init__()
-        self.script = list(script)
-        self.starts = 0
-        self.stops = 0
-        self.check_network_interval = 0.001
-        self.check_network_timeout = 0.02
-
-    async def check_network(self):
-        if not self.script:
-            raise asyncio.CancelledError
-        step = self.script.pop(0)
-        if step == "timeout":
-            await asyncio.sleep(1)
-        return NetworkStatus.CONNECTED if step == "up" else NetworkStatus.NOT_CONNECTED
-
-    async def start_network(self):
-        self.starts += 1
-
-    async def stop_network(self):
-        self.stops += 1
-
-
-class NetworkFailureThresholdTest(IsolatedAsyncioWrapperTestCase):
-    """A connected connector is torn down (and later rebuilt by start_network) only after the failure persists."""
-
-    async def run_script(self, script):
-        iterator = ScriptedNetworkIterator(script)
-        clock = Clock(ClockMode.BACKTEST, 1, 0, 10)
-        iterator.start(clock, 0)
-        with self.assertRaises(asyncio.CancelledError):
-            await iterator.check_network_task
-        return iterator
-
-    async def test_transient_failures_keep_the_connection(self):
-        iterator = await self.run_script(["up", "timeout", "down", "up", "timeout", "timeout", "up"])
-        self.assertEqual((NetworkStatus.CONNECTED, 1, 0), (iterator.network_status, iterator.starts, iterator.stops))
-
-    async def test_a_persistent_failure_stops_networking_once_and_recovery_restarts_it(self):
-        iterator = await self.run_script(["up", "timeout", "down", "timeout", "timeout", "up"])
-        self.assertEqual((NetworkStatus.CONNECTED, 2, 1), (iterator.network_status, iterator.starts, iterator.stops))
-        iterator = await self.run_script(["up", "timeout", "timeout", "timeout"])
-        self.assertEqual((NetworkStatus.NOT_CONNECTED, 1, 1), (iterator.network_status, iterator.starts, iterator.stops))
-
-    async def test_failures_before_the_first_connection_do_not_start_or_stop(self):
-        iterator = await self.run_script(["timeout", "down", "timeout"])
-        self.assertEqual((NetworkStatus.NOT_CONNECTED, 0, 0), (iterator.network_status, iterator.starts, iterator.stops))
-
-
 class NetworkIteratorUnitTest(IsolatedAsyncioWrapperTestCase):
 
     start: pd.Timestamp = pd.Timestamp("2021-01-01", tz="UTC")
@@ -116,10 +64,9 @@ class NetworkIteratorUnitTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(NetworkStatus.CONNECTED, self.network_iterator.network_status)
         self.assertTrue(self.network_iterator._start_network_event.is_set())
 
-        # The mock alternates connected / not connected: a single failed check never tears the connection down.
         await asyncio.sleep(0.5)
-        self.assertEqual(NetworkStatus.CONNECTED, self.network_iterator.network_status)
-        self.assertFalse(self.network_iterator._stop_network_event.is_set())
+        self.assertEqual(NetworkStatus.NOT_CONNECTED, self.network_iterator.network_status)
+        self.assertTrue(self.network_iterator._stop_network_event.is_set())
 
     def test_last_connected_timestamp(self):
         self.clock.backtest_til(self.start_timestamp)

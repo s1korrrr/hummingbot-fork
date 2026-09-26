@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Optional
 
-from hummingbot.core.network_iterator import NetworkStatus
+from hummingbot.core.network_iterator import NETWORK_FAILURE_THRESHOLD, NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
 
@@ -78,11 +78,37 @@ class NetworkBase:
         return NetworkStatus.NOT_CONNECTED
 
     async def _check_network_loop(self):
+        # A connected network is stopped only after NETWORK_FAILURE_THRESHOLD consecutive failed checks. A single
+        # slow or failed check (a starved event loop, one timed-out ping) used to mark the network NOT_CONNECTED
+        # (silently, on a timeout) so the next good check ran start_network(), rebuilding every order book and
+        # stream. The stop now also runs stop_network(), so status and networking agree.
+        failures = 0
         while True:
             last_status = self._network_status
+            wait = self._check_network_interval
             try:
-                new_status = await asyncio.wait_for(self.check_network(), timeout=self._check_network_timeout)
+                try:
+                    new_status = await asyncio.wait_for(self.check_network(), timeout=self._check_network_timeout)
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    self.logger().debug("Check network call has timed out.")
+                    new_status = NetworkStatus.NOT_CONNECTED
+                except Exception as e:
+                    self.logger().error(f"Unexpected error while checking for network status: {e}", exc_info=True)
+                    new_status = NetworkStatus.NOT_CONNECTED
+                    wait = self._network_error_wait_time
+                if new_status is NetworkStatus.CONNECTED:
+                    failures = 0
+                elif last_status is NetworkStatus.CONNECTED:
+                    failures += 1
+                    if failures < NETWORK_FAILURE_THRESHOLD:
+                        self.logger().info(f"Network check failed ({failures} of {NETWORK_FAILURE_THRESHOLD} consecutive); "
+                                           "keeping networking running.")
+                        new_status = last_status
+                        wait = self._check_network_interval
                 if new_status != last_status:
+                    failures = 0
                     self._network_status = new_status
                     if self._network_status is NetworkStatus.CONNECTED:
                         self.logger().info(f"Network status has changed to {new_status}. Starting networking...")
@@ -90,17 +116,13 @@ class NetworkBase:
                     else:
                         self.logger().info(f"Network status has changed to {new_status}. Stopping networking...")
                         await self.stop_network()
-                await self._sleep(self._check_network_interval)
             except asyncio.CancelledError:
                 raise
-            except asyncio.TimeoutError:
-                self.logger().debug("Check network call has timed out. Network status is not connected.")
-                self._network_status = NetworkStatus.NOT_CONNECTED
-                await self._sleep(self._check_network_interval)
             except Exception as e:
                 self.logger().error(f"Unexpected error while checking for network status: {e}", exc_info=True)
                 self._network_status = NetworkStatus.NOT_CONNECTED
-                await self._sleep(self._network_error_wait_time)
+                wait = self._network_error_wait_time
+            await self._sleep(wait)
 
     def start(self):
         self._check_network_task = safe_ensure_future(self._check_network_loop())

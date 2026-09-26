@@ -644,3 +644,30 @@ def test_controller_config_depth_budget_needs_capital_and_history():
     ok = ModularSpotControllerConfig(**base, max_records=1500, capital=LiveCapitalConfig(position_cap_quote=None),
                                      depth_budget=depth)
     assert ok.depth_budget == depth
+
+
+def test_depth_scaled_buy_size_grows_with_depth_and_stays_within_the_budget():
+    from controllers.generic.modular_spot_core.bag import DepthBudgetConfig, LiveCapitalConfig, depth_slice_quote
+    from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy
+    from controllers.generic.modular_spot_core.market import MarketFeatures
+    from controllers.generic.modular_spot_core.planner import plan
+    from controllers.generic.modular_spot_core.state import DecisionState
+
+    cfg = DepthBudgetConfig(budget_quote=D('5000'), lookback_minutes=1440, full_depth=D('0.2'), base_fraction=D('1'),
+                            max_slice_multiplier=D('3'))
+    assert depth_slice_quote(cfg, D('100'), D('0')) == D('100')
+    assert depth_slice_quote(cfg, D('100'), D('0.1')) == D('200')
+    assert depth_slice_quote(cfg, D('100'), D('0.5')) == D('300')  # capped at full depth
+    assert DepthBudgetConfig(budget_quote=D('1'), lookback_minutes=60, full_depth=D('0.2'), base_fraction=D('1')).max_slice_multiplier == 1
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=None, max_active_tranches=8)
+    _, bag_features_ = feats()
+    market = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=replace(bag_features_, recent_high=D('100')))
+    base = dict(fingerprint='a' * 64, budget=D('5000'), now=1200, available_quote=D('5000'), amount_step=D('.001'),
+                minimum_amount=D('.001'), minimum_notional=D('1'), pnl=D('0'), signal=SignalPolicy(),
+                acquisition=AcquisitionPolicy(), risk=RiskPolicy(), market=market, bid=D('90'), ask=D('90.1'))
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    empty = HeldBag(D('0'), D('0'), D('0'))
+    _, proposal, reason = plan(state, {}, **base, bag=empty, capital=cap, depth_budget=cfg)
+    assert reason == 'entry_proposed' and proposal.amount * D('90') > D('190')  # 10% deep: a 2x (200) buy
+    poor = dict(base, available_quote=D('150'))
+    assert plan(state, {}, **poor, bag=empty, capital=cap, depth_budget=cfg)[2] == 'cash_exhausted'  # the sized buy is refused, not shrunk

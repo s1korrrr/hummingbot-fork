@@ -183,6 +183,9 @@ class DepthBudgetConfig(PolicyModel):
     lookback_minutes: int = Field(ge=60, le=2999, strict=True)  # the controller keeps <= 3000 candles
     full_depth: Decimal = Field(gt=0, lt=1)
     base_fraction: Decimal = Field(ge=0, le=1)
+    # Depth-scaled buy size: each buy plans slice_quote * (1 + (m - 1) * min(1, depth / full_depth)),
+    # so deeper buys are larger (a DCA ladder) while the budget above still caps what is deployed.
+    max_slice_multiplier: Decimal = Field(default=Decimal('1'), ge=1, le=10)
 
 
 def depth_reference(recent_high, breakeven_price=None) -> Decimal:
@@ -197,6 +200,12 @@ def depth_budget_allowed(cfg: DepthBudgetConfig, *, reference_high, price) -> Tu
     depth = max(Decimal('0'), 1 - decimal(price, 'price', positive=True) / high)
     fraction = min(Decimal('1'), cfg.base_fraction + (1 - cfg.base_fraction) * depth / cfg.full_depth)
     return depth, cfg.budget_quote * fraction
+
+
+def depth_slice_quote(cfg: DepthBudgetConfig, slice_quote, depth) -> Decimal:
+    """The planned buy size at ``depth`` (the live capital slice when the multiplier is 1)."""
+    scale = min(Decimal('1'), decimal(depth, 'depth') / cfg.full_depth)
+    return decimal(slice_quote, 'slice quote', positive=True) * (1 + (cfg.max_slice_multiplier - 1) * scale)
 
 
 def depth_budget_decision(cfg: DepthBudgetConfig, quote, *, deployed_quote, reference_high, price):

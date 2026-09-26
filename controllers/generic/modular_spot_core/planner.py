@@ -163,7 +163,14 @@ def _live_capital_entry(state, active, acquired, bag, bag_empty, capital, *, fin
                         acquisition, risk, buy_gap=None, depth_budget=None):
     """Live OK RSI admission under the live capital model (see bag.LiveCapitalConfig), then the
     research depth budget (bag.DepthBudgetConfig) when configured."""
-    from .bag import depth_budget_decision, depth_reference, live_buy_gap, live_capital_quote
+    from .bag import (
+        depth_budget_allowed,
+        depth_budget_decision,
+        depth_reference,
+        depth_slice_quote,
+        live_buy_gap,
+        live_capital_quote,
+    )
 
     # Same entry evidence as next_stage, with the live active-buy limit instead of a stage count.
     if not fresh_signal or not all(x.entry_terminal for x in active):
@@ -189,17 +196,22 @@ def _live_capital_entry(state, active, acquired, bag, bag_empty, capital, *, fin
         bag.amount * bag.breakeven_price + bag.remaining_fees_quote
         + sum((max(value.planned_quote, value.entry_quote) for value in active), Decimal('0'))
         * (1 + risk.fee_reserve_fraction))
+    reference = None
+    if depth_budget is not None:
+        features = getattr(market, 'bag', None)
+        if features is None or features.recent_high is None:
+            return state, None, 'depth_history_unavailable'  # entries only; exits are planned elsewhere
+        reference = depth_reference(features.recent_high, None if bag_empty else bag.breakeven_price)
+        if depth_budget.max_slice_multiplier != 1:  # depth-scaled buy size enters the live capital gates
+            depth, _ = depth_budget_allowed(depth_budget, reference_high=reference, price=bid)
+            capital = capital.model_copy(update={'slice_quote': depth_slice_quote(depth_budget, capital.slice_quote, depth)})
     quote, reason = live_capital_quote(capital, held_amount=bag.amount, held_dust=bag_empty, mid=mid, active=rows,
                                        available_quote=available_quote, funded_used_quote=funded_used)
     if quote is None:
         return state, None, reason
     if depth_budget is not None:
-        features = getattr(market, 'bag', None)
-        if features is None or features.recent_high is None:
-            return state, None, 'depth_history_unavailable'  # entries only; exits are planned elsewhere
         deployed = (bag.amount * bag.breakeven_price + bag.remaining_fees_quote
                     + sum((max(value.planned_quote, value.entry_quote) for value in active), Decimal('0')))
-        reference = depth_reference(features.recent_high, None if bag_empty else bag.breakeven_price)
         quote, reason = depth_budget_decision(depth_budget, quote, deployed_quote=deployed,
                                               reference_high=reference, price=bid)
         if quote is None:

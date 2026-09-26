@@ -1,5 +1,10 @@
 """Public-data, native spot paper runtime. Never constructs an exchange client.
 
+Hosts either the component_breakout reference on explicit pairs, or a paper twin of live rsi_modular controllers
+built from their mounted live YAML files. A twin differs from its live controller only in its declared fields:
+a separate owner id, paper execution, the native paper connector, the explicit public OKX candle owner and
+injected (native) candles taken from the same candle service instead of the shared stream.
+
 Books are observed five-level snapshots; fills use the native paper connector's
 explicit participation assumption. Queue priority and venue execution equivalence
 are not established. A stale book holds the complete configured portfolio.
@@ -18,6 +23,7 @@ import time
 from collections import deque
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import aiohttp
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -50,6 +56,8 @@ class PaperConfig(BaseModel):
     taker_fee: Decimal = Field(default=Decimal(".001"), ge=0, le=Decimal(".05"))
     trade_participation: Decimal = Field(default=Decimal(".1"), gt=0, le=1)
     book_max_age_seconds: float = Field(default=5, gt=0, le=5)
+    controller_kind: Literal["component_breakout", "rsi_modular"] = "component_breakout"
+    controller_files: tuple[Path, ...] = ()
 
     @field_validator("pairs")
     @classmethod
@@ -72,6 +80,10 @@ class PaperConfig(BaseModel):
             raise ValueError("Separate absolute state and status paths required")
         if self.position_quote > self.simulated_quote:
             raise ValueError("Position allocation exceeds simulated cash")
+        if (self.controller_kind == "rsi_modular") != bool(self.controller_files):
+            raise ValueError("rsi_modular requires controller_files; component_breakout forbids them")
+        if any(not f.is_absolute() for f in self.controller_files) or len(set(self.controller_files)) != len(self.controller_files):
+            raise ValueError("Distinct absolute controller_files required")
         return self
 
 
@@ -100,6 +112,42 @@ def atomic_json(path, value):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+TWIN_FIELDS = ("id", "execution_mode", "connector_name", "candles_connector", "data", "shared_history")
+
+
+def rsi_modular_paper_configs(paths, pairs):
+    """Paper twins of live rsi_modular controller files; returns configs and the per-controller divergence."""
+    import yaml
+
+    from controllers.generic.rsi_modular import get_config_class
+
+    configs, divergence = [], {}
+    for path in paths:
+        live = yaml.safe_load(Path(path).read_text())
+        if (not isinstance(live, dict) or live.get("controller_name") != "rsi_modular"
+                or live.get("execution_mode") != "live" or live.get("connector_name") != "okx"
+                or not str(live.get("id", "")).startswith("modular_spot_") or live.get("profile") not in ("ok_rsi", "rsi_v5")):
+            raise ValueError(f"Paper twin requires a live rsi_modular controller file: {path}")
+        cls = get_config_class(live["profile"])
+        reference = cls.model_validate(live).model_dump(mode="json")
+        paper = {k: v for k, v in live.items() if k not in ("data", "shared_history")}
+        paper.update(id="modular_spot_paper_" + live["id"][len("modular_spot_"):], execution_mode="paper",
+                     connector_name="okx_paper_trade", candles_connector="okx")
+        config = cls.model_validate(paper)
+        if config.data.mode != "native":
+            raise ValueError("Paper twin candles must be injected")
+        values = config.model_dump(mode="json")
+        changed = {k: [reference.get(k), values.get(k)] for k in set(reference) | set(values)
+                   if reference.get(k) != values.get(k)}
+        if not set(changed) <= set(TWIN_FIELDS):
+            raise ValueError(f"Paper twin diverges beyond its declared fields: {sorted(set(changed) - set(TWIN_FIELDS))}")
+        configs.append(config)
+        divergence[config.id] = changed
+    if sorted(c.trading_pair for c in configs) != sorted(pairs):
+        raise ValueError("Paper twin controller pairs must equal the configured pairs")
+    return configs, divergence
 
 
 def parse_rules(payload, pairs):
@@ -396,8 +444,27 @@ class PublicLiquidity:
 class PaperRuntime:
     def __init__(self, config, rules):
         self.config = config
+        self.twin_divergence = {}
+        if config.controller_kind == "rsi_modular":
+            configs, self.twin_divergence = rsi_modular_paper_configs(config.controller_files, config.pairs)
+            history = {c.trading_pair: max(feed.max_records for feed in c.candles_config) for c in configs}
+            if any(feed.interval != "1m" for c in configs for feed in c.candles_config):
+                raise ValueError("Paper twin injects 1m candles only")
+        else:
+            configs = [
+                ComponentBreakoutConfig(
+                    id="paper_" + p.replace("-", "_"),
+                    trading_pair=p,
+                    execution_enabled=True,
+                    total_amount_quote=config.position_quote,
+                    trade_quote=config.position_quote,
+                )
+                for p in config.pairs
+            ]
+            history = {p: 60 for p in config.pairs}
+        self.controller_ids = {c.trading_pair: c.id for c in configs}
         self.datasets = [
-            Dataset(connector="okx", trading_pair=p, history=60) for p in config.pairs
+            Dataset(connector="okx", trading_pair=p, history=history[p]) for p in config.pairs
         ]
         self.candles = CandleStreamClient(
             config.candle_origin, config.candle_token_file, self.datasets
@@ -416,16 +483,6 @@ class PaperRuntime:
         connector.set_balance("USDC", config.simulated_quote)
         for pair in config.pairs:
             connector.set_balance(pair.split("-")[0], Decimal("0"))
-        configs = [
-            ComponentBreakoutConfig(
-                id="paper_" + p.replace("-", "_"),
-                trading_pair=p,
-                execution_enabled=True,
-                total_amount_quote=config.position_quote,
-                trade_quote=config.position_quote,
-            )
-            for p in config.pairs
-        ]
         config.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_fd = os.open(
             str(config.state_path) + '.runtime.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -435,6 +492,9 @@ class PaperRuntime:
             self.source_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
             binding = {'schema': 'native_component_paper_runtime_v1', 'source_sha256': self.source_sha256,
                        'config': config.model_dump(mode='json')}
+            if config.controller_files:  # a changed live file is a changed twin; restore must refuse it
+                binding['controller_files_sha256'] = {str(f): hashlib.sha256(Path(f).read_bytes()).hexdigest()
+                                                      for f in config.controller_files}
             receipt = Path(str(config.state_path) + '.runtime.json')
             if self.restored:
                 if not receipt.is_file() or receipt.is_symlink() or json.loads(receipt.read_text()) != binding:
@@ -467,6 +527,8 @@ class PaperRuntime:
             "timestamp": now,
             "generated_at": now,
             "execution_mode": "paper",
+            "controller_kind": self.config.controller_kind,
+            "twin_divergence": self.twin_divergence,
             "process_boot_id": self.boot_id,
             "process_pid": os.getpid(),
             "source_sha256": self.source_sha256,
@@ -498,10 +560,7 @@ class PaperRuntime:
                 "sessions": self.candles.sessions,
                 "failures": self.candles.failures,
             },
-            "controllers": [
-                dict(c.get_status_summary(), id=c.config.id)
-                for c in self.session.controllers.values()
-            ],
+            "controllers": [self._controller_row(c) for c in self.session.controllers.values()],
             "native_reports": reports,
             "report_observed_at": self.report_observed_at if reports else None,
             "unavailable_controller_ids": sorted(set(self.session.controllers) - set(reports)),
@@ -513,6 +572,15 @@ class PaperRuntime:
             },
         }
 
+    @staticmethod
+    def _controller_row(controller):
+        """Native status plus the identity the paper reader binds (filled from config only when absent)."""
+        row = dict(controller.get_status_summary(), id=controller.config.id)
+        row.setdefault("controller_name", controller.config.controller_name)
+        row.setdefault("pair", controller.config.trading_pair)
+        row.setdefault("execution_mode", controller.config.execution_mode)
+        return row
+
     async def step(self, now):
         if self.failure:
             raise RuntimeError("Paper runtime held after failure")
@@ -522,14 +590,16 @@ class PaperRuntime:
         reasons = []
         frames = []
         submitted_digests = {}
+        breakout = self.config.controller_kind == "component_breakout"
         for spec in self.datasets:
-            controller = self.session.controllers[
-                "paper_" + spec.trading_pair.replace("-", "_")
-            ]
+            controller = self.session.controllers[self.controller_ids[spec.trading_pair]]
             try:
                 frame = self.candles.replica.frame(spec.key, now=now, max_age=70)
                 snapshot = self.candles.replica.snapshots[spec.key]
                 if not self.candles.replica.entry_ready(spec.key):
+                    if not breakout:  # the twin, like its live stream owner, acts only after a live candle
+                        reasons.append(spec.trading_pair + ":candles_warming")
+                        continue
                     controller._last_decision = int(frame.iloc[-1].timestamp) + 60
                 if self._seen_candles.get(spec.key) != snapshot.digest:
                     submitted_digests[spec.key] = snapshot.digest
@@ -545,10 +615,10 @@ class PaperRuntime:
             except (DataUnavailable, ValueError):
                 reasons.append(spec.trading_pair + ":candles_unavailable")
                 # Preserve existing restart hold; prevent a stale cached frame admitting entry.
-                if not self.restored:
+                if breakout and not self.restored:
                     controller.recovery_hold = "public_candles_unavailable"
                 continue
-            if not self.restored:
+            if breakout and not self.restored:
                 controller.recovery_hold = ""
         for pair, book in list(self.liquidity.books.items()):
             if book['sequence'] > self._applied_books.get(pair, -1):

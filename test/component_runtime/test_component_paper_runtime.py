@@ -535,3 +535,108 @@ async def test_stale_exposure_shutdown_is_durable_hold(tmp_path):
     finally:
         await runtime.close()
         await runtime.liquidity.close()
+
+
+# ---------------------------------------------------------------- rsi_modular paper twin
+TWIN_FIELDS = {"id", "execution_mode", "connector_name", "candles_connector", "data", "shared_history"}
+
+
+def live_rsi_file(tmp_path, pair="BTC-USDC", name=None):
+    import yaml
+
+    from controllers.generic.rsi_modular import get_config_class
+    suffix = pair.split("-")[0].lower()
+    live = get_config_class("ok_rsi")(
+        id="modular_spot_v2_" + suffix, profile="ok_rsi", execution_mode="live", connector_name="okx",
+        trading_pair=pair, execution_enabled=True, strict_hmm_mode=False, trend_confirmation_enabled=False,
+        min_signal_score=1, dynamic_position_sizing=False,
+        data={"mode": "shared", "transport": "stream", "origin": "http://127.0.0.1:8092",
+              "token_file": "/run/candles/token"}, shared_history=7514,
+        funding={"allocation_quote": "50", "fee_reserve_fraction": ".003"})
+    path = tmp_path / (name or f"rsi_modular_v2_{suffix}.yml")
+    path.write_text(yaml.safe_dump(live.model_dump(mode="json"), sort_keys=False))
+    return path, live
+
+
+def twin_config(tmp_path, files, pairs=("BTC-USDC",), **kwargs):
+    return PaperConfig(bot_name="rsi_modular_paper_v2", pairs=list(pairs), state_path=tmp_path / "paper.sqlite",
+                       status_path=tmp_path / "status.json", candle_origin="http://127.0.0.1:8092",
+                       controller_kind="rsi_modular", controller_files=[str(f) for f in files],
+                       simulated_quote="50", **kwargs)
+
+
+def test_rsi_twin_differs_from_the_live_controller_only_in_declared_fields(tmp_path):
+    from scripts.component_paper_runtime import rsi_modular_paper_configs
+    path, live = live_rsi_file(tmp_path)
+    (paper,), divergence = rsi_modular_paper_configs([path], ("BTC-USDC",))
+    live_values, paper_values = live.model_dump(mode="json"), paper.model_dump(mode="json")
+    changed = {k for k in set(live_values) | set(paper_values) if live_values.get(k) != paper_values.get(k)}
+    assert changed <= TWIN_FIELDS and {"id", "execution_mode", "connector_name"} <= changed
+    assert set(divergence[paper.id]) == changed
+    assert paper.id == "modular_spot_paper_v2_btc" and paper.execution_mode == "paper"
+    assert paper.connector_name == "okx_paper_trade" and paper.data.mode == "native"
+    assert paper.funding == live.funding and paper.execution_enabled is True
+
+
+def test_rsi_twin_refuses_non_live_files_pair_mismatch_and_breakout_file_mixing(tmp_path):
+    import yaml
+
+    from scripts.component_paper_runtime import rsi_modular_paper_configs
+    path, _ = live_rsi_file(tmp_path)
+    with pytest.raises(ValueError, match="pairs"):
+        rsi_modular_paper_configs([path], ("ETH-USDC",))
+    values = yaml.safe_load(path.read_text())
+    bad = tmp_path / "paper.yml"
+    bad.write_text(yaml.safe_dump({**values, "execution_mode": "paper", "connector_name": "okx_paper_trade"}))
+    with pytest.raises(ValueError, match="live rsi_modular"):
+        rsi_modular_paper_configs([bad], ("BTC-USDC",))
+    with pytest.raises(ValueError, match="controller_files"):
+        config(tmp_path, controller_files=[str(path)])
+    with pytest.raises(ValueError, match="controller_files"):
+        PaperConfig(bot_name="x", pairs=["BTC-USDC"], state_path=tmp_path / "p.sqlite", status_path=tmp_path / "s.json",
+                    candle_origin="http://127.0.0.1:8092", controller_kind="rsi_modular", controller_files=[])
+
+
+@pytest.mark.asyncio
+async def test_rsi_twin_runtime_injects_the_controller_history_and_reports_the_twin(tmp_path):
+    path, _ = live_rsi_file(tmp_path)
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    runtime = None
+    try:
+        with patch("socket.getaddrinfo", side_effect=AssertionError("no networking")):
+            runtime = PaperRuntime(twin_config(tmp_path, [path]), rules())
+            (controller,) = runtime.session.controllers.values()
+            need = max(c.max_records for c in controller.config.candles_config)
+            assert runtime.datasets[0].history == need and need > 60
+            now = 600000
+            await ack(runtime.liquidity)
+            runtime.candles.clock = lambda: now
+            runtime.candles.begin_session()
+            runtime.candles.apply(dict(v=1, type="snapshot", epoch="fixture", published_at=now, received_at=now,
+                                       pair="BTC-USDC", sequence=1,
+                                       rows=[row(t) for t in range(now - 60 * need, now, 60)]))
+            await runtime.liquidity.accept(book(now), now)
+            await runtime.step(now)
+            warming = json.loads((tmp_path / "status.json").read_text())
+            assert "BTC-USDC:candles_warming" in warming["reasons"]  # boot snapshot alone never admits the twin
+            later = now + 60
+            runtime.candles.clock = lambda: later
+            runtime.candles.apply(dict(v=1, type="candle", epoch="fixture", published_at=later, received_at=later,
+                                       pair="BTC-USDC", sequence=2, row=row(now, "100")))
+            await runtime.liquidity.accept(book(later), later)
+            await runtime.step(later)
+            frame = runtime.session.market_data_provider.get_candles_df("okx", "BTC-USDC", "1m", need)
+            assert len(frame) == need and int(frame.iloc[-1].timestamp) == now
+            status = json.loads((tmp_path / "status.json").read_text())
+            assert status["controller_kind"] == "rsi_modular"
+            assert set(status["twin_divergence"]["modular_spot_paper_v2_btc"]) <= TWIN_FIELDS
+            assert [c["id"] for c in status["controllers"]] == ["modular_spot_paper_v2_btc"]
+            (status_row,) = status["controllers"]  # the reporting paper reader binds these identities
+            assert (status_row["controller_name"], status_row["pair"], status_row["execution_mode"]) == (
+                "rsi_modular", "BTC-USDC", "paper")
+            assert not any("candles_" in r for r in status["reasons"]), status["reasons"]
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        MarketsRecorder._shared_instance = prior

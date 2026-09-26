@@ -671,3 +671,16 @@ def test_depth_scaled_buy_size_grows_with_depth_and_stays_within_the_budget():
     assert reason == 'entry_proposed' and proposal.amount * D('90') > D('190')  # 10% deep: a 2x (200) buy
     poor = dict(base, available_quote=D('150'))
     assert plan(state, {}, **poor, bag=empty, capital=cap, depth_budget=cfg)[2] == 'cash_exhausted'  # the sized buy is refused, not shrunk
+
+
+def test_live_capital_pending_buy_is_reserved_at_at_least_current_mid():
+    from controllers.generic.modular_spot_core.bag import LiveCapitalConfig, live_capital_exposure, live_capital_quote
+
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('250'))
+    inputs = dict(held_amount=D('0'), held_dust=True, mid=D('200'),
+                  active=((D('0'), D('1'), D('100')),))
+    assert live_capital_exposure(**inputs) == D('200')
+    assert live_capital_quote(cap, **inputs, available_quote=D('1000')) == (None, 'max_position')
+    # A limit above mid still binds; owned base and pending base are separate.
+    assert live_capital_exposure(held_amount=D('1'), held_dust=False, mid=D('90'),
+                                 active=((D('0.5'), D('0.5'), D('100')),)) == D('185')

@@ -222,9 +222,9 @@ STORED_EXECUTOR_WINDOW = 20  # ExecutorOrchestrator keeps each controller's 20 m
 def live_sell_reference(stored, *, window: int = STORED_EXECUTOR_WINDOW) -> Optional[Decimal]:
     """Live ``_last_same_side_ref_price(SELL)`` over the orchestrator's stored window.
 
-    ``stored`` holds one ``(order_key, filled_sell_price_or_None)`` per terminal executor of
+    ``stored`` holds one ``(order_key, sell_proposal_price_or_None)`` per terminal executor of
     the controller, of any kind. Only the ``window`` most recent by ``order_key`` are visible
-    (live ``executors_info``); the newest filled sell among them is the reference.
+    (live ``executors_info``); the newest filled sell's proposal price among them is the reference.
     """
     for _, price in sorted(stored, key=lambda row: row[0], reverse=True)[:window]:
         if price is not None:
@@ -234,13 +234,13 @@ def live_sell_reference(stored, *, window: int = STORED_EXECUTOR_WINDOW) -> Opti
 
 def live_capital_exposure(*, held_amount: Decimal, held_dust: bool, mid: Decimal, active) -> Decimal:
     """Live ``_total_position_value_usd``: the non-dust held bag at mid plus active buys
-    (owned base at mid, unfilled remainder at its commitment price)."""
+    (owned base at mid, unfilled remainder at the greater of mid and commitment price)."""
     mid = decimal(mid, 'mid', positive=True)
     exposure = Decimal('0') if held_dust else decimal(held_amount, 'held amount') * mid
     for owned, outstanding, price in active:
         exposure += decimal(owned, 'owned base') * mid
         if decimal(outstanding, 'outstanding base') > 0:
-            exposure += outstanding * decimal(price, 'commitment price', positive=True)
+            exposure += outstanding * max(mid, decimal(price, 'commitment price', positive=True))
     return exposure
 
 

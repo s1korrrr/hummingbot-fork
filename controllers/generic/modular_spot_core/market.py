@@ -84,7 +84,8 @@ def atr_fraction(data: pd.DataFrame, length: int) -> Decimal | None:
 
 
 def features(frame: pd.DataFrame, *, now: float, interval: int, max_age: int,
-             policy: SignalPolicy, trend_analyzer: Callable, bag_config=None) -> MarketFeatures:
+             policy: SignalPolicy, trend_analyzer: Callable, bag_config=None,
+             depth_lookback=None) -> MarketFeatures:
     now = float(decimal(now, 'now'))
     if type(interval) is not int or interval <= 0 or type(max_age) is not int or max_age <= 0:
         raise PolicyError('invalid candle clock')
@@ -121,7 +122,8 @@ def features(frame: pd.DataFrame, *, now: float, interval: int, max_age: int,
         if len(data) < bag_config.required_records() - 1:
             raise PolicyError('bag feature history unavailable')
         bag = bag_features(data, rsi_prev=values[-2], now=now, short_records=bag_config.trend_short_records,
-                           higher_records=bag_config.trend_higher_records, adx_threshold=bag_config.trend_adx_threshold)
+                           higher_records=bag_config.trend_higher_records, adx_threshold=bag_config.trend_adx_threshold,
+                           depth_lookback=depth_lookback)
     rsi = pd.Series(values)
     return MarketFeatures(int(data.timestamp.iloc[-1]), Decimal(str(data.close.iloc[-1])),
                           Decimal(str(values[-2])), Decimal(str(values[-1])),

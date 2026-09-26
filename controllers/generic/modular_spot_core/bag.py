@@ -9,7 +9,7 @@ controller's orchestrator PositionHold built from its own keep_position stops.
 import json
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -110,6 +110,171 @@ class AdaptiveTrailingConfig(PolicyModel):
         return selection.activation, selection.delta
 
 
+class LiveCapitalConfig(PolicyModel):
+    """Live OK RSI capital model (HLRSIController buy gates), replacing the fixed allocation.
+
+    Every buy plans ``slice_quote`` (``usd_per_entry``). With ``funded_cap_quote`` set (live
+    V2 ``funding.max_position_quote``, at cost), the plan is first resized to the per-pair
+    funding ceiling ``(funded_cap - used - pending) / (1 + funding_fee_reserve)``. The
+    (resized) buy is admitted only while ``held bag + active buys`` marked at mid plus the buy
+    stays within ``position_cap_quote`` (``max_total_position_usd``) and fewer than
+    ``max_active_tranches`` buys are active (``max_executors_per_side``). Without funding
+    (V1) a buy the wallet cannot pay for is refused (live ``balance_low``), never shrunk.
+    Live BNB: V2 is 100 / 500 / 8 with funding 505 at cost (and a strategy-wide 2500
+    allocation across pairs, not modelled per pair); V1 is 200 / 2500 / 8, unfunded.
+    Every buy plans the full slice: the live scout/runner split and dynamic signal-strength
+    sizing are entry-side behaviour, not modelled here.
+    """
+    slice_quote: Decimal = Field(default=Decimal('100'), gt=0)
+    # Required so no config loses its cap by omission: a quote, or None for no position cap (live V2 BNB: 500).
+    position_cap_quote: Optional[Decimal] = Field(..., gt=0)
+    max_active_tranches: int = Field(default=8, ge=1, le=64, strict=True)
+    funded_cap_quote: Optional[Decimal] = Field(default=None, gt=0)
+    funding_fee_reserve: Decimal = Field(default=Decimal('0.003'), ge=0, lt=1)
+
+    @model_validator(mode='after')
+    def slice_within_cap(self):
+        if self.position_cap_quote is not None and self.slice_quote > self.position_cap_quote:
+            raise ValueError('slice_quote must not exceed position_cap_quote (live usd_per_entry <= max_total_position_usd)')
+        return self
+
+
+class BuyGapConfig(PolicyModel):
+    """Live OK RSI ``_effective_price_gap`` (use_adaptive_filters): an ATR-scaled buy gap.
+
+    gap = clamp(atr_pct * atr_multiplier, min_gap, max_gap), falling back to ``base_gap``
+    without ATR. A new buy needs an absolute gap of at least ``gap`` from the last active buy
+    (``_has_sufficient_price_gap``) and from the held cost basis
+    (``_has_sufficient_avg_entry_gap_for_buy``), in either direction.
+    Live BNB: base 0.8%, x3 ATR, clamped 0.5-1.8%.
+    """
+    base_gap: Decimal = Field(default=Decimal('0.008'), gt=0, lt=1)
+    atr_multiplier: Decimal = Field(default=Decimal('3'), ge=0, le=100)
+    min_gap: Decimal = Field(default=Decimal('0.005'), ge=0, lt=1)
+    max_gap: Decimal = Field(default=Decimal('0.018'), gt=0, lt=1)
+
+    @model_validator(mode='after')
+    def ordered(self):
+        if self.min_gap > self.max_gap:
+            raise ValueError('min_gap must not exceed max_gap')
+        return self
+
+
+def live_buy_gap(cfg: BuyGapConfig, atr_pct: Optional[Decimal]) -> Decimal:
+    dynamic = None if atr_pct is None else decimal(atr_pct, 'ATR fraction') * cfg.atr_multiplier
+    gap = dynamic if dynamic is not None and dynamic > 0 else cfg.base_gap
+    return min(max(gap, cfg.min_gap), cfg.max_gap)
+
+
+class DepthBudgetConfig(PolicyModel):
+    """Research capital pacing by depth: the capital deployed at cost may grow with the drawdown
+    below the recent high, so a long down-leg cannot spend the whole budget early.
+
+    depth = max(0, 1 - price / reference), the reference being the higher of the highest
+    closed-candle high over ``lookback_minutes`` and the held (non-dust) bag's breakeven, so a
+    long down-leg is still measured from where the capital went in after the rolling high has
+    followed the price down; allowed = budget_quote * min(1, base_fraction + (1 - base_fraction)
+    * depth / full_depth). A buy is refused (``depth_budget``) when the at-cost capital already
+    deployed plus its quote would exceed ``allowed``. It needs no crash classification: shallow
+    dips keep ``base_fraction`` of the budget, deeper legs unlock the rest, and averaging down
+    lowers the breakeven so each further buy needs a deeper price. Not a live OK RSI setting.
+    """
+    budget_quote: Decimal = Field(gt=0)
+    lookback_minutes: int = Field(ge=60, le=2999, strict=True)  # the controller keeps <= 3000 candles
+    full_depth: Decimal = Field(gt=0, lt=1)
+    base_fraction: Decimal = Field(ge=0, le=1)
+    # Depth-scaled buy size: each buy plans slice_quote * (1 + (m - 1) * min(1, depth / full_depth)),
+    # so deeper buys are larger (a DCA ladder) while the budget above still caps what is deployed.
+    max_slice_multiplier: Decimal = Field(default=Decimal('1'), ge=1, le=10)
+
+
+def depth_reference(recent_high, breakeven_price=None) -> Decimal:
+    """The higher of the lookback high and the held bag's breakeven (None when no bag is held)."""
+    high = decimal(recent_high, 'recent high', positive=True)
+    return high if breakeven_price is None else max(high, decimal(breakeven_price, 'breakeven', positive=True))
+
+
+def depth_budget_allowed(cfg: DepthBudgetConfig, *, reference_high, price) -> Tuple[Decimal, Decimal]:
+    """(depth, allowed deployed quote) at ``price`` below the reference (see depth_reference)."""
+    high = decimal(reference_high, 'reference high', positive=True)
+    depth = max(Decimal('0'), 1 - decimal(price, 'price', positive=True) / high)
+    fraction = min(Decimal('1'), cfg.base_fraction + (1 - cfg.base_fraction) * depth / cfg.full_depth)
+    return depth, cfg.budget_quote * fraction
+
+
+def depth_slice_quote(cfg: DepthBudgetConfig, slice_quote, depth) -> Decimal:
+    """The planned buy size at ``depth`` (the live capital slice when the multiplier is 1)."""
+    scale = min(Decimal('1'), decimal(depth, 'depth') / cfg.full_depth)
+    return decimal(slice_quote, 'slice quote', positive=True) * (1 + (cfg.max_slice_multiplier - 1) * scale)
+
+
+def depth_budget_decision(cfg: DepthBudgetConfig, quote, *, deployed_quote, reference_high, price):
+    """``(quote, 'admitted')`` or ``(None, 'depth_budget')``; pure, for the research verifier."""
+    _, allowed = depth_budget_allowed(cfg, reference_high=reference_high, price=price)
+    if decimal(deployed_quote, 'deployed quote') + decimal(quote, 'quote', positive=True) > allowed:
+        return None, 'depth_budget'
+    return quote, 'admitted'
+
+
+STORED_EXECUTOR_WINDOW = 20  # ExecutorOrchestrator keeps each controller's 20 most recent stored executors
+
+
+def live_sell_reference(stored, *, window: int = STORED_EXECUTOR_WINDOW) -> Optional[Decimal]:
+    """Live ``_last_same_side_ref_price(SELL)`` over the orchestrator's stored window.
+
+    ``stored`` holds one ``(order_key, sell_proposal_price_or_None)`` per terminal executor of
+    the controller, of any kind. Only the ``window`` most recent by ``order_key`` are visible
+    (live ``executors_info``); the newest filled sell's proposal price among them is the reference.
+    """
+    for _, price in sorted(stored, key=lambda row: row[0], reverse=True)[:window]:
+        if price is not None:
+            return decimal(price, 'sell reference', positive=True)
+    return None
+
+
+def live_capital_exposure(*, held_amount: Decimal, held_dust: bool, mid: Decimal, active) -> Decimal:
+    """Live ``_total_position_value_usd``: the non-dust held bag at mid plus active buys
+    (owned base at mid, unfilled remainder at the greater of mid and commitment price)."""
+    mid = decimal(mid, 'mid', positive=True)
+    exposure = Decimal('0') if held_dust else decimal(held_amount, 'held amount') * mid
+    for owned, outstanding, price in active:
+        exposure += decimal(owned, 'owned base') * mid
+        if decimal(outstanding, 'outstanding base') > 0:
+            exposure += outstanding * max(mid, decimal(price, 'commitment price', positive=True))
+    return exposure
+
+
+def live_capital_decision(cap: LiveCapitalConfig, *, active_count: int, exposure: Decimal, available_quote: Decimal,
+                          funded_used_quote: Optional[Decimal] = None):
+    """Quote for the next buy, or ``(None, reason)``, in the live gate order. Pure, so the
+    research verifier can recompute every recorded capital decision."""
+    if active_count >= cap.max_active_tranches:
+        return None, 'max_executors'
+    quote = cap.slice_quote
+    if cap.funded_cap_quote is not None:
+        if funded_used_quote is None:
+            raise PolicyError('funded capital requires the funding used quote')
+        ceiling = (cap.funded_cap_quote - decimal(funded_used_quote, 'funded used')) / (1 + cap.funding_fee_reserve)
+        quote = min(quote, max(ceiling, Decimal('0')))
+        if quote <= 0:
+            return None, 'funding_exhausted'
+    if cap.position_cap_quote is not None and decimal(exposure, 'exposure') + quote > cap.position_cap_quote:
+        return None, 'max_position'
+    if cap.funded_cap_quote is None and decimal(available_quote, 'available quote') < quote:
+        return None, 'cash_exhausted'  # live V1 balance_low: refused, not resized
+    return quote, 'admitted'
+
+
+def live_capital_quote(cap: LiveCapitalConfig, *, held_amount: Decimal, held_dust: bool, mid: Decimal, active,
+                       available_quote: Decimal, funded_used_quote: Optional[Decimal] = None):
+    """``live_capital_exposure`` then ``live_capital_decision``; ``active`` holds one
+    ``(owned_base, outstanding_base, commitment_price)`` per active buy."""
+    rows = tuple(active)
+    exposure = live_capital_exposure(held_amount=held_amount, held_dust=held_dust, mid=mid, active=rows)
+    return live_capital_decision(cap, active_count=len(rows), exposure=exposure, available_quote=available_quote,
+                                 funded_used_quote=funded_used_quote)
+
+
 @dataclass(frozen=True)
 class BagFeatures:
     """Closed-candle inputs of the live bag/sell/trailing decisions."""
@@ -120,10 +285,11 @@ class BagFeatures:
     atr_pct: Decimal
     trend_direction: str
     trend_confidence: Decimal
+    recent_high: Optional[Decimal] = None  # highest closed high over the depth-budget lookback
 
 
 def bag_features(closed: pd.DataFrame, *, rsi_prev, now: float, short_records: int,
-                 higher_records: int, adx_threshold) -> BagFeatures:
+                 higher_records: int, adx_threshold, depth_lookback: Optional[int] = None) -> BagFeatures:
     """EMA9, MACD(14,22,9), Wilder ATR14 and the live multi-timeframe trend on closed candles.
 
     Live OK RSI reads ``short_records`` rows including the forming candle, so it keeps
@@ -153,8 +319,13 @@ def bag_features(closed: pd.DataFrame, *, rsi_prev, now: float, short_records: i
     # Same call as live rsi_signals.analyze_rsi_trend_confirmation (short/medium/long labels).
     trend = analyze_multi_timeframe_trend({'short': short_df, 'medium': medium, 'long': long},
                                           adx_length=14, adx_threshold=float(adx_threshold))
+    recent_high = None
+    if depth_lookback is not None and len(closed) >= depth_lookback:
+        # Short history leaves it None: the planner refuses only new entries (depth_history_unavailable)
+        # so bag recovery sells and exits keep running (review nit: never suspend sells for an entry gate).
+        recent_high = Decimal(str(float(high.iloc[-depth_lookback:].max())))
     return BagFeatures(Decimal(str(rsi_prev)), *(Decimal(str(v)) for v in values),
-                       trend.direction.value, Decimal(str(float(trend.confidence or 0.0))))
+                       trend.direction.value, Decimal(str(float(trend.confidence or 0.0))), recent_high)
 
 
 @dataclass(frozen=True)

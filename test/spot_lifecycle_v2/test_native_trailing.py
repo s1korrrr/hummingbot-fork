@@ -91,6 +91,19 @@ def test_trailing_projection_is_bound_to_the_same_native_execution_receipt():
         capture_native_trailing_view(info, snap)
 
 
+def test_trailing_projection_rejects_state_changed_after_snapshot_capture():
+    info = trailing_info()
+    snap = capture(info)
+    info.custom_info.update({
+        'trailing_stop_trigger_pct': D('.09'),
+        'trailing_trigger_price': D('110'),
+        'trailing_move_count': 1,
+        'trailing_last_update_timestamp': 1002.0,
+    })
+    with pytest.raises(PolicyError, match='snapshot'):
+        capture_native_trailing_view(info, snap)
+
+
 def test_native_projection_and_lifecycle_share_the_same_threshold_ratchet_contract():
     first_info = trailing_info()
     first_snapshot = capture(first_info)

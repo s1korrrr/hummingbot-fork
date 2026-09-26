@@ -75,6 +75,20 @@ def test_native_capture_rejects_missing_wrong_or_unsupported_evidence(change):
         capture(info)
 
 
+def test_native_capture_identity_binds_trailing_management_state():
+    info = native_info()
+    info.custom_info.update({
+        'trailing_state': 'armed', 'trailing_delta_pct': D('.02'),
+        'trailing_stop_trigger_pct': D('.08'), 'trailing_trigger_price': D('109'),
+        'trailing_move_count': 0, 'trailing_armed_timestamp': 1000.0,
+        'trailing_last_update_timestamp': 1001.0,
+    })
+    old = capture(info)
+    info.custom_info['trailing_trigger_price'] = D('110')
+    changed = capture(info, sequence=2)
+    assert changed.receipt_sha256 != old.receipt_sha256
+
+
 def test_fee_correction_changes_receipt_identity_not_previous_evidence():
     info = native_info()
     old = capture(info)

@@ -781,3 +781,40 @@ def test_flash_pause_until_matches_the_live_detector_and_the_planner_pauses_entr
     assert plan(state, {}, **base, market=paused, bag=empty, capital=cap)[2] == 'flash_crash_pause'
     over = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=bag_features_, flash_pause_until=1200.0)
     assert plan(state, {}, **base, market=over, bag=empty, capital=cap)[2] != 'flash_crash_pause'  # pause ended at now
+
+
+def test_shared_feature_cache_key_separates_flash_crash_configurations():
+    """The shared DataPool caches MarketFeatures across controllers by spec; the flash-crash pause is part of
+    the computed features, so controllers differing only in it must not share one cached value."""
+    import pandas as pd
+
+    from controllers.generic.modular_spot_core.bag import FlashCrashConfig
+    from controllers.generic.modular_spot_core.config import SignalPolicy
+    from controllers.generic.modular_spot_core.runtime import ModularRuntime
+
+    specs = []
+    frame = pd.DataFrame({'timestamp': [0.0], 'open': [1.0], 'high': [1.0], 'low': [1.0], 'close': [1.0],
+                          'volume': [1.0]})
+    snapshot = SimpleNamespace(digest='d', frame=lambda **kwargs: frame)
+
+    def observed_spec(flash_crash):
+        config = SimpleNamespace(data=SimpleNamespace(mode='shared', source_profile='native'), interval_seconds=lambda: 60,
+                                 max_candle_age_seconds=120, signal=SignalPolicy(), bag=None, adaptive_trailing=None,
+                                 depth_budget=None, flash_crash=flash_crash, execution_enabled=False,
+                                 connector_name='okx', trading_pair='BNB-USDT', interval='1m', max_records=100,
+                                 candles_connector=None)
+        runtime = object.__new__(ModularRuntime)
+        runtime.controller = SimpleNamespace(config=config, market_data_provider=SimpleNamespace(time=lambda: 120))
+        runtime.bindings = SimpleNamespace(trend=None)
+        runtime.feature_implementation = 'x'
+        runtime.pool = SimpleNamespace(
+            snapshot=lambda *args, **kwargs: snapshot,
+            features=SimpleNamespace(get=lambda snap, *, spec, **kwargs: specs.append(spec) or object()))
+        assert runtime.observe() is not None, runtime.reason
+        return specs[-1]
+
+    plain = observed_spec(None)
+    assert plain == SignalPolicy().model_dump(mode='json')  # controllers without it keep their cache key
+    one = observed_spec(FlashCrashConfig(lookback=5, drop_pct=D('0.03'), cooldown_seconds=300))
+    other = observed_spec(FlashCrashConfig(lookback=5, drop_pct=D('0.05'), cooldown_seconds=300))
+    assert len({repr(plain), repr(one), repr(other)}) == 3

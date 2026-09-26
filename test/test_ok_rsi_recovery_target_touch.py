@@ -55,3 +55,12 @@ def test_bag_that_never_touched_target_is_not_armed_by_the_flag():
     actions = bot._check_held_bag_recovery(current_price=FADED_PRICE, now_ts=1725000000, current_signal=0)
     assert actions == []
     assert bot._recovery_trails == {}
+
+
+def test_raised_target_that_was_never_touched_drops_the_retained_trail():
+    bot = recovery_bot(keep_trail=True)
+    arm(bot)
+    bot.config.bag_recovery_target_pct = 0.15
+    actions = bot._check_held_bag_recovery(current_price=FADED_PRICE, now_ts=1725000000, current_signal=0)
+    assert actions == []
+    assert bot._recovery_trails == {}

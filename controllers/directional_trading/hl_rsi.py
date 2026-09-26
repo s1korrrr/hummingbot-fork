@@ -1061,13 +1061,17 @@ class HLRSIController(DirectionalTradingControllerBase):
             "price_below_ema": price_below_ema,
         }
 
-    def _keep_touched_recovery_trail(self, trail: Optional[RecoveryTrailState], pnl_pct: Decimal) -> bool:
+    def _keep_touched_recovery_trail(self, trail: Optional[RecoveryTrailState], pnl_pct: Decimal,
+                                     effective_target: Decimal) -> bool:
         """Whether an armed trail survives a net pnl below the recovery target.
 
         Called only when pnl_pct < effective target. Returning False restores the
         legacy behaviour: drop the trail and wait for a fresh arm.
         """
         if not self.config.recovery_keep_trail_after_target or trail is None:
+            return False
+        # A target raised after arming was never touched by this trail.
+        if effective_target > trail.target_profit_pct:
             return False
         # Stop tracking where the owned cost floor would refuse the sale anyway.
         return pnl_pct >= Decimal(str(self.config.min_profit_pct_for_sell))
@@ -5233,7 +5237,7 @@ class HLRSIController(DirectionalTradingControllerBase):
                 continue
             position_key = self._recovery_position_key(pos)
             trail = self._recovery_trails.get(position_key)
-            if pnl_pct < effective_target and not self._keep_touched_recovery_trail(trail, pnl_pct):
+            if pnl_pct < effective_target and not self._keep_touched_recovery_trail(trail, pnl_pct, effective_target):
                 self._recovery_trails.pop(position_key, None)
                 continue
 

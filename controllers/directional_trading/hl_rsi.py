@@ -294,6 +294,9 @@ class HLRSIControllerConfig(DirectionalTradingControllerConfigBase):
     trend_sell_threshold_boost: float = Field(default=4.0, ge=0.0, le=10.0, client_data=ClientFieldData(prompt=lambda mi: "HTF uptrend sell-threshold boost:", prompt_on_new=False, is_updatable=True))
     sell_rsi_rollover_delta: float = Field(default=0.5, ge=0.0, le=10.0, client_data=ClientFieldData(prompt=lambda mi: "Sell RSI rollover delta:", prompt_on_new=False, is_updatable=True))
     recovery_trail_pullback_pct: float = Field(default=0.0035, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery trailing pullback pct:", prompt_on_new=False, is_updatable=True))
+    # Off keeps the legacy disarm below target. On keeps an armed trail after the
+    # bag touched target so a fading spike can still sell above the owned cost floor.
+    recovery_keep_trail_after_target: bool = Field(default=False, client_data=ClientFieldData(prompt=lambda mi: "Keep recovery trail after target touch?:", prompt_on_new=False, is_updatable=False))
     recovery_rsi_rollover_delta: float = Field(default=2.0, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery RSI rollover delta:", prompt_on_new=False, is_updatable=True))
     recovery_cancel_stale_order_pct: float = Field(default=0.0025, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery stale-order cancel pct:", prompt_on_new=False, is_updatable=True))
     recovery_sell_execution_strategy: ExecutionStrategy = Field(default=ExecutionStrategy.LIMIT_CHASER, client_data=ClientFieldData(prompt=lambda mi: "Recovery sell execution strategy (LIMIT/LIMIT_MAKER/LIMIT_CHASER/MARKET):", prompt_on_new=False, is_updatable=True))
@@ -1057,6 +1060,21 @@ class HLRSIController(DirectionalTradingControllerBase):
             "rsi_rollover": rsi_rollover,
             "price_below_ema": price_below_ema,
         }
+
+    def _keep_touched_recovery_trail(self, trail: Optional[RecoveryTrailState], pnl_pct: Decimal,
+                                     effective_target: Decimal) -> bool:
+        """Whether an armed trail survives a net pnl below the recovery target.
+
+        Called only when pnl_pct < effective target. Returning False restores the
+        legacy behaviour: drop the trail and wait for a fresh arm.
+        """
+        if not self.config.recovery_keep_trail_after_target or trail is None:
+            return False
+        # A target raised after arming was never touched by this trail.
+        if effective_target > trail.target_profit_pct:
+            return False
+        # Stop tracking where the owned cost floor would refuse the sale anyway.
+        return pnl_pct >= Decimal(str(self.config.min_profit_pct_for_sell))
 
     def _held_bag_recovery_sell_rsi_threshold(self) -> float:
         return float(self.config.sell_rsi_overbought)
@@ -5218,11 +5236,11 @@ class HLRSIController(DirectionalTradingControllerBase):
             if pnl_pct is None:
                 continue
             position_key = self._recovery_position_key(pos)
-            if pnl_pct < effective_target:
+            trail = self._recovery_trails.get(position_key)
+            if pnl_pct < effective_target and not self._keep_touched_recovery_trail(trail, pnl_pct, effective_target):
                 self._recovery_trails.pop(position_key, None)
                 continue
 
-            trail = self._recovery_trails.get(position_key)
             if trail is None:
                 if not self._held_bag_recovery_is_overbought(current_rsi):
                     continue

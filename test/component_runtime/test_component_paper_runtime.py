@@ -640,3 +640,69 @@ async def test_rsi_twin_runtime_injects_the_controller_history_and_reports_the_t
         if runtime is not None:
             await runtime.close()
         MarketsRecorder._shared_instance = prior
+
+
+# ---------------------------------------------------------------- modular_spot_research paper
+def research_file(tmp_path, pair="BTC-USDC", **overrides):
+    import yaml
+
+    from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
+    from controllers.generic.modular_spot_research import ModularSpotResearchConfig
+    config = ModularSpotResearchConfig(
+        id="modular_spot_research_paper_" + pair.split("-")[0].lower(), trading_pair=pair, execution_enabled=True,
+        total_amount_quote=Decimal("5000"), account="research-paper",
+        budget=BudgetPolicy(group="research-paper", max_quote=Decimal("5000"), max_assets=1), **overrides)
+    path = tmp_path / f"modular_spot_research_{pair.split('-')[0].lower()}.yml"
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False))
+    return path, config
+
+
+def test_modular_spot_research_paper_files_load_strictly(tmp_path):
+    import yaml
+
+    from scripts.component_paper_runtime import modular_spot_research_paper_configs
+    path, reference = research_file(tmp_path)
+    (loaded,) = modular_spot_research_paper_configs([path], ("BTC-USDC",))
+    assert loaded.model_dump(mode="json") == reference.model_dump(mode="json")
+    assert loaded.connector_name == "okx_paper_trade" and loaded.data.mode == "native"
+    with pytest.raises(ValueError, match="pairs"):
+        modular_spot_research_paper_configs([path], ("ETH-USDC",))
+    other = tmp_path / "other.yml"
+    other.write_text(yaml.safe_dump({**yaml.safe_load(path.read_text()), "controller_name": "rsi_modular"}))
+    with pytest.raises(ValueError, match="modular_spot_research controller file"):
+        modular_spot_research_paper_configs([other], ("BTC-USDC",))
+    with pytest.raises(ValueError, match="controller_files"):
+        PaperConfig(bot_name="x", pairs=["BTC-USDC"], state_path=tmp_path / "p.sqlite", status_path=tmp_path / "s.json",
+                    candle_origin="http://127.0.0.1:8092", controller_kind="modular_spot_research", controller_files=[])
+
+
+@pytest.mark.asyncio
+async def test_modular_spot_research_runtime_injects_max_records_and_reports_the_controller(tmp_path):
+    path, reference = research_file(tmp_path)
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    runtime = None
+    try:
+        with patch("socket.getaddrinfo", side_effect=AssertionError("no networking")):
+            runtime = PaperRuntime(PaperConfig(
+                bot_name="spot_research_paper_v2", pairs=["BTC-USDC"], state_path=tmp_path / "paper.sqlite",
+                status_path=tmp_path / "status.json", candle_origin="http://127.0.0.1:8092",
+                controller_kind="modular_spot_research", controller_files=[str(path)], simulated_quote="5000"), rules())
+            (controller,) = runtime.session.controllers.values()
+            assert runtime.datasets[0].history == reference.max_records
+            now = 600000
+            await ack(runtime.liquidity)
+            runtime.candles.clock = lambda: now
+            runtime.candles.begin_session()
+            runtime.candles.apply(dict(v=1, type="snapshot", epoch="fixture", published_at=now, received_at=now,
+                                       pair="BTC-USDC", sequence=1,
+                                       rows=[row(t) for t in range(now - 60 * reference.max_records, now, 60)]))
+            await runtime.liquidity.accept(book(now), now)
+            await runtime.step(now)
+            status = json.loads((tmp_path / "status.json").read_text())
+            assert status["controller_kind"] == "modular_spot_research"
+            assert [c["id"] for c in status["controllers"]] == [reference.id]
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        MarketsRecorder._shared_instance = prior

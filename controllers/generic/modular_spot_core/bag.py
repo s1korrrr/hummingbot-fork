@@ -259,6 +259,34 @@ def distribution_gate_price(cfg: DistributionGateConfig, *, breakeven, anchor) -
     return base + cfg.retrace * max(Decimal('0'), decimal(anchor, 'cycle anchor', positive=True) - base)
 
 
+class FlashCrashConfig(PolicyModel):
+    """Live OK RSI ``_detect_flash_crash`` as a stateless entry pause: a closed candle t crashes when
+    (high[t - lookback] - low[t]) / high[t - lookback] >= drop_pct, pausing new entries until its close plus
+    ``cooldown_seconds``. Recomputed from the candle window on every tick, so it survives restarts when the
+    window covers lookback + cooldown. Research parity: quants spot_modular_minute completed_features.
+    """
+    lookback: int = Field(ge=2, le=2999, strict=True)
+    drop_pct: Decimal = Field(ge=Decimal('0.005'), lt=1)
+    cooldown_seconds: int = Field(ge=30, le=86400, strict=True)
+
+    def required_records(self, interval: int = 60) -> int:
+        """Closed candles needed to see every crash that can still pause entries."""
+        return self.lookback + -(-self.cooldown_seconds // interval) + 2
+
+
+def flash_pause_until(cfg: FlashCrashConfig, timestamps, highs, lows, *, interval: int = 60) -> Optional[float]:
+    """Latest pause end (close availability + cooldown) over closed candles, or None when none crashed."""
+    t, h, lo = (np.asarray(x, dtype=float) for x in (timestamps, highs, lows))
+    if not (len(t) == len(h) == len(lo)):
+        raise PolicyError('flash-crash inputs differ in length')
+    if len(t) <= cfg.lookback:
+        return None
+    crash = (h[:-cfg.lookback] - lo[cfg.lookback:]) / h[:-cfg.lookback] >= float(cfg.drop_pct)
+    if not crash.any():
+        return None
+    return float(t[cfg.lookback:][crash].max() + interval + cfg.cooldown_seconds)
+
+
 class KnifeGateConfig(PolicyModel):
     """Research entry gate: no new buy while price is ``lower`` to ``upper`` below the highest closed-candle high over
     ``lookback_minutes`` (the "falling knife" zone); buys resume below ``upper`` (capitulation). Hypothesis from

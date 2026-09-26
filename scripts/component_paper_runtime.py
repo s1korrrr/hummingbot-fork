@@ -56,7 +56,7 @@ class PaperConfig(BaseModel):
     taker_fee: Decimal = Field(default=Decimal(".001"), ge=0, le=Decimal(".05"))
     trade_participation: Decimal = Field(default=Decimal(".1"), gt=0, le=1)
     book_max_age_seconds: float = Field(default=5, gt=0, le=5)
-    controller_kind: Literal["component_breakout", "rsi_modular"] = "component_breakout"
+    controller_kind: Literal["component_breakout", "rsi_modular", "modular_spot_research"] = "component_breakout"
     controller_files: tuple[Path, ...] = ()
 
     @field_validator("pairs")
@@ -80,8 +80,8 @@ class PaperConfig(BaseModel):
             raise ValueError("Separate absolute state and status paths required")
         if self.position_quote > self.simulated_quote:
             raise ValueError("Position allocation exceeds simulated cash")
-        if (self.controller_kind == "rsi_modular") != bool(self.controller_files):
-            raise ValueError("rsi_modular requires controller_files; component_breakout forbids them")
+        if (self.controller_kind != "component_breakout") != bool(self.controller_files):
+            raise ValueError("rsi_modular and modular_spot_research require controller_files; component_breakout forbids them")
         if any(not f.is_absolute() for f in self.controller_files) or len(set(self.controller_files)) != len(self.controller_files):
             raise ValueError("Distinct absolute controller_files required")
         return self
@@ -148,6 +148,26 @@ def rsi_modular_paper_configs(paths, pairs):
     if sorted(c.trading_pair for c in configs) != sorted(pairs):
         raise ValueError("Paper twin controller pairs must equal the configured pairs")
     return configs, divergence
+
+
+def modular_spot_research_paper_configs(paths, pairs):
+    """Research-bound modular_spot paper controllers (okx_paper_trade, injected 1m candles) from YAML files."""
+    import yaml
+
+    from controllers.generic.modular_spot_research import ModularSpotResearchConfig
+
+    configs = []
+    for path in paths:
+        values = yaml.safe_load(Path(path).read_text())
+        if not isinstance(values, dict) or values.get("controller_name") != "modular_spot_research":
+            raise ValueError(f"modular_spot_research paper requires a modular_spot_research controller file: {path}")
+        config = ModularSpotResearchConfig.model_validate(values)
+        if config.connector_name != "okx_paper_trade" or config.data.mode != "native" or config.interval_seconds() != 60:
+            raise ValueError("modular_spot_research paper needs okx_paper_trade, injected native 1m candles")
+        configs.append(config)
+    if sorted(c.trading_pair for c in configs) != sorted(pairs):
+        raise ValueError("Paper controller pairs must equal the configured pairs")
+    return configs
 
 
 def parse_rules(payload, pairs):
@@ -450,6 +470,9 @@ class PaperRuntime:
             history = {c.trading_pair: max(feed.max_records for feed in c.candles_config) for c in configs}
             if any(feed.interval != "1m" for c in configs for feed in c.candles_config):
                 raise ValueError("Paper twin injects 1m candles only")
+        elif config.controller_kind == "modular_spot_research":
+            configs = modular_spot_research_paper_configs(config.controller_files, config.pairs)
+            history = {c.trading_pair: c.max_records for c in configs}  # the binding reads max_records closed candles
         else:
             configs = [
                 ComponentBreakoutConfig(

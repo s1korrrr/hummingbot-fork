@@ -101,7 +101,7 @@ class ModularRuntime:
             def compute(frame):
                 return features(frame, now=now, interval=c.interval_seconds(), max_age=c.max_candle_age_seconds,
                                 policy=c.signal, trend_analyzer=self.bindings.trend, bag_config=bag_config,
-                                depth_lookback=depth_lookback)
+                                depth_lookback=depth_lookback, flash_crash=c.flash_crash)
             if c.data.mode == 'shared':
                 if self.pool is None:
                     raise DataUnavailable('shared candle reader is stopped')

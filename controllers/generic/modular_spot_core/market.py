@@ -22,6 +22,7 @@ class MarketFeatures:
     score: int = 0
     atr_fraction: Decimal | None = None
     bag: Optional[object] = None  # BagFeatures when live OK RSI parity features are enabled
+    flash_pause_until: float | None = None  # entry pause end from FlashCrashConfig (None: no active crash)
 
 
 def wilder_rsi(close: np.ndarray, length: int) -> np.ndarray:
@@ -85,7 +86,7 @@ def atr_fraction(data: pd.DataFrame, length: int) -> Decimal | None:
 
 def features(frame: pd.DataFrame, *, now: float, interval: int, max_age: int,
              policy: SignalPolicy, trend_analyzer: Callable, bag_config=None,
-             depth_lookback=None) -> MarketFeatures:
+             depth_lookback=None, flash_crash=None) -> MarketFeatures:
     now = float(decimal(now, 'now'))
     if type(interval) is not int or interval <= 0 or type(max_age) is not int or max_age <= 0:
         raise PolicyError('invalid candle clock')
@@ -125,8 +126,15 @@ def features(frame: pd.DataFrame, *, now: float, interval: int, max_age: int,
                            higher_records=bag_config.trend_higher_records, adx_threshold=bag_config.trend_adx_threshold,
                            depth_lookback=depth_lookback)
     rsi = pd.Series(values)
+    pause = None
+    if flash_crash is not None:
+        from .bag import flash_pause_until
+        if len(data) < flash_crash.required_records(interval):
+            raise PolicyError('flash-crash history unavailable')
+        pause = flash_pause_until(flash_crash, data.timestamp.to_numpy(), data.high.to_numpy(), data.low.to_numpy(),
+                                  interval=interval)
     return MarketFeatures(int(data.timestamp.iloc[-1]), Decimal(str(data.close.iloc[-1])),
                           Decimal(str(values[-2])), Decimal(str(values[-1])),
                           bool(data.close.iloc[-1] > prior_high), trend.direction.value == 'up',
                           turn=reversal_turn(rsi, policy), score=confluence_score(data, rsi, policy),
-                          atr_fraction=atr_fraction(data, policy.atr_length), bag=bag)
+                          atr_fraction=atr_fraction(data, policy.atr_length), bag=bag, flash_pause_until=pause)

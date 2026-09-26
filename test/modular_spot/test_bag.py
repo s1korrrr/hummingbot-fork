@@ -747,3 +747,37 @@ def test_knife_gate_blocks_entries_only_inside_the_falling_knife_zone():
         KnifeGateConfig(lower=D('0.2'), upper=D('0.1'), lookback_minutes=43200)
     with pytest.raises(ValueError):
         KnifeGateConfig(lower=D('0.1'), upper=D('0.2'), lookback_minutes=30)
+
+
+def test_flash_pause_until_matches_the_live_detector_and_the_planner_pauses_entries():
+    import numpy as np
+
+    from controllers.generic.modular_spot_core.bag import FlashCrashConfig, LiveCapitalConfig, flash_pause_until
+    from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy
+    from controllers.generic.modular_spot_core.market import MarketFeatures
+    from controllers.generic.modular_spot_core.planner import plan
+    from controllers.generic.modular_spot_core.state import DecisionState
+
+    cfg = FlashCrashConfig(lookback=3, drop_pct=D('0.02'), cooldown_seconds=600)
+    stamps = np.arange(10) * 60 + 1_800_000_000
+    highs = np.full(10, 100.0)
+    lows = np.full(10, 99.5)
+    assert flash_pause_until(cfg, stamps, highs, lows) is None  # no 2% drop from the high 3 candles earlier
+    lows[6] = 97.9  # (high[3] - low[6]) / high[3] = 2.1%
+    assert flash_pause_until(cfg, stamps, highs, lows) == float(stamps[6] + 60 + 600)
+    lows[8] = 97.0  # a later crash extends the pause
+    assert flash_pause_until(cfg, stamps, highs, lows) == float(stamps[8] + 60 + 600)
+    assert cfg.required_records() == 3 + 10 + 2
+    with pytest.raises(ValueError):
+        FlashCrashConfig(lookback=3, drop_pct=D('0.001'), cooldown_seconds=600)  # live minimum drop 0.5%
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=None, max_active_tranches=8)
+    _, bag_features_ = feats()
+    base = dict(fingerprint='a' * 64, budget=D('5000'), now=1200, available_quote=D('5000'), amount_step=D('.001'),
+                minimum_amount=D('.001'), minimum_notional=D('1'), pnl=D('0'), signal=SignalPolicy(),
+                acquisition=AcquisitionPolicy(), risk=RiskPolicy(), bid=D('90'), ask=D('90.1'))
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    empty = HeldBag(D('0'), D('0'), D('0'))
+    paused = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=bag_features_, flash_pause_until=1500.0)
+    assert plan(state, {}, **base, market=paused, bag=empty, capital=cap)[2] == 'flash_crash_pause'
+    over = MarketFeatures(1140, D('90'), D('29'), D('31'), False, False, bag=bag_features_, flash_pause_until=1200.0)
+    assert plan(state, {}, **base, market=over, bag=empty, capital=cap)[2] != 'flash_crash_pause'  # pause ended at now

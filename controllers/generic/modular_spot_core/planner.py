@@ -82,6 +82,9 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     revised = revised.model_copy(update={'candle': market.candle_open})
     if now - revised.last_entry_time < acquisition.cooldown_seconds:
         return revised, None, 'cooldown'
+    pause = getattr(market, 'flash_pause_until', None)
+    if pause is not None and now < decimal(pause, 'flash pause'):  # research order: cooldown, flash pause, gaps
+        return revised, None, 'flash_crash_pause'
     if (ask - bid) / bid > risk.max_spread_fraction:
         return revised, None, 'spread_limit'
     signal_result = signal_decision(signal, previous_rsi=market.previous_rsi, rsi=market.rsi,

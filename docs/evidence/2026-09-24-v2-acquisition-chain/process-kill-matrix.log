@@ -1,0 +1,7 @@
+[replacement_accepted_before_sync] killed after venue_open (exit 137)
+[replacement_accepted_before_sync] verify ok: balances_finite, chain_persisted, executor_row_not_ahead_of_venue, fills_persisted, held_when_receipt_present, no_actions, no_active_executor_recreated, no_new_buy, one_executor_row, open_orders_restored, recovery_required_latched, step_held_or_not_ready, step_receipt_present_matches_expectation
+[first_fill_before_sync] killed after venue_fill (exit 137)
+[first_fill_before_sync] verify ok: balances_finite, chain_persisted, executor_row_not_ahead_of_venue, fills_persisted, held_when_receipt_present, no_actions, no_active_executor_recreated, no_new_buy, one_executor_row, open_orders_restored, recovery_required_latched, step_held_or_not_ready, step_receipt_present_matches_expectation
+[closed_chain_between_steps] killed after step_complete (exit 137)
+[closed_chain_between_steps] verify ok: balances_finite, chain_closed, chain_persisted, chain_validates_closed, fills_persisted, held_when_receipt_present, no_actions, no_active_executor_recreated, no_new_buy, one_executor_row, open_orders_restored, recovery_required_latched, step_held_or_not_ready, step_receipt_present_matches_expectation
+kill matrix: PASS

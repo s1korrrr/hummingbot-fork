@@ -1,7 +1,7 @@
 """Persist native held-recovery policy state; native recorder remains inventory truth."""
 import json
 from dataclasses import asdict
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 from types import SimpleNamespace
 from typing import Literal
 
@@ -143,6 +143,7 @@ class NativeRecoveryStore:
         # Position.amount/breakeven_price use SqliteDecimal(6). The owner is
         # reconstructed from exact native fills and must retain that precision;
         # compare only the lossy recorder projection at its actual storage scale.
+
         def projected(items):
             rows = []
             for item in items:
@@ -186,11 +187,17 @@ class NativeRecoveryStore:
                 raise PolicyError('native held recovery source/configuration changed; explicit reconciliation required')
             if previous.positions != positions:
                 raise PolicyError('native inventory changed across restart; explicit held recovery reconciliation required')
-            source_changed = (previous.source_sha256 != self.source_hash
-                              or previous.configuration_sha256 != self.owner._composition_digest)
-            if source_changed and positions:
+            configuration_changed = previous.configuration_sha256 != self.owner._composition_digest
+            if configuration_changed and positions:
                 raise PolicyError('native held recovery source/configuration changed; explicit reconciliation required')
-            if not source_changed:
+            if previous.source_sha256 != self.source_hash and positions:
+                # Same owner, family, configuration and exact inventory: a code
+                # upgrade carries the recovery trails forward (the next persist
+                # records the new source hash). Held bags keep their exits.
+                self.owner.logger().warning(
+                    'Native held recovery carried across code upgrade | controller=%s source=%s->%s positions=%s',
+                    self.owner.config.id, previous.source_sha256, self.source_hash, len(positions))
+            if not configuration_changed:
                 self._verify_pending()
                 if self.owner._recovery_trails:
                     raise PolicyError('native recovery state was mutated before checkpoint restoration')

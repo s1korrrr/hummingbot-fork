@@ -1,6 +1,11 @@
 import tempfile
 from pathlib import Path
-from test.hummingbot.connector.exchange.paper_trade.test_native_paper_trade_exchange import PAIR, D, paper
+from test.hummingbot.connector.exchange.paper_trade.test_native_paper_trade_exchange import (
+    PAIR,
+    D,
+    delayed_research_paper,
+    paper,
+)
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
@@ -57,6 +62,32 @@ class NativePaperSessionTests(IsolatedAsyncioTestCase):
             guard = patch(target, side_effect=AssertionError('network forbidden'))
             guard.start()
             self.addCleanup(guard.stop)
+
+    async def test_research_second_input_routes_through_native_connector_and_recorder(self):
+        from hummingbot.core.data_type.common import OrderType, PositionAction
+        with tempfile.TemporaryDirectory() as directory:
+            market = delayed_research_paper()
+            session = NativePaperSession(market, [config()], Path(directory) / 'research.sqlite')
+            try:
+                await session.step(1000, books=[dict(trading_pair=PAIR, sequence=2, timestamp=1000,
+                                                     bids=[(99, 10)], asks=[(101, 10)])])
+                order_id = session.buy(market.name, PAIR, D('2'), OrderType.LIMIT_MAKER, D('99'), PositionAction.NIL)
+                with self.assertRaisesRegex(ValueError, 'preceding second'):
+                    await session.step(1001, observed_seconds=[dict(trading_pair=PAIR, timestamp=1001,
+                                                                    low=98, high=102, volume=100)])
+                await session.step(1001, books=[dict(trading_pair=PAIR, sequence=3, timestamp=1000,
+                                                     bids=[(99, 10)], asks=[(101, 10)])],
+                                   observed_seconds=[dict(trading_pair=PAIR, timestamp=1000,
+                                                          low=98, high=102, volume=100)])
+                self.assertEqual(market._order_tracker.fetch_order(order_id).executed_amount_base, D('0'))
+                await session.step(1002, books=[dict(trading_pair=PAIR, sequence=4, timestamp=1001,
+                                                     bids=[(99, 10)], asks=[(101, 10)])],
+                                   observed_seconds=[dict(trading_pair=PAIR, timestamp=1001,
+                                                          low=98, high=102, volume=100)])
+                self.assertEqual(market._order_tracker.fetch_order(order_id).executed_amount_base, D('1'))
+                self.assertEqual(len(session.recorder.get_trades_for_config('native-paper-session')), 1)
+            finally:
+                await session.close()
 
     async def test_actual_native_feature_pipeline_for_both_families_no_orders_when_disabled(self):
         for family in (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig):

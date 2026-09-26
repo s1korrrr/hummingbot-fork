@@ -239,6 +239,24 @@ class InFlightOrderPyUnitTests(unittest.TestCase):
         self.assertEqual(self.exchange_order_id, result)
         self.assertTrue(order.exchange_order_id_update_event.is_set())
 
+    def test_trade_update_json_preserves_maker_and_legacy_role(self):
+        update = TradeUpdate(
+            trade_id="maker-fill", client_order_id="order", exchange_order_id="venue",
+            trading_pair=self.trading_pair, fill_timestamp=1640001112,
+            fill_price=Decimal("100"), fill_base_amount=Decimal("2"),
+            fill_quote_amount=Decimal("200"), fee=AddedToCostTradeFee(), is_taker=False,
+        )
+        payload = json.loads(json.dumps(update.to_json()))
+        self.assertEqual(update, TradeUpdate.from_json(payload))
+        payload["is_taker"] = True
+        self.assertTrue(TradeUpdate.from_json(payload).is_taker)
+        for invalid in ("false", None, 0, 1):
+            payload["is_taker"] = invalid
+            with self.assertRaisesRegex(ValueError, "must be a boolean"):
+                TradeUpdate.from_json(payload)
+        del payload["is_taker"]
+        self.assertTrue(TradeUpdate.from_json(payload).is_taker)
+
     def test_from_json(self):
         fee = AddedToCostTradeFee(
             percent=Decimal("0.5"),

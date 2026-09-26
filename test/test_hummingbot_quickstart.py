@@ -93,3 +93,48 @@ class HummingbotQuickstartTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_signal_stop_suspends_without_cancelling_and_exits_cleanly():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    quickstart = quickstart_module
+
+    hb = MagicMock()
+    hb.stop_loop = AsyncMock(return_value=None)
+    exits = []
+    asyncio.run(quickstart.graceful_signal_stop(hb, exit_process=exits.append, timeout=1))
+    hb.stop_loop.assert_awaited_once_with(skip_order_cancellation=True)
+    assert exits == [0]
+
+
+def test_signal_stop_timeout_still_exits_for_checkpoint_restore():
+    import asyncio
+    from unittest.mock import MagicMock
+
+    quickstart = quickstart_module
+
+    async def hang(**_):
+        await asyncio.sleep(10)
+
+    hb = MagicMock()
+    hb.stop_loop = hang
+    exits = []
+    asyncio.run(quickstart.graceful_signal_stop(hb, exit_process=exits.append, timeout=0.01))
+    assert exits == [1]
+
+
+def test_refused_native_stop_falls_back_to_direct_suspend_and_exits_nonzero():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    quickstart = quickstart_module
+    hb = MagicMock()
+    hb.stop_loop = AsyncMock(return_value={'error': 'native stop refused'})
+    hb.trading_core.strategy.on_stop = AsyncMock()
+    exits = []
+    asyncio.run(quickstart.graceful_signal_stop(hb, exit_process=exits.append, timeout=1))
+    hb.trading_core.strategy.on_stop.assert_awaited_once()
+    assert exits == [1]
+    assert quickstart.stop_succeeded(None) and quickstart.stop_succeeded({'error': None})

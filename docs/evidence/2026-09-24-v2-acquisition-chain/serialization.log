@@ -1,0 +1,20 @@
+Native image: sha256:b1d0865fc9405631522e91d01ae5a31041f002da8be8bd23902e339c45b9062c
+636bea993d6dd3ebdb0ed3f37688a92e5ccf109909d1cdfd442d1af1bf3b9544  hummingbot/core/data_type/in_flight_order.py
+4b5d5e1d4c5d834e5e5e6f8ea618534e9868b51d11931f21fdb1c0d9a8f01306  controllers/directional_trading/ok_rsi_core/down_only_entry_execution.py
+5a0cb49871b7cb532b9b541c01b6104cfa203b4a4b34b7f3086d65598bfc6918  controllers/generic/modular_spot_core/native_composition.py
+0e4f0f9705ce01d03fd2e99e1741bbf4f3e74d19c296fccb818bfc3c1b179108  controllers/generic/modular_spot_core/native_funding.py
+62b82ebde06567a69a95702c15ad6e1f752b68f0df0505277e89b2d1f23505c2  controllers/generic/modular_spot_core/native_funding_transition.py
+7b7c5648aaf8cc619be4d0fac3bb7697ff53bef59d08737f5f27e109e48e8cef  hummingbot/strategy_v2/executors/acquisition_chain.py
+edea61901692f855954ead449c7cf640cacdc43141abec58fba0c05fefc7cf31  hummingbot/strategy_v2/executors/planned_position_resume.py
+cefd77ee1182ed7025abfb68ad1f7e598feeed4e97b961deba72973f7d32280a  hummingbot/strategy_v2/executors/executor_orchestrator.py
+fa6b10af8a9844710a287cfa58026938f9beca36b6011f4be7bceeba819ab6bb  hummingbot/strategy_v2/executors/position_executor/position_executor.py
+41e7c2feb29a3a0df1b646b7ab2b28a0e30f0ea6638b6e45805b684ce9cbbd08  hummingbot/strategy_v2/executors/position_executor/data_types.py
+d72b020dafbdb0e5aa7c1f3e67714ba74a063224f77cc5ba46d2ef800d994c55  hummingbot/data_feed/market_data_provider.py
+........................                                                 [100%]
+=============================== warnings summary ===============================
+test/hummingbot/core/data_type/test_in_flight_order.py::InFlightOrderPyUnitTests::test_average_executed_price
+  /home/hummingbot/test/hummingbot/core/data_type/test_in_flight_order.py:20: DeprecationWarning: There is no current event loop
+    cls.ev_loop = asyncio.get_event_loop()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+24 passed, 1 warning in 0.72s

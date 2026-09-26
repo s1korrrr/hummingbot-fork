@@ -143,6 +143,8 @@ class V2WithControllers(StrategyV2Base):
         if getattr(self, '_risk_reconciliation_error', None) is not None:
             self._is_stop_triggered = True
             return False
+        if getattr(self, '_controller_reports_valid', True) is False:
+            return False  # ported from live V1: never size a new entry from an invalid report
         try:
             if self._funding_scope_owners and (
                     set(self.controllers) != {owner.config.id for owner in self._funding_scope_owners}
@@ -303,7 +305,8 @@ class V2WithControllers(StrategyV2Base):
             elif action == "bot_cancel_pending_entries":
                 target_controller_ids = {controller.config.id for controller in target_controllers}
                 actions = [
-                    StopExecutorAction(executor_id=executor.id, controller_id=executor.controller_id, keep_position=True)
+                    StopExecutorAction(executor_id=executor.id, controller_id=executor.controller_id,
+                                       keep_position=True, acquisition_only=True)
                     for executor in self.get_all_executors()
                     if executor.controller_id in target_controller_ids
                     and executor.side == TradeType.BUY
@@ -358,7 +361,11 @@ class V2WithControllers(StrategyV2Base):
             self.check_max_global_drawdown()
 
     def _drawdown_pnl(self, controller_id):
+        if getattr(self, "_controller_reports_valid", True) is False:
+            return None
         report = self.get_performance_report(controller_id)
+        if report is None:
+            return None
         value = getattr(report, "global_pnl_quote", None)
         if getattr(report, "pnl_available", True) and value is not None:
             if not value.is_finite():

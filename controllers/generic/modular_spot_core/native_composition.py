@@ -17,6 +17,7 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.components.candle_aggregation import derive_higher_timeframe_candles
 from hummingbot.strategy_v2.components.candle_data import Dataset
 from hummingbot.strategy_v2.components.data_reader import DataPolicy, DataPool
+from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1
 
 from .domain import DataUnavailable, PolicyError
 from .native_funding import CandidateFundingPolicy, NativeFundingStore
@@ -241,7 +242,8 @@ class NativeComposition:
         self._recovery_store = None
         self._recovery_hold = None
         self._recovery_fault = None
-        self._native_source_hash = source_digest(source_root(), source_files(self._native_family, public_module=self._public_module))
+        self._native_source_hash = source_digest(source_root(), source_files(
+            self._native_family, public_module=self._public_module))
 
     @classmethod
     def implementation_source_files(cls):
@@ -365,6 +367,11 @@ class NativeComposition:
     def get_executor_config(self, *args, **kwargs):
         config = super().get_executor_config(*args, **kwargs)
         if self.config.funding is not None and config.side == TradeType.BUY:
+            if (self._native_family == 'ok_rsi'
+                    and getattr(config, 'entry_acquisition_policy', None) == 'down_only_maker_v1'):
+                if 'entry_chain_contract' not in type(config).model_fields:
+                    raise PolicyError('V2 bounded acquisition executor contract is unavailable')
+                config.entry_chain_contract = ACQUISITION_CHAIN_V1
             if self.config.funding.resize_to_available_quote and config.amount * config.entry_price > self.config.usd_per_entry:
                 rule = self._get_trading_rule()
                 increment = self._base_amount_increment(rule)
@@ -404,6 +411,28 @@ class NativeComposition:
         return False
 
     def validate_executor_config(self, config):
+        if (config.side == TradeType.BUY and self.config.funding is not None
+                and self._native_family == 'ok_rsi'
+                and getattr(config, 'entry_acquisition_policy', None) == 'down_only_maker_v1'):
+            try:
+                from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+                    DownOnlyMakerPositionExecutor,
+                    DownOnlyMakerPositionExecutorConfig,
+                )
+                from hummingbot.strategy_v2.executors import planned_position_resume
+                from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+                if (type(config) is not DownOnlyMakerPositionExecutorConfig
+                        or config.entry_chain_contract != ACQUISITION_CHAIN_V1
+                        or not issubclass(DownOnlyMakerPositionExecutor, PositionExecutor)
+                        or ACQUISITION_CHAIN_V1 not in
+                        planned_position_resume.SUPPORTED_ACQUISITION_CHAIN_CONTRACTS):
+                    raise PolicyError('V2 bounded acquisition execution/funding/recovery contract differs')
+            except (AttributeError, ImportError, PolicyError) as error:
+                self._funding_hold = str(error) or type(error).__name__
+                release = getattr(self, '_release_entry_decision', None)
+                if callable(release):
+                    release()
+                return False
         if (config.side == TradeType.BUY and self.config.funding is not None
                 and self.config.funding.resize_to_available_quote
                 and not self._funding_hold

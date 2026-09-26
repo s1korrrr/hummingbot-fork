@@ -199,10 +199,22 @@ def test_empty_book_source_hash_change_reseals_instead_of_faulting(recorder):
     assert sealed.sequence == previous.sequence + 1
 
 
-def test_source_hash_change_with_held_inventory_still_requires_reconciliation(recorder):
-    armed_owner(recorder)
+def test_source_hash_change_with_held_inventory_carries_recovery_trails_forward(recorder):
+    armed = armed_owner(recorder)
     result = owner()
     result._native_source_hash = 'b' * 64
+    observe(result)
+    result.determine_executor_actions()
+    assert result._recovery_fault is None
+    assert result._recovery_trails.keys() == armed._recovery_trails.keys()
+    assert next(iter(result._recovery_trails.values())).peak_price == D('102')  # held-bag peak survives
+    assert result._recovery_store.previous.source_sha256 == 'b' * 64
+
+
+def test_configuration_change_with_held_inventory_still_requires_reconciliation(recorder):
+    armed_owner(recorder)
+    result = owner()
+    result._composition_digest = 'c' * 64
     observe(result)
     assert result.determine_executor_actions() == []
     assert 'source/configuration changed' in result._recovery_fault

@@ -47,8 +47,8 @@ def test_risk_state_roundtrip_uses_real_sqlite_and_rejects_invalid_write(recorde
     assert recorder.load_strategy_risk_state() == state
 
 
-def test_persisted_unfinished_executor_blocks_restart(recorder):
-    executor = make_executor()
+def test_persisted_unfinished_legacy_executor_is_reported_without_fencing(recorder):
+    executor = make_executor()  # retry-policy row: no order snapshots, so it cannot be rebuilt
     executor.config.controller_id = 'controller'
     recorder.store_or_update_executor(executor)
     strategy = executor._strategy
@@ -57,8 +57,7 @@ def test_persisted_unfinished_executor_blocks_restart(recorder):
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
         orchestrator = ExecutorOrchestrator(strategy)
         assert orchestrator.recovery_required == {'controller': [executor.config.id]}
-        with pytest.raises(RuntimeError, match='startup reconciliation'):
-            orchestrator.create_executor(CreateExecutorAction(controller_id='controller', executor_config=executor.config))
+        assert orchestrator._planned_resume_pending is False
     strategy.buy.assert_not_called()
 
 

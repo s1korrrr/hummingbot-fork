@@ -51,7 +51,8 @@ def controllers(family, wrapper_config, wrapper, native_config, native, **change
     config = wrapper_config(id='modular_spot_parity', trading_pair='BTC-USDC', strict_hmm_mode=False,
                             **changes)
     wrapped = wrapper(config, provider(), asyncio.Queue())
-    values = config.model_dump(mode='python', exclude={'profile', 'data', 'shared_history', 'recipe_binding', 'execution_enabled', 'execution_mode', 'funding'})
+    values = config.model_dump(mode='python', exclude={
+                               'profile', 'data', 'shared_history', 'recipe_binding', 'execution_enabled', 'execution_mode', 'funding'})
     values['controller_name'] = family
     values['controller_type'] = 'directional_trading'
     legacy = native(native_config.model_validate(values), provider(), asyncio.Queue())
@@ -68,7 +69,8 @@ def test_native_executor_factory_parameters_match_exactly(family, wrapper_config
     created = [owner.get_executor_config(TradeType.BUY, D('100'), D('.3')) for owner in (wrapped, legacy)]
     assert created[0].require_terminal_entry_reconciliation is True
     assert created[1].require_terminal_entry_reconciliation is False
-    assert created[0].model_dump(exclude={'id', 'require_terminal_entry_reconciliation'}) == created[1].model_dump(exclude={'id', 'require_terminal_entry_reconciliation'})
+    assert created[0].model_dump(exclude={'id', 'require_terminal_entry_reconciliation'}) == created[1].model_dump(
+        exclude={'id', 'require_terminal_entry_reconciliation'})
     assert created[0].type == 'position_executor'
     assert created[0].leverage == 1
 
@@ -186,7 +188,8 @@ def test_actual_native_signal_pipeline_matches_shared_candle_composition(
                 count = 90
             actual = wrapped.shared_candles.get_candles_df('okx', 'BTC-USDC', interval, count)
             expected = independent_aggregate(frame.tail(wrapped.shared_candles.spec.history), interval, count)
-            pd.testing.assert_frame_equal(actual.reset_index(drop=True), expected.reset_index(drop=True), check_dtype=False)
+            pd.testing.assert_frame_equal(actual.reset_index(
+                drop=True), expected.reset_index(drop=True), check_dtype=False)
         await legacy.update_processed_data()
         await wrapped.update_processed_data()
         assert wrapped.processed_data['signal'] == legacy.processed_data['signal']
@@ -230,7 +233,8 @@ def test_actual_native_create_action_path_matches(family, wrapper_config, wrappe
         assert len(actions) == 1
         assert actions[0].executor_config.side == TradeType.BUY
         assert actions[0].executor_config.require_terminal_entry_reconciliation is (owner is wrapped)
-        results.append(actions[0].model_dump(exclude={'executor_config': {'id', 'require_terminal_entry_reconciliation'}}))
+        results.append(actions[0].model_dump(exclude={'executor_config': {
+                       'id', 'require_terminal_entry_reconciliation'}}))
     assert results[0] == results[1]
 
 
@@ -422,6 +426,7 @@ def test_empty_book_source_hash_change_reseals_and_releases_dust_fuse(recorder):
 
 
 def test_down_only_pending_configs_tracks_terminal_entry_reconciliation():
+    from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1
     wrapped, _legacy = controllers(
         *FAMILIES[0], execution_enabled=True, entry_acquisition_policy='down_only_maker_v1')
     prices = {PriceType.MidPrice: D('100.005'), PriceType.BestBid: D('100'), PriceType.BestAsk: D('100.01')}
@@ -431,6 +436,7 @@ def test_down_only_pending_configs_tracks_terminal_entry_reconciliation():
     pending = wrapped._down_only_pending_configs[cfg.id]
     assert cfg.require_terminal_entry_reconciliation is True
     assert pending.require_terminal_entry_reconciliation is True
+    assert cfg.entry_chain_contract == pending.entry_chain_contract == ACQUISITION_CHAIN_V1
     assert pending.model_dump(mode='python') == cfg.model_dump(mode='python')
 
 

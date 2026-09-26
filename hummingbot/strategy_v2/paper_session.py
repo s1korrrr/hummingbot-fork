@@ -187,9 +187,11 @@ class NativePaperSession:
             raise RuntimeError('Paper session refuses an existing active rate oracle')
         configs = list(controller_configs)
         from controllers.generic.component_breakout import ComponentBreakoutConfig
+        from controllers.generic.modular_spot_research import ModularSpotResearchConfig
         from controllers.generic.momentum_fusion_v2 import MomentumFusionV2Config
         from controllers.generic.rsi_modular import CONFIG_PROFILES
-        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(), ComponentBreakoutConfig, MomentumFusionV2Config)
+        allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(),
+                   ComponentBreakoutConfig, MomentumFusionV2Config, ModularSpotResearchConfig)
         if not configs or len({c.id for c in configs}) != len(configs):
             raise ValueError('Distinct native paper controller identities required')
         for config in configs:
@@ -265,7 +267,8 @@ class NativePaperSession:
                 from controllers.generic.momentum_fusion_v2_runtime.paper_lifecycle import MomentumPaperLifecycle
                 self.momentum_fixture = MomentumPaperLifecycle(self, momentum_fixture_policy)
             self.executor_orchestrator = ExecutorOrchestrator(self, executor_start=self._start_executor,
-                                                              executor_restore=self.momentum_fixture.restore_executor if restore and self.momentum_fixture else None)
+                                                              executor_restore=self.momentum_fixture.restore_executor if restore and self.momentum_fixture else None,
+                                                              restart_continuity=False)
         except BaseException:
             if self.recorder is not None:
                 self.recorder.stop()
@@ -345,11 +348,16 @@ class NativePaperSession:
         finally:
             os.close(directory)
 
-    def _preflight(self, timestamp, books, trades, candles):
+    def _preflight(self, timestamp, books, trades, candles, observed_seconds):
         timestamp = float(timestamp)
         if not np.isfinite(timestamp) or timestamp < self.current_timestamp:
             raise ValueError('Paper clock must be finite and monotonic')
-        books, trades, candles = copy.deepcopy((list(books), list(trades), list(candles)))
+        books, trades, candles, observed_seconds = copy.deepcopy(
+            (list(books), list(trades), list(candles), list(observed_seconds)))
+        if observed_seconds and self._connector.research_execution_mode is None:
+            raise ValueError('Observed-second input requires offline research execution mode')
+        if trades and self._connector.research_execution_mode:
+            raise ValueError('Research execution requires completed-second observations')
         sequences = dict(self._connector._book_sequence)
         book_times = dict(self._connector._book_time)
         for book in books:
@@ -362,7 +370,15 @@ class NativePaperSession:
         for trade in trades:
             self._connector.validate_trade_input(**trade, current_timestamp=timestamp,
                                                  book_timestamp=book_times.get(trade.get('trading_pair'), float('-inf')))
-        return timestamp, books, trades, candles
+        observed_pairs = set()
+        for row in observed_seconds:
+            if set(row) != {'trading_pair', 'timestamp', 'low', 'high', 'volume'}:
+                raise ValueError('Exact completed-second observation required')
+            self._connector.validate_observed_second_input(**row, current_timestamp=timestamp)
+            if row['trading_pair'] in observed_pairs:
+                raise ValueError('Repeated observed pair-second')
+            observed_pairs.add(row['trading_pair'])
+        return timestamp, books, trades, candles, observed_seconds
 
     async def _persist_failure(self, receipt, error):
         self._failure = receipt
@@ -390,36 +406,41 @@ class NativePaperSession:
             # The pre-effect fsynced journal remains; restore must still hold.
             receipt['persistence_errors'].append('failure_receipt:' + type(failure).__name__)
 
-    async def step(self, timestamp, *, books=(), trades=(), candles=()):
+    async def step(self, timestamp, *, books=(), trades=(), candles=(), observed_seconds=()):
         async with self._step_lock:
             self._check_connector(self._connector.name)
             if self._failure is not None:
                 raise RuntimeError('Paper session HELD after failed or interrupted step; explicit reconciliation required')
-            timestamp, books, trades, candles = self._preflight(timestamp, books, trades, candles)
+            timestamp, books, trades, candles, observed_seconds = self._preflight(
+                timestamp, books, trades, candles, observed_seconds)
 
             def encode(value):
                 return value.to_json(orient='split', double_precision=15) if isinstance(value, pd.DataFrame) else str(value)
             receipt = {'schema': 'native_paper_step_v1', 'status': 'in_progress', 'identity': self._identity,
                        'clock_before': self.current_timestamp, 'timestamp': timestamp,
                        'input_sha256': hashlib.sha256(json.dumps(
-                           [timestamp, books, trades, candles], sort_keys=True, default=encode).encode()).hexdigest()}
+                           [timestamp, books, trades, candles, observed_seconds], sort_keys=True, default=encode).encode()).hexdigest()}
             # Persist interruption evidence before any clock, liquidity or fill mutation.
             self._write_step_receipt(receipt)
             try:
-                result = await self._apply_step(timestamp, books=books, trades=trades, candles=candles)
+                result = await self._apply_step(timestamp, books=books, trades=trades, candles=candles,
+                                                observed_seconds=observed_seconds)
                 self._failure_path.unlink()
                 return result
             except BaseException as error:
                 await self._persist_failure(receipt, error)
                 raise
 
-    async def _apply_step(self, timestamp, *, books, trades, candles):
+    async def _apply_step(self, timestamp, *, books, trades, candles, observed_seconds):
         self._connector.tick(timestamp)
         for book in books:
             self._connector.set_order_book(**book)
             self._oracle.set_price(book['trading_pair'], self._connector.get_mid_price(book['trading_pair']))
         for frame in candles:
             self.market_data_provider.set_candles(**frame)
+        await self._connector.settle_research_events()
+        for row in observed_seconds:
+            await self._connector.process_observed_second(**row)
         fresh_ids = {key for key, controller in self.controllers.items()
                      if self._connector.pair_ready(controller.config.trading_pair)}
         for trade in trades:

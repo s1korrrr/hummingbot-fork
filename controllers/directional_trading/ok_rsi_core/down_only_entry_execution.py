@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from decimal import ROUND_FLOOR, Decimal
 from typing import Literal, Optional
@@ -29,6 +30,7 @@ ENTRY_REPLACEMENT_POST_ONLY_REPAIR = "post_only_repair"
 
 class DownOnlyMakerPositionExecutorConfig(PositionExecutorConfig):
     entry_acquisition_policy: Literal["down_only_maker_v1"] = "down_only_maker_v1"
+    entry_chain_contract: Literal["v2_bounded_acquisition_v1"] | None = None
     decision_best_bid: Decimal
     decision_best_ask: Decimal
     decision_atr_1m: Decimal
@@ -113,6 +115,163 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         self._entry_upward_bound_first_breached_at = None
         self._entry_replacement_of_order_id = None
         self._entry_replacement_purpose = None
+        self._entry_chain_children = []
+        self._entry_child_lifecycles = {}
+        self._entry_reconciliation_order_id = None
+        self._entry_submission_uncertain = False
+
+    def hydrate_planned_position(self, position, manifest_id):
+        super().hydrate_planned_position(position, manifest_id)
+        if not self._v2_chain:
+            return
+        chain = position.get("acquisition_chain")
+        if not isinstance(chain, dict) or not chain.get("membership_closed"):
+            raise ValueError("Planned V2 acquisition must have closed membership")
+        self._entry_chain_children = copy.deepcopy(chain["children"])
+        self._entry_child_lifecycles = copy.deepcopy(position.get("entry_child_lifecycles", {}))
+        archived_lifecycle = position.get("entry_lifecycle")
+        if isinstance(archived_lifecycle, dict):
+            self._entry_child_lifecycles.setdefault(self._open_order.order_id, copy.deepcopy(archived_lifecycle))
+        self._entry_reprice_count = len(self._entry_chain_children) - 1
+        self._entry_stop_reason = (position.get("entry_terminal_reason")
+                                   or self._entry_lifecycle.get("stop_reason")
+                                   or "planned_resume_sealed_entry")
+        self._entry_submission_uncertain = False
+        self._clear_replacement()
+        self._entry_lifecycle.update(order_id=self._open_order.order_id,
+                                     generation=self._entry_reprice_count)
+
+    def hydrate_restart_continuity(self, plan):
+        super().hydrate_restart_continuity(plan)
+        custom = plan.custom_info
+        acquisition = custom.get("entry_acquisition") if isinstance(custom.get("entry_acquisition"), dict) else {}
+        if acquisition.get("current_order_price") not in (None, "None"):
+            self._entry_current_price = Decimal(str(acquisition["current_order_price"]))
+        reprice_count = acquisition.get("reprice_count")
+        if isinstance(reprice_count, int) and not isinstance(reprice_count, bool) and reprice_count >= 0:
+            self._entry_reprice_count = reprice_count
+        if acquisition.get("terminal_reason") is not None:
+            self._entry_stop_reason = acquisition["terminal_reason"]
+        if self._v2_chain:
+            chain = custom.get("acquisition_chain")
+            if isinstance(chain, dict):
+                self._entry_chain_children = copy.deepcopy(chain.get("children") or [])
+            self._entry_child_lifecycles = copy.deepcopy(custom.get("entry_child_lifecycles") or {})
+        self._entry_submission_uncertain = False
+        self._clear_replacement()
+
+    def stop_entry_acquisition(self, reason: str):
+        """Stop the maker acquisition only; filled inventory keeps its trailing exit."""
+        if self.is_closed or self.status == RunnableStatus.SHUTTING_DOWN:
+            return
+        if (self._open_order is None and not self._entry_submitted
+                and self._cumulative_entry_filled_base() <= Decimal("0")):
+            self._request_terminal_cancel(reason)  # no recorded order: end the intent, never submit one
+            return
+        if self._entry_terminal_confirmed():
+            return  # nothing left to acquire; never cancel a terminal (filled) entry
+        self._request_terminal_cancel(reason)
+
+    @property
+    def _v2_chain(self):
+        return self.config.entry_chain_contract == "v2_bounded_acquisition_v1"
+
+    def _entry_cancel_observed(self):
+        if not self._v2_chain:
+            return super()._entry_cancel_observed()
+        return (self._open_order is not None
+                and self._entry_lifecycle.get("cancel_event_order_id") == self._open_order.order_id
+                and self._entry_lifecycle.get("cancel_event_timestamp") is not None)
+
+    def _submit_open_order(self, price, amount=None):
+        if not self._v2_chain:
+            return super()._submit_open_order(price, amount=amount)
+        if self._entry_submission_uncertain:
+            self._block_replacement("submission_identity_uncertain")
+            return
+        predecessor = self._entry_replacement_of_order_id
+        purpose = self._entry_replacement_purpose or "initial"
+        previous_id = self._entry_lifecycle.get("order_id")
+        if previous_id:
+            self._entry_child_lifecycles[previous_id] = copy.deepcopy(self._entry_lifecycle)
+        # The previous child's terminal audit remains immutable history; a new
+        # current child does not inherit its cancellation/reconciliation flags.
+        self._entry_lifecycle = {"policy": self.config.entry_order_policy,
+                                 "generation": len(self._entry_chain_children)}
+        self._entry_cancel_last_attempt_at = None
+        self._entry_expiry_reconciliation_retry_at = 0
+        self._open_order_expiry_reconciled = False
+        self._open_order_entry_expired = False
+        self._entry_submission_uncertain = True
+        super()._submit_open_order(price, amount=amount)
+        if self._open_order is None or not self._open_order.order_id:
+            self._block_replacement("submission_identity_uncertain")
+            return
+        self._entry_chain_children.append({
+            "generation": len(self._entry_chain_children),
+            "order_id": self._open_order.order_id,
+            "predecessor_id": predecessor,
+            "purpose": purpose,
+            "submitted_base": str(self.config.amount if amount is None else amount),
+            "limit_price": str(price),
+        })
+        self._entry_lifecycle["order_id"] = self._open_order.order_id
+        self._entry_submission_uncertain = False
+
+    def _chain_membership_closed(self):
+        orders = self._entry_orders()
+        return (bool(orders) and self._resume_conflicting_fill is None
+                and not self._entry_submission_uncertain
+                and not self._entry_child_submission_authorized
+                and self._entry_replacement_purpose is None
+                and all(tracked.order is not None and tracked.is_done for tracked in orders)
+                and (self._entry_stop_reason is not None
+                     or self._cumulative_entry_filled_base() == self.config.amount))
+
+    def _store_entry_reconciliation(self, orders, reconciled):
+        if not self._v2_chain:
+            return super()._store_entry_reconciliation(orders, reconciled)
+        known = {tracked.order_id: tracked for tracked in self._entry_orders()}
+        incoming = {proof.get("order_id"): proof for proof in reconciled}
+        if len(incoming) != len(reconciled) or set(incoming) != {tracked.order_id for tracked in orders}:
+            self._mark_fill_reconciliation_required("V2 terminal response identities differ from requested child set")
+            raise ValueError("V2 terminal response identities differ from requested child set")
+        previous = self._entry_reconciliation
+        proofs = previous.get("orders", [previous]) if isinstance(previous, dict) else []
+        merged = {proof["order_id"]: proof for proof in proofs}
+        for oid, proof in incoming.items():
+            tracked = known.get(oid)
+            if (tracked is None or tracked.order is None
+                    or proof.get("exchange_order_id") != tracked.order.exchange_order_id
+                    or Decimal(proof.get("filled_base", "-1")) != tracked.executed_amount_base):
+                self._mark_fill_reconciliation_required("V2 terminal response child scope or gross fill differs")
+                raise ValueError("V2 terminal response child scope or gross fill differs")
+            if oid in merged and merged[oid] != proof:
+                self._mark_fill_reconciliation_required("V2 child terminal proof changed: " + oid)
+                raise ValueError("V2 child terminal proof changed")
+            merged[oid] = copy.deepcopy(proof)
+        ordered = [merged[tracked.order_id] for tracked in self._entry_orders() if tracked.order_id in merged]
+        from hummingbot.strategy_v2.executors.acquisition_chain import validate_acquisition_chain
+        try:
+            validate_acquisition_chain(self.config, self.get_custom_info(), ordered, require_closed=False)
+        except ValueError as error:
+            self._mark_fill_reconciliation_required(str(error))
+            raise
+        super()._store_entry_reconciliation(orders, ordered)
+
+    async def control_task(self):
+        await super().control_task()
+        if (self._v2_chain and self.status == RunnableStatus.RUNNING
+                and self._resume_conflicting_fill is None and self._chain_membership_closed()):
+            # Completing the acquisition does not shut down its position owner.
+            # Obtain the final child's terminal proof while trailing/exit management
+            # continues, so shared funding does not wait until the position exits.
+            await self._reconcile_funding_entries()
+
+    async def _reconcile_funding_entries(self):
+        if self._v2_chain and not self._chain_membership_closed():
+            return False
+        return await super()._reconcile_funding_entries()
 
     @property
     def _entry_terminal_reason(self) -> Optional[str]:
@@ -213,6 +372,8 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         return order.current_state in {OrderState.OPEN, OrderState.PARTIALLY_FILLED}
 
     def control_open_order(self):
+        if self._v2_chain and self._resume_conflicting_fill is not None:
+            return
         if self._resume_entry_sealed or self.is_closed:
             return
         if self._entry_child_submission_authorized:
@@ -412,6 +573,8 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         self._entry_cancel_order_id = self._open_order.order_id
         self._entry_cancel_last_attempt_at = now
         self._entry_lifecycle.setdefault("cancel_requested_timestamp", now)
+        if self._v2_chain:
+            self._entry_lifecycle["cancel_requested_order_id"] = self._open_order.order_id
         self.cancel_open_order()
 
     def _request_terminal_cancel(self, reason: str) -> None:
@@ -429,7 +592,27 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
         self._request_current_cancel()
 
+    def process_order_filled_event(self, _, market, event):
+        if self._v2_chain and any(order.order_id == event.order_id for order in self._completed_open_orders):
+            # A successor is authorized only after a zero-fill terminal predecessor.
+            # Any later predecessor fill contradicts that authorization. Preserve
+            # inventory and require reconciliation before any further action.
+            self.update_tracked_orders_with_order_id(event.order_id)
+            self._clear_replacement()
+            self._end_entry_acquisition("predecessor_fill_conflict")
+            self._mark_fill_reconciliation_required("Terminal predecessor received a fill")
+            return
+        super().process_order_filled_event(_, market, event)
+
     def process_order_canceled_event(self, _, market, event):
+        if self._v2_chain:
+            current = self._open_order.order_id if self._open_order is not None else None
+            if event.order_id != current and any(t.order_id == event.order_id for t in self._completed_open_orders):
+                history = self._entry_child_lifecycles.setdefault(event.order_id, {})
+                history.update(cancel_event_timestamp=event.timestamp, cancel_event_order_id=event.order_id)
+                return
+            if event.order_id == current:
+                self._entry_lifecycle["cancel_event_order_id"] = event.order_id
         tracked = self._open_order
         if tracked is None or event.order_id != tracked.order_id:
             super().process_order_canceled_event(_, market, event)
@@ -475,6 +658,21 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         super().process_order_canceled_event(_, market, event)
 
     async def _reconcile_expired_entry(self):
+        if not self._v2_chain:
+            return await self._reconcile_child_entry()
+        current = self._open_order.order_id if self._open_order is not None else None
+        task = self._entry_expiry_reconciliation_task
+        if task is not None and self._entry_reconciliation_order_id != current:
+            # Never consume A's REST completion as B's terminal result. The
+            # request itself may still reconcile A's immutable historical proof.
+            self._cancel_entry_expiry_reconciliation()
+            self._entry_reconciliation_order_id = None
+            return
+        await self._reconcile_child_entry()
+        if self._entry_expiry_reconciliation_task is not None:
+            self._entry_reconciliation_order_id = current
+
+    async def _reconcile_child_entry(self):
         if self._open_order is not None and self._open_order.order is not None:
             if self._open_order.order.current_state == OrderState.FILLED:
                 self.control_open_order()
@@ -521,6 +719,16 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._entry_child_submission_authorized = False
             return
 
+        if self._v2_chain:
+            receipt = self._entry_reconciliation
+            proofs = receipt.get("orders", [receipt]) if isinstance(receipt, dict) else []
+            proof = next((p for p in proofs if p.get("order_id") == tracked.order_id), None)
+            if (proof is None or proof.get("state") != "CANCELED"
+                    or proof.get("exchange_order_id") != tracked.order.exchange_order_id
+                    or Decimal(proof.get("filled_base", "-1")) != 0
+                    or proof.get("trade_ids") != []):
+                self._block_replacement("predecessor_zero_fill_proof_missing")
+                return
         if tracked not in self._completed_open_orders:
             self._completed_open_orders.append(tracked)
         self._open_order = None
@@ -599,7 +807,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             return
         if (
             remaining <= 0
-            or remaining > self.config.amount - self.open_filled_amount
+            or remaining > self.config.amount - (gross_filled if self._v2_chain else self.open_filled_amount)
             or remaining < self.trading_rules.min_order_size
             or remaining * target < self.trading_rules.min_notional_size
         ):
@@ -715,9 +923,11 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             if not risk_allowed:
                 decision = DownOnlyMakerDecision(DownOnlyMakerAction.CANCEL_TERMINAL, DownOnlyMakerReason.RISK_BLOCKED)
             elif opposing_signal:
-                decision = DownOnlyMakerDecision(DownOnlyMakerAction.CANCEL_TERMINAL, DownOnlyMakerReason.OPPOSING_SIGNAL)
+                decision = DownOnlyMakerDecision(DownOnlyMakerAction.CANCEL_TERMINAL,
+                                                 DownOnlyMakerReason.OPPOSING_SIGNAL)
             elif self._intent_age_expired():
-                decision = DownOnlyMakerDecision(DownOnlyMakerAction.CANCEL_TERMINAL, DownOnlyMakerReason.TOTAL_AGE_EXPIRED)
+                decision = DownOnlyMakerDecision(DownOnlyMakerAction.CANCEL_TERMINAL,
+                                                 DownOnlyMakerReason.TOTAL_AGE_EXPIRED)
             else:
                 decision = DownOnlyMakerDecision(DownOnlyMakerAction.HOLD, DownOnlyMakerReason.RESTING)
             return decision, None, None, now
@@ -811,6 +1021,27 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             "replacement_purpose": self._entry_replacement_purpose,
             "replacement_of_order_id": self._entry_replacement_of_order_id,
         }
+        if self._v2_chain:
+            pending = None
+            if self._entry_replacement_purpose is not None:
+                pending = {"predecessor_id": self._entry_replacement_of_order_id,
+                           "purpose": self._entry_replacement_purpose}
+            custom_info["acquisition_chain"] = {
+                "schema": 1, "contract": self.config.entry_chain_contract,
+                "parent_id": self.config.id, "authorized_base": str(self.config.amount),
+                "maximum_price": str(self.config.maximum_acceptable_price),
+                "children": copy.deepcopy(self._entry_chain_children),
+                "successor_pending": pending,
+                "membership_closed": self._chain_membership_closed(),
+                "gross_filled_base": str(cumulative_filled),
+            }
+            custom_info["entry_child_lifecycles"] = copy.deepcopy(self._entry_child_lifecycles)
+            custom_info["acquisition_outcome"] = (
+                "fully_acquired" if cumulative_filled == self.config.amount else
+                "partially_acquired" if cumulative_filled > 0 else "no_fill")
+            custom_info["further_acquisition_permission"] = (
+                "held" if self._entry_submission_uncertain or self._resume_conflicting_fill is not None
+                else "closed" if self._chain_membership_closed() or self._entry_stop_reason is not None else "open")
         return custom_info
 
     def _cumulative_entry_filled_base(self) -> Decimal:

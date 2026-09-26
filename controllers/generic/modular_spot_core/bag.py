@@ -261,8 +261,9 @@ def distribution_gate_price(cfg: DistributionGateConfig, *, breakeven, anchor) -
 
 class KnifeGateConfig(PolicyModel):
     """Research entry gate: no new buy while price is ``lower`` to ``upper`` below the highest closed-candle high over
-    ``lookback_minutes`` (the "falling knife" zone); buys resume below ``upper`` (capitulation). Statistics on 2025-26
-    hourly data: forward returns are below average in the 10-20% zone of the 30-day high and above it at >= 20%.
+    ``lookback_minutes`` (the "falling knife" zone); buys resume below ``upper`` (capitulation). Hypothesis from
+    in-sample 2025-26 hourly statistics (Research OS idea bnb-20260926-knife-gate; campaign -15 analysis
+    depth_forward_returns*.json), under test: forward returns below average 10-20% under the 30-day high, above at >= 20%.
     It only refuses entries; bag recovery sells and exits are unaffected. Live use needs a candle feed covering the
     lookback (e.g. 1h candles for 30 days). Not a live OK RSI setting.
     """

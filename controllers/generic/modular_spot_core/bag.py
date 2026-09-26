@@ -406,18 +406,26 @@ class HeldBag:
 
     @classmethod
     def from_positions(cls, positions, *, connector: str, pair: str) -> 'HeldBag':
-        rows = [p for p in positions if getattr(p, 'connector_name', None) == connector
-                and getattr(p, 'trading_pair', None) == pair and decimal(p.amount, 'held amount') > 0]
-        if any(getattr(p.side, 'name', None) != 'BUY' for p in rows):
-            raise PolicyError('bag mode holds long inventory only')
+        rows = []
+        for position in positions:
+            if decimal(getattr(position, 'amount', None), 'held amount') <= 0:
+                continue
+            side_value = getattr(position, 'side', None)
+            side = getattr(side_value, 'name', side_value)
+            if (getattr(position, 'connector_name', None) != connector
+                    or getattr(position, 'trading_pair', None) != pair or side != 'BUY'):
+                raise PolicyError('bag held inventory scope mismatch')
+            rows.append(position)
         if len(rows) > 1:
             raise PolicyError('one blended held position per market is required')
         if not rows:
             return cls(Decimal('0'), Decimal('0'), Decimal('0'))
         p = rows[0]
         fees = getattr(p, 'remaining_fees_quote', None)
-        return cls(decimal(p.amount, 'held amount'), decimal(p.breakeven_price, 'held breakeven', positive=True),
-                   decimal(p.cum_fees_quote if fees is None else fees, 'held fees'))
+        fee_value = getattr(p, 'cum_fees_quote', None) if fees is None else fees
+        return cls(decimal(p.amount, 'held amount'),
+                   decimal(getattr(p, 'breakeven_price', None), 'held breakeven', positive=True),
+                   decimal(fee_value, 'held fees'))
 
 
 @dataclass(frozen=True)

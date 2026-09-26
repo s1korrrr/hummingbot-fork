@@ -126,6 +126,16 @@ def test_held_bag_from_positions_is_long_blended_and_owned():
     with pytest.raises(PolicyError):
         HeldBag.from_positions([SimpleNamespace(**{**position.__dict__, 'side': TradeType.SELL})],
                                connector='okx', pair='BNB-USDC')
+    with pytest.raises(PolicyError, match='bag held inventory scope mismatch'):
+        HeldBag.from_positions([SimpleNamespace(**{**position.__dict__, 'trading_pair': 'ETH-USDC'})],
+                               connector='okx', pair='BNB-USDC')
+    with pytest.raises(PolicyError, match='invalid held breakeven'):
+        HeldBag.from_positions([SimpleNamespace(**{key: value for key, value in position.__dict__.items()
+                                                   if key != 'breakeven_price'})], connector='okx', pair='BNB-USDC')
+    with pytest.raises(PolicyError, match='invalid held fees'):
+        HeldBag.from_positions([SimpleNamespace(**{key: value for key, value in position.__dict__.items()
+                                                   if key not in {'remaining_fees_quote', 'cum_fees_quote'}})],
+                               connector='okx', pair='BNB-USDC')
 
 
 def test_recovery_sell_config_is_a_live_chaser_close():
@@ -230,6 +240,27 @@ def test_runtime_bag_tick_holds_losers_places_one_recovery_sell_and_persists_the
     restarted = _runtime(bag_recorder, positions=[_position()])
     trail, candle, _ = restarted._bag_store().load()
     assert candle == 1_800_000_060 and trail is not None and trail.peak_price == D('107.1')
+
+
+def test_runtime_rejects_foreign_held_position_before_entry_planning(bag_recorder):
+    foreign = SimpleNamespace(**{**_position().__dict__, 'trading_pair': 'ETH-USDC'})
+    runtime = _runtime(bag_recorder, positions=[foreign])
+    with pytest.raises(PolicyError, match='held inventory scope mismatch'):
+        runtime.inventory()
+
+
+def test_runtime_actions_hold_on_foreign_held_position(bag_recorder):
+    foreign = SimpleNamespace(**{**_position().__dict__, 'trading_pair': 'ETH-USDC'})
+    runtime = _runtime(bag_recorder, positions=[foreign])
+    runtime.reason = 'acquisition_disabled'
+    runtime.pending_inputs = {}
+    runtime.observe = lambda: runtime.market
+    runtime.acquisition_permitted = lambda: False
+    runtime.snapshot = lambda: {**_snapshot(D('106')), 'available_quote': D('500'), 'pnl': D('0')}
+
+    assert runtime.actions() == []
+    assert runtime.fault == 'PolicyError:held inventory scope mismatch'
+    assert runtime.reason == 'admission_hold:PolicyError:held inventory scope mismatch'
 
 
 def test_runtime_stale_cancel_and_single_signal_per_candle(bag_recorder):

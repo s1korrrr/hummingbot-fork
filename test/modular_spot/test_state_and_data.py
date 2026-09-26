@@ -79,6 +79,38 @@ def test_inventory_is_a_projection_and_rejects_unknown_ownership():
         inventory_view([native_info(owner='other')], [], controller_id='new', connector='okx', pair='BTC-USDC')
 
 
+@pytest.mark.parametrize('changes', [
+    {'trading_pair': 'ETH-USDC'}, {'connector_name': 'binance'},
+    {'side': NS(name='SELL')}, {'side': 'UNKNOWN'}, {'side': None},
+    {'connector_name': None}, {'trading_pair': None},
+])
+def test_bag_inventory_rejects_foreign_held_position(changes):
+    fields = {'connector_name': 'okx', 'trading_pair': 'BTC-USDC', 'side': NS(name='BUY'),
+              'amount': D('1'), 'breakeven_price': D('100')}
+    foreign = NS(**{**fields, **changes})
+    with pytest.raises(PolicyError, match='held inventory scope mismatch'):
+        inventory_view([], [foreign], controller_id='new', connector='okx', pair='BTC-USDC', bag_mode=True)
+
+
+def test_bag_inventory_accepts_own_buy_and_ignores_flat_rows():
+    own = NS(connector_name='okx', trading_pair='BTC-USDC', side=NS(name='BUY'), amount=D('1'))
+    own_dust = NS(connector_name='okx', trading_pair='BTC-USDC', side='BUY', amount=D('0.000001'))
+    flat_foreign = NS(connector_name='binance', trading_pair='ETH-USDC', side=NS(name='SELL'), amount=D('0'))
+    assert inventory_view([], [own, own_dust, flat_foreign], controller_id='new', connector='okx',
+                          pair='BTC-USDC', bag_mode=True) == {}
+
+
+def test_bag_inventory_rejects_missing_held_amount():
+    with pytest.raises(PolicyError, match='invalid held amount'):
+        inventory_view([], [NS()], controller_id='new', connector='okx', pair='BTC-USDC', bag_mode=True)
+
+
+def test_bag_inventory_rejects_missing_held_scope():
+    with pytest.raises(PolicyError, match='held inventory scope mismatch'):
+        inventory_view([], [NS(amount=D('1'))], controller_id='new', connector='okx',
+                       pair='BTC-USDC', bag_mode=True)
+
+
 def test_missing_or_contradictory_receipt_is_not_zero_inventory():
     info = native_info()
     del info.custom_info['execution_receipt']

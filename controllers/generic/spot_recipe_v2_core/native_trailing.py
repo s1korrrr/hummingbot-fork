@@ -77,7 +77,7 @@ def capture_native_trailing_view(info, snapshot: NativeSnapshotV2) -> NativeTrai
         raise PolicyError('unsupported native trailing state')
     try:
         _decimal(custom['trailing_delta_pct'], 'trailing delta', positive=True)
-        _decimal(custom['trailing_stop_trigger_pct'], 'trailing trigger')
+        trigger_pct = _decimal(custom['trailing_stop_trigger_pct'], 'trailing trigger')
         threshold = _decimal(custom['trailing_trigger_price'], 'trailing trigger price', positive=True)
         move_count = custom['trailing_move_count']
         armed_at = custom['trailing_armed_timestamp']
@@ -98,4 +98,8 @@ def capture_native_trailing_view(info, snapshot: NativeSnapshotV2) -> NativeTrai
         activated=True,
         peak_price=None,
         threshold_price=threshold,
-        exit_owner='native_executor')
+        exit_owner='native_executor',
+        native_trigger_pct=trigger_pct,
+        native_move_count=move_count,
+        native_armed_timestamp=Decimal(str(armed_at)),
+        native_last_update_timestamp=Decimal(str(updated_at)))

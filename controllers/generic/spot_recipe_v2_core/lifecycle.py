@@ -39,11 +39,24 @@ class NativeTrailingViewV2(PolicyModel):
     peak_price: Price | None = None
     threshold_price: Price
     exit_owner: Literal['native_executor', 'recipe_proposal']
+    # PositionExecutor persists a net-PnL trigger, not an immutable quote price.
+    # Older/recipe views omit this evidence and retain the quote-price guard.
+    native_trigger_pct: Decimal | None = None
+    native_move_count: int | None = Field(default=None, ge=0, strict=True)
+    native_armed_timestamp: Decimal | None = Field(default=None, ge=0)
+    native_last_update_timestamp: Decimal | None = Field(default=None, ge=0)
 
     @model_validator(mode='after')
     def ratcheted_below_peak(self):
         if self.peak_price is not None and self.threshold_price > self.peak_price:
             raise ValueError('native trailing threshold exceeds the observed peak')
+        evidence = (self.native_trigger_pct, self.native_move_count,
+                    self.native_armed_timestamp, self.native_last_update_timestamp)
+        if any(value is not None for value in evidence):
+            if any(value is None for value in evidence) or self.exit_owner != 'native_executor' or not self.activated:
+                raise ValueError('complete activated native trailing evidence required')
+            if self.native_last_update_timestamp < self.native_armed_timestamp:
+                raise ValueError('native trailing update precedes activation')
         return self
 
 
@@ -130,7 +143,20 @@ def bind_trailing_view(snapshot: NativeSnapshotV2, views: tuple[NativeTrailingVi
             raise PolicyError('native trailing exit owner changed')
         if previous.observed_at_ms > view.observed_at_ms:
             raise PolicyError('native trailing observation clock regressed')
-        if view.threshold_price < previous.threshold_price:
+        if previous.native_trigger_pct is not None:
+            if view.native_trigger_pct is None:
+                raise PolicyError('native trailing evidence disappeared')
+            if view.native_armed_timestamp != previous.native_armed_timestamp:
+                raise PolicyError('native trailing arm lineage changed')
+            if view.native_last_update_timestamp < previous.native_last_update_timestamp:
+                raise PolicyError('native trailing update clock regressed')
+            if (view.native_trigger_pct < previous.native_trigger_pct
+                    or view.native_move_count < previous.native_move_count):
+                raise PolicyError('native trailing ratchet loosened')
+            if ((view.native_trigger_pct > previous.native_trigger_pct)
+                    != (view.native_move_count > previous.native_move_count)):
+                raise PolicyError('native trailing move lineage inconsistent')
+        elif view.threshold_price < previous.threshold_price:
             raise PolicyError('native trailing ratchet loosened')
         if previous.peak_price is not None:
             if view.peak_price is None:
@@ -177,7 +203,7 @@ def resolve_exit(snapshot: NativeSnapshotV2, trailing: tuple[NativeTrailingViewV
         return assessment
     protective = protective_exit_price(bound, None if floor is None else floor.price,
                                        policy=policy, price_step=view.price_step)
-    # The ratchet is a price floor, not a stored number: a reduction below it is a silent loosening.
+    # Enforce the current native price projection after validating its persisted percentage ratchet.
     if assessment.limit_price < protective:
         return ExitAssessment(status='HOLD', reason='native_trailing_floor_not_met', input_sha256=source)
     return assessment

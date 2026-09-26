@@ -38,6 +38,15 @@ class OkxOrderRejectedError(IOError):
     """The exchange explicitly rejected this submission (distinct from transport uncertainty)."""
 
 
+# The compiled network loop (NetworkIterator) marks a connector NOT_CONNECTED, silently and without stop_network(),
+# when one check call outlives check_network_timeout (a stalled event loop or a paused Docker VM), and calls
+# start_network() on the next good check. start_network() stops and rebuilds every order book, the user stream and
+# the polling tasks. While networking was never stopped and the previous good check is this recent, that rebuild
+# only discards healthy state (measured 2026-09-26: V2 926 s of cold books from 12 such rebuilds in 5 h), so it is
+# skipped. A longer silence, or any logged stop, still rebuilds.
+NETWORK_REBUILD_GAP_SECONDS = 120.0
+
+
 class OkxExchange(ExchangePyBase):
 
     UNATTENDED_RESTART_HOLD_CONTRACT_VERSION = 1
@@ -69,6 +78,9 @@ class OkxExchange(ExchangePyBase):
         self._spot_ticker_lock = asyncio.Lock()
         self._spot_ticker_cache = None
         self.check_network_timeout = 30.0
+        self._networking_running = False
+        self._last_good_network_check = None
+        self._good_network_check_gap = None
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
         if os.environ.get('RSIBOT_V2_UNATTENDED_RESTART_HOLD') == '1':
@@ -145,7 +157,7 @@ class OkxExchange(ExchangePyBase):
                 probe.cancel()
                 probe.add_done_callback(_discard_task_result)
                 if getattr(self, "_okx_time_ok", False):
-                    return NetworkStatus.CONNECTED
+                    return self._good_network_check()
                 return NetworkStatus.NOT_CONNECTED
             exc = probe.exception()
             if exc is not None:
@@ -154,12 +166,33 @@ class OkxExchange(ExchangePyBase):
                 self._okx_time_ok = False
                 return NetworkStatus.NOT_CONNECTED
             self._okx_time_ok = True
-            return NetworkStatus.CONNECTED
+            return self._good_network_check()
         except asyncio.CancelledError:
             if not probe.done():
                 probe.cancel()
                 probe.add_done_callback(_discard_task_result)
             raise
+
+    def _good_network_check(self) -> NetworkStatus:
+        now = time.monotonic()
+        last = self._last_good_network_check
+        self._good_network_check_gap = None if last is None else now - last
+        self._last_good_network_check = now
+        return NetworkStatus.CONNECTED
+
+    async def start_network(self):
+        gap = self._good_network_check_gap
+        if self._networking_running and gap is not None and gap <= NETWORK_REBUILD_GAP_SECONDS:
+            self.logger().info(f"Network check recovered {gap:.0f} s after the previous good check and networking was "
+                               "never stopped; keeping the running order books and streams.")
+            return
+        self._networking_running = False
+        await super().start_network()
+        self._networking_running = True
+
+    async def stop_network(self):
+        self._networking_running = False
+        await super().stop_network()
 
     @property
     def trading_pairs(self):

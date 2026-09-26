@@ -66,14 +66,21 @@ def capture_native_snapshot(info, *, scope: NativeScopeV2, sequence: int, observ
             raise PolicyError('native executor scope mismatch')
         if type(info.is_done) is not bool or type(info.is_active) is not bool or info.is_active == info.is_done:
             raise PolicyError('unsupported native executor lifecycle flags')
-        receipt = _bounded_receipt(info.custom_info['execution_receipt'])
+        custom = info.custom_info
+        receipt = _bounded_receipt(custom['execution_receipt'])
         if type(receipt) is not dict:
             raise PolicyError('native execution receipt must be an object')
-        entry_state = info.custom_info['entry_lifecycle']['state']
+        entry_state = custom['entry_lifecycle']['state']
         if entry_state not in ('managing_fill', 'ended_no_fill', 'held_residual'):
             raise PolicyError('native entry lifecycle unsupported; entry-terminal evidence required')
+        trailing = _bounded_receipt({
+            key: custom.get(key) for key in (
+                'trailing_state', 'trailing_delta_pct', 'trailing_stop_trigger_pct',
+                'trailing_trigger_price', 'trailing_move_count', 'trailing_armed_timestamp',
+                'trailing_last_update_timestamp')
+        })
         raw = canonical_json([scope.model_dump(mode='json'), info.id, info.is_done, info.is_active,
-                              entry_state, receipt])
+                              entry_state, receipt, trailing])
         if len(raw.encode('utf-8')) > 131072:
             raise PolicyError('native receipt exceeds byte bound')
         return NativeSnapshotV2(

@@ -2,7 +2,7 @@
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import Field, StrictBool, field_validator, model_validator
+from pydantic import Field, StrictBool, field_validator, model_serializer, model_validator
 
 from controllers.generic.spot_recipe_v2_core.spot_lifecycle_v2 import (
     Amount,
@@ -45,6 +45,16 @@ class NativeTrailingViewV2(PolicyModel):
     native_move_count: int | None = Field(default=None, ge=0, strict=True)
     native_armed_timestamp: Decimal | None = Field(default=None, ge=0)
     native_last_update_timestamp: Decimal | None = Field(default=None, ge=0)
+
+    @model_serializer(mode='wrap')
+    def serialize_native_evidence(self, handler):
+        data = handler(self)
+        if self.native_trigger_pct is None:
+            # Legacy checkpoint hashes include the older null fields, but not these new fields.
+            for key in ('native_trigger_pct', 'native_move_count', 'native_armed_timestamp',
+                        'native_last_update_timestamp'):
+                data.pop(key, None)
+        return data
 
     @model_validator(mode='after')
     def ratcheted_below_peak(self):

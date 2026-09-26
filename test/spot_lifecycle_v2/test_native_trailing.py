@@ -209,7 +209,13 @@ def test_native_ratchet_evidence_survives_checkpoint_json_roundtrip():
     snapshot = capture(info)
     view = capture_native_trailing_view(info, snapshot)
     checkpoint = capture_checkpoint(snapshot, (view,), now_ms=1002, max_age_ms=10, previous=None)
-    decoded = decode_checkpoint(encode_checkpoint(checkpoint))
+    encoded = encode_checkpoint(checkpoint)
+    serialized = json.loads(encoded)['trailing']
+    assert serialized['native_trigger_pct'] == '0.08'
+    assert serialized['native_move_count'] == 0
+    assert serialized['native_armed_timestamp'] == '1000.0'
+    assert serialized['native_last_update_timestamp'] == '1001.0'
+    decoded = decode_checkpoint(encoded)
     assert decoded.trailing == view
 
 
@@ -223,10 +229,29 @@ def test_legacy_checkpoint_without_native_fields_still_decodes_with_legacy_guard
     raw = checkpoint.model_dump(mode='json')
     for key in ('native_trigger_pct', 'native_move_count', 'native_armed_timestamp',
                 'native_last_update_timestamp'):
-        raw['trailing'].pop(key)
+        raw['trailing'].pop(key, None)
     decoded = decode_checkpoint(json.dumps(raw))
     assert decoded.trailing.native_trigger_pct is None
     assert decoded.trailing.threshold_price == D('109')
+
+
+def test_legacy_checkpoint_canonical_bytes_and_hash_are_preserved():
+    info = trailing_info()
+    snapshot = capture(info)
+    legacy = NativeTrailingViewV2(owner_id=snapshot.scope.owner_id, executor_id=snapshot.scope.executor_id,
+                                  receipt_sha256=snapshot.receipt_sha256, observed_at_ms=snapshot.observed_at_ms,
+                                  activated=True, threshold_price=D('109'), exit_owner='native_executor')
+    checkpoint = capture_checkpoint(snapshot, (legacy,), now_ms=1002, max_age_ms=10, previous=None)
+    raw = checkpoint.model_dump(mode='json')
+    for key in ('native_trigger_pct', 'native_move_count', 'native_armed_timestamp',
+                'native_last_update_timestamp'):
+        raw['trailing'].pop(key, None)
+    canonical = json.dumps(raw, separators=(',', ':'))
+    assert '"cursor_sha256":null' in canonical
+    assert '"peak_price":null' in canonical
+    decoded = decode_checkpoint(canonical)
+    assert encode_checkpoint(decoded) == canonical
+    assert decoded.checkpoint_sha256 == 'a3e6b9ca5f3fa240a71c1a3fc8cb6c7ab463ec0595b02b07e8770f4581d4ea9d'
 
 
 def test_legacy_view_keeps_quote_price_ratchet_and_owner_guards():

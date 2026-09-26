@@ -632,6 +632,9 @@ async def test_rsi_twin_runtime_injects_the_controller_history_and_reports_the_t
             assert status["controller_kind"] == "rsi_modular"
             assert set(status["twin_divergence"]["modular_spot_paper_v2_btc"]) <= TWIN_FIELDS
             assert [c["id"] for c in status["controllers"]] == ["modular_spot_paper_v2_btc"]
+            (status_row,) = status["controllers"]  # the reporting paper reader binds these identities
+            assert (status_row["controller_name"], status_row["pair"], status_row["execution_mode"]) == (
+                "rsi_modular", "BTC-USDC", "paper")
             assert not any("candles_" in r for r in status["reasons"]), status["reasons"]
     finally:
         if runtime is not None:

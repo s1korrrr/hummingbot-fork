@@ -560,10 +560,7 @@ class PaperRuntime:
                 "sessions": self.candles.sessions,
                 "failures": self.candles.failures,
             },
-            "controllers": [
-                dict(c.get_status_summary(), id=c.config.id)
-                for c in self.session.controllers.values()
-            ],
+            "controllers": [self._controller_row(c) for c in self.session.controllers.values()],
             "native_reports": reports,
             "report_observed_at": self.report_observed_at if reports else None,
             "unavailable_controller_ids": sorted(set(self.session.controllers) - set(reports)),
@@ -574,6 +571,15 @@ class PaperRuntime:
                 "queue_priority_verified": False,
             },
         }
+
+    @staticmethod
+    def _controller_row(controller):
+        """Native status plus the identity the paper reader binds (filled from config only when absent)."""
+        row = dict(controller.get_status_summary(), id=controller.config.id)
+        row.setdefault("controller_name", controller.config.controller_name)
+        row.setdefault("pair", controller.config.trading_pair)
+        row.setdefault("execution_mode", controller.config.execution_mode)
+        return row
 
     async def step(self, now):
         if self.failure:

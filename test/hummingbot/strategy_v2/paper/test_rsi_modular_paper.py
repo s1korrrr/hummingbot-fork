@@ -42,7 +42,7 @@ class PublicProfilePaperTests(IsolatedAsyncioTestCase):
                                                             side=TradeType.SELL, price=executor.config.entry_price, amount=D('.1'))])
                     other = public_config('rsi_v5' if profile == 'ok_rsi' else 'ok_rsi')
                     foreign = other.get_controller_class()(other, session.market_data_provider, asyncio.Queue())
-                    with self.assertRaisesRegex(PolicyError, 'identity/schema'):
+                    with self.assertRaisesRegex(PolicyError, 'FUNDING_BINDING_MISMATCH'):
                         NativeFundingStore(foreign, session.recorder).reconcile()
                     with self.assertRaisesRegex(PolicyError, 'source/configuration changed'):
                         NativeRecoveryStore(foreign, session.recorder, foreign._native_source_hash).prepare()

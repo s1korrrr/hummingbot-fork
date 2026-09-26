@@ -23,10 +23,16 @@ def inventory_view(executors, positions, *, controller_id: str, connector: str, 
     from .bag import is_recovery_sell
 
     result = {}
-    if not bag_mode:
-        for position in positions:
-            if decimal(position.amount, 'held amount') > 0:
-                raise PolicyError('held_inventory_requires_reconciliation')
+    for position in positions:
+        if decimal(getattr(position, 'amount', None), 'held amount') <= 0:
+            continue
+        if not bag_mode:
+            raise PolicyError('held_inventory_requires_reconciliation')
+        native_side = getattr(position, 'side', None)
+        side = getattr(native_side, 'name', native_side)
+        if (getattr(position, 'connector_name', None) != connector
+                or getattr(position, 'trading_pair', None) != pair or side != 'BUY'):
+            raise PolicyError('held inventory scope mismatch')
     for info in executors:
         try:
             config = info.config

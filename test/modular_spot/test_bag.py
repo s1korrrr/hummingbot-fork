@@ -719,3 +719,16 @@ def test_resting_sell_is_cancelled_when_the_market_falls_far_below_it():
     assert tick(live_sells=live, mid=D('104.6'), stale_below_pct=D('0.05')).below_cancels == ()
     unchanged = tick(live_sells=live, mid=D('90'))
     assert unchanged.below_cancels == () and unchanged.cancels == ()  # disabled by default: the live order rests
+
+
+def test_live_capital_pending_buy_is_reserved_at_at_least_current_mid():
+    from controllers.generic.modular_spot_core.bag import LiveCapitalConfig, live_capital_exposure, live_capital_quote
+
+    cap = LiveCapitalConfig(slice_quote=D('100'), position_cap_quote=D('250'))
+    inputs = dict(held_amount=D('0'), held_dust=True, mid=D('200'),
+                  active=((D('0'), D('1'), D('100')),))
+    assert live_capital_exposure(**inputs) == D('200')
+    assert live_capital_quote(cap, **inputs, available_quote=D('1000')) == (None, 'max_position')
+    # A limit above mid still binds; owned base and pending base are separate.
+    assert live_capital_exposure(held_amount=D('1'), held_dust=False, mid=D('90'),
+                                 active=((D('0.5'), D('0.5'), D('100')),)) == D('185')

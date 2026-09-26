@@ -14,6 +14,7 @@ their existing explicit state, input validation and I/O contracts.
 | `exit_policy`, `trailing`, `acquisition`, `risk` | Pure existing exit, floor, schedule and loss-limit calculations |
 | `universe`, `screener`, `selection_state` | Explicit symbol selection, eligibility and persisted selection state |
 | `config`, `domain`, `recipe_contract`, `strict_json` | Strict neutral models, values/errors, binding identities and unambiguous JSON |
+| `events_v2` | Immutable cross-venue event evidence, source coverage and causal snapshot validation; no acquisition or order policy |
 
 These components do not create a second order manager. Native connectors,
 executors and recorder remain execution/accounting authorities. Recorder-scoped
@@ -25,6 +26,9 @@ lifecycles and planner remain outside this package. `config` intentionally has n
 `SignalPolicy`; `recipe_contract` intentionally has no `StrategyRecipe`. Native
 RSI composition consumes canonical candle components through its existing adapter.
 A different controller can import the same library without importing RSI policies.
+The opt-in `events_v2` records do not authorize execution. Adding their Python
+files changes the all-components source closure used by existing seals; older
+receipts must not be rewritten or treated as if they had the new source identity.
 
 The old `controllers.generic.modular_spot_core` paths remain compatibility imports.
 Fully extracted modules alias the canonical module object, retaining shared caches,

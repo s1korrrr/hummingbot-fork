@@ -12,6 +12,7 @@ from controllers.generic.modular_spot_core.bag import (
     BagConfig,
     BuyGapConfig,
     DepthBudgetConfig,
+    FlashCrashConfig,
     LiveCapitalConfig,
 )
 from controllers.generic.modular_spot_core.candle_data import FIRST_DELIVERY
@@ -74,6 +75,7 @@ class ModularSpotControllerConfig(ControllerConfigBase):
     capital: LiveCapitalConfig | None = None  # live OK RSI capital model; requires bag
     buy_gap: BuyGapConfig | None = None  # live ATR-scaled buy gap; requires capital
     depth_budget: DepthBudgetConfig | None = None  # research capital pacing by depth; requires capital
+    flash_crash: FlashCrashConfig | None = None  # live OK RSI flash-crash entry pause; requires capital
     # 'protected' keeps the modular no-loss floor raised by activation - delta; 'live_no_loss'
     # uses the plain after-fee no-loss price like live OK RSI.
     exit_floor: Literal['protected', 'live_no_loss'] = 'protected'
@@ -92,6 +94,12 @@ class ModularSpotControllerConfig(ControllerConfigBase):
             raise ValueError('live capital requires the bag lifecycle')
         if self.buy_gap is not None and self.capital is None:
             raise ValueError('the live buy gap requires live capital')
+        if self.flash_crash is not None:
+            if self.capital is None:
+                raise ValueError('the flash-crash pause requires live capital')
+            if self.max_records < self.flash_crash.required_records(self.interval_seconds()) + 1:
+                raise ValueError(f'the flash-crash pause needs max_records >= '
+                                 f'{self.flash_crash.required_records(self.interval_seconds()) + 1}')
         if self.depth_budget is not None:
             if self.capital is None:
                 raise ValueError('the depth budget requires live capital')

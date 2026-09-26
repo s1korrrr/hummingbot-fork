@@ -101,7 +101,7 @@ class ModularRuntime:
             def compute(frame):
                 return features(frame, now=now, interval=c.interval_seconds(), max_age=c.max_candle_age_seconds,
                                 policy=c.signal, trend_analyzer=self.bindings.trend, bag_config=bag_config,
-                                depth_lookback=depth_lookback)
+                                depth_lookback=depth_lookback, flash_crash=c.flash_crash)
             if c.data.mode == 'shared':
                 if self.pool is None:
                     raise DataUnavailable('shared candle reader is stopped')
@@ -111,6 +111,8 @@ class ModularRuntime:
                     spec = {**spec, 'live_bag_features': bag_config.model_dump(mode='json')}
                 if depth_lookback is not None:
                     spec = {**spec, 'depth_lookback_minutes': depth_lookback}
+                if c.flash_crash is not None:  # the pause is a computed feature; peers must not share it
+                    spec = {**spec, 'flash_crash': c.flash_crash.model_dump(mode='json')}
                 self.market = self.pool.features.get(
                     snapshot, spec=spec,
                     implementation='modular-closed-features-v1:' + self.feature_implementation,

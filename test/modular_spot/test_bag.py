@@ -671,3 +671,51 @@ def test_depth_scaled_buy_size_grows_with_depth_and_stays_within_the_budget():
     assert reason == 'entry_proposed' and proposal.amount * D('90') > D('190')  # 10% deep: a 2x (200) buy
     poor = dict(base, available_quote=D('150'))
     assert plan(state, {}, **poor, bag=empty, capital=cap, depth_budget=cfg)[2] == 'cash_exhausted'  # the sized buy is refused, not shrunk
+
+
+def test_cash_fraction_slice_scales_with_wallet_cash_within_bounds():
+    from controllers.generic.modular_spot_core.bag import CashFractionSizing, cash_fraction_slice
+
+    cfg = CashFractionSizing(fraction=D('0.04'), min_quote=D('25'), max_quote=D('300'))
+    assert cash_fraction_slice(cfg, D('5000')) == D('200')
+    assert cash_fraction_slice(cfg, D('1000')) == D('40')
+    assert cash_fraction_slice(cfg, D('100')) == D('25')  # floor: a small wallet still buys a minimum slice
+    assert cash_fraction_slice(cfg, D('20000')) == D('300')  # cap
+    assert cash_fraction_slice(cfg, D('-5')) == D('25')  # negative cash is no cash
+    with pytest.raises(ValueError):
+        CashFractionSizing(fraction=D('0.04'), min_quote=D('300'), max_quote=D('25'))
+    with pytest.raises(ValueError):
+        CashFractionSizing(fraction=D('1'), min_quote=D('1'), max_quote=D('2'))
+
+
+def test_distribution_gate_price_retraces_toward_the_cycle_anchor():
+    from controllers.generic.modular_spot_core.bag import DistributionGateConfig, distribution_gate_price
+
+    cfg = DistributionGateConfig(retrace=D('0.5'), seed_lookback_minutes=1440)
+    assert distribution_gate_price(cfg, breakeven=D('600'), anchor=D('720')) == D('660')
+    assert distribution_gate_price(cfg, breakeven=D('600'), anchor=D('590')) == D('600')  # anchor below breakeven
+    assert distribution_gate_price(cfg, breakeven=D('600'), anchor=None) is None  # no open cycle, no gate
+    assert distribution_gate_price(DistributionGateConfig(retrace=D('0'), seed_lookback_minutes=60),
+                                   breakeven=D('600'), anchor=D('720')) == D('600')
+    with pytest.raises(ValueError):
+        DistributionGateConfig(retrace=D('1'), seed_lookback_minutes=1440)
+    with pytest.raises(ValueError):
+        DistributionGateConfig(retrace=D('0.5'), seed_lookback_minutes=3000)  # live keeps <= 2999 closed candles
+
+
+def test_distribution_floor_blocks_recovery_sells_below_the_gate_without_reanchoring():
+    armed = tick().trail
+    peak = tick(trail=armed, mid=D('108')).trail
+    gated = tick(trail=peak, mid=D('107.1'), distribution_floor=D('110'))
+    assert gated.sell is None and gated.reason == 'distribution_gate' and gated.trail == peak
+    passed = tick(trail=peak, mid=D('107.1'), distribution_floor=D('107.1'))
+    assert passed.sell is not None and passed.sell.reason == 'pullback-trail'
+    assert tick(trail=peak, mid=D('107.1'), distribution_floor=None).sell is not None  # no gate: unchanged
+
+
+def test_resting_sell_is_cancelled_when_the_market_falls_far_below_it():
+    live = (LiveSell('s', D('110')),)
+    assert tick(live_sells=live, mid=D('104.4'), stale_below_pct=D('0.05')).below_cancels == ('s',)
+    assert tick(live_sells=live, mid=D('104.6'), stale_below_pct=D('0.05')).below_cancels == ()
+    unchanged = tick(live_sells=live, mid=D('90'))
+    assert unchanged.below_cancels == () and unchanged.cancels == ()  # disabled by default: the live order rests

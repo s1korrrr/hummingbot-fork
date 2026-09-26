@@ -216,6 +216,49 @@ def depth_budget_decision(cfg: DepthBudgetConfig, quote, *, deployed_quote, refe
     return quote, 'admitted'
 
 
+class CashFractionSizing(PolicyModel):
+    """Research sizing: each buy plans a fixed fraction of wallet cash, clamped to [min_quote, max_quote].
+
+    Idle cash buys larger slices (participation when flat); a draining wallet buys geometrically smaller
+    ones, so a long down-leg keeps buying instead of exhausting cash at a fixed slice. It replaces the
+    live ``slice_quote`` plan, which then passes the live capital gates unchanged. Not a live OK RSI setting.
+    """
+    fraction: Decimal = Field(gt=0, lt=1)
+    min_quote: Decimal = Field(gt=0)
+    max_quote: Decimal = Field(gt=0)
+
+    @model_validator(mode='after')
+    def ordered(self):
+        if self.min_quote > self.max_quote:
+            raise ValueError('min_quote must not exceed max_quote')
+        return self
+
+
+def cash_fraction_slice(cfg: CashFractionSizing, cash) -> Decimal:
+    """The planned buy quote for wallet ``cash`` (negative cash counts as none)."""
+    planned = cfg.fraction * max(decimal(cash, 'wallet cash', minimum=None), Decimal('0'))
+    return min(cfg.max_quote, max(cfg.min_quote, planned))
+
+
+class DistributionGateConfig(PolicyModel):
+    """Research bag distribution gate: recovery sells wait until price has retraced ``retrace`` of the way
+    from the bag breakeven back to the cycle anchor, the highest closed-candle high since the bag opened
+    (seeded with the highest closed high over ``seed_lookback_minutes`` before it opened). A bag built
+    through a deep decline therefore is not distributed into the first small bounce above breakeven; the
+    live no-loss floor still applies. retrace 0 is the live behaviour. Not a live OK RSI setting.
+    """
+    retrace: Decimal = Field(ge=0, lt=1)
+    seed_lookback_minutes: int = Field(ge=1, le=2999, strict=True)  # the controller keeps <= 3000 candles
+
+
+def distribution_gate_price(cfg: DistributionGateConfig, *, breakeven, anchor) -> Optional[Decimal]:
+    """Lowest recovery sell proposal the gate admits, or None without an open bag cycle."""
+    if anchor is None:
+        return None
+    base = decimal(breakeven, 'breakeven', positive=True)
+    return base + cfg.retrace * max(Decimal('0'), decimal(anchor, 'cycle anchor', positive=True) - base)
+
+
 STORED_EXECUTOR_WINDOW = 20  # ExecutorOrchestrator keeps each controller's 20 most recent stored executors
 
 
@@ -378,18 +421,23 @@ class BagTick:
     sell: Optional[SellRequest]
     stops: tuple
     reason: str
+    below_cancels: tuple = ()  # research stale-below cancels (distinct from the live stale-above cancel)
 
 
 def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tranches, live_sells,
            last_sell_price: Optional[Decimal], mid: Decimal, best_ask: Decimal, features, bag: BagFeatures,
            first_tick_after_close: bool, tick: Decimal, amount_step: Decimal, minimum_amount: Decimal,
-           minimum_notional: Decimal, trend=None) -> BagTick:
+           minimum_notional: Decimal, trend=None, distribution_floor: Optional[Decimal] = None,
+           stale_below_pct: Decimal = Decimal('0')) -> BagTick:
     """One live OK RSI tick for held inventory: stale cancel, recovery, then early stops.
 
     Mirrors HLRSIController.stop_actions_proposal order. ``features.rsi`` is the last
     closed RSI; the sell signal exists only on the first tick after a candle close.
     ``trend`` optionally supplies (direction, confidence) lazily; it is only called when
     a decision depends on it, otherwise ``bag.trend_direction/trend_confidence`` are used.
+    Research options (defaults are the live behaviour): ``distribution_floor`` refuses a recovery sell
+    whose proposal is below it (``distribution_gate``; the trail is not re-anchored), and
+    ``stale_below_pct`` cancels a resting sell once mid is that far below its proposal (``below_cancels``).
     """
     policy = cfg.policy()
     mid = decimal(mid, 'mid', positive=True)
@@ -448,6 +496,8 @@ def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tra
             amount = (amount / amount_step).to_integral_value(rounding='ROUND_FLOOR') * amount_step
             if amount <= 0:
                 reason = 'slice_below_minimum'
+            elif distribution_floor is not None and proposal < distribution_floor:
+                reason = 'distribution_gate'
             elif not has_sell_price_gap(proposal, last_sell_price, policy):
                 reason = 'price-gap'
             else:
@@ -457,7 +507,9 @@ def decide(cfg: BagConfig, *, trail: Optional[RecoveryTrail], held: HeldBag, tra
     elif live_sells:
         reason = 'recovery_sell_live'
     stops = tuple(t.executor_id for t in tranches if should_hold_as_bag(t.fill_basis, mid, policy))
-    return BagTick(trail, cancels, sell, stops, reason)
+    below = tuple(s.executor_id for s in live_sells if s.executor_id not in cancels and stale_below_pct > 0
+                  and mid <= s.proposal_price * (1 - stale_below_pct))
+    return BagTick(trail, cancels, sell, stops, reason, below)
 
 
 def chaser_config(cfg: BagConfig):

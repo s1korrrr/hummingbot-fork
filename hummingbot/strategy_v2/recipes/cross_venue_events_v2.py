@@ -210,7 +210,10 @@ def step(state: EventSetupStateV2 | None, snapshot: QualifiedEventSnapshotV2, *,
         elif previous is not None and previous.phase == 'REJECTED':
             phase, reason = 'REJECTED', 'setup_already_rejected'
         reported = bool(previous.reported) if previous is not None else False
-        already_reported = previous is not None and previous.reported and previous.phase == phase
+        # A coverage HOLD does not clear durable consumption. Keep reporting new
+        # risk/hold transitions, but never emit the same research setup twice.
+        already_reported = reported and (
+            previous.phase == phase or phase == 'READY_RESEARCH_ONLY')
         record = EventSetupRecordV2(
             consumption_id=key, occurrence_id=evidence.occurrence_id, asset_id=evidence.asset_id,
             kind=evidence.kind, phase=phase, first_seen_ms=(previous.first_seen_ms if previous else evidence.event_available_ms),

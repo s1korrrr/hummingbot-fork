@@ -101,6 +101,31 @@ class RecipeTests(unittest.TestCase):
         self.assertEqual(again.reasons, ())
         self.assertEqual(again.opportunities, ())
 
+    def test_coverage_recovery_does_not_reemit_consumed_opportunity(self):
+        item = evidence()
+        bound = recipe()
+        initial = snapshot((item,))
+        first = step(None, initial, now_ms=T + 60_000, recipe=bound, configuration=CONFIG)
+        self.assertEqual(len(first.opportunities), 1)
+        unavailable = CoverageScope(source_id=item.source_id, coverage_state='UNAVAILABLE',
+                                    asof_ms=T + 61_000, reason='temporary_outage')
+        outage = snapshot((item,), completeness=(unavailable,), asof_ms=T + 61_000,
+                          sequence=2, predecessor_sha256=initial.dataset_sha256,
+                          dataset_sha256='1' * 64)
+        held = step(first.state, outage, now_ms=T + 61_000, recipe=bound, configuration=CONFIG)
+        self.assertEqual(held.state.setups[0].phase, 'HOLD')
+        self.assertEqual(held.reasons, ('source_coverage_unavailable',))
+        self.assertTrue(held.state.setups[0].reported)
+        restored = type(held.state).model_validate_json(held.state.model_dump_json())
+        recovered = snapshot((item,), asof_ms=T + 62_000, sequence=3,
+                             predecessor_sha256=outage.dataset_sha256, dataset_sha256='2' * 64)
+        again = step(restored, recovered, now_ms=T + 62_000, recipe=bound, configuration=CONFIG)
+        self.assertEqual(again.state.setups[0].phase, 'READY_RESEARCH_ONLY')
+        self.assertEqual(again.state.setups[0].consumption_id, first.state.setups[0].consumption_id)
+        self.assertEqual(again.opportunities, ())
+        self.assertEqual(again.traces, ())
+        self.assertEqual(again.reasons, ())
+
     def test_correction_does_not_extend_wait_or_rearm_ready_setup(self):
         item = evidence()
         bound = recipe()

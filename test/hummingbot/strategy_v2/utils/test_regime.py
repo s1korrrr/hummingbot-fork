@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from hummingbot.strategy_v2.components import regime as R
+from hummingbot.strategy_v2.utils import regime as R
 
 ROOT = str(Path(__file__).resolve().parents[4])
 START = 1_777_593_600  # 2026-05-01 00:00 UTC
@@ -64,7 +64,7 @@ class SpecTest(unittest.TestCase):
             bars_of(frame)
 
     def test_import_does_not_load_hmmlearn_or_controllers(self):
-        code = ("import sys; import hummingbot.strategy_v2.components.regime; "
+        code = ("import sys; import hummingbot.strategy_v2.utils.regime; "
                 "print(any(m.startswith(('hmmlearn', 'controllers')) for m in sys.modules))")
         env = {**os.environ, "PYTHONPATH": ROOT}
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, cwd=ROOT, check=True)

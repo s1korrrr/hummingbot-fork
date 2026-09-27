@@ -23,6 +23,9 @@ default regime. Importing this module starts no services and imports no controll
 The HMM engine imports ``hmmlearn`` and ``scipy`` only when it fits.
 
 Research-only until separately approved: nothing here is wired into a controller.
+It lives in ``strategy_v2/utils`` rather than ``strategy_v2/components`` because every
+file under ``components`` joins the sealed source closure of the native controllers
+(live ``rsi_modular`` included); an unwired research module must not change those seals.
 """
 from __future__ import annotations
 

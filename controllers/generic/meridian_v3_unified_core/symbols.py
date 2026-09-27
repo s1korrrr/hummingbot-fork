@@ -159,6 +159,31 @@ class SymbolRuntime(ModularRuntime):
             self.budget = SymbolGrantBudget(self.portfolio, self.controller.pair)
         return store
 
+    def entry_permission(self, config, *, check_funds=True):
+        # Check the portfolio grant first: a missing or unreadable grant denies this
+        # entry. Inside the base check the same condition would fault the runtime and
+        # stop its exits.
+        if config is None:
+            return False
+        try:
+            self.ensure_store()
+            bound = self.portfolio.grant_bound(self.controller.pair, self.reservation(config))
+        except PolicyError as exc:
+            self.reason = f'portfolio_grant_hold:{exc}'[:200]
+            return False
+        if not bound:
+            self.reason = 'portfolio_grant_required'
+            return False
+        return super().entry_permission(config, check_funds=check_funds)
+
+    def _release_bag(self, held, mid, snapshot):
+        # An unprovable portfolio release keeps the capital reserved; it never faults exits.
+        try:
+            return super()._release_bag(held, mid, snapshot)
+        except PolicyError as exc:
+            self.controller.logger().warning(f'Meridian {self.controller.pair} held release deferred: {exc}')
+            return 'unproven:portfolio_grant_hold'
+
     def acquisition_permitted(self):
         if not super().acquisition_permitted():
             return False

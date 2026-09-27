@@ -175,7 +175,8 @@ class PortfolioGrantStore:
                 continue
             if getattr(config, 'controller_id', owner) != owner or pair not in self.policy.pairs:
                 raise PolicyError('portfolio executor ownership differs')
-            if key in bound or is_terminal_flat(info, released):
+            # The owner's own bag recovery sell only reduces held inventory, active or not.
+            if key in bound or is_bag_sell(info) or is_terminal_flat(info, released):
                 continue
             raise PolicyError('unreserved or reappearing native inventory requires reconciliation')
         kept = {}

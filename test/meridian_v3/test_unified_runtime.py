@@ -14,6 +14,7 @@ from controllers.generic.meridian_v3_unified import MeridianUnifiedController
 from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
 from hummingbot.core.data_type.common import TradeType
+from hummingbot.strategy_v2.components.domain import PolicyError
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
 RISK = dict(max_drawdown_fraction='.10', max_daily_loss_fraction='.05',
@@ -335,3 +336,50 @@ def test_native_controller_loader_resolves_the_unified_yaml():
     loaded = load_controller_config(unified().model_dump(mode='json'))
     assert type(loaded) is MeridianUnifiedConfig and loaded.get_controller_class() is MeridianUnifiedController
     assert loaded.owned_trading_pairs() == tuple(sorted(PAIRS))
+
+
+class MeridianUnifiedIsolationTests(IsolatedAsyncioTestCase):
+    """Audit regressions: another symbol's bag sell must not block or fault this symbol."""
+    setUp = session_tests.NativePaperSessionTests.setUp
+
+    async def test_active_own_bag_sell_neither_blocks_grants_nor_faults_entries(self):
+        from types import SimpleNamespace as NS
+
+        from controllers.generic.modular_spot_core.program_budget import BAG_RECOVERY_LEVEL
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(PAIRS, '500'), [unified(execution_enabled=True)],
+                                         Path(directory) / 'meridian.sqlite')
+            try:
+                controller = session.controllers[OWNER]
+                sell = NS(id='bag-sell-sol', controller_id=OWNER, is_done=False, is_active=True, custom_info={},
+                          config=NS(controller_id=OWNER, connector_name='okx_paper_trade', trading_pair='SOL-USDC',
+                                    type='order_executor', side=NS(name='SELL'), position_action=NS(name='CLOSE'),
+                                    level_id=BAG_RECOVERY_LEVEL + ':x', min_sell_price=D('1')))
+                evidence = controller.portfolio.evidence
+                controller.portfolio.evidence = lambda: (*evidence(), sell)
+                receipt = await MeridianUnifiedPaperTests.enter(self, session)
+                self.assertEqual(len(receipt['actions']), 5)
+                self.assertEqual({p: c.runtime.fault for p, c in controller.contexts.items()},
+                                 {p: None for p in PAIRS})
+            finally:
+                await session.close()
+
+    async def test_grant_store_failure_denies_entry_without_faulting_the_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(PAIRS, '500'), [unified(execution_enabled=True)],
+                                         Path(directory) / 'meridian.sqlite')
+            try:
+                controller = session.controllers[OWNER]
+                runtime = controller.contexts['BTC-USDC'].runtime
+
+                def broken(pair, claim):
+                    raise PolicyError('injected grant store outage')
+                receipt = await MeridianUnifiedPaperTests.enter(self, session)
+                config = next(a.executor_config for a in receipt['actions']
+                              if a.executor_config.trading_pair == 'BTC-USDC')
+                controller.portfolio.grant_bound = broken
+                self.assertFalse(runtime.entry_permission(config))
+                self.assertIsNone(runtime.fault)
+                self.assertIn('portfolio_grant_hold', runtime.reason)
+            finally:
+                await session.close()

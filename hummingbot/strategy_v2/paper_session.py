@@ -145,7 +145,11 @@ def _runtime_identity():
 
 
 def _config_pairs(config):
-    """A multi-symbol owner declares every instrument; single-pair owners declare one."""
+    """A multi-symbol owner declares every instrument; single-pair owners declare one.
+
+    An owner steps only while every declared book is fresh: native reports value each
+    active executor at its own pair's book, so a partial step cannot report.
+    """
     owned = getattr(config, 'owned_trading_pairs', None)
     return tuple(owned()) if callable(owned) else (config.trading_pair,)
 

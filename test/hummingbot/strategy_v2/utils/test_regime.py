@@ -39,13 +39,15 @@ HMM = R.HmmSpec(n_states=3, fit_bars=720, refit_seconds=21600, warm_bars=120, se
 
 class SpecTest(unittest.TestCase):
     def test_specs_validate_and_round_trip(self):
-        for spec in (R.HtfVolSpec(), HTF, R.HmmSpec(), HMM):
+        for spec in (HTF, R.HmmSpec(), HMM):
             again = R.spec_from_dict(json.loads(json.dumps(spec.to_dict())))
             self.assertEqual(again, spec)
             self.assertEqual(again.spec_hash, spec.spec_hash)
         self.assertNotEqual(HTF.spec_hash, replace(HTF, vol_edges=(0.004, 0.008)).spec_hash)
         with self.assertRaises(ValueError):
             R.HtfVolSpec(vol_edges=(0.006, 0.004))
+        with self.assertRaisesRegex(ValueError, 'vol_edges are required'):
+            R.HtfVolSpec()  # edges are data-derived choices: no calibrated default
         with self.assertRaises(ValueError):
             R.HtfVolSpec(vol_interval="3m")
         with self.assertRaises(ValueError):

@@ -2,12 +2,15 @@
 
 Two engines share one contract:
 
-* ``HtfVolSpec`` (recommended): the volatility level of completed higher-timeframe
-  bars (mean true range over a fixed window of UTC-aligned bars, as a fraction of the
-  last close), bucketed by absolute edges fixed in the spec. A trend score on another
-  completed higher timeframe is reported as a diagnostic and joins the label only when
-  ``trend_in_label`` is set. It has no fitted state: the spec is the model, so every
-  output is a pure function of a fixed trailing window of completed bars.
+* ``HtfVolSpec``: the volatility level of completed higher-timeframe bars (mean true
+  range over a fixed window of UTC-aligned bars, as a fraction of the last close),
+  bucketed by absolute edges the caller must supply. A trend score on another completed
+  higher timeframe is reported as a diagnostic and joins the label only when
+  ``trend_in_label`` is set. Nothing is fitted at evaluation time, so every output is a
+  pure function of the spec and a fixed trailing window of completed bars. The edges
+  themselves are the caller's data-derived choice (for example in-sample terciles) and
+  have no default: record their provenance, and treat any evaluation on the window that
+  chose them as in-sample and exploratory.
 * ``HmmSpec``: a Gaussian HMM on finite-window 1m features, fitted on the fixed UTC
   refit grid from bars ``[b - W, b)``, several seeds (best converged log-likelihood),
   a t-statistic/occupancy label gate and Hungarian anchoring of states to fixed spec
@@ -119,10 +122,10 @@ def _digest(value) -> str:
 
 @dataclass(frozen=True)
 class HtfVolSpec:
-    """Higher-timeframe volatility regime with fixed absolute edges (no fitted state)."""
+    """Higher-timeframe volatility regime; the caller supplies the absolute vol_edges (no default)."""
     vol_interval: str = "1h"
     vol_window: int = 24
-    vol_edges: tuple = (0.0045, 0.0062)
+    vol_edges: Optional[tuple] = None
     trend_interval: str = "4h"
     trend_window: int = 24
     trend_threshold: float = 2.0
@@ -137,6 +140,8 @@ class HtfVolSpec:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or not 2 <= value <= 1000:
                 raise ValueError(f"{name} must be an integer in [2, 1000]")
+        if self.vol_edges is None:
+            raise ValueError("vol_edges are required: supply the edges and record their provenance")
         edges = tuple(float(edge) for edge in self.vol_edges)
         if len(edges) != 2 or not all(math.isfinite(edge) for edge in edges) or not 0 < edges[0] < edges[1] < 1:
             raise ValueError("vol_edges must be two increasing finite fractions in (0, 1)")

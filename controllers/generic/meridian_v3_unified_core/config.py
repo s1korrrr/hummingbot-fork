@@ -26,13 +26,17 @@ from hummingbot.strategy_v2.components.recipe_contract import (
 )
 from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
 from hummingbot.strategy_v2.portfolio_v3.contracts import P0Policy, PortfolioMandate
-from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import CapitalDomainBinding
+from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import LiveCapitalBinding
 
 RECIPE_ID = 'meridian_v3_unified_runtime_v1'
 PORTFOLIO_ID = 'meridian_v3'
 PRODUCER = 'bnb_p23_mr'
 PAIRS = recipe.PAIRS
 ORDER_QUOTE, ASSET_QUOTE, ENVELOPE_QUOTE = Decimal('20'), Decimal('100'), Decimal('500')
+# Meridian is a DCA controller with no loss rail. The shared p23 runtime still takes a
+# RiskPolicy, so it receives no PnL signal (see SymbolBindings.snapshot) and these
+# fractions are never reached. They exist only to satisfy the shared policy type.
+UNREACHABLE_LOSS_FRACTION = Decimal('.99')
 
 
 def source_files():
@@ -46,6 +50,17 @@ class SymbolRuntimeConfig(ModularSpotControllerConfig):
     """Effective native configuration of one symbol context. Candles are OKX market
     data even when orders execute on the isolated paper connector."""
     candles_connector: Literal['okx'] = 'okx'
+
+
+class MeridianRiskPolicy(PolicyModel):
+    """Execution guards only. There is deliberately no drawdown or daily-loss limit."""
+    max_spread_fraction: Decimal = Field(gt=0, lt=1)
+    fee_reserve_fraction: Decimal = Field(gt=0, lt=1)
+    cash_reserve_quote: Decimal = Field(ge=0)
+
+    def native(self):
+        return RiskPolicy(max_drawdown_fraction=UNREACHABLE_LOSS_FRACTION,
+                          max_daily_loss_fraction=UNREACHABLE_LOSS_FRACTION, **self.model_dump())
 
 
 class SymbolPolicyBinding(PolicyModel):
@@ -70,10 +85,10 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     symbols: tuple[SymbolPolicyBinding, ...] = Field(min_length=5, max_length=5, json_schema_extra={'is_updatable': True})
     # Explicit P0 competition order for scarce capital. Never inferred or defaulted.
     priority: tuple[str, ...] = Field(min_length=5, max_length=5)
-    risk: RiskPolicy = Field(...)
+    risk: MeridianRiskPolicy = Field(...)
     data: DataPolicy = Field(default_factory=DataPolicy)
     execution_enabled: StrictBool = False
-    capital_domain: CapitalDomainBinding | None = None
+    live_capital: LiveCapitalBinding | None = None
     recipe_binding: RecipeBinding | None = None
     max_candle_age_seconds: int = Field(default=120, ge=1, le=600, strict=True)
     max_native_report_age_seconds: int = Field(default=5, ge=1, le=60, strict=True)
@@ -102,15 +117,16 @@ class MeridianUnifiedConfig(ControllerConfigBase):
         if self.execution_mode == 'paper':
             if self.connector_name != 'okx_paper_trade' or self.data.mode != 'native':
                 raise ValueError('Meridian paper requires the isolated native paper connector and injected candles')
-            if self.capital_domain is not None:
-                raise ValueError('the native paper wallet is exclusive by construction')
+            if self.live_capital is not None:
+                raise ValueError('the native paper wallet needs no live capital binding')
         else:
             if self.connector_name != 'okx' or self.data.mode != 'shared':
                 raise ValueError('observation and live read shared OKX candles through the native connector')
-            if self.capital_domain is not None and (self.execution_mode != 'live'
-                                                    or self.capital_domain.account_id != self.account_id
-                                                    or self.capital_domain.connector != self.connector_name):
-                raise ValueError('a capital-domain binding must name this live account and connector')
+            if self.live_capital is not None and (self.execution_mode != 'live'
+                                                  or self.live_capital.account_id != self.account_id
+                                                  or self.live_capital.connector != self.connector_name
+                                                  or self.live_capital.envelope_quote != ENVELOPE_QUOTE):
+                raise ValueError('live capital must bind this live account, connector and the 500 envelope')
         if self.execution_mode == 'observation' and self.execution_enabled:
             raise ValueError('observation mode cannot dispatch execution')
         if self.execution_enabled and self.recipe_binding is None:
@@ -138,7 +154,7 @@ class MeridianUnifiedConfig(ControllerConfigBase):
                 execution_enabled=self.execution_enabled, acquisition_enabled=binding.entry_enabled,
                 max_records=1500, max_candle_age_seconds=self.max_candle_age_seconds,
                 max_native_report_age_seconds=self.max_native_report_age_seconds,
-                risk=self.risk, data=self.data, account=self.account_id,
+                risk=self.risk.native(), data=self.data, account=self.account_id,
                 budget=BudgetPolicy(group='meridian_v3_unified', max_quote=ENVELOPE_QUOTE, max_assets=5),
                 program_revision='meridian_v3_unified', policy_revision=binding.policy_version,
                 capital=recipe.capital_policy(self.risk.fee_reserve_fraction), exit_floor='protected',
@@ -152,7 +168,7 @@ class MeridianUnifiedConfig(ControllerConfigBase):
             reference_quote=ENVELOPE_QUOTE, funding_envelope_quote=ENVELOPE_QUOTE, per_asset_quote=ASSET_QUOTE,
             order_quote=ORDER_QUOTE, gross_reference_ratio=1, gross_nav_ratio=1,
             cash_reserve_quote=self.risk.cash_reserve_quote, fee_reserve_fraction=self.risk.fee_reserve_fraction,
-            pairs=PAIRS, loss_policy_sha256=digest({'risk': self.risk.model_dump(mode='json'),
+            pairs=PAIRS, loss_policy_sha256=digest({'loss_rails': 'none', 'guards': self.risk.model_dump(mode='json'),
                                                     'exit_floor': 'protected', 'no_loss_sell': True}),
             max_age_ms=self.max_snapshot_age_ms, target_lifetime_ms=self.target_lifetime_ms)
 

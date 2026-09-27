@@ -17,8 +17,9 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.components.domain import PolicyError
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
-RISK = dict(max_drawdown_fraction='.10', max_daily_loss_fraction='.05',
-            max_spread_fraction='.003', fee_reserve_fraction='.003', cash_reserve_quote='0')
+RISK = dict(max_spread_fraction='.003', fee_reserve_fraction='.003', cash_reserve_quote='0')
+LIVE_CAPITAL = dict(mode='shared_wallet_bounded', account_id='meridian_live', connector='okx', envelope_quote='500',
+                    shared_wallet_acknowledged=True, approved_by='operator')
 PRIORITY = ('BTC-USDC', 'ETH-USDC', 'BNB-USDC', 'SOL-USDC', 'XRP-USDC')
 OWNER = 'modular_spot_meridian_v3_unified_paper'
 
@@ -68,8 +69,9 @@ def test_one_owner_five_symbol_contexts_share_identity_not_wallets():
     {'id': 'modular_spot_meridian_v3_unified_live'},
     {'connector_name': 'okx'},
     {'total_amount_quote': '600'},
-    {'capital_domain': {'account_id': 'meridian_paper', 'connector': 'okx_paper_trade', 'exclusive': True,
-                        'evidence_sha256': 'a' * 64, 'approved_by': 'operator'}},
+    {'live_capital': {**LIVE_CAPITAL, 'account_id': 'meridian_paper'}},
+    {'risk': {**RISK, 'max_drawdown_fraction': '.10'}},
+    {'risk': {**RISK, 'max_daily_loss_fraction': '.05'}},
     {'symbols': [{'trading_pair': p, 'policy_version': 'custom'} for p in PAIRS]},
     {'unknown_field': 1},
 ])
@@ -88,7 +90,21 @@ def test_observation_cannot_execute_and_live_needs_shared_data():
     with pytest.raises(ValueError, match='shared OKX candles'):
         unified('live', data={'mode': 'native'})
     live = unified('live', execution_enabled=True)
-    assert live.capital_domain is None and live.execution_enabled
+    assert live.live_capital is None and live.execution_enabled
+    bounded = unified('live', execution_enabled=True, live_capital=LIVE_CAPITAL)
+    assert bounded.live_capital.envelope_quote == 500
+    for change in ({'envelope_quote': '600'}, {'account_id': 'other'}, {'shared_wallet_acknowledged': False}):
+        with pytest.raises(ValueError):
+            unified('live', live_capital={**LIVE_CAPITAL, **change})
+
+
+def test_meridian_has_no_loss_rail_but_keeps_execution_guards():
+    c = unified()
+    assert set(c.risk.model_dump()) == {'max_spread_fraction', 'fee_reserve_fraction', 'cash_reserve_quote'}
+    native = c.symbol_configs()['BTC-USDC'].risk
+    assert native.max_spread_fraction == c.risk.max_spread_fraction
+    assert native.fee_reserve_fraction == c.risk.fee_reserve_fraction
+    assert c.mandate().loss_policy_sha256 == unified().mandate().loss_policy_sha256
 
 
 def test_seal_binds_configuration_and_ignores_control_fields():
@@ -383,3 +399,41 @@ class MeridianUnifiedIsolationTests(IsolatedAsyncioTestCase):
                 self.assertIn('portfolio_grant_hold', runtime.reason)
             finally:
                 await session.close()
+
+
+class MeridianNoLossRailTests(IsolatedAsyncioTestCase):
+    setUp = session_tests.NativePaperSessionTests.setUp
+
+    async def test_deep_marked_portfolio_loss_never_pauses_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(PAIRS, '500'), [unified(execution_enabled=True)],
+                                         Path(directory) / 'meridian.sqlite')
+            try:
+                reports = session.executor_orchestrator.get_all_reports
+
+                def losing(**kwargs):
+                    result = reports(**kwargs)
+                    for report in result.values():
+                        performance = report.get('performance')
+                        if performance is not None:
+                            performance.global_pnl_quote = D('-450')
+                    return result
+                session.executor_orchestrator.get_all_reports = losing
+                receipt = await MeridianUnifiedPaperTests.enter(self, session)
+                controller = session.controllers[OWNER]
+                self.assertEqual(controller.performance_report.global_pnl_quote, D('-450'))
+                self.assertEqual(len(receipt['actions']), 5, controller.to_format_status())
+                states = [c.runtime.ensure_store().load()[0] for c in controller.contexts.values()]
+                self.assertFalse(any(state.risk_paused for state in states))
+                self.assertEqual(controller.get_custom_info()['loss_rails'], 'none')
+            finally:
+                await session.close()
+
+    async def test_live_without_bounded_capital_never_grants(self):
+        from types import SimpleNamespace as NS
+        controller = NS(config=unified('live', execution_enabled=True), market_data_provider=NS(connectors={}))
+        from controllers.generic.meridian_v3_unified_core.portfolio import MeridianPortfolio
+        self.assertEqual(MeridianPortfolio.execution_capable(NS(owner=controller)),
+                         (False, 'CAPITAL_DOMAIN_UNPROVEN'))
+        controller.config = unified('live', execution_enabled=True, live_capital=LIVE_CAPITAL)
+        self.assertEqual(MeridianPortfolio.execution_capable(NS(owner=controller)), (True, None))

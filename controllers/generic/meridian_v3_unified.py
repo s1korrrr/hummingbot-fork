@@ -191,8 +191,9 @@ class MeridianUnifiedController(ControllerBase):
             'operator': self.get_operator_state(), 'portfolio': dict(self.portfolio.status),
             'fault': self.fault, 'writer_epoch': self.portfolio.epoch,
             'limits': {'order_quote_including_fees': '20', 'asset_quote': '100', 'envelope_quote': '500'},
-            'capital_scope': 'RECORDER_GRANTS' if self.config.execution_mode == 'paper' or self.config.capital_domain
-            else 'CAPITAL_DOMAIN_UNPROVEN',
+            'capital_scope': ('PAPER_WALLET' if self.config.execution_mode == 'paper'
+                              else 'SHARED_WALLET_BOUNDED' if self.config.live_capital else 'CAPITAL_DOMAIN_UNPROVEN'),
+            'loss_rails': 'none',
             'target': None if target is None else {'status': target.status, 'reasons': list(target.reasons),
                                                    'sha256': target.identity, 'decision_time_ms': target.decision_time_ms,
                                                    'requested_quote': str(target.requested_acquisition_quote)},

@@ -8,6 +8,8 @@ owners' rows pass through unchanged so foreign-writer checks still see them.
 Capital never comes from the symbol: its budget is the portfolio grant store.
 A symbol can bind a grant the portfolio admitted; it cannot create one.
 """
+from decimal import Decimal
+
 from controllers.generic.modular_spot_core.domain import PolicyError
 from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 from controllers.generic.modular_spot_core.runtime import ModularRuntime
@@ -46,6 +48,12 @@ class PairScopedRecorder:
 class SymbolBindings(NativeBindings):
     def __init__(self, owner_id, pair):
         self.owner_id, self.pair = owner_id, pair
+
+    def snapshot(self, controller):
+        # Meridian has no loss rail: the p23 risk update receives no PnL, so drawdown
+        # and daily-loss pauses can never trigger. Freshness checks of the native
+        # report, book and account still apply before any entry.
+        return {**super().snapshot(controller), 'pnl': Decimal('0')}
 
     def recorder(self):
         recorder = NativeBindings.recorder()

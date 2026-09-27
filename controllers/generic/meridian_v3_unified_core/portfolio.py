@@ -118,7 +118,7 @@ class MeridianPortfolio:
         if config.execution_mode == 'paper':
             connector = self.owner.market_data_provider.connectors.get(config.connector_name)
             return (True, None) if is_native_paper_connector(connector) else (False, CAPITAL_DOMAIN_UNPROVEN)
-        if config.capital_domain is None:
+        if config.live_capital is None:
             return False, CAPITAL_DOMAIN_UNPROVEN
         return True, None
 

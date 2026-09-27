@@ -25,16 +25,19 @@ NATIVE_INVENTORY_MISMATCH = 'NATIVE_INVENTORY_MISMATCH'
 GRANT_STORE_HOLD = 'GRANT_STORE_HOLD'
 
 
-class CapitalDomainBinding(Identified):
-    """Operator evidence that one account domain has exactly one spending writer.
+class LiveCapitalBinding(Identified):
+    """Operator-approved bounded live spending on a wallet other bots also use.
 
-    The native paper connector is exclusive by construction and needs no binding.
-    A live account shared with other bots, keys or manual trading must not carry one.
+    The portfolio spends at most `envelope_quote`, admits at most its per-asset and
+    per-order limits, and sells only inventory its own executors bought. It cannot
+    stop another process from spending the same balance first; its own buys then
+    fail at the native funds check instead of overspending.
     """
+    mode: Literal['shared_wallet_bounded']
     account_id: str = Field(pattern=NAME)
-    connector: str = Field(pattern=NAME)
-    exclusive: Literal[True]
-    evidence_sha256: str = Field(pattern=HASH)
+    connector: Literal['okx']
+    envelope_quote: Decimal = Field(gt=0)
+    shared_wallet_acknowledged: Literal[True]
     approved_by: str = Field(pattern=NAME)
 
 

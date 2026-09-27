@@ -102,6 +102,11 @@ class InjectedPaperMarketData(MarketDataProvider):
 
     def set_candles(self, connector_name, trading_pair, interval, frame, *, available_at):
         validated = self.validate_candles_input(connector_name, trading_pair, interval, frame, available_at=available_at)
+        self._publish_validated_candles(connector_name, trading_pair, interval, validated, available_at=available_at)
+
+    def _publish_validated_candles(self, connector_name, trading_pair, interval, frame, *, available_at):
+        """Store a frame `validate_candles_input` already returned for this same step."""
+        validated = frame
         key = (connector_name, trading_pair, interval)
         self._frames[key] = validated
         if not hasattr(self, '_frame_publications'):
@@ -383,7 +388,8 @@ class NativePaperSession:
                                                       previous_sequence=sequences.get(pair, -1), previous_timestamp=book_times.get(pair, 0))
             sequences[pair], book_times[pair] = book['sequence'], float(book['timestamp'])
         for candle in candles:
-            self.market_data_provider.validate_candles_input(**candle, current_timestamp=timestamp)
+            # Keep the validated copy: the step publishes exactly this frame without re-validating it.
+            candle['frame'] = self.market_data_provider.validate_candles_input(**candle, current_timestamp=timestamp)
         for trade in trades:
             self._connector.validate_trade_input(**trade, current_timestamp=timestamp,
                                                  book_timestamp=book_times.get(trade.get('trading_pair'), float('-inf')))
@@ -454,7 +460,7 @@ class NativePaperSession:
             self._connector.set_order_book(**book)
             self._oracle.set_price(book['trading_pair'], self._connector.get_mid_price(book['trading_pair']))
         for frame in candles:
-            self.market_data_provider.set_candles(**frame)
+            self.market_data_provider._publish_validated_candles(**frame)
         await self._connector.settle_research_events()
         for row in observed_seconds:
             await self._connector.process_observed_second(**row)

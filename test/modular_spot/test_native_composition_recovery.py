@@ -15,8 +15,8 @@ from hummingbot.model.metadata import Metadata
 recorder = _recorder_fixture
 
 
-def owner():
-    return controllers(*FAMILIES[1], use_bag_freeze=False, early_stop_drawdown_pct=D('0'))[0]
+def owner(family=1):
+    return controllers(*FAMILIES[family], use_bag_freeze=False, early_stop_drawdown_pct=D('0'))[0]
 
 
 def observe(controller, price='102', *, reversal=False):
@@ -30,8 +30,8 @@ def observe(controller, price='102', *, reversal=False):
     }
 
 
-def armed_owner(recorder):
-    result = owner()
+def armed_owner(recorder, family=1):
+    result = owner(family)
     assert result.determine_executor_actions() == []
     persist_position(recorder, result.config.id)
     observe(result, '101')
@@ -262,3 +262,95 @@ def test_event_observer_hold_does_not_suppress_native_inventory_reduction(record
     assert restarted_owner.determine_executor_actions() == []
     assert 'reduction receipt pending' in restarted_owner._recovery_hold
     assert observer.determine_executor_actions() == []
+
+
+@pytest.mark.parametrize('family', [0, 1], ids=['ok_rsi', 'rsi_v5'])
+def test_recovery_sale_leaving_dust_drops_the_finished_trail_without_faulting(recorder, family):
+    """Live V2 SOL 2026-09-27: the recovery exit sold the bag, fee dust remained, the trail must go."""
+    first = armed_owner(recorder, family)
+    assert first._recovery_trails
+    persist_position(recorder, first.config.id, amount=D('0.000006'))
+    observe(first)
+    first.positions_held[0].amount = D('0.000006')
+    first.determine_executor_actions()
+    assert first._recovery_fault is None and first._recovery_hold is None
+    assert first._recovery_trails == {}
+    assert first._recovery_store.previous.positions == () and first._recovery_store.previous.trails == ()
+
+
+@pytest.mark.parametrize('family', [0, 1], ids=['ok_rsi', 'rsi_v5'])
+def test_restart_after_the_bag_was_sold_is_not_blocked_by_a_stale_checkpoint(recorder, family):
+    armed_owner(recorder, family)  # checkpoint still lists the bag and its armed trail
+    persist_position(recorder, owner(family).config.id, amount=D('0.000006'))
+    result = owner(family)
+    observe(result)
+    result.positions_held[0].amount = D('0.000006')
+    result.determine_executor_actions()
+    assert result._recovery_fault is None
+    assert result._recovery_trails == {}
+
+
+@pytest.mark.parametrize('family', [0, 1], ids=['ok_rsi', 'rsi_v5'])
+def test_bag_worth_below_five_quote_is_dust_not_a_held_bag(recorder, family):
+    result = controllers(*FAMILIES[family], use_bag_freeze=False, early_stop_drawdown_pct=D('0'))[0]
+    if family == 1:  # rsi_v5 has no sweep bound in its config; exercise the shared rule directly
+        result._held_dust_max_quote = lambda: D('5')
+    else:
+        assert result._held_dust_max_quote() == D('5')  # ok_rsi: sell_remainder_sweep_max_quote default
+    observe(result)
+    result.positions_held[0].amount = D('0.04')  # 0.04 * 100 = 4 quote at cost and at market
+    assert result._held_position_is_dust(result.positions_held[0])
+    assert result._held_bag_count() == 0
+    result.positions_held[0].amount = D('0.06')  # 6 quote: a real bag
+    assert not result._held_position_is_dust(result.positions_held[0])
+    assert result._held_bag_count() == 1
+
+
+def test_unexplained_new_inventory_across_restart_still_requires_reconciliation(recorder):
+    first = armed_owner(recorder)
+    persist_position(recorder, first.config.id, amount=D('2'))
+    result = owner()
+    observe(result)
+    result.positions_held[0].amount = D('2')
+    assert result.determine_executor_actions() == []
+    assert 'inventory changed across restart' in result._recovery_fault
+
+
+@pytest.mark.parametrize('family', [0, 1], ids=['ok_rsi', 'rsi_v5'])
+def test_dust_never_imposes_entry_spacing(recorder, family):
+    result = owner(family)
+    if family == 1:
+        result._held_dust_max_quote = lambda: D('5')
+    observe(result)
+    result.positions_held[0].amount = D('0.04')  # 4 quote at cost: dust
+    assert result._has_sufficient_avg_entry_gap_for_buy(D('100.1'))
+    result.positions_held[0].amount = D('1')  # a real bag at 100: 0.1% away is too close
+    result._effective_price_gap = lambda: D('0.015')
+    assert not result._has_sufficient_avg_entry_gap_for_buy(D('100.1'))
+
+
+@pytest.mark.parametrize('family', [0, 1], ids=['ok_rsi', 'rsi_v5'])
+def test_bag_sellable_at_market_is_not_dust_even_when_cost_is_below_the_minimum(recorder, family):
+    result = owner(family)
+    if family == 1:
+        result._held_dust_max_quote = lambda: D('5')
+    observe(result)
+    result.positions_held[0].amount = D('0.06')
+    result.positions_held[0].breakeven_price = D('50')  # 3 quote at cost, 6 quote at market
+    assert not result._held_position_is_dust(result.positions_held[0])
+    assert result._held_bag_count() == 1
+
+
+def test_checkpoint_accepts_an_untrailed_bag_the_old_filter_excluded_but_not_other_new_bags(recorder):
+    first = armed_owner(recorder)
+    store = first._recovery_store
+    previous = store.previous
+    known = previous.positions[0]
+    newcomer = known.model_copy(update={'position_key': known.position_key + '-legacy'})
+    store._below_venue_minimum = lambda amount, price: True  # below the minimum at cost: never checkpointed before
+    reconciled = store._reconcile_checkpoint_positions(previous, (known, newcomer))
+    assert reconciled.positions == (known, newcomer)
+    assert reconciled.trails == previous.trails
+    store._below_venue_minimum = lambda amount, price: False
+    with pytest.raises(Exception, match='inventory changed across restart'):
+        store._reconcile_checkpoint_positions(previous, (known, newcomer))

@@ -835,6 +835,45 @@ class HLRSIController(DirectionalTradingControllerBase):
             min_amount = self._ceil_to_increment(min_amount, increment)
         return max(min_amount, Decimal("0"))
 
+    def _held_dust_max_quote(self) -> Decimal:
+        """Held remainders worth less than this are dust, swept into the next sell."""
+        try:
+            value = Decimal(str(getattr(self.config, "sell_remainder_sweep_max_quote", 0) or 0))
+        except _DECIMAL_CONVERSION_ERRORS:
+            return Decimal("0")
+        return value if value.is_finite() and value > 0 else Decimal("0")
+
+    def _held_amount_is_dust(self, amount, basis) -> bool:
+        """A held remainder is dust when it cannot be sold alone at the market, or
+        is worth less than the sweep bound at the better of cost and market.
+
+        Dust is not counted, trailed, recovered or used as an entry-spacing
+        anchor; the next sell of the pair sweeps it. A bag that is sellable at
+        the market is never dust, even if its cost is below the exchange
+        minimum. Without a market price only the price-independent minimum
+        order size reclassifies a remainder, so an outage cannot drop a trail.
+        """
+        amount = self._decimal_or_none(amount)
+        if amount is None or amount <= 0:
+            return True
+        rule = self._get_trading_rule()
+        min_size = self._rule_decimal(rule, "min_order_size")
+        if min_size > 0 and amount < min_size:
+            return True
+        mid = self._decimal_or_none(self._get_mid_price())
+        if mid is None or mid <= 0:
+            return False
+        min_amount = self._minimum_entry_amount(mid, rule)
+        min_quote = self._minimum_entry_quote(mid, rule)
+        if amount < min_amount or (min_quote > 0 and amount * mid < min_quote):
+            return True
+        basis = self._decimal_or_none(basis)
+        value_price = max(mid, basis) if basis is not None and basis > 0 else mid
+        return amount * value_price < self._held_dust_max_quote()
+
+    def _held_position_is_dust(self, position) -> bool:
+        return self._held_amount_is_dust(getattr(position, "amount", None), getattr(position, "breakeven_price", None))
+
     def _inventory_is_dust(self, amount: Decimal, price: Optional[Decimal] = None) -> bool:
         if amount <= 0:
             return True
@@ -1025,7 +1064,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             if position.connector_name == self.config.connector_name
             and position.trading_pair == self.config.trading_pair
             and position.side == TradeType.BUY
-            and position.amount > 0
+            and not self._held_position_is_dust(position)  # a sold-down bag's trail is finished
         }
         for key in list(self._recovery_trails.keys()):
             if key not in active_keys:
@@ -1461,15 +1500,7 @@ class HLRSIController(DirectionalTradingControllerBase):
         return f"controller={self.config.id} pair={self.config.trading_pair}"
 
     def _held_bag_count(self, side: TradeType = TradeType.BUY) -> int:
-        price = self._decimal_or_none(self._get_mid_price())
-        count = 0
-        for position in self._held_positions(side):
-            amount = self._decimal_or_none(getattr(position, "amount", None))
-            if amount is None or amount <= 0:
-                continue
-            if not self._inventory_is_dust(amount, price):
-                count += 1
-        return count
+        return sum(1 for position in self._held_positions(side) if not self._held_position_is_dust(position))
 
     def _position_log_context(self) -> str:
         mid_price = self._get_mid_price()
@@ -3180,8 +3211,8 @@ class HLRSIController(DirectionalTradingControllerBase):
         if self.config.trade_mode == "sell_only":
             amount = self._get_sellable_inventory_amount()
             return amount > 0 and not self._inventory_is_dust(amount)
-        amount = self._position_amount(TradeType.BUY)
-        return amount > 0 and not self._inventory_is_dust(amount)
+        # Only real bags impose entry spacing; dust is swept by the next sell.
+        return self._held_bag_count(TradeType.BUY) > 0
 
     def _should_emit_live_buy_reversal(self, buy_signal_on_bar: bool, candle_timestamp: Optional[float]) -> bool:
         if not buy_signal_on_bar:
@@ -5221,8 +5252,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             if (pos.connector_name != self.config.connector_name
                     or pos.trading_pair != self.config.trading_pair
                     or pos.side != TradeType.BUY
-                    or pos.amount <= Decimal("0")
-                    or self._inventory_is_dust(pos.amount, current_price)):
+                    or self._held_position_is_dust(pos)):
                 continue
 
             try:

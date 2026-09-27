@@ -899,6 +899,45 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         min_quote_from_base = min_base * price if min_base > 0 else Decimal("0")
         return max(min_quote_from_base, min_notional, min_order_value)
 
+    def _held_dust_max_quote(self) -> Decimal:
+        """Held remainders worth less than this are dust, swept into the next sell."""
+        try:
+            value = Decimal(str(getattr(self.config, "sell_remainder_sweep_max_quote", 0) or 0))
+        except (InvalidOperation, TypeError, ValueError):
+            return Decimal("0")
+        return value if value.is_finite() and value > 0 else Decimal("0")
+
+    def _held_amount_is_dust(self, amount, basis) -> bool:
+        """A held remainder is dust when it cannot be sold alone at the market, or
+        is worth less than the sweep bound at the better of cost and market.
+
+        Dust is not counted, trailed, recovered or used as an entry-spacing
+        anchor; the next sell of the pair sweeps it. A bag that is sellable at
+        the market is never dust, even if its cost is below the exchange
+        minimum. Without a market price only the price-independent minimum
+        order size reclassifies a remainder, so an outage cannot drop a trail.
+        """
+        amount = self._decimal_or_none(amount)
+        if amount is None or amount <= 0:
+            return True
+        rule = self._get_trading_rule()
+        min_size = self._rule_decimal(rule, "min_order_size")
+        if min_size > 0 and amount < min_size:
+            return True
+        mid = self._decimal_or_none(self._get_mid_price())
+        if mid is None or mid <= 0:
+            return False
+        min_amount = self._minimum_entry_amount(mid, rule)
+        min_quote = self._minimum_entry_quote(mid, rule)
+        if amount < min_amount or (min_quote > 0 and amount * mid < min_quote):
+            return True
+        basis = self._decimal_or_none(basis)
+        value_price = max(mid, basis) if basis is not None and basis > 0 else mid
+        return amount * value_price < self._held_dust_max_quote()
+
+    def _held_position_is_dust(self, position) -> bool:
+        return self._held_amount_is_dust(getattr(position, "amount", None), getattr(position, "breakeven_price", None))
+
     def _minimum_entry_amount(self, price: Decimal, rule: Optional[TradingRule] = None) -> Decimal:
         if price <= 0:
             return Decimal("0")
@@ -1089,7 +1128,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             if position.connector_name == self.config.connector_name
             and position.trading_pair == self.config.trading_pair
             and position.side == TradeType.BUY
-            and position.amount > 0
+            and not self._held_position_is_dust(position)  # a sold-down bag's trail is finished
         }
         for key in list(self._recovery_trails.keys()):
             if key not in active_keys:
@@ -1496,7 +1535,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return f"controller={self.config.id} pair={self.config.trading_pair}"
 
     def _held_bag_count(self, side: TradeType = TradeType.BUY) -> int:
-        return self._aggregate_held_inventory(side).bag_count
+        return sum(1 for position in self._held_positions(side) if not self._held_position_is_dust(position))
 
     def _position_log_context(self) -> str:
         mid_price = self._get_mid_price()
@@ -2551,6 +2590,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return pct_gap >= gap_thr
 
     def _has_sufficient_avg_entry_gap_for_buy(self, new_price: Optional[Decimal]) -> bool:
+        if self._held_bag_count(TradeType.BUY) == 0:
+            return True  # only real bags impose entry spacing; dust is swept by the next sell
         gap_thr = self._effective_price_gap()
         if gap_thr <= 0:
             return True
@@ -4593,7 +4634,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             if (pos.connector_name != self.config.connector_name
                     or pos.trading_pair != self.config.trading_pair
                     or pos.side != TradeType.BUY
-                    or pos.amount <= Decimal("0")):
+                    or self._held_position_is_dust(pos)):
                 continue
 
             try:

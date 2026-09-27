@@ -10,7 +10,7 @@ engineering result, not economic evidence or activation authority.
 from pathlib import Path
 from typing import Literal
 
-from pydantic import ConfigDict, model_validator
+from pydantic import ConfigDict, PrivateAttr, model_validator
 
 from controllers.generic import modular_spot
 from controllers.generic.modular_spot import ModularSpotController, ModularSpotControllerConfig
@@ -39,6 +39,7 @@ class ModularSpotResearchConfig(ModularSpotControllerConfig):
     connector_name: Literal['okx_paper_trade'] = 'okx_paper_trade'
     candles_connector: Literal['okx'] = 'okx'
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
+    _source_manifest: list | None = PrivateAttr(default=None)
 
     @model_validator(mode='after')
     def research_scope(self):
@@ -55,7 +56,16 @@ class ModularSpotResearchConfig(ModularSpotControllerConfig):
         return self
 
     def source_manifest(self):
-        return source_records(source_root(), source_files())
+        """Sealed replay sources are hashed once per configuration instance.
+
+        The research controller forbids implementation hot reload and the replay owner
+        verifies the frozen source closure before and after a run, so re-reading every
+        source file on each one-second tick changes nothing but the runtime. Configuration
+        values are still folded into every fingerprint call.
+        """
+        if self._source_manifest is None:
+            self._source_manifest = source_records(source_root(), source_files())
+        return self._source_manifest
 
     def get_controller_class(self):
         return ModularSpotResearchController

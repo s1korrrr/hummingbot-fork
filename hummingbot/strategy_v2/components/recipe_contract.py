@@ -3,6 +3,7 @@ import json
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Mapping
 
 from pydantic import Field, field_validator
@@ -11,6 +12,24 @@ from .config import PolicyModel
 from .domain import PolicyError
 
 CONTROL_FIELDS = frozenset({'recipe_binding', 'execution_enabled', 'manual_kill_switch', 'acquisition_enabled'})
+
+# Configuration fields added after live owners bound their identity, with the
+# default value that preserves the earlier behaviour. At exactly that value the
+# field is left out of the configuration digest, so a code upgrade that only
+# adds the field keeps existing funding ledgers and held-recovery checkpoints
+# bound. Any other value is part of the identity. A new configuration field
+# belongs here when its default preserves the previous behaviour; otherwise the
+# upgrade needs explicit reconciliation.
+IDENTITY_NEUTRAL_DEFAULTS = MappingProxyType({
+    'recovery_keep_trail_after_target': False,
+})
+
+
+def _identity_neutral(key: str, value) -> bool:
+    if key not in IDENTITY_NEUTRAL_DEFAULTS:
+        return False
+    default = IDENTITY_NEUTRAL_DEFAULTS[key]
+    return type(value) is type(default) and value == default
 
 
 def canonical_json(value) -> str:
@@ -32,7 +51,8 @@ def digest(value) -> str:
 def configuration_digest(payload: Mapping) -> str:
     if not isinstance(payload, Mapping) or any(not isinstance(key, str) for key in payload):
         raise PolicyError('a string-keyed native configuration is required')
-    return digest({key: value for key, value in payload.items() if key not in CONTROL_FIELDS})
+    return digest({key: value for key, value in payload.items()
+                   if key not in CONTROL_FIELDS and not _identity_neutral(key, value)})
 
 
 def source_records(root: Path, files: tuple[Path, ...] | list[Path]) -> list[tuple[str, str]]:

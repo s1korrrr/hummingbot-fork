@@ -121,10 +121,50 @@ class NativeRecoveryStore:
         held = []
         for key in sorted(result):
             item = result[key]
-            if self._below_venue_minimum(item.amount, item.breakeven_price):
+            if self._below_venue_min_size(item.amount):
                 continue
             held.append(item)
         return tuple(held)
+
+    def _reconcile_checkpoint_positions(self, previous, positions):
+        """Accept inventory differences that are explained; refuse anything else.
+
+        A bag that vanished (sold, or now below the venue minimum size) has
+        nothing left to sell, so its trail and pending reduction are finished.
+        A bag without a trail that the previous checkpoint excluded because it
+        was below the venue minimum at cost is legitimately new to it. A changed
+        amount, or any other new bag, is unexplained and still needs explicit
+        reconciliation.
+        """
+        before = {item.position_key: item for item in previous.positions}
+        trailed = {item.position_key for item in previous.trails}
+        for item in positions:
+            prior = before.get(item.position_key)
+            if prior == item:
+                continue
+            legacy_excluded = (prior is None and item.position_key not in trailed
+                               and self._below_venue_minimum(item.amount, item.breakeven_price))
+            if not legacy_excluded:
+                raise PolicyError('native inventory changed across restart; explicit held recovery reconciliation required')
+        kept = {item.position_key for item in positions}
+        self.owner.logger().warning(
+            'Native held recovery reconciled checkpoint positions across restart | controller=%s dropped=%s added=%s',
+            self.owner.config.id, sorted(set(before) - kept), sorted(kept - set(before)))
+        return previous.model_copy(update={
+            'positions': tuple(positions),
+            'trails': tuple(item for item in previous.trails if item.position_key in kept),
+            'pending_reductions': tuple(item for item in previous.pending_reductions if item.position_key in kept),
+        })
+
+    def _below_venue_min_size(self, amount):
+        """Price-independent: a remainder below the venue minimum order size can never be sold alone."""
+        try:
+            rules = self.owner.market_data_provider.get_trading_rules(
+                self.owner.config.connector_name, self.owner.config.trading_pair)
+            min_size = decimal(rules.min_order_size, 'venue min order size', positive=True)
+        except (PolicyError, AttributeError, TypeError, ValueError):
+            return False
+        return amount < min_size
 
     def _below_venue_minimum(self, amount, price):
         try:
@@ -186,7 +226,8 @@ class NativeRecoveryStore:
             if previous.family != self.owner._native_family:
                 raise PolicyError('native held recovery source/configuration changed; explicit reconciliation required')
             if previous.positions != positions:
-                raise PolicyError('native inventory changed across restart; explicit held recovery reconciliation required')
+                previous = self._reconcile_checkpoint_positions(previous, positions)
+                self.previous = previous
             configuration_changed = previous.configuration_sha256 != self.owner._composition_digest
             if configuration_changed and positions:
                 raise PolicyError('native held recovery source/configuration changed; explicit reconciliation required')
@@ -225,6 +266,14 @@ class NativeRecoveryStore:
     def persist(self, positions, actions=()):
         if self.inventory() != positions:
             raise DataUnavailable('native held inventory changed during the decision')
+        held_keys = {item.position_key for item in positions}
+        orphaned = sorted(key for key in self.owner._recovery_trails if key not in held_keys)
+        if orphaned:
+            # A trail whose bag is gone (sold down to dust) is finished; never let it block.
+            self.owner.logger().warning('Native held recovery dropped trails without a bag | controller=%s bags=%s',
+                                        self.owner.config.id, orphaned)
+            for key in orphaned:
+                self.owner._recovery_trails.pop(key, None)
         trails = tuple(NativeTrail.model_validate(asdict(value))
                        for _, value in sorted(self.owner._recovery_trails.items()))
         previous_trails = {} if self.previous is None else {item.position_key: item for item in self.previous.trails}

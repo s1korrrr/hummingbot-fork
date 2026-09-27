@@ -423,3 +423,37 @@ def test_unrestorable_row_fills_are_not_rebuilt_into_held_bags(recorder):
         recorder.store_or_update_executor(broken)
     orchestrator, _ = boot(recorder, booting_strategy())
     assert ('okx', 'ETH-USDT', 'entry') in orchestrator._non_hold_order_ids
+
+
+class _SubclassExecutor(PositionExecutor):
+    pass
+
+
+def test_controller_named_continuity_class_restores_its_tranche_subclass(recorder):
+    executor = live_executor(trigger='.015', moves=2)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(executor)
+    strategy = booting_strategy()
+    strategy.controllers['controller'].restart_continuity_executor_class = lambda config: _SubclassExecutor
+    orchestrator, _ = boot(recorder, strategy)
+    again = restored(orchestrator)
+    assert type(again) is _SubclassExecutor
+    assert again._trailing_stop_trigger_pct == D('.015')
+
+
+def test_controller_refusing_a_row_is_reported_not_rebuilt_as_plain_executor(recorder):
+    executor = live_executor()
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(executor)
+    strategy = booting_strategy()
+
+    def refuse(config):
+        raise RestartContinuityError('not a tranche of this controller')
+    strategy.controllers['controller'].restart_continuity_executor_class = refuse
+    orchestrator, start = boot(recorder, strategy)
+    assert orchestrator.active_executors.get('controller', []) == []
+    assert orchestrator.recovery_required == {'controller': [executor.config.id]}
+    start.assert_not_called()
+    strategy.controllers['controller'].restart_continuity_executor_class = lambda config: object
+    with pytest.raises(RestartContinuityError):
+        orchestrator._continuity_executor_class(strategy.controllers['controller'], executor.config)

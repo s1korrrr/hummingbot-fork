@@ -437,3 +437,26 @@ class MeridianNoLossRailTests(IsolatedAsyncioTestCase):
                          (False, 'CAPITAL_DOMAIN_UNPROVEN'))
         controller.config = unified('live', execution_enabled=True, live_capital=LIVE_CAPITAL)
         self.assertEqual(MeridianPortfolio.execution_capable(NS(owner=controller)), (True, None))
+
+
+class MeridianRestartContinuityTests(IsolatedAsyncioTestCase):
+    setUp = session_tests.NativePaperSessionTests.setUp
+
+    async def test_live_restart_restores_tranches_as_protected_modular_executors(self):
+        from hummingbot.strategy_v2.executors.restart_continuity import RestartContinuityError
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(PAIRS, '500'), [unified(execution_enabled=True)],
+                                         Path(directory) / 'meridian.sqlite')
+            try:
+                receipt = await MeridianUnifiedPaperTests.enter(self, session)
+                controller = session.controllers[OWNER]
+                for action in receipt['actions']:
+                    self.assertIs(controller.restart_continuity_executor_class(action.executor_config),
+                                  ModularPositionExecutor)
+                config = receipt['actions'][0].executor_config
+                for change in ({'trading_pair': 'DOGE-USDC'}, {'controller_id': 'modular_spot_v2_btc'},
+                               {'level_id': 'signal_exit'}, {'side': TradeType.SELL}):
+                    with self.assertRaises(RestartContinuityError):
+                        controller.restart_continuity_executor_class(config.model_copy(update=change))
+            finally:
+                await session.close()

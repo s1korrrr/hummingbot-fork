@@ -13,7 +13,9 @@ from controllers.generic.meridian_v3_unified_core.portfolio import MeridianPortf
 from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext, SymbolRuntime
 from controllers.generic.modular_spot_core.bag import is_recovery_sell
 from controllers.generic.modular_spot_core.data_reader import attach_pool
+from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.components.source_identity import component_source_files
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
@@ -165,6 +167,14 @@ class MeridianUnifiedController(ControllerBase):
         if is_recovery_sell(config):
             return super().validate_executor_config(config) and context.runtime.recovery_permission(config)
         return self.entry_permission(config)
+
+    def restart_continuity_executor_class(self, config):
+        """Restore persisted p23 tranches with their exit floor and limit-only close policy."""
+        from hummingbot.strategy_v2.executors.restart_continuity import RestartContinuityError
+        if (self._context(config) is None or getattr(config, 'side', None) != TradeType.BUY
+                or not str(getattr(config, 'level_id', '')).startswith('modular_spot:v1:')):
+            raise RestartContinuityError('Persisted executor is not a Meridian p23 tranche')
+        return ModularPositionExecutor
 
     def get_executor_class_for_config(self, config):
         context = self._context(config)

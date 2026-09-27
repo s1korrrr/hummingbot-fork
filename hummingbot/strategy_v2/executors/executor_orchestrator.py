@@ -470,6 +470,14 @@ class ExecutorOrchestrator:
                    and is_continuity_candidate(info) for info in infos)
 
     def _continuity_executor_class(self, controller, config):
+        # A controller whose tranches run a PositionExecutor subclass names it; otherwise a
+        # restart would silently rebuild them without their exit-floor and close policies.
+        hook = getattr(controller, 'restart_continuity_executor_class', None)
+        if callable(hook):
+            executor_class = hook(config)
+            if not (isinstance(executor_class, type) and issubclass(executor_class, PositionExecutor)):
+                raise RestartContinuityError('Controller continuity class is not a native PositionExecutor')
+            return executor_class
         if getattr(config, 'entry_acquisition_policy', None) != 'down_only_maker_v1':
             return PositionExecutor
         from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig

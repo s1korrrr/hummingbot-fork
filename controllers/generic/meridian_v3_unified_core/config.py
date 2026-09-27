@@ -95,6 +95,9 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     max_snapshot_age_ms: int = Field(default=5000, ge=100, le=60000, strict=True)
     target_lifetime_ms: int = Field(default=30000, ge=1000, le=60000, strict=True)
     total_amount_quote: Decimal = Field(default=ENVELOPE_QUOTE, json_schema_extra={'is_updatable': False})
+    # Read by ModularPositionExecutor from its owning controller: the protected no-loss floor
+    # (after-fee breakeven raised by activation - delta), never the plain after-fee price.
+    exit_floor: Literal['protected'] = 'protected'
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
 
     @field_validator('symbols')
@@ -157,7 +160,7 @@ class MeridianUnifiedConfig(ControllerConfigBase):
                 risk=self.risk.native(), data=self.data, account=self.account_id,
                 budget=BudgetPolicy(group='meridian_v3_unified', max_quote=ENVELOPE_QUOTE, max_assets=5),
                 program_revision='meridian_v3_unified', policy_revision=binding.policy_version,
-                capital=recipe.capital_policy(self.risk.fee_reserve_fraction), exit_floor='protected',
+                capital=recipe.capital_policy(self.risk.fee_reserve_fraction), exit_floor=self.exit_floor,
                 manual_kill_switch=self.manual_kill_switch, **modules)
             result[binding.trading_pair] = SymbolRuntimeConfig(**values)
         return result

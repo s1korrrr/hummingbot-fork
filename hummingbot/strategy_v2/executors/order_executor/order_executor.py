@@ -143,7 +143,10 @@ class OrderExecutor(ExecutorBase):
         if self._order is not None:
             return
         remaining = self.config.amount - sum((order.executed_amount_base for order in self._all_orders()), Decimal("0"))
-        if remaining <= Decimal("0"):
+        if remaining <= Decimal("0") or (remaining < self.config.amount and self._unplaceable_remainder(remaining)):
+            # A partial fill can leave a remainder the venue would reject (below its minimum
+            # size or notional). That remainder is dust: finish with the fills instead of
+            # re-submitting an order that can never be accepted.
             self._finish_with_fills()
             return
         order_id = self.place_order(
@@ -157,6 +160,14 @@ class OrderExecutor(ExecutorBase):
         )
         self._order = TrackedOrder(order_id=order_id)
         self.logger().debug(self._log_message(f"Placing order order_id={order_id}"))
+
+    def _unplaceable_remainder(self, remaining: Decimal) -> bool:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        connector = self.connectors[self.config.connector_name]
+        amount = Decimal(str(connector.quantize_order_amount(self.config.trading_pair, remaining)))
+        price = self.get_order_price()
+        return (amount <= Decimal("0") or amount < Decimal(str(rules.min_order_size))
+                or (price.is_finite() and amount * price < Decimal(str(rules.min_notional_size))))
 
     def get_order_type(self) -> OrderType:
         """

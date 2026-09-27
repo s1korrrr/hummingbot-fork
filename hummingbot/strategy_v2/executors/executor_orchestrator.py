@@ -2037,8 +2037,22 @@ class ExecutorOrchestrator:
                 executor_info = executor.executor_info
                 self.executors_ids_position_held.append(executor_info.config.id)
                 self._persist_position_hold_entries_from_executor_info(executor_info)
+                # Order-executor fills are never executor-owned, so trade-fill reconciliation
+                # already carries them (keyed per fill). Re-applying the order record here
+                # would subtract a sale twice until the next rebuild, and a sync in between
+                # would persist a false opposite-side position.
+                if executor_info.type == "order_executor" and self._fill_reconciled_scope(
+                        controller_id, executor_info.connector_name, executor_info.trading_pair):
+                    continue
                 self._apply_executor_info_to_positions(controller_id, executor_info)
             self._prune_flat_positions(controller_id)
+
+    def _fill_reconciled_scope(self, controller_id: str, connector_name: str, trading_pair: str) -> bool:
+        controller_by_pair, _ = self._controller_ids_by_market_pair()
+        return (controller_by_pair.get((connector_name, trading_pair)) == controller_id
+                and controller_id not in self.initial_positions_by_controller
+                and "_perpetual" not in connector_name
+                and trading_pair in self.strategy.markets.get(connector_name, set()))
 
     def _determine_position_side(self, executor_info: ExecutorInfo) -> Optional[TradeType]:
         """

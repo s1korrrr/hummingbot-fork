@@ -46,10 +46,21 @@ def source_files():
             *[Path(p) for p in modular_spot.source_files()]]
 
 
+_SOURCE_MANIFEST = {}
+
+
 class SymbolRuntimeConfig(ModularSpotControllerConfig):
     """Effective native configuration of one symbol context. Candles are OKX market
     data even when orders execute on the isolated paper connector."""
     candles_connector: Literal['okx'] = 'okx'
+
+    def source_manifest(self):
+        # The p23 runtime re-checks its fingerprint on every tick. Its engine sources are
+        # fixed for the life of the process (read-only image, hot reload disabled), so they
+        # are hashed once; configuration values are still compared on every call.
+        if 'modular_spot' not in _SOURCE_MANIFEST:
+            _SOURCE_MANIFEST['modular_spot'] = super().source_manifest()
+        return _SOURCE_MANIFEST['modular_spot']
 
 
 class MeridianRiskPolicy(PolicyModel):

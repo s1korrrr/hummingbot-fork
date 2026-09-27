@@ -460,3 +460,20 @@ class MeridianRestartContinuityTests(IsolatedAsyncioTestCase):
                         controller.restart_continuity_executor_class(config.model_copy(update=change))
             finally:
                 await session.close()
+
+
+def test_symbol_source_manifest_is_hashed_once_and_matches_a_fresh_hash(monkeypatch):
+    from controllers.generic.meridian_v3_unified_core import config as module
+    from controllers.generic.modular_spot import ModularSpotControllerConfig
+    symbol = unified().symbol_configs()['BTC-USDC']
+    fresh = ModularSpotControllerConfig.source_manifest(symbol)
+    monkeypatch.setattr(module, '_SOURCE_MANIFEST', {})
+    calls = []
+    original = ModularSpotControllerConfig.source_manifest
+    monkeypatch.setattr(ModularSpotControllerConfig, 'source_manifest',
+                        lambda self: calls.append(1) or original(self))
+    first = symbol.fingerprint()
+    assert symbol.fingerprint() == first and len(calls) == 1
+    assert module._SOURCE_MANIFEST['modular_spot'] == fresh
+    other = unified(disabled=('BTC-USDC',)).symbol_configs()['BTC-USDC']
+    assert other.fingerprint() == first  # entry switches are controls, not identity

@@ -109,6 +109,10 @@ class InjectedPaperMarketData(MarketDataProvider):
         prior = self._frame_publications.get(key, (0, 0))
         self._frame_publications[key] = (prior[0] + 1, available_at)
 
+    def candle_publication(self, connector_name, trading_pair, interval):
+        """(sequence, available_at) of the injected frame a read returns, or None before any publication."""
+        return getattr(self, '_frame_publications', {}).get((connector_name, trading_pair, interval))
+
     def get_candle_snapshot(self, dataset):
         from hummingbot.strategy_v2.components.candle_data import Candle, CandleSnapshot
         frame = self.get_candles_df(dataset.connector, dataset.trading_pair, dataset.interval, dataset.history)

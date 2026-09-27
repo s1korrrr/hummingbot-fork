@@ -36,6 +36,8 @@ class ModularRuntime:
         self.store = self.budget = self.selection_store = None
         self.market = self.input_identity = None
         self.closed_rows = {}
+        self._observation = None
+        self._decision_scope = None
         self.pending, self.pending_inputs = {}, {}
         self.dispatched = set()
         self.fault = None
@@ -88,6 +90,32 @@ class ModularRuntime:
         # Candles that scrolled out of the bounded window cannot be re-read; only re-readable ones count.
         return any(current[stamp] != digest for stamp, digest in rows.items() if stamp in current)
 
+    def _publication_key(self, now):
+        """Identity of the injected candle publication an observation depends on, or None.
+
+        Only a provider that publishes an explicit per-frame sequence (the native paper
+        session) qualifies. Within one candle interval the closed-bar set of a published
+        frame cannot change, so the computed features and closed-row digests are reused
+        until the next publication, the next interval boundary, or the frame going stale.
+        """
+        c, p = self.controller.config, self.controller.market_data_provider
+        publication = getattr(p, 'candle_publication', None)
+        if not callable(publication):
+            return None
+        published = publication(getattr(c, 'candles_connector', None) or c.connector_name, c.trading_pair, c.interval)
+        if published is None:
+            return None
+        return (tuple(published), c.max_records, int(now // c.interval_seconds()))
+
+    def _reusable_observation(self, key, now):
+        c = self.controller.config
+        cached = getattr(self, '_observation', None)
+        if key is None or cached is None or cached[0] != key:
+            return None
+        if now - (cached[1].candle_open + c.interval_seconds()) > c.max_candle_age_seconds:
+            return None  # `features` would reject stale candles; recompute so it does.
+        return cached
+
     def observe(self):
         c, p = self.controller.config, self.controller.market_data_provider
         self.market = self.input_identity = None
@@ -121,6 +149,12 @@ class ModularRuntime:
                 self.input_identity = snapshot.digest
                 frame = snapshot.frame(now=now, max_age=c.max_candle_age_seconds)
             else:
+                key = self._publication_key(now)
+                reusable = self._reusable_observation(key, now)
+                if reusable is not None:
+                    self.market, self.closed_rows, self.input_identity = reusable[1], dict(reusable[2]), reusable[3]
+                    self.reason = 'observed' if c.execution_enabled else 'execution_disabled'
+                    return self.market
                 # A research binding may read public candles under a separate owner namespace.
                 frame = p.get_candles_df(getattr(c, 'candles_connector', None) or c.connector_name,
                                          c.trading_pair, c.interval, c.max_records)
@@ -131,6 +165,8 @@ class ModularRuntime:
                                         pd.util.hash_pandas_object(closed, index=False).astype(str).tolist()))
             if c.data.mode != 'shared':
                 self.input_identity = identity(list(self.closed_rows.values()))
+                if key is not None:
+                    self._observation = (key, self.market, dict(self.closed_rows), self.input_identity)
             self.reason = 'observed' if c.execution_enabled else 'execution_disabled'
         except ERRORS as exc:
             self.reason = f'market_unavailable:{type(exc).__name__}:{exc}'
@@ -152,6 +188,9 @@ class ModularRuntime:
         return None
 
     def inventory(self):
+        scope = getattr(self, '_decision_scope', None)
+        if scope is not None and 'inventory' in scope:
+            return scope['inventory']
         c = self.controller.config
         recorder = self.ensure_store().recorder
         kwargs = dict(controller_id=c.id, connector=c.connector_name, pair=c.trading_pair)
@@ -163,7 +202,19 @@ class ModularRuntime:
             if old and (value.entry_quote < old.entry_quote or value.sold_base < old.sold_base
                         or (old.terminal and not value.terminal)):
                 raise PolicyError('native execution receipt regressed')
-        return {**saved, **current}
+        result = {**saved, **current}
+        if scope is not None:
+            scope['inventory'] = result
+        return result
+
+    def _native_executors(self):
+        """All recorded native executors; read once per decision, since a decision never writes them."""
+        scope = getattr(self, '_decision_scope', None)
+        if scope is None:
+            return self.ensure_store().recorder.get_all_executors()
+        if 'executors' not in scope:
+            scope['executors'] = self.ensure_store().recorder.get_all_executors()
+        return scope['executors']
 
     def _managed_pairs(self):
         c = self.controller.config
@@ -171,8 +222,7 @@ class ModularRuntime:
                    if view.remaining_base > 0 or not view.terminal}
         managed.update(item.trading_pair for item in self.pending.values())
         if self.budget is not None:
-            managed.update(self.budget.occupied_pairs(
-                native_executors=self.store.recorder.get_all_executors()))
+            managed.update(self.budget.occupied_pairs(native_executors=self._native_executors()))
         return tuple(sorted(managed))
 
     def _listed_execution(self, admitted):
@@ -285,6 +335,13 @@ class ModularRuntime:
             return []
         if c.universe.mode == 'sell_only':
             return self._sell_only_actions()
+        self._decision_scope = {}
+        try:
+            return self._decide(c)
+        finally:
+            self._decision_scope = None
+
+    def _decide(self, c):
         try:
             if c.fingerprint() != self.fingerprint:
                 raise PolicyError('implementation/configuration changed')
@@ -319,7 +376,7 @@ class ModularRuntime:
                 if self.budget is None:
                     self.reason = 'topology_unproven'
                     return bag_actions
-                if not self.budget.reserve(self.reservation(config), native_executors=store.recorder.get_all_executors()):
+                if not self.budget.reserve(self.reservation(config), native_executors=self._native_executors()):
                     self.reason = 'program_capital_or_asset_limit'
                     return bag_actions
             # A group claim remains reserved if this second persistence boundary fails.

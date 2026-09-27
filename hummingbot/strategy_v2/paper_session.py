@@ -144,6 +144,12 @@ def _runtime_identity():
     return digest.hexdigest()
 
 
+def _config_pairs(config):
+    """A multi-symbol owner declares every instrument; single-pair owners declare one."""
+    owned = getattr(config, 'owned_trading_pairs', None)
+    return tuple(owned()) if callable(owned) else (config.trading_pair,)
+
+
 class NativePaperSession:
     """Own a disposable native recorder, full controllers and real V2 orchestrator.
 
@@ -192,17 +198,19 @@ class NativePaperSession:
         configs = list(controller_configs)
         from controllers.generic.component_breakout import ComponentBreakoutConfig
         from controllers.generic.meridian_v3 import MeridianV3Config
+        from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig
         from controllers.generic.modular_spot_research import ModularSpotResearchConfig
         from controllers.generic.momentum_fusion_v2 import MomentumFusionV2Config
         from controllers.generic.rsi_modular import CONFIG_PROFILES
         allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(),
-                   ComponentBreakoutConfig, MomentumFusionV2Config, ModularSpotResearchConfig, MeridianV3Config)
+                   ComponentBreakoutConfig, MomentumFusionV2Config, ModularSpotResearchConfig, MeridianV3Config,
+                   MeridianUnifiedConfig)
         if not configs or len({c.id for c in configs}) != len(configs):
             raise ValueError('Distinct native paper controller identities required')
         for config in configs:
             if (type(config) not in allowed or getattr(config, 'execution_mode', None) != 'paper'
                     or config.connector_name != connector.name or config.data.mode != 'native'
-                    or config.trading_pair not in connector.trading_pairs):
+                    or not set(_config_pairs(config)) <= set(connector.trading_pairs)):
                 raise ValueError('Only explicitly paper-bound native modular controllers are admitted')
         path = Path(db_path)
         marker = path.with_suffix(path.suffix + '.paper-session.json')
@@ -447,7 +455,7 @@ class NativePaperSession:
         for row in observed_seconds:
             await self._connector.process_observed_second(**row)
         fresh_ids = {key for key, controller in self.controllers.items()
-                     if self._connector.pair_ready(controller.config.trading_pair)}
+                     if all(self._connector.pair_ready(pair) for pair in _config_pairs(controller.config))}
         for trade in trades:
             await self._connector.process_trade(**trade)
         self._refresh_reports(controller_ids=fresh_ids)

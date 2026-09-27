@@ -706,3 +706,68 @@ async def test_modular_spot_research_runtime_injects_max_records_and_reports_the
         if runtime is not None:
             await runtime.close()
         MarketsRecorder._shared_instance = prior
+
+
+MERIDIAN_PAIRS = ("BNB-USDC", "BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC")
+
+
+def meridian_file(tmp_path, **changes):
+    from test.meridian_v3.test_unified_runtime import unified
+
+    import yaml
+    config = unified(**changes)
+    path = tmp_path / "meridian_v3_unified_paper.yml"
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False))
+    return path, config
+
+
+def test_meridian_unified_paper_file_loads_strictly(tmp_path):
+    from scripts.component_paper_runtime import meridian_unified_paper_configs
+    path, reference = meridian_file(tmp_path, execution_enabled=True)
+    (loaded,) = meridian_unified_paper_configs([path], MERIDIAN_PAIRS)
+    assert loaded.model_dump(mode="json") == reference.model_dump(mode="json")
+    with pytest.raises(ValueError, match="pairs"):
+        meridian_unified_paper_configs([path], MERIDIAN_PAIRS[:4])
+    with pytest.raises(ValueError, match="one portfolio controller file"):
+        PaperConfig(bot_name="x", pairs=list(MERIDIAN_PAIRS), state_path=tmp_path / "p.sqlite",
+                    status_path=tmp_path / "s.json", candle_origin="http://127.0.0.1:8092",
+                    controller_kind="meridian_v3_unified", controller_files=[str(path), str(tmp_path / "b.yml")])
+
+
+@pytest.mark.asyncio
+async def test_meridian_unified_runtime_hosts_one_owner_for_five_pairs(tmp_path):
+    path, reference = meridian_file(tmp_path, execution_enabled=True)
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    runtime = None
+    try:
+        with patch("socket.getaddrinfo", side_effect=AssertionError("no networking")):
+            runtime = PaperRuntime(PaperConfig(
+                bot_name="meridian_paper_v3", pairs=list(MERIDIAN_PAIRS), state_path=tmp_path / "paper.sqlite",
+                status_path=tmp_path / "status.json", candle_origin="http://127.0.0.1:8092",
+                controller_kind="meridian_v3_unified", controller_files=[str(path)], simulated_quote="500"),
+                rules(MERIDIAN_PAIRS))
+            (controller,) = runtime.session.controllers.values()
+            assert controller.config.id == reference.id
+            assert {d.trading_pair: d.history for d in runtime.datasets} == {p: 1500 for p in MERIDIAN_PAIRS}
+            assert set(runtime.controller_ids.values()) == {reference.id}
+            now = 600000
+            await ack(runtime.liquidity)
+            runtime.candles.clock = lambda: now
+            runtime.candles.begin_session()
+            for pair in MERIDIAN_PAIRS:
+                runtime.candles.apply(dict(v=1, type="snapshot", epoch="fixture", published_at=now, received_at=now,
+                                           pair=pair, sequence=1,
+                                           rows=[row(t) for t in range(now - 60 * 1500, now, 60)]))
+                await runtime.liquidity.accept(book(now, pair), now)
+            result = await runtime.step(now)
+            assert result["actions"] == []  # the first observed cut only seeds each symbol
+            status = json.loads((tmp_path / "status.json").read_text())
+            assert status["controller_kind"] == "meridian_v3_unified"
+            (row_,) = status["controllers"]
+            assert row_["id"] == reference.id and sorted(row_["pair"]) == sorted(MERIDIAN_PAIRS)
+            assert status["unavailable_controller_ids"] == []
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        MarketsRecorder._shared_instance = prior

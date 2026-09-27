@@ -856,19 +856,19 @@ class StrategyV2Base(StrategyPyBase):
                 "coverage_note": "Known startup, expired-entry and result-receipt records; exchange-wide reconciliation is not observed."}
 
     def _build_runtime_operations_snapshot(self) -> Dict[str, Any]:
+        from hummingbot.strategy_v2.executors.executor_orchestrator import controller_market_pairs
         pairs = []
         for controller_id, controller in self.controllers.items():
             config = controller.config
-            connector = getattr(config, "connector_name", None)
-            pair = getattr(config, "trading_pair", None)
-            if not isinstance(connector, str) or not isinstance(pair, str):
-                continue
-            observation = self.market_data_provider.get_market_data_health(
-                connector, pair, getattr(config, "interval", None), observed_at=float(self.current_timestamp),
-                candle_connector=getattr(config, "candles_connector", None),
-                candle_pair=getattr(config, "candles_trading_pair", None))
-            observation["controller_id"] = controller_id
-            pairs.append(observation)
+            for connector, pair in controller_market_pairs(controller):
+                if not isinstance(connector, str) or not isinstance(pair, str):
+                    continue
+                observation = self.market_data_provider.get_market_data_health(
+                    connector, pair, getattr(config, "interval", None), observed_at=float(self.current_timestamp),
+                    candle_connector=getattr(config, "candles_connector", None),
+                    candle_pair=getattr(config, "candles_trading_pair", None))
+                observation["controller_id"] = controller_id
+                pairs.append(observation)
         return {"schema_version": 1,
                 "observed_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
                 "pairs": pairs, "reconciliation": self._runtime_reconciliation_observation()}

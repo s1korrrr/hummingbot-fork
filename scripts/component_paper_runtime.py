@@ -56,7 +56,8 @@ class PaperConfig(BaseModel):
     taker_fee: Decimal = Field(default=Decimal(".001"), ge=0, le=Decimal(".05"))
     trade_participation: Decimal = Field(default=Decimal(".1"), gt=0, le=1)
     book_max_age_seconds: float = Field(default=5, gt=0, le=5)
-    controller_kind: Literal["component_breakout", "rsi_modular", "modular_spot_research"] = "component_breakout"
+    controller_kind: Literal["component_breakout", "rsi_modular", "modular_spot_research",
+                             "meridian_v3_unified"] = "component_breakout"
     controller_files: tuple[Path, ...] = ()
 
     @field_validator("pairs")
@@ -81,10 +82,18 @@ class PaperConfig(BaseModel):
         if self.position_quote > self.simulated_quote:
             raise ValueError("Position allocation exceeds simulated cash")
         if (self.controller_kind != "component_breakout") != bool(self.controller_files):
-            raise ValueError("rsi_modular and modular_spot_research require controller_files; component_breakout forbids them")
+            raise ValueError("controller_files are required except for component_breakout, which forbids them")
         if any(not f.is_absolute() for f in self.controller_files) or len(set(self.controller_files)) != len(self.controller_files):
             raise ValueError("Distinct absolute controller_files required")
+        if self.controller_kind == "meridian_v3_unified" and len(self.controller_files) != 1:
+            raise ValueError("Meridian unified is one portfolio controller file")
         return self
+
+
+def owned_pairs(config):
+    """One declared pair, or every pair one multi-symbol owner declares."""
+    owned = getattr(config, "owned_trading_pairs", None)
+    return tuple(owned()) if callable(owned) else (config.trading_pair,)
 
 
 def json_value(value):
@@ -461,6 +470,24 @@ class PublicLiquidity:
         await self.factory._connections_factory.close()
 
 
+def meridian_unified_paper_configs(paths, pairs):
+    """The one Meridian portfolio controller (native paper wallet, injected 1m candles)."""
+    import yaml
+
+    from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig
+
+    (path,) = paths
+    values = yaml.safe_load(Path(path).read_text())
+    if not isinstance(values, dict) or values.get("controller_name") != "meridian_v3_unified":
+        raise ValueError(f"Meridian unified paper requires a meridian_v3_unified controller file: {path}")
+    config = MeridianUnifiedConfig.model_validate(values)
+    if config.execution_mode != "paper" or config.connector_name != "okx_paper_trade" or config.data.mode != "native":
+        raise ValueError("Meridian unified paper needs okx_paper_trade and injected native 1m candles")
+    if sorted(config.owned_trading_pairs()) != sorted(pairs):
+        raise ValueError("Meridian controller pairs must equal the configured pairs")
+    return [config]
+
+
 class PaperRuntime:
     def __init__(self, config, rules):
         self.config = config
@@ -473,6 +500,9 @@ class PaperRuntime:
         elif config.controller_kind == "modular_spot_research":
             configs = modular_spot_research_paper_configs(config.controller_files, config.pairs)
             history = {c.trading_pair: c.max_records for c in configs}  # the binding reads max_records closed candles
+        elif config.controller_kind == "meridian_v3_unified":
+            configs = meridian_unified_paper_configs(config.controller_files, config.pairs)
+            history = {p: 1500 for p in config.pairs}  # every symbol context reads the p23 1500-candle window
         else:
             configs = [
                 ComponentBreakoutConfig(
@@ -485,7 +515,7 @@ class PaperRuntime:
                 for p in config.pairs
             ]
             history = {p: 60 for p in config.pairs}
-        self.controller_ids = {c.trading_pair: c.id for c in configs}
+        self.controller_ids = {pair: c.id for c in configs for pair in owned_pairs(c)}
         self.datasets = [
             Dataset(connector="okx", trading_pair=p, history=history[p]) for p in config.pairs
         ]
@@ -600,7 +630,8 @@ class PaperRuntime:
         """Native status plus the identity the paper reader binds (filled from config only when absent)."""
         row = dict(controller.get_status_summary(), id=controller.config.id)
         row.setdefault("controller_name", controller.config.controller_name)
-        row.setdefault("pair", controller.config.trading_pair)
+        pairs = owned_pairs(controller.config)
+        row.setdefault("pair", pairs[0] if len(pairs) == 1 else list(pairs))
         row.setdefault("execution_mode", controller.config.execution_mode)
         return row
 

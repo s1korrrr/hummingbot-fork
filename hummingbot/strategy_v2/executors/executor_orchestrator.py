@@ -217,6 +217,26 @@ class PositionHold:
             cum_fees_quote=self.cum_fees_quote, remaining_fees_quote=remaining_fees_quote)
 
 
+def controller_market_pairs(controller) -> Tuple[Tuple[str, str], ...]:
+    """The (connector, pair) scopes a controller owns for native fill and position attribution.
+
+    A controller declares either one ``trading_pair`` or, for one owner of several
+    instruments, an explicit ``owned_trading_pairs()`` on its config. Nothing is inferred.
+    """
+    config = getattr(controller, "config", None)
+    connector_name = getattr(config, "connector_name", None)
+    trading_pair = getattr(config, "trading_pair", None)
+    if connector_name is None or trading_pair is None:
+        owned = getattr(config, "owned_trading_pairs", None)
+        if isinstance(connector_name, str) and callable(owned):
+            return tuple((connector_name, pair) for pair in owned())
+        connector_name = getattr(controller, "connector_name", None)
+        trading_pair = getattr(controller, "trading_pair", None)
+    if connector_name is None or trading_pair is None:
+        return ()
+    return ((connector_name, trading_pair),)
+
+
 class ExecutorOrchestrator:
     """
     Orchestrator for various executors.
@@ -474,8 +494,7 @@ class ExecutorOrchestrator:
                     or config.connector_name not in self.strategy.connectors
                     or config.trading_pair not in self.strategy.markets.get(config.connector_name, set())):
                 raise RestartContinuityError("Persisted executor market is unavailable or overridden")
-            if (getattr(controller.config, "connector_name", None) != config.connector_name
-                    or getattr(controller.config, "trading_pair", None) != config.trading_pair):
+            if (config.connector_name, config.trading_pair) not in controller_market_pairs(controller):
                 raise RestartContinuityError("Persisted executor controller identity differs")
             executor_class = self._continuity_executor_class(controller, config)
             executor = executor_class(self.strategy, config, self.executors_update_interval, self.executors_max_retries)
@@ -611,8 +630,7 @@ class ExecutorOrchestrator:
                     or config.connector_name not in self.strategy.connectors
                     or config.trading_pair not in self.strategy.markets.get(config.connector_name, set())):
                 raise ValueError("Planned position owner/market is unavailable or overridden")
-            if (controller.config.connector_name != config.connector_name
-                    or controller.config.trading_pair != config.trading_pair):
+            if (config.connector_name, config.trading_pair) not in controller_market_pairs(controller):
                 raise ValueError("Planned position controller identity differs")
             connector = self.strategy.connectors[config.connector_name]
             if any(order.trading_pair == config.trading_pair for order in connector.in_flight_orders.values()):
@@ -743,21 +761,13 @@ class ExecutorOrchestrator:
         controller_by_market_pair: Dict[Tuple[str, str], str] = {}
         ambiguous_market_pairs: Set[Tuple[str, str]] = set()
         for controller_id, controller in self.strategy.controllers.items():
-            controller_config = getattr(controller, "config", None)
-            connector_name = getattr(controller_config, "connector_name", None)
-            trading_pair = getattr(controller_config, "trading_pair", None)
-            if connector_name is None or trading_pair is None:
-                connector_name = getattr(controller, "connector_name", None)
-                trading_pair = getattr(controller, "trading_pair", None)
-            if connector_name is None or trading_pair is None:
-                continue
-            market_pair = (connector_name, trading_pair)
-            existing_controller_id = controller_by_market_pair.get(market_pair)
-            if existing_controller_id is not None and existing_controller_id != controller_id:
-                ambiguous_market_pairs.add(market_pair)
-                controller_by_market_pair.pop(market_pair, None)
-            elif market_pair not in ambiguous_market_pairs:
-                controller_by_market_pair[market_pair] = controller_id
+            for market_pair in controller_market_pairs(controller):
+                existing_controller_id = controller_by_market_pair.get(market_pair)
+                if existing_controller_id is not None and existing_controller_id != controller_id:
+                    ambiguous_market_pairs.add(market_pair)
+                    controller_by_market_pair.pop(market_pair, None)
+                elif market_pair not in ambiguous_market_pairs:
+                    controller_by_market_pair[market_pair] = controller_id
         return controller_by_market_pair, ambiguous_market_pairs
 
     @staticmethod
@@ -1218,10 +1228,9 @@ class ExecutorOrchestrator:
     ) -> Tuple[Set[Tuple[str, str, str]], Dict[Tuple[str, str, str], PositionHold]]:
         """Build atomically from exact receipts; legacy rows can only corroborate ledger truth."""
         controller_by_pair, ambiguous = self._controller_ids_by_market_pair()
-        selected_pairs = {(getattr(getattr(c, "config", c), "connector_name", None),
-                           getattr(getattr(c, "config", c), "trading_pair", None))
-                          for cid, c in self.strategy.controllers.items()
-                          if controller_ids is None or cid in controller_ids}
+        selected_pairs = {pair for cid, c in self.strategy.controllers.items()
+                          if controller_ids is None or cid in controller_ids
+                          for pair in controller_market_pairs(c)}
         owned_orders = self._executor_owned_order_keys(controller_ids=controller_ids)
         accounted_fills = self._executor_accounted_fill_keys(controller_ids=controller_ids)
         groups, ledger_by_order, positions = {}, {}, {}

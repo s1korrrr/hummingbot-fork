@@ -109,7 +109,7 @@ class ModularRuntime:
 
     def _reusable_observation(self, key, now):
         c = self.controller.config
-        cached = self._observation
+        cached = getattr(self, '_observation', None)
         if key is None or cached is None or cached[0] != key:
             return None
         if now - (cached[1].candle_open + c.interval_seconds()) > c.max_candle_age_seconds:
@@ -188,7 +188,7 @@ class ModularRuntime:
         return None
 
     def inventory(self):
-        scope = self._decision_scope
+        scope = getattr(self, '_decision_scope', None)
         if scope is not None and 'inventory' in scope:
             return scope['inventory']
         c = self.controller.config
@@ -209,7 +209,7 @@ class ModularRuntime:
 
     def _native_executors(self):
         """All recorded native executors; read once per decision, since a decision never writes them."""
-        scope = self._decision_scope
+        scope = getattr(self, '_decision_scope', None)
         if scope is None:
             return self.ensure_store().recorder.get_all_executors()
         if 'executors' not in scope:

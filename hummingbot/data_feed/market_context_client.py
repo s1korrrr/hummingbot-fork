@@ -134,6 +134,7 @@ class MarketContextClient:
         self._pending: deque = deque(maxlen=MAX_PENDING_NOTIFICATIONS)
         self._resync = False
         self._wake: asyncio.Event | None = None
+        self.last_notification_ms: int | None = None
 
     def on_notification(self, payload: Mapping | bytes, *, received_at_ms: int) -> None:
         """Queue a broker pointer; it is never a payload, and gaps/overflow recover from the canonical store."""
@@ -144,6 +145,7 @@ class MarketContextClient:
         if envelope.stream_id != self.stream_id:
             self.counters['foreign_notifications'] += 1
             return
+        self.last_notification_ms = int(received_at_ms)  # diagnostics only; snapshot receipt is its fetch time
         if len(self._pending) == self._pending.maxlen:
             self.counters['notification_overflow'] += 1
             self._resync = True

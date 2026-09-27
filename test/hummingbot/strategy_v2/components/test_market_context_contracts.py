@@ -198,8 +198,9 @@ def test_import_has_no_io_or_controller_dependency():
     for path in sorted(PACKAGE.glob('*.py')):
         for module in _imports(path):
             assert not any(module == f or module.startswith(f + '.') for f in forbidden), (path.name, module)
-        source = path.read_text()
-        assert 'time.time' not in source and 'datetime.now' not in source and 'monotonic' not in source
+        clock_reads = {'now', 'utcnow', 'today', 'monotonic', 'monotonic_ns', 'perf_counter', 'time_ns'}
+        assert not [node.attr for node in ast.walk(ast.parse(path.read_text()))
+                    if isinstance(node, ast.Attribute) and node.attr in clock_reads], path.name
     modules = sorted(path.stem for path in PACKAGE.glob('*.py') if path.stem != '__init__')
     assert 'contracts' in modules
     probe = (

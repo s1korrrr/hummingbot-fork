@@ -774,6 +774,47 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertLess(message.index("📊 STATUS • V1"), message.index("📊 STATUS • V2"))
         self.assertLess(message.index("🧿 MAIN"), message.index("🪙 SUI"))
 
+    async def test_v3_meridian_is_its_own_stack_block_and_never_summed(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {
+                "main": self.write_status_snapshot(root, "main", self.status_snapshot(
+                    "ok_rsi", controllers=["btc"], orders=0, executors=1, positions=1, equity=15000, net=12.5,
+                )),
+                "v2": self.write_status_snapshot(root, "v2", self.status_snapshot(
+                    "rsi_modular_v2", controllers=["btc"], orders=1, executors=1, positions=1, equity=80, net=1.5,
+                )),
+                "v3": self.write_status_snapshot(root, "v3", self.status_snapshot(
+                    "meridian_v3", controllers=["modular_spot_meridian_v3_unified_live"],
+                    orders=2, executors=3, positions=2, equity=500, net=4.25,
+                )),
+            }
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                notifier = TelegramNotifier(self.hb_app)
+                everything = await notifier._dispatch_command("status", [])
+                v3_only = await notifier._dispatch_command("status", ["v3"])
+                v3_balances = await notifier._dispatch_command("balances", ["v3"])
+
+        self.assertLess(everything.index("📊 STATUS • V2"), everything.index("📊 STATUS • V3"))
+        self.assertIn("🧭 V3: meridian_v3", everything)
+        self.assertIn("💹 Reporting Net: $4.25", everything)
+        self.assertNotIn("$18.25", everything)
+        self.assertNotIn("$5.75", everything)
+        self.assertIn("STATUS • V3", v3_only)
+        self.assertIn("meridian_v3", v3_only)
+        self.assertNotIn("rsi_modular_v2", v3_only)
+        self.assertNotIn("ok_rsi", v3_balances)
+
+    async def test_missing_v3_snapshot_is_reported_unavailable_not_skipped(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = {"v2": self.write_status_snapshot(root, "v2", self.status_snapshot(
+                "rsi_modular_v2", controllers=["btc"], orders=0, executors=0, positions=0, equity=80, net=0,
+            )), "v3": str(root / "missing.status.json")}
+            with patch.dict(os.environ, {"HB_TELEGRAM_STATUS_SNAPSHOTS": json.dumps(paths)}):
+                message = await TelegramNotifier(self.hb_app)._dispatch_command("status", ["v3"])
+        self.assertIn("V3 status unavailable", message)
+
     async def test_status_without_scope_keeps_rsi_v5_out_of_v1_v2_blocks(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -877,8 +918,8 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
     async def test_status_rejects_unknown_or_extra_scope_arguments(self):
         notifier = TelegramNotifier(self.hb_app)
 
-        self.assertEqual("Usage: /status [v1|v2]", await notifier._dispatch_command("status", ["other"]))
-        self.assertEqual("Usage: /status [v1|v2]", await notifier._dispatch_command("status", ["main", "sui"]))
+        self.assertEqual("Usage: /status [v1|v2|v3]", await notifier._dispatch_command("status", ["other"]))
+        self.assertEqual("Usage: /status [v1|v2|v3]", await notifier._dispatch_command("status", ["main", "sui"]))
 
     async def test_status_balances_controllers_accept_v1_v2_or_both_without_merging(self):
         with TemporaryDirectory() as directory:
@@ -947,7 +988,7 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn("value $80", v1_balances)
         self.assertNotIn("value $100", v2_balances)
         self.assertNotIn("value $192", both_balances)
-        self.assertEqual("Usage: /balances [v1|v2]", usage)
+        self.assertEqual("Usage: /balances [v1|v2|v3]", usage)
 
         self.assertIn("🧠 CONTROLLERS • V1", both_controllers)
         self.assertIn("🧠 CONTROLLERS • V2", both_controllers)
@@ -955,7 +996,7 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("HUNTING", v2_controllers)
         self.assertNotIn("HUNTING", v1_controllers)
         self.assertNotIn("SUI-USDC", v2_controllers)
-        self.assertEqual("Usage: /controllers [v1|v2]", await TelegramNotifier(self.hb_app)._dispatch_command(
+        self.assertEqual("Usage: /controllers [v1|v2|v3]", await TelegramNotifier(self.hb_app)._dispatch_command(
             "controllers", ["paper"]))
 
     async def test_status_distinguishes_active_from_closing_executor_count(self):
@@ -1115,7 +1156,7 @@ class TelegramNotifierTest(IsolatedAsyncioWrapperTestCase):
         self.assertIn("⚙️ EXECUTORS • SUI", message)
         self.assertIn("🪙 SUI: ok_rsi_sui_sell_only", message)
         self.assertNotIn("ok_rsi\n", message)
-        self.assertEqual("Usage: /executors [main|sui|rsi-v5|v2]", usage)
+        self.assertEqual("Usage: /executors [main|sui|rsi-v5|v2|v3]", usage)
 
     async def test_run_command_loop_retries_after_transient_failure(self):
         notifier = TelegramNotifier(self.hb_app)

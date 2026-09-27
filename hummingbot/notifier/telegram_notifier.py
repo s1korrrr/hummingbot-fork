@@ -56,16 +56,19 @@ class TelegramNotifier(NotifierBase):
         "sui": "ok_rsi_sui_sell_only",
         "rsi-v5": "rsi_v5",
         "v2": "rsi_modular_v2",
+        "v3": "meridian_v3",
     }
     STACK_SCOPES = {
         "v1": ("main", "sui"),
         "v2": ("v2",),
+        "v3": ("v3",),
     }
     CONTROLLER_MARKERS = {
         "ok_rsi": "🧿",
         "rsi_v5": "⚡",
         "ok_rsi_sui_sell_only": "🪙",
         "rsi_modular_v2": "🧿",
+        "meridian_v3": "🧭",
     }
     EXECUTOR_LIFECYCLE_LABELS = {
         "not_started": "CREATING",
@@ -84,11 +87,11 @@ class TelegramNotifier(NotifierBase):
         ("start", "bind chat and show command list"),
         ("help", "show all trading desk commands"),
         ("ping", "basic bot health check"),
-        ("status", "portfolio overview (v1|v2, or both)"),
-        ("balances", "balances by stack (v1|v2, or both)"),
-        ("controllers", "controller lanes (v1|v2, or both)"),
+        ("status", "portfolio overview (v1|v2|v3, or all)"),
+        ("balances", "balances by stack (v1|v2|v3, or all)"),
+        ("controllers", "controller lanes (v1|v2|v3, or all)"),
         ("focus", "attention queue from controllers"),
-        ("executors", "executor and order lifecycle (main|sui|rsi-v5|v2)"),
+        ("executors", "executor and order lifecycle (main|sui|rsi-v5|v2|v3)"),
         ("positions", "held positions summary"),
         ("performance", "realized, unrealized, fees, volume"),
         ("orders", "active orders and latest stored orders"),
@@ -525,7 +528,7 @@ class TelegramNotifier(NotifierBase):
     def _command_scope(self, args: List[str], command: str) -> Tuple[Optional[str], Optional[str]]:
         allowed = set(self.STACK_SCOPES) | set(self.STATUS_LANES)
         if len(args) > 1 or (args and args[0].lower() not in allowed):
-            return None, f"Usage: /{command} [v1|v2]"
+            return None, f"Usage: /{command} [{'|'.join(self.STACK_SCOPES)}]"
         return (args[0].lower() if args else None), None
 
     def _iter_requested_stacks(self, token: Optional[str]):

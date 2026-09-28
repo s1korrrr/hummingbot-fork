@@ -533,7 +533,9 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
         if not self.is_closed:
             self._clear_replacement()
             self._entry_child_submission_authorized = False
-            reason = "external_invalidation" if keep_position else "early_stop"
+            # A full keep-position stop hands the fill to the held ledger; it is not the
+            # acquisition-only "external_invalidation" stop, which keeps the executor.
+            reason = "position_hold" if keep_position else "early_stop"
             self._end_entry_acquisition(reason)
             if self._cumulative_entry_filled_base() > Decimal("0"):
                 self._entry_lifecycle["state"] = "managing_fill"

@@ -1994,6 +1994,12 @@ class ExecutorOrchestrator:
         if getattr(action, "acquisition_only", False) and callable(stop_acquisition):
             stop_acquisition("external_invalidation")
             return
+        if not executor.is_closed and executor.status != RunnableStatus.SHUTTING_DOWN:
+            filled = getattr(executor, "open_filled_amount", None)
+            self.logger().warning(
+                f"Executor stop requested | controller={controller_id} executor={executor_id} "
+                f"keep_position={action.keep_position} filled_base={filled} "
+                f"close_type={'POSITION_HOLD' if action.keep_position else 'EARLY_STOP'}")
         executor.early_stop(action.keep_position)
 
     def _update_positions_from_done_executors(self, *, controller_ids: Optional[Set[str]] = None):

@@ -78,6 +78,21 @@ def test_histogram_has_symmetric_overflow_and_exact_count_conservation():
     assert result.zero_count == 1
 
 
+@pytest.mark.parametrize("horizon,span", [(1, 0.5), (5, 1), (15, 2), (60, 3), (240, 5), (1440, 10)])
+def test_declared_histogram_spans_conserve_boundary_and_overflow_values(horizon, span):
+    from hummingbot.strategy_v2.market_context.market_picture.definitions import get_definition
+
+    definition = get_definition("return_distribution_40_bins")
+    parameters = dict(definition.parameters)
+    assert float(parameters["spans_percent"][str(horizon)]) == span
+    result = histogram([-span - 0.01, -span, 0, span, span + 0.01], span, parameters["interior_bins"])
+    assert len(result.counts) == 42
+    assert result.edges[0] == -span and result.edges[-1] == span
+    assert result.counts[0] == result.counts[-1] == 1
+    assert result.counts[1] == result.counts[-2] == 1
+    assert sum(result.counts) == 5
+
+
 def test_participation_predicate_uses_strict_comparison_and_real_valid_denominator():
     result = count_predicate({"a": 70.0, "b": 70.01, "c": None}, lambda x: x > 70.0, 3)
     assert (result.numerator, result.denominator, result.expected_denominator) == (1, 2, 3)

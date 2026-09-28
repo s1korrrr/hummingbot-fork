@@ -66,6 +66,18 @@ DEFINITIONS = {
         {"source": "latest-confirmed-closed-minute"},
         "Last confirmed close in the declared quote numeraire.",
     ),
+    "return_distribution_40_bins": _definition(
+        "return_distribution_40_bins",
+        "return_percent",
+        {
+            "spans_percent": {"1": "0.5", "5": "1", "15": "2", "60": "3", "240": "5", "1440": "10"},
+            "interior_bins": 40,
+            "interior": "lower-inclusive-upper-exclusive",
+            "last_interior_upper": "inclusive",
+            "overflow": "strictly-outside-symmetric-span",
+        },
+        "Fixed symmetric empirical return bins per horizon, with two explicit overflow bins.",
+    ),
     "breadth_counts": _definition(
         "breadth_counts",
         "count",

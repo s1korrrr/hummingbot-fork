@@ -348,6 +348,14 @@ impl Projection {
         validate_cache_bars(&body.bars_1m, Interval::Minute, MINUTE_ROWS)?;
         validate_cache_bars(&body.bars_1h, Interval::Hour, HOUR_ROWS)?;
         validate_cache_bars(&body.bars_1d, Interval::Day, DAY_ROWS)?;
+        ensure!(
+            body.bars_1m
+                .iter()
+                .chain(&body.bars_1h)
+                .chain(&body.bars_1d)
+                .all(|bar| bar.available_at_ms <= body.saved_at_ms),
+            "cached source availability follows cache save time"
+        );
         intern_bar_epochs(&mut body.bars_1m);
         intern_bar_epochs(&mut body.bars_1h);
         intern_bar_epochs(&mut body.bars_1d);
@@ -518,34 +526,28 @@ impl Projection {
                 .minute
                 .iter()
                 .find(|row| row.open_time_ms == bar.open_time_ms);
-            if previous.is_some_and(|existing| same_market_values(existing, &bar)) {
-                continue;
-            }
-            changed = true;
-            if previous.is_some() || open_s % 3_600 == 3_540 {
+            // A source snapshot or correction can revise receipt and epoch
+            // lineage without changing OHLCV. Keep the supplied row so the
+            // latest row and the response header describe the same revision.
+            changed |= previous.is_none_or(|existing| existing != &bar);
+            let market_changed =
+                previous.is_none_or(|existing| !same_market_values(existing, &bar));
+            let historical_insert = previous.is_none()
+                && history
+                    .minute
+                    .back()
+                    .is_some_and(|last| bar.open_time_ms < last.open_time_ms);
+            if market_changed
+                && (previous.is_some() || historical_insert || open_s % 3_600 == 3_540)
+            {
                 touched.push((Interval::Hour, open_s / 3_600 * 3_600));
             }
-            if previous.is_some() || open_s % 86_400 == 86_340 {
+            if market_changed
+                && (previous.is_some() || historical_insert || open_s % 86_400 == 86_340)
+            {
                 touched.push((Interval::Day, open_s / 86_400 * 86_400));
             }
             insert_sorted(&mut history.minute, bar, MINUTE_ROWS);
-        }
-        if snapshot {
-            let starts: Vec<u64> = history
-                .minute
-                .iter()
-                .map(|bar| bar.open_time_ms / 1000)
-                .collect();
-            touched.extend(
-                starts
-                    .iter()
-                    .map(|time| (Interval::Hour, time / 3_600 * 3_600)),
-            );
-            touched.extend(
-                starts
-                    .iter()
-                    .map(|time| (Interval::Day, time / 86_400 * 86_400)),
-            );
         }
         touched.sort_unstable();
         touched.dedup();
@@ -651,7 +653,7 @@ impl Projection {
             None
         } else if invalid_bucket {
             Some("aggregate_overflow".to_owned())
-        } else if history.last_observed_at_ms == 0 {
+        } else if history.last_observed_at_ms == 0 && bars.is_empty() {
             Some("warming".to_owned())
         } else if !fresh_source {
             Some("stale".to_owned())
@@ -669,7 +671,32 @@ impl Projection {
             first_open_time_ms: bars.first().map(|bar| bar.open_time_ms),
             last_close_time_ms: newest_close,
         };
-        let available_at_ms = history.last_observed_at_ms;
+        // Row availability includes the source publish time, which can follow
+        // its receive time. The receive time remains the independent freshness
+        // signal above; it cannot serve as this response's availability bound.
+        let available_at_ms = bars
+            .iter()
+            .map(|bar| bar.available_at_ms)
+            .max()
+            .unwrap_or(0)
+            .max(history.available_at_ms);
+        // Hourly and daily aggregates retain the revision at which their
+        // latest completed bucket was sealed. The minute source can advance
+        // many revisions before either aggregate changes again.
+        let source_epoch = bars
+            .last()
+            .map(|bar| bar.source_epoch.to_string())
+            .unwrap_or_else(|| {
+                if history.source_epoch.is_empty() {
+                    "unavailable".to_owned()
+                } else {
+                    history.source_epoch.to_string()
+                }
+            });
+        let source_sequence = bars
+            .last()
+            .map(|bar| bar.source_sequence)
+            .unwrap_or(history.source_sequence);
         validate_bars(&bars, interval, expected)?;
         let cutoff_ms = bars.last().map(|bar| bar.close_time_ms);
         // Even typed stale/unavailable responses need a coherent response
@@ -685,12 +712,8 @@ impl Projection {
             interval: interval.name().into(),
             epoch: self.epoch.clone(),
             sequence: history.projection_sequence,
-            source_epoch: if history.source_epoch.is_empty() {
-                "unavailable".to_owned()
-            } else {
-                history.source_epoch.to_string()
-            },
-            source_sequence: history.source_sequence,
+            source_epoch,
+            source_sequence,
             source_epochs: source_epoch_dictionary(&bars),
             published_at_ms: now_ms,
             available_at_ms,
@@ -1446,8 +1469,10 @@ mod tests {
             .response(&pair, Interval::Minute, 4_000_000_100)
             .unwrap();
         assert!(!response.ready);
-        assert_eq!(response.reason.as_deref(), Some("warming"));
+        assert_eq!(response.reason.as_deref(), Some("stale"));
         assert_eq!(response.bars.len(), MINUTE_ROWS);
+        assert_eq!(response.available_at_ms, response.bars.last().unwrap().6);
+        assert!(response.available_at_ms <= response.published_at_ms);
     }
 
     #[test]
@@ -1611,6 +1636,238 @@ mod tests {
         assert!(response.bars.is_empty());
         assert_eq!(response.source_epoch, "unavailable");
         assert_eq!(response.source_epochs, Vec::<String>::new());
+        assert_eq!(response.sequence, 0);
+        assert_eq!(response.source_sequence, 0);
+        assert_eq!(response.cutoff_ms, None);
+        assert_eq!(response.coverage.first_open_time_ms, None);
+        assert_eq!(response.coverage.last_close_time_ms, None);
+        assert!(response.expires_at_ms > response.published_at_ms);
+
+        let disabled =
+            Projection::unavailable("BTC-USDC", Interval::Day, 2_000, "projection_disabled");
+        assert_eq!(disabled.reason.as_deref(), Some("projection_disabled"));
+        assert_eq!(disabled.cutoff_ms, None);
+        assert_eq!(disabled.coverage.first_open_time_ms, None);
+        assert_eq!(disabled.coverage.last_close_time_ms, None);
+        assert_eq!(disabled.expires_at_ms, 0);
+    }
+
+    #[test]
+    fn source_publish_lag_and_unchanged_reconnect_keep_response_lineage_coherent() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let open_time = (now_ms / 60_000 - 1) * 60;
+        let candle = Arc::new(crate::model::Candle {
+            open_time,
+            open: "1".into(),
+            high: "1".into(),
+            low: "1".into(),
+            close: "1".into(),
+            volume: "1".into(),
+            quote_volume: "1".into(),
+            confirmed: true,
+        });
+        let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 2_000);
+        for (epoch, sequence) in [("epoch-a", 1), ("epoch-b", 1), ("epoch-b", 2)] {
+            projection
+                .observe(
+                    Event::Snapshot {
+                        metadata: serde_json::json!({
+                            "v": 1,
+                            "type": "snapshot",
+                            "epoch": epoch,
+                            "pair": pair,
+                            "sequence": sequence,
+                            "published_at": now_ms as f64 / 1000.0,
+                            "received_at": (now_ms - 1_000) as f64 / 1000.0,
+                        }),
+                        rows: vec![candle.clone()].into(),
+                    },
+                    now_ms,
+                )
+                .unwrap();
+            let response = projection
+                .response(&pair, Interval::Minute, now_ms)
+                .unwrap();
+            let newest = response.bars.last().unwrap();
+            assert_eq!(response.available_at_ms, now_ms);
+            assert_eq!(newest.6, response.available_at_ms);
+            assert_eq!(response.source_epochs[newest.7], epoch);
+            assert_eq!(newest.8, sequence);
+            assert_eq!(response.source_epoch, epoch);
+            assert_eq!(response.source_sequence, sequence);
+        }
+    }
+
+    #[test]
+    fn completed_hour_and_day_keep_their_revision_when_minute_source_advances() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let hour_close = now_ms / 3_600_000 * 3_600_000;
+        let day_close = now_ms / 86_400_000 * 86_400_000;
+        let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 2_000);
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        let mut hour = bar(hour_close - 3_600_000, "1");
+        hour.close_time_ms = hour_close;
+        hour.available_at_ms = hour_close;
+        let mut day = bar(day_close - 86_400_000, "1");
+        day.close_time_ms = day_close;
+        day.available_at_ms = day_close;
+        history.hour.push_back(hour);
+        history.day.push_back(day);
+        history.source_epoch = "newer-minute-epoch".into();
+        history.source_sequence = 2;
+        history.projection_sequence = 2;
+        history.available_at_ms = now_ms;
+        history.last_observed_at_ms = now_ms;
+        history.ready_source = true;
+        for interval in [Interval::Hour, Interval::Day] {
+            let response = projection.response(&pair, interval, now_ms).unwrap();
+            assert_eq!(response.source_epoch, "source-epoch");
+            assert_eq!(response.source_sequence, 1);
+            assert_eq!(
+                response.source_epochs[response.bars[0].7],
+                response.source_epoch
+            );
+            assert_eq!(response.bars[0].8, response.source_sequence);
+        }
+    }
+
+    #[test]
+    fn small_snapshot_preserves_unsupplied_cached_rollups_until_a_market_correction() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let old_day_start = (now_ms / 86_400_000 - 1) * 86_400_000;
+        let old_hour_start = old_day_start + 23 * 3_600_000;
+        let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 2_000);
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        history.minute = (0..1_440)
+            .map(|index| {
+                let mut value = bar(old_day_start + index * 60_000, "1");
+                value.source_epoch = "cached-source".into();
+                value.source_sequence = 7;
+                value
+            })
+            .collect();
+        let cached_hour = match aggregate_bucket(
+            &history.minute,
+            Interval::Hour,
+            old_hour_start / 1000,
+            &Arc::from("cached-source"),
+            7,
+            old_hour_start + 3_600_000,
+        )
+        .unwrap()
+        {
+            AggregateOutcome::Complete(value) => value,
+            _ => panic!("cached hour fixture must be complete"),
+        };
+        let cached_day = match aggregate_bucket(
+            &history.minute,
+            Interval::Day,
+            old_day_start / 1000,
+            &Arc::from("cached-source"),
+            7,
+            old_day_start + 86_400_000,
+        )
+        .unwrap()
+        {
+            AggregateOutcome::Complete(value) => value,
+            _ => panic!("cached day fixture must be complete"),
+        };
+        history.hour.push_back(cached_hour.clone());
+        history.day.push_back(cached_day.clone());
+        history.source_epoch = "cached-source".into();
+        history.source_sequence = 7;
+
+        let make_candle = |open_time_ms: u64, high: &str, close: &str| {
+            Arc::new(crate::model::Candle {
+                open_time: open_time_ms / 1000,
+                open: "1".into(),
+                high: high.into(),
+                low: "1".into(),
+                close: close.into(),
+                volume: "1".into(),
+                quote_volume: "1".into(),
+                confirmed: true,
+            })
+        };
+        let newest_open = (now_ms / 60_000 - 1) * 60_000;
+        for (sequence, row) in [
+            (1, make_candle(newest_open, "1", "1")),
+            (2, make_candle(old_hour_start + 10 * 60_000, "2", "2")),
+        ] {
+            projection
+                .observe(
+                    Event::Snapshot {
+                        metadata: serde_json::json!({
+                            "v": 1, "type": "snapshot", "epoch": "new-source", "pair": pair,
+                            "sequence": sequence, "published_at": now_ms as f64 / 1000.0,
+                            "received_at": (now_ms - 1_000) as f64 / 1000.0,
+                        }),
+                        rows: vec![row].into(),
+                    },
+                    now_ms,
+                )
+                .unwrap();
+            let hour = projection.pairs[&pair].hour.front().unwrap();
+            let day = projection.pairs[&pair].day.front().unwrap();
+            if sequence == 1 {
+                assert_eq!(
+                    hour, &cached_hour,
+                    "unsupplied cache must retain its source revision"
+                );
+                assert_eq!(day, &cached_day);
+            } else {
+                assert_eq!(hour.source_epoch.as_ref(), "new-source");
+                assert_eq!(hour.source_sequence, 2);
+                assert_eq!(hour.high, Decimal::TWO);
+                assert_eq!(day.source_epoch.as_ref(), "new-source");
+                assert_eq!(day.source_sequence, 2);
+                assert_eq!(day.high, Decimal::TWO);
+            }
+        }
+    }
+
+    #[test]
+    fn historical_gap_fill_completes_hour_and_day_without_a_new_closing_bar() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let day_start = (now_ms / 86_400_000 - 1) * 86_400_000;
+        let missing_open = day_start + 100 * 60_000;
+        let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 2_000);
+        projection.pairs.get_mut(&pair).unwrap().minute = (0..1_440)
+            .filter(|index| *index != 100)
+            .map(|index| bar(day_start + index * 60_000, "1"))
+            .collect();
+        projection
+            .observe(
+                Event::Snapshot {
+                    metadata: serde_json::json!({
+                        "v": 1, "type": "snapshot", "epoch": "gap-repair", "pair": pair,
+                        "sequence": 1, "published_at": now_ms as f64 / 1000.0,
+                        "received_at": (now_ms - 1_000) as f64 / 1000.0,
+                    }),
+                    rows: vec![Arc::new(crate::model::Candle {
+                        open_time: missing_open / 1000,
+                        open: "1".into(),
+                        high: "1".into(),
+                        low: "1".into(),
+                        close: "1".into(),
+                        volume: "1".into(),
+                        quote_volume: "1".into(),
+                        confirmed: true,
+                    })]
+                    .into(),
+                },
+                now_ms,
+            )
+            .unwrap();
+        let history = &projection.pairs[&pair];
+        assert_eq!(history.hour.len(), 1);
+        assert_eq!(history.day.len(), 1);
+        assert_eq!(history.hour[0].source_epoch.as_ref(), "gap-repair");
+        assert_eq!(history.day[0].source_epoch.as_ref(), "gap-repair");
     }
 
     #[test]

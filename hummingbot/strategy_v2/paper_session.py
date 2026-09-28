@@ -80,19 +80,20 @@ class InjectedPaperMarketData(MarketDataProvider):
         required = {'timestamp', 'open', 'high', 'low', 'close', 'volume'}
         if not isinstance(frame, pd.DataFrame) or not required.issubset(frame.columns) or frame.empty:
             raise ValueError('Native candle columns are required')
-        numeric = frame[list(required)].astype(float)
-        timestamps = numeric['timestamp']
-        if (not np.isfinite(numeric.to_numpy()).all() or not timestamps.is_monotonic_increasing
-                or timestamps.duplicated().any() or (timestamps + seconds > available_at).any()
-                or (timestamps < 0).any() or (timestamps % seconds != 0).any()
-                or (timestamps.diff().dropna() != seconds).any()
-                or (numeric[['open', 'high', 'low', 'close']] <= 0).any().any()
-                or (numeric['volume'] < 0).any()
-                or (numeric['low'] > numeric[['open', 'close']].min(axis=1)).any()
-                or (numeric['high'] < numeric[['open', 'close']].max(axis=1)).any()):
+        # One float array and vectorized checks: the same rules as per-column pandas operations.
+        values = frame[['timestamp', 'open', 'high', 'low', 'close', 'volume']].astype(float).to_numpy()
+        timestamps, open_, high, low, close, volume = values.T
+        steps = np.diff(timestamps)
+        if (not np.isfinite(values).all() or (steps <= 0).any() or (timestamps + seconds > available_at).any()
+                or (timestamps < 0).any() or (timestamps % seconds != 0).any() or (steps != seconds).any()
+                or (values[:, 1:5] <= 0).any() or (volume < 0).any()
+                or (low > np.minimum(open_, close)).any() or (high < np.maximum(open_, close)).any()):
             raise ValueError('Non-finite, unordered, duplicated, or unavailable candles')
-        if 'confirmed' in frame and not frame['confirmed'].map(lambda value: isinstance(value, (bool, np.bool_)) and bool(value)).all():
-            raise ValueError('Only confirmed candles are admitted to paper replay')
+        if 'confirmed' in frame:
+            confirmed = frame['confirmed']
+            if not (confirmed.dtype == bool and confirmed.to_numpy().all()) and not confirmed.map(
+                    lambda value: isinstance(value, (bool, np.bool_)) and bool(value)).all():
+                raise ValueError('Only confirmed candles are admitted to paper replay')
         for field in ('quote_asset_volume', 'n_trades', 'taker_buy_base_volume', 'taker_buy_quote_volume'):
             if field in frame:
                 values = pd.to_numeric(frame[field], errors='raise')
@@ -453,7 +454,12 @@ class NativePaperSession:
                 timestamp, books, trades, candles, observed_seconds)
 
             def encode(value):
-                return value.to_json(orient='split', double_precision=15) if isinstance(value, pd.DataFrame) else str(value)
+                if not isinstance(value, pd.DataFrame):
+                    return str(value)
+                # Interruption evidence only: a content digest of the frame, not its full JSON text.
+                digest = hashlib.sha256(json.dumps([list(map(str, value.columns)), list(map(str, value.dtypes))]).encode())
+                digest.update(pd.util.hash_pandas_object(value, index=True).to_numpy().tobytes())
+                return digest.hexdigest()
             receipt = {'schema': 'native_paper_step_v1', 'status': 'in_progress', 'identity': self._identity,
                        'clock_before': self.current_timestamp, 'timestamp': timestamp,
                        'input_sha256': hashlib.sha256(json.dumps(

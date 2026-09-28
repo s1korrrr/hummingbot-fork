@@ -526,13 +526,20 @@ class MarketsRecorder:
             self._market_data_collection_task.cancel()
 
     def store_or_update_executor(self, executor, executor_info: Optional[ExecutorInfo] = None):
-        """`executor_info` may carry the info the caller already built for `executor` in the same pass."""
+        """`executor_info` may carry the info the caller already built for `executor` in the same pass.
+
+        With cached executor reads, a row this recorder last wrote with identical content is
+        not rewritten; any other writer to the Executors table clears that knowledge first.
+        """
+        info = executor.executor_info if executor_info is None else executor_info
+        if info.id != executor.config.id:
+            raise ValueError("Executor info belongs to another executor")
+        serialized_config = info.model_dump_json()
+        reads = self._executor_reads
+        if reads is not None and reads["written"].get(info.id) == serialized_config:
+            return
         with self._sql_manager.get_new_session() as session:
             existing_executor = session.query(Executors).filter(Executors.id == executor.config.id).one_or_none()
-            info = executor.executor_info if executor_info is None else executor_info
-            if info.id != executor.config.id:
-                raise ValueError("Executor info belongs to another executor")
-            serialized_config = info.model_dump_json()
             executor_dict = json.loads(serialized_config)
             if existing_executor:
                 # Update existing executor
@@ -542,7 +549,15 @@ class MarketsRecorder:
                 # Insert new executor
                 new_executor = Executors(**executor_dict)
                 session.add(new_executor)
-            session.commit()
+            if reads is None:
+                session.commit()
+                return
+            reads["own"] = True
+            try:
+                session.commit()
+            finally:
+                reads["own"] = False
+            reads["written"][info.id] = serialized_config
 
     @staticmethod
     def _same_rsi_v5_runtime_fact(row: RSIV5RuntimeEvent, event: Dict[str, Any]) -> bool:
@@ -843,6 +858,9 @@ class MarketsRecorder:
             return executors
 
     def get_executors_by_controller(self, controller_id: str = None) -> List[ExecutorInfo]:
+        if self._executor_reads is not None:
+            # Same rows, in the same table order, as the filtered query.
+            return [info for info in self._all_executor_infos() if info.controller_id == controller_id]
         with self._sql_manager.get_new_session() as session:
             executors = session.query(Executors).filter(Executors.controller_id == controller_id).all()
             return [executor.to_executor_info() for executor in executors]
@@ -857,12 +875,14 @@ class MarketsRecorder:
         """
         if self._executor_reads is not None:
             return
-        reads = self._executor_reads = {"rows": None, "pending": False}
+        reads = self._executor_reads = {"rows": None, "pending": False, "own": False, "written": {}}
 
         def statement(conn, cursor, text, parameters, context, executemany):
             head = text.lstrip()[:8].upper()
             if not head.startswith(("SELECT", "PRAGMA")) and "EXECUTORS" in text.upper():
                 reads["rows"], reads["pending"] = None, True
+                if not reads["own"]:
+                    reads["written"].clear()
 
         def boundary(conn):
             if reads["pending"]:
@@ -874,6 +894,9 @@ class MarketsRecorder:
         sql_event.listen(engine, "rollback", boundary)
 
     def get_all_executors(self) -> List[ExecutorInfo]:
+        return self._all_executor_infos()
+
+    def _all_executor_infos(self) -> List[ExecutorInfo]:
         reads = self._executor_reads
         if reads is not None and reads["rows"] is not None:
             return [info.model_copy() for info in reads["rows"]]

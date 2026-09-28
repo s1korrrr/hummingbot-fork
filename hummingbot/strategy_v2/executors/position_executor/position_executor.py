@@ -27,7 +27,7 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1, validate_acquisition_chain
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
-from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
+from hummingbot.strategy_v2.executors.order_accounting import in_flight_base_fee
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
     TrailingStop,
@@ -536,7 +536,7 @@ class PositionExecutor(ExecutorBase):
         """
         base_asset = self.config.trading_pair.split("-")[0]
         amount = sum((order.executed_amount_base - (
-            base_fee_amount(order.order.to_json(), base_asset) if order.order is not None and self.config.side == TradeType.BUY else Decimal("0")
+            in_flight_base_fee(order.order, base_asset) if order.order is not None and self.config.side == TradeType.BUY else Decimal("0")
         ) for order in self._entry_orders()), Decimal("0"))
         return amount
 

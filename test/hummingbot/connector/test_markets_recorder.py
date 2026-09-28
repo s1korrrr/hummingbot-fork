@@ -822,6 +822,12 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         with self.manager.get_new_session() as session, session.begin():  # a direct Core statement
             session.execute(update(Executors).where(Executors.id == "b").values(net_pnl_quote=4))
         self.assertEqual(Decimal("4"), pnls()["b"])
+        with self.manager.get_new_session() as session, session.begin():  # a row of another controller
+            other = json.loads(executor("z", "5").executor_info.model_dump_json())
+            session.add(Executors(**{**other, "controller_id": "other"}))
+        self.assertEqual(["a", "b"], [info.id for info in recorder.get_executors_by_controller("c")])
+        self.assertEqual(["z"], [info.id for info in recorder.get_executors_by_controller("other")])
+        self.assertEqual([], recorder.get_executors_by_controller(None))
         selects = []
         event.listen(self.manager.engine, "before_cursor_execute",
                      lambda conn, cursor, text, *args: selects.append(text) if "FROM \"Executors\"" in text else None)
@@ -830,6 +836,22 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNot(first[0], second[0])  # callers never share one cached object
         first[0].net_pnl_quote = Decimal("99")
         self.assertNotEqual(Decimal("99"), pnls()[first[0].id])
+
+        writes = []
+        event.listen(self.manager.engine, "before_cursor_execute",
+                     lambda conn, cursor, text, *args: writes.append(text) if text.lstrip().startswith(
+                         ("INSERT", "UPDATE")) else None)
+        recorder.store_or_update_executor(executor("a", "2"))  # foreign writes above cleared what "a" holds
+        self.assertEqual(1, len(writes))
+        writes.clear()
+        recorder.store_or_update_executor(executor("a", "2"))  # identical to the last own write
+        self.assertEqual([], writes)
+        with self.manager.get_new_session() as session, session.begin():  # a foreign writer changes "a"
+            session.execute(update(Executors).where(Executors.id == "a").values(net_pnl_quote=7))
+        writes.clear()
+        recorder.store_or_update_executor(executor("a", "2"))  # must be written again
+        self.assertEqual(1, len(writes))
+        self.assertEqual(Decimal("2"), pnls()["a"])
 
     def test_add_market(self):
         """Test adding a new market dynamically to the recorder."""

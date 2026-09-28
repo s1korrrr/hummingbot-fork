@@ -377,6 +377,83 @@ for _name in PARTICIPATION_PREDICATES:
         "Per-instrument binary membership in the named descriptive predicate.",
     )
 
+EVENT_PARAMETERS = {
+    "rsi_threshold_crossing": {
+        "source": "rsi14_wilder",
+        "above": "70",
+        "below": "30",
+        "interval_ms": 60000,
+        "rearm": "opposite-side-or-equal",
+        "missing": "break-consecutive-chain",
+    },
+    "rvol_threshold_crossing": {
+        "source": "rvol20",
+        "above": "1.5",
+        "severe_above": "3",
+        "interval_ms": 60000,
+        "rearm": "at-or-below-threshold",
+        "missing": "break-consecutive-chain",
+    },
+    "breadth_threshold_crossing": {
+        "source": "breadth_share",
+        "above": "0.6",
+        "below": "0.4",
+        "minimum_coverage": "0.95",
+        "same_valid_cohort": True,
+        "interval_ms": 60000,
+        "missing": "break-consecutive-chain",
+    },
+    "trend_continuation_event": {
+        "source": "adx14_wilder",
+        "adx_above": "25",
+        "valid_bars": 3,
+        "direction": "unchanged-up-or-down",
+        "adx": "strictly-increasing",
+        "interval_ms": 60000,
+        "rearm": "condition-false-or-missing",
+    },
+    "regime_transition_event": {
+        "source": "exact-owner-record",
+        "same_instrument_and_schema": True,
+        "sequence": "consecutive",
+        "interval_ms": 60000,
+        "missing": "break-consecutive-chain",
+    },
+    "provider_quality_transition": {
+        "source": "provider-state-and-valid-expected-counts",
+        "emit": "state-or-count-change",
+        "first_observation": "baseline-only",
+    },
+    "observation_correction_event": {
+        "source": "immutable-revision-lineage",
+        "identity": "stable-occurrence",
+        "actions": ["supersede", "retract"],
+        "availability": "receipt-time",
+        "rewrite_original": False,
+    },
+    "taker_side_volume_spike": {
+        "source": "qualified-complete-taker-side-quote-volume",
+        "prior_minutes": 20,
+        "multiple_above": "2",
+        "side_share_at_least": "0.65",
+        "zero_baseline": "unavailable",
+        "dedup": "provider-trade-identity",
+    },
+    "low_break_10d_1h": {
+        "event_bar": "latest-completed-1h-close",
+        "prior_hours": 240,
+        "comparison": "close<min(prior-low)",
+        "strict": True,
+    },
+}
+for _event_id, _event_parameters in EVENT_PARAMETERS.items():
+    DEFINITIONS[_event_id] = _definition(
+        _event_id,
+        "count",
+        _event_parameters,
+        "Descriptive persisted event occurrence; never an order or trading permission.",
+    )
+
 REGISTRY_HASH = sha256(
     canonical_json({key: value.definition_hash for key, value in sorted(DEFINITIONS.items())}).encode()
 ).hexdigest()

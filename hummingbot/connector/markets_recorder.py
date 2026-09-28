@@ -11,7 +11,7 @@ from shutil import move
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
-from sqlalchemy import func, inspect, update
+from sqlalchemy import event as sql_event, func, inspect, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Query, Session
 
@@ -106,6 +106,7 @@ class MarketsRecorder:
         self._strategy_name: str = strategy_name
         self._market_data_collection_config: MarketDataCollectionConfigMap = market_data_collection
         self._market_data_collection_task: Optional[asyncio.Task] = None
+        self._executor_reads: Optional[Dict[str, Any]] = None
         # Internal collection of trade fills in connector will be used for remote/local history reconciliation
         for market in self._markets:
             trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
@@ -524,10 +525,14 @@ class MarketsRecorder:
         if self._market_data_collection_task is not None:
             self._market_data_collection_task.cancel()
 
-    def store_or_update_executor(self, executor):
+    def store_or_update_executor(self, executor, executor_info: Optional[ExecutorInfo] = None):
+        """`executor_info` may carry the info the caller already built for `executor` in the same pass."""
         with self._sql_manager.get_new_session() as session:
             existing_executor = session.query(Executors).filter(Executors.id == executor.config.id).one_or_none()
-            serialized_config = executor.executor_info.model_dump_json()
+            info = executor.executor_info if executor_info is None else executor_info
+            if info.id != executor.config.id:
+                raise ValueError("Executor info belongs to another executor")
+            serialized_config = info.model_dump_json()
             executor_dict = json.loads(serialized_config)
             if existing_executor:
                 # Update existing executor
@@ -842,10 +847,43 @@ class MarketsRecorder:
             executors = session.query(Executors).filter(Executors.controller_id == controller_id).all()
             return [executor.to_executor_info() for executor in executors]
 
+    def cache_executor_reads(self):
+        """Serve `get_all_executors` from memory until the Executors table is written.
+
+        Only for a database with one owning process (the native paper session): any
+        statement through this engine that names Executors and is not a read clears
+        the cache, and so does the commit or rollback that ends that transaction.
+        Writes from another process are not observed, so a live owner must not opt in.
+        """
+        if self._executor_reads is not None:
+            return
+        reads = self._executor_reads = {"rows": None, "pending": False}
+
+        def statement(conn, cursor, text, parameters, context, executemany):
+            head = text.lstrip()[:8].upper()
+            if not head.startswith(("SELECT", "PRAGMA")) and "EXECUTORS" in text.upper():
+                reads["rows"], reads["pending"] = None, True
+
+        def boundary(conn):
+            if reads["pending"]:
+                reads["rows"], reads["pending"] = None, False
+
+        engine = self._sql_manager.engine
+        sql_event.listen(engine, "before_cursor_execute", statement)
+        sql_event.listen(engine, "commit", boundary)
+        sql_event.listen(engine, "rollback", boundary)
+
     def get_all_executors(self) -> List[ExecutorInfo]:
+        reads = self._executor_reads
+        if reads is not None and reads["rows"] is not None:
+            return [info.model_copy() for info in reads["rows"]]
         with self._sql_manager.get_new_session() as session:
             executors = session.query(Executors).all()
-            return [executor.to_executor_info() for executor in executors]
+            infos = [executor.to_executor_info() for executor in executors]
+        if reads is None or reads["pending"]:
+            return infos
+        reads["rows"] = infos
+        return [info.model_copy() for info in infos]
 
     def get_positions_by_ids(self, position_ids: List[str]) -> List[Position]:
         with self._sql_manager.get_new_session() as session:

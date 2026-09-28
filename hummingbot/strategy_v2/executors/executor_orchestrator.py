@@ -2,6 +2,7 @@ import asyncio
 import logging
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
@@ -241,6 +242,7 @@ class ExecutorOrchestrator:
     """
     Orchestrator for various executors.
     """
+    _info_pass: Optional[Dict[int, Tuple[Any, ExecutorInfo]]] = None
     _logger = None
     _executor_mapping = {
         "position_executor": PositionExecutor,
@@ -1087,7 +1089,7 @@ class ExecutorOrchestrator:
             if controller_ids is not None and controller_id not in controller_ids:
                 continue
             for executor in executors:
-                info = executor.executor_info
+                info = self._info(executor)
                 if info.is_done and self._has_single_attempt_receipts(info):
                     keys.update(self._accounted_fill_keys(info))
         return keys
@@ -1116,7 +1118,7 @@ class ExecutorOrchestrator:
             if controller_ids is not None and controller_id not in controller_ids:
                 continue
             for executor in executors:
-                info = executor.executor_info
+                info = self._info(executor)
                 if (info.type == "order_executor" or (info.is_done and info.close_type == CloseType.POSITION_HOLD)
                         or self._entry_without_fill_handed_off(info)
                         or (info.is_done and self._has_single_attempt_receipts(info))):
@@ -1213,8 +1215,7 @@ class ExecutorOrchestrator:
             if controller_ids is not None and controller not in controller_ids:
                 continue
             infos = {info.id: info for info in self.stored_executors.get(controller, [])}
-            infos.update({executor.executor_info.id: executor.executor_info
-                          for executor in self.active_executors.get(controller, [])})
+            infos.update({info.id: info for info in map(self._info, self.active_executors.get(controller, []))})
             for info in infos.values():
                 if not self._is_unknown_wallet_sale(info):
                     continue
@@ -1824,12 +1825,14 @@ class ExecutorOrchestrator:
             if controller_ids is not None and controller_id not in controller_ids:
                 continue
             for executor in executors_list:
-                MarketsRecorder.get_instance().store_or_update_executor(executor)
-                self._persist_position_hold_entries_from_executor_info(executor.executor_info)
+                info = self._info(executor)
+                MarketsRecorder.get_instance().store_or_update_executor(executor, info)
+                self._persist_position_hold_entries_from_executor_info(info)
 
     def sync_live_state_to_db(self, *, controller_ids: Optional[Set[str]] = None):
-        self.sync_live_positions_to_db(controller_ids=controller_ids)
-        self.sync_live_executors_to_db(controller_ids=controller_ids)
+        with self._executor_info_pass():
+            self.sync_live_positions_to_db(controller_ids=controller_ids)
+            self.sync_live_executors_to_db(controller_ids=controller_ids)
 
     def execute_action(self, action: ExecutorAction):
         """
@@ -2024,9 +2027,9 @@ class ExecutorOrchestrator:
             # Filter executors that need position updates
             executors_to_process = [
                 executor for executor in executors_list
-                if (executor.executor_info.is_done and
-                    executor.executor_info.close_type == CloseType.POSITION_HOLD and
-                    executor.executor_info.config.id not in self.executors_ids_position_held)
+                if (self._info(executor).is_done and
+                    self._info(executor).close_type == CloseType.POSITION_HOLD and
+                    self._info(executor).config.id not in self.executors_ids_position_held)
             ]
 
             # Skip if no executors to process
@@ -2034,7 +2037,7 @@ class ExecutorOrchestrator:
                 continue
 
             for executor in executors_to_process:
-                executor_info = executor.executor_info
+                executor_info = self._info(executor)
                 self.executors_ids_position_held.append(executor_info.config.id)
                 self._persist_position_hold_entries_from_executor_info(executor_info)
                 # Order-executor fills are never executor-owned, so trade-fill reconciliation
@@ -2136,7 +2139,7 @@ class ExecutorOrchestrator:
         if controller_ids is not None:
             selected_ids &= controller_ids
         for controller_id in selected_ids:
-            active_executors = [executor.executor_info for executor in self.active_executors.get(controller_id, []) if executor]
+            active_executors = [self._info(executor) for executor in self.active_executors.get(controller_id, []) if executor]
             active_executor_ids = {executor.id for executor in active_executors}
             stored_executors = [
                 executor
@@ -2176,7 +2179,37 @@ class ExecutorOrchestrator:
             report[controller_id] = positions_summary
         return report
 
+    @contextmanager
+    def _executor_info_pass(self):
+        """One synchronous report or sync pass computes each executor's info once.
+
+        `executor_info` rebuilds custom info, PnL and order snapshots on every access; a pass
+        read it about nine times per executor. Nothing inside a pass awaits or drives an
+        executor, so its state cannot change until the pass ends and the memo is dropped.
+        """
+        if self._info_pass is not None:
+            yield
+            return
+        self._info_pass = {}
+        try:
+            yield
+        finally:
+            self._info_pass = None
+
+    def _info(self, executor) -> ExecutorInfo:
+        memo = self._info_pass
+        if memo is None:
+            return executor.executor_info
+        entry = memo.get(id(executor))
+        if entry is None or entry[0] is not executor:
+            entry = memo[id(executor)] = (executor, executor.executor_info)
+        return entry[1]
+
     def get_all_reports(self, *, controller_ids: Optional[Set[str]] = None) -> Dict[str, Dict]:
+        with self._executor_info_pass():
+            return self._get_all_reports(controller_ids=controller_ids)
+
+    def _get_all_reports(self, *, controller_ids: Optional[Set[str]] = None) -> Dict[str, Dict]:
         """
         Generate native reports for all owners, or only explicitly selected owners.
 
@@ -2228,7 +2261,7 @@ class ExecutorOrchestrator:
         positions = self.positions_held.get(controller_id, [])
 
         for executor in active_executors:
-            executor_info = executor.executor_info
+            executor_info = self._info(executor)
             if not executor_info.is_done:
                 if not self._is_unknown_wallet_sale(executor_info):
                     report.unrealized_pnl_quote += executor_info.net_pnl_quote

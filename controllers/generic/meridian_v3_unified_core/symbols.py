@@ -75,6 +75,9 @@ class SymbolGrantBudget:
     def __init__(self, portfolio, pair):
         self.portfolio, self.pair = portfolio, pair
         self.key = portfolio.store().key + ':' + pair
+        # The claim SymbolRuntime.entry_permission proved bound by a fresh read earlier in the
+        # same synchronous call; the base check's repeat of that read is answered from it.
+        self.verified = None
 
     def _claim(self, claim):
         owner = self.portfolio.owner.config
@@ -94,7 +97,10 @@ class SymbolGrantBudget:
 
     def contains(self, claim, *, native_executors=()):
         try:
-            return self.portfolio.grant_bound(self.pair, self._claim(claim))
+            claim = self._claim(claim)
+            if self.verified is not None and self.verified == claim:
+                return True
+            return self.portfolio.grant_bound(self.pair, claim)
         except PolicyError as exc:
             self.portfolio.owner.logger().warning(f'Meridian {self.pair} grant check held: {exc}')
             return False
@@ -175,14 +181,19 @@ class SymbolRuntime(ModularRuntime):
             return False
         try:
             self.ensure_store()
-            bound = self.portfolio.grant_bound(self.controller.pair, self.reservation(config))
+            claim = self.reservation(config)
+            bound = self.portfolio.grant_bound(self.controller.pair, claim)
         except PolicyError as exc:
             self.reason = f'portfolio_grant_hold:{exc}'[:200]
             return False
         if not bound:
             self.reason = 'portfolio_grant_required'
             return False
-        return super().entry_permission(config, check_funds=check_funds)
+        self.budget.verified = claim  # nothing awaits before the base check reads it
+        try:
+            return super().entry_permission(config, check_funds=check_funds)
+        finally:
+            self.budget.verified = None
 
     def _release_bag(self, held, mid, snapshot):
         # An unprovable portfolio release keeps the capital reserved; it never faults exits.

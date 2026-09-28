@@ -1514,6 +1514,39 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertIn("positions", result["test_controller"])
         self.assertIn("performance", result["test_controller"])
 
+    def test_report_and_sync_passes_compute_each_executor_info_once(self):
+        config = PositionExecutorConfig(timestamp=1234, trading_pair="ETH-USDT", connector_name="binance",
+                                        side=TradeType.BUY, amount=Decimal(10), entry_price=Decimal(100))
+        config.id = "active_executor"
+        builds = []
+
+        class Executor:
+            def __init__(self):
+                self.config = config
+
+            @property
+            def executor_info(self):
+                builds.append(1)
+                return ExecutorInfo(id=config.id, timestamp=1234, type="position_executor",
+                                    status=RunnableStatus.RUNNING, config=config, filled_amount_quote=Decimal(0),
+                                    net_pnl_quote=Decimal(0), net_pnl_pct=Decimal(0), cum_fees_quote=Decimal(0),
+                                    is_trading=True, is_active=True, custom_info={}, connector_name="binance",
+                                    trading_pair="ETH-USDT")
+
+        self.orchestrator.active_executors = {"test_controller": [Executor()]}
+        self.orchestrator.positions_held = {"test_controller": []}
+        self.orchestrator.cached_performance = {"test_controller": PerformanceReport()}
+        self.mock_strategy.controllers = {"test_controller": MagicMock()}
+        first = self.orchestrator.get_all_reports()["test_controller"]["executors"]
+        self.assertEqual(len(builds), 1)
+        self.assertIsNone(self.orchestrator._info_pass)  # the memo never outlives its pass
+        second = self.orchestrator.get_all_reports()["test_controller"]["executors"]
+        self.assertEqual(len(builds), 2)  # a later pass sees the executor's current state
+        self.assertIsNot(first[0], second[0])
+        self.orchestrator.sync_live_state_to_db()
+        self.assertEqual(len(builds), 3)
+        self.assertIsNone(self.orchestrator._info_pass)
+
     @patch.object(MarketsRecorder, "get_instance")
     def test_get_all_reports_persists_position_hold_ledger_for_done_executors(self, markets_recorder_mock):
         markets_recorder_mock.return_value = MagicMock(spec=MarketsRecorder)

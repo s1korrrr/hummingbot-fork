@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import time
@@ -9,7 +10,7 @@ from typing import Awaitable
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
@@ -786,6 +787,49 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             query = session.query(Executors)
             executors = query.all()
         self.assertEqual(1, len(executors))
+
+    def test_cached_executor_reads_follow_every_executors_write(self):
+        recorder = MarketsRecorder(
+            sql=self.manager, markets=[self], config_file_path=self.config_file_path, strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False,
+                                                                 market_data_collection_interval=60,
+                                                                 market_data_collection_depth=20))
+        recorder.cache_executor_reads()
+
+        def executor(executor_id, pnl):
+            config = PositionExecutorConfig(id=executor_id, timestamp=1234, trading_pair="ETH-USDT",
+                                            connector_name="binance", side=TradeType.BUY, entry_price=Decimal("1000"),
+                                            amount=Decimal("1"))
+            mock = MagicMock(spec=PositionExecutor)
+            mock.config = config
+            mock.executor_info = ExecutorInfo(
+                id=executor_id, timestamp=1234, type="position_executor", status=RunnableStatus.RUNNING,
+                controller_id="c", custom_info={}, config=config, net_pnl_pct=Decimal("0"), net_pnl_quote=Decimal(pnl),
+                cum_fees_quote=Decimal("0"), filled_amount_quote=Decimal("1"), is_active=True, is_trading=True)
+            return mock
+
+        def pnls():
+            return {info.id: info.net_pnl_quote for info in recorder.get_all_executors()}
+
+        self.assertEqual({}, pnls())
+        recorder.store_or_update_executor(executor("a", "1"))  # insert through the recorder
+        self.assertEqual({"a": Decimal("1")}, pnls())
+        recorder.store_or_update_executor(executor("a", "2"))  # update through the recorder
+        self.assertEqual({"a": Decimal("2")}, pnls())
+        with self.manager.get_new_session() as session, session.begin():  # a direct ORM writer
+            session.add(Executors(**json.loads(executor("b", "3").executor_info.model_dump_json())))
+        self.assertEqual({"a": Decimal("2"), "b": Decimal("3")}, pnls())
+        with self.manager.get_new_session() as session, session.begin():  # a direct Core statement
+            session.execute(update(Executors).where(Executors.id == "b").values(net_pnl_quote=4))
+        self.assertEqual(Decimal("4"), pnls()["b"])
+        selects = []
+        event.listen(self.manager.engine, "before_cursor_execute",
+                     lambda conn, cursor, text, *args: selects.append(text) if "FROM \"Executors\"" in text else None)
+        first, second = recorder.get_all_executors(), recorder.get_all_executors()
+        self.assertEqual([], selects)  # unchanged table: served from memory
+        self.assertIsNot(first[0], second[0])  # callers never share one cached object
+        first[0].net_pnl_quote = Decimal("99")
+        self.assertNotEqual(Decimal("99"), pnls()[first[0].id])
 
     def test_add_market(self):
         """Test adding a new market dynamically to the recorder."""

@@ -168,6 +168,7 @@ class NativePaperSession:
     instantiate this session. Existing state requires `restore=True`; unfinished
     executors remain under native reconciliation holds rather than replaying BUYs.
     """
+    closed_executors_buffer = 30  # same as scripts/v2_with_controllers.py
 
     def __init__(self, connector, controller_configs, db_path, *, restore=False, momentum_fixture_policy=None):
         # Acquire ownership before SQL construction or any persisted state read.
@@ -275,6 +276,8 @@ class NativePaperSession:
         try:
             self.recorder = MarketsRecorder(self._sql, [connector], 'native-paper-session', 'v2_with_controllers',
                                             MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+            # This process owns the paper database, so every Executors write passes this engine.
+            self.recorder.cache_executor_reads()
             if restore:
                 self.recorder.restore_market_states('native-paper-session', connector)
             self.recorder.start()
@@ -341,6 +344,18 @@ class NativePaperSession:
             controller.positions_held = report.get('positions', [])
             controller.performance_report = report.get('performance')
         return reports
+
+    def _store_actions(self, controller_ids):
+        """Archive done executors beyond the live buffer, as `StrategyV2Base.store_actions_proposal` does.
+
+        Owners have already seen every done executor in this step's refreshed report. Archived
+        executors persist through the recorder and stop being re-reported on every later step.
+        """
+        done = [executor for key in controller_ids for executor in self.executor_orchestrator.active_executors.get(key, [])
+                if executor and executor.status == RunnableStatus.TERMINATED]
+        done.sort(key=lambda executor: executor.config.timestamp, reverse=True)
+        return [StoreExecutorAction(executor_id=executor.config.id, controller_id=executor.config.controller_id)
+                for executor in done[self.closed_executors_buffer:]]
 
     def _validate_actions(self, actions):
         from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
@@ -477,6 +492,7 @@ class NativePaperSession:
                 continue
             await controller.update_processed_data()
             actions.extend(controller.determine_executor_actions())
+        actions.extend(self._store_actions(fresh_ids))
         self._validate_actions(actions)
         self.executor_orchestrator.execute_actions(actions)
         started, self._started = self._started, []

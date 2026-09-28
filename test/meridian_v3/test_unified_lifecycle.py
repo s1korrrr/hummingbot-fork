@@ -113,6 +113,29 @@ class Lifecycle(IsolatedAsyncioTestCase):
         receipt = await s.step(rsi={BTC: rebound()})
         self.assertEqual(len(creates(receipt, BTC)), 1)  # capital came back; the symbol re-enters
 
+    async def test_finished_executors_are_archived_like_live_and_capital_stays_consistent(self):
+        # Live stores done executors beyond `closed_executors_buffer`; the paper step must too, or
+        # every finished executor stays in the per-step reports forever. Buffer 0 is the strictest case.
+        s = self.scenario()
+        s.session.closed_executors_buffer = 0
+        finished = []
+        for _ in range(3):
+            executor = await self.entered(s, BTC)
+            for mid in ('104.5', '105.5', '104.9'):
+                await s.step(mids={BTC: mid})
+            await s.lift(BTC)
+            self.assertTrue(executor.is_closed)
+            finished.append(executor.config.id)
+            await s.step()  # the owner sees the done executor once, then the step archives it
+            self.assertEqual(s.executors(BTC), [])
+            self.assertEqual(s.grants(), ())
+            s.mids[BTC] = D('100')
+        stored = {e.id for e in s.session.recorder.get_all_executors() if e.close_type is not None}
+        self.assertLessEqual(set(finished), stored)
+        self.assertEqual(s.balance('BTC'), D('0'))
+        receipt = await s.step(rsi={BTC: rebound()})
+        self.assertEqual(len(creates(receipt, BTC)), 1)  # archived history never blocks the next entry
+
     async def test_no_trailing_or_bag_sell_ever_realizes_a_loss(self):
         s = self.scenario()
         executor = await self.entered(s, BTC)

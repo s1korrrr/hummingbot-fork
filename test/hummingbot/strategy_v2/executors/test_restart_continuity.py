@@ -478,4 +478,5 @@ def test_sealed_restored_down_only_fill_keeps_executor_and_drawdown_hold_is_visi
     assert again._entry_stop_reason == 'position_hold'
     assert again.get_custom_info()['entry_acquisition']['terminal_reason'] == 'position_hold'
     assert f'Executor stop requested | controller=controller executor={executor_id} keep_position=True' in caplog.text
+    assert 'requested_close_type=POSITION_HOLD' in caplog.text
     assert 'Entry acquisition stopped reason=position_hold' in caplog.text

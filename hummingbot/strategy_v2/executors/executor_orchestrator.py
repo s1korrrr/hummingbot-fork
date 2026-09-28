@@ -1999,7 +1999,7 @@ class ExecutorOrchestrator:
             self.logger().warning(
                 f"Executor stop requested | controller={controller_id} executor={executor_id} "
                 f"keep_position={action.keep_position} filled_base={filled} "
-                f"close_type={'POSITION_HOLD' if action.keep_position else 'EARLY_STOP'}")
+                f"requested_close_type={'POSITION_HOLD' if action.keep_position else 'EARLY_STOP'}")
         executor.early_stop(action.keep_position)
 
     def _update_positions_from_done_executors(self, *, controller_ids: Optional[Set[str]] = None):

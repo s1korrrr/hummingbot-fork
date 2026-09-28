@@ -7,12 +7,55 @@ from hummingbot.strategy_v2.market_context.market_picture.contracts import (
     MarketEventV1,
     MetricSeriesV1,
     MetricValueV1,
+    metric_series_digest,
     parse_metric_series,
     resolve_metric_series,
     validate_frame,
 )
 
 FIXTURE = Path(__file__).parents[3] / "fixtures" / "market_picture_metric_series.v1.json"
+
+
+def test_valid_cell_quality_defaults_are_lossless_and_hash_equivalent():
+    explicit = json.loads(FIXTURE.read_text())
+    explicit["payload_digest"] = metric_series_digest(explicit)
+    compact = json.loads(json.dumps(explicit))
+    valid = compact["cells"][0]
+    assert valid["computation_status"] == "VALID"
+    assert valid["coverage_status"] == "COMPLETE"
+    assert valid["reason_codes"] == []
+    for key in ("computation_status", "coverage_status", "reason_codes"):
+        valid.pop(key)
+    assert metric_series_digest(compact) == explicit["payload_digest"]
+    assert resolve_metric_series(MetricSeriesV1.model_validate_json(json.dumps(compact))) == resolve_metric_series(
+        MetricSeriesV1.model_validate_json(json.dumps(explicit))
+    )
+    assert all(key not in MetricSeriesV1.model_validate_json(json.dumps(explicit)).model_dump(
+        mode="json", exclude_defaults=True, exclude_none=True
+    )["cells"][0] for key in ("computation_status", "coverage_status", "reason_codes"))
+    aggregate = resolve_metric_series(MetricSeriesV1.model_validate_json(json.dumps(explicit)))["okx:spot:BTC-USDC"]
+    for key in ("computation_status", "coverage_status", "reason_codes"):
+        aggregate.pop(key)
+    with pytest.raises(ValueError):
+        MetricValueV1.model_validate_json(json.dumps(aggregate))
+
+
+@pytest.mark.parametrize("missing", ["status", "reasons", "value"])
+def test_unavailable_or_valueless_cell_cannot_hide_behind_quality_defaults(missing):
+    data = json.loads(FIXTURE.read_text())
+    valid = data["cells"][0]
+    if missing == "status":
+        valid["value"] = None
+        valid.pop("computation_status")
+    elif missing == "reasons":
+        unavailable = data["cells"][1]
+        unavailable.pop("reason_codes")
+    else:
+        valid.pop("value")
+        valid.pop("computation_status")
+    data["payload_digest"] = metric_series_digest(data)
+    with pytest.raises(ValueError):
+        MetricSeriesV1.model_validate(data)
 
 
 def test_compact_metric_series_round_trips_every_semantic_field():

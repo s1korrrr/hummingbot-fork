@@ -148,11 +148,17 @@ class ProviderRefV1(ContractModel):
 
 
 class MetricCellV1(ContractModel):
+    """A series cell omits VALID, COMPLETE and empty reasons when they are exact defaults.
+
+    The defaults apply only inside metric-series.v1 cells. Expanded MetricValueV1
+    and aggregate metrics still carry their explicit quality fields.
+    """
+
     instrument_id: str = Field(pattern=INSTRUMENT_PATTERN)
     value: str | None = Field(default=None, max_length=128)
-    computation_status: ComputationStatus
-    coverage_status: CoverageStatus
-    reason_codes: tuple[ReasonCode, ...] = Field(max_length=MAX_REASONS)
+    computation_status: ComputationStatus = "VALID"
+    coverage_status: CoverageStatus = "COMPLETE"
+    reason_codes: tuple[ReasonCode, ...] = Field(default=(), max_length=MAX_REASONS)
     window_start_ms: int | None = Field(default=None, ge=0, le=MAX_TIMESTAMP_MS)
     window_end_ms: int | None = Field(default=None, ge=0, le=MAX_TIMESTAMP_MS)
     observation_interval_ms: int | None = Field(default=None, ge=1, le=604_800_000)
@@ -270,7 +276,7 @@ class MetricSeriesV1(ContractModel):
 
 
 def metric_series_digest(value) -> str:
-    """Hash canonical compact JSON with the digest field omitted."""
+    """Hash canonical compact JSON; explicit cell quality defaults equal omitted defaults."""
     if isinstance(value, BaseModel):
         payload = value.model_dump(mode="json", exclude={"payload_digest"}, exclude_none=True, exclude_defaults=True)
     else:
@@ -288,6 +294,14 @@ def metric_series_digest(value) -> str:
         return item
 
     payload = omit_nulls(payload)
+    cells = payload.get("cells") if isinstance(payload, dict) else None
+    if isinstance(cells, list):
+        defaults = {"computation_status": "VALID", "coverage_status": "COMPLETE", "reason_codes": []}
+        payload["cells"] = [
+            {key: item for key, item in cell.items() if key not in defaults or item != defaults[key]}
+            if isinstance(cell, dict) else cell
+            for cell in cells
+        ]
     return sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 

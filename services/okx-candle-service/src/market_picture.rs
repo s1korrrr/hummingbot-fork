@@ -175,6 +175,18 @@ pub struct Coverage {
     pub last_close_time_ms: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AggregateInvalidReason {
+    VolumeOverflow,
+    QuoteVolumeOverflow,
+}
+
+enum AggregateOutcome {
+    Incomplete,
+    Invalid(AggregateInvalidReason),
+    Complete(SourceBar),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HistoryResponse {
@@ -265,6 +277,7 @@ struct PairHistory {
     available_at_ms: u64,
     last_observed_at_ms: u64,
     ready_source: bool,
+    invalid_buckets: BTreeMap<Interval, std::collections::BTreeSet<u64>>,
 }
 impl PairHistory {
     fn new() -> Self {
@@ -278,6 +291,7 @@ impl PairHistory {
             available_at_ms: 0,
             last_observed_at_ms: 0,
             ready_source: false,
+            invalid_buckets: BTreeMap::new(),
         }
     }
     fn bars(&self, interval: Interval) -> &VecDeque<SourceBar> {
@@ -536,7 +550,7 @@ impl Projection {
         touched.sort_unstable();
         touched.dedup();
         for (interval, start_s) in touched {
-            if let Some(bar) = aggregate_bucket(
+            match aggregate_bucket(
                 &history.minute,
                 interval,
                 start_s,
@@ -544,14 +558,36 @@ impl Projection {
                 source_sequence,
                 history.available_at_ms,
             )? {
-                let previous = history
-                    .bars(interval)
-                    .iter()
-                    .find(|row| row.open_time_ms == bar.open_time_ms);
-                if previous != Some(&bar) {
-                    changed = true;
+                AggregateOutcome::Complete(bar) => {
+                    let invalid = history.invalid_buckets.entry(interval).or_default();
+                    invalid.remove(&bar.open_time_ms);
+                    let previous = history
+                        .bars(interval)
+                        .iter()
+                        .find(|row| row.open_time_ms == bar.open_time_ms);
+                    if previous != Some(&bar) {
+                        changed = true;
+                    }
+                    insert_sorted(history.bars_mut(interval), bar, interval.expected_rows());
                 }
-                insert_sorted(history.bars_mut(interval), bar, interval.expected_rows());
+                AggregateOutcome::Incomplete => {}
+                AggregateOutcome::Invalid(reason) => {
+                    let start_ms = start_s.saturating_mul(1_000);
+                    let newly_invalid = history
+                        .invalid_buckets
+                        .entry(interval)
+                        .or_default()
+                        .insert(start_ms);
+                    history
+                        .bars_mut(interval)
+                        .retain(|row| row.open_time_ms != start_ms);
+                    changed = true;
+                    if newly_invalid {
+                        eprintln!(
+                            "market picture {interval:?} aggregate invalid at {start_ms}: {reason:?}"
+                        );
+                    }
+                }
             }
         }
         if changed || snapshot {
@@ -595,12 +631,26 @@ impl Projection {
             close <= now_ms.saturating_add(90_000)
                 && now_ms.saturating_sub(close) <= interval_freshness_ms
         });
+        // All intervals depend on the same live minute-source owner. A fresh
+        // daily cutoff cannot mask a silent minute stream.
+        let fresh_receipt = history.last_observed_at_ms <= now_ms.saturating_add(90_000)
+            && now_ms.saturating_sub(history.last_observed_at_ms) <= 90_000;
+        let requested_floor = now_ms.saturating_sub(
+            (expected as u64).saturating_mul(interval.seconds().saturating_mul(1_000)),
+        );
+        let invalid_bucket = history
+            .invalid_buckets
+            .get(&interval)
+            .is_some_and(|invalid| invalid.range(requested_floor..=now_ms).next().is_some());
         let fresh_source = history.ready_source
             && history.last_observed_at_ms >= self.started_at_ms
+            && fresh_receipt
             && fresh_cutoff;
-        let ready = bars.len() == expected && gap_count == 0 && fresh_source;
+        let ready = bars.len() == expected && gap_count == 0 && fresh_source && !invalid_bucket;
         let reason = if ready {
             None
+        } else if invalid_bucket {
+            Some("aggregate_overflow".to_owned())
         } else if history.last_observed_at_ms == 0 {
             Some("warming".to_owned())
         } else if !fresh_source {
@@ -622,7 +672,11 @@ impl Projection {
         let available_at_ms = history.last_observed_at_ms;
         validate_bars(&bars, interval, expected)?;
         let cutoff_ms = bars.last().map(|bar| bar.close_time_ms);
-        let expires_at_ms = available_at_ms.saturating_add(interval_freshness_ms);
+        // Even typed stale/unavailable responses need a coherent response
+        // envelope. Their `ready`/`reason` fields carry source freshness truth.
+        let expires_at_ms = available_at_ms
+            .saturating_add(interval_freshness_ms)
+            .max(now_ms.saturating_add(1));
         let response = HistoryResponse {
             schema_version: SCHEMA_VERSION.into(),
             encoding: "ohlcv-tuples.v1".into(),
@@ -913,9 +967,9 @@ fn aggregate_bucket(
     source_epoch: &Arc<str>,
     source_sequence: u64,
     available_at_ms: u64,
-) -> Result<Option<SourceBar>> {
+) -> Result<AggregateOutcome> {
     if interval == Interval::Minute {
-        return Ok(None);
+        return Ok(AggregateOutcome::Incomplete);
     }
     let start_ms = start_s.checked_mul(1000).context("bucket time overflow")?;
     let duration_ms = interval.seconds() * 1000;
@@ -929,12 +983,22 @@ fn aggregate_bucket(
             .windows(2)
             .any(|pair| pair[1].open_time_ms != pair[0].open_time_ms + 60_000)
     {
-        return Ok(None);
+        return Ok(AggregateOutcome::Incomplete);
     }
-    let sum = |select: fn(&SourceBar) -> Decimal| -> Decimal {
+    let sum = |select: fn(&SourceBar) -> Decimal| -> Option<Decimal> {
         members
             .iter()
-            .fold(Decimal::ZERO, |total, bar| total + select(bar))
+            .try_fold(Decimal::ZERO, |total, bar| total.checked_add(select(bar)))
+    };
+    let Some(volume) = sum(|bar| bar.volume) else {
+        return Ok(AggregateOutcome::Invalid(
+            AggregateInvalidReason::VolumeOverflow,
+        ));
+    };
+    let Some(quote_volume) = sum(|bar| bar.quote_volume) else {
+        return Ok(AggregateOutcome::Invalid(
+            AggregateInvalidReason::QuoteVolumeOverflow,
+        ));
     };
     let high = members
         .iter()
@@ -948,15 +1012,15 @@ fn aggregate_bucket(
         .context("empty bucket")?;
     let first = members.first().context("empty bucket")?;
     let last = members.last().context("empty bucket")?;
-    Ok(Some(SourceBar {
+    Ok(AggregateOutcome::Complete(SourceBar {
         open_time_ms: start_ms,
         close_time_ms: start_ms + duration_ms,
         open: first.open,
         high,
         low,
         close: last.close,
-        volume: sum(|bar| bar.volume),
-        quote_volume: sum(|bar| bar.quote_volume),
+        volume,
+        quote_volume,
         confirmed: true,
         available_at_ms: members
             .iter()
@@ -1303,7 +1367,7 @@ mod tests {
         assert_eq!((MINUTE_ROWS, HOUR_ROWS, DAY_ROWS), (11_521, 3_001, 401));
         let start = 1_800_000_000u64 / 3_600 * 3_600;
         let rows: VecDeque<_> = (0..60).map(|n| bar((start + n * 60) * 1000, "2")).collect();
-        let hour = aggregate_bucket(
+        let AggregateOutcome::Complete(hour) = aggregate_bucket(
             &rows,
             Interval::Hour,
             start,
@@ -1311,8 +1375,9 @@ mod tests {
             9,
             start * 1000,
         )
-        .unwrap()
-        .unwrap();
+        .unwrap() else {
+            panic!("complete hourly bucket expected")
+        };
         assert_eq!(
             (hour.open_time_ms, hour.close_time_ms),
             (start * 1000, (start + 3_600) * 1000)
@@ -1326,7 +1391,7 @@ mod tests {
             .filter(|n| *n != 21)
             .map(|n| bar((start + n * 60) * 1000, "2"))
             .collect();
-        assert!(
+        assert!(matches!(
             aggregate_bucket(
                 &rows,
                 Interval::Hour,
@@ -1335,11 +1400,11 @@ mod tests {
                 1,
                 start * 1000
             )
-            .unwrap()
-            .is_none()
-        );
+            .unwrap(),
+            AggregateOutcome::Incomplete
+        ));
         rows.pop_back();
-        assert!(
+        assert!(matches!(
             aggregate_bucket(
                 &rows,
                 Interval::Hour,
@@ -1348,9 +1413,9 @@ mod tests {
                 1,
                 start * 1000
             )
-            .unwrap()
-            .is_none()
-        );
+            .unwrap(),
+            AggregateOutcome::Incomplete
+        ));
     }
     #[test]
     fn cache_load_is_a_baseline_and_requires_fresh_source_observation() {
@@ -1419,6 +1484,118 @@ mod tests {
         history.hour.truncate(100);
         let partial = projection.response(&pair, Interval::Hour, now_ms).unwrap();
         assert_eq!(partial.reason.as_deref(), Some("stale"));
+    }
+
+    #[test]
+    fn fresh_bucket_cutoff_does_not_hide_a_stale_hourly_or_daily_receipt() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        for (interval, expected, step_ms, receipt_age) in [
+            (Interval::Hour, HOUR_ROWS, 3_600_000, 180_000),
+            (Interval::Day, DAY_ROWS, 86_400_000, 180_000),
+        ] {
+            let latest_close = (now_ms / step_ms) * step_ms;
+            let first_open = latest_close - (expected as u64 - 1) * step_ms;
+            let mut projection =
+                Projection::new(std::slice::from_ref(&pair), now_ms - receipt_age - 1);
+            let history = projection.pairs.get_mut(&pair).unwrap();
+            let rows: VecDeque<_> = (0..expected)
+                .map(|index| {
+                    let open = first_open + index as u64 * step_ms;
+                    let mut value = bar(open, "1");
+                    value.close_time_ms = open + step_ms;
+                    value.available_at_ms = open + step_ms;
+                    value.source_epoch = "epoch".into();
+                    value.source_sequence = index as u64 + 1;
+                    value
+                })
+                .collect();
+            match interval {
+                Interval::Hour => history.hour = rows,
+                Interval::Day => history.day = rows,
+                Interval::Minute => unreachable!(),
+            }
+            history.source_epoch = "epoch".into();
+            history.source_sequence = expected as u64;
+            history.projection_sequence = 1;
+            history.last_observed_at_ms = now_ms - receipt_age;
+            history.ready_source = true;
+
+            let response = projection.response(&pair, interval, now_ms).unwrap();
+            assert!(
+                !response.ready,
+                "{interval:?} must fail closed on stale receipt"
+            );
+            assert_eq!(response.reason.as_deref(), Some("stale"));
+            assert_eq!(response.coverage.valid_count, expected);
+            assert!(response.expires_at_ms > response.published_at_ms);
+        }
+    }
+
+    #[test]
+    fn volume_overflow_invalidates_hour_and_day_buckets_without_panicking() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let max = Decimal::MAX;
+        for (interval, step_ms, count) in [
+            (Interval::Hour, 60_000, 60usize),
+            (Interval::Day, 60_000, 1_440usize),
+        ] {
+            for overflow_quote_volume in [false, true] {
+                let bucket_ms = match interval {
+                    Interval::Hour => ((now_ms / 3_600_000) - 1) * 3_600_000,
+                    Interval::Day => ((now_ms / 86_400_000) - 1) * 86_400_000,
+                    Interval::Minute => unreachable!(),
+                };
+                let first_open = bucket_ms / step_ms * step_ms;
+                let bars: Vec<_> = (0..count)
+                    .map(|index| {
+                        let mut value = bar(first_open + index as u64 * step_ms, "1");
+                        value.available_at_ms = value.close_time_ms;
+                        value.source_epoch = "overflow-epoch".into();
+                        if overflow_quote_volume {
+                            value.quote_volume = max;
+                        } else {
+                            value.volume = max;
+                        }
+                        value
+                    })
+                    .collect();
+                let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 1_000);
+                let history = projection.pairs.get_mut(&pair).unwrap();
+                let mut previous_rollup = bar(bucket_ms, "1");
+                previous_rollup.close_time_ms = bucket_ms + interval.seconds() * 1_000;
+                previous_rollup.available_at_ms = previous_rollup.close_time_ms;
+                previous_rollup.source_epoch = "overflow-epoch".into();
+                match interval {
+                    Interval::Hour => history.hour.push_back(previous_rollup),
+                    Interval::Day => history.day.push_back(previous_rollup),
+                    Interval::Minute => unreachable!(),
+                }
+                let outcome = projection.observe_rows(SourceObservation {
+                    pair: pair.clone(),
+                    source_epoch: Arc::from("overflow-epoch"),
+                    source_sequence: 1,
+                    published_at_ms: now_ms,
+                    received_at_ms: now_ms,
+                    bars,
+                    snapshot: true,
+                    now_ms,
+                });
+                assert!(
+                    outcome.is_ok(),
+                    "overflow is typed data invalidity, not an event failure"
+                );
+                let response = projection.response(&pair, interval, now_ms).unwrap();
+                assert!(!response.ready);
+                assert_eq!(response.reason.as_deref(), Some("aggregate_overflow"));
+                assert!(response.expires_at_ms > response.published_at_ms);
+                assert!(
+                    response.bars.is_empty(),
+                    "the invalid cutoff must not retain an old rollup"
+                );
+            }
+        }
     }
 
     #[test]

@@ -329,10 +329,14 @@ def parse_metric_series(raw: bytes | str, *, maximum_bytes: int = 2 * 1024 * 102
     return MetricSeriesV1.model_validate_json(raw)
 
 
-def resolve_metric_series(series: MetricSeriesV1) -> dict[str, dict]:
-    """Expand shared series metadata into per-instrument values; performs no metric computation."""
+def resolve_metric_series(series: MetricSeriesV1, *, instrument_id: str | None = None) -> dict[str, dict]:
+    """Expand shared metadata for all cells or one selected instrument; compute no metric."""
+    if instrument_id is not None and not isinstance(instrument_id, str):
+        raise ValueError("selected instrument ID must be a string")
     result = {}
     for cell in series.cells:
+        if instrument_id is not None and cell.instrument_id != instrument_id:
+            continue
         expanded = {
             "metric_id": series.metric_id,
             "value": cell.value,
@@ -361,6 +365,8 @@ def resolve_metric_series(series: MetricSeriesV1) -> dict[str, dict]:
             ),
         }
         result[cell.instrument_id] = MetricValueV1.model_validate_json(json.dumps(expanded)).model_dump(mode="json")
+    if instrument_id is not None and instrument_id not in result:
+        raise ValueError("selected instrument ID is not present in the series")
     return result
 
 

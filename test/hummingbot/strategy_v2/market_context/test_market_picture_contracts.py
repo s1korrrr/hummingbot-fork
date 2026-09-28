@@ -75,6 +75,15 @@ def test_compact_metric_series_round_trips_every_semantic_field():
     assert expanded["okx:spot:ETH-USDC"]["reason_codes"] == ["INSUFFICIENT_HISTORY"]
 
 
+def test_selected_metric_cell_matches_full_resolution_and_rejects_missing_id():
+    series = parse_metric_series(FIXTURE.read_bytes())
+    complete = resolve_metric_series(series)
+    for instrument_id, metric in complete.items():
+        assert resolve_metric_series(series, instrument_id=instrument_id) == {instrument_id: metric}
+    with pytest.raises(ValueError, match="not present"):
+        resolve_metric_series(series, instrument_id="okx:spot:SOL-USDC")
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

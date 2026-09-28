@@ -6,6 +6,7 @@ import pytest
 from hummingbot.strategy_v2.market_context.market_picture.contracts import (
     MarketEventV1,
     MetricSeriesV1,
+    MetricValueV1,
     parse_metric_series,
     resolve_metric_series,
     validate_frame,
@@ -166,3 +167,31 @@ def test_event_contract_preserves_source_lineage_and_revision_rules():
         json.dumps(_event_payload(status="corrected", supersedes_event_id="c" * 64))
     )
     assert corrected.supersedes_event_id == "c" * 64
+
+
+def test_difference_units_accept_signed_deltas_without_widening_levels():
+    metric = resolve_metric_series(parse_metric_series(FIXTURE.read_bytes()))["okx:spot:BTC-USDC"]
+
+    metric["reason_codes"] = tuple(metric["reason_codes"])
+    metric["source_ref"]["capabilities"] = tuple(metric["source_ref"]["capabilities"])
+
+    pressure_delta = dict(metric, metric_id="breadth_pressure_delta", value="-6", unit="index_points")
+    pressure_delta["definition"] = dict(
+        pressure_delta["definition"], definition_id="breadth_pressure_delta", unit="index_points"
+    )
+    assert MetricValueV1.model_validate(pressure_delta).value == "-6"
+
+    adx_delta = dict(metric, metric_id="adx_delta", value="80", unit="index_points")
+    adx_delta["definition"] = dict(adx_delta["definition"], definition_id="adx_delta", unit="index_points")
+    assert MetricValueV1.model_validate(adx_delta).value == "80"
+
+    rvol_delta = dict(metric, metric_id="rvol_delta", value="-0.25", unit="ratio_points")
+    rvol_delta["definition"] = dict(rvol_delta["definition"], definition_id="rvol_delta", unit="ratio_points")
+    assert MetricValueV1.model_validate(rvol_delta).value == "-0.25"
+
+    pressure_level = dict(metric, metric_id="breadth_pressure", value="6", unit="index_minus3_to3")
+    pressure_level["definition"] = dict(
+        pressure_level["definition"], definition_id="breadth_pressure", unit="index_minus3_to3"
+    )
+    with pytest.raises(ValueError):
+        MetricValueV1.model_validate(pressure_level)

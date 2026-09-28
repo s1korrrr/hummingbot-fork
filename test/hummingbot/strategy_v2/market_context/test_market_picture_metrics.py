@@ -1,4 +1,5 @@
 import math
+from decimal import Decimal
 
 import numpy as np
 import pytest
@@ -25,6 +26,7 @@ from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     realized_volatility_24h,
     relative_volume,
     return_percent,
+    return_percent_decimal,
 )
 
 
@@ -35,6 +37,15 @@ def test_six_horizon_returns_and_breadth_keep_zero_and_missing_distinct():
     assert (result.advances, result.declines, result.unchanged) == (1, 1, 1)
     assert (result.valid_count, result.expected_count, result.omitted_count) == (3, 4, 1)
     assert result.advance_share == pytest.approx(1 / 3)
+
+
+def test_exact_decimal_return_preserves_sub_float_breadth_sign():
+    closes = [Decimal("1000000000000000000000000"), Decimal("1000000000000000000000001")]
+    exact = return_percent_decimal(closes, 1)
+    assert exact is not None and exact > 0
+    assert 100.0 * (float(closes[-1]) / float(closes[0]) - 1.0) == 0.0
+    result = breadth({"tiny_advance": exact, "flat": Decimal(0)}, 2, 1, 60_000)
+    assert (result.advances, result.declines, result.unchanged) == (1, 0, 1)
 
 
 def test_breadth_pressure_uses_same_eligible_denominator_and_display_bands():
@@ -194,6 +205,36 @@ def test_distribution_summary_preserves_empty_and_stable_extrema():
     assert (result.best_instrument_id, result.worst_instrument_id) == ("b", "a")
     empty = distribution_summary({"a": None}, 1)
     assert empty.mean_return_percent is None and empty.positive_count == 0
+
+
+def test_asset_metric_builder_keeps_exact_decimal_return_for_breadth_consumers():
+    cutoff = 1_800_000_000_000
+    first = Decimal("1000000000000000000000000")
+    last = Decimal("1000000000000000000000001")
+    bars = AssetBarsV1(
+        instrument_id="okx:spot:BTC-USDC",
+        close_times_ms=(cutoff - 60_000, cutoff),
+        high=(last, last),
+        low=(first, first),
+        close=(first, last),
+        quote_volume=(1.0, 1.0),
+        cutoff_ms=cutoff,
+    )
+    result = compute_asset_metrics(bars)["return_1m"]
+    assert isinstance(result.value, Decimal) and result.value > 0
+    assert result.computation_status == "VALID"
+    summary = breadth({"okx:spot:BTC-USDC": result.value}, 1, 1, cutoff)
+    assert (summary.advances, summary.declines, summary.unchanged) == (1, 0, 0)
+
+
+def test_distribution_dispersion_requires_two_valid_returns():
+    singleton = distribution_summary({"a": 0.25, "b": None}, 2)
+    assert singleton.valid_count == 1
+    assert singleton.mean_return_percent == pytest.approx(0.25)
+    assert singleton.dispersion_percent is None
+
+    pair = distribution_summary({"a": 0.25, "b": 0.25}, 2)
+    assert pair.dispersion_percent == pytest.approx(0.0)
 
 
 def test_numeric_wire_text_is_finite_fixed_and_bounded():

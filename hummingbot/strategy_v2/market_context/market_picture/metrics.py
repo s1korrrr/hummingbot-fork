@@ -73,9 +73,9 @@ class AssetBarsV1:
 
     instrument_id: str
     close_times_ms: tuple[int, ...]
-    high: tuple[float, ...]
-    low: tuple[float, ...]
-    close: tuple[float, ...]
+    high: tuple[Decimal | str | float | int, ...]
+    low: tuple[Decimal | str | float | int, ...]
+    close: tuple[Decimal | str | float | int, ...]
     quote_volume: tuple[float | None, ...]
     cutoff_ms: int
 
@@ -104,7 +104,7 @@ class AssetBarsV1:
         ):
             raise ValueError("asset bars must be contiguous and end exactly at the frame cutoff")
         highs, lows, closes = (
-            _finite_vector(values, name=name)
+            _price_vector(values, name=name)
             for values, name in ((self.high, "high"), (self.low, "low"), (self.close, "close"))
         )
         if (
@@ -125,7 +125,7 @@ class AssetBarsV1:
 @dataclass(frozen=True)
 class AssetMetricObservation:
     metric_id: str
-    value: float | None
+    value: float | Decimal | None
     computation_status: str
     reason_codes: tuple[str, ...]
     sample_count: int
@@ -160,18 +160,62 @@ def _finite_vector(values: Sequence[float], *, name: str) -> np.ndarray:
     return array
 
 
-def return_percent(closes: Sequence[float], horizon_minutes: int) -> float | None:
-    """Simple return at the exact horizon; callers must supply the contiguous h+1 close window."""
+def _price_vector(values: Sequence[Decimal | str | float | int], *, name: str) -> np.ndarray:
+    """Validate exact decimal-compatible prices, then project to float for indicator math."""
+    converted = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (Decimal, str, float, int)):
+            raise ValueError(f"{name} must contain decimal-compatible non-boolean prices")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"{name} must contain finite positive prices")
+        try:
+            exact = value if isinstance(value, Decimal) else Decimal(str(value))
+            numeric = float(exact)
+        except (ValueError, TypeError, OverflowError) as error:
+            raise ValueError(f"{name} must contain finite positive prices") from error
+        if not exact.is_finite() or not math.isfinite(numeric):
+            raise ValueError(f"{name} must contain finite positive prices")
+        converted.append(numeric)
+    array = np.asarray(converted, dtype=float)
+    if array.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional sequence")
+    return array
+
+
+def return_percent_decimal(closes: Sequence[Decimal | str | float | int], horizon_minutes: int) -> Decimal | None:
+    """Exact source-price return; Decimal sign survives float display underflow."""
     if type(horizon_minutes) is not int or horizon_minutes not in (*HORIZONS_MINUTES, 10_080):
         raise ValueError("horizon must be a registered interval or exact seven-day ranking horizon")
-    values = _finite_vector(closes, name="closes")
-    if len(values) != horizon_minutes + 1 or (values <= 0).any():
+    if len(closes) != horizon_minutes + 1:
         return None
-    return float(100.0 * (values[-1] / values[0] - 1.0))
+    values = []
+    for value in closes:
+        if isinstance(value, bool) or not isinstance(value, (Decimal, str, float, int)):
+            raise ValueError("closes must contain exact decimal-compatible positive prices")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("closes must contain finite prices")
+        try:
+            decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
+        except Exception as error:
+            raise ValueError("closes must contain decimal-compatible prices") from error
+        if not decimal_value.is_finite():
+            raise ValueError("closes must contain finite prices")
+        if decimal_value <= 0:
+            return None
+        values.append(decimal_value)
+    with localcontext() as context:
+        context.prec = 80
+        return (values[-1] / values[0] - Decimal(1)) * Decimal(100)
+
+
+def return_percent(closes: Sequence[Decimal | str | float | int], horizon_minutes: int) -> float | None:
+    """Simple return at the exact horizon, projected to float for math/display kernels."""
+    value = return_percent_decimal(closes, horizon_minutes)
+    return float(value) if value is not None else None
 
 
 def breadth(
-    values: Mapping[str, float | None], expected_count: int, horizon_minutes: int, cutoff_ms: int
+    values: Mapping[str, Decimal | float | int | None], expected_count: int, horizon_minutes: int, cutoff_ms: int
 ) -> BreadthValue:
     """Count signs before display rounding; null and absent members are omitted, not unchanged."""
     if type(expected_count) is not int or expected_count < len(values) or expected_count < 0:
@@ -181,15 +225,17 @@ def breadth(
     if type(cutoff_ms) is not int or cutoff_ms < 0 or cutoff_ms % 60_000:
         raise ValueError("cutoff must be a nonnegative UTC minute boundary")
     valid = []
+    signs = []
     for value in values.values():
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if isinstance(value, bool) or not isinstance(value, (Decimal, int, float)) or not math.isfinite(value):
             raise ValueError("breadth values must be finite numbers or null")
+        signs.append((value > 0, value < 0))
         valid.append(float(value))
-    advances = sum(value > 0.0 for value in valid)
-    declines = sum(value < 0.0 for value in valid)
-    unchanged = len(valid) - advances - declines
+    advances = sum(positive for positive, _ in signs)
+    declines = sum(negative for _, negative in signs)
+    unchanged = len(signs) - advances - declines
     n = len(valid)
 
     def share(count):
@@ -584,7 +630,7 @@ def distribution_summary(values: Mapping[str, float | None], expected_count: int
         expected_count,
         mean,
         float(np.median(ordered)) if n else None,
-        float(np.std(ordered, ddof=0)) if n else None,
+        float(np.std(ordered, ddof=0)) if n >= 2 else None,
         sum(value < 0 for value in valid.values()),
         sum(value == 0 for value in valid.values()),
         sum(value > 0 for value in valid.values()),
@@ -596,7 +642,7 @@ def distribution_summary(values: Mapping[str, float | None], expected_count: int
 
 def _observation(
     metric_id: str,
-    value: float | None,
+    value: float | Decimal | None,
     *,
     available: int,
     required: int,
@@ -639,9 +685,10 @@ def compute_asset_metrics(
     Source gaps are rejected by AssetBarsV1 before this function. Missing quote-volume values remain
     unavailable only for the RVOL families; they never invalidate price/return calculations.
     """
-    close = _finite_vector(bars.close, name="close")
-    high = _finite_vector(bars.high, name="high")
-    low = _finite_vector(bars.low, name="low")
+    exact_close = bars.close
+    close = _price_vector(exact_close, name="close")
+    high = _price_vector(bars.high, name="high")
+    low = _price_vector(bars.low, name="low")
     volumes = bars.quote_volume
     n = len(close)
     end = bars.cutoff_ms
@@ -663,11 +710,13 @@ def compute_asset_metrics(
     returns = {}
     for horizon in (*HORIZONS_MINUTES, 10_080):
         metric_id = f"return_{horizon}m"
-        value = return_percent(close[-horizon - 1 :] if n >= horizon + 1 else close, horizon)  # noqa: E203
+        exact_window = exact_close[-horizon - 1 :] if n >= horizon + 1 else exact_close  # noqa: E203
+        exact_value = return_percent_decimal(exact_window, horizon)
+        value = float(exact_value) if exact_value is not None else None
         count = min(n, horizon + 1)
         put(
             metric_id,
-            value,
+            exact_value,
             horizon + 1,
             count=count,
             reason=None if value is not None else "INSUFFICIENT_HISTORY",

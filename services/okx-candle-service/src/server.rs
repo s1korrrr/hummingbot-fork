@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
     extract::{
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
@@ -29,16 +29,26 @@ pub struct App {
     pub token: Arc<String>,
     pub clients: Arc<Semaphore>,
     pub stop: CancellationToken,
+    pub market_picture: Option<crate::market_picture::SharedProjection>,
+    pub market_picture_clients: Arc<Semaphore>,
 }
-pub fn router(state: Shared, token: String, stop: CancellationToken) -> Router {
+pub fn router(
+    state: Shared,
+    token: String,
+    stop: CancellationToken,
+    market_picture: Option<crate::market_picture::SharedProjection>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v2/market-picture/history", get(market_picture_history))
         .route("/v1/stream", get(upgrade))
         .with_state(App {
             state,
             token: Arc::new(token),
             clients: Arc::new(Semaphore::new(32)),
             stop,
+            market_picture,
+            market_picture_clients: Arc::new(Semaphore::new(16)),
         })
 }
 fn authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -63,6 +73,54 @@ async fn health(State(app): State<App>, headers: HeaderMap) -> Response {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(app.state.lock().await.health()).into_response()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketPictureQuery {
+    pair: String,
+    interval: String,
+}
+async fn market_picture_history(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<MarketPictureQuery>,
+) -> Response {
+    if !authorized(&headers, &app.token) || headers.contains_key("origin") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(interval) = crate::market_picture::Interval::parse(&query.interval) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !crate::model::valid_pair(&query.pair) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(_permit) = app.market_picture_clients.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let now_ms = (crate::model::now() * 1000.0).round() as u64;
+    let response = if let Some(projection) = app.market_picture {
+        let projection = projection.lock().await;
+        match projection.response(&query.pair, interval, now_ms) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    } else {
+        crate::market_picture::Projection::unavailable(
+            &query.pair,
+            interval,
+            now_ms,
+            "projection_disabled",
+        )
+    };
+    match serde_json::to_vec(&response) {
+        Ok(bytes) if bytes.len() <= crate::market_picture::MAX_RESPONSE_BYTES => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 async fn upgrade(State(app): State<App>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     if !authorized(&headers, &app.token) || headers.contains_key("origin") {

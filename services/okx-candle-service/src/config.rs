@@ -25,6 +25,9 @@ pub struct Args {
     /// Optional private directory for validated public-candle restart caches.
     #[arg(long)]
     pub cache_dir: Option<PathBuf>,
+    /// Enable the separately versioned, bounded Market Picture history projection.
+    #[arg(long, default_value_t = false)]
+    pub market_picture: bool,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +87,21 @@ impl Args {
             u.pairs.len().saturating_mul(self.history) <= 3_000_000,
             "configured histories exceed 3000000-row process budget"
         );
+        if self.market_picture {
+            ensure!(
+                self.cache_dir.is_some(),
+                "market picture history requires the existing private cache directory"
+            );
+            ensure!(
+                u.pairs.len().saturating_mul(
+                    self.history
+                        + crate::market_picture::MINUTE_ROWS
+                        + crate::market_picture::HOUR_ROWS
+                        + crate::market_picture::DAY_ROWS
+                ) <= 3_000_000,
+                "market picture and candle histories exceed 3000000-row process budget"
+            );
+        }
         ensure!(
             u.pairs.iter().all(|p| valid_pair(p)),
             "invalid USDC spot pair"

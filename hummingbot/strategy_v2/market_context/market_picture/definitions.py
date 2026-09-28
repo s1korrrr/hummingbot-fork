@@ -72,6 +72,57 @@ DEFINITIONS = {
         {"sign": "unrounded_return", "zero": "unchanged"},
         "Advance, decline and unchanged counts over a pinned eligible cohort.",
     ),
+    "breadth_instrument_count": _definition(
+        "breadth_instrument_count",
+        "instruments",
+        {"unit_semantics": "integer-instrument-count", "zero_when_empty": True},
+        "Count of instruments in the pinned eligible or valid breadth cohort.",
+    ),
+    "breadth_share": _definition(
+        "breadth_share",
+        "share_fraction",
+        {
+            "formula": "category_count/eligible_count",
+            "categories": ["advance", "decline", "unchanged"],
+            "zero_denominator": "unavailable",
+        },
+        "Descriptive advance, decline or unchanged share of the pinned eligible cohort.",
+    ),
+    "instrument_coverage": _definition(
+        "instrument_coverage",
+        "share_fraction",
+        {"formula": "valid_count/eligible_count", "zero_denominator": "unavailable"},
+        "Fraction of the pinned eligible cohort with valid observations.",
+    ),
+    "breadth_return_mean": _definition(
+        "breadth_return_mean",
+        "return_percent",
+        {"aggregation": "arithmetic_mean", "cohort": "valid_horizon_returns"},
+        "Mean same-horizon arithmetic return across valid cohort members.",
+    ),
+    "breadth_return_median": _definition(
+        "breadth_return_median",
+        "return_percent",
+        {"aggregation": "median", "even_sample": "midpoint", "cohort": "valid_horizon_returns"},
+        "Median same-horizon arithmetic return across valid cohort members.",
+    ),
+    "breadth_downside_magnitude": _definition(
+        "breadth_downside_magnitude",
+        "return_percent",
+        {"formula": "max(-mean_return_percent,0)", "cohort": "valid_horizon_returns"},
+        "Magnitude of negative mean cohort return, or zero when the mean is nonnegative.",
+    ),
+    "breadth_return_dispersion": _definition(
+        "breadth_return_dispersion",
+        "percentage_points",
+        {
+            "aggregation": "population_standard_deviation",
+            "ddof": 0,
+            "minimum_samples": 2,
+            "cohort": "valid_horizon_returns",
+        },
+        "Population standard deviation of same-horizon returns in percentage points.",
+    ),
     "breadth_pressure": _definition(
         "breadth_pressure",
         "index_minus3_to3",
@@ -83,6 +134,36 @@ DEFINITIONS = {
             "serialization": "fixed-strip-trailing-zero",
         },
         "Descriptive net-breadth pressure, not flow or a forecast.",
+    ),
+    "breadth_pressure_delta": _definition(
+        "breadth_pressure_delta",
+        "index_points",
+        {"formula": "current_pressure-previous_pressure", "range": [-6, 6], "matched_cohort": True},
+        "Matched-cohort breadth pressure change in index points.",
+    ),
+    "rvol_delta": _definition(
+        "rvol_delta",
+        "ratio_points",
+        {"formula": "current_rvol-previous_rvol", "matched_cohort": True},
+        "Matched-cohort relative-volume change in ratio points.",
+    ),
+    "share_delta": _definition(
+        "share_delta",
+        "percentage_points",
+        {"formula": "100*(current_share-previous_share)", "matched_cohort": True, "comparison_horizon": "1h"},
+        "Matched-cohort one-hour change in participation share, in percentage points.",
+    ),
+    "volatility_delta": _definition(
+        "volatility_delta",
+        "percentage_points",
+        {"formula": "100*(current_median_rv-previous_median_rv)", "matched_cohort": True, "comparison_horizon": "1h"},
+        "Matched-cohort one-hour change in median realized volatility, in percentage points.",
+    ),
+    "trend_strength_delta": _definition(
+        "trend_strength_delta",
+        "index_points",
+        {"formula": "current_mean_adx-previous_mean_adx", "matched_cohort": True, "comparison_horizon": "1h"},
+        "Matched-cohort one-hour change in mean ADX trend strength, in index points.",
     ),
     "breadth_pressure_band": _definition(
         "breadth_pressure_band",
@@ -222,6 +303,12 @@ for _name in PARTICIPATION_PREDICATES:
     }[_name]
     DEFINITIONS[_name] = _definition(
         _name, "share_fraction", _parameters, "Overlapping descriptive participation predicate."
+    )
+    DEFINITIONS[f"{_name}_membership"] = _definition(
+        f"{_name}_membership",
+        "count",
+        {**_parameters, "encoding": "binary-0-or-1"},
+        "Per-instrument binary membership in the named descriptive predicate.",
     )
 
 REGISTRY_HASH = sha256(

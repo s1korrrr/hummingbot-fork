@@ -5,7 +5,7 @@ from decimal import Decimal as D
 from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_lifecycle import make_executor, tracked
 from test.test_ok_rsi_down_only_entry_execution import make_config as make_down_only_config
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -291,6 +291,19 @@ def test_acquisition_only_stop_keeps_filled_position_trailing():
     assert executor.status == RunnableStatus.RUNNING and executor.close_type is None
 
 
+def test_unreadable_fill_accounting_never_aborts_a_stop(caplog):
+    executor = live_executor()
+    orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)
+    orchestrator.active_executors = {'controller': [executor]}
+    with patch.object(PositionExecutor, 'open_filled_amount', new_callable=PropertyMock,
+                      side_effect=ValueError('Non-finite base fee')), caplog.at_level(logging.WARNING):
+        orchestrator.stop_executor(StopExecutorAction(controller_id='controller', executor_id=executor.config.id,
+                                                      keep_position=True))
+    assert executor.close_type == CloseType.POSITION_HOLD
+    assert executor.status == RunnableStatus.SHUTTING_DOWN
+    assert 'filled_base=UNAVAILABLE pending_close_type=POSITION_HOLD' in caplog.text
+
+
 def test_acquisition_only_stop_is_a_no_op_for_a_filled_entry():
     executor = live_executor()
     executor.stop_entry_acquisition('external_invalidation')
@@ -478,5 +491,5 @@ def test_sealed_restored_down_only_fill_keeps_executor_and_drawdown_hold_is_visi
     assert again._entry_stop_reason == 'position_hold'
     assert again.get_custom_info()['entry_acquisition']['terminal_reason'] == 'position_hold'
     assert f'Executor stop requested | controller=controller executor={executor_id} keep_position=True' in caplog.text
-    assert 'requested_close_type=POSITION_HOLD' in caplog.text
+    assert 'pending_close_type=POSITION_HOLD' in caplog.text
     assert 'Entry acquisition stopped reason=position_hold' in caplog.text

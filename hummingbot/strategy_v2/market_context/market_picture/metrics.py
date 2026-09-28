@@ -427,6 +427,69 @@ def correlation_coverage(sample_count: int, expected_count: int) -> float | None
     return sample_count / expected_count if expected_count else None
 
 
+def prepare_hourly_log_returns(prices: Mapping[int, float], *, expected_end_times_ms: Sequence[int]) -> np.ndarray:
+    """Align closed prices once; NaN explicitly represents an unavailable hourly return.
+
+    This reusable neutral projection lets an all-pairs consumer avoid calculating
+    an instrument's identical hourly log returns for every counterpart.
+    """
+    if any(type(t) is not int or t < 0 for t in expected_end_times_ms):
+        raise ValueError("expected hourly endpoints must be nonnegative integer UTC milliseconds")
+    expected_times = _finite_vector(expected_end_times_ms, name="expected hourly endpoints")
+    if len(expected_times) and (np.diff(expected_times) <= 0).any():
+        raise ValueError("expected hourly endpoints must be strictly increasing")
+    if len(expected_times) > 1 and not (np.diff(expected_times) == 3_600_000).all():
+        raise ValueError("expected hourly endpoints must be a contiguous 1h grid")
+    result = np.full(len(expected_times), np.nan, dtype=float)
+    for index, end_ms in enumerate(expected_times.astype(np.int64)):
+        end = int(end_ms)
+        if end not in prices or end - 3_600_000 not in prices:
+            continue
+        current, prior = prices[end], prices[end - 3_600_000]
+        if any(
+            isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x <= 0
+            for x in (current, prior)
+        ):
+            continue
+        ratio = current / prior
+        if math.isfinite(ratio) and ratio > 0:
+            result[index] = math.log(ratio)
+    result.flags.writeable = False
+    return result
+
+
+def correlate_hourly_return_vectors(
+    left: np.ndarray, right: np.ndarray, *, min_coverage: float = 0.95, min_pairs: int = 60
+) -> CorrelationValue:
+    """Same estimator on vectors prepared against the same explicit hourly grid.
+
+    Callers must bind both vectors to one grid; vector positions are timestamps,
+    never arbitrary observation offsets. Missing pairs are omitted together.
+    """
+    if not 0 < min_coverage <= 1 or type(min_pairs) is not int or min_pairs < 2:
+        raise ValueError("invalid correlation coverage policy")
+    if (
+        not isinstance(left, np.ndarray)
+        or not isinstance(right, np.ndarray)
+        or left.ndim != 1
+        or right.ndim != 1
+        or left.shape != right.shape
+        or left.dtype != np.dtype(float)
+        or right.dtype != np.dtype(float)
+    ):
+        raise ValueError("prepared return vectors must be matching one-dimensional float arrays")
+    expected = len(left)
+    if not expected:
+        return CorrelationValue(None, 0, 0, None)
+    paired = np.isfinite(left) & np.isfinite(right)
+    sample_count = int(np.count_nonzero(paired))
+    coverage = sample_count / expected
+    if coverage < min_coverage or sample_count < min_pairs:
+        return CorrelationValue(None, sample_count, expected, coverage)
+    coefficient = pearson_correlation(left[paired], right[paired], min_pairs=min_pairs)
+    return CorrelationValue(coefficient, sample_count, expected, coverage)
+
+
 def correlate_hourly_closes(
     left: Mapping[int, float],
     right: Mapping[int, float],
@@ -435,45 +498,13 @@ def correlate_hourly_closes(
     min_coverage: float = 0.95,
     min_pairs: int = 60,
 ) -> CorrelationValue:
-    """90d-style paired 1h log-return correlation; each return needs its own prior hour on both sides."""
-    if not 0 < min_coverage <= 1 or type(min_pairs) is not int or min_pairs < 2:
-        raise ValueError("invalid correlation coverage policy")
-    if any(type(t) is not int or t < 0 for t in expected_end_times_ms):
-        raise ValueError("expected hourly endpoints must be nonnegative integer UTC milliseconds")
-    expected_times = _finite_vector(expected_end_times_ms, name="expected hourly endpoints")
-    if len(expected_times) and (np.diff(expected_times) <= 0).any():
-        raise ValueError("expected hourly endpoints must be strictly increasing")
-    if len(expected_times) > 1 and not (np.diff(expected_times) == 3_600_000).all():
-        raise ValueError("expected hourly endpoints must be a contiguous 1h grid")
-    expected = len(expected_times)
-    if not expected:
-        return CorrelationValue(None, 0, 0, None)
-
-    def returns(prices: Mapping[int, float]) -> dict[int, float]:
-        result = {}
-        for end_ms in expected_times.astype(np.int64):
-            end = int(end_ms)
-            if end not in prices or end - 3_600_000 not in prices:
-                continue
-            current, prior = prices[end], prices[end - 3_600_000]
-            if any(
-                isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x <= 0
-                for x in (current, prior)
-            ):
-                continue
-            result[end] = math.log(current / prior)
-        return result
-
-    left_returns, right_returns = returns(left), returns(right)
-    paired_times = sorted(left_returns.keys() & right_returns.keys())
-    sample_count = len(paired_times)
-    coverage = sample_count / expected
-    if coverage < min_coverage or sample_count < min_pairs:
-        return CorrelationValue(None, sample_count, expected, coverage)
-    coefficient = pearson_correlation(
-        [left_returns[t] for t in paired_times], [right_returns[t] for t in paired_times], min_pairs=min_pairs
+    """Paired 1h log-return correlation; each return needs its prior hour on both sides."""
+    return correlate_hourly_return_vectors(
+        prepare_hourly_log_returns(left, expected_end_times_ms=expected_end_times_ms),
+        prepare_hourly_log_returns(right, expected_end_times_ms=expected_end_times_ms),
+        min_coverage=min_coverage,
+        min_pairs=min_pairs,
     )
-    return CorrelationValue(coefficient, sample_count, expected, coverage)
 
 
 def correlate_90d_hourly_closes(

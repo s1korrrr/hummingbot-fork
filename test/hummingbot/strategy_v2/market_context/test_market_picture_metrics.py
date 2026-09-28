@@ -12,6 +12,7 @@ from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     classify_pressure,
     compute_asset_metrics,
     correlate_hourly_closes,
+    correlate_hourly_return_vectors,
     correlation_30d_trend,
     count_predicate,
     distribution_summary,
@@ -23,6 +24,7 @@ from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     new_52w_completed_day_break,
     pearson_correlation,
     percentile_midranks,
+    prepare_hourly_log_returns,
     realized_volatility_24h,
     relative_volume,
     return_percent,
@@ -76,6 +78,29 @@ def test_histogram_has_symmetric_overflow_and_exact_count_conservation():
     assert result.counts[0] == result.counts[-1] == 1
     assert sum(result.counts) == len(values)
     assert result.zero_count == 1
+
+
+def test_prepared_correlation_preserves_pairwise_missing_and_constant_semantics():
+    grid = tuple(range(3_600_000, 2161 * 3_600_000, 3_600_000))
+    left = {t: 100 + math.sin(index / 10) for index, t in enumerate((0, *grid))}
+    right = {t: 50 + math.sin(index / 11) for index, t in enumerate((0, *grid))}
+    for t in grid[10:20]:
+        right.pop(t)
+    a = prepare_hourly_log_returns(left, expected_end_times_ms=grid)
+    b = prepare_hourly_log_returns(right, expected_end_times_ms=grid)
+    result = correlate_hourly_return_vectors(a, b)
+    paired = [
+        (math.log(left[t] / left[t - 3_600_000]), math.log(right[t] / right[t - 3_600_000]))
+        for t in grid
+        if t in right and t - 3_600_000 in right
+    ]
+    assert result.sample_count == len(paired) == 2149
+    assert result.value == pytest.approx(np.corrcoef(np.array(paired).T)[0, 1])
+    assert not a.flags.writeable
+    assert correlate_hourly_return_vectors(a, np.zeros_like(b)).value is None
+    assert correlate_hourly_return_vectors(a, np.full_like(b, np.nan)).sample_count == 0
+    with pytest.raises(ValueError):
+        correlate_hourly_return_vectors(a, b[:-1])
 
 
 @pytest.mark.parametrize("horizon,span", [(1, 0.5), (5, 1), (15, 2), (60, 3), (240, 5), (1440, 10)])

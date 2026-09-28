@@ -2,7 +2,7 @@
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from typing import Callable, Mapping, Sequence
 
@@ -78,6 +78,9 @@ class AssetBarsV1:
     close: tuple[Decimal | str | float | int, ...]
     quote_volume: tuple[float | None, ...]
     cutoff_ms: int
+    _high_vector: np.ndarray = field(init=False, repr=False, compare=False)
+    _low_vector: np.ndarray = field(init=False, repr=False, compare=False)
+    _close_vector: np.ndarray = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         from .contracts import INSTRUMENT_PATTERN, MAX_TIMESTAMP_MS
@@ -120,6 +123,9 @@ class AssetBarsV1:
                 isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
             ):
                 raise ValueError("quote volume must be a finite nonnegative number or null")
+        for name, vector in (("_high_vector", highs), ("_low_vector", lows), ("_close_vector", closes)):
+            vector.flags.writeable = False
+            object.__setattr__(self, name, vector)
 
 
 @dataclass(frozen=True)
@@ -717,9 +723,9 @@ def compute_asset_metrics(
     unavailable only for the RVOL families; they never invalidate price/return calculations.
     """
     exact_close = bars.close
-    close = _price_vector(exact_close, name="close")
-    high = _price_vector(bars.high, name="high")
-    low = _price_vector(bars.low, name="low")
+    close = bars._close_vector
+    high = bars._high_vector
+    low = bars._low_vector
     volumes = bars.quote_volume
     n = len(close)
     end = bars.cutoff_ms

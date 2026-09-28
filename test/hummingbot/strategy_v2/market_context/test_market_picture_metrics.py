@@ -4,6 +4,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
+from hummingbot.strategy_v2.market_context.market_picture import metrics as market_picture_metrics
 from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     AssetBarsV1,
     breadth,
@@ -198,6 +199,32 @@ def test_breakouts_use_exact_closed_history_and_strict_boundaries():
     assert new_10d_hourly_close_break(11.0, [11.0] * 240, [9.0] * 240) == (False, False)
     assert new_52w_completed_day_break(12.0, 8.0, [11.0] * 364, [9.0] * 364) == (True, True)
     assert new_52w_completed_day_break(12.0, 8.0, [11.0] * 363, [9.0] * 363) is None
+
+
+def test_asset_metrics_do_not_reparse_validated_ohlc(monkeypatch):
+    n = 1_441
+    cutoff = 1_800_000_000_000
+    source = tuple(str(100 + i / 1000) for i in range(n))
+    parsed = []
+    original = market_picture_metrics._price_vector
+
+    def count_parses(values, *, name):
+        parsed.append((name, len(values)))
+        return original(values, name=name)
+
+    monkeypatch.setattr(market_picture_metrics, "_price_vector", count_parses)
+    bars = AssetBarsV1(
+        instrument_id="okx:spot:BTC-USDC",
+        close_times_ms=tuple(cutoff - (n - i - 1) * 60_000 for i in range(n)),
+        high=tuple(str(Decimal(value) + Decimal("0.5")) for value in source),
+        low=tuple(str(Decimal(value) - Decimal("0.5")) for value in source),
+        close=source,
+        quote_volume=(1.0,) * n,
+        cutoff_ms=cutoff,
+    )
+    result = compute_asset_metrics(bars)
+    assert result["return_1440m"].value == return_percent_decimal(source, 1440)
+    assert parsed == [("high", n), ("low", n), ("close", n)]
 
 
 def test_asset_metric_builder_emits_all_frozen_asset_keys_and_feature_specific_statuses():

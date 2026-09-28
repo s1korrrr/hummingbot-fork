@@ -18,7 +18,6 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
 };
 use tokio::{
@@ -32,8 +31,67 @@ pub const MINUTE_ROWS: usize = 11_521;
 pub const HOUR_ROWS: usize = 3_001;
 pub const DAY_ROWS: usize = 401;
 pub const MAX_RESPONSE_BYTES: usize = 8_000_000;
+pub const MAX_MARKET_PICTURE_PAIRS: usize = 300;
+pub const MAX_EXTENSION_MEMORY_BYTES: u64 = 1_073_741_824;
 const MAX_CACHE_BYTES: u64 = 8_000_000;
 const MAX_CACHE_TOTAL_BYTES: u64 = 2_000_000_000;
+
+/// Conservative reserved-buffer estimate for the optional projection. VecDeque
+/// buffers are pre-sized; 32 extra bytes per slot cover allocator/slab overhead
+/// and conservatively account for shared source-epoch provenance allocations.
+pub fn estimated_extension_memory_bytes(pair_count: usize) -> Option<u64> {
+    if pair_count > MAX_MARKET_PICTURE_PAIRS {
+        return None;
+    }
+    let rows_per_pair = MINUTE_ROWS + HOUR_ROWS + DAY_ROWS;
+    let row_bytes = std::mem::size_of::<SourceBar>().checked_add(32)?;
+    let row_storage = pair_count
+        .checked_mul(rows_per_pair)?
+        .checked_mul(row_bytes)?;
+    let pair_overhead = pair_count.checked_mul(4096 + std::mem::size_of::<PairHistory>())?;
+    u64::try_from(row_storage.checked_add(pair_overhead)?).ok()
+}
+
+fn canonical_decimal_text(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
+fn parse_canonical_decimal(value: &str) -> Result<Decimal> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.'),
+        "source decimal is not canonical"
+    );
+    let parsed = Decimal::from_str_exact(value).context("invalid decimal source value")?;
+    ensure!(
+        canonical_decimal_text(parsed) == value,
+        "source decimal is not canonical"
+    );
+    Ok(parsed)
+}
+
+mod canonical_decimal {
+    use super::{Decimal, canonical_decimal_text, parse_canonical_decimal};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_canonical_decimal(&value).map_err(D::Error::custom)
+    }
+
+    pub fn serialize<S>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&canonical_decimal_text(*value))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Interval {
@@ -78,21 +136,27 @@ impl Interval {
 pub struct SourceBar {
     pub open_time_ms: u64,
     pub close_time_ms: u64,
-    pub open: String,
-    pub high: String,
-    pub low: String,
-    pub close: String,
-    pub volume: String,
-    pub quote_volume: String,
+    #[serde(with = "canonical_decimal")]
+    pub open: Decimal,
+    #[serde(with = "canonical_decimal")]
+    pub high: Decimal,
+    #[serde(with = "canonical_decimal")]
+    pub low: Decimal,
+    #[serde(with = "canonical_decimal")]
+    pub close: Decimal,
+    #[serde(with = "canonical_decimal")]
+    pub volume: Decimal,
+    #[serde(with = "canonical_decimal")]
+    pub quote_volume: Decimal,
     pub confirmed: bool,
     pub available_at_ms: u64,
-    pub source_epoch: String,
+    pub source_epoch: Arc<str>,
     pub source_sequence: u64,
 }
 
 struct SourceObservation {
     pair: String,
-    source_epoch: String,
+    source_epoch: Arc<str>,
     source_sequence: u64,
     published_at_ms: u64,
     received_at_ms: u64,
@@ -195,7 +259,7 @@ struct PairHistory {
     minute: VecDeque<SourceBar>,
     hour: VecDeque<SourceBar>,
     day: VecDeque<SourceBar>,
-    source_epoch: String,
+    source_epoch: Arc<str>,
     source_sequence: u64,
     projection_sequence: u64,
     available_at_ms: u64,
@@ -205,10 +269,10 @@ struct PairHistory {
 impl PairHistory {
     fn new() -> Self {
         Self {
-            minute: VecDeque::new(),
-            hour: VecDeque::new(),
-            day: VecDeque::new(),
-            source_epoch: String::new(),
+            minute: VecDeque::with_capacity(MINUTE_ROWS),
+            hour: VecDeque::with_capacity(HOUR_ROWS),
+            day: VecDeque::with_capacity(DAY_ROWS),
+            source_epoch: Arc::from(""),
             source_sequence: 0,
             projection_sequence: 0,
             available_at_ms: 0,
@@ -250,7 +314,7 @@ impl Projection {
         }
     }
 
-    fn load_record(&mut self, pair: &str, body: CacheBody, now_ms: u64) -> Result<()> {
+    fn load_record(&mut self, pair: &str, mut body: CacheBody, now_ms: u64) -> Result<()> {
         ensure!(
             body.schema_version == "market-picture.history-cache.v1",
             "cache schema mismatch"
@@ -270,9 +334,12 @@ impl Projection {
         validate_cache_bars(&body.bars_1m, Interval::Minute, MINUTE_ROWS)?;
         validate_cache_bars(&body.bars_1h, Interval::Hour, HOUR_ROWS)?;
         validate_cache_bars(&body.bars_1d, Interval::Day, DAY_ROWS)?;
-        history.minute = body.bars_1m.into();
-        history.hour = body.bars_1h.into();
-        history.day = body.bars_1d.into();
+        intern_bar_epochs(&mut body.bars_1m);
+        intern_bar_epochs(&mut body.bars_1h);
+        intern_bar_epochs(&mut body.bars_1d);
+        history.minute.extend(body.bars_1m);
+        history.hour.extend(body.bars_1h);
+        history.day.extend(body.bars_1d);
         // Persisted rows are a baseline only. A current source snapshot must
         // prove freshness after this process starts before any interval is ready.
         history.ready_source = false;
@@ -286,10 +353,11 @@ impl Projection {
                     .as_str()
                     .context("snapshot pair missing")?
                     .to_owned();
-                let epoch = metadata["epoch"]
-                    .as_str()
-                    .context("snapshot epoch missing")?
-                    .to_owned();
+                let epoch: Arc<str> = Arc::from(
+                    metadata["epoch"]
+                        .as_str()
+                        .context("snapshot epoch missing")?,
+                );
                 let sequence = metadata["sequence"]
                     .as_u64()
                     .context("snapshot sequence missing")?;
@@ -333,10 +401,15 @@ impl Projection {
             .as_str()
             .context("source event pair missing")?
             .to_owned();
-        let epoch = message["epoch"]
+        let epoch_text = message["epoch"]
             .as_str()
-            .context("source event epoch missing")?
-            .to_owned();
+            .context("source event epoch missing")?;
+        let epoch = self
+            .pairs
+            .get(&pair)
+            .filter(|history| history.source_epoch.as_ref() == epoch_text)
+            .map(|history| history.source_epoch.clone())
+            .unwrap_or_else(|| Arc::from(epoch_text));
         let sequence = message["sequence"]
             .as_u64()
             .context("source event sequence missing")?;
@@ -516,15 +589,21 @@ impl Projection {
             Interval::Hour => 3_690_000,
             Interval::Day => 86_490_000,
         };
+        // Freshness follows the newest completed interval cutoff. A recent minute
+        // heartbeat cannot make an old hourly or daily rollup appear current.
+        let fresh_cutoff = newest_close.is_some_and(|close| {
+            close <= now_ms.saturating_add(90_000)
+                && now_ms.saturating_sub(close) <= interval_freshness_ms
+        });
         let fresh_source = history.ready_source
             && history.last_observed_at_ms >= self.started_at_ms
-            && now_ms.saturating_sub(history.last_observed_at_ms) <= interval_freshness_ms;
+            && fresh_cutoff;
         let ready = bars.len() == expected && gap_count == 0 && fresh_source;
         let reason = if ready {
             None
         } else if history.last_observed_at_ms == 0 {
             Some("warming".to_owned())
-        } else if !history.ready_source {
+        } else if !fresh_source {
             Some("stale".to_owned())
         } else if gap_count > 0 {
             Some("gap".to_owned())
@@ -555,7 +634,7 @@ impl Projection {
             source_epoch: if history.source_epoch.is_empty() {
                 "unavailable".to_owned()
             } else {
-                history.source_epoch.clone()
+                history.source_epoch.to_string()
             },
             source_sequence: history.source_sequence,
             source_epochs: source_epoch_dictionary(&bars),
@@ -657,7 +736,7 @@ fn seconds_ms(seconds: f64) -> Result<u64> {
 
 fn row_to_source(
     row: &Candle,
-    epoch: &str,
+    epoch: &Arc<str>,
     sequence: u64,
     available_at_ms: u64,
 ) -> Result<SourceBar> {
@@ -671,15 +750,15 @@ fn row_to_source(
         close_time_ms: open_time_ms
             .checked_add(60_000)
             .context("source close timestamp overflow")?,
-        open: row.open.clone(),
-        high: row.high.clone(),
-        low: row.low.clone(),
-        close: row.close.clone(),
-        volume: row.volume.clone(),
-        quote_volume: row.quote_volume.clone(),
+        open: parse_canonical_decimal(&row.open)?,
+        high: parse_canonical_decimal(&row.high)?,
+        low: parse_canonical_decimal(&row.low)?,
+        close: parse_canonical_decimal(&row.close)?,
+        volume: parse_canonical_decimal(&row.volume)?,
+        quote_volume: parse_canonical_decimal(&row.quote_volume)?,
         confirmed: true,
         available_at_ms,
-        source_epoch: epoch.to_owned(),
+        source_epoch: epoch.clone(),
         source_sequence: sequence,
     })
 }
@@ -711,50 +790,35 @@ fn validate_source_rows(bars: &[SourceBar]) -> Result<()> {
     Ok(())
 }
 
-fn validate_decimal_bar(bar: &SourceBar) -> Result<()> {
-    let values = [
-        &bar.open,
-        &bar.high,
-        &bar.low,
-        &bar.close,
-        &bar.volume,
-        &bar.quote_volume,
-    ]
-    .map(|value| Decimal::from_str(value).context("invalid decimal source bar"));
-    let [open, high, low, close, volume, quote_volume] = values;
-    let (open, high, low, close, volume, quote_volume) =
-        (open?, high?, low?, close?, volume?, quote_volume?);
-    for (text, value) in [
-        (&bar.open, open),
-        (&bar.high, high),
-        (&bar.low, low),
-        (&bar.close, close),
-        (&bar.volume, volume),
-        (&bar.quote_volume, quote_volume),
-    ] {
-        ensure!(
-            !text.is_empty()
-                && text.len() <= 64
-                && text
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
-                && value.normalize().to_string() == *text,
-            "source decimal is not canonical"
-        );
+fn intern_bar_epochs(bars: &mut [SourceBar]) {
+    let mut epochs = BTreeMap::<String, Arc<str>>::new();
+    for bar in bars {
+        let shared = epochs
+            .entry(bar.source_epoch.to_string())
+            .or_insert_with(|| bar.source_epoch.clone())
+            .clone();
+        bar.source_epoch = shared;
     }
+}
+
+fn validate_decimal_bar(bar: &SourceBar) -> Result<()> {
     ensure!(
-        open > Decimal::ZERO
-            && high > Decimal::ZERO
-            && low > Decimal::ZERO
-            && close > Decimal::ZERO,
+        bar.open > Decimal::ZERO
+            && bar.high > Decimal::ZERO
+            && bar.low > Decimal::ZERO
+            && bar.close > Decimal::ZERO,
         "nonpositive source price"
     );
     ensure!(
-        volume >= Decimal::ZERO && quote_volume >= Decimal::ZERO,
+        bar.volume >= Decimal::ZERO && bar.quote_volume >= Decimal::ZERO,
         "negative source volume"
     );
     ensure!(
-        high >= open && high >= close && low <= open && low <= close && low <= high,
+        bar.high >= bar.open
+            && bar.high >= bar.close
+            && bar.low <= bar.open
+            && bar.low <= bar.close
+            && bar.low <= bar.high,
         "invalid source OHLC geometry"
     );
     Ok(())
@@ -846,7 +910,7 @@ fn aggregate_bucket(
     minute: &VecDeque<SourceBar>,
     interval: Interval,
     start_s: u64,
-    source_epoch: &str,
+    source_epoch: &Arc<str>,
     source_sequence: u64,
     available_at_ms: u64,
 ) -> Result<Option<SourceBar>> {
@@ -867,48 +931,39 @@ fn aggregate_bucket(
     {
         return Ok(None);
     }
-    let sum = |select: fn(&SourceBar) -> &String| -> Result<String> {
-        let value = members.iter().try_fold(Decimal::ZERO, |total, bar| {
-            Ok::<_, anyhow::Error>(total + Decimal::from_str(select(bar))?)
-        })?;
-        Ok(value.normalize().to_string())
+    let sum = |select: fn(&SourceBar) -> Decimal| -> Decimal {
+        members
+            .iter()
+            .fold(Decimal::ZERO, |total, bar| total + select(bar))
     };
     let high = members
         .iter()
-        .map(|bar| Decimal::from_str(&bar.high))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .map(|bar| bar.high)
         .max()
-        .context("empty bucket")?
-        .normalize()
-        .to_string();
+        .context("empty bucket")?;
     let low = members
         .iter()
-        .map(|bar| Decimal::from_str(&bar.low))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .map(|bar| bar.low)
         .min()
-        .context("empty bucket")?
-        .normalize()
-        .to_string();
+        .context("empty bucket")?;
     let first = members.first().context("empty bucket")?;
     let last = members.last().context("empty bucket")?;
     Ok(Some(SourceBar {
         open_time_ms: start_ms,
         close_time_ms: start_ms + duration_ms,
-        open: first.open.clone(),
+        open: first.open,
         high,
         low,
-        close: last.close.clone(),
-        volume: sum(|bar| &bar.volume)?,
-        quote_volume: sum(|bar| &bar.quote_volume)?,
+        close: last.close,
+        volume: sum(|bar| bar.volume),
+        quote_volume: sum(|bar| bar.quote_volume),
         confirmed: true,
         available_at_ms: members
             .iter()
             .map(|bar| bar.available_at_ms)
             .max()
             .unwrap_or(available_at_ms),
-        source_epoch: source_epoch.to_owned(),
+        source_epoch: source_epoch.clone(),
         source_sequence,
     }))
 }
@@ -936,6 +991,7 @@ fn source_epoch_dictionary(bars: &[SourceBar]) -> Vec<String> {
         .map(|bar| bar.source_epoch.clone())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
+        .map(|epoch| epoch.to_string())
         .collect()
 }
 
@@ -944,15 +1000,15 @@ fn wire_bars(bars: Vec<SourceBar>) -> Vec<WireBar> {
     bars.into_iter()
         .map(|bar| {
             (
-                bar.open,
-                bar.high,
-                bar.low,
-                bar.close,
-                bar.volume,
-                bar.quote_volume,
+                canonical_decimal_text(bar.open),
+                canonical_decimal_text(bar.high),
+                canonical_decimal_text(bar.low),
+                canonical_decimal_text(bar.close),
+                canonical_decimal_text(bar.volume),
+                canonical_decimal_text(bar.quote_volume),
                 bar.available_at_ms,
                 epochs
-                    .binary_search(&bar.source_epoch)
+                    .binary_search_by(|candidate| candidate.as_str().cmp(bar.source_epoch.as_ref()))
                     .expect("source epoch dictionary is complete"),
                 bar.source_sequence,
             )
@@ -1014,7 +1070,11 @@ impl ProjectionCache {
         Ok(())
     }
     pub fn save(&self, projection: &Projection, pair: &str, saved_at_ms: u64) -> Result<()> {
-        let body = projection.cache_body(pair, saved_at_ms)?;
+        self.save_body(projection.cache_body(pair, saved_at_ms)?)
+    }
+
+    fn save_body(&self, body: CacheBody) -> Result<()> {
+        let pair = body.pair.clone();
         let rows = body.bars_1m.len() + body.bars_1h.len() + body.bars_1d.len();
         ensure!(
             rows <= MINUTE_ROWS + HOUR_ROWS + DAY_ROWS,
@@ -1034,7 +1094,7 @@ impl ProjectionCache {
             .filter_map(|entry| entry.metadata().ok())
             .map(|meta| meta.len())
             .sum::<u64>();
-        let target = self.path(pair)?;
+        let target = self.path(&pair)?;
         let old_size = match fs::symlink_metadata(&target) {
             Ok(meta) => {
                 ensure!(
@@ -1119,23 +1179,35 @@ async fn flush_projection(
         .cloned()
         .collect::<Vec<_>>();
     for pair in pairs {
-        let sequence = projection.lock().await.sequence(&pair).unwrap_or_default();
-        if sequence == 0 {
-            continue;
-        }
-        if !final_flush && saved.get(&pair) == Some(&sequence) {
-            continue;
-        }
-        let snapshot = projection.lock().await.clone();
-        let cache = cache.clone();
-        let name = pair.clone();
         let saved_at_ms = (now() * 1000.0).round() as u64;
-        match tokio::task::spawn_blocking(move || cache.save(&snapshot, &name, saved_at_ms)).await {
+        let snapshot = {
+            let owner = projection.lock().await;
+            let sequence = owner.sequence(&pair).unwrap_or_default();
+            if sequence == 0 || (!final_flush && saved.get(&pair) == Some(&sequence)) {
+                None
+            } else {
+                match owner.cache_body(&pair, saved_at_ms) {
+                    Ok(body) => Some((sequence, body)),
+                    Err(error) => {
+                        eprintln!("market picture cache snapshot failed {pair}: {error:#}");
+                        None
+                    }
+                }
+            }
+        };
+        let Some((sequence, body)) = snapshot else {
+            continue;
+        };
+        let cache = cache.clone();
+        let cache_pair = pair.clone();
+        match tokio::task::spawn_blocking(move || cache.save_body(body)).await {
             Ok(Ok(())) => {
                 saved.insert(pair, sequence);
             }
-            Ok(Err(error)) => eprintln!("market picture cache write failed {pair}: {error:#}"),
-            Err(error) => eprintln!("market picture cache task failed {pair}: {error}"),
+            Ok(Err(error)) => {
+                eprintln!("market picture cache write failed {cache_pair}: {error:#}")
+            }
+            Err(error) => eprintln!("market picture cache task failed {cache_pair}: {error}"),
         }
     }
 }
@@ -1148,18 +1220,84 @@ mod tests {
         SourceBar {
             open_time_ms,
             close_time_ms: open_time_ms + 60_000,
-            open: close.into(),
-            high: close.into(),
-            low: close.into(),
-            close: close.into(),
-            volume: "1".into(),
-            quote_volume: close.into(),
+            open: parse_canonical_decimal(close).unwrap(),
+            high: parse_canonical_decimal(close).unwrap(),
+            low: parse_canonical_decimal(close).unwrap(),
+            close: parse_canonical_decimal(close).unwrap(),
+            volume: Decimal::ONE,
+            quote_volume: parse_canonical_decimal(close).unwrap(),
             confirmed: true,
             available_at_ms: open_time_ms + 60_000,
             source_epoch: "source-epoch".into(),
             source_sequence: 1,
         }
     }
+    #[test]
+    fn maximum_configured_projection_has_a_bounded_compact_buffer_estimate() {
+        let estimate = estimated_extension_memory_bytes(MAX_MARKET_PICTURE_PAIRS).unwrap();
+        println!(
+            "Market Picture max-pair buffer estimate: pairs={MAX_MARKET_PICTURE_PAIRS}, source_bar_bytes={}, projected_bytes={estimate}",
+            std::mem::size_of::<SourceBar>()
+        );
+        assert!(estimate <= MAX_EXTENSION_MEMORY_BYTES);
+        assert!(estimated_extension_memory_bytes(240).unwrap() <= MAX_EXTENSION_MEMORY_BYTES);
+        assert!(estimated_extension_memory_bytes(MAX_MARKET_PICTURE_PAIRS + 1).is_none());
+        assert!(std::mem::size_of::<SourceBar>() <= 160);
+    }
+
+    #[test]
+    #[ignore = "one-off synthetic max-capacity RSS evidence; run explicitly when auditing the memory bound"]
+    fn synthetic_max_pair_preallocation_memory_probe() {
+        let before = resource_rss_bytes();
+        let mut histories: Vec<_> = (0..MAX_MARKET_PICTURE_PAIRS)
+            .map(|_| PairHistory::new())
+            .collect();
+        let sample = bar(1_800_000_000_000, "1.25");
+        for history in &mut histories {
+            for _ in 0..MINUTE_ROWS {
+                history.minute.push_back(sample.clone());
+            }
+            for _ in 0..HOUR_ROWS {
+                history.hour.push_back(sample.clone());
+            }
+            for _ in 0..DAY_ROWS {
+                history.day.push_back(sample.clone());
+            }
+        }
+        let slots: usize = histories
+            .iter()
+            .map(|history| {
+                history.minute.capacity() + history.hour.capacity() + history.day.capacity()
+            })
+            .sum();
+        assert_eq!(
+            slots,
+            MAX_MARKET_PICTURE_PAIRS * (MINUTE_ROWS + HOUR_ROWS + DAY_ROWS)
+        );
+        let after = resource_rss_bytes();
+        println!(
+            "synthetic max projection: pairs={}, source_bar_bytes={}, reserved_slots={}, estimated_buffer_bytes={}, maxrss_before_bytes={before}, maxrss_after_bytes={after}",
+            MAX_MARKET_PICTURE_PAIRS,
+            std::mem::size_of::<SourceBar>(),
+            slots,
+            slots * std::mem::size_of::<SourceBar>()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resource_rss_bytes() -> u64 {
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        usage.ru_maxrss as u64
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn resource_rss_bytes() -> u64 {
+        let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        (usage.ru_maxrss as u64) * 1024
+    }
+
     #[test]
     fn interval_sizes_and_utc_aggregate_boundaries_are_frozen() {
         assert_eq!((MINUTE_ROWS, HOUR_ROWS, DAY_ROWS), (11_521, 3_001, 401));
@@ -1169,7 +1307,7 @@ mod tests {
             &rows,
             Interval::Hour,
             start,
-            "source-epoch",
+            &Arc::from("source-epoch"),
             9,
             start * 1000,
         )
@@ -1179,7 +1317,7 @@ mod tests {
             (hour.open_time_ms, hour.close_time_ms),
             (start * 1000, (start + 3_600) * 1000)
         );
-        assert_eq!(hour.quote_volume, "120");
+        assert_eq!(hour.quote_volume, Decimal::from(120));
     }
     #[test]
     fn incomplete_or_gapped_utc_bucket_never_becomes_a_confirmed_rollup() {
@@ -1189,15 +1327,29 @@ mod tests {
             .map(|n| bar((start + n * 60) * 1000, "2"))
             .collect();
         assert!(
-            aggregate_bucket(&rows, Interval::Hour, start, "e", 1, start * 1000)
-                .unwrap()
-                .is_none()
+            aggregate_bucket(
+                &rows,
+                Interval::Hour,
+                start,
+                &Arc::from("e"),
+                1,
+                start * 1000
+            )
+            .unwrap()
+            .is_none()
         );
         rows.pop_back();
         assert!(
-            aggregate_bucket(&rows, Interval::Hour, start, "e", 1, start * 1000)
-                .unwrap()
-                .is_none()
+            aggregate_bucket(
+                &rows,
+                Interval::Hour,
+                start,
+                &Arc::from("e"),
+                1,
+                start * 1000
+            )
+            .unwrap()
+            .is_none()
         );
     }
     #[test]
@@ -1231,6 +1383,42 @@ mod tests {
         assert!(!response.ready);
         assert_eq!(response.reason.as_deref(), Some("warming"));
         assert_eq!(response.bars.len(), MINUTE_ROWS);
+    }
+
+    #[test]
+    fn a_recent_minute_observation_cannot_refresh_an_old_hourly_rollup() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let latest_close = (now_ms / 3_600_000) * 3_600_000 - 2 * 3_600_000;
+        let first_open = latest_close - HOUR_ROWS as u64 * 3_600_000;
+        let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 1_000);
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        history.hour = (0..HOUR_ROWS)
+            .map(|index| {
+                let open = first_open + index as u64 * 3_600_000;
+                let mut value = bar(open, "1");
+                value.close_time_ms = open + 3_600_000;
+                value.available_at_ms = value.close_time_ms;
+                value.source_epoch = "epoch".into();
+                value.source_sequence = index as u64 + 1;
+                value
+            })
+            .collect();
+        history.source_epoch = "epoch".into();
+        history.source_sequence = 9;
+        history.projection_sequence = 1;
+        history.last_observed_at_ms = now_ms;
+        history.ready_source = true;
+
+        let response = projection.response(&pair, Interval::Hour, now_ms).unwrap();
+        assert!(!response.ready);
+        assert_eq!(response.reason.as_deref(), Some("stale"));
+        assert_eq!(response.coverage.valid_count, HOUR_ROWS);
+
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        history.hour.truncate(100);
+        let partial = projection.response(&pair, Interval::Hour, now_ms).unwrap();
+        assert_eq!(partial.reason.as_deref(), Some("stale"));
     }
 
     #[test]
@@ -1323,6 +1511,16 @@ mod tests {
         assert!(bytes.len() <= MAX_RESPONSE_BYTES, "{} bytes", bytes.len());
         let decoded: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded["bars"][0].as_array().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn compact_rows_preserve_v1_cache_decimal_and_epoch_wire_strings() {
+        let value = bar(1_800_000_000_000, "1.25");
+        let encoded = serde_json::to_value(&value).unwrap();
+        assert_eq!(encoded["open"], "1.25");
+        assert_eq!(encoded["source_epoch"], "source-epoch");
+        let decoded: SourceBar = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, value);
     }
 
     #[test]

@@ -54,8 +54,11 @@ def regime_transition(
     current_label: str | None,
     expected_instrument_id: str,
     expected_schema: str,
+    interval_ms: int = 60_000,
 ) -> bool:
     """Only consecutive, valid, same-instrument/schema observations can create a regime shift."""
+    if type(interval_ms) is not int or interval_ms < 1:
+        raise ValueError("regime cadence must be a positive integer number of milliseconds")
     if previous_label is None or current_label is None or previous_label == current_label:
         return False
     return bool(
@@ -63,7 +66,7 @@ def regime_transition(
         and previous.instrument_id == current.instrument_id == expected_instrument_id
         and previous.source_schema == current.source_schema == expected_schema
         and current.sequence == previous.sequence + 1
-        and current.cutoff_ms > previous.cutoff_ms
+        and current.cutoff_ms - previous.cutoff_ms == interval_ms
     )
 
 
@@ -202,6 +205,7 @@ def regime_transition_event(
     current_label: str | None,
     expected_instrument_id: str,
     expected_schema: str,
+    interval_ms: int = 60_000,
 ) -> dict | None:
     if not regime_transition(
         previous,
@@ -210,6 +214,7 @@ def regime_transition_event(
         current_label=current_label,
         expected_instrument_id=expected_instrument_id,
         expected_schema=expected_schema,
+        interval_ms=interval_ms,
     ):
         return None
     return {

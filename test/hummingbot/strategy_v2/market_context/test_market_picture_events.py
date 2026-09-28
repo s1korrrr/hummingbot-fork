@@ -31,6 +31,24 @@ def test_regime_events_require_same_instrument_schema_and_consecutive_sequence()
         expected_instrument_id="okx:spot:BTC-USDC",
         expected_schema="regime.v1",
     )
+    skipped_cutoff = ValidObservation("okx:spot:BTC-USDC", "regime.v1", 9, 180_000, None)
+    assert not regime_transition(
+        previous,
+        skipped_cutoff,
+        previous_label="range",
+        current_label="trend",
+        expected_instrument_id="okx:spot:BTC-USDC",
+        expected_schema="regime.v1",
+    )
+    assert regime_transition(
+        previous,
+        skipped_cutoff,
+        previous_label="range",
+        current_label="trend",
+        expected_instrument_id="okx:spot:BTC-USDC",
+        expected_schema="regime.v1",
+        interval_ms=120_000,
+    )
     other_asset = ValidObservation("okx:spot:ETH-USDC", "regime.v1", 9, 120_000, None)
     assert not regime_transition(
         previous,

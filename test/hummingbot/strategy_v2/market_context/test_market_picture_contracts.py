@@ -59,6 +59,43 @@ def test_parse_rejects_duplicate_keys_and_digest_mismatch():
         parse_metric_series(json.dumps(data).encode())
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda data: data.update(available_at_ms=data["provider_ref"]["available_at_ms"] - 1),
+        lambda data: data.update(available_at_ms=data["window_end_ms"] - 1),
+        lambda data: data.update(expires_at_ms=data["provider_ref"]["expires_at_ms"] + 1),
+        lambda data: data["cells"][0].update(available_at_ms=data["provider_ref"]["available_at_ms"] - 1),
+        lambda data: data["cells"][0].update(window_end_ms=data["available_at_ms"] + 1),
+        lambda data: data["cells"][0].update(expires_at_ms=data["expires_at_ms"] + 1),
+    ],
+)
+def test_metric_series_rejects_cell_and_series_effective_time_outside_provenance(mutate):
+    from hummingbot.strategy_v2.market_context.market_picture.contracts import metric_series_digest
+
+    data = json.loads(FIXTURE.read_text())
+    mutate(data)
+    data["payload_digest"] = metric_series_digest(data)
+    with pytest.raises(ValueError):
+        MetricSeriesV1.model_validate_json(json.dumps(data))
+
+
+def test_expanded_metric_value_must_fit_source_availability_and_expiry():
+    metric = resolve_metric_series(parse_metric_series(FIXTURE.read_bytes()))["okx:spot:BTC-USDC"]
+    metric["reason_codes"] = tuple(metric["reason_codes"])
+    metric["source_ref"]["capabilities"] = tuple(metric["source_ref"]["capabilities"])
+    metric["available_at_ms"] = metric["source_ref"]["available_at_ms"] - 1
+    with pytest.raises(ValueError):
+        MetricValueV1.model_validate(metric)
+
+    metric = resolve_metric_series(parse_metric_series(FIXTURE.read_bytes()))["okx:spot:BTC-USDC"]
+    metric["reason_codes"] = tuple(metric["reason_codes"])
+    metric["source_ref"]["capabilities"] = tuple(metric["source_ref"]["capabilities"])
+    metric["expires_at_ms"] = metric["source_ref"]["expires_at_ms"] + 1
+    with pytest.raises(ValueError):
+        MetricValueV1.model_validate(metric)
+
+
 def test_valid_zero_is_distinct_from_missing():
     data = json.loads(FIXTURE.read_text())
     data["cells"][0]["value"] = "0"

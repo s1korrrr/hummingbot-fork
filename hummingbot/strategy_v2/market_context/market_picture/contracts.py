@@ -226,14 +226,34 @@ class MetricSeriesV1(ContractModel):
     def coherent_series(self):
         if self.series_unit != self.definition_ref.unit:
             raise ValueError("series unit must match its definition")
+        if self.available_at_ms < self.provider_ref.available_at_ms:
+            raise ValueError("series availability precedes its provider")
+        if self.window_end_ms is not None and self.available_at_ms < self.window_end_ms:
+            raise ValueError("series availability precedes its effective window end")
         if self.expires_at_ms <= self.available_at_ms:
             raise ValueError("series expiry must follow availability")
+        if self.expires_at_ms > self.provider_ref.expires_at_ms:
+            raise ValueError("series expiry exceeds provider expiry")
         if (
             self.window_start_ms is not None
             and self.window_end_ms is not None
             and self.window_end_ms < self.window_start_ms
         ):
             raise ValueError("series window is reversed")
+        for cell in self.cells:
+            effective_available = cell.available_at_ms if cell.available_at_ms is not None else self.available_at_ms
+            effective_expires = cell.expires_at_ms if cell.expires_at_ms is not None else self.expires_at_ms
+            effective_window_end = cell.window_end_ms if cell.window_end_ms is not None else self.window_end_ms
+            if effective_available < self.provider_ref.available_at_ms:
+                raise ValueError("metric cell availability precedes its provider")
+            if effective_window_end is not None and effective_available < effective_window_end:
+                raise ValueError("metric cell availability precedes its effective window end")
+            if effective_expires <= effective_available:
+                raise ValueError("metric cell expiry must follow availability")
+            if effective_expires > self.expires_at_ms:
+                raise ValueError("metric cell expiry exceeds series expiry")
+            if effective_expires > self.provider_ref.expires_at_ms:
+                raise ValueError("metric cell expiry exceeds provider expiry")
         ids = [cell.instrument_id for cell in self.cells]
         if ids != sorted(set(ids)):
             raise ValueError("metric cells must be sorted by unique instrument identity")
@@ -390,8 +410,14 @@ class MetricValueV1(ContractModel):
                     raise ValueError(f"value is outside the bounds for unit {self.unit}")
                 if self.unit in ("count", "instruments", "milliseconds") and number != number.to_integral_value():
                     raise ValueError(f"value must be integral for unit {self.unit}")
+        if self.available_at_ms < self.source_ref.available_at_ms:
+            raise ValueError("metric availability precedes its provider")
+        if self.window_end_ms is not None and self.available_at_ms < self.window_end_ms:
+            raise ValueError("metric availability precedes its effective window end")
         if self.expires_at_ms <= self.available_at_ms:
             raise ValueError("metric expiry must follow availability")
+        if self.expires_at_ms > self.source_ref.expires_at_ms:
+            raise ValueError("metric expiry exceeds provider expiry")
         if self.denominator is not None and self.numerator is not None and self.numerator > self.denominator:
             raise ValueError("numerator exceeds denominator")
         if self.denominator is not None and self.denominator > self.expected_denominator:

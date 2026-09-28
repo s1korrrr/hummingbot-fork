@@ -183,6 +183,24 @@ DEFINITIONS = {
         {"baseline_bars": 1440, "current_excluded": True},
         "Current minute quote volume divided by prior 24-hour mean minute quote volume.",
     ),
+    "median_relative_volume_24h": _definition(
+        "median_relative_volume_24h",
+        "ratio",
+        {"aggregation": "median", "source_metric": "rvol_24h", "cohort": "valid_instruments"},
+        "Cross-sectional median 24-hour relative volume over valid instruments.",
+    ),
+    "mean_adx14": _definition(
+        "mean_adx14",
+        "adx_0_100",
+        {"aggregation": "arithmetic_mean", "source_metric": "adx14", "cohort": "valid_instruments"},
+        "Cross-sectional mean ADX14 trend strength over valid instruments.",
+    ),
+    "median_realized_volatility_24h": _definition(
+        "median_realized_volatility_24h",
+        "volatility_fraction_annualized",
+        {"aggregation": "median", "source_metric": "realized_volatility_24h", "cohort": "valid_instruments"},
+        "Cross-sectional median annualized realized volatility over valid instruments.",
+    ),
     "rv24h_annualized": _definition(
         "rv24h_annualized",
         "volatility_fraction_annualized",
@@ -269,6 +287,42 @@ DEFINITIONS = {
         "count",
         {"event_bar": "latest-closed-1h-close", "prior_bars": 240, "strict": True},
         "Latest completed hourly close breaks prior 240 completed hourly highs.",
+    ),
+    "high_break_52w": _definition(
+        "high_break_52w",
+        "count",
+        {"event_bar": "latest-completed-utc-day-high", "prior_days": 364, "strict": True},
+        "Per-instrument completed-day high break against the prior 364 UTC days.",
+    ),
+    "low_break_52w": _definition(
+        "low_break_52w",
+        "count",
+        {"event_bar": "latest-completed-utc-day-low", "prior_days": 364, "strict": True},
+        "Per-instrument completed-day low break against the prior 364 UTC days.",
+    ),
+    "market_high_break_count_24h": _definition(
+        "market_high_break_count_24h",
+        "instruments",
+        {"aggregation": "sum_true", "source_metric": "high_break_24h", "cohort": "eligible_instruments"},
+        "Number of eligible instruments making a strict 24-hour high break.",
+    ),
+    "market_low_break_count_24h": _definition(
+        "market_low_break_count_24h",
+        "instruments",
+        {"aggregation": "sum_true", "source_metric": "low_break_24h", "cohort": "eligible_instruments"},
+        "Number of eligible instruments making a strict 24-hour low break.",
+    ),
+    "market_high_break_count_52w": _definition(
+        "market_high_break_count_52w",
+        "instruments",
+        {"aggregation": "sum_true", "source_metric": "high_break_52w", "cohort": "eligible_instruments"},
+        "Number of eligible instruments making a strict 52-week high break.",
+    ),
+    "market_low_break_count_52w": _definition(
+        "market_low_break_count_52w",
+        "instruments",
+        {"aggregation": "sum_true", "source_metric": "low_break_52w", "cohort": "eligible_instruments"},
+        "Number of eligible instruments making a strict 52-week low break.",
     ),
     "high_low_52w": _definition(
         "high_low_52w",

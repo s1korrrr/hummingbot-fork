@@ -706,7 +706,8 @@ def compute_asset_metrics(
             window_start_ms=start,
         )
 
-    put("price", float(close[-1]), 1, count=1, start=end)
+    latest_close = exact_close[-1] if isinstance(exact_close[-1], Decimal) else Decimal(str(exact_close[-1]))
+    put("price", latest_close, 1, count=1, start=end)
     returns = {}
     for horizon in (*HORIZONS_MINUTES, 10_080):
         metric_id = f"return_{horizon}m"

@@ -220,8 +220,11 @@ def test_asset_metric_builder_keeps_exact_decimal_return_for_breadth_consumers()
         quote_volume=(1.0, 1.0),
         cutoff_ms=cutoff,
     )
-    result = compute_asset_metrics(bars)["return_1m"]
+    metrics = compute_asset_metrics(bars)
+    result = metrics["return_1m"]
     assert isinstance(result.value, Decimal) and result.value > 0
+    assert metrics["price"].value == last
+    assert metrics["price"].value != Decimal(str(float(last)))
     assert result.computation_status == "VALID"
     summary = breadth({"okx:spot:BTC-USDC": result.value}, 1, 1, cutoff)
     assert (summary.advances, summary.declines, summary.unchanged) == (1, 0, 0)

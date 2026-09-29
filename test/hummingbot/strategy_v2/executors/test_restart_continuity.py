@@ -1,12 +1,16 @@
 """Restart continuity: a planned or crash restart restores executors exactly (real SQLite)."""
 import asyncio
+import logging
 from decimal import Decimal as D
 from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_lifecycle import make_executor, tracked
+from test.test_ok_rsi_down_only_entry_execution import make_config as make_down_only_config
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
+from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import DownOnlyMakerPositionExecutor
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.markets_recorder import MarketsRecorder
@@ -287,6 +291,19 @@ def test_acquisition_only_stop_keeps_filled_position_trailing():
     assert executor.status == RunnableStatus.RUNNING and executor.close_type is None
 
 
+def test_unreadable_fill_accounting_never_aborts_a_stop(caplog):
+    executor = live_executor()
+    orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)
+    orchestrator.active_executors = {'controller': [executor]}
+    with patch.object(PositionExecutor, 'open_filled_amount', new_callable=PropertyMock,
+                      side_effect=ValueError('Non-finite base fee')), caplog.at_level(logging.WARNING):
+        orchestrator.stop_executor(StopExecutorAction(controller_id='controller', executor_id=executor.config.id,
+                                                      keep_position=True))
+    assert executor.close_type == CloseType.POSITION_HOLD
+    assert executor.status == RunnableStatus.SHUTTING_DOWN
+    assert 'filled_base=UNAVAILABLE pending_close_type=POSITION_HOLD' in caplog.text
+
+
 def test_acquisition_only_stop_is_a_no_op_for_a_filled_entry():
     executor = live_executor()
     executor.stop_entry_acquisition('external_invalidation')
@@ -457,3 +474,56 @@ def test_controller_refusing_a_row_is_reported_not_rebuilt_as_plain_executor(rec
     strategy.controllers['controller'].restart_continuity_executor_class = lambda config: object
     with pytest.raises(RestartContinuityError):
         orchestrator._continuity_executor_class(strategy.controllers['controller'], executor.config)
+
+
+def sealed_down_only_executor():
+    base = make_executor()
+    barriers = base.config.triple_barrier_config.model_copy(update={'open_order_limit_max_age_seconds': 0})
+    config = make_down_only_config(id=base.config.id, timestamp=base.config.timestamp, controller_id='controller',
+                                   trading_pair='ETH-USDT', triple_barrier_config=barriers)
+    with patch.object(PositionExecutor, 'get_trading_rules', return_value=RULE):
+        executor = DownOnlyMakerPositionExecutor(base._strategy, config)
+    executor._status = RunnableStatus.RUNNING
+    executor.get_price = MagicMock(return_value=D('96'))  # below the 100 entry: a drawdown hold is due
+    executor._open_order = tracked('entry', TradeType.BUY, '1', OrderState.FILLED)
+    executor._entry_submitted = True
+    executor._entry_lifecycle = {'state': 'managing_fill', 'stop_reason': None}
+    return executor
+
+
+def test_sealed_restored_down_only_fill_keeps_executor_and_drawdown_hold_is_visible(recorder, caplog):
+    """2026-09-28 ok-rsi-xrp: a sealed restored fill closed as POSITION_HOLD under an 'external_invalidation' label."""
+    executor = sealed_down_only_executor()
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        assert executor.suspend_for_restart() is True
+        executor._advance_restart_suspend()
+    strategy = booting_strategy()
+    strategy.controllers['controller'] = SimpleNamespace(
+        config=OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT',
+                                     entry_acquisition_policy='down_only_maker_v1'),
+        get_executor_class_for_config=lambda config: DownOnlyMakerPositionExecutor)
+    orchestrator, _ = boot(recorder, strategy)
+    again = restored(orchestrator)
+    assert isinstance(again, DownOnlyMakerPositionExecutor) and again._resume_entry_sealed is True
+    again._status = RunnableStatus.RUNNING
+    again.get_price = MagicMock(return_value=D('96'))
+    executor_id = again.config.id
+
+    # D1: the opposing-signal / kill-switch stop only ends the entry. The filled,
+    # sealed position keeps its executor and trailing exit.
+    orchestrator.stop_executor(StopExecutorAction(controller_id='controller', executor_id=executor_id,
+                                                  keep_position=True, acquisition_only=True))
+    assert again.status == RunnableStatus.RUNNING and again.close_type is None
+    assert again._entry_stop_reason is None
+
+    # The configured drawdown hold (early_stop_drawdown_pct + early_stop_keep_position) is a full
+    # keep-position stop. It hands the fill to the held ledger and must say so in the live log.
+    with caplog.at_level(logging.INFO):
+        orchestrator.stop_executor(StopExecutorAction(controller_id='controller', executor_id=executor_id,
+                                                      keep_position=True))
+    assert again.close_type == CloseType.POSITION_HOLD
+    assert again._entry_stop_reason == 'position_hold'
+    assert again.get_custom_info()['entry_acquisition']['terminal_reason'] == 'position_hold'
+    assert f'Executor stop requested | controller=controller executor={executor_id} keep_position=True' in caplog.text
+    assert 'pending_close_type=POSITION_HOLD' in caplog.text
+    assert 'Entry acquisition stopped reason=position_hold' in caplog.text

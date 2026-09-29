@@ -26,6 +26,7 @@ import time
 from contextlib import nullcontext
 
 from controllers.generic.meridian_v3_unified_core.config import PAIRS, RECIPE_ID, MeridianUnifiedConfig, source_files
+from controllers.generic.meridian_v3_unified_core.market_context import MarketContextObserver
 from controllers.generic.meridian_v3_unified_core.portfolio import MeridianPortfolio
 from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext, SymbolRuntime
 from controllers.generic.modular_spot_core.bag import is_recovery_sell
@@ -72,6 +73,8 @@ class MeridianUnifiedController(ControllerBase):
         for context in self.contexts.values():
             context.runtime = SymbolRuntime(context, self.portfolio, paper=paper)
         self.fault = None
+        self.market_context = MarketContextObserver(config.market_context, clock_ms=self.portfolio.now_ms,
+                                                    logger=self.logger())
 
     # ------------------------------------------------------------------ native report
     @property
@@ -132,7 +135,8 @@ class MeridianUnifiedController(ControllerBase):
         super().start()
 
     def _close_data(self):
-        return [task for task in (c.runtime.close_data() for c in self.contexts.values()) if task is not None]
+        tasks = [c.runtime.close_data() for c in self.contexts.values()] + [self.market_context.close()]
+        return [task for task in tasks if task is not None]
 
     def stop(self):
         super().stop()
@@ -198,6 +202,7 @@ class MeridianUnifiedController(ControllerBase):
             self.portfolio.withdraw_unused()
         except Exception as exc:
             self.logger().error(f'Meridian unused grant withdrawal deferred: {type(exc).__name__}:{exc}')
+        self.market_context.after_cycle(self.portfolio)  # observe-only; never raises, never read back
         return actions
 
     def _context(self, config):
@@ -266,11 +271,13 @@ class MeridianUnifiedController(ControllerBase):
                                                    'requested_quote': str(target.requested_acquisition_quote)},
             'admission': None if admission is None else admission.model_dump(mode='json'),
             'symbols': rows,
+            'market_context': self.market_context.custom_info(),
         }
 
     def to_format_status(self):
         lines = [f'Meridian v3 unified | {RECIPE_ID} | {self.config.execution_mode} | {self.config.capital_stage} | '
-                 f'execution={self.config.execution_enabled} | portfolio={self.portfolio.status.get("reason")}']
+                 f'execution={self.config.execution_enabled} | portfolio={self.portfolio.status.get("reason")}',
+                 f'  {self.market_context.status_line()}']
         for pair, context in self.contexts.items():
             lines.append(f'  {pair}: {context.runtime.reason} | bag={context.runtime.bag_status}')
         return lines

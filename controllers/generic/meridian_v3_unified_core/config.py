@@ -12,6 +12,7 @@ from typing import Literal
 from pydantic import ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from controllers.generic import meridian_v3_portfolio, meridian_v3_recipe as recipe
+from controllers.generic.meridian_v3_unified_core.market_context import MarketContextPolicy
 from controllers.generic.modular_spot import ModularSpotControllerConfig
 from controllers.generic.modular_spot_core.data_reader import DataPolicy
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
@@ -117,6 +118,8 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     execution_enabled: StrictBool = False
     live_capital: LiveCapitalBinding | None = None
     recipe_binding: RecipeBinding | None = None
+    # Shared Market Context is observe-only: recorded and reported, never read by a decision.
+    market_context: MarketContextPolicy = Field(default_factory=MarketContextPolicy)
     max_candle_age_seconds: int = Field(default=120, ge=1, le=600, strict=True)
     max_native_report_age_seconds: int = Field(default=5, ge=1, le=60, strict=True)
     max_snapshot_age_ms: int = Field(default=5000, ge=100, le=60000, strict=True)
@@ -231,6 +234,9 @@ class MeridianUnifiedConfig(ControllerConfigBase):
         """Behavioural configuration. Per-symbol entry switches are operator controls,
         like `execution_enabled`: pausing one symbol must not require a new seal."""
         payload = self.model_dump(mode='json')
+        # Market context is observe-only: recorded, never read by a decision (proved by paired runs).
+        # No gating mode exists; one would be behavioural and must be bound here before it is accepted.
+        payload.pop('market_context')
         payload['symbols'] = [{k: v for k, v in s.items() if k != 'entry_enabled'} for s in payload['symbols']]
         return payload
 

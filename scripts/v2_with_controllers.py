@@ -62,6 +62,7 @@ class V2WithControllers(StrategyV2Base):
         self.max_pnl_by_controller = {}
         self.max_global_pnl = Decimal("0")
         self.drawdown_exited_controllers = []
+        self._acquisition_kill_switch = set()  # acquisition-only owners whose entries the switch already stopped
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self._operator_event_queue = ExternalEventFactory.create_queue("rsibot.operator")
@@ -443,6 +444,9 @@ class V2WithControllers(StrategyV2Base):
 
     def check_manual_kill_switch(self):
         for controller_id, controller in self.controllers.items():
+            if getattr(type(controller), "kill_switch_stops_acquisition_only", False) is True:
+                self._kill_switch_acquisitions(controller_id, controller)
+                continue
             if controller.config.manual_kill_switch and controller.status == RunnableStatus.RUNNING:
                 keep_position = bool(getattr(controller.config, "early_stop_keep_position", False))
                 self.logger().info(
@@ -459,6 +463,29 @@ class V2WithControllers(StrategyV2Base):
                     continue
                 self.logger().info(f"Restarting controller {controller_id}.")
                 controller.start()
+
+    def _kill_switch_acquisitions(self, controller_id, controller):
+        """The kill switch of an owner that declares it stops buying only.
+
+        The controller keeps running and holds new entries itself while the switch is
+        set. Every BUY entry still acquiring stops acquiring (`acquisition_only`); a
+        filled or partially filled tranche keeps its exits and a held bag its recovery.
+        Nothing is demoted to a held bag and nothing is sold by the switch.
+        """
+        if not controller.config.manual_kill_switch:
+            self._acquisition_kill_switch.discard(controller_id)
+            return
+        if controller_id in self._acquisition_kill_switch:
+            return
+        actions = [StopExecutorAction(executor_id=executor.id, controller_id=executor.controller_id,
+                                      keep_position=True, acquisition_only=True)
+                   for executor in self.get_executors_by_controller(controller_id)
+                   if executor.is_active and executor.side == TradeType.BUY]
+        self.logger().info(f"Kill switch for controller {controller_id}: entries stopped ({len(actions)} "
+                           f"acquiring executors); positions, exits and held bags keep running.")
+        if actions:
+            self.executor_orchestrator.execute_actions(actions)
+        self._acquisition_kill_switch.add(controller_id)
 
     def check_executors_status(self):
         active_executors = self.filter_executors(

@@ -16,10 +16,11 @@ from controllers.generic.meridian_v3_recipe import PAIRS
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import NATIVE_SNAPSHOT_UNAVAILABLE
 
-BTC, ETH, SOL, XRP = 'BTC-USDC', 'ETH-USDC', 'SOL-USDC', 'XRP-USDC'
+BTC, ETH, SOL, XRP, BNB = 'BTC-USDC', 'ETH-USDC', 'SOL-USDC', 'XRP-USDC', 'BNB-USDC'
 
 
 class Lifecycle(IsolatedAsyncioTestCase):
@@ -261,6 +262,78 @@ class Lifecycle(IsolatedAsyncioTestCase):
         await s.lift(BTC)
         self.assertEqual(executor.close_type, CloseType.TRAILING_STOP)
         self.assertEqual(s.balance('BTC'), D('0'))
+
+    def kill_switch(self, s, enabled):
+        """Flip the config switch and run the real V2 script check on this native session."""
+        from unittest.mock import MagicMock
+
+        from scripts.v2_with_controllers import V2WithControllers
+        changed = s.controller.config.model_dump(mode='json')
+        changed['manual_kill_switch'] = enabled
+        s.controller.update_config(type(s.controller.config)(**changed))
+        orchestrator = s.session.executor_orchestrator
+        strategy = getattr(s, 'kill_switch_strategy', None) or NS(
+            controllers=s.session.controllers, executor_orchestrator=orchestrator, drawdown_exited_controllers=[],
+            _acquisition_kill_switch=set(), logger=MagicMock(return_value=MagicMock()),
+            get_executors_by_controller=lambda key: orchestrator.get_executors_report(controller_ids={key}).get(key, []))
+        strategy._kill_switch_acquisitions = lambda *args: V2WithControllers._kill_switch_acquisitions(strategy, *args)
+        s.kill_switch_strategy = strategy
+        V2WithControllers.check_manual_kill_switch(strategy)
+
+    async def test_kill_switch_stops_buying_only_for_filled_partial_unfilled_and_held(self):
+        s = self.scenario()
+        await s.step()
+        receipt = await s.step(rsi={p: rebound() for p in (BTC, ETH, SOL, BNB)})
+        self.assertEqual({a.executor_config.trading_pair for a in creates(receipt)}, {BTC, ETH, SOL, BNB})
+        await s.fill(BTC)  # filled tranche
+        await s.fill(ETH, amount='.05')  # partial fill, remainder still resting
+        await s.fill(BNB)
+        await s.step(mids={BNB: '96.9'})
+        await s.step(mids={BNB: '96.8'})  # held bag
+        btc, eth, sol = (s.executors(p)[0] for p in (BTC, ETH, SOL))  # SOL: an unfilled resting entry
+        bag = s.held(BNB)
+        self.assertGreater(bag, 0)
+
+        self.kill_switch(s, True)
+        self.assertEqual(s.controller.status, RunnableStatus.RUNNING)  # the owner keeps managing
+        receipt = await s.step(rsi={XRP: rebound()})
+        self.assertEqual(creates(receipt), [])
+        self.assertEqual(self.reason(s, XRP), 'kill_switch_entry_hold')
+        # Unfilled: the entry ends without a fill and its capital is released.
+        self.assertEqual(sol._open_order.order.current_state.name, 'CANCELED')
+        await s.step()  # the native cancel acknowledgement is reconciled one step later
+        self.assertEqual(sol.close_type, CloseType.EXPIRED)
+        self.assertEqual(sol.open_filled_amount, D('0'))
+        self.assertNotEqual(sol.close_type, CloseType.POSITION_HOLD)
+        self.assertEqual(s.balance('SOL'), D('0'))
+        self.assertNotIn(SOL, {g.symbol for g in s.grants()})
+        # Partial: the remainder stops buying; the filled part stays an active, trailing tranche.
+        self.assertEqual(eth._open_order.order.current_state.name, 'CANCELED')
+        self.assertTrue(eth.is_active)
+        self.assertIsNone(eth.close_type)
+        self.assertEqual((eth.open_filled_amount, s.held(ETH)), (D('.05'), D('0')))
+        # Filled: never demoted, never sold by the switch.
+        self.assertTrue(btc.is_active)
+        self.assertIsNone(btc.close_type)
+        self.assertEqual(s.held(BTC), D('0'))
+        self.kill_switch(s, True)  # every tick re-checks the switch; nothing is stopped twice
+        # Management continues: BTC trails out above its floor and the BNB bag recovers.
+        for btc_mid, bnb_mid in (('104.5', '101'), ('105.5', '103'), ('104.9', '104')):
+            if btc_mid == '104.9':
+                floor = btc._min_no_loss_sell_price()
+            await s.step(mids={BTC: btc_mid, BNB: bnb_mid}, rsi={BNB: (80, 80)})
+        await s.lift(BTC)
+        self.assertEqual(btc.close_type, CloseType.TRAILING_STOP)
+        self.assertGreaterEqual(btc._close_order.order.price, floor)
+        self.assertTrue(self.bag(s, BNB)['trail_armed'])
+        receipt = await s.step(mids={BNB: '103.05'}, rsi={BNB: (80, 80)})
+        [sell] = creates(receipt, BNB)
+        self.assertEqual((sell.executor_config.side, sell.executor_config.amount), (TradeType.SELL, bag))
+        self.assertEqual(s.held(BNB), bag)  # the bag was never sold at a loss or liquidated by the switch
+
+        self.kill_switch(s, False)
+        receipt = await s.step(rsi={XRP: rebound()})
+        self.assertEqual(len(creates(receipt, XRP)), 1)
 
     async def test_foreign_writer_holds_new_entries_but_not_exits(self):
         s = self.scenario()

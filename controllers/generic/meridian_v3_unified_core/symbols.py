@@ -234,6 +234,10 @@ class SymbolRuntime(ModularRuntime):
             return 'unproven:portfolio_grant_hold'
 
     def acquisition_permitted(self):
+        held = self.portfolio.owner.entries_held()
+        if held is not None:
+            self.reason = held
+            return False
         if not super().acquisition_permitted():
             return False
         try:

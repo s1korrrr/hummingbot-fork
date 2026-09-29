@@ -26,8 +26,9 @@ exceed 3,000,000 configured rows. The token file must be a non-symlink regular
 file with permissions 0600 and contain a randomly generated 32–128 character
 URL-safe token (letters, digits, `_`, `-`, optional trailing newline). Token
 contents are never logged. Bind addresses other than 127.0.0.1 are rejected.
-Both endpoints require `Authorization: Bearer TOKEN`; browser Origin headers
-are refused for the stream. SIGINT/SIGTERM stop only this process and its sockets.
+All endpoints require `Authorization: Bearer TOKEN`; browser Origin headers are
+refused for the stream and history routes. SIGINT/SIGTERM stop only this process
+and its sockets.
 
 ## Wire protocol v1
 
@@ -76,6 +77,35 @@ monotonic within an epoch and absent keys mean zero; they include
 `text_pongs`, `parser_failures`, `client_disconnect_errors`, `cache_loaded`,
 `cache_missing`, `cache_rejected`, `cache_writes`, `cache_write_failures`, and
 `warm_restores`.
+
+## Market Picture history updates
+
+When the optional Market Picture projection is enabled, authenticated HTTP GET
+`/v2/market-picture/history?pair=BTC-USDC&interval=1m` returns the existing
+complete `market-picture.source-history.v1` snapshot. GET
+`/v2/market-picture/updates?pair=BTC-USDC&interval=1m` adds bounded incremental
+reads without changing that v1 route. A client may add both `epoch` and
+`sequence` from its last update response; sending only one is a `400`.
+
+The updates response uses `market-picture.source-updates.v1` and retains all
+history metadata. `mode:"full"` carries the current complete contiguous bar
+window in the existing compact tuple format. `mode:"delta"` carries
+`from_sequence`, the new per-pair/per-interval `sequence`, timestamp-keyed
+`upserts`, and explicit `deleted_open_time_ms`. Delta rows include a literal
+source epoch, so their provenance does not depend on the full snapshot's epoch
+dictionary. Metadata is refreshed on every response; row-set sequence changes
+only when the interval's returned rows change. Receipt freshness remains
+separate from interval-bar availability.
+
+Clients must apply a delta only when both projection `epoch` and exact
+`from_sequence` match their cached cursor. A missing cursor, process restart,
+future or expired cursor, discontinuity or oversized patch returns `mode:"full"`
+so the client can reset its local basis. The per-pair/per-interval change
+journal is capped at 16 KiB and 128 revisions, with at most 128 row operations
+per revision; delta responses are capped at 64,000 bytes. Oversized corrections
+advance a reset boundary instead of retaining an incomplete patch. Full
+responses retain the existing 8 MB bound. The optional 300-pair projection
+memory estimate includes a conservative journal reserve.
 
 ## Bounded collection and recovery
 

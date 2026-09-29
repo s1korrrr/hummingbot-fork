@@ -147,6 +147,43 @@ class ProviderRefV1(ContractModel):
         return self
 
 
+_UNIT_LIMITS = {
+    "share_fraction": (Decimal(0), Decimal(1)),
+    "rsi_0_100": (Decimal(0), Decimal(100)),
+    "adx_0_100": (Decimal(0), Decimal(100)),
+    "correlation_minus1_to1": (Decimal(-1), Decimal(1)),
+    "index_minus3_to3": (Decimal(-3), Decimal(3)),
+    "index_points": (None, None),
+    "ratio_points": (None, None),
+    "percentile_0_100": (Decimal(0), Decimal(100)),
+    "volatility_fraction_annualized": (Decimal(0), None),
+    "count": (Decimal(0), None),
+    "instruments": (Decimal(0), None),
+    "milliseconds": (Decimal(0), None),
+    "volume_quote": (Decimal(0), None),
+    "quote_volume": (Decimal(0), None),
+    "price_quote": (Decimal(0), None),
+    "atr_percent": (Decimal(0), None),
+    "ratio": (Decimal(0), None),
+    "percent": (Decimal(0), Decimal(100)),
+    "return_percent": (Decimal(-100), None),
+    "return_fraction": (Decimal(-1), None),
+}
+
+
+def _validate_unit_value(value: str | None, unit: str) -> None:
+    """Validate the same declared numeric bounds for compact and expanded values."""
+    if value is None:
+        return
+    number = Decimal(value)
+    if unit in _UNIT_LIMITS:
+        lower, upper = _UNIT_LIMITS[unit]
+        if (lower is not None and number < lower) or (upper is not None and number > upper):
+            raise ValueError(f"value is outside the bounds for unit {unit}")
+        if unit in ("count", "instruments", "milliseconds") and number != number.to_integral_value():
+            raise ValueError(f"value must be integral for unit {unit}")
+
+
 class MetricCellV1(ContractModel):
     """A series cell omits VALID, COMPLETE and empty reasons when they are exact defaults.
 
@@ -247,6 +284,10 @@ class MetricSeriesV1(ContractModel):
         ):
             raise ValueError("series window is reversed")
         for cell in self.cells:
+            _validate_unit_value(cell.value, self.series_unit)
+            expected = cell.expected_denominator if cell.expected_denominator is not None else self.expected_denominator
+            if cell.denominator is not None and cell.denominator > expected:
+                raise ValueError("denominator exceeds expected denominator")
             effective_available = cell.available_at_ms if cell.available_at_ms is not None else self.available_at_ms
             effective_expires = cell.expires_at_ms if cell.expires_at_ms is not None else self.expires_at_ms
             effective_window_end = cell.window_end_ms if cell.window_end_ms is not None else self.window_end_ms
@@ -271,7 +312,6 @@ class MetricSeriesV1(ContractModel):
             raise ValueError("fixtures must use reconstructed source kind")
         if metric_series_digest(self) != self.payload_digest:
             raise ValueError("metric series digest mismatch")
-        resolve_metric_series(self)  # also enforces the declared unit's numeric bounds on every cell
         return self
 
 
@@ -401,35 +441,7 @@ class MetricValueV1(ContractModel):
         if self.value is not None:
             if re.fullmatch(DECIMAL_PATTERN, self.value) is None:
                 raise ValueError("value must be a canonical finite decimal string")
-            number = Decimal(self.value)
-            limits = {
-                "share_fraction": (Decimal(0), Decimal(1)),
-                "rsi_0_100": (Decimal(0), Decimal(100)),
-                "adx_0_100": (Decimal(0), Decimal(100)),
-                "correlation_minus1_to1": (Decimal(-1), Decimal(1)),
-                "index_minus3_to3": (Decimal(-3), Decimal(3)),
-                "index_points": (None, None),
-                "ratio_points": (None, None),
-                "percentile_0_100": (Decimal(0), Decimal(100)),
-                "volatility_fraction_annualized": (Decimal(0), None),
-                "count": (Decimal(0), None),
-                "instruments": (Decimal(0), None),
-                "milliseconds": (Decimal(0), None),
-                "volume_quote": (Decimal(0), None),
-                "quote_volume": (Decimal(0), None),
-                "price_quote": (Decimal(0), None),
-                "atr_percent": (Decimal(0), None),
-                "ratio": (Decimal(0), None),
-                "percent": (Decimal(0), Decimal(100)),
-                "return_percent": (Decimal(-100), None),
-                "return_fraction": (Decimal(-1), None),
-            }
-            if self.unit in limits:
-                lower, upper = limits[self.unit]
-                if (lower is not None and number < lower) or (upper is not None and number > upper):
-                    raise ValueError(f"value is outside the bounds for unit {self.unit}")
-                if self.unit in ("count", "instruments", "milliseconds") and number != number.to_integral_value():
-                    raise ValueError(f"value must be integral for unit {self.unit}")
+            _validate_unit_value(self.value, self.unit)
         if self.available_at_ms < self.source_ref.available_at_ms:
             raise ValueError("metric availability precedes its provider")
         if self.window_end_ms is not None and self.available_at_ms < self.window_end_ms:

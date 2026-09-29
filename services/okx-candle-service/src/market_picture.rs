@@ -31,10 +31,14 @@ pub const MINUTE_ROWS: usize = 11_521;
 pub const HOUR_ROWS: usize = 3_001;
 pub const DAY_ROWS: usize = 401;
 pub const MAX_RESPONSE_BYTES: usize = 8_000_000;
+pub const MAX_UPDATE_RESPONSE_BYTES: usize = 64_000;
 pub const MAX_MARKET_PICTURE_PAIRS: usize = 300;
 pub const MAX_EXTENSION_MEMORY_BYTES: u64 = 1_073_741_824;
 const MAX_CACHE_BYTES: u64 = 8_000_000;
 const MAX_CACHE_TOTAL_BYTES: u64 = 2_000_000_000;
+const MAX_UPDATE_JOURNAL_BYTES: usize = 16_384;
+const MAX_UPDATE_BATCHES: usize = 128;
+const MAX_UPDATE_ROWS: usize = 128;
 
 /// Conservative reserved-buffer estimate for the optional projection. VecDeque
 /// buffers are pre-sized; 32 extra bytes per slot cover allocator/slab overhead
@@ -48,7 +52,13 @@ pub fn estimated_extension_memory_bytes(pair_count: usize) -> Option<u64> {
     let row_storage = pair_count
         .checked_mul(rows_per_pair)?
         .checked_mul(row_bytes)?;
-    let pair_overhead = pair_count.checked_mul(4096 + std::mem::size_of::<PairHistory>())?;
+    let journal_reserve =
+        3usize.checked_mul(MAX_UPDATE_JOURNAL_BYTES.checked_mul(2)?.checked_add(1024)?)?;
+    let pair_overhead = pair_count.checked_mul(
+        4096usize
+            .checked_add(std::mem::size_of::<PairHistory>())?
+            .checked_add(journal_reserve)?,
+    )?;
     u64::try_from(row_storage.checked_add(pair_overhead)?).ok()
 }
 
@@ -211,6 +221,157 @@ pub struct HistoryResponse {
     pub bars: Vec<WireBar>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateBar {
+    pub open_time_ms: u64,
+    pub close_time_ms: u64,
+    pub open: String,
+    pub high: String,
+    pub low: String,
+    pub close: String,
+    pub volume: String,
+    pub quote_volume: String,
+    pub confirmed: bool,
+    pub available_at_ms: u64,
+    pub source_epoch: String,
+    pub source_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatesResponse {
+    pub mode: String,
+    pub from_sequence: Option<u64>,
+    #[serde(flatten)]
+    pub history: HistoryResponse,
+    pub upserts: Vec<UpdateBar>,
+    pub deleted_open_time_ms: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct UpdateBatch {
+    from: u64,
+    to: u64,
+    upserts: BTreeMap<u64, SourceBar>,
+    deleted: std::collections::BTreeSet<u64>,
+    bytes: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UpdateJournal {
+    sequence: u64,
+    surface: Option<(u64, u64)>,
+    batches: VecDeque<UpdateBatch>,
+    bytes: usize,
+    force_full: bool,
+}
+
+impl UpdateJournal {
+    fn reset_at(&mut self, sequence: u64) {
+        self.sequence = sequence;
+        self.batches.clear();
+        self.bytes = 0;
+        self.force_full = false;
+    }
+
+    fn reset_after_change(&mut self) {
+        if let Some(next) = self.sequence.checked_add(1) {
+            self.reset_at(next);
+        } else {
+            self.batches.clear();
+            self.bytes = 0;
+            self.force_full = true;
+        }
+    }
+
+    fn append(
+        &mut self,
+        upserts: BTreeMap<u64, SourceBar>,
+        deleted: std::collections::BTreeSet<u64>,
+    ) {
+        if upserts.is_empty() && deleted.is_empty() {
+            return;
+        }
+        if self.force_full {
+            return;
+        }
+        let from = self.sequence;
+        let Some(to) = from.checked_add(1) else {
+            self.reset_after_change();
+            return;
+        };
+        let bytes = upserts
+            .values()
+            .map(estimated_update_bar_bytes)
+            .sum::<usize>()
+            .saturating_add(deleted.len().saturating_mul(24));
+        self.sequence = to;
+        if upserts.len().saturating_add(deleted.len()) > MAX_UPDATE_ROWS
+            || bytes > MAX_UPDATE_JOURNAL_BYTES
+        {
+            self.reset_at(to);
+            return;
+        }
+        self.batches.push_back(UpdateBatch {
+            from,
+            to,
+            upserts,
+            deleted,
+            bytes,
+        });
+        self.bytes = self.bytes.saturating_add(bytes);
+        while self.batches.len() > MAX_UPDATE_BATCHES || self.bytes > MAX_UPDATE_JOURNAL_BYTES {
+            if let Some(batch) = self.batches.pop_front() {
+                self.bytes = self.bytes.saturating_sub(batch.bytes);
+            }
+        }
+    }
+
+    fn replay(
+        &self,
+        cursor: u64,
+    ) -> Option<(BTreeMap<u64, SourceBar>, std::collections::BTreeSet<u64>)> {
+        if self.force_full || cursor > self.sequence {
+            return None;
+        }
+        if cursor == self.sequence {
+            return Some((BTreeMap::new(), std::collections::BTreeSet::new()));
+        }
+        let mut expected = cursor;
+        let mut upserts = BTreeMap::new();
+        let mut deleted = std::collections::BTreeSet::new();
+        for batch in self.batches.iter().filter(|batch| batch.to > cursor) {
+            if batch.from != expected {
+                return None;
+            }
+            for key in &batch.deleted {
+                upserts.remove(key);
+                deleted.insert(*key);
+            }
+            for (key, bar) in &batch.upserts {
+                deleted.remove(key);
+                upserts.insert(*key, bar.clone());
+            }
+            expected = batch.to;
+        }
+        (expected == self.sequence).then_some((upserts, deleted))
+    }
+}
+
+fn estimated_update_bar_bytes(bar: &SourceBar) -> usize {
+    // The fixed reserve covers JSON field names, integer widths, quotes and
+    // separators; value lengths account for canonical decimals and epoch text.
+    256usize
+        .saturating_add(canonical_decimal_text(bar.open).len())
+        .saturating_add(canonical_decimal_text(bar.high).len())
+        .saturating_add(canonical_decimal_text(bar.low).len())
+        .saturating_add(canonical_decimal_text(bar.close).len())
+        .saturating_add(canonical_decimal_text(bar.volume).len())
+        .saturating_add(canonical_decimal_text(bar.quote_volume).len())
+        .saturating_add(bar.source_epoch.len())
+}
+
 /// Compact exact source history tuple: decimal OHLCV, availability, source
 /// epoch dictionary index, and source sequence. Open times are reconstructed
 /// from the contiguous UTC window in Coverage.
@@ -278,6 +439,7 @@ struct PairHistory {
     last_observed_at_ms: u64,
     ready_source: bool,
     invalid_buckets: BTreeMap<Interval, std::collections::BTreeSet<u64>>,
+    update_journals: BTreeMap<Interval, UpdateJournal>,
 }
 impl PairHistory {
     fn new() -> Self {
@@ -292,6 +454,10 @@ impl PairHistory {
             last_observed_at_ms: 0,
             ready_source: false,
             invalid_buckets: BTreeMap::new(),
+            update_journals: [Interval::Minute, Interval::Hour, Interval::Day]
+                .into_iter()
+                .map(|interval| (interval, UpdateJournal::default()))
+                .collect(),
         }
     }
     fn bars(&self, interval: Interval) -> &VecDeque<SourceBar> {
@@ -362,6 +528,17 @@ impl Projection {
         history.minute.extend(body.bars_1m);
         history.hour.extend(body.bars_1h);
         history.day.extend(body.bars_1d);
+        for interval in [Interval::Minute, Interval::Hour, Interval::Day] {
+            let surface = surface_bounds(history.bars(interval), interval);
+            let journal = history
+                .update_journals
+                .get_mut(&interval)
+                .expect("interval journal");
+            journal.surface = surface;
+            if surface.is_some() {
+                journal.sequence = 1;
+            }
+        }
         // Persisted rows are a baseline only. A current source snapshot must
         // prove freshness after this process starts before any interval is ready.
         history.ready_source = false;
@@ -520,6 +697,7 @@ impl Projection {
 
         let mut touched = Vec::new();
         let mut changed = false;
+        let mut changed_rows = BTreeMap::<Interval, std::collections::BTreeSet<u64>>::new();
         for bar in bars {
             let open_s = bar.open_time_ms / 1000;
             let previous = history
@@ -529,7 +707,14 @@ impl Projection {
             // A source snapshot or correction can revise receipt and epoch
             // lineage without changing OHLCV. Keep the supplied row so the
             // latest row and the response header describe the same revision.
-            changed |= previous.is_none_or(|existing| existing != &bar);
+            let row_changed = previous.is_none_or(|existing| existing != &bar);
+            changed |= row_changed;
+            if row_changed {
+                changed_rows
+                    .entry(Interval::Minute)
+                    .or_default()
+                    .insert(bar.open_time_ms);
+            }
             let market_changed =
                 previous.is_none_or(|existing| !same_market_values(existing, &bar));
             let historical_insert = previous.is_none()
@@ -569,10 +754,27 @@ impl Projection {
                         .find(|row| row.open_time_ms == bar.open_time_ms);
                     if previous != Some(&bar) {
                         changed = true;
+                        changed_rows
+                            .entry(interval)
+                            .or_default()
+                            .insert(bar.open_time_ms);
                     }
                     insert_sorted(history.bars_mut(interval), bar, interval.expected_rows());
                 }
-                AggregateOutcome::Incomplete => {}
+                AggregateOutcome::Incomplete => {
+                    let start_ms = start_s.saturating_mul(1_000);
+                    let had_row = history
+                        .bars_mut(interval)
+                        .iter()
+                        .any(|row| row.open_time_ms == start_ms);
+                    if had_row {
+                        history
+                            .bars_mut(interval)
+                            .retain(|row| row.open_time_ms != start_ms);
+                        changed = true;
+                        changed_rows.entry(interval).or_default().insert(start_ms);
+                    }
+                }
                 AggregateOutcome::Invalid(reason) => {
                     let start_ms = start_s.saturating_mul(1_000);
                     let newly_invalid = history
@@ -580,9 +782,13 @@ impl Projection {
                         .entry(interval)
                         .or_default()
                         .insert(start_ms);
+                    let before = history.bars(interval).len();
                     history
                         .bars_mut(interval)
                         .retain(|row| row.open_time_ms != start_ms);
+                    if history.bars(interval).len() != before {
+                        changed_rows.entry(interval).or_default().insert(start_ms);
+                    }
                     changed = true;
                     if newly_invalid {
                         eprintln!(
@@ -592,6 +798,10 @@ impl Projection {
                 }
             }
         }
+        for interval in [Interval::Minute, Interval::Hour, Interval::Day] {
+            let keys = changed_rows.remove(&interval).unwrap_or_default();
+            record_update_changes(history, interval, keys);
+        }
         if changed || snapshot {
             history.projection_sequence = history.projection_sequence.saturating_add(1);
         }
@@ -599,28 +809,92 @@ impl Projection {
     }
 
     pub fn response(&self, pair: &str, interval: Interval, now_ms: u64) -> Result<HistoryResponse> {
+        self.response_parts(pair, interval, now_ms, true)
+    }
+
+    pub fn updates(
+        &self,
+        pair: &str,
+        interval: Interval,
+        requested_epoch: Option<&str>,
+        requested_sequence: Option<u64>,
+        now_ms: u64,
+    ) -> Result<UpdatesResponse> {
         let history = self
             .pairs
             .get(pair)
             .context("pair outside configured universe")?;
-        let all_bars: Vec<_> = history.bars(interval).iter().cloned().collect();
+        let journal = history
+            .update_journals
+            .get(&interval)
+            .expect("interval journal");
+        let cursor = match (requested_epoch, requested_sequence) {
+            (Some(epoch), Some(sequence)) if epoch == self.epoch => {
+                journal.replay(sequence).map(|patch| (sequence, patch))
+            }
+            _ => None,
+        };
+        if let Some((from_sequence, (upserts, deleted))) = cursor {
+            let mut metadata = self.response_parts(pair, interval, now_ms, false)?;
+            metadata.schema_version = "market-picture.source-updates.v1".into();
+            metadata.sequence = journal.sequence;
+            apply_update_availability(&mut metadata, history, interval, now_ms);
+            metadata.source_epochs.clear();
+            let upserts = upserts.into_values().map(update_bar).collect::<Vec<_>>();
+            let updates = UpdatesResponse {
+                mode: "delta".into(),
+                from_sequence: Some(from_sequence),
+                history: metadata,
+                upserts,
+                deleted_open_time_ms: deleted.into_iter().collect(),
+            };
+            if serde_json::to_vec(&updates)?.len() > MAX_UPDATE_RESPONSE_BYTES {
+                return self.updates(pair, interval, None, None, now_ms);
+            }
+            return Ok(updates);
+        }
+        let mut metadata = self.response_parts(pair, interval, now_ms, true)?;
+        metadata.schema_version = "market-picture.source-updates.v1".into();
+        metadata.sequence = journal.sequence;
+        apply_update_availability(&mut metadata, history, interval, now_ms);
+        Ok(UpdatesResponse {
+            mode: "full".into(),
+            from_sequence: None,
+            history: metadata,
+            upserts: Vec::new(),
+            deleted_open_time_ms: Vec::new(),
+        })
+    }
+
+    fn response_parts(
+        &self,
+        pair: &str,
+        interval: Interval,
+        now_ms: u64,
+        include_bars: bool,
+    ) -> Result<HistoryResponse> {
+        let history = self
+            .pairs
+            .get(pair)
+            .context("pair outside configured universe")?;
+        let all_bars = history.bars(interval).iter().collect::<Vec<_>>();
         let expected = interval.expected_rows();
         let bounded = if all_bars.len() > expected {
             &all_bars[all_bars.len() - expected..]
         } else {
             &all_bars[..]
         };
-        let mut bars = Vec::new();
+        let mut bars = Vec::<&SourceBar>::new();
         for bar in bounded.iter().rev() {
-            if bars.last().is_some_and(|newer: &SourceBar| {
+            if bars.last().is_some_and(|newer: &&SourceBar| {
                 newer.open_time_ms != bar.open_time_ms + interval.seconds() * 1_000
             }) {
                 break;
             }
-            bars.push(bar.clone());
+            bars.push(*bar);
         }
         bars.reverse();
-        let gap_count = gaps(bounded, interval.seconds() * 1_000);
+        let gap_count = gaps_refs(bounded, interval.seconds() * 1_000);
         let newest_close = bars.last().map(|bar| bar.close_time_ms);
         let interval_freshness_ms = match interval {
             Interval::Minute => 90_000,
@@ -697,7 +971,13 @@ impl Projection {
             .last()
             .map(|bar| bar.source_sequence)
             .unwrap_or(history.source_sequence);
-        validate_bars(&bars, interval, expected)?;
+        let owned_bars = if include_bars {
+            let owned = bars.iter().map(|bar| (*bar).clone()).collect::<Vec<_>>();
+            validate_bars(&owned, interval, expected)?;
+            owned
+        } else {
+            Vec::new()
+        };
         let cutoff_ms = bars.last().map(|bar| bar.close_time_ms);
         // Even typed stale/unavailable responses need a coherent response
         // envelope. Their `ready`/`reason` fields carry source freshness truth.
@@ -714,7 +994,11 @@ impl Projection {
             sequence: history.projection_sequence,
             source_epoch,
             source_sequence,
-            source_epochs: source_epoch_dictionary(&bars),
+            source_epochs: if include_bars {
+                source_epoch_dictionary(&owned_bars)
+            } else {
+                Vec::new()
+            },
             published_at_ms: now_ms,
             available_at_ms,
             expires_at_ms,
@@ -722,12 +1006,18 @@ impl Projection {
             coverage,
             ready,
             reason,
-            bars: wire_bars(bars),
+            bars: if include_bars {
+                wire_bars(owned_bars)
+            } else {
+                Vec::new()
+            },
         };
-        ensure!(
-            serde_json::to_vec(&response)?.len() <= MAX_RESPONSE_BYTES,
-            "source history response exceeds byte bound"
-        );
+        if include_bars {
+            ensure!(
+                serde_json::to_vec(&response)?.len() <= MAX_RESPONSE_BYTES,
+                "source history response exceeds byte bound"
+            );
+        }
         Ok(response)
     }
 
@@ -1055,10 +1345,177 @@ fn aggregate_bucket(
     }))
 }
 
-fn gaps(bars: &[SourceBar], step_ms: u64) -> usize {
+fn gaps_refs(bars: &[&SourceBar], step_ms: u64) -> usize {
     bars.windows(2)
         .filter(|pair| pair[1].open_time_ms != pair[0].open_time_ms + step_ms)
         .count()
+}
+
+fn surface_bounds(rows: &VecDeque<SourceBar>, interval: Interval) -> Option<(u64, u64)> {
+    let step_ms = interval.seconds().saturating_mul(1_000);
+    let expected = interval.expected_rows();
+    let latest = rows.iter().next_back()?.open_time_ms;
+    let mut expected_close = latest.checked_add(step_ms)?;
+    let mut first = latest;
+    for row in rows.iter().rev().take(expected) {
+        if row.close_time_ms != expected_close {
+            break;
+        }
+        first = row.open_time_ms;
+        expected_close = row.open_time_ms;
+    }
+    Some((first, latest)).filter(|(first, last)| last >= first && (last - first) % step_ms == 0)
+}
+
+fn record_update_changes(
+    history: &mut PairHistory,
+    interval: Interval,
+    changed_keys: std::collections::BTreeSet<u64>,
+) {
+    let new_surface = surface_bounds(history.bars(interval), interval);
+    let old_surface = history
+        .update_journals
+        .get(&interval)
+        .expect("interval journal");
+    let old_surface = old_surface.surface;
+    if changed_keys.is_empty() && new_surface == old_surface {
+        return;
+    }
+    let step_ms = interval.seconds().saturating_mul(1_000);
+    let bounds_len = |bounds: Option<(u64, u64)>| -> usize {
+        bounds.map_or(0, |(first, last)| ((last - first) / step_ms + 1) as usize)
+    };
+    let overlap_len = match (old_surface, new_surface) {
+        (Some((old_first, old_last)), Some((new_first, new_last))) => {
+            let first = old_first.max(new_first);
+            let last = old_last.min(new_last);
+            if first <= last {
+                ((last - first) / step_ms + 1) as usize
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    let deleted_count = bounds_len(old_surface).saturating_sub(overlap_len);
+    let inserted_count = bounds_len(new_surface).saturating_sub(overlap_len);
+    let changed_count = changed_keys
+        .iter()
+        .filter(|key| new_surface.is_some_and(|(first, last)| first <= **key && **key <= last))
+        .count();
+    if deleted_count > MAX_UPDATE_ROWS
+        || inserted_count.saturating_add(changed_count) > MAX_UPDATE_ROWS
+    {
+        let journal = history
+            .update_journals
+            .get_mut(&interval)
+            .expect("interval journal");
+        journal.surface = new_surface;
+        journal.reset_after_change();
+        return;
+    }
+    let mut upserts = BTreeMap::new();
+    if let Some((first, last)) = new_surface {
+        for row in history
+            .bars(interval)
+            .iter()
+            .filter(|row| first <= row.open_time_ms && row.open_time_ms <= last)
+        {
+            let newly_visible = old_surface.is_none_or(|(old_first, old_last)| {
+                row.open_time_ms < old_first || row.open_time_ms > old_last
+            });
+            if newly_visible || changed_keys.contains(&row.open_time_ms) {
+                upserts.insert(row.open_time_ms, row.clone());
+            }
+        }
+    }
+    let mut deleted = std::collections::BTreeSet::new();
+    if let Some((first, last)) = old_surface {
+        let old_keys_are_visible =
+            new_surface.is_some_and(|(new_first, new_last)| first <= new_last && new_first <= last);
+        if !old_keys_are_visible {
+            let journal = history
+                .update_journals
+                .get_mut(&interval)
+                .expect("interval journal");
+            journal.surface = new_surface;
+            journal.reset_after_change();
+            return;
+        }
+        if let Some((new_first, new_last)) = new_surface {
+            let mut key = first;
+            while key <= last {
+                if key < new_first || key > new_last {
+                    deleted.insert(key);
+                }
+                let Some(next) = key.checked_add(step_ms) else {
+                    break;
+                };
+                key = next;
+            }
+        }
+    }
+    let journal = history
+        .update_journals
+        .get_mut(&interval)
+        .expect("interval journal");
+    journal.surface = new_surface;
+    journal.append(upserts, deleted);
+}
+
+fn update_bar(bar: SourceBar) -> UpdateBar {
+    UpdateBar {
+        open_time_ms: bar.open_time_ms,
+        close_time_ms: bar.close_time_ms,
+        open: canonical_decimal_text(bar.open),
+        high: canonical_decimal_text(bar.high),
+        low: canonical_decimal_text(bar.low),
+        close: canonical_decimal_text(bar.close),
+        volume: canonical_decimal_text(bar.volume),
+        quote_volume: canonical_decimal_text(bar.quote_volume),
+        confirmed: bar.confirmed,
+        available_at_ms: bar.available_at_ms,
+        source_epoch: bar.source_epoch.to_string(),
+        source_sequence: bar.source_sequence,
+    }
+}
+
+fn apply_update_availability(
+    response: &mut HistoryResponse,
+    history: &PairHistory,
+    interval: Interval,
+    now_ms: u64,
+) {
+    let surface = history
+        .update_journals
+        .get(&interval)
+        .and_then(|journal| journal.surface);
+    response.available_at_ms = surface
+        .map(|(first, last)| {
+            history
+                .bars(interval)
+                .iter()
+                .filter(|bar| first <= bar.open_time_ms && bar.open_time_ms <= last)
+                .map(|bar| bar.available_at_ms)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or_default();
+    let interval_freshness_ms = match interval {
+        Interval::Minute => 90_000,
+        Interval::Hour => 3_690_000,
+        Interval::Day => 86_490_000,
+    };
+    response.expires_at_ms = if response.available_at_ms == 0
+        || response.reason.as_deref() == Some("stale")
+        || response.reason.as_deref() == Some("warming")
+    {
+        now_ms.saturating_add(1)
+    } else {
+        response
+            .available_at_ms
+            .saturating_add(interval_freshness_ms)
+    };
 }
 
 fn same_market_values(left: &SourceBar, right: &SourceBar) -> bool {
@@ -1319,6 +1776,374 @@ mod tests {
             source_sequence: 1,
         }
     }
+
+    fn seeded_minute_projection(times: &[u64]) -> Projection {
+        let pair = "BTC-USDC".to_owned();
+        let mut projection = Projection::new(std::slice::from_ref(&pair), 1);
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        history.minute = times
+            .iter()
+            .map(|open| bar(*open, "100"))
+            .collect::<VecDeque<_>>();
+        let journal = history.update_journals.get_mut(&Interval::Minute).unwrap();
+        journal.surface = surface_bounds(&history.minute, Interval::Minute);
+        journal.sequence = 1;
+        projection
+    }
+
+    #[test]
+    fn updates_expand_and_shrink_the_contiguous_gap_tail_with_explicit_patches() {
+        let pair = "BTC-USDC";
+        let mut projection = seeded_minute_projection(&[0, 60_000, 120_000, 240_000, 300_000]);
+        let initial = projection
+            .updates(pair, Interval::Minute, None, None, 400_000)
+            .unwrap();
+        assert_eq!(initial.mode, "full");
+        assert_eq!(initial.history.coverage.valid_count, 2);
+        assert_eq!(initial.history.coverage.gap_count, 1);
+        assert_eq!(initial.history.coverage.first_open_time_ms, Some(240_000));
+        assert_eq!(initial.history.sequence, 1);
+
+        let history = projection.pairs.get_mut(pair).unwrap();
+        insert_sorted(&mut history.minute, bar(180_000, "100"), MINUTE_ROWS);
+        record_update_changes(history, Interval::Minute, [180_000].into_iter().collect());
+        let expanded = projection
+            .updates(
+                pair,
+                Interval::Minute,
+                Some(&projection.epoch),
+                Some(1),
+                400_000,
+            )
+            .unwrap();
+        assert_eq!(expanded.mode, "delta");
+        assert_eq!(expanded.from_sequence, Some(1));
+        assert_eq!(expanded.history.sequence, 2);
+        assert_eq!(expanded.history.coverage.valid_count, 6);
+        assert_eq!(expanded.history.coverage.gap_count, 0);
+        let expanded_keys = expanded
+            .upserts
+            .iter()
+            .map(|bar| bar.open_time_ms)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            expanded_keys,
+            [0, 60_000, 120_000, 180_000].into_iter().collect()
+        );
+        assert!(expanded.deleted_open_time_ms.is_empty());
+
+        let history = projection.pairs.get_mut(pair).unwrap();
+        history.minute.retain(|bar| bar.open_time_ms != 180_000);
+        record_update_changes(history, Interval::Minute, [180_000].into_iter().collect());
+        let shrunk = projection
+            .updates(
+                pair,
+                Interval::Minute,
+                Some(&projection.epoch),
+                Some(2),
+                400_000,
+            )
+            .unwrap();
+        assert_eq!(shrunk.mode, "delta");
+        assert_eq!(shrunk.history.coverage.valid_count, 2);
+        assert_eq!(shrunk.history.coverage.first_open_time_ms, Some(240_000));
+        assert_eq!(shrunk.deleted_open_time_ms, [0, 60_000, 120_000, 180_000]);
+        assert!(shrunk.upserts.is_empty());
+        let coalesced = projection
+            .updates(
+                pair,
+                Interval::Minute,
+                Some(&projection.epoch),
+                Some(1),
+                400_000,
+            )
+            .unwrap();
+        assert_eq!(coalesced.mode, "delta");
+        assert_eq!(coalesced.history.sequence, 3);
+        assert!(coalesced.upserts.is_empty());
+        assert_eq!(
+            coalesced.deleted_open_time_ms,
+            [0, 60_000, 120_000, 180_000]
+        );
+    }
+
+    #[test]
+    fn update_journal_byte_estimate_covers_serialized_patch_rows() {
+        let mut value = bar(60_000, "1234567890123456789012345678");
+        value.source_epoch = "e".repeat(64).into();
+        value.source_sequence = u64::MAX;
+        let serialized_len = serde_json::to_vec(&update_bar(value.clone()))
+            .unwrap()
+            .len();
+        assert!(estimated_update_bar_bytes(&value) >= serialized_len);
+    }
+
+    #[test]
+    fn updates_force_full_for_restart_unknown_epoch_and_evicted_cursor() {
+        let pair = "BTC-USDC";
+        let mut projection = seeded_minute_projection(&[0, 60_000, 120_000]);
+        let old_epoch = projection.epoch.clone();
+        let restarted = Projection::new(&[pair.to_owned()], 2);
+        assert_eq!(
+            restarted
+                .updates(pair, Interval::Minute, Some(&old_epoch), Some(1), 3)
+                .unwrap()
+                .mode,
+            "full"
+        );
+        assert_eq!(
+            projection
+                .updates(pair, Interval::Minute, Some("unknown"), Some(1), 3)
+                .unwrap()
+                .mode,
+            "full"
+        );
+        assert_eq!(
+            projection
+                .updates(pair, Interval::Minute, Some(&old_epoch), Some(2), 3)
+                .unwrap()
+                .mode,
+            "full"
+        );
+
+        for revision in 0..=MAX_UPDATE_BATCHES {
+            let history = projection.pairs.get_mut(pair).unwrap();
+            let row = history.minute.back_mut().unwrap();
+            let changed = Decimal::from(101 + revision as u64);
+            row.open = changed;
+            row.high = changed;
+            row.low = changed;
+            row.close = changed;
+            record_update_changes(history, Interval::Minute, [120_000].into_iter().collect());
+        }
+        assert_eq!(
+            projection
+                .updates(pair, Interval::Minute, Some(&old_epoch), Some(1), 3)
+                .unwrap()
+                .mode,
+            "full"
+        );
+        let current = projection.pairs[pair].update_journals[&Interval::Minute].sequence;
+        assert_eq!(
+            projection
+                .updates(pair, Interval::Minute, Some(&old_epoch), Some(current), 3)
+                .unwrap()
+                .mode,
+            "delta"
+        );
+
+        let mut exhausted = seeded_minute_projection(&[0, 60_000, 120_000]);
+        let exhausted_epoch = exhausted.epoch.clone();
+        let history = exhausted.pairs.get_mut(pair).unwrap();
+        history
+            .update_journals
+            .get_mut(&Interval::Minute)
+            .unwrap()
+            .sequence = u64::MAX;
+        let latest = history.minute.back_mut().unwrap();
+        latest.close = Decimal::from(101);
+        latest.high = Decimal::from(101);
+        record_update_changes(history, Interval::Minute, [120_000].into_iter().collect());
+        assert_eq!(
+            exhausted
+                .updates(
+                    pair,
+                    Interval::Minute,
+                    Some(&exhausted_epoch),
+                    Some(u64::MAX),
+                    3,
+                )
+                .unwrap()
+                .mode,
+            "full"
+        );
+    }
+
+    #[test]
+    fn update_metadata_is_interval_scoped_but_freshness_remains_current() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = 1_800_000_000_000;
+        let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 60_000);
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        let mut hourly = bar(now_ms / 3_600_000 * 3_600_000 - 3_600_000, "100");
+        hourly.close_time_ms = hourly.open_time_ms + 3_600_000;
+        hourly.available_at_ms = now_ms;
+        history.hour.push_back(hourly);
+        history.source_epoch = "source-epoch".into();
+        history.source_sequence = 2;
+        history.available_at_ms = now_ms;
+        history.last_observed_at_ms = now_ms;
+        history.ready_source = true;
+        let journal = history.update_journals.get_mut(&Interval::Hour).unwrap();
+        journal.surface = surface_bounds(&history.hour, Interval::Hour);
+        journal.sequence = 1;
+
+        let epoch = projection.epoch.clone();
+        let first = projection
+            .updates(&pair, Interval::Hour, None, None, now_ms)
+            .unwrap();
+        let first_available = first.history.available_at_ms;
+        let first_expiry = first.history.expires_at_ms;
+        assert_eq!(first_available, now_ms);
+        assert_eq!(first_expiry, now_ms + 3_690_000);
+
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        history.available_at_ms += 60_000;
+        history.last_observed_at_ms += 60_000;
+        history.source_sequence += 1;
+        let refreshed = projection
+            .updates(
+                &pair,
+                Interval::Hour,
+                Some(&epoch),
+                Some(1),
+                now_ms + 60_000,
+            )
+            .unwrap();
+        assert_eq!(refreshed.mode, "delta");
+        assert!(refreshed.upserts.is_empty());
+        assert_eq!(refreshed.history.available_at_ms, first_available);
+        assert_eq!(refreshed.history.expires_at_ms, first_expiry);
+        assert_eq!(
+            refreshed.history.reason,
+            Some("insufficient_history".into())
+        );
+
+        let stale = projection
+            .updates(
+                &pair,
+                Interval::Hour,
+                Some(&epoch),
+                Some(1),
+                now_ms + 200_000,
+            )
+            .unwrap();
+        assert_eq!(stale.mode, "delta");
+        assert_eq!(stale.history.reason, Some("stale".into()));
+        assert_eq!(stale.history.expires_at_ms, now_ms + 200_001);
+        assert_eq!(stale.history.sequence, 1);
+    }
+
+    #[test]
+    #[ignore = "one-off JSONL fixture probe for the Python source-update contract"]
+    fn source_updates_jsonl_contract_probe() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let latest_closed = now_ms / 60_000 * 60_000 - 60_000;
+        let mut projection =
+            seeded_minute_projection(&[latest_closed - 120_000, latest_closed - 60_000]);
+        {
+            let history = projection.pairs.get_mut(&pair).unwrap();
+            history.source_epoch = "source-epoch".into();
+            history.source_sequence = 1;
+            history.available_at_ms = now_ms;
+            history.last_observed_at_ms = now_ms;
+            history.ready_source = true;
+        }
+        let epoch = projection.epoch.clone();
+        let full = projection
+            .updates(&pair, Interval::Minute, None, None, now_ms)
+            .unwrap();
+        println!("UPDATE_FIXTURE {}", serde_json::to_string(&full).unwrap());
+
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        insert_sorted(&mut history.minute, bar(latest_closed, "100"), MINUTE_ROWS);
+        record_update_changes(
+            history,
+            Interval::Minute,
+            [latest_closed].into_iter().collect(),
+        );
+        let appended = projection
+            .updates(
+                &pair,
+                Interval::Minute,
+                Some(&epoch),
+                Some(full.history.sequence),
+                now_ms,
+            )
+            .unwrap();
+        println!(
+            "UPDATE_FIXTURE {}",
+            serde_json::to_string(&appended).unwrap()
+        );
+
+        let history = projection.pairs.get_mut(&pair).unwrap();
+        let latest = history.minute.back_mut().unwrap();
+        latest.open = Decimal::from(101);
+        latest.high = Decimal::from(101);
+        latest.low = Decimal::from(101);
+        latest.close = Decimal::from(101);
+        record_update_changes(
+            history,
+            Interval::Minute,
+            [latest_closed].into_iter().collect(),
+        );
+        let corrected = projection
+            .updates(
+                &pair,
+                Interval::Minute,
+                Some(&epoch),
+                Some(appended.history.sequence),
+                now_ms,
+            )
+            .unwrap();
+        println!(
+            "UPDATE_FIXTURE {}",
+            serde_json::to_string(&corrected).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "one-off 300-pair source delta latency probe"]
+    fn synthetic_300_pair_updates_probe() {
+        let pairs = (0..MAX_MARKET_PICTURE_PAIRS)
+            .map(|index| format!("ASSET{index:03}-USDC"))
+            .collect::<Vec<_>>();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let mut projection = Projection::new(&pairs, now_ms);
+        for pair in &pairs {
+            let history = projection.pairs.get_mut(pair).unwrap();
+            for (interval, rows) in [
+                (Interval::Minute, MINUTE_ROWS),
+                (Interval::Hour, HOUR_ROWS),
+                (Interval::Day, DAY_ROWS),
+            ] {
+                let step_ms = interval.seconds() * 1_000;
+                let last = (now_ms / step_ms) * step_ms - step_ms;
+                let first = last - (rows as u64 - 1) * step_ms;
+                for index in 0..rows {
+                    let mut value = bar(first + index as u64 * step_ms, "100");
+                    value.close_time_ms = value.open_time_ms + step_ms;
+                    value.available_at_ms = value.close_time_ms;
+                    history.bars_mut(interval).push_back(value);
+                }
+                let surface = surface_bounds(history.bars(interval), interval);
+                let journal = history.update_journals.get_mut(&interval).unwrap();
+                journal.surface = surface;
+                journal.sequence = 1;
+            }
+        }
+        let epoch = projection.epoch.clone();
+        let start = std::time::Instant::now();
+        let mut response_bytes = 0usize;
+        for pair in &pairs {
+            for interval in [Interval::Minute, Interval::Hour, Interval::Day] {
+                let response = projection
+                    .updates(pair, interval, Some(&epoch), Some(1), now_ms)
+                    .unwrap();
+                assert_eq!(response.mode, "delta");
+                response_bytes += serde_json::to_vec(&response).unwrap().len();
+            }
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "synthetic source updates: pairs={}, requests={}, elapsed_ms={}, mean_us_per_request={}, response_bytes_total={response_bytes}",
+            pairs.len(),
+            pairs.len() * 3,
+            elapsed.as_millis(),
+            elapsed.as_micros() / (pairs.len() * 3) as u128
+        );
+    }
     #[test]
     fn maximum_configured_projection_has_a_bounded_compact_buffer_estimate() {
         let estimate = estimated_extension_memory_bytes(MAX_MARKET_PICTURE_PAIRS).unwrap();
@@ -1363,11 +2188,12 @@ mod tests {
         );
         let after = resource_rss_bytes();
         println!(
-            "synthetic max projection: pairs={}, source_bar_bytes={}, reserved_slots={}, estimated_buffer_bytes={}, maxrss_before_bytes={before}, maxrss_after_bytes={after}",
+            "synthetic max projection: pairs={}, source_bar_bytes={}, reserved_slots={}, estimated_buffer_bytes={}, extension_estimate_bytes={}, maxrss_before_bytes={before}, maxrss_after_bytes={after}",
             MAX_MARKET_PICTURE_PAIRS,
             std::mem::size_of::<SourceBar>(),
             slots,
-            slots * std::mem::size_of::<SourceBar>()
+            slots * std::mem::size_of::<SourceBar>(),
+            estimated_extension_memory_bytes(MAX_MARKET_PICTURE_PAIRS).unwrap()
         );
     }
 

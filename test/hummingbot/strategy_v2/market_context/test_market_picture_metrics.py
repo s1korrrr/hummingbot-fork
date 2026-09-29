@@ -1,4 +1,5 @@
 import math
+import warnings
 from decimal import Decimal
 
 import numpy as np
@@ -16,6 +17,8 @@ from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     correlate_hourly_return_vectors,
     correlation_30d_trend,
     count_predicate,
+    dense_hourly_correlation_matrix,
+    dense_hourly_correlation_row,
     distribution_summary,
     histogram,
     indicator_snapshot,
@@ -26,6 +29,7 @@ from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     pearson_correlation,
     percentile_midranks,
     prepare_hourly_log_returns,
+    prepare_hourly_log_returns_from_validated_closes,
     realized_volatility_24h,
     relative_volume,
     return_percent,
@@ -38,12 +42,19 @@ def test_six_horizon_returns_and_breadth_keep_zero_and_missing_distinct():
     values = {"a": 1.0, "b": -1.0, "c": 0.0, "d": None}
     result = breadth(values, expected_count=4, horizon_minutes=1, cutoff_ms=60_000)
     assert (result.advances, result.declines, result.unchanged) == (1, 1, 1)
-    assert (result.valid_count, result.expected_count, result.omitted_count) == (3, 4, 1)
+    assert (result.valid_count, result.expected_count, result.omitted_count) == (
+        3,
+        4,
+        1,
+    )
     assert result.advance_share == pytest.approx(1 / 3)
 
 
 def test_exact_decimal_return_preserves_sub_float_breadth_sign():
-    closes = [Decimal("1000000000000000000000000"), Decimal("1000000000000000000000001")]
+    closes = [
+        Decimal("1000000000000000000000000"),
+        Decimal("1000000000000000000000001"),
+    ]
     exact = return_percent_decimal(closes, 1)
     assert exact is not None and exact > 0
     assert 100.0 * (float(closes[-1]) / float(closes[0]) - 1.0) == 0.0
@@ -68,7 +79,9 @@ def test_breadth_pressure_decimal_uses_frozen_precision_without_float_serializat
     assert breadth_pressure_decimal(result) == "3"
     result = breadth({"a": 1.0, "b": 0.0, "c": 0.0}, 3, 1, 60_000)
     assert breadth_pressure_decimal(result) == "1"
-    result = breadth({f"a{i}": (1.0 if i < 4 else -1.0) for i in range(7)}, 7, 1, 60_000)
+    result = breadth(
+        {f"a{i}": (1.0 if i < 4 else -1.0) for i in range(7)}, 7, 1, 60_000
+    )
     assert breadth_pressure_decimal(result) == "0.4285714285714285714285714286"
 
 
@@ -91,7 +104,10 @@ def test_prepared_correlation_preserves_pairwise_missing_and_constant_semantics(
     b = prepare_hourly_log_returns(right, expected_end_times_ms=grid)
     result = correlate_hourly_return_vectors(a, b)
     paired = [
-        (math.log(left[t] / left[t - 3_600_000]), math.log(right[t] / right[t - 3_600_000]))
+        (
+            math.log(left[t] / left[t - 3_600_000]),
+            math.log(right[t] / right[t - 3_600_000]),
+        )
         for t in grid
         if t in right and t - 3_600_000 in right
     ]
@@ -104,14 +120,68 @@ def test_prepared_correlation_preserves_pairwise_missing_and_constant_semantics(
         correlate_hourly_return_vectors(a, b[:-1])
 
 
-@pytest.mark.parametrize("horizon,span", [(1, 0.5), (5, 1), (15, 2), (60, 3), (240, 5), (1440, 10)])
+def test_batched_dense_correlations_match_scalar_estimator_and_preserve_constant_rows():
+    rng = np.random.default_rng(8217)
+    returns = rng.normal(0.0, 0.01, (6, 720))
+    returns[4] = 0.0
+    matrix, constant_rows = dense_hourly_correlation_matrix(returns)
+    assert constant_rows.tolist() == [False, False, False, False, True, False]
+    for left in range(len(returns)):
+        for right in range(len(returns)):
+            expected = pearson_correlation(returns[left], returns[right], min_pairs=60)
+            actual = matrix[left, right]
+            if expected is None:
+                assert np.isnan(actual)
+            else:
+                assert actual == pytest.approx(expected, abs=1e-12)
+
+    row, constants = dense_hourly_correlation_row(returns, 1, 24, 600)
+    assert constants.tolist() == [False, False, False, False, True, False]
+    for other in range(len(returns)):
+        expected = pearson_correlation(
+            returns[1, 24:600], returns[other, 24:600], min_pairs=60
+        )
+        if expected is None:
+            assert np.isnan(row[other])
+        else:
+            assert row[other] == pytest.approx(expected, abs=1e-12)
+
+
+def test_validated_close_alignment_matches_public_helper_for_gaps_and_extreme_ratios():
+    start = 10_000 * 3_600_000
+    grid = tuple(start + i * 3_600_000 for i in range(8))
+    prices = {
+        grid[0] - 3_600_000: 1e308,
+        grid[0]: 1e-308,
+        grid[1]: 2e-308,
+        grid[2]: 3e-308,
+        grid[4] - 3_600_000: 4e-308,
+        grid[4]: 8e-308,
+        grid[5] - 3_600_000: 8e-308,
+        grid[5]: 16e-308,
+        grid[6]: 1e308,
+        grid[7]: 8e307,
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        actual = prepare_hourly_log_returns_from_validated_closes(prices, grid)
+        expected = prepare_hourly_log_returns(prices, expected_end_times_ms=grid)
+    np.testing.assert_equal(actual, expected)
+    assert actual.flags.writeable is False
+
+
+@pytest.mark.parametrize(
+    "horizon,span", [(1, 0.5), (5, 1), (15, 2), (60, 3), (240, 5), (1440, 10)]
+)
 def test_declared_histogram_spans_conserve_boundary_and_overflow_values(horizon, span):
     from hummingbot.strategy_v2.market_context.market_picture.definitions import get_definition
 
     definition = get_definition("return_distribution_40_bins")
     parameters = dict(definition.parameters)
     assert float(parameters["spans_percent"][str(horizon)]) == span
-    result = histogram([-span - 0.01, -span, 0, span, span + 0.01], span, parameters["interior_bins"])
+    result = histogram(
+        [-span - 0.01, -span, 0, span, span + 0.01], span, parameters["interior_bins"]
+    )
     assert len(result.counts) == 42
     assert result.edges[0] == -span and result.edges[-1] == span
     assert result.counts[0] == result.counts[-1] == 1
@@ -121,12 +191,18 @@ def test_declared_histogram_spans_conserve_boundary_and_overflow_values(horizon,
 
 def test_participation_predicate_uses_strict_comparison_and_real_valid_denominator():
     result = count_predicate({"a": 70.0, "b": 70.01, "c": None}, lambda x: x > 70.0, 3)
-    assert (result.numerator, result.denominator, result.expected_denominator) == (1, 2, 3)
+    assert (result.numerator, result.denominator, result.expected_denominator) == (
+        1,
+        2,
+        3,
+    )
     assert result.share == pytest.approx(0.5)
 
 
 def test_relative_volume_excludes_current_bar_and_zero_mean_is_unavailable():
-    assert relative_volume([10.0, *([2.0] * 20)], baseline_count=20) == pytest.approx(5.0)
+    assert relative_volume([10.0, *([2.0] * 20)], baseline_count=20) == pytest.approx(
+        5.0
+    )
     assert relative_volume([10.0, *([0.0] * 20)], baseline_count=20) is None
     assert relative_volume([10.0, 2.0], baseline_count=20) is None
 
@@ -149,12 +225,16 @@ def test_hourly_correlation_never_spans_a_missing_hour_and_enforces_95_percent()
     times = [i * 3_600_000 for i in range(101)]
     left = {t: 100.0 + i for i, t in enumerate(times)}
     right = {t: 200.0 + 2 * i for i, t in enumerate(times)}
-    complete = correlate_hourly_closes(left, right, expected_end_times_ms=times[1:], min_pairs=60)
+    complete = correlate_hourly_closes(
+        left, right, expected_end_times_ms=times[1:], min_pairs=60
+    )
     assert complete.sample_count == complete.expected_count == 100
     assert complete.value == pytest.approx(1.0)
     for index in (4, 15, 30, 45, 60, 75):
         left.pop(times[index])
-    partial = correlate_hourly_closes(left, right, expected_end_times_ms=times[1:], min_pairs=60)
+    partial = correlate_hourly_closes(
+        left, right, expected_end_times_ms=times[1:], min_pairs=60
+    )
     assert partial.sample_count == 88  # neither adjacent return spans a missing hour
     assert partial.value is None  # below the 95% gate
 
@@ -167,7 +247,9 @@ def test_30d_correlation_trend_is_30_points_of_the_rolling_90d_estimator():
     trend = correlation_30d_trend(left, right, cutoff_ms=times[-1])
     assert len(trend) == 30
     assert trend[0][0] == times[-1] - 29 * 24 * interval
-    assert all(point.value is not None and point.expected_count == 2160 for _, point in trend)
+    assert all(
+        point.value is not None and point.expected_count == 2160 for _, point in trend
+    )
 
 
 def test_indicator_snapshot_is_causal_and_returns_null_during_warmup():
@@ -176,17 +258,43 @@ def test_indicator_snapshot_is_causal_and_returns_null_during_warmup():
     warm = indicator_snapshot(high[:10], low[:10], close[:10])
     assert warm.ema21 is not None and warm.rsi14 is None and warm.adx14 is None
     result = indicator_snapshot(high, low, close)
-    assert result.rsi14 is not None and result.atr14 is not None and result.adx14 is not None
+    assert (
+        result.rsi14 is not None
+        and result.atr14 is not None
+        and result.adx14 is not None
+    )
     assert result.plus_di14 is not None and result.minus_di14 is not None
 
 
 def test_wilder_rsi_matches_existing_modular_v2_kernel_without_importing_it_in_runtime():
     from controllers.generic.modular_spot_core.market import wilder_rsi as existing_wilder_rsi
 
-    close = np.asarray([100, 99, 101, 102, 100, 98, 99, 103, 102, 105, 107, 106, 108, 110, 109, 112, 111], dtype=float)
+    close = np.asarray(
+        [
+            100,
+            99,
+            101,
+            102,
+            100,
+            98,
+            99,
+            103,
+            102,
+            105,
+            107,
+            106,
+            108,
+            110,
+            109,
+            112,
+            111,
+        ],
+        dtype=float,
+    )
     expected = existing_wilder_rsi(close, 14)
     actual = __import__(
-        "hummingbot.strategy_v2.market_context.market_picture.metrics", fromlist=["wilder_rsi"]
+        "hummingbot.strategy_v2.market_context.market_picture.metrics",
+        fromlist=["wilder_rsi"],
     ).wilder_rsi(close, 14)
     np.testing.assert_allclose(actual[np.isfinite(actual)], expected)
 
@@ -197,7 +305,10 @@ def test_breakouts_use_exact_closed_history_and_strict_boundaries():
     assert new_24h_high(11.0, [10.0] * 1439) is None
     assert new_10d_hourly_close_break(12.0, [11.0] * 240, [9.0] * 240) == (True, False)
     assert new_10d_hourly_close_break(11.0, [11.0] * 240, [9.0] * 240) == (False, False)
-    assert new_52w_completed_day_break(12.0, 8.0, [11.0] * 364, [9.0] * 364) == (True, True)
+    assert new_52w_completed_day_break(12.0, 8.0, [11.0] * 364, [9.0] * 364) == (
+        True,
+        True,
+    )
     assert new_52w_completed_day_break(12.0, 8.0, [11.0] * 363, [9.0] * 363) is None
 
 
@@ -240,7 +351,9 @@ def test_asset_metric_builder_emits_all_frozen_asset_keys_and_feature_specific_s
         quote_volume=tuple(10.0 if i == n - 1 else 2.0 for i in range(n)),
         cutoff_ms=cutoff,
     )
-    metrics = compute_asset_metrics(bars, benchmark_returns_24h={"btc": 0.0, "eth": 1.0})
+    metrics = compute_asset_metrics(
+        bars, benchmark_returns_24h={"btc": 0.0, "eth": 1.0}
+    )
     assert set(metrics) == {
         "price",
         *(f"return_{h}m" for h in (1, 5, 15, 60, 240, 1440, 10080)),
@@ -266,9 +379,15 @@ def test_asset_metric_builder_emits_all_frozen_asset_keys_and_feature_specific_s
 
 
 def test_distribution_summary_preserves_empty_and_stable_extrema():
-    result = distribution_summary({"a": -2.0, "b": 4.0, "c": 4.0, "d": 0.0, "e": None}, 5)
+    result = distribution_summary(
+        {"a": -2.0, "b": 4.0, "c": 4.0, "d": 0.0, "e": None}, 5
+    )
     assert (result.valid_count, result.expected_count) == (4, 5)
-    assert (result.negative_count, result.unchanged_count, result.positive_count) == (1, 1, 2)
+    assert (result.negative_count, result.unchanged_count, result.positive_count) == (
+        1,
+        1,
+        2,
+    )
     assert (result.best_instrument_id, result.worst_instrument_id) == ("b", "a")
     empty = distribution_summary({"a": None}, 1)
     assert empty.mean_return_percent is None and empty.positive_count == 0
@@ -316,3 +435,25 @@ def test_numeric_wire_text_is_finite_fixed_and_bounded():
         metric_decimal(float("inf"))
     with pytest.raises(ValueError):
         metric_decimal(True)
+
+
+def test_dense_correlation_row_preserves_large_finite_scalar_result():
+    x = np.linspace(-1, 1, 2160)
+    rows = np.array([x * 1e150, (x + np.sin(x * 20) * 0.1) * 1e150])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        actual, constant = dense_hourly_correlation_row(rows, 0, 0, 2160)
+    assert not constant.any()
+    expected = correlate_hourly_return_vectors(rows[0], rows[1]).value
+    assert actual[1] == pytest.approx(expected, abs=1e-12)
+
+
+def test_hourly_correlation_exact_95_percent_pair_boundary():
+    left = np.linspace(-0.1, 0.1, 2160)
+    right = left.copy()
+    right[2052:] = np.nan
+    accepted = correlate_hourly_return_vectors(left, right)
+    assert accepted.sample_count == 2052 and accepted.value == pytest.approx(1.0)
+    right[2051] = np.nan
+    rejected = correlate_hourly_return_vectors(left, right)
+    assert rejected.sample_count == 2051 and rejected.value is None

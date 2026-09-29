@@ -48,7 +48,7 @@ async fn market_picture_read_route_is_auth_bound_compact_and_keeps_v1_separate()
                     "sequence": 1,
                     "received_at": now_seconds,
                 }),
-                rows: source_rows.into(),
+                rows: source_rows.clone().into(),
             },
             now_ms,
         )
@@ -62,6 +62,7 @@ async fn market_picture_read_route_is_auth_bound_compact_and_keeps_v1_separate()
         .unwrap();
 
     let projection = Arc::new(Mutex::new(projection)) as SharedProjection;
+    let projection_writer = projection.clone();
     let source_state = State::new(std::slice::from_ref(&pair), 90);
     let stop = CancellationToken::new();
     let token = "0123456789abcdef0123456789abcdef";
@@ -95,6 +96,123 @@ async fn market_picture_read_route_is_auth_bound_compact_and_keeps_v1_separate()
     assert_eq!(body["bars"][0][0], "1000000000000000000000000");
     assert_eq!(body["bars"][0][7], 0);
     assert_eq!(body["bars"][0][8], 1);
+
+    let updates_route = format!("http://{addr}/v2/market-picture/updates");
+    let unauthorized_updates = client
+        .get(&updates_route)
+        .query(&[("pair", "BTC-USDC"), ("interval", "1m")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_updates.status(), 401);
+    let full = client
+        .get(&updates_route)
+        .query(&[("pair", "BTC-USDC"), ("interval", "1m")])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(full.status(), 200);
+    let full: Value = full.json().await.unwrap();
+    assert_eq!(full["schema_version"], "market-picture.source-updates.v1");
+    assert_eq!(full["mode"], "full");
+    assert_eq!(full["from_sequence"], Value::Null);
+    assert_eq!(full["bars"].as_array().unwrap().len(), MINUTE_ROWS);
+    let projection_epoch = full["epoch"].as_str().unwrap().to_owned();
+    let mut cursor = full["sequence"].as_u64().unwrap();
+    let stable_available_at = full["available_at_ms"].as_u64().unwrap();
+    let cursor_text = cursor.to_string();
+    let empty = client
+        .get(&updates_route)
+        .query(&[
+            ("pair", "BTC-USDC"),
+            ("interval", "1m"),
+            ("epoch", projection_epoch.as_str()),
+            ("sequence", cursor_text.as_str()),
+        ])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), 200);
+    let empty: Value = empty.json().await.unwrap();
+    assert_eq!(empty["mode"], "delta");
+    assert_eq!(empty["from_sequence"], cursor);
+    assert!(empty["upserts"].as_array().unwrap().is_empty());
+    assert!(empty["deleted_open_time_ms"].as_array().unwrap().is_empty());
+    assert!(empty["source_epochs"].as_array().unwrap().is_empty());
+
+    let mut corrected = (*source_rows.last().unwrap().as_ref()).clone();
+    corrected.close = "1000000000000000000000000".into();
+    let latest_open = corrected.open_time;
+    projection_writer
+        .lock()
+        .await
+        .observe(
+            okx_candle_service::state::Event::Other(json!({
+                "v": 1,
+                "type": "candle",
+                "epoch": source_epoch,
+                "pair": pair,
+                "sequence": 2,
+                "published_at": now_seconds,
+                "received_at": now_seconds,
+                "row": corrected,
+            })),
+            now_ms,
+        )
+        .unwrap();
+    let cursor_text = cursor.to_string();
+    let correction = client
+        .get(&updates_route)
+        .query(&[
+            ("pair", "BTC-USDC"),
+            ("interval", "1m"),
+            ("epoch", projection_epoch.as_str()),
+            ("sequence", cursor_text.as_str()),
+        ])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(correction.status(), 200);
+    let correction: Value = correction.json().await.unwrap();
+    assert_eq!(correction["mode"], "delta");
+    assert_eq!(correction["from_sequence"], cursor);
+    assert_eq!(correction["upserts"].as_array().unwrap().len(), 1);
+    assert_eq!(correction["upserts"][0]["open_time_ms"], latest_open * 1000);
+    assert_eq!(
+        correction["upserts"][0]["close"],
+        "1000000000000000000000000"
+    );
+    cursor = correction["sequence"].as_u64().unwrap();
+    assert!(cursor > full["sequence"].as_u64().unwrap());
+    assert_eq!(correction["available_at_ms"], stable_available_at);
+
+    let future_cursor_text = cursor.saturating_add(1).to_string();
+    let bad_cursor = client
+        .get(&updates_route)
+        .query(&[
+            ("pair", "BTC-USDC"),
+            ("interval", "1m"),
+            ("epoch", projection_epoch.as_str()),
+            ("sequence", future_cursor_text.as_str()),
+        ])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_cursor.status(), 200);
+    assert_eq!(bad_cursor.json::<Value>().await.unwrap()["mode"], "full");
+
+    let partial_cursor = client
+        .get(&updates_route)
+        .query(&[("pair", "BTC-USDC"), ("interval", "1m"), ("epoch", "only")])
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(partial_cursor.status(), 400);
 
     let unknown = client
         .get(format!(

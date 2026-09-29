@@ -16,6 +16,17 @@ from hummingbot.strategy_v2.market_context.market_picture.contracts import (
 FIXTURE = Path(__file__).parents[3] / "fixtures" / "market_picture_metric_series.v1.json"
 
 
+def test_series_expected_denominator_bounds_cells_without_override():
+    data = json.loads(FIXTURE.read_text())
+    data["expected_denominator"] = 2
+    data["cells"][0].pop("expected_denominator", None)
+    data["cells"][0]["denominator"] = 3
+    data["cells"][0]["numerator"] = 1
+    data["payload_digest"] = metric_series_digest(data)
+    with pytest.raises(ValueError, match="denominator exceeds expected denominator"):
+        MetricSeriesV1.model_validate_json(json.dumps(data))
+
+
 def test_valid_cell_quality_defaults_are_lossless_and_hash_equivalent():
     explicit = json.loads(FIXTURE.read_text())
     explicit["payload_digest"] = metric_series_digest(explicit)

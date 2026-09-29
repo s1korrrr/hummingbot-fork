@@ -6,6 +6,8 @@ binary MR eligibility only; no RSI-to-return conversion or hidden MOM model.
 """
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 
 from pydantic import Field, model_validator
 
@@ -18,6 +20,21 @@ from hummingbot.strategy_v2.portfolio_v3.allocation import propose_target
 from hummingbot.strategy_v2.portfolio_v3.contracts import AlphaProposal, Identified, P0Policy, PortfolioMandate
 
 RECIPE_ID = 'meridian_v3_unified_p0_v1'
+
+
+class CapitalStage(NamedTuple):
+    envelope_quote: Decimal
+    per_asset_quote: Decimal
+    order_quote: Decimal
+
+
+# The only admitted capital scales. Canary keeps the full per-order and per-asset sizes,
+# so fills and one asset's DCA stages behave identically; only the shared envelope, for
+# which the five assets compete in P0 priority, is smaller. No other numbers exist.
+CAPITAL_STAGES = MappingProxyType({
+    'canary': CapitalStage(Decimal('100'), Decimal('100'), Decimal('20')),
+    'full': CapitalStage(Decimal('500'), Decimal('100'), Decimal('20')),
+})
 
 
 def portfolio_source_files():
@@ -89,10 +106,12 @@ class MeridianPortfolioRecipe:
     def __init__(self, mandate: PortfolioMandate, policy: P0Policy):
         self.mandate = PortfolioMandate.model_validate(mandate.model_dump(mode='json'))
         self.policy = P0Policy.model_validate(policy.model_dump(mode='json'))
+        stage = (mandate.funding_envelope_quote, mandate.per_asset_quote, mandate.order_quote)
         if (mandate.portfolio_id != 'meridian_v3' or set(mandate.pairs) != set(meridian_v3_recipe.PAIRS)
-                or mandate.order_quote != 20 or mandate.per_asset_quote != 100
-                or mandate.funding_envelope_quote != 500 or mandate.reference_quote != 500):
-            raise ValueError('Meridian requires its explicit five pairs and 20/100/500 mandate')
+                or stage not in {tuple(s) for s in CAPITAL_STAGES.values()}
+                or mandate.reference_quote != mandate.funding_envelope_quote):
+            raise ValueError('Meridian requires its explicit five pairs and a canary 20/100/100 '
+                             'or full 20/100/500 mandate')
         if set(policy.pair_priority) != set(mandate.pairs) or policy.producers != ('bnb_p23_mr',):
             raise ValueError('explicit five-pair priority and supported BNB MR producer required; MOM is not qualified')
         self.recipe_sha256 = digest(dict(recipe_id=RECIPE_ID, source_sha256=source_identity(),

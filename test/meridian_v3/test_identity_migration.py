@@ -30,7 +30,8 @@ BTC, ETH, SOL = 'BTC-USDC', 'ETH-USDC', 'SOL-USDC'
 UPGRADED = 'controllers/generic/modular_spot_core/bag.py'  # moves the p23 fingerprint and every Meridian seal
 
 
-class IdentityMigrationTests(IsolatedAsyncioTestCase):
+class OwnerStateCase(IsolatedAsyncioTestCase):
+    """A paper owner with held and active state, closed and restored under changed identities."""
     setUp = session_tests.NativePaperSessionTests.setUp  # denies all network connections
 
     async def asyncSetUp(self):
@@ -58,9 +59,9 @@ class IdentityMigrationTests(IsolatedAsyncioTestCase):
         [executor] = [e for e in s.executors(pair) if e.config.id == create.executor_config.id]
         return executor
 
-    async def owner_with_active_and_held_state(self):
+    async def owner_with_active_and_held_state(self, **config):
         """BTC is a held bag, ETH an active filled tranche; both keep bound grants."""
-        s = self.scenario()
+        s = self.scenario(**config)
         await s.step()  # the first observed cut only seeds each symbol
         btc = await self.entered(s, BTC)
         eth = await self.entered(s, ETH)
@@ -71,9 +72,10 @@ class IdentityMigrationTests(IsolatedAsyncioTestCase):
         grants = s.grants()
         self.assertEqual({g.symbol for g in grants}, {BTC, ETH})
         self.assertEqual({g.status for g in grants}, {'BOUND'})
-        state = {'grants': grants, 'held': s.held(BTC), 'eth': eth.config.id, 'btc': btc.config.id,
-                 'rows': self.rows(s), 'minute': s.minute, 'sequence': dict(s.sequence),
-                 'trades': dict(s.trade_sequence)}
+        return await self.closed(s, grants=grants, held=s.held(BTC), eth=eth.config.id, btc=btc.config.id)
+
+    async def closed(self, s, **state):
+        state.update(rows=self.rows(s), minute=s.minute, sequence=dict(s.sequence), trades=dict(s.trade_sequence))
         await s.close()
         return state
 
@@ -99,9 +101,16 @@ class IdentityMigrationTests(IsolatedAsyncioTestCase):
         recorder = s.session.recorder
         return recorder.sql_manager.get_new_session, recorder.config_file_path
 
+    def decision_keys(self, s):
+        from controllers.generic.modular_spot_core.state import DecisionStore
+        recorder, c = s.session.recorder, s.controller.config
+        return {pair: DecisionStore(recorder, c.id, c.connector_name, pair).key for pair in s.controller.contexts}
+
     def decisions(self, s):
         return {pair: c.runtime.ensure_store().load()[0] for pair, c in s.controller.contexts.items()}
 
+
+class IdentityMigrationTests(OwnerStateCase):
     async def test_code_upgrade_holds_entries_until_migration_then_carries_every_obligation(self):
         before = await self.owner_with_active_and_held_state()
         mutate(self.patch, UPGRADED)
@@ -160,11 +169,6 @@ class IdentityMigrationTests(IsolatedAsyncioTestCase):
         stored = r.controller.portfolio.target_store().read()
         self.assertEqual(stored['previous_sha256'], head['target_sha256'])
         self.assertGreaterEqual(stored['target']['sequence'], head['sequence'])
-
-    def decision_keys(self, s):
-        from controllers.generic.modular_spot_core.state import DecisionStore
-        recorder, c = s.session.recorder, s.controller.config
-        return {pair: DecisionStore(recorder, c.id, c.connector_name, pair).key for pair in s.controller.contexts}
 
     async def test_same_code_restart_is_bound_and_writes_nothing_new(self):
         before = await self.owner_with_active_and_held_state()

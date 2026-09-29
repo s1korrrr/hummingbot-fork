@@ -3,7 +3,8 @@
 The owner's recorder state is bound to identities derived from source and
 configuration: the p23 decision checkpoints (symbol fingerprint), the target slot
 (writer epoch and portfolio recipe) and the grant row (grant policy). A code-only
-image upgrade changes the first two. Without a migration the owner holds new
+image upgrade changes the first two; an explicit `capital_stage` change (canary
+<-> full) changes all three. Without a migration the owner holds new
 acquisitions and keeps only protective bag stops (fail closed, reported as
 IDENTITY_MIGRATION_REQUIRED); it never rewrites or deletes its checkpoints.
 
@@ -11,14 +12,18 @@ The owner records the identity its state is written under (the witness) the
 first time it runs with state it can prove is its own. `plan_identity_migration`
 recomputes the witnessed fingerprints from their recorded configuration and
 sources, checks every persisted row is bound to the witness, and compares the
-witnessed configuration with the current one: a behavioural configuration
-change is refused. `apply_identity_migration` re-plans inside one SQLite write
+witnessed configuration with the current one: any behavioural configuration
+change other than `capital_stage` (with its derived envelope) is refused, and a
+stage change is refused while the persisted grant reservations exceed the target
+stage's envelope or per-asset limit (a full -> canary downgrade with exposure
+above 100 quote). `apply_identity_migration` re-plans inside one SQLite write
 transaction, archives every row it changes in a content-addressed receipt, and
 carries decision checkpoints (claims, cycle, clocks), the target chain and the
 grants forward unchanged except for their identity binding. Native orders,
 fills, executors, positions and held-bag trails are never touched.
 """
 import json
+from decimal import Decimal as D
 from types import SimpleNamespace
 
 from controllers.generic.meridian_v3_portfolio import MeridianPortfolioRecipe, source_identity
@@ -29,9 +34,9 @@ from hummingbot.strategy_v2.components.recipe_contract import CONTROL_FIELDS, ca
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
 from hummingbot.strategy_v2.controllers.portfolio_target_store_v3 import NativeTargetStore, ProposalWriter
 from hummingbot.strategy_v2.portfolio_v3.contracts import P0Policy, PortfolioMandate
-from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import GrantPolicy
+from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import GrantPolicy, PortfolioGrant
 
-from .config import PAIRS, PORTFOLIO_ID, RECIPE_ID
+from .config import CAPITAL_STAGES, PAIRS, PORTFOLIO_ID, RECIPE_ID
 
 WITNESS_PREFIX = 'meridian-v3-identity:v1:'
 RECEIPT_PREFIX = 'meridian-v3-migration:v1:'
@@ -190,6 +195,44 @@ class IdentityGuard:
 
 
 # ---------------------------------------------------------------------- migration
+STAGE_FIELDS = frozenset({'capital_stage', 'total_amount_quote', 'live_capital'})
+STAGE_MANDATE_FIELDS = frozenset({'reference_quote', 'funding_envelope_quote'})
+STAGE_GRANT_FIELDS = frozenset({'envelope_quote', 'mandate_sha256'})
+ZERO = D('0')
+
+
+def _stage_change(witness, current):
+    """(from, to) when only the explicit capital stage moved its derived envelope."""
+    old, new = witness['configuration'], current['configuration']
+    if old.get('capital_stage') == new.get('capital_stage'):
+        return None
+    if old.get('capital_stage') not in CAPITAL_STAGES or new.get('capital_stage') not in CAPITAL_STAGES:
+        raise MigrationRefused('unknown capital stage; identity migration refused')
+    old_live, new_live = old.get('live_capital'), new.get('live_capital')
+    if (old_live is None) != (new_live is None) or (old_live is not None and (
+            {k: v for k, v in old_live.items() if k != 'envelope_quote'}
+            != {k: v for k, v in new_live.items() if k != 'envelope_quote'})):
+        raise MigrationRefused('live capital binding changed beyond its stage envelope; identity migration refused')
+    return old['capital_stage'], new['capital_stage']
+
+
+def _without_budget_ceiling(configuration):
+    return {**configuration, 'budget': {**configuration['budget'], 'max_quote': None}}
+
+
+def _grant_exposure(grants):
+    """Reserved quote of every persisted grant, before native reconciliation drops any.
+
+    Every Meridian acquisition spends inside a grant, and a grant is released only by
+    native proof, so this bounds the owner's capital at cost from above.
+    """
+    by_asset = {}
+    for grant in (grants or {}).get('grants', ()):
+        value = PortfolioGrant.model_validate(grant)
+        by_asset[value.symbol] = by_asset.get(value.symbol, ZERO) + value.reserved_quote
+    return {'total': sum(by_asset.values(), ZERO), 'by_asset': by_asset}
+
+
 def _changes(old, new):
     keys = set(old) | set(new)
     return sorted(k for k in keys if old.get(k) != new.get(k))
@@ -218,21 +261,45 @@ def _plan(config, current, rows):
     bad = _consistent(rows, witness)
     if bad:
         raise MigrationRefused(f'persisted state is not bound to the witnessed identity: {",".join(bad)}')
-    changed = _changes(witness['configuration'], current['configuration'])
+    stage = _stage_change(witness, current)
+    changed = [k for k in _changes(witness['configuration'], current['configuration'])
+               if stage is None or k not in STAGE_FIELDS]
     if changed:
-        raise MigrationRefused(f'behavioural configuration changed ({",".join(changed)}); '
-                               'a code-upgrade migration carries code changes only')
-    if witness['policy'] != current['policy'] or witness['mandate'] != current['mandate']:
-        raise MigrationRefused('portfolio mandate or P0 policy changed; identity migration refused')
+        raise MigrationRefused(f'behavioural configuration changed ({",".join(changed)}); only code '
+                               'and an explicit capital_stage change can be carried')
+    if witness['policy'] != current['policy']:
+        raise MigrationRefused('P0 policy changed; identity migration refused')
+    allowed = STAGE_MANDATE_FIELDS if stage else frozenset()
+    if [k for k in _changes(witness['mandate'], current['mandate']) if k not in allowed]:
+        raise MigrationRefused('portfolio mandate changed beyond the capital stage; identity migration refused')
     for pair in PAIRS:
-        if witness['symbols'][pair]['configuration'] != current['symbols'][pair]['configuration']:
+        old, new = witness['symbols'][pair]['configuration'], current['symbols'][pair]['configuration']
+        if stage:
+            old, new = _without_budget_ceiling(old), _without_budget_ceiling(new)
+        if old != new:
             raise MigrationRefused(f'{pair} effective p23 configuration changed; identity migration refused')
-    if witness['grant_policy_sha256'] != current['grant_policy_sha256']:
-        raise MigrationRefused('grant policy changed without a configuration change')
-    kinds = ['code_upgrade']
+    allowed = STAGE_GRANT_FIELDS if stage else frozenset()
+    if [k for k in _changes(witness['grant_policy'], current['grant_policy']) if k not in allowed]:
+        raise MigrationRefused('grant policy changed beyond the capital stage; identity migration refused')
     decisions = {pair: decode(value) for pair, value in rows['decisions'].items() if value is not None}
     target = None if rows['target'] is None else json.loads(rows['target'])
     grants = None if rows['grants'] is None else json.loads(rows['grants'])
+    code = (witness['source_sha256'] != current['source_sha256']
+            or witness['portfolio_source_sha256'] != current['portfolio_source_sha256']
+            or witness['symbol_sources'] != current['symbol_sources'])
+    kinds = [*(['code_upgrade'] if code else []), *([f'capital_stage_{stage[0]}_to_{stage[1]}'] if stage else [])]
+    if not kinds:
+        raise MigrationRefused('identity changed without a code or capital stage change; explicit reconciliation required')
+    exposure = _grant_exposure(grants)
+    if stage:
+        policy = current['grant_policy']
+        envelope, per_asset = D(policy['envelope_quote']), D(policy['per_asset_quote'])
+        worst = max(exposure['by_asset'].values(), default=ZERO)
+        if exposure['total'] > envelope or worst > per_asset:
+            raise MigrationRefused(
+                f'capital stage {stage[0]} -> {stage[1]} refused: reserved exposure {exposure["total"]} quote '
+                f'(largest asset {worst}) exceeds the {stage[1]} envelope {envelope} / per-asset {per_asset}; '
+                'let exposure fall below the target stage first')
     transition_id = identity([witness, current, rows])
     return {
         'transition_id': transition_id, 'kinds': kinds, 'controller_id': current['controller_id'],
@@ -245,6 +312,7 @@ def _plan(config, current, rows):
                                  'committed_quote': str(state.committed_quote)} for pair, state in sorted(decisions.items())},
             'target_head': None if target is None else target['target_sha256'],
             'grants': None if grants is None else len(grants['grants']),
+            'reserved_quote': str(exposure['total']),
             'released': None if grants is None else len(grants['released']),
         }}
 

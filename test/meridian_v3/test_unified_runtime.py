@@ -28,7 +28,7 @@ def unified(mode='paper', execution_enabled=False, disabled=(), **overrides):
     values = dict(id=f'modular_spot_meridian_v3_unified_{mode}', execution_mode=mode,
                   connector_name='okx_paper_trade' if mode == 'paper' else 'okx', account_id=f'meridian_{mode}',
                   symbols=[{'trading_pair': p, 'entry_enabled': p not in disabled} for p in PAIRS],
-                  priority=PRIORITY, risk=RISK)
+                  priority=PRIORITY, risk=RISK, capital_stage='full')
     if mode != 'paper':
         values['data'] = {'mode': 'shared', 'transport': 'stream', 'origin': 'http://127.0.0.1:8092',
                           'token_file': '/run/candles/token'}

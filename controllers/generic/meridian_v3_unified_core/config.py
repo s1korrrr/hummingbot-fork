@@ -32,7 +32,7 @@ RECIPE_ID = 'meridian_v3_unified_runtime_v1'
 PORTFOLIO_ID = 'meridian_v3'
 PRODUCER = 'bnb_p23_mr'
 PAIRS = recipe.PAIRS
-ORDER_QUOTE, ASSET_QUOTE, ENVELOPE_QUOTE = Decimal('20'), Decimal('100'), Decimal('500')
+CAPITAL_STAGES = meridian_v3_portfolio.CAPITAL_STAGES
 # Meridian is a DCA controller with no loss rail. The shared p23 runtime still takes a
 # RiskPolicy, so it receives no PnL signal (see SymbolBindings.snapshot) and these
 # fractions are never reached. They exist only to satisfy the shared policy type.
@@ -103,6 +103,10 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     recipe_version: Literal['meridian_v3_unified_runtime_v1'] = RECIPE_ID
     id: str = Field(pattern=r'^modular_spot_meridian_v3_unified_(observation|paper|live)$')
     execution_mode: Literal['observation', 'paper', 'live']
+    # Explicit capital scale; never defaulted. canary = 100 envelope, full = 500 envelope,
+    # both 100 per asset and 20 per order. Changing it on an owner with state is an
+    # explicit operator identity migration (see migration.py).
+    capital_stage: Literal['canary', 'full'] = Field(json_schema_extra={'is_updatable': False})
     connector_name: Literal['okx', 'okx_paper_trade']
     account_id: str = Field(pattern=NAME)
     symbols: tuple[SymbolPolicyBinding, ...] = Field(min_length=5, max_length=5, json_schema_extra={'is_updatable': True})
@@ -117,11 +121,19 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     max_native_report_age_seconds: int = Field(default=5, ge=1, le=60, strict=True)
     max_snapshot_age_ms: int = Field(default=5000, ge=100, le=60000, strict=True)
     target_lifetime_ms: int = Field(default=30000, ge=1000, le=60000, strict=True)
-    total_amount_quote: Decimal = Field(default=ENVELOPE_QUOTE, json_schema_extra={'is_updatable': False})
+    # The stage envelope; filled from `capital_stage` when omitted, and must equal it.
+    total_amount_quote: Decimal = Field(json_schema_extra={'is_updatable': False})
     # Read by ModularPositionExecutor from its owning controller: the protected no-loss floor
     # (after-fee breakeven raised by activation - delta), never the plain after-fee price.
     exit_floor: Literal['protected'] = 'protected'
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
+
+    @model_validator(mode='before')
+    @classmethod
+    def stage_envelope(cls, values):
+        if isinstance(values, dict) and 'total_amount_quote' not in values and values.get('capital_stage') in CAPITAL_STAGES:
+            values = {**values, 'total_amount_quote': CAPITAL_STAGES[values['capital_stage']].envelope_quote}
+        return values
 
     @field_validator('symbols')
     @classmethod
@@ -136,8 +148,8 @@ class MeridianUnifiedConfig(ControllerConfigBase):
             raise ValueError('explicit priority over exactly the five Meridian pairs is required')
         if self.initial_positions:
             raise ValueError('unverified inventory adoption is not supported')
-        if self.total_amount_quote != ENVELOPE_QUOTE:
-            raise ValueError('the Meridian envelope is the versioned 500 quote recipe')
+        if self.total_amount_quote != self.stage().envelope_quote:
+            raise ValueError(f'the Meridian {self.capital_stage} envelope is {self.stage().envelope_quote} quote')
         if self.id != f'modular_spot_meridian_v3_unified_{self.execution_mode}':
             raise ValueError('controller identity must name its execution mode')
         if self.execution_mode == 'paper':
@@ -151,8 +163,8 @@ class MeridianUnifiedConfig(ControllerConfigBase):
             if self.live_capital is not None and (self.execution_mode != 'live'
                                                   or self.live_capital.account_id != self.account_id
                                                   or self.live_capital.connector != self.connector_name
-                                                  or self.live_capital.envelope_quote != ENVELOPE_QUOTE):
-                raise ValueError('live capital must bind this live account, connector and the 500 envelope')
+                                                  or self.live_capital.envelope_quote != self.stage().envelope_quote):
+                raise ValueError('live capital must bind this live account, connector and the stage envelope')
         if self.execution_mode == 'observation' and self.execution_enabled:
             raise ValueError('observation mode cannot dispatch execution')
         if self.execution_enabled and self.recipe_binding is None:
@@ -165,6 +177,9 @@ class MeridianUnifiedConfig(ControllerConfigBase):
         return self
 
     # ------------------------------------------------------------------ bindings
+    def stage(self):
+        return CAPITAL_STAGES[self.capital_stage]
+
     def owned_trading_pairs(self):
         """Every instrument this one native owner manages; read by the engine for attribution."""
         return tuple(s.trading_pair for s in self.symbols)
@@ -176,12 +191,12 @@ class MeridianUnifiedConfig(ControllerConfigBase):
         for binding in self.symbols:
             values = dict(
                 controller_name='modular_spot', id=self.id, connector_name=self.connector_name,
-                trading_pair=binding.trading_pair, total_amount_quote=ASSET_QUOTE,
+                trading_pair=binding.trading_pair, total_amount_quote=self.stage().per_asset_quote,
                 execution_enabled=self.execution_enabled, acquisition_enabled=binding.entry_enabled,
                 max_records=1500, max_candle_age_seconds=self.max_candle_age_seconds,
                 max_native_report_age_seconds=self.max_native_report_age_seconds,
                 risk=self.risk.native(), data=self.data, account=self.account_id,
-                budget=BudgetPolicy(group='meridian_v3_unified', max_quote=ENVELOPE_QUOTE, max_assets=5),
+                budget=BudgetPolicy(group='meridian_v3_unified', max_quote=self.stage().envelope_quote, max_assets=5),
                 program_revision='meridian_v3_unified', policy_revision=binding.policy_version,
                 capital=recipe.capital_policy(self.risk.fee_reserve_fraction), exit_floor=self.exit_floor,
                 manual_kill_switch=self.manual_kill_switch, **modules)
@@ -191,8 +206,9 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     def mandate(self):
         return PortfolioMandate(
             portfolio_id=PORTFOLIO_ID, account_id=self.account_id, version=RECIPE_ID, mode='observation',
-            reference_quote=ENVELOPE_QUOTE, funding_envelope_quote=ENVELOPE_QUOTE, per_asset_quote=ASSET_QUOTE,
-            order_quote=ORDER_QUOTE, gross_reference_ratio=1, gross_nav_ratio=1,
+            reference_quote=self.stage().envelope_quote, funding_envelope_quote=self.stage().envelope_quote,
+            per_asset_quote=self.stage().per_asset_quote, order_quote=self.stage().order_quote,
+            gross_reference_ratio=1, gross_nav_ratio=1,
             cash_reserve_quote=self.risk.cash_reserve_quote, fee_reserve_fraction=self.risk.fee_reserve_fraction,
             pairs=PAIRS, loss_policy_sha256=digest({'loss_rails': 'none', 'guards': self.risk.model_dump(mode='json'),
                                                     'exit_floor': 'protected', 'no_loss_sell': True}),

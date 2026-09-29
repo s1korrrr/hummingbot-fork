@@ -202,7 +202,10 @@ class MeridianUnifiedController(ControllerBase):
             'operator': self.get_operator_state(), 'portfolio': dict(self.portfolio.status),
             'fault': self.fault, 'writer_epoch': self.portfolio.epoch, 'clock': self.portfolio.clock,
             'identity_hold': self.portfolio.identity_hold,
-            'limits': {'order_quote_including_fees': '20', 'asset_quote': '100', 'envelope_quote': '500'},
+            'capital_stage': self.config.capital_stage,
+            'limits': {'order_quote_including_fees': str(self.config.stage().order_quote),
+                       'asset_quote': str(self.config.stage().per_asset_quote),
+                       'envelope_quote': str(self.config.stage().envelope_quote)},
             'capital_scope': ('PAPER_WALLET' if self.config.execution_mode == 'paper'
                               else 'SHARED_WALLET_BOUNDED' if self.config.live_capital else 'CAPITAL_DOMAIN_UNPROVEN'),
             'loss_rails': 'none',
@@ -214,7 +217,7 @@ class MeridianUnifiedController(ControllerBase):
         }
 
     def to_format_status(self):
-        lines = [f'Meridian v3 unified | {RECIPE_ID} | {self.config.execution_mode} | '
+        lines = [f'Meridian v3 unified | {RECIPE_ID} | {self.config.execution_mode} | {self.config.capital_stage} | '
                  f'execution={self.config.execution_enabled} | portfolio={self.portfolio.status.get("reason")}']
         for pair, context in self.contexts.items():
             lines.append(f'  {pair}: {context.runtime.reason} | bag={context.runtime.bag_status}')

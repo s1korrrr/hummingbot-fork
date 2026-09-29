@@ -60,13 +60,43 @@ class SymbolBindings(NativeBindings):
         return None if recorder is None else PairScopedRecorder(recorder, self.owner_id, self.pair)
 
 
+class _SymbolReadiness:
+    """One symbol's view of a native paper provider or connector: `ready` is its own book."""
+
+    def __init__(self, target, ready):
+        self._target, self.ready = target, ready
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
+
+
+class _SymbolController:
+    def __init__(self, controller, ready):
+        self._controller = controller
+        self.market_data_provider = _SymbolReadiness(controller.market_data_provider, ready)
+
+    def __getattr__(self, name):
+        return getattr(self._controller, name)
+
+
 class PaperSymbolBindings(SymbolBindings):
+    """The paper connector's aggregate `ready` requires every injected book to be fresh.
+
+    A live connector's readiness does not track another pair's book age, so a symbol's
+    snapshot is gated on its own paper book only; paper and live then agree that one
+    stale symbol never withholds another symbol's snapshot.
+    """
+
     @staticmethod
     def spot_connector(controller):
         connector = controller.market_data_provider.connectors.get(controller.config.connector_name)
         if not is_native_paper_connector(connector):
             raise PolicyError('Meridian paper requires the exact native paper connector')
-        return connector
+        return _SymbolReadiness(connector, connector.pair_ready(controller.config.trading_pair))
+
+    def snapshot(self, controller):
+        ready = self.spot_connector(controller).ready
+        return super().snapshot(_SymbolController(controller, ready))
 
 
 class SymbolGrantBudget:

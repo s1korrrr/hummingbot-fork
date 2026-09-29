@@ -151,13 +151,15 @@ def _runtime_identity():
 
 
 def _config_pairs(config):
-    """A multi-symbol owner declares every instrument; single-pair owners declare one.
-
-    An owner steps only while every declared book is fresh: native reports value each
-    active executor at its own pair's book, so a partial step cannot report.
-    """
+    """A multi-symbol owner declares every instrument; single-pair owners declare one."""
     owned = getattr(config, 'owned_trading_pairs', None)
     return tuple(owned()) if callable(owned) else (config.trading_pair,)
+
+
+def _per_symbol_freshness(controller):
+    """An owner that holds a stale symbol itself (no acquisition, no stale-price action)
+    declares it. Only such an owner steps while some of its books are stale."""
+    return getattr(type(controller), 'per_symbol_book_freshness', False) is True
 
 
 class NativePaperSession:
@@ -353,7 +355,7 @@ class NativePaperSession:
         executors persist through the recorder and stop being re-reported on every later step.
         """
         done = [executor for key in controller_ids for executor in self.executor_orchestrator.active_executors.get(key, [])
-                if executor and executor.status == RunnableStatus.TERMINATED]
+                if executor and executor.status == RunnableStatus.TERMINATED and self._drivable(executor)]
         done.sort(key=lambda executor: executor.config.timestamp, reverse=True)
         return [StoreExecutorAction(executor_id=executor.config.id, controller_id=executor.config.controller_id)
                 for executor in done[self.closed_executors_buffer:]]
@@ -372,6 +374,8 @@ class NativePaperSession:
                 self._check_connector(config.connector_name)
                 if config.trading_pair not in self._connector.trading_pairs:
                     raise ValueError('Unexpected paper executor pair')
+                if not self._connector.pair_ready(config.trading_pair):
+                    raise ValueError('Paper owner requested execution on a stale book')
 
     def _write_step_receipt(self, receipt):
         temporary = self._failure_path.with_suffix('.tmp')
@@ -485,11 +489,13 @@ class NativePaperSession:
         await self._connector.settle_research_events()
         for row in observed_seconds:
             await self._connector.process_observed_second(**row)
-        fresh_ids = {key for key, controller in self.controllers.items()
-                     if all(self._connector.pair_ready(pair) for pair in _config_pairs(controller.config))}
+        fresh_ids, stale_pairs = self._steppable_owners()
         for trade in trades:
             await self._connector.process_trade(**trade)
-        self._refresh_reports(controller_ids=fresh_ids)
+        # Reports value an exposed stale symbol at its last observed book, as live does.
+        retained = {pair for key in fresh_ids for pair in stale_pairs.get(key, ()) if pair in self._exposed_pairs(key)}
+        with self._connector.retained_marks(retained):
+            self._refresh_reports(controller_ids=fresh_ids)
         actions = []
         for key, controller in self.controllers.items():
             if key not in fresh_ids:
@@ -505,11 +511,17 @@ class NativePaperSession:
         for executor in started:
             await executor.on_start()
         await self._drive_executors(fresh_ids)
-        self.executor_orchestrator.sync_live_state_to_db(controller_ids=fresh_ids)
-        reports = self._refresh_reports(controller_ids=fresh_ids)
+        with self._connector.retained_marks(retained):
+            self.executor_orchestrator.sync_live_state_to_db(controller_ids=fresh_ids)
+            reports = self._refresh_reports(controller_ids=fresh_ids)
         reasons = []
         if not self._connector.ready:
             reasons.append('fresh_book_required')
+        for key in sorted(stale_pairs):
+            if key in fresh_ids:
+                reasons.append(f'{key}: stale_symbols_held:{",".join(stale_pairs[key])}')
+        for pair in sorted(retained):
+            reasons.append(f'reported_at_last_observed_book:{pair}')
         reasons.extend('exposed_pair_book_unavailable:' + p for p in self.unavailable_exposure())
         for key, controller in self.controllers.items():
             recovery_hold = getattr(controller, '_recovery_hold', getattr(controller, 'recovery_hold', ''))
@@ -523,12 +535,43 @@ class NativePaperSession:
         return {'actions': actions, 'reports': reports, 'market_state': self._connector.tracking_states,
                 'readiness': {'ready': not reasons, 'reasons': reasons}}
 
+    def _steppable_owners(self):
+        """Owners this step may run, and each one's stale declared symbols.
+
+        An owner runs while every declared book is fresh. A per-symbol owner also runs
+        with some stale books when each exposed stale symbol still has an observed book
+        to report from; its stale symbols' executors are not driven (see `_drivable`).
+        """
+        stepped, stale_pairs = set(), {}
+        for key, controller in self.controllers.items():
+            pairs = _config_pairs(controller.config)
+            stale = tuple(pair for pair in pairs if not self._connector.pair_ready(pair))
+            if not stale:
+                stepped.add(key)
+                continue
+            if not _per_symbol_freshness(controller) or len(stale) == len(pairs):
+                continue
+            exposed = self._exposed_pairs(key)
+            if all(self._connector.has_observed_book(pair) for pair in stale if pair in exposed):
+                stepped.add(key)
+                stale_pairs[key] = stale
+        return stepped, stale_pairs
+
+    def _exposed_pairs(self, key):
+        pairs = {executor.config.trading_pair for executor in self.executor_orchestrator.active_executors.get(key, [])}
+        pairs.update(position.trading_pair for position in self.executor_orchestrator.positions_held.get(key, []))
+        return pairs
+
+    def _drivable(self, executor):
+        """A stale symbol's executor never acts on a stale price; it waits for a fresh book."""
+        return self._connector.pair_ready(executor.config.trading_pair)
+
     async def _control_open_executors(self, fresh_ids):
         for key, executors in self.executor_orchestrator.active_executors.items():
             if key not in fresh_ids:
                 continue
             for executor in list(executors):
-                if not executor.is_closed:
+                if not executor.is_closed and self._drivable(executor):
                     await executor.control_task()
                     await self._connector.drain()
 
@@ -540,6 +583,8 @@ class NativePaperSession:
             if key not in fresh_ids:
                 continue
             for executor in executors:
+                if not self._drivable(executor):
+                    continue
                 for name in ('_entry_expiry_reconciliation_task', '_funding_entry_reconciliation_task'):
                     task = getattr(executor, name, None)
                     if task is not None and not task.done():
@@ -552,7 +597,7 @@ class NativePaperSession:
         # the same single-pass semantics as a step without reconciliation.
         for key, executor in follow_up.values():
             active = self.executor_orchestrator.active_executors.get(key, ())
-            if executor.is_closed or not any(item is executor for item in active):
+            if executor.is_closed or not any(item is executor for item in active) or not self._drivable(executor):
                 continue
             await executor.control_task()
             await self._connector.drain()

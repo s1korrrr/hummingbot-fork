@@ -8,6 +8,7 @@ from decimal import Decimal as D
 from pathlib import Path
 from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
 from test.meridian_v3.lifecycle_harness import Scenario, creates, rebound, stops
+from test.meridian_v3.test_unified_runtime import OWNER
 from types import SimpleNamespace as NS
 from unittest import IsolatedAsyncioTestCase
 
@@ -16,8 +17,9 @@ from controllers.generic.modular_spot_core.execution import ModularPositionExecu
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.models.executors import CloseType
+from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import NATIVE_SNAPSHOT_UNAVAILABLE
 
-BTC, ETH, SOL = 'BTC-USDC', 'ETH-USDC', 'SOL-USDC'
+BTC, ETH, SOL, XRP = 'BTC-USDC', 'ETH-USDC', 'SOL-USDC', 'XRP-USDC'
 
 
 class Lifecycle(IsolatedAsyncioTestCase):
@@ -34,8 +36,10 @@ class Lifecycle(IsolatedAsyncioTestCase):
                 await scenario.close()
         self._directory.cleanup()
 
-    def scenario(self, **kwargs):
-        scenario = Scenario(self.directory, **kwargs)
+    def scenario(self, *, directory=None, **kwargs):
+        directory = directory or self.directory
+        directory.mkdir(exist_ok=True)
+        scenario = Scenario(directory, **kwargs)
         self.scenarios.append(scenario)
         return scenario
 
@@ -276,19 +280,80 @@ class Lifecycle(IsolatedAsyncioTestCase):
         await s.lift(BTC)
         self.assertEqual(executor.close_type, CloseType.TRAILING_STOP)
 
-    async def test_stale_book_pauses_the_paper_owner_without_losing_state(self):
+    # ------------------------------------------------------------------ per-symbol freshness
+    async def test_stale_symbol_holds_acquisitions_but_never_another_symbols_trailing(self):
         s = self.scenario()
         executor = await self.entered(s, BTC)
-        receipt = await s.step(mids={BTC: '104.5'}, stale=('XRP-USDC',))
-        self.assertIn('fresh_book_required', receipt['readiness']['reasons'])
-        self.assertEqual(receipt['actions'], [])
-        self.assertIsNone(executor._trailing_stop_trigger_pct)  # not driven while the owner is paused
-        self.assertTrue(executor.is_active)
-        for mid in ('104.5', '105.5', '104.9'):  # books fresh again: the same position resumes
-            await s.step(mids={BTC: mid})
-        await s.lift(BTC)
+        receipt = await s.step(mids={BTC: '104.5'}, rsi={ETH: rebound()}, stale=(XRP,))
+        reasons = receipt['readiness']['reasons']
+        self.assertIn('fresh_book_required', reasons)
+        self.assertIn(f'{OWNER}: stale_symbols_held:{XRP}', reasons)
+        self.assertEqual(creates(receipt), [])  # the portfolio cannot mark XRP: no new acquisition anywhere
+        self.assertEqual(s.controller.portfolio.status['reason'], NATIVE_SNAPSHOT_UNAVAILABLE)
+        self.assertTrue(self.reason(s, XRP).startswith('data_hold:'), self.reason(s, XRP))
+        self.assertIsNotNone(executor._trailing_stop_trigger_pct)  # BTC's own book is fresh: it is managed
+        for mid in ('105.5', '104.9'):
+            await s.step(mids={BTC: mid}, stale=(XRP,))
+        await s.lift(BTC, stale=(XRP,))
         self.assertEqual(executor.close_type, CloseType.TRAILING_STOP)
+        self.assertEqual(s.balance('BTC'), D('0'))
+        await s.step(stale=(XRP,))
         self.assertEqual(s.grants(), ())
+        receipt = await s.step(rsi={ETH: rebound()})  # XRP fresh again: acquisitions resume
+        self.assertEqual(len(creates(receipt, ETH)), 1)
+
+    async def test_stale_symbols_own_executor_never_acts_on_its_stale_book(self):
+        s = self.scenario()
+        await s.step()
+        receipt = await s.step(rsi={BTC: rebound(), XRP: rebound()})
+        self.assertEqual({a.executor_config.trading_pair for a in creates(receipt)}, {BTC, XRP})
+        await s.fill(BTC)
+        await s.fill(XRP)
+        [btc], [xrp] = s.executors(BTC), s.executors(XRP)
+        for mid in ('104.5', '105.5'):
+            receipt = await s.step(mids={BTC: mid, XRP: mid}, stale=(XRP,))
+            self.assertIn(f'reported_at_last_observed_book:{XRP}', receipt['readiness']['reasons'])
+            self.assertEqual([a for a in receipt['actions'] if getattr(a, 'executor_config', None) is not None
+                              and a.executor_config.trading_pair == XRP], [])
+        self.assertIsNotNone(btc._trailing_stop_trigger_pct)
+        self.assertIsNone(xrp._trailing_stop_trigger_pct)  # never saw an unpublished price
+        self.assertTrue(xrp.is_active)
+        self.assertEqual(len([g for g in s.grants() if g.symbol == XRP]), 1)
+        self.assertEqual({p.trading_pair for p in s.session.recorder.get_positions_by_controller(OWNER)
+                          if D(str(p.amount)) > 0}, set())
+        await s.step(mids={XRP: '105.5'})  # fresh again: the same executor resumes from the observed book
+        self.assertIsNotNone(xrp._trailing_stop_trigger_pct)
+
+    async def test_stale_symbol_never_stops_another_symbols_bag_recovery(self):
+        s = self.scenario()
+        executor = await self.entered(s, BTC)
+        amount = executor.open_filled_amount
+        await s.step(mids={BTC: '96.9'}, stale=(XRP,))
+        await s.step(mids={BTC: '96.8'}, stale=(XRP,))
+        self.assertEqual(s.held(BTC), amount)  # the bag stop is BTC management, not an acquisition
+        for mid in ('101', '103', '104'):
+            await s.step(mids={BTC: mid}, rsi={BTC: (80, 80)}, stale=(XRP,))
+        self.assertTrue(self.bag(s, BTC)['trail_armed'])
+        receipt = await s.step(mids={BTC: '103.05'}, rsi={BTC: (80, 80)}, stale=(XRP,))
+        [sell] = creates(receipt, BTC)
+        self.assertEqual((sell.executor_config.side, sell.executor_config.amount), (TradeType.SELL, amount))
+
+    async def test_a_stale_symbol_leaves_a_healthy_symbols_trace_unchanged(self):
+        async def trace(stale):
+            s = self.scenario(directory=self.directory / ('stale' if stale else 'fresh'))
+            executor = await self.entered(s, BTC)
+            steps = []
+            for mid in ('102', '104.5', '105.5', '104.9'):
+                receipt = await s.step(mids={BTC: mid}, stale=stale)
+                steps.append((mid, [(type(a).__name__, getattr(a, 'executor_id', None)) for a in receipt['actions']],
+                              executor._trailing_stop_trigger_pct))
+            await s.lift(BTC, stale=stale)
+            close = executor._close_order.order
+            result = (executor.config.id, steps, executor.close_type, close.price, close.executed_amount_base,
+                      s.balance('USDC'), s.balance('BTC'))
+            await s.close()  # one native recorder per process
+            return result
+        self.assertEqual(await trace(()), await trace((XRP,)))
 
     # ------------------------------------------------------------------ restart
     async def test_restart_with_a_held_bag_recovers_it_without_reentry(self):

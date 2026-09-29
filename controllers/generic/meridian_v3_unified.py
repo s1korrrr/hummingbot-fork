@@ -27,6 +27,9 @@ __all__ = ['MeridianUnifiedConfig', 'MeridianUnifiedController']
 
 class MeridianUnifiedController(ControllerBase):
     allow_implementation_hot_reload = False
+    # A stale or unavailable symbol holds its own acquisitions (and every new acquisition
+    # while the portfolio cannot mark it); the other symbols' exits and bags keep running.
+    per_symbol_book_freshness = True
 
     @classmethod
     def implementation_source_files(cls):

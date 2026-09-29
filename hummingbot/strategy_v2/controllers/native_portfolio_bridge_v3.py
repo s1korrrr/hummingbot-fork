@@ -138,6 +138,29 @@ class PortfolioGrantStore:
         except IntegrityError:
             return False
 
+    def rebind_policy(self, session, previous_policy_hash):
+        """Carry every grant, release and consumed setup to this policy, in the caller's transaction.
+
+        Only for an explicit, verified identity migration of the same owner. The row must
+        be bound to `previous_policy_hash`, and every carried grant must fit this policy's
+        instruments and limits; otherwise nothing changes. Returns the (old, new) row
+        values, or None when this recorder holds no grant row.
+        """
+        row = session.get(self.model, self.key)
+        if row is None:
+            return None
+        try:
+            value = json.loads(row.value)
+            if not isinstance(value, dict) or value.get('policy_hash') != previous_policy_hash:
+                raise PolicyError('portfolio grant row is not bound to the migrated policy')
+        except (TypeError, ValueError) as exc:
+            raise PolicyError('portfolio grant checkpoint invalid') from exc
+        value['policy_hash'] = self.policy_hash
+        encoded = json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False)
+        self._parse(encoded)  # Same schema, instruments and limits as any other read.
+        old, row.value = row.value, encoded
+        return old, encoded
+
     def _transact(self, mutate):
         """Read, reconcile and conditionally replace the one grant row."""
         try:

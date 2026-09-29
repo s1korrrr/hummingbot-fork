@@ -167,6 +167,15 @@ class SymbolRuntime(ModularRuntime):
         bindings = (PaperSymbolBindings if paper else SymbolBindings)(context.owner.config.id, context.pair)
         super().__init__(context, bindings=bindings)
 
+    def actions(self):
+        # Checkpoints bound to another code/config identity: no entry, recovery sell or
+        # checkpoint write until the operator migration; protective bag stops continue.
+        hold = self.portfolio.identity_hold
+        if hold is not None:
+            self.reason = hold[:200]
+            return self._bag_stops_only()
+        return super().actions()
+
     def ensure_store(self):
         store = super().ensure_store()
         if type(self.budget) is not SymbolGrantBudget:

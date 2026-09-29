@@ -134,7 +134,8 @@ class MeridianUnifiedController(ControllerBase):
         self.portfolio.begin_tick()
         markets = {pair: c.runtime.market for pair, c in self.contexts.items()}
         try:
-            self.portfolio.evaluate(markets)
+            if self.portfolio.check_identity() is None:
+                self.portfolio.evaluate(markets)
             self.fault = None
         except Exception as exc:  # Portfolio failure holds entries only; management continues below.
             self.fault = f'{type(exc).__name__}:{exc}'[:300]
@@ -200,6 +201,7 @@ class MeridianUnifiedController(ControllerBase):
             'execution_mode': self.config.execution_mode, 'execution_enabled': self.config.execution_enabled,
             'operator': self.get_operator_state(), 'portfolio': dict(self.portfolio.status),
             'fault': self.fault, 'writer_epoch': self.portfolio.epoch, 'clock': self.portfolio.clock,
+            'identity_hold': self.portfolio.identity_hold,
             'limits': {'order_quote_including_fees': '20', 'asset_quote': '100', 'envelope_quote': '500'},
             'capital_scope': ('PAPER_WALLET' if self.config.execution_mode == 'paper'
                               else 'SHARED_WALLET_BOUNDED' if self.config.live_capital else 'CAPITAL_DOMAIN_UNPROVEN'),

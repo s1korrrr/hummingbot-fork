@@ -93,3 +93,58 @@ def test_unbounded_or_inconsistent_targets_cannot_enter_recorder(native):
         with pytest.raises(ValueError):
             store.publish(t.model_copy(update=update), previous_sha256=None, now_ms=1000)
     assert store.read() is None
+
+
+def carry(native, previous, current, migration='c' * 64):
+    with native() as session, session.begin():
+        return NativeTargetStore(native, current).carry_forward(session, previous, migration_sha256=migration)
+
+
+def test_identity_migration_carries_the_chain_without_deleting_history(native):
+    old, new = writer(), writer(epoch='e2', recipe_sha256='b' * 64)
+    t = target()
+    first = NativeTargetStore(native, old).publish(t, previous_sha256=None, now_ms=1000)
+    with pytest.raises(ValueError, match='another writer'):
+        carry(native, writer(epoch='other'), new)
+    before, after = carry(native, old, new)
+    assert json.loads(before) == first
+    store = NativeTargetStore(native, new)
+    assert store.head() == {'target_sha256': t.identity, 'sequence': 1, 'decision_time_ms': 1000,
+                            'published_at_ms': 1000}
+    assert not store.read()['execution_authorized']
+    with pytest.raises(ValueError, match='another writer'):
+        NativeTargetStore(native, old).read()
+    with native() as session:
+        assert session.get(Metadata, store.key + ':receipt:' + t.identity).value == before
+    # Back to the publishing identity: its own receipt is the head again.
+    carry(native, new, old)
+    assert NativeTargetStore(native, old).read() == first
+
+
+def test_carried_head_must_be_extended_and_cannot_move_to_another_writer(native):
+    old, new = writer(), writer(epoch='e2')
+    t = target()
+    NativeTargetStore(native, old).publish(t, previous_sha256=None, now_ms=1000)
+    with pytest.raises(ValueError):
+        carry(native, old, writer(writer_id='writer2'))
+    carry(native, old, new)
+    store = NativeTargetStore(native, new)
+    from hummingbot.strategy_v2.portfolio_v3.allocation import propose_target
+    newer = propose_target(mandate(), snapshot(cutoff_ms=1001, sequence=1), (proposal(),), policy(),
+                           recipe_sha256=H, epoch='e2', fence=1)
+    with pytest.raises(ValueError, match='compare-and-swap'):
+        store.publish(newer, previous_sha256=None, now_ms=1001)
+    receipt = store.publish(newer, previous_sha256=t.identity, now_ms=1001)
+    assert receipt['previous_sha256'] == t.identity and store.head()['target_sha256'] == newer.identity
+
+
+def test_a_tampered_carry_record_fails_closed(native):
+    old, new = writer(), writer(epoch='e2', recipe_sha256='b' * 64)
+    NativeTargetStore(native, old).publish(target(), previous_sha256=None, now_ms=1000)
+    carry(native, old, new)
+    store = NativeTargetStore(native, new)
+    with native() as session, session.begin():
+        row = session.get(Metadata, store.key)
+        row.value = json.dumps({**json.loads(row.value), 'sequence': 7})
+    with pytest.raises(ValueError, match='history differ'):
+        store.read()

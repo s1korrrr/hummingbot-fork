@@ -21,7 +21,7 @@ from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange impor
 from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, ObservationRef, Opportunity
 from hummingbot.strategy_v2.components.recipe_contract import digest
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
-from hummingbot.strategy_v2.controllers.portfolio_target_store_v3 import NativeTargetStore, ProposalWriter
+from hummingbot.strategy_v2.controllers.portfolio_target_store_v3 import NativeTargetStore
 from hummingbot.strategy_v2.portfolio_v3.contracts import AssetState, Commitment, PortfolioSnapshot
 from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import (
     CAPITAL_DOMAIN_UNPROVEN,
@@ -29,10 +29,10 @@ from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import (
     GRANT_STORE_HOLD,
     NATIVE_INVENTORY_MISMATCH,
     NATIVE_SNAPSHOT_UNAVAILABLE,
-    GrantPolicy,
 )
 
 from .config import PORTFOLIO_ID, PRODUCER
+from .migration import IDENTITY_UNVERIFIED, IdentityGuard, epoch, grant_policy, proposal_writer
 
 ZERO = Decimal('0')
 ERRORS = (ValueError, TypeError, ArithmeticError, KeyError, AttributeError, OSError)
@@ -55,8 +55,10 @@ class MeridianPortfolio:
         self.owner = owner
         config = owner.config
         self.recipe = MeridianPortfolioRecipe(config.mandate(), config.p0_policy())
-        self.epoch = f'{config.execution_mode}.{self.recipe.recipe_sha256[:16]}'
+        self.epoch = epoch(config, self.recipe)
         self.fence = 1
+        self.identity = IdentityGuard(config)
+        self.identity_hold = None  # explicit reason while recorder state is bound to another identity
         self.source_sha256 = digest(config.source_manifest())
         self._store = self._targets = None
         self._seen = {}  # pair -> first cut observed by this process
@@ -76,23 +78,32 @@ class MeridianPortfolio:
 
     def store(self):
         if self._store is None:
-            config, mandate = self.owner.config, self.recipe.mandate
-            self._store = PortfolioGrantStore(self.recorder(), GrantPolicy(
-                portfolio_id=PORTFOLIO_ID, account_id=config.account_id, controller_id=config.id,
-                connector=config.connector_name, mandate_sha256=mandate.identity,
-                policy_sha256=self.recipe.policy.identity, pairs=mandate.pairs,
-                envelope_quote=mandate.funding_envelope_quote, per_asset_quote=mandate.per_asset_quote,
-                order_quote=mandate.order_quote))
+            self._store = PortfolioGrantStore(self.recorder(), grant_policy(self.owner.config, self.recipe))
         return self._store
 
     def target_store(self):
         if self._targets is None:
-            config = self.owner.config
-            self._targets = NativeTargetStore(self.recorder().sql_manager.get_new_session, ProposalWriter(
-                portfolio_id=PORTFOLIO_ID, account_id=config.account_id, writer_id=config.id,
-                epoch=self.epoch, fence=self.fence, mandate_sha256=self.recipe.mandate.identity,
-                recipe_sha256=self.recipe.recipe_sha256))
+            self._targets = NativeTargetStore(self.recorder().sql_manager.get_new_session,
+                                              proposal_writer(self.owner.config, self.recipe, fence=self.fence))
         return self._targets
+
+    def check_identity(self):
+        """Hold every acquisition while recorder state is bound to another code/config identity.
+
+        Returns None once bound; the reason otherwise. Symbol runtimes then keep only
+        protective bag stops until an operator applies the identity migration.
+        """
+        try:
+            recorder = self.recorder()
+            hold = self.identity.check(recorder.sql_manager.get_new_session, recorder.config_file_path)
+        except (PolicyError, *ERRORS) as exc:
+            hold = f'{IDENTITY_UNVERIFIED}:{type(exc).__name__}:{exc}'[:300]
+        if hold != self.identity_hold and hold is not None:
+            self.owner.logger().error(f'Meridian entries held until identity migration: {hold}')
+        self.identity_hold = hold
+        if hold is not None:
+            self.status = {'reason': hold.split(':', 1)[0], 'hold': hold}
+        return hold
 
     def evidence(self):
         """Every recorded executor of this recorder, with current active state preferred."""
@@ -223,7 +234,7 @@ class MeridianPortfolio:
         for pair in pairs:
             self._evaluated[pair] = markets[pair].candle_open
         target = self.recipe.propose(snapshot, observations, epoch=self.epoch, fence=self.fence)
-        stored = self.target_store().read()
+        stored = self.target_store().head()
         self.target_store().publish(target, previous_sha256=None if stored is None else stored['target_sha256'],
                                     now_ms=now_ms)
         self.last_target = target
@@ -268,8 +279,8 @@ class MeridianPortfolio:
         except PolicyError as exc:  # foreign or unexplained writer: entries hold, targets stay observable
             grants = ()
             holds.append(f'{CAPITAL_DOMAIN_UNPROVEN}:{exc}')
-        stored = self.target_store().read()
-        floor = 0 if stored is None else stored['target']['sequence']
+        stored = self.target_store().head()
+        floor = 0 if stored is None else stored['sequence']
         book_read_ms = now_ms  # every native book below is read at this owner clock
         self.clock.update(native_book_read_ms=book_read_ms, venue_book_event_ms=None,
                           venue_book_event='UNAVAILABLE_FROM_NATIVE_ADAPTER')

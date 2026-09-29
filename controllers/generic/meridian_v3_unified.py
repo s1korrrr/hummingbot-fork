@@ -23,6 +23,7 @@ Operator vocabulary. None of these controls sells, liquidates, or demotes a posi
 """
 import asyncio
 import time
+from contextlib import nullcontext
 
 from controllers.generic.meridian_v3_unified_core.config import PAIRS, RECIPE_ID, MeridianUnifiedConfig, source_files
 from controllers.generic.meridian_v3_unified_core.portfolio import MeridianPortfolio
@@ -30,6 +31,7 @@ from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext, 
 from controllers.generic.modular_spot_core.bag import is_recovery_sell
 from controllers.generic.modular_spot_core.data_reader import attach_pool
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
+from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -169,6 +171,13 @@ class MeridianUnifiedController(ControllerBase):
     def determine_executor_actions(self):
         if self.status != RunnableStatus.RUNNING:
             return []
+        # One synchronous decision over five symbols reads the Executors table about 25 times;
+        # they share one read, cleared by any Executors write (see MarketsRecorder).
+        recorder = NativeBindings.recorder()
+        with nullcontext() if recorder is None else recorder.shared_executor_reads():
+            return self._determine_executor_actions()
+
+    def _determine_executor_actions(self):
         self.portfolio.begin_tick()
         markets = {pair: c.runtime.market for pair, c in self.contexts.items()}
         try:

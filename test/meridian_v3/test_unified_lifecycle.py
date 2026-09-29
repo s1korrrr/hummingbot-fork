@@ -4,6 +4,7 @@ Every order, fill, executor, held position, grant and restart is native; only th
 closed-candle features are scripted (see lifecycle_harness). Economics are not claimed.
 """
 import tempfile
+from contextlib import nullcontext
 from decimal import Decimal as D
 from pathlib import Path
 from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
@@ -11,6 +12,8 @@ from test.meridian_v3.lifecycle_harness import Scenario, creates, rebound, stops
 from test.meridian_v3.test_unified_runtime import OWNER
 from types import SimpleNamespace as NS
 from unittest import IsolatedAsyncioTestCase
+
+from sqlalchemy import event
 
 from controllers.generic.meridian_v3_recipe import PAIRS
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
@@ -541,6 +544,57 @@ class Lifecycle(IsolatedAsyncioTestCase):
             await s.close()  # one native recorder per process
             return result
         self.assertEqual(await trace(()), await trace((XRP,)))
+
+    # ------------------------------------------------------------------ decision-loop reads
+    async def test_shared_executor_reads_decide_the_same_tape_with_one_read_per_decision(self):
+        async def tape(shared):
+            s = self.scenario(directory=self.directory / ('shared' if shared else 'unshared'))
+            recorder = s.session.recorder
+            recorder._executor_reads = None  # the live read path: no process-lifetime paper cache
+            if not shared:
+                recorder.shared_executor_reads = nullcontext
+            reads, decide = [], s.controller.determine_executor_actions
+            selects = {'n': 0}
+
+            def count(conn, cursor, text, *args):
+                selects['n'] += text.lstrip().upper().startswith('SELECT') and 'FROM "Executors"' in text
+
+            def measured():
+                before = selects['n']
+                try:
+                    return decide()
+                finally:
+                    reads.append(selects['n'] - before)
+            event.listen(recorder.sql_manager.engine, 'before_cursor_execute', count)
+            s.controller.determine_executor_actions = measured
+            trace = []
+
+            async def step(**kwargs):
+                receipt = await s.step(**kwargs)
+                trace.append([(type(a).__name__, getattr(a, 'executor_id', None), getattr(a, 'keep_position', None),
+                               *((a.executor_config.id, a.executor_config.trading_pair, str(a.executor_config.amount))
+                                 if isinstance(a, CreateExecutorAction) else ())) for a in receipt['actions']])
+            await step()
+            await step(rsi={BTC: rebound(), ETH: rebound()})
+            await s.fill(BTC)
+            await s.fill(ETH)
+            await step(mids={ETH: '99'}, rsi={ETH: rebound()})
+            await s.fill(ETH)
+            for btc, eth in (('104.5', '96.9'), ('105.5', '96.8'), ('104.9', '101'), ('104.9', '103'), ('104.9', '104')):
+                await step(mids={BTC: btc, ETH: eth}, rsi={ETH: (80, 80)})
+            await s.lift(BTC)
+            await step(mids={ETH: '103.05'}, rsi={ETH: (80, 80)})
+            await s.lift(ETH, amount='5', above='0.5')
+            await step()
+            result = (trace, [(g.symbol, g.status, g.executor_id, g.bound_quote) for g in s.grants()],
+                      {asset: s.balance(asset) for asset in ('USDC', 'BTC', 'ETH')}, self.bag(s, ETH))
+            await s.close()
+            return result, reads
+        (shared, reads), (unshared, unshared_reads) = await tape(True), await tape(False)
+        self.assertEqual(shared, unshared)
+        self.assertTrue(any(trace for trace in shared[0]))
+        self.assertEqual(max(reads), 1)
+        self.assertGreater(max(unshared_reads), 10)
 
     # ------------------------------------------------------------------ restart
     async def test_restart_with_a_held_bag_recovers_it_without_reentry(self):

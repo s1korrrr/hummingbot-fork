@@ -853,6 +853,52 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(writes))
         self.assertEqual(Decimal("2"), pnls()["a"])
 
+    def test_shared_executor_reads_last_one_scope_and_follow_every_write(self):
+        recorder = MarketsRecorder(
+            sql=self.manager, markets=[self], config_file_path=self.config_file_path, strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False,
+                                                                 market_data_collection_interval=60,
+                                                                 market_data_collection_depth=20))
+
+        def executor(executor_id, pnl, controller="c"):
+            config = PositionExecutorConfig(id=executor_id, timestamp=1234, trading_pair="ETH-USDT",
+                                            connector_name="binance", side=TradeType.BUY, entry_price=Decimal("1000"),
+                                            amount=Decimal("1"))
+            mock = MagicMock(spec=PositionExecutor)
+            mock.config = config
+            mock.executor_info = ExecutorInfo(
+                id=executor_id, timestamp=1234, type="position_executor", status=RunnableStatus.RUNNING,
+                controller_id=controller, custom_info={}, config=config, net_pnl_pct=Decimal("0"),
+                net_pnl_quote=Decimal(pnl), cum_fees_quote=Decimal("0"), filled_amount_quote=Decimal("1"),
+                is_active=True, is_trading=True)
+            return mock
+
+        def pnls():
+            return {info.id: info.net_pnl_quote for info in recorder.get_all_executors()}
+
+        selects = []
+        event.listen(self.manager.engine, "before_cursor_execute",
+                     lambda conn, cursor, text, *args: selects.append(text) if "FROM \"Executors\"" in text else None)
+        recorder.store_or_update_executor(executor("a", "1"))
+        recorder.store_or_update_executor(executor("z", "9", controller="other"))
+        selects.clear()
+        with recorder.shared_executor_reads():
+            first = pnls()
+            with recorder.shared_executor_reads():  # a nested scope shares the outer one
+                self.assertEqual(first, pnls())
+            self.assertEqual(["a"], [info.id for info in recorder.get_executors_by_controller("c")])
+            self.assertEqual(1, len(selects))  # one query serves the whole synchronous decision
+            recorder.get_all_executors()[0].net_pnl_quote = Decimal("99")
+            self.assertEqual(Decimal("1"), pnls()["a"])  # callers never share one object
+            recorder.store_or_update_executor(executor("a", "2"))  # an own write inside the scope
+            self.assertEqual(Decimal("2"), pnls()["a"])
+            with self.manager.get_new_session() as session, session.begin():  # any writer through this engine
+                session.execute(update(Executors).where(Executors.id == "a").values(net_pnl_quote=3))
+            self.assertEqual(Decimal("3"), pnls()["a"])
+        selects.clear()
+        pnls(), pnls()
+        self.assertEqual(2, len(selects))  # outside a scope every read is live, as before
+
     def test_add_market(self):
         """Test adding a new market dynamically to the recorder."""
         recorder = MarketsRecorder(

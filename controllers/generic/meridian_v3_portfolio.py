@@ -20,19 +20,30 @@ from hummingbot.strategy_v2.portfolio_v3.contracts import AlphaProposal, Identif
 RECIPE_ID = 'meridian_v3_unified_p0_v1'
 
 
+def portfolio_source_files():
+    """The explicit source closure of the Meridian portfolio decision and its native stores.
+
+    Every module whose code decides, proposes, admits or persists a Meridian portfolio
+    target or grant: this module, the frozen p23 recipe, each portfolio_v3 contract and
+    allocation module, the native grant bridge, the native target store and the p23
+    symbol runtime. Additive: it never changes the legacy component source selection.
+    """
+    from hummingbot.strategy_v2 import portfolio_v3
+    from hummingbot.strategy_v2.controllers import native_portfolio_bridge_v3, portfolio_target_store_v3
+    from hummingbot.strategy_v2.portfolio_v3 import runtime_contracts_v1
+    modules = (portfolio_v3, allocation, capital, contracts, runtime_contracts_v1,
+               native_portfolio_bridge_v3, portfolio_target_store_v3)
+    return [Path(__file__), Path(meridian_v3_recipe.__file__), *[Path(m.__file__) for m in modules],
+            *modular_spot.source_files()]
+
+
 def source_identity():
-    """Additive closure; never changes legacy component source selection."""
+    """Digest of the portfolio closure plus the neutral component sources it imports."""
     import hashlib
 
-    from hummingbot.strategy_v2 import portfolio_v3
     from hummingbot.strategy_v2.components.source_identity import checked_source, component_source_files
-    from hummingbot.strategy_v2.controllers import portfolio_target_store_v3
     root = Path(__file__).resolve().parents[2]
-    paths = {Path(__file__).resolve(), Path(meridian_v3_recipe.__file__).resolve(),
-             Path(allocation.__file__).resolve(), Path(capital.__file__).resolve(), Path(contracts.__file__).resolve(),
-             Path(portfolio_v3.__file__).resolve(), Path(portfolio_target_store_v3.__file__).resolve(),
-             *[p.resolve() for p in modular_spot.source_files()],
-             *[p.resolve() for p in component_source_files()]}
+    paths = {*[p.resolve() for p in portfolio_source_files()], *[p.resolve() for p in component_source_files()]}
     return digest({str(p.relative_to(root)): hashlib.sha256(checked_source(p)).hexdigest() for p in sorted(paths)})
 
 

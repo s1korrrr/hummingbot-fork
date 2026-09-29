@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from controllers.generic import meridian_v3_portfolio, meridian_v3_recipe as recipe, modular_spot
+from controllers.generic import meridian_v3_portfolio, meridian_v3_recipe as recipe
 from controllers.generic.modular_spot import ModularSpotControllerConfig
 from controllers.generic.modular_spot_core.data_reader import DataPolicy
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
@@ -39,11 +39,23 @@ ORDER_QUOTE, ASSET_QUOTE, ENVELOPE_QUOTE = Decimal('20'), Decimal('100'), Decima
 UNREACHABLE_LOSS_FRACTION = Decimal('.99')
 
 
+def source_root():
+    """The image/checkout root owning both `controllers/` and the `hummingbot/` package."""
+    return Path(__file__).resolve().parents[3]
+
+
 def source_files():
-    core = Path(__file__).parent
-    return [Path(__file__).parents[1] / 'meridian_v3_unified.py', *sorted(core.glob('*.py')),
-            Path(recipe.__file__), Path(meridian_v3_portfolio.__file__),
-            *[Path(p) for p in modular_spot.source_files()]]
+    """The one explicit executable source closure sealed by the unified recipe binding.
+
+    The unified controller and its core, plus the portfolio closure (recipe, portfolio_v3
+    contracts and allocation, native grant bridge, native target store and the p23 symbol
+    runtime). Neutral components are added by `source_records` exactly as for every
+    other recipe; this list never widens that legacy component seal.
+    """
+    core = Path(__file__).resolve().parent
+    files = [core.parent / 'meridian_v3_unified.py', *sorted(core.glob('*.py')),
+             *[p.resolve() for p in meridian_v3_portfolio.portfolio_source_files()]]
+    return list(dict.fromkeys(files))
 
 
 _SOURCE_MANIFEST = {}
@@ -190,7 +202,7 @@ class MeridianUnifiedConfig(ControllerConfigBase):
         return P0Policy(version=RECIPE_ID, horizon_ms=60000, pair_priority=self.priority, producers=(PRODUCER,))
 
     def source_manifest(self):
-        return source_records(Path(__file__).parents[2], source_files())
+        return source_records(source_root(), source_files())
 
     def recipe_digest(self):
         return digest({'recipe_id': RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,

@@ -1994,7 +1994,20 @@ class ExecutorOrchestrator:
         if getattr(action, "acquisition_only", False) and callable(stop_acquisition):
             stop_acquisition("external_invalidation")
             return
+        closing = not executor.is_closed and executor.status != RunnableStatus.SHUTTING_DOWN
         executor.early_stop(action.keep_position)
+        if closing:
+            # Logged after the stop so a bad fill or fee record can never abort it. The executor
+            # may override keep_position, and a hold without held orders can still end as EARLY_STOP.
+            try:
+                filled = executor.open_filled_amount
+            except (ValueError, ArithmeticError):
+                filled = "UNAVAILABLE"
+            close_type = getattr(executor, "close_type", None)
+            pending = getattr(close_type, "name", close_type)
+            self.logger().warning(
+                f"Executor stop requested | controller={controller_id} executor={executor_id} "
+                f"keep_position={action.keep_position} filled_base={filled} pending_close_type={pending}")
 
     def _update_positions_from_done_executors(self, *, controller_ids: Optional[Set[str]] = None):
         """

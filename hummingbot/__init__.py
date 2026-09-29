@@ -161,6 +161,9 @@ def init_logging(conf_filename: str,
             for logger in config_dict["loggers"]:
                 if logger in client_config_map.logger_override_whitelist:
                     config_dict["loggers"][logger]["level"] = override_log_level
+        # Headless start re-runs this with the strategy file name. dictConfig's default
+        # would disable every logger created earlier (e.g. controller loggers).
+        config_dict.setdefault("disable_existing_loggers", False)
         logging.config.dictConfig(config_dict)
 
 

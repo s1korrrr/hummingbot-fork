@@ -86,6 +86,25 @@ class DecisionStore:
                 raise PolicyError('invalid campaign reset')
             if previous.risk_paused and not state.risk_paused:
                 raise PolicyError('risk latch cannot be cleared by a decision')
+        return self._replace(expected, payload)
+
+    def retire_unexecuted(self, expected: str, identifier: str) -> bool:
+        """Drop the newest claim when its owner proved no executor exists or can still be created.
+
+        Only the newest claim can be unexecuted: an unreceipted claim holds every later
+        entry. Candle, cycle, entry clock and risk state are unchanged, so the retired
+        setup is never retried; the next entry needs a later signal. A remaining claim
+        keeps the old commitment, which only overstates capital in use.
+        """
+        previous = decode(expected)
+        if not previous.claims or previous.claims[-1] != identifier:
+            raise PolicyError('only the newest claim can be retired as unexecuted')
+        claims = previous.claims[:-1]
+        state = previous.model_copy(update={'claims': claims,
+                                            'committed_quote': previous.committed_quote if claims else Decimal('0')})
+        return self._replace(expected, encode(state))
+
+    def _replace(self, expected, payload):
         try:
             with self.recorder.sql_manager.get_new_session() as session:
                 with session.begin():

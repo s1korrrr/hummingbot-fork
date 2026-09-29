@@ -14,9 +14,10 @@ from unittest import IsolatedAsyncioTestCase
 
 from controllers.generic.meridian_v3_recipe import PAIRS
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
-from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import NATIVE_SNAPSHOT_UNAVAILABLE
 
@@ -352,6 +353,119 @@ class Lifecycle(IsolatedAsyncioTestCase):
             await s.step(mids={BTC: mid})
         await s.lift(BTC)
         self.assertEqual(executor.close_type, CloseType.TRAILING_STOP)
+
+    # ------------------------------------------------------------------ shared-wallet cash contention
+    def foreign_bid(self, s, quote='489'):
+        """Another owner of the physical wallet rests a bid: native cash is reserved, no Meridian row."""
+        return s.session._connector.buy(SOL, D(quote) / D('90'), OrderType.LIMIT, D('90'))
+
+    async def release_foreign(self, s, order_id):
+        s.session._connector.cancel(SOL, order_id)
+        await s.session._connector.drain()  # the venue acknowledges the cancel; the cash is available again
+
+    def claims(self, s, pair):
+        state, _ = s.controller.contexts[pair].runtime.ensure_store().load()
+        return () if state is None else state.claims
+
+    def contend(self, s, *, after_create=False):
+        """Spend the wallet once, just before (or after) the engine executes this step's creates."""
+        orchestrator, spent = s.session.executor_orchestrator, []
+        original = orchestrator.execute_actions
+
+        def execute(actions):
+            creating = any(isinstance(a, CreateExecutorAction) for a in actions)
+            if creating and not after_create and not spent:
+                spent.append(self.foreign_bid(s))
+            result = original(actions)
+            if creating and after_create and not spent:
+                spent.append(self.foreign_bid(s))
+            return result
+        orchestrator.execute_actions = execute
+        return spent
+
+    async def test_insufficient_shared_cash_refuses_entry_and_a_later_signal_enters(self):
+        s = self.scenario()
+        await s.step()
+        foreign = self.foreign_bid(s)
+        self.assertLess(s.session._connector.get_available_balance('USDC'), D('20'))
+        receipt = await s.step(rsi={BTC: rebound()})
+        self.assertEqual(creates(receipt), [])
+        self.assertEqual((s.grants(), self.claims(s, BTC)), ((), ()))  # nothing reserved, nothing consumed
+        await self.release_foreign(s, foreign)
+        receipt = await s.step(rsi={BTC: rebound()})
+        self.assertEqual(len(creates(receipt, BTC)), 1)
+
+    async def test_cash_taken_before_creation_never_pins_the_symbol_or_its_capital(self):
+        s = self.scenario()
+        await s.step()
+        spent = self.contend(s)
+        receipt = await s.step(rsi={BTC: rebound()})
+        [create] = creates(receipt, BTC)  # decided and bound, then the engine refused the create
+        self.assertEqual(s.executors(BTC), [])
+        self.assertNotIn(create.executor_config.id, s.controller.contexts[BTC].runtime.dispatched)
+        [grant] = s.grants()
+        self.assertEqual((grant.status, grant.executor_id), ('BOUND', create.executor_config.id))
+        await s.step(minutes=4)
+        self.assertEqual(self.reason(s, BTC), 'execution_receipt_missing')  # the entry window is still open
+        self.assertEqual(len(s.grants()), 1)
+        await s.step(minutes=2)  # past the 300 s entry window: no executor can be created for that claim
+        self.assertEqual((s.grants(), self.claims(s, BTC)), ((), ()))
+        self.assertNotIn(create.executor_config.id, s.controller.contexts[BTC].runtime.pending)
+        await self.release_foreign(s, spent[0])
+        receipt = await s.step(rsi={BTC: rebound()})
+        [retry] = creates(receipt, BTC)
+        self.assertNotEqual(retry.executor_config.id, create.executor_config.id)
+        self.assertEqual([e.config.id for e in s.executors(BTC)], [retry.executor_config.id])
+
+    async def test_cash_taken_after_creation_ends_the_entry_without_an_order(self):
+        s = self.scenario()
+        await s.step()
+        spent = self.contend(s, after_create=True)
+        receipt = await s.step(rsi={BTC: rebound()})
+        [create] = creates(receipt, BTC)
+        [executor] = s.executors(BTC)
+        self.assertIsNone(executor._open_order)  # funds re-checked at submission: never sent
+        await s.step()
+        self.assertTrue(executor.is_closed)
+        self.assertEqual((executor.open_filled_amount, s.balance('BTC')), (D('0'), D('0')))
+        self.assertEqual(s.grants(), ())
+        await self.release_foreign(s, spent[0])
+        receipt = await s.step(rsi={BTC: rebound()})
+        self.assertEqual(len(creates(receipt, BTC)), 1)
+        self.assertNotEqual(creates(receipt, BTC)[0].executor_config.id, create.executor_config.id)
+
+    async def test_partial_fill_then_refused_entry_conserves_capital(self):
+        s = self.scenario()
+        executor = await self.entered(s, ETH, amount='.05')
+        await s.step(minutes=6)  # the remainder expires; the partial stays managed and reserved
+        await s.step()  # the native cancel acknowledgement is reconciled one step later
+        self.assertTrue(executor._entry_terminal_confirmed())
+        entry = executor._open_order.order
+        fills = list(entry.order_fills.values())
+        self.assertTrue(all(f.fee.percent == 0 and {t.token for t in f.fee.flat_fees} == {'USDC'} for f in fills))
+        spent = entry.executed_amount_quote + sum((t.amount for f in fills for t in f.fee.flat_fees), D('0'))
+        self.assertEqual(D('500') - s.balance('USDC'), spent)
+        [partial] = s.grants()
+        self.assertGreaterEqual(partial.bound_quote, spent)
+        balances = s.balance('USDC'), s.balance('ETH')
+        foreign = self.foreign_bid(s, quote='480')
+        receipt = await s.step(rsi={BTC: rebound()})  # another symbol's entry the wallet cannot fund
+        self.assertEqual(creates(receipt), [])
+        self.assertEqual(s.grants(), (partial,))  # the partial keeps exactly its own reservation
+        self.assertEqual((self.claims(s, ETH), self.claims(s, BTC)), ((executor.config.id,), ()))
+        self.assertEqual((s.balance('USDC'), s.balance('ETH')), balances)
+        portfolio = s.controller.portfolio
+        portfolio.begin_tick()
+        snapshot = portfolio.snapshot(portfolio.now_ms())
+        [eth] = [a for a in snapshot.assets if a.symbol == ETH]
+        self.assertEqual((snapshot.commitments, eth.quantity, eth.basis_quote),
+                         ((), executor.open_filled_amount, entry.executed_amount_quote))  # no unfilled remainder counted
+        self.assertTrue(executor.is_active)
+        self.assertEqual(s.held(ETH), D('0'))
+        await self.release_foreign(s, foreign)
+        receipt = await s.step(rsi={BTC: rebound()})
+        self.assertEqual(len(creates(receipt, BTC)), 1)
+        self.assertEqual({g.symbol for g in s.grants()}, {ETH, BTC})
 
     # ------------------------------------------------------------------ per-symbol freshness
     async def test_stale_symbol_holds_acquisitions_but_never_another_symbols_trailing(self):

@@ -162,6 +162,22 @@ def test_held_release_is_symbol_scoped_and_proven(native):
     assert 'x1' in s.released()
 
 
+def test_unexecuted_release_needs_absent_executor_and_matching_symbol(native):
+    s = store(native)
+    admit(s, 'BTC-USDC', 'ETH-USDC')
+    assert s.bind(executor_id='x1', symbol='BTC-USDC', reserved_quote=20, now_ms=1000, native_executors=())
+    assert s.bind(executor_id='x2', symbol='ETH-USDC', reserved_quote=20, now_ms=1000, native_executors=())
+    with pytest.raises(PolicyError, match='executor exists'):  # a real executor's receipt decides its release
+        s.release_unexecuted(executor_id='x1', symbol='BTC-USDC', native_executors=(executor('x1'),), now_ms=2000)
+    with pytest.raises(PolicyError, match='another symbol'):
+        s.release_unexecuted(executor_id='x1', symbol='ETH-USDC', native_executors=(), now_ms=2000)
+    assert len(s.release_unexecuted(executor_id='x1', symbol='BTC-USDC', native_executors=(), now_ms=2000)) == 1
+    assert [(g.symbol, g.executor_id) for g in s.grants(now_ms=2000, native_executors=())] == [('ETH-USDC', 'x2')]
+    assert s.release_unexecuted(executor_id='x1', symbol='BTC-USDC', native_executors=(), now_ms=2001) == ()
+    with pytest.raises(PolicyError, match='unreserved or reappearing'):  # an executor appearing later holds admission
+        s.grants(now_ms=2002, native_executors=(executor('x1'),))
+
+
 def test_holds_and_missing_capability_create_no_grants(native):
     s = store(native)
     assert admit(s, 'BTC-USDC', capable=False).reasons == ('EXECUTION_CAPABILITY_UNBOUND',)

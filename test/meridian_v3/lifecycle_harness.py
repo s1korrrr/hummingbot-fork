@@ -86,14 +86,14 @@ class Scenario:
         assert not short, f'spot owner persisted an opposite-side held position: {short}'
         return receipt
 
-    async def fill(self, pair, amount='1', *, below='0.02'):
+    async def fill(self, pair, amount='1', *, below='0.02', stale=()):
         """A market SELL print below our resting bid fills our buy (full participation)."""
-        return await self.step(minutes=0, seconds=1, trades=[
+        return await self.step(minutes=0, seconds=1, stale=stale, trades=[
             self.trade(pair, TradeType.SELL, self.mids[pair] - D(below), amount)])
 
-    async def lift(self, pair, amount='1', *, above='0.02'):
+    async def lift(self, pair, amount='1', *, above='0.02', stale=()):
         """A market BUY print above our resting ask fills our sell."""
-        return await self.step(minutes=0, seconds=1, trades=[
+        return await self.step(minutes=0, seconds=1, stale=stale, trades=[
             self.trade(pair, TradeType.BUY, self.mids[pair] + D(above), amount)])
 
     def executors(self, pair=None):

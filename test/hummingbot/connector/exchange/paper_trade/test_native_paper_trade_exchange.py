@@ -277,6 +277,27 @@ class NativePaperTradeTests(IsolatedAsyncioTestCase):
         target.set_order_book(PAIR, 2, 1006, [(99, 1)], [(101, 1)])
         self.assertTrue(target.ready)
 
+    async def test_retained_marks_value_a_stale_book_for_reports_but_never_trade_on_it(self):
+        market = paper()
+        market.tick(1006)
+        self.assertFalse(market.pair_ready(PAIR))
+        with self.assertRaises(ValueError):
+            market.get_price(PAIR, True)
+        with market.retained_marks({PAIR}):
+            self.assertEqual(market.get_price(PAIR, True), D('101'))
+            self.assertEqual(market.get_mid_price(PAIR), D('100'))
+            with self.assertRaises(ValueError):  # orders still require a fresh book
+                market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+            with self.assertRaises(ValueError):
+                await market.process_trade(PAIR, 1, 1006, TradeType.SELL, D('98'), D('1'))
+        with self.assertRaises(ValueError):
+            market.get_price(PAIR, True)
+        market.invalidate_order_book(PAIR)
+        self.assertFalse(market.has_observed_book(PAIR))
+        with self.assertRaises(ValueError):  # a mark is retained, never invented
+            with market.retained_marks({PAIR}):
+                pass
+
     async def test_crossing_limit_reserves_taker_fee_before_async_fill(self):
         market = paper()
         market.set_balance('USDC', D('101.151'))

@@ -344,6 +344,27 @@ class PortfolioGrantStore:
             return removed, {k: v for k, v in grants.items() if k not in removed}, released, consumed
         return self._transact(mutate)
 
+    def release_unexecuted(self, *, executor_id, symbol, native_executors, now_ms):
+        """Release a grant bound to an executor that was never created.
+
+        The owner proves the entry can no longer be created (its entry window closed);
+        this store requires that no native receipt of the executor exists. An executor
+        that later appears is not released here and holds admission for reconciliation.
+        """
+        evidence = evidence_by_id(native_executors)
+        if not isinstance(executor_id, str) or not executor_id:
+            raise PolicyError('release requires an explicit executor id')
+        if executor_id in evidence:
+            raise PolicyError('a native executor exists; its receipt decides the release')
+
+        def mutate(grants, released, consumed):
+            grants = self._reconcile(grants, released, evidence, now_ms)
+            matched = tuple(sorted(k for k, g in grants.items() if g.status == 'BOUND' and g.executor_id == executor_id))
+            if any(grants[k].symbol != symbol for k in matched):
+                raise PolicyError('unexecuted grant belongs to another symbol')
+            return matched, {k: v for k, v in grants.items() if k not in matched}, released, consumed
+        return self._transact(mutate)
+
     def release_held(self, *, symbol, executor_ids, native_executors, now_ms):
         """Release terminal held tranches and bag sells the owner proved flat for this symbol."""
         ids = frozenset(executor_ids)

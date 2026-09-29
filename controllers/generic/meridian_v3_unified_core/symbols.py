@@ -10,9 +10,9 @@ A symbol can bind a grant the portfolio admitted; it cannot create one.
 """
 from decimal import Decimal
 
-from controllers.generic.modular_spot_core.domain import PolicyError
+from controllers.generic.modular_spot_core.domain import PolicyError, decimal
 from controllers.generic.modular_spot_core.native_bindings import NativeBindings
-from controllers.generic.modular_spot_core.runtime import ModularRuntime
+from controllers.generic.modular_spot_core.runtime import ERRORS, ModularRuntime
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 
 
@@ -60,13 +60,43 @@ class SymbolBindings(NativeBindings):
         return None if recorder is None else PairScopedRecorder(recorder, self.owner_id, self.pair)
 
 
+class _SymbolReadiness:
+    """One symbol's view of a native paper provider or connector: `ready` is its own book."""
+
+    def __init__(self, target, ready):
+        self._target, self.ready = target, ready
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
+
+
+class _SymbolController:
+    def __init__(self, controller, ready):
+        self._controller = controller
+        self.market_data_provider = _SymbolReadiness(controller.market_data_provider, ready)
+
+    def __getattr__(self, name):
+        return getattr(self._controller, name)
+
+
 class PaperSymbolBindings(SymbolBindings):
+    """The paper connector's aggregate `ready` requires every injected book to be fresh.
+
+    A live connector's readiness does not track another pair's book age, so a symbol's
+    snapshot is gated on its own paper book only; paper and live then agree that one
+    stale symbol never withholds another symbol's snapshot.
+    """
+
     @staticmethod
     def spot_connector(controller):
         connector = controller.market_data_provider.connectors.get(controller.config.connector_name)
         if not is_native_paper_connector(connector):
             raise PolicyError('Meridian paper requires the exact native paper connector')
-        return connector
+        return _SymbolReadiness(connector, connector.pair_ready(controller.config.trading_pair))
+
+    def snapshot(self, controller):
+        ready = self.spot_connector(controller).ready
+        return super().snapshot(_SymbolController(controller, ready))
 
 
 class SymbolGrantBudget:
@@ -111,6 +141,16 @@ class SymbolGrantBudget:
 
     def released(self):
         return self.portfolio.store().released()
+
+    def release_unexecuted(self, executor_id):
+        """Return a grant whose executor was never created; always a fresh native read."""
+        portfolio = self.portfolio
+        portfolio.begin_tick()
+        try:
+            return portfolio.store().release_unexecuted(executor_id=executor_id, symbol=self.pair,
+                                                        native_executors=portfolio.evidence(), now_ms=portfolio.now_ms())
+        finally:
+            portfolio.begin_tick()
 
     def release_held(self, controller_id, executor_ids, *, native_executors=()):
         if controller_id != self.portfolio.owner.config.id:
@@ -204,6 +244,42 @@ class SymbolRuntime(ModularRuntime):
         finally:
             self.budget.verified = None
 
+    def _decide(self, c):
+        self._retire_unexecuted_entry(c)
+        return super()._decide(c)
+
+    def _retire_unexecuted_entry(self, c):
+        """Free a claim and grant whose entry executor was never created.
+
+        The claim and grant commit before the engine creates the executor, and the engine
+        may still refuse or drop that create (funds, kill switch, invalid reports, a crash).
+        Without this the symbol holds every later entry on the missing receipt and the
+        grant pins envelope capital. The entry window proves the refusal final: past it,
+        permission denies creating that executor, and after a restart it is not pending.
+        """
+        try:
+            store = self.ensure_store()
+            state, raw = store.load()
+            if state is None or not state.claims:
+                return
+            claim = state.claims[-1]
+            now = decimal(self.controller.market_data_provider.time(), 'now')
+            if claim in self.inventory() or now - state.last_entry_time <= c.acquisition.entry_timeout_seconds:
+                return
+            released = self.budget.release_unexecuted(claim)
+            if not store.retire_unexecuted(raw, claim):
+                raise PolicyError('decision CAS conflict; unexecuted claim kept')
+        except (PolicyError, *ERRORS) as exc:
+            # The claim keeps holding this symbol's entries; exits are unaffected.
+            self.controller.logger().warning(f'Meridian {self.controller.pair} unexecuted entry kept: '
+                                             f'{type(exc).__name__}:{exc}')
+            return
+        self.pending.pop(claim, None)
+        self.pending_inputs.pop(claim, None)
+        self.dispatched.discard(claim)
+        self.controller.logger().warning(f'Meridian {self.controller.pair} entry {claim} was never executed; '
+                                         f'claim retired, grants released: {list(released)}')
+
     def _release_bag(self, held, mid, snapshot):
         # An unprovable portfolio release keeps the capital reserved; it never faults exits.
         try:
@@ -213,6 +289,10 @@ class SymbolRuntime(ModularRuntime):
             return 'unproven:portfolio_grant_hold'
 
     def acquisition_permitted(self):
+        held = self.portfolio.owner.entries_held()
+        if held is not None:
+            self.reason = held
+            return False
         if not super().acquisition_permitted():
             return False
         try:

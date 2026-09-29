@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+from contextlib import contextmanager
 from dataclasses import fields
 from decimal import Decimal
 from types import SimpleNamespace
@@ -146,6 +147,7 @@ class NativePaperTradeExchange(ExchangeBase):
         self._execution_started = False
         self._terminal_orders = {}
         self._terminal_recorder = None
+        self._retained_marks = frozenset()
         if type(max_unresolved_orders) is not int or max_unresolved_orders < 1:
             raise ValueError('Positive terminal evidence capacity required')
         self.max_unresolved_orders = max_unresolved_orders
@@ -244,8 +246,31 @@ class NativePaperTradeExchange(ExchangeBase):
         return self._rules[trading_pair].min_base_amount_increment
 
     def get_order_book(self, trading_pair):
+        if trading_pair in self._retained_marks and trading_pair in self._books:
+            return self._books[trading_pair]
         self._require_fresh(trading_pair)
         return self._books[trading_pair]
+
+    def has_observed_book(self, trading_pair):
+        """A last observed book exists (fresh or not); invalidation removes it."""
+        return trading_pair in self._books
+
+    @contextmanager
+    def retained_marks(self, pairs):
+        """Value `pairs` at their last observed book while native reports are built.
+
+        Reporting only, as a live connector reports from its last book: orders, fills and
+        observed-second input still require a fresh book, and the caller must disclose
+        the stale mark. A pair without an observed book is refused, never invented.
+        """
+        pairs = frozenset(pairs)
+        if any(pair not in self._rules or pair not in self._books for pair in pairs):
+            raise ValueError('A retained mark requires an observed paper book')
+        previous, self._retained_marks = self._retained_marks, self._retained_marks | pairs
+        try:
+            yield
+        finally:
+            self._retained_marks = previous
 
     def get_price(self, trading_pair, is_buy):
         book = self.get_order_book(trading_pair)

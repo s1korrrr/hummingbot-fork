@@ -5,6 +5,7 @@ import logging
 import os.path
 import threading
 import time
+from contextlib import contextmanager
 from decimal import Decimal
 from enum import Enum
 from shutil import move
@@ -107,6 +108,8 @@ class MarketsRecorder:
         self._market_data_collection_config: MarketDataCollectionConfigMap = market_data_collection
         self._market_data_collection_task: Optional[asyncio.Task] = None
         self._executor_reads: Optional[Dict[str, Any]] = None
+        self._executor_scope: Optional[Dict[str, Any]] = None
+        self._executor_scope_watched = False
         # Internal collection of trade fills in connector will be used for remote/local history reconciliation
         for market in self._markets:
             trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
@@ -858,7 +861,7 @@ class MarketsRecorder:
             return executors
 
     def get_executors_by_controller(self, controller_id: str = None) -> List[ExecutorInfo]:
-        if self._executor_reads is not None:
+        if self._executor_reads is not None or self._executor_scope is not None:
             # Same rows, in the same table order, as the filtered query.
             return [info for info in self._all_executor_infos() if info.controller_id == controller_id]
         with self._sql_manager.get_new_session() as session:
@@ -893,11 +896,52 @@ class MarketsRecorder:
         sql_event.listen(engine, "commit", boundary)
         sql_event.listen(engine, "rollback", boundary)
 
+    @contextmanager
+    def shared_executor_reads(self):
+        """Serve repeated Executors reads inside one synchronous decision from one query.
+
+        Safe for a live owner: sharing ends with the scope, so a write by any other process
+        is seen by the next scope, and any statement through this engine that writes the
+        Executors table clears the shared rows at once (as `cache_executor_reads` does).
+        The caller must not await inside the scope. Nested scopes share the outermost one;
+        a paper session's process-lifetime cache already serves these reads.
+        """
+        if self._executor_scope is not None or self._executor_reads is not None:
+            yield
+            return
+        self._watch_executor_scope_writes()
+        self._executor_scope = {"rows": None, "pending": False}
+        try:
+            yield
+        finally:
+            self._executor_scope = None
+
+    def _watch_executor_scope_writes(self):
+        if self._executor_scope_watched:
+            return
+
+        def statement(conn, cursor, text, parameters, context, executemany):
+            scope = self._executor_scope
+            head = text.lstrip()[:8].upper()
+            if scope is not None and not head.startswith(("SELECT", "PRAGMA")) and "EXECUTORS" in text.upper():
+                scope["rows"], scope["pending"] = None, True
+
+        def boundary(conn):
+            scope = self._executor_scope
+            if scope is not None and scope["pending"]:
+                scope["rows"], scope["pending"] = None, False
+
+        engine = self._sql_manager.engine
+        sql_event.listen(engine, "before_cursor_execute", statement)
+        sql_event.listen(engine, "commit", boundary)
+        sql_event.listen(engine, "rollback", boundary)
+        self._executor_scope_watched = True
+
     def get_all_executors(self) -> List[ExecutorInfo]:
         return self._all_executor_infos()
 
     def _all_executor_infos(self) -> List[ExecutorInfo]:
-        reads = self._executor_reads
+        reads = self._executor_reads if self._executor_reads is not None else self._executor_scope
         if reads is not None and reads["rows"] is not None:
             return [info.model_copy() for info in reads["rows"]]
         with self._sql_manager.get_new_session() as session:

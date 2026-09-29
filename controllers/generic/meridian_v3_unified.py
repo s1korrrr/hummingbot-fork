@@ -4,9 +4,26 @@ Symbol contexts run the frozen p23 lifecycle (features, bags, trailing exits).
 Only the portfolio admits acquisitions, through native grants in this owner's
 recorder. Exits and held-inventory management never wait for portfolio alpha.
 Live spending additionally requires an explicit exclusive capital-domain binding.
+
+Operator vocabulary. None of these controls sells, liquidates, or demotes a position:
+
+* Entry pause (`set_operator_entry_pause`, `*_pause_entries` commands): no new
+  acquisition; a resting unfilled entry ends at its next permission check. Filled
+  tranches keep trailing, held bags keep their recovery sells.
+* Kill switch (`manual_kill_switch`): the same entry hold, persisted in the config.
+  The V2 script also stops every acquiring BUY executor with `acquisition_only`, so
+  a partial fill keeps its filled part as an active trailing tranche. The owner is
+  not stopped, so its management continues. Clearing the switch resumes entries.
+* Cancel pending entries (`bot_cancel_pending_entries`): one-off `acquisition_only`
+  stop of resting entries; no hold on later entries.
+* Suspend (planned restart, `owner_restart.py`, shutdown): executors persist exactly
+  and resume on start; not a trading control.
+* Demotion to a held bag (`keep_position=True` without `acquisition_only`) is strategy
+  management only (the -3 % bag line, unprovable restart state), never an operator stop.
 """
 import asyncio
 import time
+from contextlib import nullcontext
 
 from controllers.generic.meridian_v3_unified_core.config import PAIRS, RECIPE_ID, MeridianUnifiedConfig, source_files
 from controllers.generic.meridian_v3_unified_core.portfolio import MeridianPortfolio
@@ -14,6 +31,7 @@ from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext, 
 from controllers.generic.modular_spot_core.bag import is_recovery_sell
 from controllers.generic.modular_spot_core.data_reader import attach_pool
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
+from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -27,6 +45,11 @@ __all__ = ['MeridianUnifiedConfig', 'MeridianUnifiedController']
 
 class MeridianUnifiedController(ControllerBase):
     allow_implementation_hot_reload = False
+    # A stale or unavailable symbol holds its own acquisitions (and every new acquisition
+    # while the portfolio cannot mark it); the other symbols' exits and bags keep running.
+    per_symbol_book_freshness = True
+    # The generic kill switch stops and demotes every executor; this owner's stops buying only.
+    kill_switch_stops_acquisition_only = True
 
     @classmethod
     def implementation_source_files(cls):
@@ -66,10 +89,27 @@ class MeridianUnifiedController(ControllerBase):
 
     # ------------------------------------------------------------------ configuration
     def symbol_config(self, pair):
-        """Per-symbol native configuration, rebuilt only when the owner config object changes."""
+        """Per-symbol native configuration, rebuilt only when the owner config object changes.
+
+        The p23 runtime's own kill switch would stop exits too; this owner applies the
+        switch as an entry hold (`entries_held`), so symbols never see it.
+        """
         if self._symbol_source is not self.config:
-            self._symbol_configs, self._symbol_source = self.config.symbol_configs(), self.config
+            configs = self.config.symbol_configs()
+            self._symbol_configs = {p: c.model_copy(update={'manual_kill_switch': False}) for p, c in configs.items()}
+            self._symbol_source = self.config
         return self._symbol_configs[pair]
+
+    def entries_held(self):
+        """Why no symbol may acquire now, or None: the kill switch, then the entry pause."""
+        if self.config.manual_kill_switch:
+            return 'kill_switch_entry_hold'
+        if self.operator_entry_paused:
+            return 'operator_entry_pause'
+        return None
+
+    def _running(self):
+        return self.status == RunnableStatus.RUNNING
 
     def set_operator_entry_pause(self, enabled, *, reason=None, scope=None, command_id=None, updated_at=None):
         """Stop new acquisitions only; positions, bags and exits keep running."""
@@ -131,10 +171,20 @@ class MeridianUnifiedController(ControllerBase):
     def determine_executor_actions(self):
         if self.status != RunnableStatus.RUNNING:
             return []
+        # One synchronous decision over five symbols reads the Executors table about 25 times;
+        # they share one read, cleared by any Executors write (see MarketsRecorder).
+        recorder = NativeBindings.recorder()
+        with nullcontext() if recorder is None else recorder.shared_executor_reads():
+            return self._determine_executor_actions()
+
+    def _determine_executor_actions(self):
         self.portfolio.begin_tick()
         markets = {pair: c.runtime.market for pair, c in self.contexts.items()}
         try:
-            if self.portfolio.check_identity() is None:
+            identity_hold = self.portfolio.check_identity()  # records its own hold status
+            if identity_hold is None and self.config.manual_kill_switch:
+                self.portfolio.status = {'reason': 'kill_switch_entry_hold', 'hold': None}
+            elif identity_hold is None:
                 self.portfolio.evaluate(markets)
             self.fault = None
         except Exception as exc:  # Portfolio failure holds entries only; management continues below.
@@ -166,7 +216,8 @@ class MeridianUnifiedController(ControllerBase):
         if context is None or config.id in context.runtime.dispatched:
             return False
         if is_recovery_sell(config):
-            return super().validate_executor_config(config) and context.runtime.recovery_permission(config)
+            # An exit of held inventory: neither the kill switch nor an entry pause stops it.
+            return self._running() and context.runtime.recovery_permission(config)
         return self.entry_permission(config)
 
     def restart_continuity_executor_class(self, config):
@@ -179,7 +230,8 @@ class MeridianUnifiedController(ControllerBase):
 
     def get_executor_class_for_config(self, config):
         context = self._context(config)
-        if context is None or not super().validate_executor_config(config):
+        allowed = self._running() if is_recovery_sell(config) else super().validate_executor_config(config)
+        if context is None or not allowed:
             raise ValueError('Meridian executor request is outside its symbols or the controller is stopped')
         return context.runtime.executor_class(config)
 

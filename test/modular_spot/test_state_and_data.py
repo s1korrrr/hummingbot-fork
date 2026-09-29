@@ -206,3 +206,19 @@ def test_checkpoint_cannot_clear_risk_latch(store_pair):
     _, raw = a.load()
     with pytest.raises(PolicyError):
         a.compare_and_swap(raw, initial.model_copy(update={'risk_paused': False}))
+
+
+def test_only_the_newest_unexecuted_claim_retires_and_the_entry_clock_stays(store_pair):
+    a, b, _, _ = store_pair
+    state = DecisionState(fingerprint='a' * 64, candle=120, claims=('one', 'two'), committed_quote=D('20'),
+                          last_entry_time=D('7200'))
+    assert a.compare_and_swap(None, state)
+    _, raw = a.load()
+    with pytest.raises(PolicyError):
+        a.retire_unexecuted(raw, 'one')
+    assert a.retire_unexecuted(raw, 'two')
+    assert not b.retire_unexecuted(raw, 'two')  # compare-and-swap: a stale checkpoint cannot retire twice
+    retired, raw = a.load()
+    assert retired == state.model_copy(update={'claims': ('one',)})
+    assert a.retire_unexecuted(raw, 'one')
+    assert a.load()[0] == state.model_copy(update={'claims': (), 'committed_quote': D('0')})

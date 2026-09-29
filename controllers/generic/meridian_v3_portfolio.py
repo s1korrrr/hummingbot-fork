@@ -54,14 +54,19 @@ class BNBMRFeatures(Identified):
 
 
 class BNBMRObservation(Identified):
+    """Features of one closed candle. `candle_open_ms` is the candle's open time and
+    `feature_closed_at_ms` its close, when the features became final; the primary
+    observation's event is that close and its availability is when the owner read it."""
     opportunity: Opportunity
     features: BNBMRFeatures
+    candle_open_ms: int = Field(ge=0, strict=True)
     feature_closed_at_ms: int = Field(ge=0, strict=True)
 
     @model_validator(mode='after')
     def feature_binding(self):
         o = self.opportunity
         if (o.action != 'acquire' or o.setup != 'bnb_p23_mr' or o.primary.content_sha256 != self.features.identity
+                or not self.candle_open_ms < self.feature_closed_at_ms
                 or not o.primary.event_time_ms <= self.feature_closed_at_ms <= o.primary.available_time_ms):
             raise ValueError('confirmed MR feature content and observation binding required')
         return self

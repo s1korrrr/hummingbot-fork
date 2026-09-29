@@ -17,7 +17,7 @@ from hummingbot.strategy_v2.portfolio_v3.contracts import P0Policy
 def observation(o, previous_rsi=28, rsi=30, atr_fraction='.005'):
     features = BNBMRFeatures(previous_rsi=previous_rsi, rsi=rsi, atr_fraction=atr_fraction)
     o = o.model_copy(update={'primary': o.primary.model_copy(update={'content_sha256': features.identity})})
-    return BNBMRObservation(opportunity=o, features=features, feature_closed_at_ms=1000)
+    return BNBMRObservation(opportunity=o, features=features, candle_open_ms=940, feature_closed_at_ms=1000)
 
 
 def composition():

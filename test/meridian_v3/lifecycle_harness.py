@@ -50,8 +50,9 @@ class Scenario:
 
     def feature(self, pair, *, prev, rsi, recent_high=None, atr_fraction='.005', atr_pct='.002'):
         mid = self.mids[pair]
+        # The last closed one-minute candle opened a minute before the owner clock.
         self.features[pair] = MarketFeatures(
-            self.now, mid, D(str(prev)), D(str(rsi)), False, False, atr_fraction=D(atr_fraction),
+            self.now - 60, mid, D(str(prev)), D(str(rsi)), False, False, atr_fraction=D(atr_fraction),
             bag=BagFeatures(D(str(prev)), mid, D('0'), D('0'), D(atr_pct), 'range', D('0'),
                             D(str(recent_high)) if recent_high is not None else mid))
 

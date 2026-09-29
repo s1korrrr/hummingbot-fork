@@ -65,6 +65,7 @@ class MeridianPortfolio:
         self._tick = None  # (evidence, live grants) read once per controller tick
         self.last_target = self.last_admission = None
         self.status = {'reason': 'no_evaluation', 'hold': None}
+        self.clock = {'candles': {}}  # timestamps of the last evaluation, each under its real meaning
 
     # ------------------------------------------------------------------ native owners
     def recorder(self):
@@ -182,26 +183,35 @@ class MeridianPortfolio:
         return tuple(result)
 
     def observation(self, pair, market, runtime, now_ms):
+        """The closed candle's open and close, and when this owner read its features.
+
+        The features are final at the candle close, so that is the observation event;
+        a close after the owner's clock is not a closed candle and fails validation.
+        """
         features = BNBMRFeatures(previous_rsi=market.previous_rsi, rsi=market.rsi, atr_fraction=market.atr_fraction)
-        event_ms = int(market.candle_open) * 1000
+        open_ms = int(market.candle_open) * 1000
+        closed_ms = open_ms + self.owner.symbol_config(pair).interval_seconds() * 1000
         lineage = runtime.input_identity
         if not isinstance(lineage, str):
             raise DataUnavailable('closed candle lineage unavailable')
         ref = ObservationRef(dataset_sha256=identity(['okx', pair, '1m', 'closed', lineage]), epoch='closed_1m',
-                             revision=1, content_sha256=features.identity, event_time_ms=event_ms,
+                             revision=1, content_sha256=features.identity, event_time_ms=closed_ms,
                              available_time_ms=now_ms)
         opportunity = Opportunity(
             scope=DecisionScope(program_id=PORTFOLIO_ID, owner_id=PORTFOLIO_ID, connector='okx', trading_pair=pair,
                                 recipe_sha256=self.recipe.recipe_sha256),
             setup=PRODUCER, action='acquire', primary=ref, created_at_ms=now_ms,
             lifetime_ms=self.owner.config.target_lifetime_ms)
-        return BNBMRObservation(opportunity=opportunity, features=features, feature_closed_at_ms=event_ms)
+        self.clock['candles'][pair] = {'open_ms': open_ms, 'closed_at_ms': closed_ms, 'read_at_ms': now_ms}
+        return BNBMRObservation(opportunity=opportunity, features=features, candle_open_ms=open_ms,
+                                feature_closed_at_ms=closed_ms)
 
     def evaluate(self, markets):
         pairs = self.candidates(markets)
         if not pairs:
             return None
         now_ms = self.now_ms()
+        self.clock = {'decision_cutoff_ms': now_ms, 'candles': {}}
         try:
             snapshot = self.snapshot(now_ms)
             observations = tuple(self.observation(pair, markets[pair], self.owner.contexts[pair].runtime, now_ms)
@@ -239,7 +249,13 @@ class MeridianPortfolio:
 
     # ------------------------------------------------------------------ native snapshot
     def snapshot(self, now_ms):
-        """Attributed fixed-envelope state from native fills, executors, positions and books."""
+        """Attributed fixed-envelope state from native fills, executors, positions and books.
+
+        Books are read from the native connector at the owner clock `now_ms`. The native
+        adapter exposes no venue event time for a book, so each mark's event and
+        availability are that read time, and the clock records the venue book event
+        time as unavailable rather than inventing one.
+        """
         config = self.owner.config
         mandate = self.recipe.mandate
         fee = config.risk.fee_reserve_fraction
@@ -254,6 +270,9 @@ class MeridianPortfolio:
             holds.append(f'{CAPITAL_DOMAIN_UNPROVEN}:{exc}')
         stored = self.target_store().read()
         floor = 0 if stored is None else stored['target']['sequence']
+        book_read_ms = now_ms  # every native book below is read at this owner clock
+        self.clock.update(native_book_read_ms=book_read_ms, venue_book_event_ms=None,
+                          venue_book_event='UNAVAILABLE_FROM_NATIVE_ADAPTER')
         assets, commitments, consumed, wallet = [], [], ZERO, None
         entries = tuple(s.trading_pair for s in config.symbols if s.entry_enabled)
         for pair in mandate.pairs:
@@ -289,7 +308,7 @@ class MeridianPortfolio:
                 symbol=pair, quantity=quantity, basis_quote=basis, net_cash_consumed_quote=projection['cash_used'],
                 mark=mark, bid=book['bid'], ask=book['ask'], lot=book['amount_step'],
                 minimum_quantity=book['minimum_amount'], minimum_notional=book['minimum_notional'],
-                mark_event_ms=now_ms, available_at_ms=now_ms, revision=len(fills) + len(evidence) + 1,
+                mark_event_ms=book_read_ms, available_at_ms=book_read_ms, revision=len(fills) + len(evidence) + 1,
                 sellable_quantity=0, minimum_sell_price=held.breakeven_price if held.amount > 0 else mark,
                 acquisition_allowed=pair in entries, reduction_allowed=False))
         cash_total = max(ZERO, mandate.reference_quote - consumed)
@@ -297,7 +316,7 @@ class MeridianPortfolio:
         return PortfolioSnapshot(
             portfolio_id=PORTFOLIO_ID, account_id=config.account_id, mandate_sha256=mandate.identity,
             source_sha256=self.source_sha256, sequence=max(len(fills) + len(evidence), floor), cutoff_ms=now_ms,
-            native_available_at_ms=now_ms, cash_total_quote=cash_total,
+            native_available_at_ms=book_read_ms, cash_total_quote=cash_total,
             cash_available_quote=min(cash_total, wallet), attributed_nav_quote=cash_total + sum(
                 (a.quantity * a.mark for a in assets), ZERO),
             assets=tuple(assets), commitments=tuple(commitments), entry_universe=entries,

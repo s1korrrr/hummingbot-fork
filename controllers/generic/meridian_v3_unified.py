@@ -199,7 +199,7 @@ class MeridianUnifiedController(ControllerBase):
             'strategy_name': 'Meridian v3 unified', 'recipe_version': RECIPE_ID,
             'execution_mode': self.config.execution_mode, 'execution_enabled': self.config.execution_enabled,
             'operator': self.get_operator_state(), 'portfolio': dict(self.portfolio.status),
-            'fault': self.fault, 'writer_epoch': self.portfolio.epoch,
+            'fault': self.fault, 'writer_epoch': self.portfolio.epoch, 'clock': self.portfolio.clock,
             'limits': {'order_quote_including_fees': '20', 'asset_quote': '100', 'envelope_quote': '500'},
             'capital_scope': ('PAPER_WALLET' if self.config.execution_mode == 'paper'
                               else 'SHARED_WALLET_BOUNDED' if self.config.live_capital else 'CAPITAL_DOMAIN_UNPROVEN'),

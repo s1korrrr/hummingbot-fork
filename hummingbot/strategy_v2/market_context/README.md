@@ -55,3 +55,17 @@ stays outside those seals.
   `InMemoryEventBus` satisfy the worker's notification port. The worker's
   command-line entrypoint currently runs with notification set to `none`
   (consumers poll).
+
+## Consumers and cold start (2026-09-29)
+
+- Meridian v3 binds this package **observe-only** (`market_context.mode: off | observe`,
+  `controllers/generic/meridian_v3_unified_core/market_context.py`). It records the
+  snapshot identity or an UNAVAILABLE/WARMING/STALE state per decision cycle and is never
+  read by a decision; no gating mode exists (config validation refuses one).
+- The API worker now checkpoints retained input revisions in its fenced store and restores
+  them on restart, and can hydrate missing bars once at startup from OKX public history
+  within explicit page/time bounds (`services/screener_core/market_context/history.py`).
+  Hydrated bars are available no earlier than their page receipt; readiness stays WARMING
+  until the window is complete.
+- The API lock is still 771a5fa; see the API README for the requirements check and the
+  placeholder candidate commit.

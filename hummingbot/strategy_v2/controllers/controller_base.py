@@ -9,7 +9,6 @@ from pydantic import ConfigDict, Field, field_validator
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.core.data_type.common import MarketDict, PositionAction, PriceType, TradeType
-from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
@@ -224,14 +223,24 @@ class ControllerBase(RunnableBase):
 
     def start(self):
         """
-        Allow controllers to be restarted after being stopped.
+        Restart a stopped controller after its previous loop finishes cleanup.
+        A pending stop raises RuntimeError; the caller must retry after it drains.
         """
         if self._status != RunnableStatus.RUNNING:
-            self.terminated.clear()
-            self._status = RunnableStatus.RUNNING
+            self._assert_control_loop_stopped()
+            was_ready = self.executors_update_event.is_set()
             self.executors_update_event.set()
-            safe_ensure_future(self.control_loop())
+            try:
+                self._start_control_loop()
+            except BaseException:
+                if not was_ready:
+                    self.executors_update_event.clear()
+                raise
+
+    async def on_start(self):
+        # Reader/feed I/O belongs to the accepted loop and its finalizer.
         self.initialize_candles()
+        await super().on_start()
 
     def initialize_candles(self):
         """

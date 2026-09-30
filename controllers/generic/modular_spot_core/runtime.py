@@ -52,8 +52,9 @@ class ModularRuntime:
             self.pool.start()
 
     def close_data(self):
-        pool, self.pool = self.pool, None
-        return release_pool(self.controller.market_data_provider, pool)
+        task = release_pool(self.controller.market_data_provider, self.pool)
+        self.pool = None
+        return task
 
     def ensure_store(self):
         if self.store is None:

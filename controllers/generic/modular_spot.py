@@ -188,6 +188,8 @@ class ModularSpotController(ControllerBase):
     def __init__(self, config: ModularSpotControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.runtime = ModularRuntime(self, bindings=self._runtime_bindings())
+        self._data_close_task = None
+        self._data_close_error = None
         self._operator_entry_paused = False
         self._operator_state = {'entry_paused': False, 'reason': None, 'scope': None,
                                 'updated_at': None, 'last_command_id': None}
@@ -208,27 +210,61 @@ class ModularSpotController(ControllerBase):
         return dict(self._operator_state)
 
     def start(self):
-        if self.config.data.mode == 'shared' and self.runtime.pool is None:
-            self.runtime.pool = attach_pool(self.market_data_provider, self.config)
-        super().start()
+        if self.status != RunnableStatus.RUNNING:
+            self._assert_control_loop_stopped()
+            task = getattr(self, '_data_close_task', None)
+            if task is not None and not task.done():
+                raise RuntimeError('Modular candle reader is still stopping; retry after it finishes')
+            error = getattr(self, '_data_close_error', None)
+            if error is None and task is not None:
+                error = RuntimeError('reader cleanup was cancelled') if task.cancelled() else task.exception()
+            if error is not None:
+                raise RuntimeError('Modular candle reader cleanup failed; process restart required') from error
+            self._data_close_task = None
+            if self.config.data.mode == 'shared' and self.runtime.pool is None:
+                self.runtime.pool = attach_pool(self.market_data_provider, self.config)
+        try:
+            super().start()
+        except BaseException:
+            self._close_data()
+            raise
+
+    def _close_data(self):
+        try:
+            task = self.runtime.close_data()
+        except BaseException as error:
+            self._data_close_error = error
+            self.logger().error('Modular candle reader release failed: %s', error)
+            raise
+        if task is not None:
+            self._data_close_task = task
+            task.add_done_callback(self._data_closed)
+        return getattr(self, '_data_close_task', None)
 
     def stop(self):
         super().stop()
-        task = self.runtime.close_data()
-        if task is not None:
-            task.add_done_callback(self._data_closed)
+        self._close_data()
 
     async def control_loop(self):
         try:
             await super().control_loop()
         finally:
-            task = self.runtime.close_data()
+            task = self._close_data()
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
 
+    def _control_loop_finished(self, task):
+        try:
+            if task is self._control_loop_task:
+                self._close_data()
+        finally:
+            super()._control_loop_finished(task)
+
     def _data_closed(self, task):
-        if not task.cancelled() and task.exception() is not None:
-            self.logger().error('Modular candle reader did not close cleanly: %s', task.exception())
+        error = RuntimeError('reader cleanup was cancelled') if task.cancelled() else task.exception()
+        if error is not None:
+            self._data_close_error = error
+            self.logger().error('Modular candle reader did not close cleanly: %s', error)
 
     def get_candles_config(self):
         if self.config.data.mode == 'shared':

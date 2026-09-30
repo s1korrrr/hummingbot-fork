@@ -816,6 +816,13 @@ class StrategyV2Base(StrategyPyBase):
             pending.setdefault((controller_id, executor_id), set()).add(reason)
 
         orchestrator = getattr(self, "executor_orchestrator", None)
+        if getattr(orchestrator, '_resume_preflight_failed', False) is True:
+            complete_view = False
+        claims = getattr(orchestrator, '_claimed_resume_unresolved', {})
+        if isinstance(claims, dict):
+            for controller_id, unresolved in claims.items():
+                for executor_id in unresolved:
+                    add(controller_id, executor_id, 'unfinished_position_resume_claim')
         recovery = getattr(orchestrator, "recovery_required", None)
         active = getattr(orchestrator, "active_executors", None)
         if isinstance(recovery, dict):
@@ -872,6 +879,14 @@ class StrategyV2Base(StrategyPyBase):
         return {"schema_version": 1,
                 "observed_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
                 "pairs": pairs, "reconciliation": self._runtime_reconciliation_observation()}
+
+    def _runtime_position_resume_observation(self) -> Dict[str, Any]:
+        orchestrator = getattr(self, 'executor_orchestrator', None)
+        claims = getattr(orchestrator, '_claimed_resume_unresolved', {})
+        scopes = sorted(claims) if isinstance(claims, dict) else []
+        return {'ownership_transfer_pending': getattr(orchestrator, '_planned_resume_pending', False) is True,
+                'preflight_failed': getattr(orchestrator, '_resume_preflight_failed', False) is True,
+                'unfinished_claim_controllers': scopes}
 
     def _build_runtime_status_snapshot(self) -> Dict[str, Any]:
         from hummingbot.strategy.native_observability import (
@@ -971,6 +986,7 @@ class StrategyV2Base(StrategyPyBase):
             "bot_name": self._runtime_status_snapshot_bot_name(),
             "unattended_restart_hold": self._unattended_restart_hold,
             "controller_reports_valid": self._controller_reports_valid,
+            "position_resume_recovery": self._runtime_position_resume_observation(),
             "updated_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
             "operations": self._build_runtime_operations_snapshot(),
             "active_orders_count": active_orders_count,
@@ -1006,6 +1022,10 @@ class StrategyV2Base(StrategyPyBase):
         lines = []
         if self._unattended_restart_hold:
             lines.append("V2 UNATTENDED RESTART HOLD: BUY/SELL and executor recovery remain blocked.")
+        resume = self._runtime_position_resume_observation()
+        if resume['preflight_failed'] or resume['unfinished_claim_controllers']:
+            lines.append('POSITION OWNERSHIP RECONCILIATION REQUIRED: unfinished resume claims are reported.')
+            lines.append('Orders are never fenced; other executors keep trading.')
         if self._controller_restart_required:
             lines.append("RESTART REQUIRED: new executors blocked.")
             lines.append("Controllers: " + ', '.join(sorted(self._controller_restart_required)))

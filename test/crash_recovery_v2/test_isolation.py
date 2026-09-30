@@ -17,7 +17,10 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     from hummingbot.strategy_v2.components.recipe_contract import source_records
     rows = source_records(source_root(), source_files())
     assert not any(name.endswith(('market_stress_v1.py', 'recovery_evidence_v1.py')) for name, _ in rows)
-    assert source_digest(source_root(), source_files()) == '14e76708f297834597beaa7b7eb38b89aa00e5ce1f781b01a406a8264c625224'  # noqa: documentation
+    # Intentional funding purity/runtime-preparation changes are resealed in
+    # docs/controllers/modular_spot/RELEASE_AUDIT_20260930.md. Crash policy
+    # additions must remain outside this native source closure.
+    assert source_digest(source_root(), source_files()) == '3655f2a430c809ec56fe76fb8cb33ea53585efb8af64aff2d68fe73af7ce9379'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

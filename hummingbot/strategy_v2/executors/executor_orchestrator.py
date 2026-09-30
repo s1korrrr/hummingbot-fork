@@ -18,7 +18,7 @@ from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount, base_fee_quote_amount
-from hummingbot.strategy_v2.executors.planned_position_resume import claim, pending_manifest
+from hummingbot.strategy_v2.executors.planned_position_resume import STARTUP_SEALED_RESTORE, claim, pending_manifest
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.executors.restart_continuity import (
     RestartContinuityError,
@@ -287,10 +287,12 @@ class ExecutorOrchestrator:
         self._non_hold_order_ids: Set[Tuple[str, str, str]] = set()
         self._non_hold_fill_ids: Set[Tuple[str, str, str, str]] = set()
         self.recovery_required: Dict[str, List[str]] = {}
+        self._claimed_resume_unresolved: Dict[str, Dict[str, Tuple[str, str]]] = {}
         self._resume_owned_order_keys = set()
         self._resume_position_scopes = set()
         self._planned_resume_pending = False
         self._planned_resume_failure = None
+        self._resume_preflight_failed = False
         self._restored_pending_bind = []
         self.initial_positions_by_controller = initial_positions_by_controller or {}
         self._initialize_cached_performance()
@@ -316,8 +318,10 @@ class ExecutorOrchestrator:
             resumed = self._claim_planned_positions(markets_recorder)
         except Exception as error:
             # A stale or inconsistent manifest never blocks trading: its positions
-            # stay in the held ledger and the manifest remains for inspection.
+            # stay in the held ledger, the manifest remains for inspection and the
+            # failure is reported through the runtime status snapshot.
             self._planned_resume_failure = f"{type(error).__name__}: {error}"
+            self._resume_preflight_failed = True
             self.logger().exception(f"Planned position manifest not claimed; held ledger retained: {error}")
             resumed = set()
         db_executors = markets_recorder.get_all_executors()
@@ -326,6 +330,8 @@ class ExecutorOrchestrator:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
                 if not executor.is_done:
+                    self._record_unfinished_claim(controller_id, executor.id, executor.config,
+                                                  (executor.custom_info or {}).get('planned_position_resume'))
                     self.recovery_required.setdefault(controller_id, []).append(executor.id)
                     self.logger().error(
                         f"Startup reconciliation required | controller={controller_id} executor={executor.id} "
@@ -356,6 +362,8 @@ class ExecutorOrchestrator:
                     self._restored_pending_bind = restored_executors
                     continue
             if not executor.is_done:
+                self._record_unfinished_claim(controller_id, executor.id, executor.config,
+                                              (executor.custom_info or {}).get('planned_position_resume'))
                 # A position executor restart continuity could not rebuild: its order
                 # ownership is unproven, so never rebuild its fills into held bags
                 # (a still-live exit could otherwise sell the same base twice).
@@ -457,8 +465,10 @@ class ExecutorOrchestrator:
         try:
             return pending_manifest(db_path) is not None
         except Exception as error:
-            # Manifest history problems are reported; they never stop the owner from booting.
-            self.logger().error(f"Planned position manifest history unreadable; ignored at boot: {error}")
+            self._resume_preflight_failed = True
+            self._planned_resume_failure = f'{type(error).__name__}: {error}'
+            # Manifest history problems are reported; they never stop the owner from booting or trading.
+            self.logger().error(f'Planned position manifest history unreadable; reported, trading continues: {error}')
             return False
 
     def _has_continuity_candidates(self, recorder) -> bool:
@@ -600,8 +610,6 @@ class ExecutorOrchestrator:
     def resume_planned_positions_if_ready(self):
         if not self._planned_resume_pending:
             return True
-        if self._planned_resume_failure is not None:
-            return False
         if not self.strategy.ready_to_trade or not self.strategy.market_data_provider.ready:
             return False
         try:
@@ -611,18 +619,46 @@ class ExecutorOrchestrator:
             for controller_id, executors in self.active_executors.items():
                 for executor in executors:
                     executor.stop()
+                    self._record_unfinished_claim(controller_id, executor.config.id, executor.config,
+                                                  getattr(executor, '_planned_resume_id', None))
                     unresolved = self.recovery_required.setdefault(controller_id, [])
                     if executor.config.id not in unresolved:
                         unresolved.append(executor.config.id)
                 # The claim already persisted unfinished ownership. Quiesced
                 # objects must never overwrite that row as a completed exit.
                 executors.clear()
+            # A claim can commit before an exception prevents the corresponding
+            # object from reaching active_executors. Read the durable ownership
+            # markers as well as the objects we managed to construct.
+            try:
+                for info in MarketsRecorder.get_instance().get_all_executors():
+                    if not info.is_done:
+                        self._record_unfinished_claim(info.controller_id, info.id, info.config,
+                                                      (info.custom_info or {}).get('planned_position_resume'))
+            except Exception:
+                self._resume_preflight_failed = True
+                self.logger().exception('Unfinished claim inspection failed; reported, trading continues')
             self._bind_restored_after_failure()
-            self.logger().exception("Startup position restore failed; unresolved rows reported, trading continues")
+            self.logger().exception('Startup position restore failed; unfinished claims reported for '
+                                    'reconciliation; trading continues')
             self._planned_resume_pending = False
             return True
         self._planned_resume_pending = False
         return True
+
+    def _record_unfinished_claim(self, controller_id, executor_id, config, reference):
+        # A consumed claim is durable ownership, including across the next boot,
+        # so it stays visible for reconciliation. It is reported, never an order
+        # fence. Historical completed claims and the legacy V1 marker are not tracked.
+        if reference is not None and reference != STARTUP_SEALED_RESTORE:
+            if (not isinstance(controller_id, str) or not controller_id
+                    or not isinstance(getattr(config, 'connector_name', None), str)
+                    or not isinstance(getattr(config, 'trading_pair', None), str)):
+                self._resume_preflight_failed = True
+                self._planned_resume_failure = 'Unfinished claim has unavailable controller/market identity'
+                return
+            self._claimed_resume_unresolved.setdefault(controller_id, {})[executor_id] = (
+                config.connector_name, config.trading_pair)
 
     def _claim_planned_positions(self, recorder):
         db_path = getattr(getattr(recorder, "sql_manager", None), "db_path", None)

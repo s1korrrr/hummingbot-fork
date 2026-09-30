@@ -37,8 +37,14 @@ def _native_lifecycle():
 
 def _overlay():
     controller = host_controller()
+    from test.modular_spot.test_native_lifecycle import config
+    native_owner_config = config()
 
     class Overlay:
+        # A gate overlay preserves the native execution owner's configuration.
+        # It only substitutes entry admission, never the protective exit floor.
+        config = native_owner_config
+
         def entry_permission(self, config, check_funds=True):
             return controller.entry_permission(config, check_funds=check_funds)
 

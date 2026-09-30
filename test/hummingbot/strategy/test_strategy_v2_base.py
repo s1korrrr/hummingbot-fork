@@ -8,7 +8,7 @@ from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from types import SimpleNamespace
 from typing import List
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pandas as pd
 
@@ -17,11 +17,12 @@ from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import Quant
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
 from hummingbot.core.clock import Clock
 from hummingbot.core.clock_mode import ClockMode
-from hummingbot.core.data_type.common import PositionMode, TradeType
+from hummingbot.core.data_type.common import PositionAction, PositionMode, TradeType
 from hummingbot.core.event.events import OrderType
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
+from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
@@ -112,6 +113,56 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
                 self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
         sell.assert_not_called()
+
+    def unfinished_claim_orchestrator(self):
+        # A real orchestrator instance, so any admission guard it defines is consulted.
+        from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+        orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)
+        orchestrator.strategy = self.strategy
+        orchestrator._planned_resume_pending = False
+        orchestrator._resume_preflight_failed = False
+        orchestrator._claimed_resume_unresolved = {'controller_1': {'failed-entry': (self.connector_name, self.trading_pair)}}
+        orchestrator.active_executors = {'controller_1': []}
+        orchestrator.recovery_required = {'controller_1': ['failed-entry']}
+        orchestrator.execute_actions = MagicMock()
+        self.strategy.executor_orchestrator = orchestrator
+        return orchestrator
+
+    def test_unfinished_claim_and_failed_preflight_never_fence_orders(self):
+        # "We never want to block orders": an unfinished resume claim is reported,
+        # while direct and executor BUY/SELL on the same pair keep trading.
+        from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+        orchestrator = self.unfinished_claim_orchestrator()
+        config = OrderExecutorConfig(id='held-exit', controller_id='controller_1', timestamp=1,
+                                     connector_name=self.connector_name, trading_pair=self.trading_pair,
+                                     side=TradeType.SELL, amount=Decimal('1'), price=Decimal('1'),
+                                     execution_strategy=ExecutionStrategy.LIMIT, position_action=PositionAction.CLOSE)
+        executor = ExecutorBase(self.strategy, [self.connector_name], config)
+        for preflight_failed in (False, True):
+            orchestrator._resume_preflight_failed = preflight_failed
+            with self.subTest(preflight_failed=preflight_failed), \
+                    patch.object(self.strategy, 'buy_with_specific_market', return_value='buy') as buy, \
+                    patch.object(self.strategy, 'sell_with_specific_market', return_value='sell') as sell:
+                self.assertEqual(self.strategy.buy(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT), 'buy')
+                self.assertEqual(self.strategy.sell(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT), 'sell')
+                self.assertEqual(executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                                      TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE), 'sell')
+                self.assertEqual(executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                                      TradeType.BUY, Decimal('1')), 'buy')
+                self.assertEqual(buy.call_count, 2)
+                self.assertEqual(sell.call_count, 2)
+
+    def test_unfinished_claim_and_failed_preflight_are_visible_in_native_status(self):
+        orchestrator = self.unfinished_claim_orchestrator()
+        observation = self.strategy._runtime_position_resume_observation()
+        self.assertEqual(observation['unfinished_claim_controllers'], ['controller_1'])
+        status = self.strategy.format_status()
+        self.assertIn('POSITION OWNERSHIP RECONCILIATION REQUIRED', status)
+        self.assertIn('Orders are never fenced', status)
+        orchestrator._resume_preflight_failed = True
+        observation = self.strategy._runtime_position_resume_observation()
+        self.assertTrue(observation['preflight_failed'])
+        self.assertIsNone(self.strategy._runtime_reconciliation_observation()['pending_count'])
 
     def test_unattended_v2_restart_hold_blocks_direct_buy_and_sell(self):
         self.strategy._unattended_restart_hold = True
@@ -519,6 +570,25 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         except asyncio.CancelledError:
             pass
         self.strategy.executor_orchestrator.execute_actions.assert_called_once_with([stop])
+
+    async def test_unfinished_claim_never_skips_queued_creates(self):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+        create = CreateExecutorAction(controller_id='controller_1', executor_config=self.get_position_config_market_short())
+        stop = StopExecutorAction(controller_id='controller_1', executor_id='proven-entry', keep_position=True)
+        self.unfinished_claim_orchestrator()._resume_preflight_failed = True
+        self.strategy.update_executors_info = MagicMock()
+        self.strategy.validate_create_action = MagicMock(return_value=True)
+        self.strategy._is_stop_triggered = False
+        self.strategy._controller_reports_valid = True
+        self.strategy.controllers['controller_1'] = MagicMock(status=RunnableStatus.RUNNING)
+        self.strategy.controllers['controller_1'].config.manual_kill_switch = False
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+        self.assertEqual(self.strategy.executor_orchestrator.execute_actions.call_args_list, [call([create]), call([stop])])
 
     def create_mock_executor_config(self):
         return MagicMock(

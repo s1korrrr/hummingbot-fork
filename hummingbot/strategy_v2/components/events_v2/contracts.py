@@ -2,7 +2,7 @@
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import Field, StrictBool, StrictInt, model_validator
+from pydantic import Field, StrictBool, StrictInt, model_serializer, model_validator
 
 from hummingbot.strategy_v2.components.config import PolicyModel
 
@@ -153,7 +153,8 @@ class SnapshotBindingV2(PolicyModel):
 
 
 class QualifiedEventSnapshotV2(PolicyModel):
-    schema: Literal['cross_venue_event.snapshot.v2'] = 'cross_venue_event.snapshot.v2'
+    schema_id: Literal['cross_venue_event.snapshot.v2'] = Field(
+        default='cross_venue_event.snapshot.v2', alias='schema')
     asof_ms: StrictInt
     sequence: int = Field(ge=1, le=1_000_000, strict=True)
     generation: int = Field(ge=1, le=1_000_000, strict=True)
@@ -166,6 +167,16 @@ class QualifiedEventSnapshotV2(PolicyModel):
     management_universe: tuple[str, ...] = Field(default=(), max_length=10_000)
     binding: SnapshotBindingV2
     execution_allowed: Literal[False] = False
+
+    @property
+    def schema(self) -> str:
+        return self.schema_id
+
+    # Pydantic 2.0-2.10 omit aliases by default, including in nested dumps.
+    @model_serializer(mode='wrap')
+    def canonical_wire_keys(self, handler):
+        payload = handler(self)
+        return {('schema' if key == 'schema_id' else key): value for key, value in payload.items()}
 
     @model_validator(mode='after')
     def causal_snapshot(self):

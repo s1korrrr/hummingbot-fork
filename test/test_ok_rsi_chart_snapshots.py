@@ -88,10 +88,13 @@ def test_tick_continues_executor_decisions_when_chart_persistence_fails():
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
     owner = SimpleNamespace(
         controllers={'a': object()}, update_executors_info=Mock(),
+        _unattended_restart_hold=False,
         _sync_runtime_state_to_db_if_due=Mock(), _write_chart_snapshots_if_due=Mock(side_effect=RuntimeError('disk full')),
         _write_runtime_status_snapshot_if_due=Mock(), update_controllers_configs=Mock(),
         market_data_provider=SimpleNamespace(ready=True), _is_stop_triggered=False,
-        determine_executor_actions=Mock(return_value=['risk-action']), executor_orchestrator=Mock(), logger=Mock())
+        determine_executor_actions=Mock(return_value=['risk-action']),
+        executor_orchestrator=SimpleNamespace(resume_planned_positions_if_ready=Mock(return_value=True),
+                                              execute_action=Mock()), logger=Mock())
     StrategyV2Base.on_tick(owner)
     owner.executor_orchestrator.execute_action.assert_called_once_with('risk-action')
     owner.logger().exception.assert_called_once()

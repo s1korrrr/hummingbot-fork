@@ -24,6 +24,7 @@ on:
       - 'compile'
       - '.github/actions/install_env_and_hb/**'
       - 'hummingbot/data_feed/candles_feed/**'
+      - 'hummingbot/data_feed/market_context_client.py'
       - 'scripts/v2_with_controllers.py'
       - 'services/okx-candle-service/**'
       - 'test/**'
@@ -109,6 +110,9 @@ jobs:
             test/hummingbot/strategy_v2/executors/test_wallet_sale_accounting.py \
             test/hummingbot/data_feed/candles_feed/okx_spot_candles \
             test/hummingbot/data_feed/candles_feed/test_candles_base.py \
+            test/hummingbot/data_feed/test_market_context_client.py \
+            test/hummingbot/strategy_v2/components/test_market_context_*.py \
+            test/hummingbot/strategy_v2/market_context \
             test/test_ok_rsi_controller.py \
             test/test_ok_rsi_candle_aggregation.py \
             test/test_ok_rsi_sell_policy.py \

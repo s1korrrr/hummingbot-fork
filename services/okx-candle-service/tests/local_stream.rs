@@ -19,7 +19,7 @@ async fn authenticated_snapshot_delta_status_heartbeat_and_shutdown() {
     let token = "0123456789abcdef0123456789abcdef";
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = server::router(state.clone(), token.into(), stop.clone());
+    let app = server::router(state.clone(), token.into(), stop.clone(), None);
     let stop_server = stop.clone();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -47,6 +47,47 @@ async fn authenticated_snapshot_delta_status_heartbeat_and_shutdown() {
             .status(),
         200
     );
+    let disabled: Value = client
+        .get(format!(
+            "http://{addr}/v2/market-picture/history?pair=BTC-USDC&interval=1m"
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        disabled["schema_version"],
+        "market-picture.source-history.v1"
+    );
+    assert_eq!(disabled["encoding"], "ohlcv-tuples.v1");
+    assert_eq!(disabled["ready"], false);
+    assert_eq!(disabled["reason"], "projection_disabled");
+    assert_eq!(disabled["bars"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        client
+            .get(format!(
+                "http://{addr}/v2/market-picture/history?pair=BTC-USDC&interval=10m"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let origin_response = client
+        .get(format!(
+            "http://{addr}/v2/market-picture/history?pair=BTC-USDC&interval=1m"
+        ))
+        .bearer_auth(token)
+        .header("origin", "https://example.invalid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(origin_response.status(), 401);
     assert!(
         connect_async(format!("ws://{addr}/v1/stream"))
             .await

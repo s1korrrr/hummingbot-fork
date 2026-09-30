@@ -17,7 +17,7 @@ from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import Quant
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
 from hummingbot.core.clock import Clock
 from hummingbot.core.clock_mode import ClockMode
-from hummingbot.core.data_type.common import PositionMode, TradeType
+from hummingbot.core.data_type.common import PositionAction, PositionMode, TradeType
 from hummingbot.core.event.events import OrderType
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
@@ -112,6 +112,155 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
                 self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
         sell.assert_not_called()
+
+    def claimed_resume_orchestrator(self):
+        from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+        orchestrator = SimpleNamespace(
+            strategy=self.strategy, _planned_resume_pending=False,
+            _resume_preflight_failed=False,
+            _claimed_resume_unresolved={'controller_1': {'failed-entry': (self.connector_name, self.trading_pair)}},
+            active_executors={'controller_1': []})
+        orchestrator.claimed_resume_order_allowed = types.MethodType(
+            ExecutorOrchestrator.claimed_resume_order_allowed, orchestrator)
+        self.strategy.executor_orchestrator = orchestrator
+        return orchestrator
+
+    def test_failed_claim_blocks_direct_buy_and_unowned_sell(self):
+        self.claimed_resume_orchestrator()
+        with patch.object(self.strategy, 'buy_with_specific_market') as buy, \
+                patch.object(self.strategy, 'sell_with_specific_market') as sell:
+            for method in (self.strategy.buy, self.strategy.sell):
+                with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+                    method(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT)
+        buy.assert_not_called()
+        sell.assert_not_called()
+
+    def test_registered_executor_cannot_sell_open_or_unspecified_action_during_quarantine(self):
+        from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+        orchestrator = self.claimed_resume_orchestrator()
+        config = PositionExecutorConfig(id='proven-entry', controller_id='controller_1', timestamp=1,
+                                        connector_name=self.connector_name, trading_pair=self.trading_pair,
+                                        side=TradeType.BUY, amount=Decimal('1'), entry_price=Decimal('1'))
+        executor = ExecutorBase(self.strategy, [self.connector_name], config)
+        orchestrator.active_executors['controller_1'] = [executor]
+        with patch.object(self.strategy, 'sell_with_specific_market') as sell:
+            for action in (PositionAction.OPEN, PositionAction.NIL):
+                with self.subTest(action=action):
+                    with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+                        executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                             TradeType.SELL, Decimal('1'), position_action=action)
+            executor.config.side = TradeType.SELL
+            with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+                executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                     TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE)
+        sell.assert_not_called()
+
+    def test_protective_close_permission_cannot_be_reused_by_synchronous_callback(self):
+        from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+        orchestrator = self.claimed_resume_orchestrator()
+        config = PositionExecutorConfig(id='proven-entry', controller_id='controller_1', timestamp=1,
+                                        connector_name=self.connector_name, trading_pair=self.trading_pair,
+                                        side=TradeType.BUY, amount=Decimal('1'), entry_price=Decimal('1'))
+        executor = ExecutorBase(self.strategy, [self.connector_name], config)
+        orchestrator.active_executors['controller_1'] = [executor]
+
+        def connector_sell(*args, **kwargs):
+            with patch.object(self.strategy, 'sell_with_specific_market') as nested_sell:
+                with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+                    self.strategy.sell(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT,
+                                       position_action=PositionAction.CLOSE)
+            nested_sell.assert_not_called()
+            return 'protective-exit'
+
+        with patch.object(self.strategy, 'sell_with_specific_market', side_effect=connector_sell) as sell:
+            self.assertEqual(executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                                  TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE),
+                             'protective-exit')
+        sell.assert_called_once()
+
+    def test_failed_claim_allows_only_registered_executor_protective_sell_and_resets_context(self):
+        from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+        orchestrator = self.claimed_resume_orchestrator()
+        config = PositionExecutorConfig(id='proven-entry', controller_id='controller_1', timestamp=1,
+                                        connector_name=self.connector_name, trading_pair=self.trading_pair,
+                                        side=TradeType.BUY, amount=Decimal('1'), entry_price=Decimal('1'))
+        executor = ExecutorBase(self.strategy, [self.connector_name], config)
+        orchestrator.active_executors['controller_1'] = [executor]
+        with patch.object(self.strategy, 'sell_with_specific_market', return_value='protective-exit') as sell:
+            result = executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                          TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE)
+        self.assertEqual(result, 'protective-exit')
+        sell.assert_called_once()
+        with patch.object(self.strategy, 'sell_with_specific_market', side_effect=ValueError('venue rejection')):
+            with self.assertRaisesRegex(ValueError, 'venue rejection'):
+                executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                     TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE)
+        with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+            self.strategy.sell(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT, position_action=PositionAction.CLOSE)
+        with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+            executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                 TradeType.BUY, Decimal('1'))
+        orchestrator.active_executors['controller_1'] = []
+        with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+            executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                 TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE)
+
+    def test_terminated_executor_retained_in_active_list_cannot_place_protective_sell(self):
+        from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+        orchestrator = self.claimed_resume_orchestrator()
+        config = PositionExecutorConfig(id='proven-entry', controller_id='controller_1', timestamp=1,
+                                        connector_name=self.connector_name, trading_pair=self.trading_pair,
+                                        side=TradeType.BUY, amount=Decimal('1'), entry_price=Decimal('1'))
+        executor = ExecutorBase(self.strategy, [self.connector_name], config)
+        orchestrator.active_executors['controller_1'] = [executor]
+        executor._status = RunnableStatus.SHUTTING_DOWN
+        with patch.object(self.strategy, 'sell_with_specific_market', return_value='protective-exit') as sell:
+            self.assertEqual(executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                                  TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE), 'protective-exit')
+        sell.assert_called_once()
+        executor.stop()
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertIs(orchestrator.active_executors['controller_1'][0], executor)
+        with patch.object(self.strategy, 'sell_with_specific_market') as sell:
+            with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+                executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                     TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE)
+        sell.assert_not_called()
+
+    async def test_connector_child_task_cannot_reuse_protective_order_context(self):
+        from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+        orchestrator = self.claimed_resume_orchestrator()
+        config = PositionExecutorConfig(id='proven-entry', controller_id='controller_1', timestamp=1,
+                                        connector_name=self.connector_name, trading_pair=self.trading_pair,
+                                        side=TradeType.BUY, amount=Decimal('1'), entry_price=Decimal('1'))
+        executor = ExecutorBase(self.strategy, [self.connector_name], config)
+        orchestrator.active_executors['controller_1'] = [executor]
+        child = None
+
+        async def inherited_context_sell():
+            with self.assertRaisesRegex(RuntimeError, 'claimed.*reconciliation'):
+                self.strategy.sell(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT, position_action=PositionAction.CLOSE)
+
+        def connector_sell(*args, **kwargs):
+            nonlocal child
+            child = asyncio.create_task(inherited_context_sell())
+            return 'protective-exit'
+
+        with patch.object(self.strategy, 'sell_with_specific_market', side_effect=connector_sell) as sell:
+            self.assertEqual(executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                                  TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE), 'protective-exit')
+            await child
+        sell.assert_called_once()
+
+    def test_resume_quarantine_and_failed_preflight_are_visible_in_native_status(self):
+        orchestrator = self.claimed_resume_orchestrator()
+        observation = self.strategy._runtime_position_resume_observation()
+        self.assertEqual(observation['quarantined_controllers'], ['controller_1'])
+        self.assertIn('POSITION OWNERSHIP RECONCILIATION REQUIRED', self.strategy.format_status())
+        orchestrator._resume_preflight_failed = True
+        observation = self.strategy._runtime_position_resume_observation()
+        self.assertTrue(observation['preflight_failed'])
+        self.assertIsNone(self.strategy._runtime_reconciliation_observation()['pending_count'])
 
     def test_unattended_v2_restart_hold_blocks_direct_buy_and_sell(self):
         self.strategy._unattended_restart_hold = True
@@ -512,6 +661,20 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         create = CreateExecutorAction(controller_id='controller_1', executor_config=self.get_position_config_market_short())
         stop = StopExecutorAction(controller_id='controller_1', executor_id='existing', keep_position=True)
         self.strategy._controller_restart_required = {'controller_1': 'source changed'}
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+        self.strategy.executor_orchestrator.execute_actions.assert_called_once_with([stop])
+
+    async def test_failed_claim_skips_queued_creates_but_preserves_management_actions(self):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+        create = CreateExecutorAction(controller_id='controller_1', executor_config=self.get_position_config_market_short())
+        stop = StopExecutorAction(controller_id='controller_1', executor_id='proven-entry', keep_position=True)
+        self.strategy.executor_orchestrator._planned_resume_pending = False
+        self.strategy.executor_orchestrator.claimed_resume_controller_blocked.return_value = True
         self.strategy.actions_queue = MagicMock()
         self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
         try:

@@ -272,7 +272,7 @@ class NativeComposition:
                                    'data_health': {'ready': False, 'reason': type(exc).__name__}}
 
     def _refresh_funding_assessment(self):
-        """Assess funding before a signal arrives, without changing native state."""
+        """Prepare the runtime source binding, then inspect funding before a signal."""
         if self.config.funding is None:
             return
         now = self.market_data_provider.time()
@@ -287,6 +287,7 @@ class NativeComposition:
                 if recorder is None:
                     raise DataUnavailable('Native recorder required for funding assessment')
                 self._funding_store = NativeFundingStore(self, recorder)
+            self._funding_store.prepare_runtime_binding()
             self._funding_store.status = self._funding_store.assess()
             self._funding_store.status['observed_at'] = now
             self._funding_assessment_hold = None
@@ -355,6 +356,7 @@ class NativeComposition:
                 if recorder is None:
                     raise PolicyError('Native recorder required for candidate funding sizing')
                 self._funding_store = NativeFundingStore(self, recorder)
+            self._funding_store.prepare_runtime_binding()
             ceiling = self._funding_store.entry_notional_ceiling().quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
             self._funding_size = {'requested_quote': str(planned), 'ceiling_quote': str(ceiling),
                                   'effective_quote': str(min(planned, ceiling))}

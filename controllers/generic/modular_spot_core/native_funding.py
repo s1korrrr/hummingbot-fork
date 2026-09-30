@@ -232,7 +232,7 @@ class NativeFundingStore:
             previous, persisted_binding, self.binding, header['revision'])
         return True
 
-    def _load(self, *, expected_binding=None):
+    def _load(self, *, expected_binding=None, allow_code_upgrade=True):
         binding = self.binding if expected_binding is None else expected_binding
         with self.recorder.sql_manager.get_new_session() as session:
             row = session.get(Metadata, self.key)
@@ -245,7 +245,7 @@ class NativeFundingStore:
             raise PolicyError('Funding checkpoint header corrupt (FUNDING_AUDIT_CORRUPT)')
         if type(header['schema']) is not int or header['schema'] != 1:
             raise PolicyError('Funding checkpoint schema unsupported (FUNDING_SCHEMA_UNSUPPORTED)')
-        if (header['binding'] != binding and expected_binding is None and raw is not None
+        if (allow_code_upgrade and header['binding'] != binding and expected_binding is None and raw is not None
                 and not self._code_upgrade_checked):
             rebound = self._rebind_after_code_upgrade(header['binding'])  # a lock error retries next time
             self._code_upgrade_checked = True
@@ -720,6 +720,17 @@ class NativeFundingStore:
         from .native_funding_transition import plan_transition
         return plan_transition(self, expected_binding, legacy_evidence=legacy_evidence)
 
+    def prepare_runtime_binding(self):
+        """Run the existing source-only upgrade policy once for a live owner.
+
+        This is a mutating runtime step, separate from read-only readiness and
+        sizing. Configuration and ownership changes still require the explicit
+        stopped-owner transition. A failed load never marks preparation complete.
+        """
+        if not self._code_upgrade_checked:
+            self._load()
+            self._code_upgrade_checked = True
+
     def apply_binding_transition(self, transition_id):
         """Explicit maintenance operation, requiring an unchanged reviewed plan."""
         from .native_funding_transition import apply_transition
@@ -747,7 +758,7 @@ class NativeFundingStore:
         """Read-only sizing hint; admission still rechecks and durably claims it."""
         if any(not owner._composition_unchanged() for owner in self.owners.values()):
             raise PolicyError('Funding owner configuration changed')
-        raw, state = self._load()
+        raw, state = self._load(allow_code_upgrade=False)
         projection, pending, _ = self._evidence(state, raw, reconcile=True)
         pair = self.owner.config.trading_pair
         available = min(self.policy.allocation_quote - projection['used'] - pending,
@@ -756,14 +767,16 @@ class NativeFundingStore:
         return max(ZERO, available / (1 + self.policy.fee_reserve_fraction))
 
     def assess(self):
-        """Inspect current native evidence without writing a claim or release.
+        """Inspect current native evidence without any durable funding writes.
 
         This is readiness evidence only. Admission rechecks the actual proposal
         against fresh evidence and persists its reservation before execution.
+        A source-binding mismatch is reported without running code-upgrade
+        maintenance; only mutating runtime or explicit maintenance paths rebind.
         """
         if any(not owner._composition_unchanged() for owner in self.owners.values()):
             raise PolicyError('Funding owner configuration changed')
-        raw, state = self._load()
+        raw, state = self._load(allow_code_upgrade=False)
         projection, pending, _ = self._evidence(state, raw, reconcile=False)
         return {'assessment': 'read_only_native_evidence', 'binding': self.binding,
                 'revision': state['revision'], 'pending_quote': str(pending),

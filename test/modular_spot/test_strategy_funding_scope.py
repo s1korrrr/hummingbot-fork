@@ -121,6 +121,8 @@ async def test_native_cash_shortage_precedes_durable_funding_admission():
     owner = SimpleNamespace(config=SimpleNamespace(id='owned'), validate_executor_config=Mock(return_value=True))
     orchestrator = object.__new__(ExecutorOrchestrator)
     orchestrator._planned_resume_pending = False
+    orchestrator._resume_preflight_failed = False
+    orchestrator._claimed_resume_unresolved = {}
     orchestrator.recovery_required = {}
     orchestrator.active_executors = {'owned': []}
     orchestrator.stored_executors = {}

@@ -3,7 +3,7 @@
 Symbol contexts run the frozen p23 lifecycle (features, bags, trailing exits).
 Only the portfolio admits acquisitions, through native grants in this owner's
 recorder. Exits and held-inventory management never wait for portfolio alpha.
-Live spending additionally requires an explicit exclusive capital-domain binding.
+Live spending additionally requires an explicit bounded shared-wallet capital binding.
 
 Operator vocabulary. None of these controls sells, liquidates, or demotes a position:
 
@@ -216,6 +216,21 @@ class MeridianUnifiedController(ControllerBase):
         return (context is not None and super().validate_executor_config(config)
                 and context.runtime.entry_permission(config, check_funds=check_funds))
 
+    def quote_permission(self, trading_pair):
+        """Price-dependent management requires this pair's current applied book.
+
+        This is independent of acquisition switches and performance reports. Native
+        order/fill reconciliation and already-resting profit exits keep running.
+        """
+        context = self.contexts.get(trading_pair)
+        if context is None:
+            return False
+        try:
+            context.runtime.bindings.fresh_book(context)
+            return True
+        except (ValueError, TypeError, AttributeError, KeyError, RuntimeError):
+            return False
+
     def validate_executor_config(self, config):
         context = self._context(config)
         if context is None or config.id in context.runtime.dispatched:
@@ -238,7 +253,11 @@ class MeridianUnifiedController(ControllerBase):
         allowed = self._running() if is_recovery_sell(config) else super().validate_executor_config(config)
         if context is None or not allowed:
             raise ValueError('Meridian executor request is outside its symbols or the controller is stopped')
-        return context.runtime.executor_class(config)
+        selected = context.runtime.executor_class(config)
+        if is_recovery_sell(config):
+            from controllers.generic.meridian_v3_unified_core.execution import MeridianRecoveryExecutor
+            return MeridianRecoveryExecutor
+        return selected
 
     # ------------------------------------------------------------------ reporting
     def get_custom_info(self) -> dict:

@@ -243,6 +243,9 @@ class ExchangePyBase(ExchangeBase, ABC):
             raise ValueError(f"No order book exists for '{trading_pair}'.")
         return self.order_book_tracker.order_books[trading_pair]
 
+    def get_order_book_observation(self, trading_pair: str):
+        return self.order_book_tracker.get_order_book_observation(trading_pair)
+
     def tick(self, timestamp: float):
         """
         Includes the logic that has to be processed every time a new tick happens in the bot. Particularly it enables

@@ -31,7 +31,18 @@ PORTFOLIO_OWNED = (*CONSEQUENTIAL, 'controllers/generic/meridian_v3_portfolio.py
 UNIFIED_ONLY = ('controllers/generic/meridian_v3_unified.py',
                 'controllers/generic/meridian_v3_unified_core/config.py',
                 'controllers/generic/meridian_v3_unified_core/portfolio.py',
-                'controllers/generic/meridian_v3_unified_core/symbols.py')
+                'controllers/generic/meridian_v3_unified_core/symbols.py',
+                'controllers/generic/meridian_v3_unified_core/execution.py',
+                'hummingbot/core/data_type/order_book_observation.py',
+                'hummingbot/core/data_type/order_book_message.py',
+                'hummingbot/core/data_type/order_book_tracker.py',
+                'hummingbot/connector/exchange_py_base.py',
+                'hummingbot/connector/exchange/okx/okx_api_order_book_data_source.py',
+                'hummingbot/connector/exchange/paper_trade/native_paper_trade_exchange.py',
+                'hummingbot/data_feed/market_context_client.py',
+                'hummingbot/strategy_v2/executors/order_accounting.py',
+                'hummingbot/strategy_v2/executors/position_executor/position_executor.py',
+                'hummingbot/strategy_v2/executors/executor_orchestrator.py')
 
 
 @pytest.fixture

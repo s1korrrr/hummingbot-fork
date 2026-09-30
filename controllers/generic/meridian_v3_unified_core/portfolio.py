@@ -32,6 +32,7 @@ from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import (
 )
 
 from .config import PORTFOLIO_ID, PRODUCER
+from .entry_preview import preview_entry
 from .migration import IDENTITY_UNVERIFIED, IdentityGuard, epoch, grant_policy, proposal_writer
 
 ZERO = Decimal('0')
@@ -175,10 +176,12 @@ class MeridianPortfolio:
 
     # ------------------------------------------------------------------ evaluation
     def candidates(self, markets):
-        """Symbols whose new confirmed cut shows fresh p23 eligibility, in stable order."""
+        """New p23 setups with complete executable planner proposals, in stable order."""
         signal = recipe.strategy_parameters()['signal']
         entries = {s.trading_pair: s.entry_enabled for s in self.owner.config.symbols}
-        result = []
+        result, holds, previews = [], {}, {}
+        now = self.owner.market_data_provider.time()
+        entry_hold = self.owner.entries_held()
         for pair in sorted(markets):
             market = markets[pair]
             if market is None:
@@ -189,8 +192,19 @@ class MeridianPortfolio:
                 continue
             decision = signal_decision(signal, previous_rsi=market.previous_rsi, rsi=market.rsi,
                                        atr_fraction=market.atr_fraction, breakout=False, trend_up=False)
-            if decision.enter:
+            if not decision.enter:
+                continue
+            try:
+                proposal, reason = preview_entry(self.owner.contexts[pair].runtime, market,
+                                                 now=now, first_observed_cut=first, entry_hold=entry_hold)
+            except (DataUnavailable, PolicyError, RuntimeError, *ERRORS) as exc:
+                proposal, reason = None, f'preview_unavailable:{type(exc).__name__}:{exc}'[:200]
+            if proposal is not None:
                 result.append(pair)
+                previews[pair] = reason
+            else:
+                holds[pair] = reason
+        self.status = {**self.status, 'candidate_holds': holds, 'candidate_previews': previews}
         return tuple(result)
 
     def observation(self, pair, market, runtime, now_ms):
@@ -220,6 +234,9 @@ class MeridianPortfolio:
     def evaluate(self, markets):
         pairs = self.candidates(markets)
         if not pairs:
+            entry_hold = self.owner.entries_held()
+            if entry_hold is not None:
+                self.status = {**self.status, 'reason': 'ENTRY_HOLD', 'hold': entry_hold}
             return None
         now_ms = self.now_ms()
         self.clock = {'decision_cutoff_ms': now_ms, 'candles': {}}
@@ -231,8 +248,6 @@ class MeridianPortfolio:
             # Transient: this cut may be retried while it is still the current cut.
             self.status = {'reason': NATIVE_SNAPSHOT_UNAVAILABLE, 'hold': f'{type(exc).__name__}:{exc}'[:300]}
             return None
-        for pair in pairs:
-            self._evaluated[pair] = markets[pair].candle_open
         target = self.recipe.propose(snapshot, observations, epoch=self.epoch, fence=self.fence)
         stored = self.target_store().head()
         self.target_store().publish(target, previous_sha256=None if stored is None else stored['target_sha256'],
@@ -252,9 +267,12 @@ class MeridianPortfolio:
             return target
         self._invalidate()
         self.last_admission = outcome
+        # A failed publication/admission may retry; preview alone never consumes a cut.
+        for pair in pairs:
+            self._evaluated[pair] = markets[pair].candle_open
         self._admitted = outcome.admitted
         hold = reason if not capable else None
-        self.status = {'reason': 'admitted' if outcome.admitted else (hold or target.status.lower()), 'hold': hold,
+        self.status = {**self.status, 'reason': 'admitted' if outcome.admitted else (hold or target.status.lower()), 'hold': hold,
                        'snapshot_holds': self.status.get('snapshot_holds', ())}
         return target
 
@@ -262,10 +280,9 @@ class MeridianPortfolio:
     def snapshot(self, now_ms):
         """Attributed fixed-envelope state from native fills, executors, positions and books.
 
-        Books are read from the native connector at the owner clock `now_ms`. The native
-        adapter exposes no venue event time for a book, so each mark's event and
-        availability are that read time, and the clock records the venue book event
-        time as unavailable rather than inventing one.
+        Books are read at the owner clock `now_ms`, but marks retain the validated
+        source-event and local-application clocks of each pair's native book.
+        The current read time never refreshes the book's availability or age.
         """
         config = self.owner.config
         mandate = self.recipe.mandate
@@ -281,15 +298,21 @@ class MeridianPortfolio:
             holds.append(f'{CAPITAL_DOMAIN_UNPROVEN}:{exc}')
         stored = self.target_store().head()
         floor = 0 if stored is None else stored['sequence']
-        book_read_ms = now_ms  # every native book below is read at this owner clock
+        book_read_ms = now_ms
         self.clock.update(native_book_read_ms=book_read_ms, venue_book_event_ms=None,
-                          venue_book_event='UNAVAILABLE_FROM_NATIVE_ADAPTER')
+                          venue_book_event='PER_PAIR_APPLIED_BOOK', books={})
         assets, commitments, consumed, wallet = [], [], ZERO, None
         entries = tuple(s.trading_pair for s in config.symbols if s.entry_enabled)
         for pair in mandate.pairs:
             context = self.owner.contexts[pair]
             runtime = context.runtime
             book = runtime.snapshot()
+            observed = runtime.bindings.quote_observation
+            event_ms = int(observed.event_timestamp * 1000)
+            applied_ms = int(observed.applied_timestamp * 1000)
+            self.clock['books'][pair] = {'event_ms': event_ms, 'applied_ms': applied_ms,
+                                         'read_ms': book_read_ms,
+                                         'source': 'paper_injected' if config.execution_mode == 'paper' else 'venue'}
             wallet = book['available_quote'] if wallet is None else min(wallet, book['available_quote'])
             held = HeldBag.from_positions(context.positions_held, connector=config.connector_name, pair=pair)
             views = runtime.inventory()
@@ -319,7 +342,7 @@ class MeridianPortfolio:
                 symbol=pair, quantity=quantity, basis_quote=basis, net_cash_consumed_quote=projection['cash_used'],
                 mark=mark, bid=book['bid'], ask=book['ask'], lot=book['amount_step'],
                 minimum_quantity=book['minimum_amount'], minimum_notional=book['minimum_notional'],
-                mark_event_ms=book_read_ms, available_at_ms=book_read_ms, revision=len(fills) + len(evidence) + 1,
+                mark_event_ms=event_ms, available_at_ms=applied_ms, revision=len(fills) + len(evidence) + 1,
                 sellable_quantity=0, minimum_sell_price=held.breakeven_price if held.amount > 0 else mark,
                 acquisition_allowed=pair in entries, reduction_allowed=False))
         cash_total = max(ZERO, mandate.reference_quote - consumed)

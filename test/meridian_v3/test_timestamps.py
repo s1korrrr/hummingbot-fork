@@ -55,14 +55,18 @@ class TimestampTests(IsolatedAsyncioTestCase):
         info = s.controller.get_custom_info()['clock']
         self.assertEqual(info['native_book_read_ms'], now_ms)
         self.assertIsNone(info['venue_book_event_ms'])
-        self.assertEqual(info['venue_book_event'], 'UNAVAILABLE_FROM_NATIVE_ADAPTER')
+        self.assertEqual(info['venue_book_event'], 'PER_PAIR_APPLIED_BOOK')
+        self.assertEqual(info['books'][BTC], {'event_ms': now_ms, 'applied_ms': now_ms,
+                                              'read_ms': now_ms, 'source': 'paper_injected'})
 
-    async def test_snapshot_marks_are_the_native_book_read_time(self):
+    async def test_snapshot_marks_keep_source_time_when_owner_clock_advances(self):
         s = self.s
         await s.step()
-        now_ms = s.now * 1000
+        event_ms = s.now * 1000
+        s.session._connector.tick(s.now + 1)
+        now_ms = (s.now + 1) * 1000
         snapshot = s.controller.portfolio.snapshot(now_ms)
-        self.assertEqual({(a.mark_event_ms, a.available_at_ms) for a in snapshot.assets}, {(now_ms, now_ms)})
+        self.assertEqual({(a.mark_event_ms, a.available_at_ms) for a in snapshot.assets}, {(event_ms, event_ms)})
         self.assertEqual(snapshot.native_available_at_ms, s.controller.portfolio.clock['native_book_read_ms'])
 
     async def test_a_candle_that_has_not_closed_is_not_an_observation(self):

@@ -39,6 +39,11 @@ def native_config(config, *, identifier, timestamp, price, amount, cycle, stage,
 
 
 class ModularPositionExecutor(PositionExecutor):
+    def _quote_permitted(self):
+        owner = self._strategy.controllers.get(self.config.controller_id)
+        check = getattr(owner, 'quote_permission', None)
+        return check is None or check(self.config.trading_pair) is True
+
     def control_open_order(self):
         controller = self._strategy.controllers.get(self.config.controller_id)
         if controller is None or not controller.entry_permission(self.config, check_funds=not self._entry_submitted):
@@ -62,11 +67,20 @@ class ModularPositionExecutor(PositionExecutor):
             return None
 
     def _current_trailing_reference_price(self):
+        if not self._quote_permitted():
+            return None
         try:
             return decimal(self.get_price(self.config.connector_name, self.config.trading_pair,
                                           PriceType.BestBid), 'executable bid', positive=True)
         except (PolicyError, RuntimeError, KeyError, AttributeError):
             return None
+
+    def control_trailing_stop(self):
+        # The native state machine reads marked PnL before consulting the close
+        # reference. Gate that earlier read too, so stale prices cannot persist a
+        # new arm/high-water mark and change the exit after fresh data returns.
+        if self._quote_permitted():
+            super().control_trailing_stop()
 
     def _close_order_type_for(self, close_type):
         return OrderType.LIMIT
@@ -98,6 +112,8 @@ class ModularPositionExecutor(PositionExecutor):
         if close_type != CloseType.TRAILING_STOP:
             self.early_stop(keep_position=True)
             return
+        if not self._quote_permitted():
+            return  # Do not turn missing quotes into a position-hold transition.
         if not self._fees_complete():
             self.logger().error('Modular exit held: native fill/fee receipts incomplete')
             return

@@ -56,6 +56,20 @@ def source_files():
     core = Path(__file__).resolve().parent
     files = [core.parent / 'meridian_v3_unified.py', *sorted(core.glob('*.py')),
              *[p.resolve() for p in meridian_v3_portfolio.portfolio_source_files()]]
+    # These engine adapters now enforce the executable quote contract. Bind their
+    # bytes in addition to the full image source digest used by release admission.
+    files.extend(source_root() / name for name in (
+        'hummingbot/core/data_type/order_book_observation.py',
+        'hummingbot/core/data_type/order_book_message.py',
+        'hummingbot/core/data_type/order_book_tracker.py',
+        'hummingbot/connector/exchange_py_base.py',
+        'hummingbot/connector/exchange/okx/okx_api_order_book_data_source.py',
+        'hummingbot/connector/exchange/paper_trade/native_paper_trade_exchange.py',
+        'hummingbot/data_feed/market_context_client.py',
+        'hummingbot/strategy_v2/executors/order_accounting.py',
+        'hummingbot/strategy_v2/executors/position_executor/position_executor.py',
+        'hummingbot/strategy_v2/executors/executor_orchestrator.py',
+    ))
     return list(dict.fromkeys(files))
 
 

@@ -259,7 +259,11 @@ class MeridianUnifiedPaperTests(IsolatedAsyncioTestCase):
                 session.controllers[OWNER].set_operator_entry_pause(True, reason='test')
                 receipt = await self.enter(session)
                 self.assertEqual(receipt['actions'], [])
-                self.assertEqual(session.controllers[OWNER].portfolio.last_target.status, 'ENTRY_HOLD')
+                portfolio = session.controllers[OWNER].portfolio
+                self.assertIsNone(portfolio.last_target)  # paused entries are not executable proposals
+                self.assertEqual(portfolio.status['reason'], 'ENTRY_HOLD')
+                self.assertEqual(portfolio.status['hold'], 'operator_entry_pause')
+                self.assertEqual(portfolio.store().grants(now_ms=600060000, native_executors=()), ())
                 self.assertEqual(json.loads(json.dumps(session.controllers[OWNER].get_custom_info(), default=str))
                                  ['operator']['entry_paused'], True)
             finally:

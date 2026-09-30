@@ -17,7 +17,7 @@ from hummingbot.model.order import Order
 from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
-from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
+from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount, base_fee_quote_amount
 from hummingbot.strategy_v2.executors.planned_position_resume import claim, pending_manifest
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.executors.restart_continuity import (
@@ -97,7 +97,7 @@ class PositionHold:
             direction = Decimal('1') if trade_type == 'BUY' else Decimal('-1')
             if not explicit_base_fee:
                 # Explicit episode quote fees exclude base fees; their gross cost must remain intact.
-                quote -= direction * base_fee * (quote / base)
+                quote -= direction * base_fee_quote_amount(order, self.trading_pair.split('-')[0])
             base -= direction * base_fee
         if base < 0:
             raise ValueError(f'Base fees exceed acquired quantity: {order_id}')

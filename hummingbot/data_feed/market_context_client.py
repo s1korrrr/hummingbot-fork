@@ -236,8 +236,9 @@ class MarketContextClient:
 
     def start(self) -> None:
         if self.task is None:
+            loop = asyncio.get_running_loop()  # fail before creating an unowned coroutine
             self._wake = asyncio.Event()
-            self.task = asyncio.create_task(self._run(), name='market-context-client')
+            self.task = loop.create_task(self._run(), name='market-context-client')
 
     async def close(self) -> None:
         task, self.task = self.task, None

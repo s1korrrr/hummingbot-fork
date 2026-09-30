@@ -27,7 +27,7 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1, validate_acquisition_chain
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
-from hummingbot.strategy_v2.executors.order_accounting import in_flight_base_fee
+from hummingbot.strategy_v2.executors.order_accounting import in_flight_base_fee, in_flight_base_fee_quote
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
     TrailingStop,
@@ -737,7 +737,19 @@ class PositionExecutor(ExecutorBase):
 
         :return: The filled amount of the open order in quote currency.
         """
-        return self.open_filled_amount * self.entry_price
+        # Pair fee-net inventory with a per-fill fee-net quote basis. Valuing all
+        # base fees at the gross order VWAP changes cash PnL when fee rates differ.
+        base = self.config.trading_pair.split("-")[0]
+        return sum((order.executed_amount_quote - (
+            in_flight_base_fee_quote(order.order, base)
+            if order.order is not None and self.config.side == TradeType.BUY else Decimal("0")
+        ) for order in self._entry_orders()), Decimal("0"))
+
+    @property
+    def _accounting_entry_price(self) -> Decimal:
+        """Fee-net basis per owned unit; entry_price remains the gross fill VWAP."""
+        amount = self.open_filled_amount
+        return self.open_filled_amount_quote / amount if amount > Decimal("0") else self.entry_price
 
     @property
     def close_filled_amount(self) -> Decimal:
@@ -934,7 +946,7 @@ class PositionExecutor(ExecutorBase):
         sell_fee_rate = self._expected_close_fee_rate()
         if sell_fee_rate is None:
             return None
-        entry = self.entry_price
+        entry = self._accounting_entry_price
         fee_pct = self._known_fee_pct()
         if not isinstance(entry, Decimal) or not isinstance(fee_pct, Decimal) or entry <= Decimal("0"):
             return None
@@ -943,9 +955,10 @@ class PositionExecutor(ExecutorBase):
 
     def _min_no_loss_trigger_pct(self) -> Optional[Decimal]:
         min_sell = self._min_no_loss_sell_price()
-        if min_sell is None or not isinstance(self.entry_price, Decimal) or self.entry_price <= Decimal("0"):
+        entry = self._accounting_entry_price
+        if min_sell is None or not isinstance(entry, Decimal) or entry <= Decimal("0"):
             return None
-        return min_sell / self.entry_price - Decimal("1") - self._known_fee_pct()
+        return min_sell / entry - Decimal("1") - self._known_fee_pct()
 
     def _floored_trailing_trigger_pct(self, trigger_pct: Decimal) -> Decimal:
         if not self._trailing_requires_no_loss_floor():
@@ -967,14 +980,15 @@ class PositionExecutor(ExecutorBase):
     def _price_for_net_pnl_pct(self, target_net_pnl_pct: Optional[Decimal]) -> Optional[Decimal]:
         if target_net_pnl_pct is None:
             return None
-        if self.entry_price <= Decimal("0"):
+        entry = self._accounting_entry_price
+        if entry <= Decimal("0"):
             return None
         target_pct = Decimal(str(target_net_pnl_pct))
         fee_pct = self._known_fee_pct()
         if self.config.side == TradeType.BUY:
-            return self.entry_price * (Decimal("1") + fee_pct + target_pct)
+            return entry * (Decimal("1") + fee_pct + target_pct)
         else:
-            return self.entry_price * (Decimal("1") - fee_pct - target_pct)
+            return entry * (Decimal("1") - fee_pct - target_pct)
 
     def _current_trailing_reference_price(self) -> Optional[Decimal]:
         try:
@@ -1063,9 +1077,9 @@ class PositionExecutor(ExecutorBase):
             if self._exit_complete() and self.open_filled_amount_quote != Decimal("0"):
                 return self._realized_trade_pnl_quote() / self.open_filled_amount_quote
             if self.config.side == TradeType.BUY:
-                return (self.close_price - self.entry_price) / self.entry_price
+                return (self.close_price - self._accounting_entry_price) / self._accounting_entry_price
             else:
-                return (self.entry_price - self.close_price) / self.entry_price
+                return (self._accounting_entry_price - self.close_price) / self._accounting_entry_price
         else:
             return Decimal("0")
 
@@ -1079,7 +1093,7 @@ class PositionExecutor(ExecutorBase):
         if (self.open_filled_amount != Decimal("0") and self.close_type not in [CloseType.FAILED, CloseType.POSITION_HOLD]
                 and self._exit_complete()):
             return self._realized_trade_pnl_quote()
-        return self.trade_pnl_pct * self.open_filled_amount * self.entry_price
+        return self.trade_pnl_pct * self.open_filled_amount_quote
 
     def _realized_trade_pnl_quote(self) -> Decimal:
         """

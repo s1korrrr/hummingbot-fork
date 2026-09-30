@@ -16,9 +16,9 @@ from unittest import IsolatedAsyncioTestCase
 from sqlalchemy import event
 
 from controllers.generic.meridian_v3_recipe import PAIRS
+from controllers.generic.meridian_v3_unified_core.execution import MeridianRecoveryExecutor
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
@@ -184,7 +184,7 @@ class Lifecycle(IsolatedAsyncioTestCase):
         config = sell.executor_config
         self.assertEqual((config.side, config.amount), (TradeType.SELL, first.open_filled_amount))
         self.assertGreaterEqual(config.min_sell_price, first._open_order.order.price * D('1.02'))
-        self.assertTrue(any(type(e) is OrderExecutor for e in s.executors(ETH)))
+        self.assertTrue(any(type(e) is MeridianRecoveryExecutor for e in s.executors(ETH)))
         await s.lift(ETH, amount='5', above='0.5')
         await s.step()
         self.assertEqual(s.balance('ETH'), D('0'))

@@ -8,9 +8,10 @@ owners' rows pass through unchanged so foreign-writer checks still see them.
 Capital never comes from the symbol: its budget is the portfolio grant store.
 A symbol can bind a grant the portfolio admitted; it cannot create one.
 """
+import math
 from decimal import Decimal
 
-from controllers.generic.modular_spot_core.domain import PolicyError, decimal
+from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError, decimal
 from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 from controllers.generic.modular_spot_core.runtime import ERRORS, ModularRuntime
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
@@ -48,11 +49,34 @@ class PairScopedRecorder:
 class SymbolBindings(NativeBindings):
     def __init__(self, owner_id, pair):
         self.owner_id, self.pair = owner_id, pair
+        self.quote_observation = None
+
+    def fresh_book(self, controller):
+        """Validate source and application clocks on this pair, independent of reports."""
+        self.quote_observation = None
+        connector = self.spot_connector(controller)
+        if connector.ready is not True:
+            raise DataUnavailable('native book connector is not ready')
+        getter = getattr(connector, 'get_order_book_observation', None)
+        observation = getter(controller.config.trading_pair) if callable(getter) else None
+        if observation is None:
+            raise DataUnavailable('native book source timing unavailable')
+        now = controller.market_data_provider.time()
+        event, applied = observation.event_timestamp, observation.applied_timestamp
+        bound = controller.max_quote_age_ms / 1000
+        if (not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                    for v in (now, event, applied))
+                or not 0 <= now - event <= bound or not 0 <= now - applied <= bound
+                or event > applied):
+            raise DataUnavailable('native book is stale, future, or has invalid timing')
+        self.quote_observation = observation
+        return observation
 
     def snapshot(self, controller):
         # Meridian has no loss rail: the p23 risk update receives no PnL, so drawdown
         # and daily-loss pauses can never trigger. Freshness checks of the native
         # report, book and account still apply before any entry.
+        self.fresh_book(controller)
         return {**super().snapshot(controller), 'pnl': Decimal('0')}
 
     def recorder(self):
@@ -170,6 +194,10 @@ class SymbolContext:
         return self.owner.symbol_config(self.pair)
 
     @property
+    def max_quote_age_ms(self):
+        return self.owner.config.max_snapshot_age_ms
+
+    @property
     def market_data_provider(self):
         return self.owner.market_data_provider
 
@@ -215,6 +243,16 @@ class SymbolRuntime(ModularRuntime):
             self.reason = hold[:200]
             return self._bag_stops_only()
         return super().actions()
+
+    def _bag_stops_only(self):
+        # The shared fallback reads prices directly when candle/report data is
+        # unavailable. Meridian must also prove that this pair's book is current
+        # before using those prices to change a tranche into held inventory.
+        try:
+            self.bindings.fresh_book(self.controller)
+        except (DataUnavailable, *ERRORS):
+            return []
+        return super()._bag_stops_only()
 
     def ensure_store(self):
         store = super().ensure_store()

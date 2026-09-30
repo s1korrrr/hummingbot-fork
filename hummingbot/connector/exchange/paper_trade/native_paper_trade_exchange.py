@@ -25,6 +25,7 @@ from hummingbot.core.data_type.cancellation_result import CancellationResult
 from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book import OrderBook
+from hummingbot.core.data_type.order_book_observation import OrderBookObservation
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.core.data_type.terminal_reconciliation import terminal_reconciliation
@@ -135,6 +136,7 @@ class NativePaperTradeExchange(ExchangeBase):
         self._depth = {}
         self._book_sequence = {}
         self._book_time = {}
+        self._book_applied_time = {}
         self._trade_sequence = {}
         self._order_tracker = ClientOrderTracker(self)
         self._paper_budget_checker = _PaperBudgetChecker(self)
@@ -207,6 +209,11 @@ class NativePaperTradeExchange(ExchangeBase):
         """Observed freshness for one configured pair; aggregate readiness stays strict."""
         return trading_pair in self._rules and self._fresh(trading_pair)
 
+    def get_order_book_observation(self, trading_pair):
+        if trading_pair not in self._books:
+            return None
+        return OrderBookObservation(self._book_time[trading_pair], self._book_applied_time[trading_pair])
+
     def invalidate_order_book(self, trading_pair):
         """Known upstream loss revokes depth immediately, without releasing orders."""
         if trading_pair not in self._rules:
@@ -214,6 +221,7 @@ class NativePaperTradeExchange(ExchangeBase):
         self._books.pop(trading_pair, None)
         self._depth.pop(trading_pair, None)
         self._book_time.pop(trading_pair, None)
+        self._book_applied_time.pop(trading_pair, None)
 
     @property
     def status_dict(self):
@@ -410,6 +418,7 @@ class NativePaperTradeExchange(ExchangeBase):
         self._depth[trading_pair] = sides
         self._book_sequence[trading_pair] = sequence
         self._book_time[trading_pair] = float(timestamp)
+        self._book_applied_time[trading_pair] = self.current_timestamp
 
     def _reservation_maker(self, order):
         # A LIMIT can execute as maker or taker. Reserve the greater fee until

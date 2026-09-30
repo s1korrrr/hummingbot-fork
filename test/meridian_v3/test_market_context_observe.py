@@ -8,6 +8,7 @@ stale, erroring, timing out) yields identical actions, grants and balances.
 import asyncio
 import logging
 import tempfile
+import warnings
 from pathlib import Path
 from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
 from test.meridian_v3.lifecycle_harness import START, Scenario, creates, rebound
@@ -232,8 +233,13 @@ def test_client_errors_become_unavailable_and_never_raise():
 
 def test_start_without_a_loop_is_unavailable():
     # A controller tick always runs on the loop; outside one, start fails and is reported, not raised.
-    record = observer(real_client()).observe(T)
+    client = real_client()
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter('always')
+        record = observer(client).observe(T)
     assert (record['state'], record['detail']) == ('UNAVAILABLE', 'observer_error:RuntimeError')
+    assert client.task is None and client._wake is None
+    assert not [w for w in emitted if issubclass(w.category, RuntimeWarning)]
 
 
 def test_unavailable_logging_is_rate_limited(caplog):

@@ -39,10 +39,10 @@ def is_bag_sell(info):
 
 
 def is_terminal_flat(info, released=frozenset()):
-    if info.id in released:
-        return True
     if info.is_done is not True or info.is_active is not False:
         return False
+    if info.id in released:
+        return True
     if is_bag_sell(info):
         return True
     try:
@@ -186,6 +186,8 @@ class PortfolioGrantStore:
         owner = self.policy.controller_id
         bound = {g.executor_id: g for g in grants.values() if g.status == 'BOUND'}
         for key, info in evidence.items():
+            if key in released and (info.is_done is not True or info.is_active is not False):
+                raise PolicyError('unreserved or reappearing native inventory requires reconciliation')
             config = info.config
             if getattr(config, 'connector_name', None) != self.policy.connector:
                 continue

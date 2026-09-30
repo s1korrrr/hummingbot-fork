@@ -106,7 +106,7 @@ PYTHONPATH="$PWD" /Users/s1kor/anaconda3/envs/hummingbot/bin/python -m pytest -q
 **446 passed + 10 subtests passed, zero failures, zero skips, zero warnings:**
 241 modular tests, 172 native executor/orchestrator tests plus 10 subtests, and
 33 native OKX/base candle tests. [Log](evidence/2026-09-19/final-native.log) ·
-[JUnit](evidence/2026-09-19/final-native.xml).
+[JUnit](evidence/2026-09-19/final-native.xml.gz) (gzip; the XML is byte-exact).
 
 ```bash
 pre-commit run --files controllers/generic/modular_spot.py \

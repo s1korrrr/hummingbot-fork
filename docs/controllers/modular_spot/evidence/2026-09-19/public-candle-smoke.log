@@ -1,0 +1,66 @@
+{"event": "reader_reconnect", "elapsed": 80.81112599372864}
+{
+  "started_at": 1789836941.7203689,
+  "passed": true,
+  "credentials_used": false,
+  "execution_connectors_created": false,
+  "transport": "native OKX WebSocket -> loopback HTTP -> DataPool",
+  "final_snapshots": {
+    "BTC-USDC": {
+      "rows": 90,
+      "latest_open": 1789837020,
+      "sequence": 3,
+      "candle_age_seconds": 2.1445388793945312
+    },
+    "ETH-USDC": {
+      "rows": 90,
+      "latest_open": 1789837020,
+      "sequence": 3,
+      "candle_age_seconds": 2.1445600986480713
+    }
+  },
+  "hub_errors_at_completion": {},
+  "readers_at_completion": [
+    {
+      "error": null,
+      "dataset_errors": {},
+      "connected": true
+    },
+    {
+      "error": null,
+      "dataset_errors": {},
+      "connected": true
+    }
+  ],
+  "elapsed_seconds": 140.4289059638977,
+  "reader_ready_before_reconnect": true,
+  "reader_reconnected": true,
+  "http_status_counts": {
+    "503": 80,
+    "200": 14,
+    "304": 464
+  },
+  "shutdown_complete": true,
+  "feeds": [
+    {
+      "pair": "BTC-USDC",
+      "confirmed_ws_bars": [
+        1789836900,
+        1789836960,
+        1789837020
+      ],
+      "rest_warmup_requests": 1,
+      "ws_messages": 22
+    },
+    {
+      "pair": "ETH-USDC",
+      "confirmed_ws_bars": [
+        1789836900,
+        1789836960,
+        1789837020
+      ],
+      "rest_warmup_requests": 1,
+      "ws_messages": 24
+    }
+  ]
+}

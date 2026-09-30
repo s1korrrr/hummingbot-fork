@@ -1,0 +1,182 @@
+{
+  "controllers/generic/modular_spot.py": {
+    "sha256": "705f38f5de02cd0eaa0dd11a36259223ca58a9bf68361d0b8d5b5ec91f51f466",
+    "ast_sha256": "c124188b3229a4a61c61a3e73445be2b43613a4b77273a060f615d47b0e86408"
+  },
+  "controllers/generic/modular_spot_core/planner.py": {
+    "sha256": "382d82df7b36b397474d485bf70e62593e11bedaf84e11982c6812e7f1a76cc1",
+    "ast_sha256": "456d723b6fcb14e7098c6c4bf73d8e55fb2b7347ad6663d8657ee3b3674dcfee"
+  },
+  "controllers/generic/modular_spot_core/signals.py": {
+    "sha256": "4dd15f85d1ce2f808da8774ce016f5b0fbb5931fa8d031edd2b5756b9bae3146",
+    "ast_sha256": "cd55efc9aafb1cce46adcb20eef5b2956d2fa8476b4adcdb74fc977ab5a56ad4"
+  },
+  "controllers/generic/modular_spot_core/execution.py": {
+    "sha256": "1f44c9d7a9191b12a45182d25bb063e22b37fc38c2202306bae2683706bf7d7d",
+    "ast_sha256": "0b3383a349d04438be7021bb71aba28af6d8740e53d24a6b8bc7ffaa0cd50830"
+  },
+  "controllers/generic/modular_spot_core/config.py": {
+    "sha256": "f2a0297294b58c5a916cc0e3195ac803a0f3e50ed49a22692882a50170226897",
+    "ast_sha256": "4f65a0d724873c30ab6370effc073170ffa16cb915ba21111a71d6d163aa1277"
+  },
+  "controllers/generic/modular_spot_core/domain.py": {
+    "sha256": "6aee8f6e832535a2baadacdfaf64e5487d58a75c7c5e251aa23d5b46ad316407",
+    "ast_sha256": "09f3479961c9eb4c40cf877894dc91223b07c6c27d81763639e1bd8f0c2b4a77"
+  },
+  "controllers/generic/modular_spot_core/feature_cache.py": {
+    "sha256": "603d5b0e58dc2d4a9cbce4c85ad7ed985091a38a0dbd70e1908b26f0f9844284",
+    "ast_sha256": "762839fa512dc5f35ca52e3b5e25ce113843da37cea40513458a7bef3372db49"
+  },
+  "controllers/generic/modular_spot_core/market.py": {
+    "sha256": "32a850e38eb6ad44a2f765148052f6f33566021afae2ac2757778b2c66c62949",
+    "ast_sha256": "eed42e669af14ed7b2b9447eab748caab9633c834bf5fabb73bfc76fe4873d7c"
+  },
+  "controllers/generic/modular_spot_core/screener.py": {
+    "sha256": "ada43eb56d3aedc3078a39cdcd6a98d80531d51872c5debbf4964023f496b036",
+    "ast_sha256": "8b599770f2a27777f36185922eb38416c88ba89f44bd994e26c19de2816c0f57"
+  },
+  "controllers/generic/modular_spot_core/__init__.py": {
+    "sha256": "4b05664b2fd0e267ace694cd19434956ed72139b805c0ea4f9fe93a22db02f71",
+    "ast_sha256": "b58aaee2c5c34ac6f545298a045c7d8c7132e8e40ac9878f715a8f86b0677c14"
+  },
+  "controllers/generic/modular_spot_core/candle_transport.py": {
+    "sha256": "35665ed0c05d36aebe900083cdd687bc3af525e2ec9c2b1f8b2d17b6bda40222",
+    "ast_sha256": "b5f0219810562d69140deae5b7c9dd42713aeae9bd9e22caf8bc36b531eb4d16"
+  },
+  "controllers/generic/modular_spot_core/selection_state.py": {
+    "sha256": "a25d7e44a7ebe227fe1965a0433fb7142692ab52eab6d162dc7ac4bfe83801e9",
+    "ast_sha256": "e6d001a60583e897ec9b30aeeae701f90b418d08e2d5c5dd5285cbcd7beef80e"
+  },
+  "controllers/generic/modular_spot_core/runtime.py": {
+    "sha256": "9c7d911d621d7e4a9c3d9e0ea7a859f327eafbe56d69f4adb924de81b7a33886",
+    "ast_sha256": "332db83d277c91541ce2aed817d2239852af41b785c111ca04cc6962ea0cd485"
+  },
+  "controllers/generic/modular_spot_core/data_reader.py": {
+    "sha256": "2f7474526ea5735bb1388c4354899a6475855610e3e0d556321d013b7ea19bac",
+    "ast_sha256": "4da372e48415dc01eba4d5842a60120d1744144cf6e041bdce1d3e8b138abcdf"
+  },
+  "controllers/generic/modular_spot_core/universe.py": {
+    "sha256": "233e33e1ada48783959c2661d927e27df3e2d6b15fb15202902d8e25c307bf64",
+    "ast_sha256": "21f1025e0ac94610db9fac28cfe120c4d3121ac60eed3fe3d43be1990035c177"
+  },
+  "controllers/generic/modular_spot_core/candle_data.py": {
+    "sha256": "faa49cc5f8d61cb24fcd665eaefaa7deb92b38a435b2771f1879c093e00ed05b",
+    "ast_sha256": "64793dd784f5e31e779423b276b107238861115a582ef8ec8ea5d5720cc70b60"
+  },
+  "controllers/generic/modular_spot_core/risk.py": {
+    "sha256": "c4b4ca70b694c8d9ba9a4fb65d4702e5c0aec0d7fc41f8840d021986ea4844db",
+    "ast_sha256": "a391a30903ebc71175da3d52a25b95409993bae767e0392b36d71c5e91367e09"
+  },
+  "controllers/generic/modular_spot_core/program_budget.py": {
+    "sha256": "dd018a3dbe11c7395771cce22596f5b718924ee3b360058461f45c8b28c795b2",
+    "ast_sha256": "dead0ec934595e93a6b87908b3bff7d9ca9c0bead55c4ada4225ac95dd7524a4"
+  },
+  "controllers/generic/modular_spot_core/acquisition.py": {
+    "sha256": "c0786dd85c3ea69f5efb01b6f2b6a6b48a5545bf17d3266cdb89c65011a0cb80",
+    "ast_sha256": "8fe8e315a4c99d9c51c0991b0334d092576ca06a30013c6c29ad291a17a3af4f"
+  },
+  "controllers/generic/modular_spot_core/native_bindings.py": {
+    "sha256": "302bcecbb1d93dd7f2f09c79757fcd638a142fc1819d3f5f33b3795085b8866c",
+    "ast_sha256": "db65f5241bce0b66bcef8a6fdf2d9384f741b5b5bb098d9501e932920eeb445b"
+  },
+  "controllers/generic/modular_spot_core/sell_only.py": {
+    "sha256": "13bf899de9b9a37decc3606cf51e8d8875683e385a08b0525d4521c5e8a3083d",
+    "ast_sha256": "d85e0b882cc55ff2ccff1c3f25c2cf8ebfae58e51654fdbd934b104dc339f0ba"
+  },
+  "controllers/generic/modular_spot_core/portfolio.py": {
+    "sha256": "11caff8805c82b4a1b527d59007c2535b0f5d39f7626d44a2f3933bd08e6823b",
+    "ast_sha256": "b58f19db1205557bb052f21c70e7693f79a99ebb814c194c58cd6115c19bde50"
+  },
+  "controllers/generic/modular_spot_core/profiles.py": {
+    "sha256": "6bf0b586bc64df82f34bfbc5b423e8ec6121e90c6ae33f364e77854b166f79a8",
+    "ast_sha256": "32bcedf79ee60cd07983707715529c271671566d6971a08601115809cecba0cb"
+  },
+  "controllers/generic/modular_spot_core/trailing.py": {
+    "sha256": "8ec62a24f1c86a36306b8c3db08a38012fc172a9625729df578077170497a4f3",
+    "ast_sha256": "3bed32a26c920a2c6e0ba4d49ce53b512a7239e9f580f03267b088689fd80a52"
+  },
+  "controllers/generic/modular_spot_core/state.py": {
+    "sha256": "c8239b01cb51d2a6849d6d0d3e67ade2b2c0b04ceed7e122c3d0b49094b9edaa",
+    "ast_sha256": "c32f2e21fed9255cf59f875ef6bc3bc95b8367a7386f386485bf637616afc7b0"
+  },
+  "controllers/generic/modular_spot_core/inventory.py": {
+    "sha256": "7bfeaa5ebf26ee9b9db365ed2eeb2fe462c96115b9a31fee492446124f168240",
+    "ast_sha256": "6cc52de55f36d6aef8be4f4023af7b899d8693d5fee63faa68086096295e5cb3"
+  },
+  "test/modular_spot/test_native_lifecycle.py": {
+    "sha256": "9a93aea6caad81a48a199ecc3ea41066376c3677c0793147c68d65bd5b3a5799",
+    "ast_sha256": "e79d105c04ccfb50de7a8def4d5cda0e9c1f2a2dd5a3f3582ddcea58d885f41e"
+  },
+  "test/modular_spot/test_program_budget.py": {
+    "sha256": "d38618c9a52d895dcec269e90c1a94d4f43c63b35c2e70ed9f044d4c7781f9e5",
+    "ast_sha256": "40c90d06a27ecf84c19a98001407c7d5c4fffae65c6572d7f58af929dee922ff"
+  },
+  "test/modular_spot/test_native_contract.py": {
+    "sha256": "f76eaef6d0d1951cdb40bdd6569aedfafc24a43713b66ea06186410182abca0a",
+    "ast_sha256": "7b0a69a277a78e49e6731f74ad0481a19f7290568e8591f0d9b3737cea88ad84"
+  },
+  "test/modular_spot/test_screener_dispatch.py": {
+    "sha256": "603aa5e076b637bc97b5c20612e0f58557c08d359d2094405ba54692f5b2c822",
+    "ast_sha256": "a1510a94ba2bf02070f237154bc46dfc038192ed20d121cbae6522beaad95c4c"
+  },
+  "test/modular_spot/test_planner.py": {
+    "sha256": "4eaba1a55eb9003ed928fb3b84e81d2a578aaea1ef1e9b69f974a3c1ae67f885",
+    "ast_sha256": "ca345cd3d80402fd71ec5e7d5e5995cf5d446a6d2e30fe0e80c03dc1ce3a3321"
+  },
+  "test/modular_spot/test_m1_seams.py": {
+    "sha256": "907e5e1aa7ccb2d0f4550ab913bce64169fad635bd0569a8651983f56b59c182",
+    "ast_sha256": "2a03c467d4b5e36590706f9f0cee38ceba444b7bcf3409cd350571bc84e36450"
+  },
+  "test/modular_spot/test_shared_native_load.py": {
+    "sha256": "87e2f949383a558f7afdcf22589aa5a43687009ac2adb077bda666c42e4d8b02",
+    "ast_sha256": "7b5d07b1da48958fadf22b6e72279164a91713bdf487e6fd073710033b83e495"
+  },
+  "test/modular_spot/test_shared_data.py": {
+    "sha256": "b4820fffbe55e051ddf76ff674ba83598104c29d0c872e5f072a893a0f0122e1",
+    "ast_sha256": "a5f997d66637e3cce00659fa7f6daf92d63978393d065b4314b773ea01b77082"
+  },
+  "test/modular_spot/test_sell_only.py": {
+    "sha256": "d34f18e29e198be53ea3bc5984baac3088e60c6c54d3c96316f37c0a76517587",
+    "ast_sha256": "f2caf29e7607a24db6f9b98a7805e65dacd23bb1236f01d1e5f41222283414eb"
+  },
+  "test/modular_spot/test_universes.py": {
+    "sha256": "3516e92be6e42fdc8cf0b905ca5f224bc145ff89a45795877337325e00e8096c",
+    "ast_sha256": "80f2f033f1bc64a4ccedfab775e60eef80df76593d971a64bd9f1f657c523f9a"
+  },
+  "test/modular_spot/test_candle_transport.py": {
+    "sha256": "c773e66d7c0c12eff31c7e60673042becbf11bed3bde795fa9cbc02038ab4dea",
+    "ast_sha256": "21a906be344edbbcbdcafea87f2446a7d6f51f6428223c7a8a3d32f6173a9a98"
+  },
+  "test/modular_spot/test_profiles.py": {
+    "sha256": "a7389a742ec316426628868354bc3e637298201c0fe86ef7cc7e7e8afb750b11",
+    "ast_sha256": "c8916b953fb0b70c27047536b1541ecc871dd2b8bc41b5fb828344f763a87bfa"
+  },
+  "test/modular_spot/test_policies.py": {
+    "sha256": "28ed745c053acc41d4eedd7e3532548378a924d223a4d1d71b590ede2544a6b9",
+    "ast_sha256": "8867bd184a0e9f882e7816430265c5e2a4e1e3768363305411c13043acd22400"
+  },
+  "test/modular_spot/test_isolation.py": {
+    "sha256": "d7395fba88b18c414c9f779536c1bdacb4fcba6d656d0668565e1ec9b79c8c66",
+    "ast_sha256": "cedaadce9f5bb16d1578a070a2f3b2579b35ed847d396769c5433759b8068019"
+  },
+  "test/modular_spot/test_programs.py": {
+    "sha256": "01bc93767845644100b3b59b2250d7f6b923ab0d7fe95f62d0cec614c6311135",
+    "ast_sha256": "6aba9118ca3bd91974e1dd762d5e9ea75acc5d8b8b5b60bdd01e9b9e69e31929"
+  },
+  "test/modular_spot/test_native_recovery.py": {
+    "sha256": "5239754b6855cf1b54cdb4f1272d498638f71b67b462597a915548ff5a2e158e",
+    "ast_sha256": "eec144749d6cd4cc9de56b65be6e17d9530b9920c3a2d1353b34af76dd61c5ff"
+  },
+  "test/modular_spot/test_state_and_data.py": {
+    "sha256": "b7d5a28fc6b55804eea8691f7a999cb3dd2067980d01f24a0358aed5c9ee2697",
+    "ast_sha256": "4626a1c58001dde435d364f3abb971a6141bcca45b0ba2c05dbad9e00efa6e63"
+  },
+  "test/modular_spot/test_capital_admission.py": {
+    "sha256": "40c990d6a720f88d6dc3f38eb93fd3a6037dec9b3fd5e3c1699aa2a2ea1bbdd4",
+    "ast_sha256": "1ce6715e1e637b2addbf327b26fc909e87df2da8b34bd2b395aae2f9d3d8daaf"
+  },
+  "docs/controllers/modular_spot/public_candle_smoke.py": {
+    "sha256": "0e5e5c3f193185f2d999d556d7534bb56cf3b217276e34c8e32a45fbf10c84be",
+    "ast_sha256": "7b75779bcb8aca7058eacb49a2d4d72d5b756cdfb069c7cf6115a6b819315ea6"
+  }
+}

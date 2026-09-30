@@ -607,7 +607,7 @@ async def test_old_database_missing_empty_sidecars_survives_new_schema_creation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['start', 'restore'])
-async def test_post_claim_failure_fences_ownership_without_retry_or_record_overwrite(tmp_path, failure):
+async def test_post_claim_failure_is_reported_never_retried_and_never_blocks(tmp_path, failure):
     db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
     resume.prepare(db, before, evidence, now=1000, root=root)
     strategy = old._strategy
@@ -631,18 +631,17 @@ async def test_post_claim_failure_fences_ownership_without_retry_or_record_overw
             patch.object(target, method, side_effect=RuntimeError('injected after claim')) as broken:
         orchestrator = ExecutorOrchestrator(strategy)
         strategy.executor_orchestrator = orchestrator
-        assert orchestrator.resume_planned_positions_if_ready()  # reporting and healthy management continue
+        assert orchestrator.resume_planned_positions_if_ready()  # reported; trading is not fenced
         assert broken.call_count == 1
         assert orchestrator.resume_planned_positions_if_ready()
         assert broken.call_count == 1
         assert 'injected after claim' in orchestrator._planned_resume_failure
         assert orchestrator._planned_resume_pending is False
         assert resume.inspect_manifest(db)[0]['state'] == 'claimed'
-        for side in (TradeType.BUY, TradeType.SELL):
-            with pytest.raises(RuntimeError, match='claimed.*reconciliation'):
-                old.place_order('okx', 'ETH-USDT', OrderType.LIMIT, side, Decimal('.1'), price=Decimal('100'))
-        with pytest.raises(RuntimeError, match='claimed.*reconciliation'):
-            orchestrator.create_executor(CreateExecutorAction(controller_id='owner', executor_config=old.config))
+        assert old.config.id in orchestrator._claimed_resume_unresolved['owner']  # reported for reconciliation
+        assert old.config.id in orchestrator.recovery_required['owner']
+        for side in (TradeType.BUY, TradeType.SELL):  # never an order fence
+            old.place_order('okx', 'ETH-USDT', OrderType.LIMIT, side, Decimal('.1'), price=Decimal('100'))
         orchestrator.store_all_executors(clear=False)
         orchestrator.sync_live_executors_to_db()
         assert not recorder.get_all_executors()[0].is_done
@@ -650,21 +649,20 @@ async def test_post_claim_failure_fences_ownership_without_retry_or_record_overw
         assert not recorder.get_all_executors()[0].is_done  # the claimed row survives for the next boot
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
         after_crash = ExecutorOrchestrator(strategy)
-        # The durable unfinished claim still fences this owner on the next boot.
+        # The claimed row has no order snapshots to rebuild from: reported on the
+        # next boot as well, never a fence.
         assert after_crash._planned_resume_pending is False
         assert after_crash.active_executors['owner'] == []
         assert after_crash.recovery_required['owner'] == [old.config.id]
-        assert after_crash.claimed_resume_controller_blocked('owner') is True
-        assert after_crash.claimed_resume_controller_blocked('healthy-owner') is False
-        with pytest.raises(RuntimeError, match='claimed.*reconciliation'):
-            after_crash.create_executor(CreateExecutorAction(controller_id='owner', executor_config=old.config))
-    strategy.buy.assert_not_called()
-    strategy.sell.assert_not_called()
+        assert after_crash._claimed_resume_unresolved == {'owner': {old.config.id: ('okx', 'ETH-USDT')}}
+        assert not hasattr(after_crash, 'claimed_resume_controller_blocked')
+    assert strategy.buy.call_count == 1
+    assert strategy.sell.call_count == 1
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['expired', 'malformed', 'after_commit'])
-async def test_unverified_resume_preflight_cannot_reopen_order_admission(tmp_path, failure):
+async def test_unverified_resume_preflight_is_reported_and_never_blocks(tmp_path, failure):
     db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
     manifest = resume.prepare(db, before, evidence, now=1000, root=root)
     if failure == 'malformed':
@@ -692,24 +690,21 @@ async def test_unverified_resume_preflight_cannot_reopen_order_admission(tmp_pat
         strategy.executor_orchestrator = orchestrator
         assert orchestrator.resume_planned_positions_if_ready()
         assert orchestrator._resume_preflight_failed is True
-        assert orchestrator.claimed_resume_controller_blocked('owner') is True
-        for side in (TradeType.BUY, TradeType.SELL):
-            with pytest.raises(RuntimeError, match='claimed.*reconciliation'):
-                old.place_order('okx', 'ETH-USDT', OrderType.LIMIT, side, Decimal('.1'), price=Decimal('100'))
-        with pytest.raises(RuntimeError, match='claimed.*reconciliation'):
-            orchestrator.create_executor(CreateExecutorAction(controller_id='owner', executor_config=old.config))
+        assert orchestrator._planned_resume_failure is not None
+        for side in (TradeType.BUY, TradeType.SELL):  # reported, never an order fence
+            old.place_order('okx', 'ETH-USDT', OrderType.LIMIT, side, Decimal('.1'), price=Decimal('100'))
         assert resume.inspect_manifest(db)[0]['state'] == ('claimed' if failure == 'after_commit' else 'prepared')
         if failure == 'after_commit':
             assert old.config.id in orchestrator._claimed_resume_unresolved['owner']
             orchestrator.store_all_executors(clear=False)
             orchestrator.sync_live_executors_to_db()
             assert not recorder.get_all_executors()[0].is_done
-    strategy.buy.assert_not_called()
-    strategy.sell.assert_not_called()
+    assert strategy.buy.call_count == 1
+    assert strategy.sell.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_claim_missing_owner_identity_keeps_admission_closed_and_status_readable(tmp_path):
+async def test_claim_missing_owner_identity_is_reported_and_status_readable(tmp_path):
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
     db, before, root, recorder, old, evidence = await stopped_fixture(tmp_path)
     manifest = resume.prepare(db, before, evidence, now=1000, root=root)
@@ -726,9 +721,8 @@ async def test_claim_missing_owner_identity_keeps_admission_closed_and_status_re
     strategy.executor_orchestrator = orchestrator
     observation = StrategyV2Base._runtime_position_resume_observation(strategy)
     assert observation['preflight_failed'] is True
-    assert observation['quarantined_controllers'] == []
-    assert orchestrator.claimed_resume_controller_blocked('owner') is True
-    assert orchestrator.claimed_resume_order_allowed('okx', 'ETH-USDT', TradeType.BUY) is False
+    assert observation['unfinished_claim_controllers'] == []
+    assert orchestrator._planned_resume_failure == 'Unfinished claim has unavailable controller/market identity'
     assert not recorder.get_all_executors()[0].is_done
 
 

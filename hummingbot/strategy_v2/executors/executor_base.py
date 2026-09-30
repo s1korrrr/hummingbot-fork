@@ -1,4 +1,3 @@
-from contextvars import ContextVar
 from decimal import Decimal
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Union
@@ -25,8 +24,6 @@ from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 from hummingbot.strategy_v2.runnable_base import RunnableBase
-
-_executor_order_context = ContextVar('native_executor_order_context', default=None)
 
 
 class ExecutorBase(RunnableBase):
@@ -316,32 +313,17 @@ class ExecutorBase(RunnableBase):
             raise RuntimeError("V2 unattended restart hold; executor order submission is blocked")
         if self._stack_recovery_required():
             raise RuntimeError("Stack requires startup reconciliation; executor order submission is blocked")
-        orchestrator = getattr(self._strategy, 'executor_orchestrator', None)
-        guard = getattr(orchestrator, 'claimed_resume_order_allowed', None)
-        if callable(guard) and guard(connector_name, trading_pair, side, self, position_action) is False:
-            raise RuntimeError('Unfinished claimed position requires reconciliation; executor order submission is blocked')
-        # The synchronous strategy wrapper verifies the actual registered object,
-        # rather than accepting a caller-supplied executor ID or a bare SELL side.
-        permit = {'executor': self, 'active': True, 'connector_name': connector_name,
-                  'trading_pair': trading_pair, 'side': side, 'position_action': position_action}
-        token = _executor_order_context.set(permit)
-        try:
-            if side == TradeType.BUY:
-                return self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
-            else:
-                return self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
-        finally:
-            # asyncio tasks inherit a context copy but share this permit. A
-            # connector-created child task must not reuse it after this call.
-            permit['active'] = False
-            _executor_order_context.reset(token)
+        if side == TradeType.BUY:
+            return self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
+        else:
+            return self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
 
     def _stack_recovery_required(self) -> bool:
         if getattr(self._strategy, "_unattended_restart_hold", False) is True:
             return True
         orchestrator = getattr(self._strategy, "executor_orchestrator", None)
-        # Initial ownership transfer blocks every order. The scoped claim guard
-        # in place_order separately permits proven protective management.
+        # Startup ownership transfer is the only order gate. An unresolved persisted
+        # row is reported (recovery_required) but never blocks other executors' orders.
         return getattr(orchestrator, "_planned_resume_pending", False) is True
 
     def get_price(self, connector_name: str, trading_pair: str, price_type: PriceType = PriceType.MidPrice):

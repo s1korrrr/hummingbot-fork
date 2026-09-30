@@ -22,7 +22,7 @@ from hummingbot.connector.derivative_base import DerivativeBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.utils import combine_to_hb_trading_pair, split_hb_trading_pair
 from hummingbot.core.clock import Clock
-from hummingbot.core.data_type.common import MarketDict, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.common import MarketDict, PositionMode, PriceType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderType, PositionAction
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
@@ -418,9 +418,6 @@ class StrategyV2Base(StrategyPyBase):
                 for action in executor_actions:
                     if isinstance(action, CreateExecutorAction) and action.controller_id in self._controller_restart_required:
                         continue
-                    if (isinstance(action, CreateExecutorAction)
-                            and self.executor_orchestrator.claimed_resume_controller_blocked(action.controller_id) is True):
-                        continue
                     self.executor_orchestrator.execute_action(action)
 
     async def on_stop(self, strict: bool = False):
@@ -477,30 +474,14 @@ class StrategyV2Base(StrategyPyBase):
             )
         return preferences
 
-    def _require_reconciled_execution(self, connector_name=None, trading_pair=None, side=None,
-                                      position_action=PositionAction.NIL):
+    def _require_reconciled_execution(self):
         if self._unattended_restart_hold:
             raise RuntimeError("V2 unattended restart hold; order submission is blocked")
         orchestrator = getattr(self, "executor_orchestrator", None)
-        # Pending ownership transfer blocks every submission. Afterward, the
-        # scoped claim/preflight guard keeps unsafe admission closed while
-        # registered, proven executors can continue their protective exits.
+        # Only the startup ownership transfer (seconds, until connectors are ready)
+        # gates orders. Unresolved rows are reported, never an order fence.
         if getattr(orchestrator, "_planned_resume_pending", False) is True:
             raise RuntimeError("Stack requires startup reconciliation (position restore pending); order submission waits for connectors")
-        guard = getattr(orchestrator, 'claimed_resume_order_allowed', None)
-        if callable(guard):
-            from hummingbot.strategy_v2.executors.executor_base import _executor_order_context
-            permit = _executor_order_context.get()
-            executor = None
-            if isinstance(permit, dict) and permit.get('active') is True:
-                # Consume before the connector call so synchronous callbacks
-                # cannot borrow this executor's order admission.
-                permit['active'] = False
-                if (permit.get('connector_name') == connector_name and permit.get('trading_pair') == trading_pair
-                        and permit.get('side') == side and permit.get('position_action') == position_action):
-                    executor = permit.get('executor')
-            if guard(connector_name, trading_pair, side, executor, position_action) is False:
-                raise RuntimeError('Unfinished claimed position requires reconciliation; order submission is blocked')
 
     def buy(self,
             connector_name: str,
@@ -521,7 +502,7 @@ class StrategyV2Base(StrategyPyBase):
 
         :return: The client assigned id for the new order
         """
-        self._require_reconciled_execution(connector_name, trading_pair, TradeType.BUY, position_action)
+        self._require_reconciled_execution()
         market_pair = self._market_trading_pair_tuple(connector_name, trading_pair)
         self.logger().debug(f"Creating {trading_pair} buy order: price: {price} amount: {amount}.")
         return self.buy_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)
@@ -545,7 +526,7 @@ class StrategyV2Base(StrategyPyBase):
 
         :return: The client assigned id for the new order
         """
-        self._require_reconciled_execution(connector_name, trading_pair, TradeType.SELL, position_action)
+        self._require_reconciled_execution()
         market_pair = self._market_trading_pair_tuple(connector_name, trading_pair)
         self.logger().debug(f"Creating {trading_pair} sell order: price: {price} amount: {amount}.")
         return self.sell_with_specific_market(market_pair, amount, order_type, price, position_action=position_action)
@@ -905,7 +886,7 @@ class StrategyV2Base(StrategyPyBase):
         scopes = sorted(claims) if isinstance(claims, dict) else []
         return {'ownership_transfer_pending': getattr(orchestrator, '_planned_resume_pending', False) is True,
                 'preflight_failed': getattr(orchestrator, '_resume_preflight_failed', False) is True,
-                'quarantined_controllers': scopes}
+                'unfinished_claim_controllers': scopes}
 
     def _build_runtime_status_snapshot(self) -> Dict[str, Any]:
         from hummingbot.strategy.native_observability import (
@@ -1042,9 +1023,9 @@ class StrategyV2Base(StrategyPyBase):
         if self._unattended_restart_hold:
             lines.append("V2 UNATTENDED RESTART HOLD: BUY/SELL and executor recovery remain blocked.")
         resume = self._runtime_position_resume_observation()
-        if resume['preflight_failed'] or resume['quarantined_controllers']:
-            lines.append('POSITION OWNERSHIP RECONCILIATION REQUIRED: unsafe order admission is blocked.')
-            lines.append('Registered, proven executors continue protective exits.')
+        if resume['preflight_failed'] or resume['unfinished_claim_controllers']:
+            lines.append('POSITION OWNERSHIP RECONCILIATION REQUIRED: unfinished resume claims are reported.')
+            lines.append('Orders are never fenced; other executors keep trading.')
         if self._controller_restart_required:
             lines.append("RESTART REQUIRED: new executors blocked.")
             lines.append("Controllers: " + ', '.join(sorted(self._controller_restart_required)))
@@ -1380,8 +1361,6 @@ class StrategyV2Base(StrategyPyBase):
                     controller = self.controllers.get(action.controller_id)
                     if isinstance(action, CreateExecutorAction):
                         if action.controller_id in self._controller_restart_required:
-                            continue
-                        if self.executor_orchestrator.claimed_resume_controller_blocked(action.controller_id) is True:
                             continue
                         if not self.validate_create_action(action):
                             continue

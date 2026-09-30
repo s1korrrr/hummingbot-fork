@@ -317,8 +317,9 @@ class ExecutorOrchestrator:
         try:
             resumed = self._claim_planned_positions(markets_recorder)
         except Exception as error:
-            # Keep reporting and proven protective exits running, but never open
-            # new admission around an unverified ownership transfer.
+            # A stale or inconsistent manifest never blocks trading: its positions
+            # stay in the held ledger, the manifest remains for inspection and the
+            # failure is reported through the runtime status snapshot.
             self._planned_resume_failure = f"{type(error).__name__}: {error}"
             self._resume_preflight_failed = True
             self.logger().exception(f"Planned position manifest not claimed; held ledger retained: {error}")
@@ -329,8 +330,8 @@ class ExecutorOrchestrator:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
                 if not executor.is_done:
-                    self._quarantine_claimed_executor(controller_id, executor.id, executor.config,
-                                                      (executor.custom_info or {}).get('planned_position_resume'))
+                    self._record_unfinished_claim(controller_id, executor.id, executor.config,
+                                                  (executor.custom_info or {}).get('planned_position_resume'))
                     self.recovery_required.setdefault(controller_id, []).append(executor.id)
                     self.logger().error(
                         f"Startup reconciliation required | controller={controller_id} executor={executor.id} "
@@ -361,8 +362,8 @@ class ExecutorOrchestrator:
                     self._restored_pending_bind = restored_executors
                     continue
             if not executor.is_done:
-                self._quarantine_claimed_executor(controller_id, executor.id, executor.config,
-                                                  (executor.custom_info or {}).get('planned_position_resume'))
+                self._record_unfinished_claim(controller_id, executor.id, executor.config,
+                                              (executor.custom_info or {}).get('planned_position_resume'))
                 # A position executor restart continuity could not rebuild: its order
                 # ownership is unproven, so never rebuild its fills into held bags
                 # (a still-live exit could otherwise sell the same base twice).
@@ -466,7 +467,8 @@ class ExecutorOrchestrator:
         except Exception as error:
             self._resume_preflight_failed = True
             self._planned_resume_failure = f'{type(error).__name__}: {error}'
-            self.logger().error(f'Planned position manifest unavailable; admission requires reconciliation: {error}')
+            # Manifest history problems are reported; they never stop the owner from booting or trading.
+            self.logger().error(f'Planned position manifest history unreadable; reported, trading continues: {error}')
             return False
 
     def _has_continuity_candidates(self, recorder) -> bool:
@@ -617,8 +619,8 @@ class ExecutorOrchestrator:
             for controller_id, executors in self.active_executors.items():
                 for executor in executors:
                     executor.stop()
-                    self._quarantine_claimed_executor(controller_id, executor.config.id, executor.config,
-                                                      getattr(executor, '_planned_resume_id', None))
+                    self._record_unfinished_claim(controller_id, executor.config.id, executor.config,
+                                                  getattr(executor, '_planned_resume_id', None))
                     unresolved = self.recovery_required.setdefault(controller_id, [])
                     if executor.config.id not in unresolved:
                         unresolved.append(executor.config.id)
@@ -631,24 +633,23 @@ class ExecutorOrchestrator:
             try:
                 for info in MarketsRecorder.get_instance().get_all_executors():
                     if not info.is_done:
-                        self._quarantine_claimed_executor(info.controller_id, info.id, info.config,
-                                                          (info.custom_info or {}).get('planned_position_resume'))
+                        self._record_unfinished_claim(info.controller_id, info.id, info.config,
+                                                      (info.custom_info or {}).get('planned_position_resume'))
             except Exception:
                 self._resume_preflight_failed = True
-                self.logger().exception('Unfinished claim inspection failed; admission requires reconciliation')
+                self.logger().exception('Unfinished claim inspection failed; reported, trading continues')
             self._bind_restored_after_failure()
-            self.logger().exception('Startup position restore failed; unfinished claims require reconciliation; '
-                                    'reporting and proven protective management continue')
+            self.logger().exception('Startup position restore failed; unfinished claims reported for '
+                                    'reconciliation; trading continues')
             self._planned_resume_pending = False
             return True
         self._planned_resume_pending = False
         return True
 
-    def _quarantine_claimed_executor(self, controller_id, executor_id, config, reference):
-        # A consumed claim is durable ownership, including across the next boot.
-        # Historical completed claims and the legacy V1 marker are not fences.
-        # An unverified reference is also unsafe to trade around; native manifest
-        # validation reports the missing/corrupt history independently.
+    def _record_unfinished_claim(self, controller_id, executor_id, config, reference):
+        # A consumed claim is durable ownership, including across the next boot,
+        # so it stays visible for reconciliation. It is reported, never an order
+        # fence. Historical completed claims and the legacy V1 marker are not tracked.
         if reference is not None and reference != STARTUP_SEALED_RESTORE:
             if (not isinstance(controller_id, str) or not controller_id
                     or not isinstance(getattr(config, 'connector_name', None), str)
@@ -658,27 +659,6 @@ class ExecutorOrchestrator:
                 return
             self._claimed_resume_unresolved.setdefault(controller_id, {})[executor_id] = (
                 config.connector_name, config.trading_pair)
-
-    def claimed_resume_controller_blocked(self, controller_id):
-        return self._resume_preflight_failed or bool(self._claimed_resume_unresolved.get(controller_id))
-
-    def claimed_resume_order_allowed(self, connector_name, trading_pair, side, executor=None,
-                                     position_action=PositionAction.NIL):
-        """Quarantine an unfinished claim without stopping proven protective exits."""
-        affected = (self._resume_preflight_failed
-                    or any((connector_name, trading_pair) in unresolved.values()
-                           for unresolved in self._claimed_resume_unresolved.values()))
-        if not affected:
-            return True
-        if side != TradeType.SELL or position_action != PositionAction.CLOSE or executor is None:
-            return False
-        config = executor.config
-        return (executor._strategy is self.strategy
-                and executor.status != RunnableStatus.TERMINATED
-                and getattr(config, 'side', None) == TradeType.BUY
-                and config.connector_name == connector_name and config.trading_pair == trading_pair
-                and config.id not in self._claimed_resume_unresolved.get(config.controller_id, {})
-                and any(active is executor for active in self.active_executors.get(config.controller_id, [])))
 
     def _claim_planned_positions(self, recorder):
         db_path = getattr(getattr(recorder, "sql_manager", None), "db_path", None)
@@ -1929,8 +1909,6 @@ class ExecutorOrchestrator:
             raise RuntimeError("Planned position ownership transfer is pending; execution is blocked")
         controller_id = action.controller_id
         executor_config = action.executor_config
-        if self.claimed_resume_controller_blocked(controller_id):
-            raise RuntimeError('Unfinished claimed position requires reconciliation; new execution is blocked')
         if controller_id in getattr(self.strategy, "_controller_restart_required", {}):
             raise RuntimeError(f"Controller {controller_id} requires a process restart; new execution is blocked")
         if any(executor.config.id == executor_config.id for executor in self.active_executors.get(controller_id, [])):

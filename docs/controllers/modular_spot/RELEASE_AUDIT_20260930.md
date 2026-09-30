@@ -5,17 +5,20 @@ It has not been promoted to paper, canary or live execution. The upstream
 [Strategy V2 architecture](https://hummingbot.org/strategies/v2-strategies/)
 assigns order management to executors; the custom fork preserves that authority.
 
-A failed planned ownership transfer now quarantines unfinished claimed records.
-The quarantine is reconstructed from the native recorder on another boot.
-Malformed or expired prepared manifests also close new admission before a claim.
-The strategy continues its reporting and management ticks. A registered,
-independently restored long executor can place a protective SELL with
-`PositionAction.CLOSE`. The executor must still be the registered, nonterminated
-object for the exact strategy, controller, connector and pair. Direct orders,
-entry SELLs, unregistered executors and new Create actions cannot bypass the
-affected scope. The exact-operation permit is consumed before the connector
-call and revoked on exit, so synchronous callbacks and inherited asyncio
-contexts cannot reuse it. No failed claim is retried automatically.
+A failed planned ownership transfer now records its unfinished claimed records
+durably. They are reconstructed from the native recorder on the next boot and
+reported through `recovery_required`, the pending reconciliation rows, the
+native status snapshot (`position_resume_recovery`) and `format_status`. A
+malformed or expired prepared manifest, or an unreadable manifest history, is
+reported the same way.
+
+These reports are never an order fence. Per the standing operator decision
+(2026-09-25, restart continuity D2: "We never want to block orders"), entries
+and exits keep running on every pair. An unproven position is not rebuilt as a
+live executor; restart continuity keeps its existing held-ledger handling and
+the profit floor still prevents loss-selling. No failed claim is retried
+automatically. An earlier candidate of this PR fenced order admission and was
+reverted before merge because it also blocked held-bag recovery SELLs.
 
 `NativeFundingStore.assess()` and `entry_notional_ceiling()` do not upgrade source
 bindings or write metadata. The runtime explicitly calls
@@ -35,9 +38,10 @@ remain separate deployment inputs.
 
 Validation uses the pinned deployed compiled runtime with the complete candidate
 Python source and no changed compiled source. Network-disabled regressions cover
-failed restore/claim boundaries, durable restart admission, protective SELLs,
-direct/queued order rejection, inherited asyncio contexts, funding metadata
-purity, explicit runtime preparation and stopped maintenance transitions. This
+failed restore/claim boundaries, durable unfinished-claim reporting across a
+restart, direct/executor/queued orders continuing while claims are reported,
+funding metadata purity, explicit runtime preparation and stopped maintenance
+transitions. This
 does not establish a venue recovery rehearsal or a release image seal.
 
 The final compiled-runtime qualification passed 327 tests and nine subtests;

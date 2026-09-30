@@ -14,7 +14,17 @@ async def safe_wrapper(c):
 
 
 def safe_ensure_future(coro, *args, **kwargs):
-    return asyncio.ensure_future(safe_wrapper(coro), *args, **kwargs)
+    task = asyncio.ensure_future(safe_wrapper(coro), *args, **kwargs)
+
+    def close_unstarted_coroutine(done):
+        # Cancelling before safe_wrapper starts never enters its await or finally.
+        # The helper owns the wrapped coroutine and must release it in that case.
+        if (done.cancelled() and inspect.iscoroutine(coro)
+                and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED):
+            coro.close()
+
+    task.add_done_callback(close_unstarted_coroutine)
+    return task
 
 
 async def safe_gather(*args, **kwargs):

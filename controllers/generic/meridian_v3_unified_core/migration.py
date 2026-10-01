@@ -3,8 +3,8 @@
 The owner's recorder state is bound to identities derived from source and
 configuration: the p23 decision checkpoints (symbol fingerprint), the target slot
 (writer epoch and portfolio recipe) and the grant row (grant policy). A code-only
-image upgrade changes the first two; an explicit `capital_stage` change (canary
-<-> full) changes all three. Without a migration the owner holds new
+image upgrade changes the first two; an explicit `capital_stage` change (between
+any two of canary, full and full_2000) changes all three. Without a migration the owner holds new
 acquisitions (fail closed, reported as IDENTITY_MIGRATION_REQUIRED) while held-bag
 stops and recovery sells continue; it never rewrites or deletes its checkpoints.
 
@@ -12,15 +12,21 @@ The owner records the identity its state is written under (the witness) the
 first time it runs with state it can prove is its own. `plan_identity_migration`
 recomputes the witnessed fingerprints from their recorded configuration and
 sources, checks every persisted row is bound to the witness, and compares the
-witnessed configuration with the current one: any behavioural configuration
-change other than `capital_stage` (with its derived envelope) is refused, and a
-stage change is refused while the persisted grant reservations exceed the target
-stage's envelope or per-asset limit (a full -> canary downgrade with exposure
-above 100 quote). `apply_identity_migration` re-plans inside one SQLite write
-transaction, archives every row it changes in a content-addressed receipt, and
-carries decision checkpoints (claims, cycle, clocks), the target chain and the
-grants forward unchanged except for their identity binding. Native orders,
-fills, executors, positions and held-bag trails are never touched.
+witnessed configuration with the current one. Without a stage change any
+behavioural configuration change is refused. A `capital_stage` change A -> B is
+carried only when the witness is exactly the running configuration projected onto
+stage A by the stage table (`CAPITAL_STAGES`): every value the table derives
+(envelope, per-asset and per-order quote, tranche count, recipe sizing, capital
+policy, mandate and grant policy) must equal the table's A value and every other
+value must be unchanged, so neither a hand-edited size nor a second behavioural
+change rides along. It is refused while the persisted grant reservations exceed the
+target stage's envelope or per-asset limit, or a symbol holds more open grants
+than the target stage's concurrent tranches. `apply_identity_migration` re-plans
+inside one SQLite write transaction, archives every row it changes in a
+content-addressed receipt, and carries decision checkpoints (claims, cycle,
+clocks), the target chain and the grants forward unchanged except for their
+identity binding. Native orders, fills, executors, positions and held-bag trails
+are never touched: nothing is sold, closed or dropped to fit a stage.
 """
 import json
 from decimal import Decimal as D
@@ -195,14 +201,12 @@ class IdentityGuard:
 
 
 # ---------------------------------------------------------------------- migration
-STAGE_FIELDS = frozenset({'capital_stage', 'total_amount_quote', 'live_capital'})
-STAGE_MANDATE_FIELDS = frozenset({'reference_quote', 'funding_envelope_quote'})
-STAGE_GRANT_FIELDS = frozenset({'envelope_quote', 'mandate_sha256'})
 ZERO = D('0')
+MISSING = object()
 
 
 def _stage_change(witness, current):
-    """(from, to) when only the explicit capital stage moved its derived envelope."""
+    """(from, to) when the explicit capital stage changed; its live binding may move only its envelope."""
     old, new = witness['configuration'], current['configuration']
     if old.get('capital_stage') == new.get('capital_stage'):
         return None
@@ -216,21 +220,104 @@ def _stage_change(witness, current):
     return old['capital_stage'], new['capital_stage']
 
 
-def _without_budget_ceiling(configuration):
-    return {**configuration, 'budget': {**configuration['budget'], 'max_quote': None}}
+def _flatten(value, prefix=''):
+    """Dotted path -> JSON leaf. Lists are leaves: a reordered priority is one changed field."""
+    if isinstance(value, dict) and value:
+        result = {}
+        for key, item in value.items():
+            result.update(_flatten(item, f'{prefix}{key}.'))
+        return result
+    return {prefix[:-1]: value}
+
+
+def _behaviour(owner):
+    """Every behavioural value of an owner identity: no source digest, no identity derived from code."""
+    return _flatten({**{k: owner[k] for k in ('configuration', 'mandate', 'policy', 'grant_policy')},
+                     'symbols': {pair: owner['symbols'][pair]['configuration'] for pair in PAIRS}})
+
+
+def stage_projection(config, stage):
+    """`_behaviour` of `config` with only its capital stage replaced, under the running code.
+
+    The stage's values come from `CAPITAL_STAGES` through the same config methods the
+    runtime uses (mandate, recipe sizing, capital policy, budget, grant policy); this
+    module holds no copy of any stage number. Control fields and the seal are dropped:
+    they are not behavioural and the seal binds one stage only.
+    """
+    values = config.model_dump(mode='json')
+    envelope = str(CAPITAL_STAGES[stage].envelope_quote)
+    values.update(capital_stage=stage, total_amount_quote=envelope, recipe_binding=None, execution_enabled=False)
+    if values.get('live_capital') is not None:
+        values['live_capital'] = {**values['live_capital'], 'envelope_quote': envelope}
+    projected = type(config).model_validate(values)
+    mandate, policy = projected.mandate(), projected.p0_policy()
+    return _behaviour(_json({
+        'configuration': {k: v for k, v in projected.sealed_payload().items() if k not in CONTROL_FIELDS},
+        'mandate': mandate.model_dump(mode='json'), 'policy': policy.model_dump(mode='json'),
+        'grant_policy': grant_policy(projected, SimpleNamespace(mandate=mandate, policy=policy)).model_dump(mode='json'),
+        'symbols': {pair: {'configuration': symbol_configuration(symbol)}
+                    for pair, symbol in projected.symbol_configs().items()}}))
+
+
+def _differs(a, b):
+    return sorted(k for k in set(a) | set(b) if a.get(k, MISSING) != b.get(k, MISSING))
+
+
+def _check_stage_projection(config, witness, current, stage):
+    """The stage-derived values that change from `stage[0]` to `stage[1]`, as {path: [from, to]}.
+
+    A field is stage-derived when the stage table gives it different values in any two
+    stages. The witness must be the running configuration projected onto the source
+    stage exactly; a differing stage-derived value means sizing that is not the table's.
+    """
+    projections = {name: stage_projection(config, name) for name in CAPITAL_STAGES}
+    derived = set()
+    for name in CAPITAL_STAGES:
+        derived.update(_differs(projections[name], projections[stage[1]]))
+    if _differs(_behaviour(current), projections[stage[1]]):
+        raise MigrationRefused('running configuration is not its own capital stage projection; identity migration refused')
+    changed = _differs(_behaviour(witness), projections[stage[0]])
+    other = [k for k in changed if k not in derived]
+    if other:
+        raise MigrationRefused(f'behavioural configuration changed ({",".join(other)}); only code '
+                               'and an explicit capital_stage change can be carried')
+    if changed:
+        raise MigrationRefused(f'stage-derived values differ from the {stage[0]} stage table ({",".join(changed)}); '
+                               'hand-edited sizing cannot be carried; identity migration refused')
+    source, target = projections[stage[0]], projections[stage[1]]
+    return {k: [source.get(k), target.get(k)] for k in sorted(derived) if source.get(k, MISSING) != target.get(k, MISSING)}
 
 
 def _grant_exposure(grants):
-    """Reserved quote of every persisted grant, before native reconciliation drops any.
+    """Reserved quote and open grant count of every persisted grant, before native reconciliation drops any.
 
     Every Meridian acquisition spends inside a grant, and a grant is released only by
-    native proof, so this bounds the owner's capital at cost from above.
+    native proof, so this bounds the owner's capital at cost from above and its open
+    tranches per symbol from above.
     """
-    by_asset = {}
+    by_asset, open_grants = {}, {}
     for grant in (grants or {}).get('grants', ()):
         value = PortfolioGrant.model_validate(grant)
         by_asset[value.symbol] = by_asset.get(value.symbol, ZERO) + value.reserved_quote
-    return {'total': sum(by_asset.values(), ZERO), 'by_asset': by_asset}
+        open_grants[value.symbol] = open_grants.get(value.symbol, 0) + 1
+    return {'total': sum(by_asset.values(), ZERO), 'by_asset': by_asset, 'open_grants': open_grants}
+
+
+def _check_target_stage_state(stage, exposure):
+    """Carried state must satisfy the target stage's limits; the migration never sells or drops to fit."""
+    target = CAPITAL_STAGES[stage[1]]
+    worst = max(exposure['by_asset'].values(), default=ZERO)
+    if exposure['total'] > target.envelope_quote or worst > target.per_asset_quote:
+        raise MigrationRefused(
+            f'capital stage {stage[0]} -> {stage[1]} refused: reserved exposure {exposure["total"]} quote '
+            f'(largest asset {worst}) exceeds the {stage[1]} envelope {target.envelope_quote} / per-asset '
+            f'{target.per_asset_quote}; let exposure fall below the target stage first')
+    for pair, count in sorted(exposure['open_grants'].items()):
+        if count > target.max_active_tranches:
+            raise MigrationRefused(
+                f'capital stage {stage[0]} -> {stage[1]} refused: {pair} holds {count} open grants but the '
+                f'{stage[1]} stage admits {target.max_active_tranches} concurrent tranches per symbol; '
+                'let open tranches fall to the target stage first')
 
 
 def _changes(old, new):
@@ -262,25 +349,23 @@ def _plan(config, current, rows):
     if bad:
         raise MigrationRefused(f'persisted state is not bound to the witnessed identity: {",".join(bad)}')
     stage = _stage_change(witness, current)
-    changed = [k for k in _changes(witness['configuration'], current['configuration'])
-               if stage is None or k not in STAGE_FIELDS]
-    if changed:
-        raise MigrationRefused(f'behavioural configuration changed ({",".join(changed)}); only code '
-                               'and an explicit capital_stage change can be carried')
-    if witness['policy'] != current['policy']:
-        raise MigrationRefused('P0 policy changed; identity migration refused')
-    allowed = STAGE_MANDATE_FIELDS if stage else frozenset()
-    if [k for k in _changes(witness['mandate'], current['mandate']) if k not in allowed]:
-        raise MigrationRefused('portfolio mandate changed beyond the capital stage; identity migration refused')
-    for pair in PAIRS:
-        old, new = witness['symbols'][pair]['configuration'], current['symbols'][pair]['configuration']
-        if stage:
-            old, new = _without_budget_ceiling(old), _without_budget_ceiling(new)
-        if old != new:
-            raise MigrationRefused(f'{pair} effective p23 configuration changed; identity migration refused')
-    allowed = STAGE_GRANT_FIELDS if stage else frozenset()
-    if [k for k in _changes(witness['grant_policy'], current['grant_policy']) if k not in allowed]:
-        raise MigrationRefused('grant policy changed beyond the capital stage; identity migration refused')
+    if stage:
+        stage_changes = _check_stage_projection(config, witness, current, stage)
+    else:
+        stage_changes = {}
+        changed = _changes(witness['configuration'], current['configuration'])
+        if changed:
+            raise MigrationRefused(f'behavioural configuration changed ({",".join(changed)}); only code '
+                                   'and an explicit capital_stage change can be carried')
+        if witness['policy'] != current['policy']:
+            raise MigrationRefused('P0 policy changed; identity migration refused')
+        if witness['mandate'] != current['mandate']:
+            raise MigrationRefused('portfolio mandate changed beyond the capital stage; identity migration refused')
+        for pair in PAIRS:
+            if witness['symbols'][pair]['configuration'] != current['symbols'][pair]['configuration']:
+                raise MigrationRefused(f'{pair} effective p23 configuration changed; identity migration refused')
+        if witness['grant_policy'] != current['grant_policy']:
+            raise MigrationRefused('grant policy changed beyond the capital stage; identity migration refused')
     decisions = {pair: decode(value) for pair, value in rows['decisions'].items() if value is not None}
     target = None if rows['target'] is None else json.loads(rows['target'])
     grants = None if rows['grants'] is None else json.loads(rows['grants'])
@@ -292,17 +377,11 @@ def _plan(config, current, rows):
         raise MigrationRefused('identity changed without a code or capital stage change; explicit reconciliation required')
     exposure = _grant_exposure(grants)
     if stage:
-        policy = current['grant_policy']
-        envelope, per_asset = D(policy['envelope_quote']), D(policy['per_asset_quote'])
-        worst = max(exposure['by_asset'].values(), default=ZERO)
-        if exposure['total'] > envelope or worst > per_asset:
-            raise MigrationRefused(
-                f'capital stage {stage[0]} -> {stage[1]} refused: reserved exposure {exposure["total"]} quote '
-                f'(largest asset {worst}) exceeds the {stage[1]} envelope {envelope} / per-asset {per_asset}; '
-                'let exposure fall below the target stage first')
+        _check_target_stage_state(stage, exposure)
     transition_id = identity([witness, current, rows])
     return {
         'transition_id': transition_id, 'kinds': kinds, 'controller_id': current['controller_id'],
+        'stage_fields': list(stage_changes), 'stage_changes': stage_changes,
         'from': {k: witness[k] for k in ('source_sha256', 'portfolio_source_sha256', 'recipe_sha256')}
         | {'epoch': witness['writer']['epoch'], 'grant_policy_sha256': witness['grant_policy_sha256']},
         'to': {k: current[k] for k in ('source_sha256', 'portfolio_source_sha256', 'recipe_sha256')}

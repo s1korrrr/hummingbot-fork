@@ -76,7 +76,7 @@ class OwnerStateCase(IsolatedAsyncioTestCase):
         return await self.closed(s, grants=grants, held=s.held(BTC), eth=eth.config.id, btc=btc.config.id)
 
     async def closed(self, s, **state):
-        state.update(rows=self.rows(s), minute=s.minute, sequence=dict(s.sequence), trades=dict(s.trade_sequence))
+        state.update(rows=self.rows(s), cash=s.cash, minute=s.minute, sequence=dict(s.sequence), trades=dict(s.trade_sequence))
         await s.close()
         return state
 
@@ -90,7 +90,7 @@ class OwnerStateCase(IsolatedAsyncioTestCase):
         values['controllers_sha256'] = hashlib.sha256(json.dumps(
             [unified(execution_enabled=True, **config).model_dump(mode='json')], sort_keys=True).encode()).hexdigest()
         marker.write_text(json.dumps(values))
-        r = self.scenario(restore=True, **config)
+        r = self.scenario(restore=True, cash=state.get('cash', '500'), **config)
         r.minute, r.sequence, r.trade_sequence = state['minute'], dict(state['sequence']), dict(state['trades'])
         return r
 

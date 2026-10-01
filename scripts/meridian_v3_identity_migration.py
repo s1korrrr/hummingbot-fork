@@ -5,7 +5,10 @@ Operator maintenance only; never run by the controller. After a code-only image
 upgrade the owner holds new acquisitions (IDENTITY_MIGRATION_REQUIRED) and keeps
 its protective bag stops. Run `plan` with the new image, the owner's resealed
 controller file and its recorder database, review the plan, then run `apply`
-with the plan's transition id. Any behavioural configuration change is refused.
+with the plan's transition id. Any behavioural configuration change is refused,
+except an explicit `capital_stage` change whose every stage-derived value is the
+stage table's; the plan lists those values (`stage_changes`) and is refused while
+reserved exposure or open tranches exceed the target stage.
 
     meridian_v3_identity_migration.py plan  --config sealed.yml --database data/x.sqlite --recorder-name conf.yml
     meridian_v3_identity_migration.py apply --config sealed.yml --database data/x.sqlite --recorder-name conf.yml \

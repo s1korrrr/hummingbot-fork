@@ -120,8 +120,12 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     execution_mode: Literal['observation', 'paper', 'live']
     # Explicit capital scale; never defaulted. canary = 100 envelope, full = 500 envelope,
     # both 100 per asset and 20 per order; full_2000 = 2,000 envelope, no per-asset cap
-    # (per asset = envelope), 100 per order, 20 tranches. Changing it on an owner with
-    # state is an explicit operator identity migration (see migration.py).
+    # (per asset = envelope), 100 per order, 20 tranches. On an owner with state a change
+    # holds acquisitions (bags and exits keep running) until the operator plans and applies
+    # the identity migration (migration.py). It carries state only when every other value is
+    # unchanged and every stage-derived value is the stage table's, and only once reserved
+    # grants fit the target envelope and per-asset limit and each symbol's open grants fit
+    # its tranche count; it never sells, closes or drops a bag to make them fit.
     capital_stage: Literal['canary', 'full', 'full_2000'] = Field(json_schema_extra={'is_updatable': False})
     connector_name: Literal['okx', 'okx_paper_trade']
     account_id: str = Field(pattern=NAME)

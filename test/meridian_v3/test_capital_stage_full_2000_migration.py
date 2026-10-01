@@ -177,11 +177,11 @@ class Full2000MigrationTests(OwnerStateCase):
         self.assertEqual(r.held(BTC), before['held'])
         # The ETH tranche's grant stays bound to the same native executor across the stage change.
         self.assertEqual([g.executor_id for g in r.grants() if g.symbol == ETH], [before['eth']])
-        receipt = await r.step(rsi={SOL: rebound()})  # entries resume at the full_2000 order size
+        receipt = await r.step(rsi={SOL: rebound()})  # entries resume at the full_2000 order size (50)
         [entry] = creates(receipt, SOL)
         quote = entry.executor_config.amount * entry.executor_config.entry_price
-        self.assertGreater(quote, D('90'))
-        self.assertLessEqual(quote, D('100'))
+        self.assertGreater(quote, D('45'))
+        self.assertLessEqual(quote, D('50'))
 
     async def test_full_2000_to_full_migrates_when_exposure_fits_full(self):
         before = await self.owner('full_2000', (BTC, ETH))
@@ -192,7 +192,7 @@ class Full2000MigrationTests(OwnerStateCase):
                          {'order_quote_including_fees': '20', 'asset_quote': '100', 'envelope_quote': '500'})
 
     async def test_full_2000_to_full_is_refused_above_the_full_per_asset_limit(self):
-        before = await self.owner('full_2000', (BTC, BTC))  # two 100 tranches on one asset
+        before = await self.owner('full_2000', (BTC, BTC, BTC))  # three 50 tranches on one asset: 150 > 100
         r = self.restore(before, capital_stage='full')
         await r.step()
         held = r.held(BTC)
@@ -206,7 +206,7 @@ class Full2000MigrationTests(OwnerStateCase):
         self.assertEqual(self.migration_rows(r), self.migration_rows(before))  # grants and claims untouched
 
     async def test_full_2000_to_full_is_refused_above_the_full_envelope(self):
-        before = await self.owner('full_2000', (BTC, ETH, BNB, SOL, XRP, ETH))
+        before = await self.owner('full_2000', (BTC, ETH, BNB, SOL, XRP, BTC, ETH, BNB, SOL, XRP, ETH))  # 11 x 50 = 550 > 500
         r = self.restore(before, capital_stage='full')
         await r.step()
         with self.assertRaisesRegex(MigrationRefused, r'reserved exposure 5\d\d(\.\d+)? quote .* full envelope 500'):

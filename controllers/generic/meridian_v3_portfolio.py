@@ -38,14 +38,14 @@ class CapitalStage(NamedTuple):
 # The only admitted capital scales. Canary keeps the full per-order and per-asset sizes,
 # so fills and one asset's DCA stages behave identically; only the shared envelope, for
 # which the five assets compete in P0 priority, is smaller. `full_2000` (operator
-# 2026-10-01: five pairs, 100 per buy, 2,000 per controller, no per-pair cap) sets the
+# 2026-10-01: five pairs, 50 per buy, 2,000 per controller, no per-pair cap) sets the
 # per-asset limit equal to the envelope, so only the shared envelope and the tranche count
-# bound one symbol; its recipe sizing (bag slice 200, depth budget 2,000) derives from these
-# numbers in `meridian_v3_recipe`. No other numbers exist.
+# (40 x 50 = the envelope) bound one symbol; its recipe sizing (bag slice 100, depth budget
+# 2,000) derives from these numbers in `meridian_v3_recipe`. No other numbers exist.
 CAPITAL_STAGES = MappingProxyType({
     'canary': CapitalStage(Decimal('100'), Decimal('100'), Decimal('20')),
     'full': CapitalStage(Decimal('500'), Decimal('100'), Decimal('20')),
-    'full_2000': CapitalStage(Decimal('2000'), Decimal('2000'), Decimal('100'), 20),
+    'full_2000': CapitalStage(Decimal('2000'), Decimal('2000'), Decimal('50'), 40),
 })
 
 
@@ -123,7 +123,7 @@ class MeridianPortfolioRecipe:
                 or stage not in {s.limits() for s in CAPITAL_STAGES.values()}
                 or mandate.reference_quote != mandate.funding_envelope_quote):
             raise ValueError('Meridian requires its explicit five pairs and a canary 20/100/100, '
-                             'full 20/100/500 or full_2000 100/2000/2000 mandate')
+                             'full 20/100/500 or full_2000 50/2000/2000 mandate')
         if set(policy.pair_priority) != set(mandate.pairs) or policy.producers != ('bnb_p23_mr',):
             raise ValueError('explicit five-pair priority and supported BNB MR producer required; MOM is not qualified')
         self.recipe_sha256 = digest(dict(recipe_id=RECIPE_ID, source_sha256=source_identity(),

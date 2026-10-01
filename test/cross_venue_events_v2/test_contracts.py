@@ -1,9 +1,13 @@
 import ast
+import hashlib
 import inspect
+import json
+import subprocess
+import sys
 import unittest
 from decimal import Decimal
 
-from pydantic import ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from hummingbot.strategy_v2.components.events_v2.contracts import (
     CoverageScope,
@@ -54,6 +58,36 @@ def snapshot(events=None, **changes):
 
 
 class ContractTests(unittest.TestCase):
+    def test_snapshot_schema_keeps_canonical_wire_and_instance_contract(self):
+        item = snapshot()
+        payload = item.model_dump(mode='json')
+        encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), allow_nan=False)
+        self.assertEqual(item.schema, 'cross_venue_event.snapshot.v2')
+        self.assertEqual(payload['schema'], item.schema)
+        self.assertNotIn('schema_id', payload)
+        self.assertEqual(item.model_dump()['schema'], item.schema)
+        self.assertEqual(json.loads(item.model_dump_json())['schema'], item.schema)
+        self.assertEqual(item.model_dump(by_alias=False)['schema'], item.schema)
+        self.assertEqual(json.loads(item.model_dump_json(by_alias=False))['schema'], item.schema)
+        self.assertEqual(TypeAdapter(QualifiedEventSnapshotV2).dump_python(item, mode='json'), payload)
+
+        class Envelope(BaseModel):
+            snapshot: QualifiedEventSnapshotV2
+
+        self.assertEqual(Envelope(snapshot=item).model_dump(mode='json')['snapshot'], payload)
+        self.assertEqual(QualifiedEventSnapshotV2.model_validate(payload).model_dump(mode='json'), payload)
+        self.assertEqual(hashlib.sha256(encoded.encode()).hexdigest(),
+                         'f1cdc069655a4e00fb2cfc407d201e0540264641a06ef2a3b6436875cd3ecc09')  # noqa: mock
+        with self.assertRaises(ValidationError):
+            snapshot(schema='cross_venue_event.snapshot.v3')
+
+    def test_snapshot_contract_cold_import_is_warning_free(self):
+        result = subprocess.run(
+            [sys.executable, '-W', 'error', '-c',
+             'from hummingbot.strategy_v2.components.events_v2.contracts import QualifiedEventSnapshotV2'],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_late_receipt_does_not_make_market_preexisting(self):
         with self.assertRaisesRegex(ValueError, 'OKX_MARKET_NOT_PREEXISTING'):
             validate_preexisting_market(first_public_ms=1780000000000, listed_ms=1780000000500)

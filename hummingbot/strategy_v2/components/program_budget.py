@@ -189,10 +189,10 @@ class BudgetStore:
                 and getattr(config, 'min_sell_price', None) is not None)
 
     def _is_terminal_flat(self, info, released=frozenset()):
-        if info.id in released:
-            return True
         if info.is_done is not True or info.is_active is not False:
             return False
+        if info.id in released:
+            return True
         if self._is_member_bag_sell(info):
             return True  # a finished bag sell no longer occupies its pair
         try:
@@ -240,6 +240,8 @@ class BudgetStore:
 
     def _check_unreserved(self, reservations, members, evidence, released=frozenset()):
         for key, info in evidence.items():
+            if key in released and (info.is_done is not True or info.is_active is not False):
+                raise PolicyError('unreserved or reappearing native inventory requires reconciliation')
             pair = members.get(info.controller_id)
             if pair is not None and key not in reservations and not self._flat(info.controller_id, pair, info, released):
                 raise PolicyError('unreserved or reappearing native inventory requires reconciliation')

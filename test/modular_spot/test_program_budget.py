@@ -140,6 +140,20 @@ def test_held_bag_keeps_its_reservation_until_a_durable_release(budget):
     assert not budget.reserve(reservation(amount='1'), native_executors=[held])
 
 
+def test_active_receipt_reappearing_after_held_release_holds_program_budget(budget):
+    assert budget.reserve(reservation(amount='100'), native_executors=[])
+    held = _held()
+    sold = _sell('bag-sell-1', active=False)
+    budget.release_held('modular_spot_1', ['claim-1', 'bag-sell-1'], native_executors=[held, sold])
+    assert budget.occupied_pairs(native_executors=[held, sold]) == ()
+
+    for reappeared in (_held(done=False), _sell('bag-sell-1', active=True)):
+        with pytest.raises(PolicyError, match='unreserved or reappearing'):
+            budget.occupied_pairs(native_executors=[reappeared])
+        with pytest.raises(PolicyError, match='unreserved or reappearing'):
+            budget.reserve(reservation(2, '100', 'ETH-USDC'), native_executors=[reappeared])
+
+
 @pytest.mark.parametrize('target', [
     _held(done=False),  # still active
     _held(2),  # another member's executor

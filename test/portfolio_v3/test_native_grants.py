@@ -162,6 +162,34 @@ def test_held_release_is_symbol_scoped_and_proven(native):
     assert 'x1' in s.released()
 
 
+def test_active_receipt_reappearing_after_held_release_holds_new_grants(native):
+    def bag_sell(*, done):
+        config = NS(controller_id=OWNER, connector_name='okx_paper_trade', trading_pair='BTC-USDC',
+                    type='order_executor', side=NS(name='SELL'), position_action=NS(name='CLOSE'),
+                    level_id='modular_spot:v1:bag:recovery:pullback', min_sell_price=D('101'))
+        return NS(id='bag-sell-1', controller_id=OWNER, is_done=done, is_active=not done,
+                  config=config, custom_info={})
+
+    s = store(native, envelope_quote=20, per_asset_quote=20)
+    admit(s, 'BTC-USDC')
+    assert s.bind(executor_id='x1', symbol='BTC-USDC', reserved_quote=20, now_ms=1000, native_executors=())
+    held = executor('x1', done=True, remaining='.2', owner='held_position')
+    sold = bag_sell(done=True)
+    s.release_held(symbol='BTC-USDC', executor_ids=('x1', 'bag-sell-1'),
+                   native_executors=(held, sold), now_ms=2000)
+    assert s.grants(now_ms=2000, native_executors=(held, sold)) == ()
+
+    for reappeared in (executor('x1', done=False, remaining='.2', owner='held_position'),
+                       executor('x1', done=False, remaining='.2', owner='held_position', connector='other'),
+                       executor('x1', pair='BTC-USDT', done=False, remaining='.2', owner='held_position'),
+                       bag_sell(done=False)):
+        with pytest.raises(PolicyError, match='unreserved or reappearing'):
+            s.grants(now_ms=2001, native_executors=(reappeared,))
+        with pytest.raises(PolicyError, match='unreserved or reappearing'):
+            admit(s, 'ETH-USDC', setup='cut2', now=2001, decision=2001, expires=62001,
+                  evidence=(reappeared,))
+
+
 def test_unexecuted_release_needs_absent_executor_and_matching_symbol(native):
     s = store(native)
     admit(s, 'BTC-USDC', 'ETH-USDC')

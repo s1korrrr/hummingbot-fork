@@ -12,6 +12,7 @@ UNAVAILABLE observation and is logged at WARNING at most once per state/reason k
 ``LOG_INTERVAL_SECONDS``; repeats are DEBUG.
 """
 import asyncio
+import inspect
 import logging
 import time
 from collections import deque
@@ -230,11 +231,19 @@ class MarketContextObserver:
 
     def close(self):
         """Close the client's refresh task; returns an awaitable task or None."""
-        client, self.client = self.client, None
+        client = self.client
         if client is None:
             return None
         try:
             loop = asyncio.get_running_loop()
-        except RuntimeError:  # no running loop at shutdown: no refresh task was started on one either
+        except RuntimeError:
             return None
-        return loop.create_task(client.close())
+        closing = client.close()
+        try:
+            task = loop.create_task(closing)
+        except BaseException:
+            if inspect.getcoroutinestate(closing) == inspect.CORO_CREATED:
+                closing.close()
+            raise
+        self.client = None
+        return task

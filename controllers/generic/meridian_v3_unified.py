@@ -75,6 +75,8 @@ class MeridianUnifiedController(ControllerBase):
         self.fault = None
         self.market_context = MarketContextObserver(config.market_context, clock_ms=self.portfolio.now_ms,
                                                     logger=self.logger())
+        self._data_close_tasks = set()
+        self._data_close_error = None
 
     # ------------------------------------------------------------------ native report
     @property
@@ -128,32 +130,69 @@ class MeridianUnifiedController(ControllerBase):
 
     # ------------------------------------------------------------------ lifecycle
     def start(self):
+        starting = self.status != RunnableStatus.RUNNING
+        if starting:
+            self._assert_control_loop_stopped()
+            if any(not task.done() for task in self._data_close_tasks):
+                raise RuntimeError('Meridian candle readers are still stopping; retry after they finish')
+            if self._data_close_error is not None:
+                raise RuntimeError('Meridian candle reader cleanup failed; a controlled process restart is required') from self._data_close_error
+        try:
+            super().start()
+        except BaseException:
+            if starting:
+                self._close_data()
+            raise
+
+    async def on_start(self):
+        await super().on_start()
         if self.config.data.mode == 'shared':
             for context in self.contexts.values():
                 if context.runtime.pool is None:
                     context.runtime.pool = attach_pool(self.market_data_provider, context.config)
-        super().start()
 
     def _close_data(self):
-        tasks = [c.runtime.close_data() for c in self.contexts.values()] + [self.market_context.close()]
-        return [task for task in tasks if task is not None]
+        for close in [c.runtime.close_data for c in self.contexts.values()] + [self.market_context.close]:
+            try:
+                task = close()
+                if task is not None and task not in self._data_close_tasks:
+                    self._data_close_tasks.add(task)
+                    task.add_done_callback(self._data_closed)
+            except BaseException as error:
+                self._data_close_error = error
+                self.logger().error('Meridian candle reader cleanup could not be scheduled: %s', error)
+                raise
+        return list(self._data_close_tasks)
 
     def stop(self):
         super().stop()
-        for task in self._close_data():
-            task.add_done_callback(self._data_closed)
+        self._close_data()
 
     async def control_loop(self):
         try:
             await super().control_loop()
         finally:
-            tasks = self._close_data()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                self._close_data()
+            finally:
+                # A later scheduling failure must not abandon earlier close tasks.
+                if self._data_close_tasks:
+                    await asyncio.gather(*self._data_close_tasks, return_exceptions=True)
+
+    def _control_loop_finished(self, task):
+        try:
+            if task is self._control_loop_task:
+                # Cancellation before the coroutine's first tick skips its finally.
+                self._close_data()
+        finally:
+            super()._control_loop_finished(task)
 
     def _data_closed(self, task):
-        if not task.cancelled() and task.exception() is not None:
-            self.logger().error('Meridian candle reader did not close cleanly: %s', task.exception())
+        self._data_close_tasks.discard(task)
+        error = RuntimeError('reader cleanup was cancelled') if task.cancelled() else task.exception()
+        if error is not None:
+            self._data_close_error = error
+            self.logger().error('Meridian candle reader did not close cleanly: %s', self._data_close_error)
 
     def get_candles_config(self):
         if self.config.data.mode == 'shared':

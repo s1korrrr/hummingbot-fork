@@ -370,6 +370,9 @@ class OrderBookTracker:
             for _, task in self._tracking_tasks.items():
                 task.cancel()
             self._tracking_tasks.clear()
+        # A restarted pair must buffer early stream messages, not route them to
+        # its cancelled consumer's queue before the new book is initialized.
+        self._tracking_message_queues.clear()
         self._order_books_initialized.clear()
         self._book_observations.clear()
 

@@ -99,6 +99,64 @@ async def test_stream_recovery_snapshot_routes_even_when_initial_rest_snapshot_i
     assert queue.get_nowait() is snapshot
 
 
+@pytest.mark.asyncio
+async def test_restart_buffers_stream_baseline_until_later_pair_is_initialized():
+    source = SimpleNamespace(requires_order_book_stream_validation=True,
+                             request_order_book_resync=AsyncMock())
+    source.order_book_stream_valid = lambda pair, epoch: epoch == 1
+    tracker = OrderBookTracker(source, ['BTC-USDC', 'ETH-USDC'])
+    tracker._tracking_message_queues = {pair: asyncio.Queue() for pair in tracker._trading_pairs}
+    tracker._order_books = {pair: OrderBook() for pair in tracker._trading_pairs}
+    tracker.stop()  # A previous run's pair consumers are gone.
+
+    first_initialized = asyncio.Event()
+    resume_initialization = asyncio.Event()
+
+    async def initial_book(pair):
+        return OrderBook()
+
+    async def stagger(delay):
+        if not first_initialized.is_set():
+            first_initialized.set()
+            await resume_initialization.wait()
+
+    tracker._initial_order_book_for_trading_pair = initial_book
+    tracker._sleep = stagger
+    initialization = asyncio.create_task(tracker._init_order_books())
+    router = asyncio.create_task(tracker._order_book_diff_router())
+    try:
+        await asyncio.wait_for(first_initialized.wait(), 1)
+        messages = []
+        for kind, event, update, bid in ((OrderBookMessageType.SNAPSHOT, 99, 99000, '99'),
+                                         (OrderBookMessageType.DIFF, 99.1, 99100, '100')):
+            messages.append(OrderBookMessage(
+                kind, {'trading_pair': 'ETH-USDC', 'update_id': update, 'stream_epoch': 1,
+                       'bids': [[bid, '2']], 'asks': [['101', '2']]}, event))
+            tracker._order_book_diff_stream.put_nowait(messages[-1])
+        for _ in range(100):
+            if tracker.metrics.total_diffs_queued + tracker.metrics.total_diffs_processed == 2:
+                break
+            await asyncio.sleep(.01)
+        assert list(tracker._saved_message_queues['ETH-USDC']) == messages
+        resume_initialization.set()
+        await asyncio.wait_for(initialization, 1)
+        for _ in range(100):
+            observation = tracker.get_order_book_observation('ETH-USDC')
+            if observation is not None and observation.event_timestamp == 99.1:
+                break
+            await asyncio.sleep(.01)
+        assert tracker.get_order_book_observation('ETH-USDC').event_timestamp == 99.1
+        assert tracker.order_books['ETH-USDC'].get_price(False) == 100
+        source.request_order_book_resync.assert_not_awaited()
+    finally:
+        resume_initialization.set()
+        tracked = list(tracker._tracking_tasks.values())
+        tracker.stop()
+        initialization.cancel()
+        router.cancel()
+        await asyncio.gather(initialization, router, *tracked, return_exceptions=True)
+
+
 def test_stale_live_book_cannot_demote_a_tranche_through_the_bag_stop_fallback():
     runtime = object.__new__(SymbolRuntime)
     runtime.controller = Mock()

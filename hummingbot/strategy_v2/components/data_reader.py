@@ -1,5 +1,6 @@
 """Opt-in, process-local sharing for modular controllers; native providers are untouched."""
 import asyncio
+import inspect
 import time
 from decimal import Decimal
 from typing import Literal
@@ -161,15 +162,25 @@ def attach_pool(provider, config):
 def release_pool(provider, pool):
     if pool is None:
         return None
-    pool.references -= 1
-    if pool.references < 0:
+    remaining = pool.references - 1
+    if remaining < 0:
         raise PolicyError('shared reader released twice')
-    if pool.references:
+    if remaining:
+        pool.references = remaining
         return None
+    task = None
+    if pool.client is not None:
+        closing = pool.close()
+        try:
+            task = asyncio.create_task(closing, name='modular-candle-reader-close')
+        except BaseException:
+            if inspect.getcoroutinestate(closing) == inspect.CORO_CREATED:
+                closing.close()
+            raise
+    # Keep the last owner reachable unless the loop accepted cleanup ownership.
+    pool.references = remaining
     peers = _POOLS.get(provider, {})
     for key, value in tuple(peers.items()):
         if value is pool:
             del peers[key]
-    if pool.client is not None:
-        return asyncio.create_task(pool.close(), name='modular-candle-reader-close')
-    return None
+    return task

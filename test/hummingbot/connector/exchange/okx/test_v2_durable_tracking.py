@@ -1,4 +1,5 @@
 import asyncio
+import json
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -9,6 +10,7 @@ from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.model.metadata import Metadata
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 
 
@@ -85,12 +87,98 @@ async def test_native_market_state_is_durable_before_venue_submission(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_opted_in_submission_rejects_missing_or_foreign_recorder(monkeypatch):
+@pytest.mark.parametrize('kind', [OrderType.LIMIT_MAKER, OrderType.MARKET])
+@pytest.mark.parametrize('side', [TradeType.BUY, TradeType.SELL])
+async def test_meridian_submission_commits_native_identity_before_venue_io(tmp_path, monkeypatch, kind, side):
+    monkeypatch.setenv('RSIBOT_V2_DURABLE_ORDER_TRACKING', '1')
+    market = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
+    market._set_current_timestamp(1790764800)
+    sql = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                               db_path=str(tmp_path / 'meridian_v3.sqlite'))
+    prior = MarketsRecorder._shared_instance
+    recorder = MarketsRecorder(sql, [market], 'meridian_v3.yml', 'v2_with_controllers',
+                               MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+    market.start_tracking_order('meridian-client', None, 'ETH-USDC', side,
+                                Decimal('NaN') if kind == OrderType.MARKET else Decimal('100'), Decimal('.09'), kind)
+    order = market.in_flight_orders['meridian-client']
+
+    async def uncertain_venue_submission(**kwargs):
+        # A separate connection must see both identities before any venue I/O.
+        with sql.get_new_session() as session:
+            stored = recorder.get_market_states('meridian_v3.yml', market, session)
+            assert stored.saved_state['meridian-client']['last_state'] == '0'
+            receipt = json.loads(session.get(Metadata, 'v2-submitted-order:meridian-client').value)
+            assert receipt['owner'] == 'meridian_v3.yml'
+            assert receipt['order'] == order.to_json()
+        raise asyncio.CancelledError()
+
+    try:
+        with patch.object(market, '_place_order', side_effect=uncertain_venue_submission) as place:
+            with pytest.raises(asyncio.CancelledError):
+                await market._place_order_and_process_update(order)
+            place.assert_awaited_once()
+            # Transport uncertainty never permits a second submission of this ID.
+            with pytest.raises(ValueError, match='already submitted'):
+                await market._place_order_and_process_update(order)
+            place.assert_awaited_once()
+        replacement = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
+        recorder.restore_market_states('meridian_v3.yml', replacement)
+        assert replacement.in_flight_orders['meridian-client'].to_json() == order.to_json()
+    finally:
+        MarketsRecorder._shared_instance = prior
+        sql.engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('recorder_kind', ['missing', 'foreign-owner', 'foreign-market'])
+async def test_opted_in_submission_rejects_missing_or_foreign_recorder(tmp_path, monkeypatch, recorder_kind):
     monkeypatch.setenv('RSIBOT_V2_DURABLE_ORDER_TRACKING', '1')
     market = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
     market.start_tracking_order('owned-client', None, 'ETH-USDC', TradeType.BUY, Decimal('100'),
                                 Decimal('.09'), OrderType.LIMIT_MAKER)
-    with patch.object(MarketsRecorder, '_shared_instance', None), patch.object(market, '_place_order', new_callable=AsyncMock) as place:
-        with pytest.raises(ValueError, match='durable V2'):
-            await market._place_order_and_process_update(market.in_flight_orders['owned-client'])
-        place.assert_not_awaited()
+    prior = MarketsRecorder._shared_instance
+    sql = None
+    try:
+        MarketsRecorder._shared_instance = None
+        if recorder_kind != 'missing':
+            sql = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                                       db_path=str(tmp_path / 'foreign.sqlite'))
+            other_market = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
+            MarketsRecorder(sql, [other_market if recorder_kind == 'foreign-market' else market],
+                            'meridian_v3.yml' if recorder_kind == 'foreign-market' else 'unapproved.yml',
+                            'v2_with_controllers',
+                            MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+        with patch.object(market, '_place_order', new_callable=AsyncMock) as place:
+            with pytest.raises(ValueError, match='matching durable'):
+                await market._place_order_and_process_update(market.in_flight_orders['owned-client'])
+            place.assert_not_awaited()
+    finally:
+        MarketsRecorder._shared_instance = prior
+        if sql is not None:
+            sql.engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('owner', ['rsi_modular_v2.yml', 'meridian_v3.yml'])
+async def test_failed_durable_commit_blocks_venue_submission(tmp_path, monkeypatch, owner):
+    monkeypatch.setenv('RSIBOT_V2_DURABLE_ORDER_TRACKING', '1')
+    market = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
+    sql = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                               db_path=str(tmp_path / 'failed.sqlite'))
+    prior = MarketsRecorder._shared_instance
+    recorder = MarketsRecorder(sql, [market], owner, 'v2_with_controllers',
+                               MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+    market.start_tracking_order('owned-client', None, 'ETH-USDC', TradeType.BUY, Decimal('100'),
+                                Decimal('.09'), OrderType.LIMIT_MAKER)
+    try:
+        with patch.object(recorder, 'save_market_states', side_effect=IOError('durable storage unavailable')), \
+                patch.object(market, '_place_order', new_callable=AsyncMock) as place:
+            with pytest.raises(IOError, match='storage unavailable'):
+                await market._place_order_and_process_update(market.in_flight_orders['owned-client'])
+            place.assert_not_awaited()
+        with sql.get_new_session() as session:
+            assert session.get(Metadata, 'v2-submitted-order:owned-client') is None
+            assert recorder.get_market_states(owner, market, session) is None
+    finally:
+        MarketsRecorder._shared_instance = prior
+        sql.engine.dispose()

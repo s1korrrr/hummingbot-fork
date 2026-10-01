@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import importlib
+import inspect
 from copy import deepcopy
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -18,6 +19,7 @@ from hummingbot.strategy_v2.components.candle_aggregation import derive_higher_t
 from hummingbot.strategy_v2.components.candle_data import Dataset
 from hummingbot.strategy_v2.components.data_reader import DataPolicy, DataPool
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1
+from hummingbot.strategy_v2.models.base import RunnableStatus
 
 from .domain import DataUnavailable, PolicyError
 from .native_funding import CandidateFundingPolicy, NativeFundingStore
@@ -234,6 +236,8 @@ class NativeComposition:
         if config.data.mode == 'shared':
             self.shared_candles = NativeCandleProvider(market_data_provider, config, self._native_family)
             market_data_provider = self.shared_candles
+        self._reader_close_task = None
+        self._reader_close_error = None
         super().__init__(config, market_data_provider, actions_queue, **kwargs)
         self._composition_digest = configuration_digest(config.model_dump(mode='json'))
         self._funding_store = None
@@ -259,10 +263,52 @@ class NativeComposition:
             self.shared_candles.pool.start()
         super().initialize_candles()
 
+    def start(self):
+        if self.status != RunnableStatus.RUNNING:
+            self._assert_control_loop_stopped()
+            task = getattr(self, '_reader_close_task', None)
+            if task is not None and not task.done():
+                raise RuntimeError('Modular native candle reader is still stopping; retry after it finishes')
+            error = getattr(self, '_reader_close_error', None)
+            if error is None and task is not None:
+                error = RuntimeError('reader cleanup was cancelled') if task.cancelled() else task.exception()
+            if error is not None:
+                raise RuntimeError('Modular native candle reader cleanup failed; process restart required') from error
+            self._reader_close_task = None
+        super().start()
+
     def on_stop(self):
-        if self.shared_candles is not None:
-            asyncio.create_task(self.shared_candles.pool.close(), name='modular-native-candle-close')
-        super().on_stop()
+        try:
+            if self.shared_candles is not None:
+                close = self.shared_candles.pool.close()
+                try:
+                    task = asyncio.create_task(close, name='modular-native-candle-close')
+                except BaseException:
+                    if inspect.getcoroutinestate(close) == inspect.CORO_CREATED:
+                        close.close()
+                    raise
+                self._reader_close_task = task
+                task.add_done_callback(self._reader_closed)
+        except BaseException as error:
+            self._reader_close_error = error
+            self.logger().error('Modular native candle reader release failed: %s', error)
+            raise
+        finally:
+            super().on_stop()
+
+    async def control_loop(self):
+        try:
+            await super().control_loop()
+        finally:
+            task = getattr(self, '_reader_close_task', None)
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+
+    def _reader_closed(self, task):
+        error = RuntimeError('reader cleanup was cancelled') if task.cancelled() else task.exception()
+        if error is not None:
+            self._reader_close_error = error
+            self.logger().error('Modular native candle reader did not close cleanly: %s', error)
 
     async def update_processed_data(self):
         try:

@@ -1,0 +1,163 @@
+{
+  "unchanged": true,
+  "before": [
+    {
+      "name": "/rsibot-stack-watch-gateway-1",
+      "id": "290e96a5455fbd5ff7fc101390bc6f3dde1db9db4e24f8604727912c20068533",
+      "image": "sha256:c37b35b3de844b04a4554e108e20ee47f98fc11e2aa9eb5b1e865a615160f367",
+      "started_at": "2026-09-18T08:18:44.882042669Z"
+    },
+    {
+      "name": "/rsibot-stack-condor-1",
+      "id": "5670be595eaaec0cd7d0393869120e4fb677fd1de87668018a7b6e0182009424",
+      "image": "sha256:12f975a8a5739033787d1f1479a42d43c87217d87426d24b91b1695cc0d7aeeb",
+      "started_at": "2026-09-18T07:26:35.420892513Z"
+    },
+    {
+      "name": "/rsibot-stack-execution-rsi-v5-1",
+      "id": "5527398531dda487c9850f60a2a8975947e6886a26c069cff2b92ac341e53226",
+      "image": "sha256:b2de04fd8c84fdf8c7a254bb476bfa1f489eac036bf917e088a75dfd138536f9",
+      "started_at": "2026-09-19T07:48:08.821307552Z"
+    },
+    {
+      "name": "/rsibot-stack-execution-sui-1",
+      "id": "1b38f9139acdd0e1e4309618f8cc2e245b7bc65632374cdd0bd6edede1e27baa",
+      "image": "sha256:66e95ab8bf636f524706c61f73f7a97bf3d0b6b00280b7f70026f3689c1b39cd",
+      "started_at": "2026-09-17T22:04:33.272305013Z"
+    },
+    {
+      "name": "/rsibot-stack-execution-main-1",
+      "id": "87518abdae57188f09354ed7fa6701ce7ed4eefa9121b39fd2cdc3fdbbff2bef",
+      "image": "sha256:1f8bb55226084aada048b201eeaa6b11859d9ee6695e9139580b86b6580303ca",
+      "started_at": "2026-09-17T21:57:18.443107381Z"
+    },
+    {
+      "name": "/rsibot-stack-reporting-rsi-v5-1",
+      "id": "cde0faa5b5a39b3311b699c6014a9bb557ebb25f46d46f2a2a2e7f2bdc17f05c",
+      "image": "sha256:ee957de610dc1ccf667ba2055272c82cbe8e6f73d962335515d8f84a0dd38306",
+      "started_at": "2026-09-17T21:13:32.90143968Z"
+    },
+    {
+      "name": "/rsibot-stack-reporting-sui-1",
+      "id": "37445351c93e45aa907f4aed9902ced67a436f608399084a37b5dad8e819a857",
+      "image": "sha256:ee957de610dc1ccf667ba2055272c82cbe8e6f73d962335515d8f84a0dd38306",
+      "started_at": "2026-09-16T12:26:55.316526793Z"
+    },
+    {
+      "name": "/rsibot-stack-reporting-main-1",
+      "id": "9c401dba34b321bae4618a5980cafeaa0c9879967a22374bb97ed2b91dd65369",
+      "image": "sha256:ee957de610dc1ccf667ba2055272c82cbe8e6f73d962335515d8f84a0dd38306",
+      "started_at": "2026-09-16T12:26:55.277831835Z"
+    },
+    {
+      "name": "/rsibot-stack-research-1",
+      "id": "c75bbcaa0f112aa3675457937594486ae8fc59edc01b9a14548fb3a766c15744",
+      "image": "sha256:f86e13bacf7aa8a0609fef25d736d834f8dbfa47772f14ae16c8c09e99e2adfb",
+      "started_at": "2026-09-16T12:26:55.315906002Z"
+    },
+    {
+      "name": "/rsibot-stack-broker-1",
+      "id": "1cdf71ae3c2d58fa29d985d3bf1222f0c1570470a6abf5f048bd9a5c43ed2e36",
+      "image": "sha256:30419b585090a92e8c8dd912bbe70f2c1962c9b9543ebf22376c6236b0a1a4ea",
+      "started_at": "2026-09-16T08:52:27.624838837Z"
+    },
+    {
+      "name": "/rsibot-stack-ingress-1",
+      "id": "68eb00e3dfaa5278f8d6e316bc3060acfd7f643b32f4134c1177bade85614d1b",
+      "image": "sha256:ffdc945e7748900a3be5859b09285919c29ec16d7c0a840f440f3714317cd5f6",
+      "started_at": "2026-09-16T08:52:25.839968878Z"
+    },
+    {
+      "name": "/rsibot-stack-api-1",
+      "id": "2bb3960123ed76d0a73d85137ac833a206c4af187f5f24ef266102bc2278a54b",
+      "image": "sha256:f76222387aadd787f9b9c9fcb5f06f723ec18566e8cf64c6fad4025ddacbb002",
+      "started_at": "2026-09-18T07:26:35.696688138Z"
+    },
+    {
+      "name": "/rsibot-stack-network-1",
+      "id": "aacea74da02e423804a7f830a9a52360f13947880945afe453d486d23a628baa",
+      "image": "sha256:2c15e55df5d63efb31b629a557df305130612a16feb029c93447e54dda2c4189",
+      "started_at": "2026-09-16T08:52:09.472881801Z"
+    }
+  ],
+  "after": [
+    {
+      "name": "/rsibot-stack-watch-gateway-1",
+      "id": "290e96a5455fbd5ff7fc101390bc6f3dde1db9db4e24f8604727912c20068533",
+      "image": "sha256:c37b35b3de844b04a4554e108e20ee47f98fc11e2aa9eb5b1e865a615160f367",
+      "started_at": "2026-09-18T08:18:44.882042669Z"
+    },
+    {
+      "name": "/rsibot-stack-condor-1",
+      "id": "5670be595eaaec0cd7d0393869120e4fb677fd1de87668018a7b6e0182009424",
+      "image": "sha256:12f975a8a5739033787d1f1479a42d43c87217d87426d24b91b1695cc0d7aeeb",
+      "started_at": "2026-09-18T07:26:35.420892513Z"
+    },
+    {
+      "name": "/rsibot-stack-execution-rsi-v5-1",
+      "id": "5527398531dda487c9850f60a2a8975947e6886a26c069cff2b92ac341e53226",
+      "image": "sha256:b2de04fd8c84fdf8c7a254bb476bfa1f489eac036bf917e088a75dfd138536f9",
+      "started_at": "2026-09-19T07:48:08.821307552Z"
+    },
+    {
+      "name": "/rsibot-stack-execution-sui-1",
+      "id": "1b38f9139acdd0e1e4309618f8cc2e245b7bc65632374cdd0bd6edede1e27baa",
+      "image": "sha256:66e95ab8bf636f524706c61f73f7a97bf3d0b6b00280b7f70026f3689c1b39cd",
+      "started_at": "2026-09-17T22:04:33.272305013Z"
+    },
+    {
+      "name": "/rsibot-stack-execution-main-1",
+      "id": "87518abdae57188f09354ed7fa6701ce7ed4eefa9121b39fd2cdc3fdbbff2bef",
+      "image": "sha256:1f8bb55226084aada048b201eeaa6b11859d9ee6695e9139580b86b6580303ca",
+      "started_at": "2026-09-17T21:57:18.443107381Z"
+    },
+    {
+      "name": "/rsibot-stack-reporting-rsi-v5-1",
+      "id": "cde0faa5b5a39b3311b699c6014a9bb557ebb25f46d46f2a2a2e7f2bdc17f05c",
+      "image": "sha256:ee957de610dc1ccf667ba2055272c82cbe8e6f73d962335515d8f84a0dd38306",
+      "started_at": "2026-09-17T21:13:32.90143968Z"
+    },
+    {
+      "name": "/rsibot-stack-reporting-sui-1",
+      "id": "37445351c93e45aa907f4aed9902ced67a436f608399084a37b5dad8e819a857",
+      "image": "sha256:ee957de610dc1ccf667ba2055272c82cbe8e6f73d962335515d8f84a0dd38306",
+      "started_at": "2026-09-16T12:26:55.316526793Z"
+    },
+    {
+      "name": "/rsibot-stack-reporting-main-1",
+      "id": "9c401dba34b321bae4618a5980cafeaa0c9879967a22374bb97ed2b91dd65369",
+      "image": "sha256:ee957de610dc1ccf667ba2055272c82cbe8e6f73d962335515d8f84a0dd38306",
+      "started_at": "2026-09-16T12:26:55.277831835Z"
+    },
+    {
+      "name": "/rsibot-stack-research-1",
+      "id": "c75bbcaa0f112aa3675457937594486ae8fc59edc01b9a14548fb3a766c15744",
+      "image": "sha256:f86e13bacf7aa8a0609fef25d736d834f8dbfa47772f14ae16c8c09e99e2adfb",
+      "started_at": "2026-09-16T12:26:55.315906002Z"
+    },
+    {
+      "name": "/rsibot-stack-broker-1",
+      "id": "1cdf71ae3c2d58fa29d985d3bf1222f0c1570470a6abf5f048bd9a5c43ed2e36",
+      "image": "sha256:30419b585090a92e8c8dd912bbe70f2c1962c9b9543ebf22376c6236b0a1a4ea",
+      "started_at": "2026-09-16T08:52:27.624838837Z"
+    },
+    {
+      "name": "/rsibot-stack-ingress-1",
+      "id": "68eb00e3dfaa5278f8d6e316bc3060acfd7f643b32f4134c1177bade85614d1b",
+      "image": "sha256:ffdc945e7748900a3be5859b09285919c29ec16d7c0a840f440f3714317cd5f6",
+      "started_at": "2026-09-16T08:52:25.839968878Z"
+    },
+    {
+      "name": "/rsibot-stack-api-1",
+      "id": "2bb3960123ed76d0a73d85137ac833a206c4af187f5f24ef266102bc2278a54b",
+      "image": "sha256:f76222387aadd787f9b9c9fcb5f06f723ec18566e8cf64c6fad4025ddacbb002",
+      "started_at": "2026-09-18T07:26:35.696688138Z"
+    },
+    {
+      "name": "/rsibot-stack-network-1",
+      "id": "aacea74da02e423804a7f830a9a52360f13947880945afe453d486d23a628baa",
+      "image": "sha256:2c15e55df5d63efb31b629a557df305130612a16feb029c93447e54dda2c4189",
+      "started_at": "2026-09-16T08:52:09.472881801Z"
+    }
+  ]
+}

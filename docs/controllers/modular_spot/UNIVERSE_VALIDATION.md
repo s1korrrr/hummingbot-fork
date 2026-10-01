@@ -12,7 +12,7 @@ API changes are isolated at `.worktrees/hummingbot-api-modular-validation`, base
 
 ## Public WebSocket evidence
 
-Frozen public response and sorted universe: [universe.json](evidence/2026-09-19-universe/universe.json) and [instruments-response.json](evidence/2026-09-19-universe/instruments-response.json). Filter: SPOT, quoteCcy USDC, state live; catalog availability is not account trading eligibility.
+Frozen public response and sorted universe: [universe.json](evidence/2026-09-19-universe/universe.json) and [instruments-response.json](evidence/2026-09-19-rust-candles/instruments-response.json.gz) (gzip of the byte-identical response, SHA-256 `401ecddf47cb4829a0cf281c47b0cbf1e4f054da33af2cea1e9c10431ed75279` uncompressed). Filter: SPOT, quoteCcy USDC, state live; catalog availability is not account trading eligibility.
 
 | Measurement | Observed result |
 |---|---:|

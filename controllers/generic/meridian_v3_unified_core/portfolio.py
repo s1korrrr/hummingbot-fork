@@ -91,8 +91,8 @@ class MeridianPortfolio:
     def check_identity(self):
         """Hold every acquisition while recorder state is bound to another code/config identity.
 
-        Returns None once bound; the reason otherwise. Symbol runtimes then keep only
-        protective bag stops until an operator applies the identity migration.
+        Returns None once bound; the reason otherwise. Symbol runtimes keep bag stops and
+        recovery sells, never buys, until an operator applies the identity migration.
         """
         try:
             recorder = self.recorder()

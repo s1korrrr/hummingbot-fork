@@ -236,12 +236,13 @@ class SymbolRuntime(ModularRuntime):
         super().__init__(context, bindings=bindings)
 
     def actions(self):
-        # Checkpoints bound to another code/config identity: no entry, recovery sell or
-        # checkpoint write until the operator migration; protective bag stops continue.
+        # Checkpoints bound to another code/config identity: no entry and no decision
+        # checkpoint write until the operator migration. Held-bag management continues.
         hold = self.portfolio.identity_hold
         if hold is not None:
+            actions = self._identity_hold_actions()
             self.reason = hold[:200]
-            return self._bag_stops_only()
+            return actions
         return super().actions()
 
     def _bag_stops_only(self):
@@ -253,6 +254,29 @@ class SymbolRuntime(ModularRuntime):
         except (DataUnavailable, *ERRORS):
             return []
         return super()._bag_stops_only()
+
+    def _identity_hold_actions(self):
+        """Bag stops and recovery sells only. An identity hold stops buying, never exits.
+
+        The bag trail row is outside the migration's reviewed state (targets, grants and
+        decision checkpoints), so persisting it keeps a reviewed plan applicable.
+        """
+        c = self.controller.config
+        if c.bag is None or not c.execution_enabled or c.manual_kill_switch or self.fault or not self.bag_mode():
+            return self._bag_stops_only()
+        try:
+            if self.observe() is None:
+                return self._bag_stops_only()
+            state, _ = self.ensure_store().load()
+            if state is None:
+                return self._bag_stops_only()
+            from controllers.generic.modular_spot_core.bag import HeldBag
+            held = HeldBag.from_positions(self.controller.positions_held, connector=c.connector_name,
+                                          pair=c.trading_pair)
+            return self._bag_actions(self.inventory(), state, held, self.snapshot())
+        except (DataUnavailable, *ERRORS) as exc:
+            self.controller.logger().warning(f'identity hold bag management unavailable: {type(exc).__name__}:{exc}')
+            return self._bag_stops_only()
 
     def ensure_store(self):
         store = super().ensure_store()

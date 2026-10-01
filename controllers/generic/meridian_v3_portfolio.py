@@ -26,14 +26,26 @@ class CapitalStage(NamedTuple):
     envelope_quote: Decimal
     per_asset_quote: Decimal
     order_quote: Decimal
+    # Concurrent open buys per symbol (live `max_executors_per_side`); the stage's only
+    # per-symbol brake once `per_asset_quote` equals the envelope.
+    max_active_tranches: int = 8
+
+    def limits(self):
+        """(envelope, per asset, per order): the mandate triple this stage admits."""
+        return (self.envelope_quote, self.per_asset_quote, self.order_quote)
 
 
 # The only admitted capital scales. Canary keeps the full per-order and per-asset sizes,
 # so fills and one asset's DCA stages behave identically; only the shared envelope, for
-# which the five assets compete in P0 priority, is smaller. No other numbers exist.
+# which the five assets compete in P0 priority, is smaller. `full_2000` (operator
+# 2026-10-01: five pairs, 100 per buy, 2,000 per controller, no per-pair cap) sets the
+# per-asset limit equal to the envelope, so only the shared envelope and the tranche count
+# bound one symbol; its recipe sizing (bag slice 200, depth budget 2,000) derives from these
+# numbers in `meridian_v3_recipe`. No other numbers exist.
 CAPITAL_STAGES = MappingProxyType({
     'canary': CapitalStage(Decimal('100'), Decimal('100'), Decimal('20')),
     'full': CapitalStage(Decimal('500'), Decimal('100'), Decimal('20')),
+    'full_2000': CapitalStage(Decimal('2000'), Decimal('2000'), Decimal('100'), 20),
 })
 
 
@@ -108,10 +120,10 @@ class MeridianPortfolioRecipe:
         self.policy = P0Policy.model_validate(policy.model_dump(mode='json'))
         stage = (mandate.funding_envelope_quote, mandate.per_asset_quote, mandate.order_quote)
         if (mandate.portfolio_id != 'meridian_v3' or set(mandate.pairs) != set(meridian_v3_recipe.PAIRS)
-                or stage not in {tuple(s) for s in CAPITAL_STAGES.values()}
+                or stage not in {s.limits() for s in CAPITAL_STAGES.values()}
                 or mandate.reference_quote != mandate.funding_envelope_quote):
-            raise ValueError('Meridian requires its explicit five pairs and a canary 20/100/100 '
-                             'or full 20/100/500 mandate')
+            raise ValueError('Meridian requires its explicit five pairs and a canary 20/100/100, '
+                             'full 20/100/500 or full_2000 100/2000/2000 mandate')
         if set(policy.pair_priority) != set(mandate.pairs) or policy.producers != ('bnb_p23_mr',):
             raise ValueError('explicit five-pair priority and supported BNB MR producer required; MOM is not qualified')
         self.recipe_sha256 = digest(dict(recipe_id=RECIPE_ID, source_sha256=source_identity(),

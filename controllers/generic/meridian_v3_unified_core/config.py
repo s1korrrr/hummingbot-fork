@@ -119,9 +119,14 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     id: str = Field(pattern=r'^modular_spot_meridian_v3_unified_(observation|paper|live)$')
     execution_mode: Literal['observation', 'paper', 'live']
     # Explicit capital scale; never defaulted. canary = 100 envelope, full = 500 envelope,
-    # both 100 per asset and 20 per order. Changing it on an owner with state is an
-    # explicit operator identity migration (see migration.py).
-    capital_stage: Literal['canary', 'full'] = Field(json_schema_extra={'is_updatable': False})
+    # both 100 per asset and 20 per order; full_2000 = 2,000 envelope, no per-asset cap
+    # (per asset = envelope), 100 per order, 20 tranches. On an owner with state a change
+    # holds acquisitions (bags and exits keep running) until the operator plans and applies
+    # the identity migration (migration.py). It carries state only when every other value is
+    # unchanged and every stage-derived value is the stage table's, and only once reserved
+    # grants fit the target envelope and per-asset limit and each symbol's open grants fit
+    # its tranche count; it never sells, closes or drops a bag to make them fit.
+    capital_stage: Literal['canary', 'full', 'full_2000'] = Field(json_schema_extra={'is_updatable': False})
     connector_name: Literal['okx', 'okx_paper_trade']
     account_id: str = Field(pattern=NAME)
     symbols: tuple[SymbolPolicyBinding, ...] = Field(min_length=5, max_length=5, json_schema_extra={'is_updatable': True})
@@ -197,13 +202,23 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     def stage(self):
         return CAPITAL_STAGES[self.capital_stage]
 
+    def recipe_modules(self):
+        """The frozen p23 modules at this stage's sizing (identical to the sealed recipe at 20/100)."""
+        stage = self.stage()
+        return recipe.strategy_parameters(order_quote=stage.order_quote, per_asset_quote=stage.per_asset_quote)
+
+    def recipe_capital(self):
+        stage = self.stage()
+        return recipe.capital_policy(self.risk.fee_reserve_fraction, order_quote=stage.order_quote,
+                                     per_asset_quote=stage.per_asset_quote, max_active_tranches=stage.max_active_tranches)
+
     def owned_trading_pairs(self):
         """Every instrument this one native owner manages; read by the engine for attribution."""
         return tuple(s.trading_pair for s in self.symbols)
 
     def symbol_configs(self):
         """Effective native per-symbol configuration; one owner id, five instruments."""
-        modules = recipe.strategy_parameters()
+        modules = self.recipe_modules()
         result = {}
         for binding in self.symbols:
             values = dict(
@@ -215,7 +230,7 @@ class MeridianUnifiedConfig(ControllerConfigBase):
                 risk=self.risk.native(), data=self.data, account=self.account_id,
                 budget=BudgetPolicy(group='meridian_v3_unified', max_quote=self.stage().envelope_quote, max_assets=5),
                 program_revision='meridian_v3_unified', policy_revision=binding.policy_version,
-                capital=recipe.capital_policy(self.risk.fee_reserve_fraction), exit_floor=self.exit_floor,
+                capital=self.recipe_capital(), exit_floor=self.exit_floor,
                 manual_kill_switch=self.manual_kill_switch, **modules)
             result[binding.trading_pair] = SymbolRuntimeConfig(**values)
         return result
@@ -241,8 +256,8 @@ class MeridianUnifiedConfig(ControllerConfigBase):
         return digest({'recipe_id': RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,
                        'result_sha256': recipe.RESULT_SHA256, 'mandate_sha256': self.mandate().identity,
                        'policy_sha256': self.p0_policy().identity,
-                       'modules': {k: v.model_dump(mode='json') for k, v in recipe.strategy_parameters().items()},
-                       'capital': recipe.capital_policy(self.risk.fee_reserve_fraction).model_dump(mode='json')})
+                       'modules': {k: v.model_dump(mode='json') for k, v in self.recipe_modules().items()},
+                       'capital': self.recipe_capital().model_dump(mode='json')})
 
     def sealed_payload(self):
         """Behavioural configuration. Per-symbol entry switches are operator controls,

@@ -14,7 +14,9 @@ SIZED = {'bag', 'depth_budget'}
 
 
 def test_the_stage_table_admits_exactly_three_versioned_scales():
-    assert set(CAPITAL_STAGES) == {'canary', 'full', 'full_2000'}
+    assert set(CAPITAL_STAGES) == {'canary', 'full', 'full_2000', 'full_1000'}
+    assert CAPITAL_STAGES['full_1000'].limits() == (D('1000'), D('1000'), D('50'))
+    assert CAPITAL_STAGES['full_1000'].max_active_tranches == 20
     assert CAPITAL_STAGES['canary'].limits() == (D('100'), D('100'), D('20'))
     assert CAPITAL_STAGES['full'].limits() == (D('500'), D('100'), D('20'))
     assert CAPITAL_STAGES['full_2000'].limits() == (D('2000'), D('2000'), D('50'))
@@ -69,3 +71,19 @@ def test_full_2000_identity_differs_from_full_and_binds_its_envelope():
 def test_recipe_sizing_rejects_an_order_above_its_asset_limit():
     with pytest.raises(ValueError, match='order_quote'):
         recipe.strategy_parameters(order_quote='200', per_asset_quote='100')
+
+
+def test_full_1000_is_the_same_shape_at_half_the_envelope():
+    config = unified(capital_stage='full_1000')
+    assert config.total_amount_quote == 1000 and config.stage().limits() == (D('1000'), D('1000'), D('50'))
+    modules = config.recipe_modules()
+    assert modules['bag'].slice_quote == D('100') and modules['depth_budget'].budget_quote == D('1000')
+    half = LiveCapitalConfig(slice_quote='50', position_cap_quote='1000', max_active_tranches=20,
+                             funded_cap_quote='1000', funding_fee_reserve='.003')
+    assert config.recipe_capital() == half
+    for symbol in config.symbol_configs().values():
+        assert symbol.total_amount_quote == 1000 and symbol.budget.max_quote == 1000
+    MeridianPortfolioRecipe(config.mandate(), config.p0_policy())
+    assert config.recipe_digest() != unified(capital_stage='full_2000').recipe_digest()
+    live = unified('live', capital_stage='full_1000', live_capital={**LIVE_CAPITAL, 'envelope_quote': '1000'})
+    assert live.live_capital.envelope_quote == 1000

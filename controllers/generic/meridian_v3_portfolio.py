@@ -46,6 +46,9 @@ CAPITAL_STAGES = MappingProxyType({
     'canary': CapitalStage(Decimal('100'), Decimal('100'), Decimal('20')),
     'full': CapitalStage(Decimal('500'), Decimal('100'), Decimal('20')),
     'full_2000': CapitalStage(Decimal('2000'), Decimal('2000'), Decimal('50'), 40),
+    # Operator 2026-10-01 (launch): the shared wallet held 1,957 USDC against the 2,000 envelope, so the
+    # same no-per-pair-cap shape at half the envelope: 1,000 / 1,000 / 50, 20 tranches (20 x 50 = envelope).
+    'full_1000': CapitalStage(Decimal('1000'), Decimal('1000'), Decimal('50'), 20),
 })
 
 
@@ -123,7 +126,7 @@ class MeridianPortfolioRecipe:
                 or stage not in {s.limits() for s in CAPITAL_STAGES.values()}
                 or mandate.reference_quote != mandate.funding_envelope_quote):
             raise ValueError('Meridian requires its explicit five pairs and a canary 20/100/100, '
-                             'full 20/100/500 or full_2000 50/2000/2000 mandate')
+                             'full 20/100/500, full_2000 50/2000/2000 or full_1000 50/1000/1000 mandate')
         if set(policy.pair_priority) != set(mandate.pairs) or policy.producers != ('bnb_p23_mr',):
             raise ValueError('explicit five-pair priority and supported BNB MR producer required; MOM is not qualified')
         self.recipe_sha256 = digest(dict(recipe_id=RECIPE_ID, source_sha256=source_identity(),

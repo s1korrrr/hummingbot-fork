@@ -126,7 +126,7 @@ class MeridianUnifiedConfig(ControllerConfigBase):
     # unchanged and every stage-derived value is the stage table's, and only once reserved
     # grants fit the target envelope and per-asset limit and each symbol's open grants fit
     # its tranche count; it never sells, closes or drops a bag to make them fit.
-    capital_stage: Literal['canary', 'full', 'full_2000'] = Field(json_schema_extra={'is_updatable': False})
+    capital_stage: Literal['canary', 'full', 'full_2000', 'full_1000'] = Field(json_schema_extra={'is_updatable': False})
     connector_name: Literal['okx', 'okx_paper_trade']
     account_id: str = Field(pattern=NAME)
     symbols: tuple[SymbolPolicyBinding, ...] = Field(min_length=5, max_length=5, json_schema_extra={'is_updatable': True})

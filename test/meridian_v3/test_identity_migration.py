@@ -24,6 +24,7 @@ from controllers.generic.meridian_v3_unified_core.migration import (
     plan_identity_migration,
 )
 from controllers.generic.modular_spot_core.state import decode
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.model.metadata import Metadata
 
 BTC, ETH, SOL = 'BTC-USDC', 'ETH-USDC', 'SOL-USDC'
@@ -97,6 +98,12 @@ class OwnerStateCase(IsolatedAsyncioTestCase):
         with s.session.recorder.sql_manager.get_new_session() as session:
             return {row.key: row.value for row in session.query(Metadata).all()}
 
+    BAG_TRAIL = 'modular-spot:bag:v1:'  # held-bag management keeps running during an identity hold
+
+    def migration_rows(self, subject):
+        rows = subject['rows'] if isinstance(subject, dict) else self.rows(subject)
+        return {key: value for key, value in rows.items() if not key.startswith(self.BAG_TRAIL)}
+
     def sessions(self, s):
         recorder = s.session.recorder
         return recorder.sql_manager.get_new_session, recorder.config_file_path
@@ -124,7 +131,7 @@ class IdentityMigrationTests(OwnerStateCase):
         self.assertEqual(info['identity_hold'], hold)
         self.assertEqual(info['portfolio']['reason'], IDENTITY_MIGRATION_REQUIRED)
         self.assertEqual({row['status'] for row in info['symbols'].values()}, {IDENTITY_MIGRATION_REQUIRED})
-        self.assertEqual(self.rows(r), before['rows'])  # nothing rewritten, nothing deleted
+        self.assertEqual(self.migration_rows(r), self.migration_rows(before))  # nothing rewritten or deleted
         # The paper engine suspends filled tranches into held positions at close; live restart
         # continuity restores the persisted ETH tranche, which the upgraded code still accepts.
         [eth] = [i for i in r.session.recorder.get_all_executors() if i.id == before['eth']]
@@ -132,7 +139,7 @@ class IdentityMigrationTests(OwnerStateCase):
         self.assertIs(r.controller.restart_continuity_executor_class(eth.config), ModularPositionExecutor)
         self.assertEqual(r.held(BTC), before['held'])
         await r.step(mids={BTC: '96.8'})
-        self.assertEqual(self.rows(r), before['rows'])
+        self.assertEqual(self.migration_rows(r), self.migration_rows(before))
         self.assertTrue(all(c.runtime.fault is None for c in r.controller.contexts.values()))
 
         plan = plan_identity_migration(r.config, *self.sessions(r))
@@ -170,6 +177,25 @@ class IdentityMigrationTests(OwnerStateCase):
         self.assertEqual(stored['previous_sha256'], head['target_sha256'])
         self.assertGreaterEqual(stored['target']['sequence'], head['sequence'])
 
+    async def test_identity_hold_keeps_bag_recovery_sells_and_holds_only_acquisitions(self):
+        before = await self.owner_with_active_and_held_state()
+        mutate(self.patch, UPGRADED)
+        r = self.restore(before)
+        for mid in ('101', '103', '104'):
+            receipt = await r.step(mids={BTC: mid}, rsi={BTC: (80, 80), SOL: rebound()})
+            self.assertEqual([c for c in creates(receipt) if c.executor_config.side == TradeType.BUY], [])
+        status = r.controller.contexts[BTC].runtime.bag_status or {}
+        self.assertTrue(status.get('trail_armed'), status)
+        receipt = await r.step(mids={BTC: '103.05'}, rsi={BTC: (80, 80)})
+        [sell] = creates(receipt, BTC)
+        self.assertEqual((sell.executor_config.side, sell.executor_config.amount), (TradeType.SELL, before['held']))
+        self.assertTrue(r.controller.portfolio.identity_hold.startswith(IDENTITY_MIGRATION_REQUIRED))
+        # Only the held-bag trail moves; the reviewed migration state is untouched.
+        rows = self.rows(r)
+        changed = {key for key in set(rows) | set(before['rows']) if rows.get(key) != before['rows'].get(key)}
+        self.assertTrue(changed and all(key.startswith(self.BAG_TRAIL) for key in changed), changed)
+        plan_identity_migration(r.config, *self.sessions(r))  # still plannable after the sell
+
     async def test_same_code_restart_is_bound_and_writes_nothing_new(self):
         before = await self.owner_with_active_and_held_state()
         r = self.restore(before)
@@ -190,7 +216,7 @@ class IdentityMigrationTests(OwnerStateCase):
             self.assertIn('max_candle_age_seconds', hold)
             with self.assertRaisesRegex(MigrationRefused, 'behavioural configuration changed'):
                 plan_identity_migration(r.config, *self.sessions(r))
-            self.assertEqual(self.rows(r), before['rows'])
+            self.assertEqual(self.migration_rows(r), self.migration_rows(before))
             await r.close()
             before.update(minute=r.minute, sequence=dict(r.sequence), trades=dict(r.trade_sequence))
 

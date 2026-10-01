@@ -5,8 +5,8 @@ configuration: the p23 decision checkpoints (symbol fingerprint), the target slo
 (writer epoch and portfolio recipe) and the grant row (grant policy). A code-only
 image upgrade changes the first two; an explicit `capital_stage` change (canary
 <-> full) changes all three. Without a migration the owner holds new
-acquisitions and keeps only protective bag stops (fail closed, reported as
-IDENTITY_MIGRATION_REQUIRED); it never rewrites or deletes its checkpoints.
+acquisitions (fail closed, reported as IDENTITY_MIGRATION_REQUIRED) while held-bag
+stops and recovery sells continue; it never rewrites or deletes its checkpoints.
 
 The owner records the identity its state is written under (the witness) the
 first time it runs with state it can prove is its own. `plan_identity_migration`

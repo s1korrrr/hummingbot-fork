@@ -101,7 +101,7 @@ class CapitalStageTests(OwnerStateCase):
         hold = r.controller.portfolio.identity_hold
         self.assertTrue(hold.startswith(f'{IDENTITY_MIGRATION_REQUIRED}:migration_available:capital_stage_canary_to_full'),
                         hold)
-        self.assertEqual(self.rows(r), before['rows'])
+        self.assertEqual(self.migration_rows(r), self.migration_rows(before))
         plan = plan_identity_migration(r.config, *self.sessions(r))
         self.assertEqual(plan['kinds'], ['capital_stage_canary_to_full'])
         self.assertEqual(plan['carried']['reserved_quote'], str(sum(g.reserved_quote for g in before['grants'])))
@@ -142,7 +142,7 @@ class CapitalStageTests(OwnerStateCase):
         self.assertIn('migration_refused:capital stage full -> canary refused', hold)
         with self.assertRaisesRegex(MigrationRefused, r'reserved exposure 1\d\d(\.\d+)? quote .* canary envelope 100'):
             plan_identity_migration(r.config, *self.sessions(r))
-        self.assertEqual(self.rows(r), before['rows'])
+        self.assertEqual(self.migration_rows(r), self.migration_rows(before))
 
     async def test_full_to_canary_with_small_exposure_and_new_code_migrates_in_one_reviewed_step(self):
         s = await self.full_owner_with_exposure((BTC, ETH))

@@ -1,7 +1,7 @@
 """Additive event receipts; legacy six-decimal columns remain unchanged."""
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 from sqlalchemy import Column, Text, inspect
 from sqlalchemy.orm import Session
@@ -81,3 +81,26 @@ def read_exact_values(session: Session, row: Union[Order, TradeFill]) -> Recorde
     if inspect(session.connection()).has_table(model.__tablename__):
         receipt = session.get(model, key)
     return recorded_values(row, receipt)
+
+
+def trade_fills_for_config(session: Session, config_file_path: str, number_of_rows: Optional[int] = None) -> List[TradeFill]:
+    """One recorder config's fills, newest first, with immutable exact values attached, in `session`."""
+    has_exact = inspect(session.connection()).has_table(TradeFillExact.__tablename__)
+    query = (session.query(TradeFill)
+             .filter(TradeFill.config_file_path == config_file_path)
+             .order_by(TradeFill.timestamp.desc()))
+    if has_exact:
+        query = query.add_entity(TradeFillExact).outerjoin(TradeFillExact, (
+            (TradeFill.market == TradeFillExact.market)
+            & (TradeFill.order_id == TradeFillExact.order_id)
+            & (TradeFill.exchange_trade_id == TradeFillExact.exchange_trade_id)
+        ))
+    if number_of_rows is not None:
+        query = query.limit(number_of_rows)
+    trades = []
+    for result in query.all():
+        trade, receipt = result if has_exact else (result, None)
+        # Attach immutable exact values; never rewrite mapped legacy columns.
+        trade.recorded_values = recorded_values(trade, receipt)
+        trades.append(trade)
+    return trades

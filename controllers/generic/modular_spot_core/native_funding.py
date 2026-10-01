@@ -94,7 +94,7 @@ def funding_projection(fills, connector, pair):
     cost = summary.amount * summary.breakeven_price + summary.remaining_fees_quote
     if not cost.is_finite() or cost < 0:
         raise ValueError('Native acquisition cost is unavailable')
-    return {'cash_used': cash, 'inventory_cost': cost, 'used': max(ZERO, cash, cost),
+    return {'cash_used': cash, 'inventory_cost': cost, 'inventory_base': summary.amount, 'used': max(ZERO, cash, cost),
             'fills': fingerprints, 'bought_by_order': by_order}
 
 

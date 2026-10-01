@@ -145,7 +145,7 @@ class MigrationHoldingsTests(OwnerStateCase):
         reviewed = plan_identity_migration(r.config, *self.sessions(r))
         btc = reviewed['holdings']['symbols'][BTC]
         self.assertEqual(D(btc['held_amount_base']), held)
-        self.assertGreater(D(btc['held_cost_quote']), D('90'))
+        self.assertGreater(D(btc['held_cost_quote']), D('45'))
         self.assertEqual(D(btc['reserved_grant_quote']), sum(g.reserved_quote for g in before['grants']))
         self.assertFalse(btc['over_target'])
         self.assertEqual(plan_identity_migration(r.config, *self.sessions(r)), reviewed)  # deterministic
@@ -167,9 +167,9 @@ class MigrationHoldingsTests(OwnerStateCase):
         return ids
 
     async def test_a_downgrade_over_the_target_per_asset_holds_buys_and_sells_nothing(self):
-        before = await self.owner('full_2000', (BTC, BTC))  # two 100 tranches on one asset
+        before = await self.owner('full_2000', (BTC, BTC, BTC))  # three 50 tranches on one asset: 150 > 100
         r = self.restore(before, capital_stage='full')
-        self.assertEqual(len(self.release_grants(r, BTC)), 2)
+        self.assertEqual(len(self.release_grants(r, BTC)), 3)
         await r.step(mids={BTC: '96.9'})
         self.assert_hold(r, 'migration_available:capital_stage_full_2000_to_full')
         held = r.held(BTC)

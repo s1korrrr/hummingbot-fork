@@ -27,6 +27,11 @@ content-addressed receipt, and carries decision checkpoints (claims, cycle,
 clocks), the target chain and the grants forward unchanged except for their
 identity binding. Native orders, fills, executors, positions and held-bag trails
 are never touched: nothing is sold, closed or dropped to fit a stage.
+
+The reviewed plan also reports `holdings`: per symbol, the coins this recorder's native
+fills leave held, at fee-inclusive cost, beside the persisted grant reservations, and for
+a stage change whether settled usage exceeds the target stage. It is informational only:
+it adds no refusal, is not part of the transition id, and the migration never sells.
 """
 import json
 from decimal import Decimal as D
@@ -34,7 +39,9 @@ from types import SimpleNamespace
 
 from controllers.generic.meridian_v3_portfolio import MeridianPortfolioRecipe, source_identity
 from controllers.generic.modular_spot_core.domain import PolicyError, identity
+from controllers.generic.modular_spot_core.native_funding import funding_projection
 from controllers.generic.modular_spot_core.state import DecisionStore, decode, encode
+from hummingbot.model.exact_order_values import trade_fills_for_config
 from hummingbot.model.metadata import Metadata
 from hummingbot.strategy_v2.components.recipe_contract import CONTROL_FIELDS, canonical_json, digest
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
@@ -320,12 +327,77 @@ def _check_target_stage_state(stage, exposure):
                 'let open tranches fall to the target stage first')
 
 
+def _holdings(config, stage, exposure, fills):
+    """What the owner holds per symbol, beside what its grants reserve. Read-only and offline.
+
+    `held_*` replays this recorder's native fills of the symbol through the projection the
+    runtime snapshot uses (`funding_projection`: native `PositionHold`, fee-inclusive cost,
+    remaining base). No price is fetched, so nothing is marked. `admission_usage_quote` is
+    the settled usage the portfolio admission compares with the per-asset limit (the larger
+    of held cost and net cash consumed); in-flight reservations only add to it, so above
+    the target it is a certain hold, never a guess. A grant stays reserved until its
+    tranche's bag sells flat, so `total_quote` (held + reserved) can count a bag twice: it
+    is an upper bound. Nothing here refuses, sells or changes state.
+    """
+    target = None if not stage else CAPITAL_STAGES[stage[1]]
+    symbols, notes = {}, []
+    held_total = cash_total = ZERO
+    complete = True
+    for pair in PAIRS:
+        reserved = exposure['by_asset'].get(pair, ZERO)
+        grants = exposure['open_grants'].get(pair, 0)
+        try:
+            projection = funding_projection([f for f in fills if f.symbol == pair], config.connector_name, pair)
+        except (ValueError, TypeError, ArithmeticError, KeyError, PolicyError) as exc:
+            complete = False
+            symbols[pair] = {'unavailable': f'{type(exc).__name__}:{exc}'[:200], 'reserved_grant_quote': str(reserved),
+                             'open_grants': grants}
+            notes.append(f'{pair} holdings unavailable ({type(exc).__name__}: {exc}); the runtime holds acquisitions '
+                         'on the same native fills until they reconcile')
+            continue
+        cost, cash, base = projection['inventory_cost'], projection['cash_used'], projection['inventory_base']
+        held_total += cost
+        cash_total += cash
+        usage = max(cost, cash, ZERO)
+        over = target is not None and usage > target.per_asset_quote
+        symbols[pair] = {'held_amount_base': str(base), 'held_cost_quote': str(cost),
+                         'net_cash_consumed_quote': str(cash), 'admission_usage_quote': str(usage),
+                         'reserved_grant_quote': str(reserved), 'open_grants': grants,
+                         'total_quote': str(cost + reserved), 'over_target': over}
+        if over:
+            notes.append(f'{pair} holds {base} base at {cost} quote cost, above the {stage[1]} per-asset '
+                         f'{target.per_asset_quote}: the portfolio admits no new buy on any symbol until it sells '
+                         'below that; its held bag keeps its recovery sells; nothing is sold by this migration')
+        if cost > 0 and reserved > 0:
+            notes.append(f'{pair} grants stay reserved until its bag sells flat, so total_quote counts it twice '
+                         f'(held {cost} + reserved {reserved}); admission_usage_quote is the settled usage')
+    usage_total = max(held_total, cash_total, ZERO)
+    over_total = None if not complete else (target is not None and usage_total > target.envelope_quote)
+    if over_total:
+        notes.append(f'held cost {usage_total} quote is above the {stage[1]} envelope {target.envelope_quote}: '
+                     'the portfolio admits no new buy on any symbol until holdings sell below it; nothing is sold '
+                     'by this migration')
+    result = {'basis': 'native fills of this recorder at fee-inclusive cost; no marks (offline)',
+              'symbols': symbols,
+              'totals': {'held_cost_quote': str(held_total), 'admission_usage_quote': str(usage_total),
+                         'reserved_grant_quote': str(exposure['total']),
+                         'total_quote': str(held_total + exposure['total']),
+                         'over_target': over_total if target is not None else False},
+              'notes': notes}
+    if target is not None:
+        result['target'] = {'stage': stage[1], 'envelope_quote': str(target.envelope_quote),
+                            'per_asset_quote': str(target.per_asset_quote)}
+    return result
+
+
 def _changes(old, new):
     keys = set(old) | set(new)
     return sorted(k for k in keys if old.get(k) != new.get(k))
 
 
-def _plan(config, current, rows):
+def _plan(config, current, rows, *, fills=None):
+    """The reviewed plan. `fills` (this recorder's native fills) adds the informational
+    `holdings` block; it never enters the transition id or any refusal."""
     raw = rows['witness']
     if raw is None:
         raise MigrationRefused('no identity witness for this owner; explicit reconciliation required')
@@ -379,7 +451,7 @@ def _plan(config, current, rows):
     if stage:
         _check_target_stage_state(stage, exposure)
     transition_id = identity([witness, current, rows])
-    return {
+    plan = {
         'transition_id': transition_id, 'kinds': kinds, 'controller_id': current['controller_id'],
         'stage_fields': list(stage_changes), 'stage_changes': stage_changes,
         'from': {k: witness[k] for k in ('source_sha256', 'portfolio_source_sha256', 'recipe_sha256')}
@@ -394,6 +466,9 @@ def _plan(config, current, rows):
             'reserved_quote': str(exposure['total']),
             'released': None if grants is None else len(grants['released']),
         }}
+    if fills is not None:
+        plan['holdings'] = _holdings(config, stage, exposure, fills)
+    return plan
 
 
 def plan_identity_migration(config, sessions, config_file_path):
@@ -402,7 +477,7 @@ def plan_identity_migration(config, sessions, config_file_path):
     targets, grants, decisions = _stores(config, sessions, config_file_path, current)
     with sessions() as session:
         rows = _rows(session, config, config_file_path, targets, grants, decisions)
-    return _plan(config, current, rows)
+        return _plan(config, current, rows, fills=trade_fills_for_config(session, config_file_path))
 
 
 def apply_identity_migration(config, sessions, config_file_path, transition_id):
@@ -412,7 +487,7 @@ def apply_identity_migration(config, sessions, config_file_path, transition_id):
     with sessions() as session, session.begin():
         session.connection().exec_driver_sql('BEGIN IMMEDIATE')
         rows = _rows(session, config, config_file_path, targets, grants, decisions)
-        plan = _plan(config, current, rows)
+        plan = _plan(config, current, rows, fills=trade_fills_for_config(session, config_file_path))
         if plan['transition_id'] != transition_id:
             raise MigrationRefused('recorder state changed since the reviewed plan; plan again')
         witness = json.loads(rows['witness'])

@@ -48,7 +48,7 @@ from hummingbot.model.controller_candle_watermark import (
     ControllerCandleWatermarkState,
 )
 from hummingbot.model.controllers import Controllers
-from hummingbot.model.exact_order_values import OrderExact, TradeFillExact, decimal_text, recorded_values
+from hummingbot.model.exact_order_values import OrderExact, TradeFillExact, decimal_text, trade_fills_for_config
 from hummingbot.model.executors import Executors
 from hummingbot.model.funding_payment import FundingPayment
 from hummingbot.model.market_data import MarketData
@@ -986,27 +986,7 @@ class MarketsRecorder:
 
     def get_trades_for_config(self, config_file_path: str, number_of_rows: Optional[int] = None) -> List[TradeFill]:
         with self._sql_manager.get_new_session() as session:
-            has_exact = inspect(session.connection()).has_table(TradeFillExact.__tablename__)
-            query: Query = (session
-                            .query(TradeFill)
-                            .filter(TradeFill.config_file_path == config_file_path)
-                            .order_by(TradeFill.timestamp.desc()))
-            if has_exact:
-                query = query.add_entity(TradeFillExact).outerjoin(TradeFillExact, (
-                    (TradeFill.market == TradeFillExact.market)
-                    & (TradeFill.order_id == TradeFillExact.order_id)
-                    & (TradeFill.exchange_trade_id == TradeFillExact.exchange_trade_id)
-                ))
-            if number_of_rows is not None:
-                query = query.limit(number_of_rows)
-            rows = query.all()
-            trades = []
-            for result in rows:
-                trade, receipt = result if has_exact else (result, None)
-                # Attach immutable exact values; never rewrite mapped legacy columns.
-                trade.recorded_values = recorded_values(trade, receipt)
-                trades.append(trade)
-            return trades
+            return trade_fills_for_config(session, config_file_path, number_of_rows)
 
     def load_strategy_risk_state(self) -> Optional[dict]:
         with self._sql_manager.get_new_session() as session:

@@ -10,6 +10,11 @@ except an explicit `capital_stage` change whose every stage-derived value is the
 stage table's; the plan lists those values (`stage_changes`) and is refused while
 reserved exposure or open tranches exceed the target stage.
 
+The plan's `holdings` show what the owner really holds per symbol (native fills at
+fee-inclusive cost, no marks) beside its grant reservations, and flag holdings above
+a target stage's limits. They are informational: nothing is refused or sold for them.
+A short holdings summary is printed to stderr; stdout stays the plan's JSON.
+
     meridian_v3_identity_migration.py plan  --config sealed.yml --database data/x.sqlite --recorder-name conf.yml
     meridian_v3_identity_migration.py apply --config sealed.yml --database data/x.sqlite --recorder-name conf.yml \
         --transition <id>
@@ -58,6 +63,27 @@ def run(action, config_path: Path, database: Path, recorder_name: str, transitio
         engine.dispose()
 
 
+def holdings_summary(holdings) -> str:
+    """The plan's holdings as a few operator-readable lines (the JSON carries every value)."""
+    target = holdings.get('target')
+    lines = ['holdings (' + holdings['basis'] + ')' + (
+        '' if target is None else f" vs {target['stage']} per-asset {target['per_asset_quote']} "
+                                  f"/ envelope {target['envelope_quote']}")]
+    for pair, entry in sorted(holdings['symbols'].items()):
+        if 'unavailable' in entry:
+            lines.append(f"  {pair}: unavailable ({entry['unavailable']}) reserved={entry['reserved_grant_quote']}")
+            continue
+        flag = '  OVER TARGET' if entry['over_target'] else ''
+        lines.append(f"  {pair}: held {entry['held_amount_base']} base at cost {entry['held_cost_quote']} | "
+                     f"reserved {entry['reserved_grant_quote']} ({entry['open_grants']} grants) | "
+                     f"usage {entry['admission_usage_quote']}{flag}")
+    totals = holdings['totals']
+    lines.append(f"  total: held cost {totals['held_cost_quote']} | reserved {totals['reserved_grant_quote']} | "
+                 f"usage {totals['admission_usage_quote']}" + ('  OVER TARGET' if totals['over_target'] else ''))
+    lines.extend(f'  note: {note}' for note in holdings['notes'])
+    return '\n'.join(lines)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('action', choices=('plan', 'apply'))
@@ -67,6 +93,7 @@ def main(argv=None):
     parser.add_argument('--transition')
     args = parser.parse_args(argv)
     result = run(args.action, args.config, args.database, args.recorder_name, args.transition)
+    print(holdings_summary(result['holdings']), file=sys.stderr)
     print(json.dumps(result, indent=2, sort_keys=True))
     return result
 

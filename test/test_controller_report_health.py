@@ -11,7 +11,8 @@ def test_failed_report_cannot_refresh_snapshot_or_publish_stale_performance(tmp_
     original = json.dumps({'updated_at': 'old', 'active_executors': [{'id': 'completed-sale'}]})
     path.write_text(original)
     strategy = SimpleNamespace(
-        _controller_reports_valid=False, ready_to_trade=True, current_timestamp=100,
+        _controller_reports_valid=False, _unattended_restart_hold=False,
+        ready_to_trade=True, current_timestamp=100,
         _runtime_status_snapshot_enabled=lambda: True, _last_runtime_status_snapshot_ts=0,
         _runtime_status_snapshot_interval=lambda: 10, _runtime_status_snapshot_dir=lambda: tmp_path,
         _build_runtime_status_snapshot=lambda: {'bot_name': 'test', 'updated_at': 'fresh'},
@@ -104,9 +105,13 @@ def test_unknown_pnl_survives_native_snapshot_and_money_formatting():
              'executors': [], 'positions': [], 'performance': report}
     strategy = SimpleNamespace(_build_controller_status_entries=lambda: [entry], _get_balances_snapshot=lambda: [],
                                connectors={}, get_active_orders=lambda _: [], _runtime_status_snapshot_bot_name=lambda: 'sui',
-                               _build_runtime_operations_snapshot=lambda: {}, current_timestamp=100, _controller_reports_valid=True,
+                               _build_runtime_operations_snapshot=lambda: {}, current_timestamp=100,
+                               _controller_reports_valid=True, _unattended_restart_hold=False,
+                               _runtime_position_resume_observation=lambda: StrategyV2Base._runtime_position_resume_observation(strategy),
                                _safe_decimal=StrategyV2Base._safe_decimal)
     snapshot = StrategyV2Base._build_runtime_status_snapshot(strategy)
+    assert snapshot['unattended_restart_hold'] is False
+    assert snapshot['position_resume_recovery']['ownership_transfer_pending'] is False
     assert snapshot['summary']['pnl_available'] is False
     assert snapshot['summary']['net_pnl_quote'] is None
     assert snapshot['summary']['realized_pnl_quote'] is None
@@ -136,6 +141,8 @@ def test_wallet_sale_report_writes_exact_json_and_refreshes_atomically(tmp_path)
         _build_controller_status_entries=lambda: [entry], _get_balances_snapshot=lambda: [],
         connectors={}, get_active_orders=lambda _: [], _runtime_status_snapshot_bot_name=lambda: 'sui',
         _build_runtime_operations_snapshot=lambda: {}, current_timestamp=100, _controller_reports_valid=True,
+        _unattended_restart_hold=False,
+        _runtime_position_resume_observation=lambda: StrategyV2Base._runtime_position_resume_observation(strategy),
         _safe_decimal=StrategyV2Base._safe_decimal, ready_to_trade=True, logger=lambda: logger,
         _runtime_status_snapshot_enabled=lambda: True, _last_runtime_status_snapshot_ts=0,
         _runtime_status_snapshot_interval=lambda: 10, _runtime_status_snapshot_dir=lambda: tmp_path,

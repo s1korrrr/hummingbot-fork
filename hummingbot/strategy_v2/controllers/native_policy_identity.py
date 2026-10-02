@@ -28,3 +28,23 @@ def is_modular_policy(config) -> bool:
     from controllers.generic.modular_rsi_v5 import ModularRSIV5ControllerConfig
     from controllers.generic.modular_spot import ModularSpotControllerConfig
     return type(config) in {ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, ModularSpotControllerConfig}
+
+
+def is_legacy_ok_rsi_operator_policy(config) -> bool:
+    """Exact legacy directional owner for authenticated operator commands only."""
+    if getattr(config, 'controller_name', None) != 'ok_rsi':
+        return False
+    from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+    return type(config) is OKRSIControllerConfig
+
+
+def is_meridian_operator_policy(config) -> bool:
+    """Exact unified Meridian owner for durable operator controls only.
+
+    This is deliberately separate from modular accounting and funding identities.
+    A controller-name string or a symbol's modular config cannot opt into it.
+    """
+    if getattr(config, 'controller_name', None) != 'meridian_v3_unified':
+        return False
+    from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig
+    return type(config) is MeridianUnifiedConfig

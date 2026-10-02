@@ -107,6 +107,8 @@ advance a reset boundary instead of retaining an incomplete patch. Full
 responses retain the existing 8 MB bound. The optional 300-pair projection
 memory estimate includes a conservative journal reserve.
 
+Market Picture cache recovery verifies the original digest and every row before loading. It may exclude at most one otherwise-valid 1m row whose recorded availability is 1–2,000 ms before close, matching the former parser tolerance. The remaining validated history is retained; the excluded minute stays a gap until a fresh source snapshot supplies it with new provenance. The loader never clamps timestamps or rewrites the original file. Multiple affected rows, larger skews, malformed provenance/OHLC, invalid checksums, and pre-close hourly/daily rows reject the cache. Minute/hour/day readiness remains independently gated by coverage and fresh source observation. For a deferred candle, projection availability and freshness use `max(received_at, published_at)`: the original receipt remains intact, while the close-time publication is the first valid availability. A future-dated source observation is rejected.
+
 ## Bounded collection and recovery
 
 The collector uses fixed `wss://ws.okx.com:8443/ws/v5/business` (`candle1m`) and
@@ -211,6 +213,38 @@ its network namespace (for example an explicitly chosen host network), not rely
 on publishing a wildcard port. Building this image does not deploy it; no live
 service is restarted by this repository change. Linux image execution requires
 separate recorded validation; native Cargo checks alone do not prove it.
+
+## Hardening additions (2026-10-02)
+
+Wire protocol v1, `/health` and the cache format are unchanged. Design, evidence and rollout:
+`docs/architecture/rsibot-candle-service.md`.
+
+* **Confirmed-close availability.** Forming (unconfirmed) rows never fail a frame or REST page: they are
+  liveness evidence or ignored. A confirmed bar received before `open_time + 60` is deferred (at most 8 per
+  pair, with a 180 s horizon) and released only by a close-time reconciliation tick. The original upstream
+  `received_at` is retained; emitted `published_at` records release time. Market Picture derives availability
+  and freshness from the later of those timestamps, without moving the venue-receipt timestamp forward or
+  becoming stranded when a valid early receipt is held for more than its 90 s freshness window. Future-dated
+  observations are rejected. REST seeds, cache revalidation and warm-restore history
+  use the same strict close boundary. A post-close same-open row supersedes a queued early value, and a newer
+  early correction replaces the queued value. Timing deferrals do not clear a pair's warm baseline; malformed
+  confirmed rows still do.
+* **Two public sockets per group of 100 pairs**, started 15 s apart, merged and deduplicated. A pair stays
+  online while any socket is acknowledged. Reconnect backoff is `min(30, 2^n)` seconds with jitter; failed
+  seeds retry exponentially (a stale first REST page after 3 s, other failures after 10 s, cap 60 s).
+* **`--consumers-file PATH`** (mode 0600 JSON `{"consumers":[{"id","token","pairs","max_history","max_streams"}]}`):
+  per-consumer pair scope, history ceiling and stream cap. `--token-file` remains the full-scope consumer.
+  At least one of the two is required.
+* **`GET /v1/metrics?window=N`** (authenticated, read-only, scoped to the caller): per pair
+  `last_close_age_s`, `reconnects`, `rejected{reason}`, `deferred`, `lanes`, `window_digest` (SHA-256 of the
+  newest `N` rows, canonical JSON identical to the cache digest) and `window_head_open_time`.
+* **`--status-file PATH`** (absolute, mode 0600): the metrics view with a 60-bar window, rewritten atomically every
+  5 s, for monitors that cannot reach the namespace-local listener.
+* **Disconnect causes** are counted separately: `client_write_deadline`, `client_subscribe_timeout`,
+  `client_transport_error`, `client_unexpected_message`, `client_lagged`, `client_scope_refused`,
+  `client_stream_cap_refused`. The write deadline is 2 s plus 1 s per 512 KiB (cap 20 s).
+* Tools: `tools/v1_candle_parity.py` (V1 recorder copy versus service cache), `tools/ab_digest_check.py`
+  (two status files), both with stdlib unit tests (`python3 -m unittest discover -s tools`).
 
 ## Validation and operating boundary
 

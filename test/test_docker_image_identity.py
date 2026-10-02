@@ -1116,6 +1116,17 @@ def test_workflow_pr_verification_is_non_pushing_and_binds_pr_head_sha():
     assert "push: true" not in pr_job
 
 
+def test_pr_builds_both_architectures_on_separate_bounded_runners():
+    job = _workflow_document()["jobs"]["verify_pr"]
+    assert job["strategy"]["matrix"]["platform"] == ["linux/amd64", "linux/arm64"]
+    assert job["strategy"]["fail-fast"] == "false"
+    assert int(job["timeout-minutes"]) <= 60
+    build = _workflow_step_by_action("verify_pr", "docker/build-push-action")
+    assert build["with"]["platforms"] == "${{ matrix.platform }}"
+    assert build["with"]["push"] == "false"
+    assert "${{ github.event.pull_request.head.sha }}" in build["with"]["build-args"]
+
+
 def test_workflow_release_publication_is_manual_confirmed_and_uses_immutable_source_identity():
     workflow = _workflow()
     document = _workflow_document()

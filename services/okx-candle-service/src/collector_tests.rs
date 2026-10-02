@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::parse_row;
 use crate::state::State;
 use tokio::io::DuplexStream;
 use tokio_tungstenite::tungstenite::protocol::Role;
@@ -395,4 +396,161 @@ async fn actual_session_forming_head_revalidates_cached_history_without_historic
     }
     peer.send(Message::Close(None)).await.unwrap();
     assert!(collector.await.unwrap().is_err());
+}
+
+fn confirmed_frame(pair: &str, open_time: u64) -> Message {
+    Message::Text(
+        json!({"arg":{"channel":"candle1m","instId":pair},"data":[[(open_time * 1000).to_string(),"10","11","9","10","1","1","10","1"]]})
+            .to_string()
+            .into(),
+    )
+}
+
+#[tokio::test]
+async fn two_lanes_deduplicate_and_one_lane_reset_never_opens_a_gap() {
+    let pairs: Vec<String> = vec!["BTC-USDC".into()];
+    let state = State::new(&pairs, 2);
+    let closed = (now() as u64 / 60 - 1) * 60;
+    let mut peers = Vec::new();
+    let mut sessions = Vec::new();
+    for lane in 0..2u8 {
+        let (client, mut peer) = sockets().await;
+        let (state, pairs) = (state.clone(), pairs.clone());
+        sessions.push(tokio::spawn(async move {
+            session_lane(state, &pairs, client, SessionTiming::production(), lane).await
+        }));
+        acknowledge(&mut peer).await;
+        peer.send(confirmed_frame("BTC-USDC", closed))
+            .await
+            .unwrap();
+        peers.push(peer);
+    }
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let s = state.lock().await;
+            if s.counters.get("confirmed_rows") == Some(&2) {
+                break;
+            }
+            drop(s);
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let mut s = state.lock().await;
+        let p = &s.pairs["BTC-USDC"];
+        assert_eq!(p.lanes, 0b11, "both lanes acknowledged");
+        assert_eq!(p.rows.len(), 1, "identical rows from two lanes merge");
+        assert_eq!(s.counters["duplicates_ignored"], 1);
+        // Make the pair ready from a complete contiguous seed, as the repair loop would.
+        let generation = s.pairs["BTC-USDC"].generation;
+        let rows = vec![
+            crate::model::Candle {
+                open_time: closed - 60,
+                open: "10".into(),
+                high: "11".into(),
+                low: "9".into(),
+                close: "10".into(),
+                volume: "1".into(),
+                quote_volume: "10".into(),
+                confirmed: true,
+            },
+            s.pairs["BTC-USDC"].rows[0].as_ref().clone(),
+        ];
+        assert!(s.apply_seed("BTC-USDC", generation, rows, now()));
+    }
+    // Lane 0 resets. The pair must remain online and ready: no invalidation, no new epoch work.
+    drop(peers.remove(0));
+    let lane0 = sessions.remove(0).await.unwrap();
+    assert!(lane0.is_err());
+    state
+        .lock()
+        .await
+        .lane_disconnected(&pairs, 0, "upstream_disconnected");
+    {
+        let s = state.lock().await;
+        let p = &s.pairs["BTC-USDC"];
+        assert!(p.online && p.ready, "surviving lane keeps the pair live");
+        assert_eq!(p.lanes, 0b10);
+        assert_eq!(p.reconnects, 1);
+        assert_eq!(s.counters.get("invalidations"), None);
+    }
+    // The surviving lane keeps publishing: a latest-bar correction is a normal delta event.
+    peers[0]
+        .send(Message::Text(
+            json!({"arg":{"channel":"candle1m","instId":"BTC-USDC"},"data":[[(closed * 1000).to_string(),"10","11","9","10.5","1","1","10","1"]]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if state.lock().await.counters.get("candle_events") == Some(&1) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Only when the last lane is lost does the pair take the full disconnect path.
+    drop(peers.remove(0));
+    assert!(sessions.remove(0).await.unwrap().is_err());
+    state
+        .lock()
+        .await
+        .lane_disconnected(&pairs, 1, "upstream_disconnected");
+    let s = state.lock().await;
+    assert!(!s.pairs["BTC-USDC"].online && !s.pairs["BTC-USDC"].ready);
+    assert_eq!(s.counters["invalidations"], 1);
+}
+
+#[tokio::test]
+async fn skewed_confirmed_and_future_forming_rows_are_classified_not_fatal() {
+    let pairs: Vec<String> = vec!["BTC-USDC".into()];
+    let state = State::new(&pairs, 2);
+    let (client, mut peer) = sockets().await;
+    let (task_state, task_pairs) = (state.clone(), pairs.clone());
+    let collector = tokio::spawn(async move {
+        session(task_state, &task_pairs, client, SessionTiming::production()).await
+    });
+    acknowledge(&mut peer).await;
+    let next_minute = (now() as u64 / 60 + 1) * 60;
+    // A confirmed bar closing a minute ahead of the local clock and a forming bar two minutes
+    // ahead: before this change either one invalidated the pair and wiped its baseline.
+    let frame = json!({"arg":{"channel":"candle1m","instId":"BTC-USDC"},"data":[
+        [((next_minute - 60) * 1000).to_string(),"10","11","9","10","1","1","10","1"],
+        [((next_minute + 60) * 1000).to_string(),"10","11","9","10","1","1","10","0"],
+        [((now() as u64 / 60) * 60 * 1000).to_string(),"10","9","11","10","1","1","10","0"]
+    ]});
+    peer.send(Message::Text(frame.to_string().into()))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if state.lock().await.counters.get("upstream_frames") == Some(&1) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let s = state.lock().await;
+    let p = &s.pairs["BTC-USDC"];
+    assert_eq!(s.counters.get("parser_failures"), None);
+    assert_eq!(s.counters.get("invalidations"), None);
+    assert_eq!(p.generation, 0, "no generation bump, baseline untouched");
+    assert_eq!(p.deferred.len(), 1);
+    assert_eq!(p.rejected["clock_skew_deferred"], 1);
+    assert_eq!(p.rejected["forming_future"], 1);
+    assert_eq!(p.rejected["forming_malformed"], 1);
+    assert!(
+        p.live_head.is_none(),
+        "future forming bars never become a live head"
+    );
+    drop(s);
+    collector.abort();
 }

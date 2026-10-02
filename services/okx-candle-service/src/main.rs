@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (pairs, token) = args.validate()?;
+    let (pairs, auth) = args.validate()?;
     let state = State::new(&pairs, args.history);
     let cache = args.cache_dir.as_deref().map(Cache::open).transpose()?;
     if let Some(cache) = &cache {
@@ -62,6 +62,13 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
+    let status_task = args.status_file.clone().map(|path| {
+        tokio::spawn(okx_candle_service::status::run(
+            state.clone(),
+            path,
+            cache_stop.clone(),
+        ))
+    });
     let signal_stop = stop.clone();
     tokio::spawn(async move {
         let mut terminate =
@@ -79,7 +86,7 @@ async fn main() -> Result<()> {
     });
     let result = axum::serve(
         listener,
-        server::router(state, token, stop.clone(), market_picture),
+        server::router_with_auth(state, auth, stop.clone(), market_picture),
     )
     .with_graceful_shutdown(stop.clone().cancelled_owned())
     .await;
@@ -90,6 +97,9 @@ async fn main() -> Result<()> {
     cache_stop.cancel();
     if let Some(cache_task) = cache_task {
         cache_task.await?;
+    }
+    if let Some(status_task) = status_task {
+        status_task.await?;
     }
     if let Some(market_picture_task) = market_picture_task {
         market_picture_task.await?;

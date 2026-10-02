@@ -36,6 +36,7 @@ pub const MAX_MARKET_PICTURE_PAIRS: usize = 300;
 pub const MAX_EXTENSION_MEMORY_BYTES: u64 = 1_073_741_824;
 const MAX_CACHE_BYTES: u64 = 8_000_000;
 const MAX_CACHE_TOTAL_BYTES: u64 = 2_000_000_000;
+const MAX_CACHED_PRE_CLOSE_SKEW_MS: u64 = 2_000;
 const MAX_UPDATE_JOURNAL_BYTES: usize = 16_384;
 const MAX_UPDATE_BATCHES: usize = 128;
 const MAX_UPDATE_ROWS: usize = 128;
@@ -511,9 +512,6 @@ impl Projection {
             .pairs
             .get_mut(pair)
             .context("cache pair outside configured universe")?;
-        validate_cache_bars(&body.bars_1m, Interval::Minute, MINUTE_ROWS)?;
-        validate_cache_bars(&body.bars_1h, Interval::Hour, HOUR_ROWS)?;
-        validate_cache_bars(&body.bars_1d, Interval::Day, DAY_ROWS)?;
         ensure!(
             body.bars_1m
                 .iter()
@@ -522,6 +520,15 @@ impl Projection {
                 .all(|bar| bar.available_at_ms <= body.saved_at_ms),
             "cached source availability follows cache save time"
         );
+        let quarantined_minute_rows =
+            validate_cache_bars(&mut body.bars_1m, Interval::Minute, MINUTE_ROWS, true)?;
+        validate_cache_bars(&mut body.bars_1h, Interval::Hour, HOUR_ROWS, false)?;
+        validate_cache_bars(&mut body.bars_1d, Interval::Day, DAY_ROWS, false)?;
+        if quarantined_minute_rows > 0 {
+            eprintln!(
+                "market picture cache quarantined pre-close minute rows pair={pair} count={quarantined_minute_rows}"
+            );
+        }
         intern_bar_epochs(&mut body.bars_1m);
         intern_bar_epochs(&mut body.bars_1h);
         intern_bar_epochs(&mut body.bars_1d);
@@ -660,6 +667,11 @@ impl Projection {
             snapshot,
             now_ms,
         } = observation;
+        ensure!(
+            received_at_ms <= now_ms && published_at_ms <= now_ms,
+            "source observation is future dated"
+        );
+        let available_at_ms = received_at_ms.max(published_at_ms);
         let history = self
             .pairs
             .get_mut(&pair)
@@ -686,13 +698,10 @@ impl Projection {
         }
         history.source_epoch = source_epoch.clone();
         history.source_sequence = source_sequence;
-        history.available_at_ms = history
-            .available_at_ms
-            .max(received_at_ms)
-            .max(published_at_ms);
-        history.last_observed_at_ms = history.last_observed_at_ms.max(received_at_ms);
-        history.ready_source = received_at_ms >= self.started_at_ms
-            && now_ms.saturating_sub(received_at_ms) <= 90_000
+        history.available_at_ms = history.available_at_ms.max(available_at_ms);
+        history.last_observed_at_ms = history.last_observed_at_ms.max(available_at_ms);
+        history.ready_source = available_at_ms >= self.started_at_ms
+            && now_ms.saturating_sub(available_at_ms) <= 90_000
             && history.last_observed_at_ms >= self.started_at_ms;
 
         let mut touched = Vec::new();
@@ -1223,16 +1232,21 @@ fn validate_bars(bars: &[SourceBar], interval: Interval, max_count: usize) -> Re
     Ok(())
 }
 
-fn validate_cache_bars(bars: &[SourceBar], interval: Interval, max_count: usize) -> Result<()> {
+fn validate_cache_bars(
+    bars: &mut Vec<SourceBar>,
+    interval: Interval,
+    max_count: usize,
+    allow_one_preclose: bool,
+) -> Result<usize> {
     ensure!(bars.len() <= max_count, "history interval exceeds bound");
     let duration_ms = interval.seconds() * 1000;
+    let mut preclose_open = None;
     for (index, bar) in bars.iter().enumerate() {
         ensure!(
             bar.confirmed
                 && bar.close_time_ms == bar.open_time_ms + duration_ms
-                && bar.open_time_ms % duration_ms == 0
-                && bar.available_at_ms >= bar.close_time_ms,
-            "invalid cached interval bar boundary or availability"
+                && bar.open_time_ms % duration_ms == 0,
+            "invalid cached interval bar boundary"
         );
         validate_decimal_bar(bar)?;
         ensure!(
@@ -1245,6 +1259,16 @@ fn validate_cache_bars(bars: &[SourceBar], interval: Interval, max_count: usize)
                 && bar.source_sequence > 0,
             "invalid cached source provenance"
         );
+        if bar.available_at_ms < bar.close_time_ms {
+            ensure!(
+                interval == Interval::Minute
+                    && allow_one_preclose
+                    && preclose_open.is_none()
+                    && bar.close_time_ms - bar.available_at_ms <= MAX_CACHED_PRE_CLOSE_SKEW_MS,
+                "invalid cached interval availability"
+            );
+            preclose_open = Some(bar.open_time_ms);
+        }
         if index > 0 {
             ensure!(
                 bars[index - 1].open_time_ms < bar.open_time_ms,
@@ -1252,7 +1276,11 @@ fn validate_cache_bars(bars: &[SourceBar], interval: Interval, max_count: usize)
             );
         }
     }
-    Ok(())
+    let quarantined = usize::from(preclose_open.is_some());
+    if let Some(open_time_ms) = preclose_open {
+        bars.retain(|bar| bar.open_time_ms != open_time_ms);
+    }
+    Ok(quarantined)
 }
 
 fn insert_sorted(rows: &mut VecDeque<SourceBar>, bar: SourceBar, capacity: usize) {
@@ -2781,6 +2809,219 @@ mod tests {
         assert_eq!(encoded["source_epoch"], "source-epoch");
         let decoded: SourceBar = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn cache_quarantines_only_preclose_minute_row_until_fresh_snapshot_replaces_it() {
+        let pair = "BTC-USDC".to_owned();
+        let now_ms = (now() * 1000.0).round() as u64;
+        let latest_open = now_ms / 60_000 * 60_000 - 60_000;
+        let first_open = latest_open - (MINUTE_ROWS as u64 - 1) * 60_000;
+        let mut bars_1m = (0..MINUTE_ROWS)
+            .map(|index| bar(first_open + index as u64 * 60_000, "100"))
+            .collect::<Vec<_>>();
+        let quarantined_open = bars_1m[MINUTE_ROWS / 2].open_time_ms;
+        let quarantined = &mut bars_1m[MINUTE_ROWS / 2];
+        quarantined.available_at_ms = quarantined.close_time_ms - 1;
+        let body = CacheBody {
+            schema_version: "market-picture.history-cache.v1".into(),
+            provider_id: "okx-candle-service".into(),
+            pair: pair.clone(),
+            saved_at_ms: now_ms,
+            bars_1m,
+            bars_1h: Vec::new(),
+            bars_1d: Vec::new(),
+        };
+        let bytes = serde_json::to_vec(&CacheRecord {
+            sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap())),
+            body: body.clone(),
+        })
+        .unwrap();
+
+        let temp =
+            std::env::temp_dir().join(format!("market-picture-cache-{}", uuid::Uuid::new_v4()));
+        let cache = ProjectionCache::open(&temp).unwrap();
+        cache.save_body(body.clone()).unwrap();
+        let path = cache.path(&pair).unwrap();
+        let original_cache_bytes = fs::read(&path).unwrap();
+        let mut projection = Projection::new(std::slice::from_ref(&pair), now_ms - 1_000);
+
+        assert!(cache.load(&mut projection, &pair).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), original_cache_bytes);
+        let history = &projection.pairs[&pair];
+        assert_eq!(history.minute.len(), MINUTE_ROWS - 1);
+        assert!(
+            history
+                .minute
+                .iter()
+                .all(|row| row.open_time_ms != quarantined_open)
+        );
+        assert!(!history.ready_source);
+        let partial = projection
+            .response(&pair, Interval::Minute, now_ms)
+            .unwrap();
+        assert!(!partial.ready);
+        assert!(partial.coverage.gap_count > 0);
+
+        let cached_record: CacheRecord = serde_json::from_slice(&bytes).unwrap();
+        let mut malformed = cached_record.body.clone();
+        malformed.bars_1m[MINUTE_ROWS / 2].high = Decimal::ZERO;
+        let malformed_bytes = serde_json::to_vec(&CacheRecord {
+            sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&malformed).unwrap())
+            ),
+            body: malformed,
+        })
+        .unwrap();
+        let mut rejected = Projection::new(std::slice::from_ref(&pair), now_ms - 1_000);
+        assert!(
+            rejected
+                .load_cache_bytes(&pair, &malformed_bytes, now_ms)
+                .is_err()
+        );
+
+        let mut multiple_preclose = cached_record.body.clone();
+        multiple_preclose.bars_1m[1].available_at_ms =
+            multiple_preclose.bars_1m[1].close_time_ms - 1;
+        let multiple_preclose_bytes = serde_json::to_vec(&CacheRecord {
+            sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&multiple_preclose).unwrap())
+            ),
+            body: multiple_preclose,
+        })
+        .unwrap();
+        let mut rejected = Projection::new(std::slice::from_ref(&pair), now_ms - 1_000);
+        assert!(
+            rejected
+                .load_cache_bytes(&pair, &multiple_preclose_bytes, now_ms)
+                .is_err()
+        );
+
+        for unavailable_at_ms in [
+            cached_record.body.bars_1m[MINUTE_ROWS / 2]
+                .close_time_ms
+                .saturating_sub(MAX_CACHED_PRE_CLOSE_SKEW_MS + 1),
+            0,
+        ] {
+            let mut outside_skew = cached_record.body.clone();
+            outside_skew.bars_1m[MINUTE_ROWS / 2].available_at_ms = unavailable_at_ms;
+            let outside_skew_bytes = serde_json::to_vec(&CacheRecord {
+                sha256: format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&outside_skew).unwrap())
+                ),
+                body: outside_skew,
+            })
+            .unwrap();
+            let mut rejected = Projection::new(std::slice::from_ref(&pair), now_ms - 1_000);
+            assert!(
+                rejected
+                    .load_cache_bytes(&pair, &outside_skew_bytes, now_ms)
+                    .is_err()
+            );
+        }
+
+        let mut hourly_preclose = cached_record.body.clone();
+        let hour_open = now_ms / 3_600_000 * 3_600_000 - 3_600_000;
+        let mut hour = bar(hour_open, "100");
+        hour.close_time_ms = hour_open + 3_600_000;
+        hour.available_at_ms = hour.close_time_ms - 1;
+        hourly_preclose.bars_1h.push(hour);
+        let hourly_preclose_bytes = serde_json::to_vec(&CacheRecord {
+            sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&hourly_preclose).unwrap())
+            ),
+            body: hourly_preclose,
+        })
+        .unwrap();
+        let mut rejected = Projection::new(std::slice::from_ref(&pair), now_ms - 1_000);
+        assert!(
+            rejected
+                .load_cache_bytes(&pair, &hourly_preclose_bytes, now_ms)
+                .is_err()
+        );
+
+        let replacement = Candle {
+            open_time: quarantined_open / 1000,
+            open: "100".into(),
+            high: "101".into(),
+            low: "99".into(),
+            close: "100.5".into(),
+            volume: "1".into(),
+            quote_volume: "100.5".into(),
+            confirmed: true,
+        };
+        projection
+            .observe(
+                Event::Snapshot {
+                    metadata: serde_json::json!({
+                        "v": 1,
+                        "type": "snapshot",
+                        "epoch": "fresh-source",
+                        "pair": pair,
+                        "sequence": 1,
+                        "published_at": now_ms as f64 / 1000.0,
+                        "received_at": now_ms as f64 / 1000.0,
+                    }),
+                    rows: vec![Arc::new(replacement)].into(),
+                },
+                now_ms,
+            )
+            .unwrap();
+        let restored = projection
+            .response("BTC-USDC", Interval::Minute, now_ms)
+            .unwrap();
+        assert!(restored.ready);
+        assert_eq!(restored.coverage.valid_count, MINUTE_ROWS);
+        assert_eq!(restored.bars.len(), MINUTE_ROWS);
+        let index = ((quarantined_open - first_open) / 60_000) as usize;
+        assert_eq!(restored.bars[index].6, now_ms);
+        assert_eq!(
+            restored.source_epochs[restored.bars[index].7 as usize],
+            "fresh-source"
+        );
+        assert_eq!(restored.bars[index].8, 1);
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    #[ignore = "read-only qualification of the preserved local public-market cache"]
+    fn preserved_market_picture_cache_has_only_expected_preclose_rows() {
+        let root = std::env::var_os("RSIBOT_MARKET_PICTURE_CACHE_ROOT")
+            .expect("set RSIBOT_MARKET_PICTURE_CACHE_ROOT to an existing cache root");
+        let root = PathBuf::from(root);
+        assert!(root.join("market-picture").is_dir());
+        let cache = ProjectionCache::open(&root).unwrap();
+        let pairs = ["BNB-USDC", "BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC"].map(str::to_owned);
+        let now_ms = (now() * 1000.0).round() as u64;
+        let mut projection = Projection::new(&pairs, now_ms);
+        for (pair, expected_rows) in pairs
+            .iter()
+            .zip([MINUTE_ROWS - 1; 4].into_iter().chain([MINUTE_ROWS]))
+        {
+            assert!(
+                cache.load(&mut projection, pair).unwrap(),
+                "missing cache for {pair}"
+            );
+            let history = &projection.pairs[pair];
+            assert_eq!(
+                history.minute.len(),
+                expected_rows,
+                "minute baseline for {pair}"
+            );
+            assert!(
+                !history.ready_source,
+                "cache alone must not grant readiness for {pair}"
+            );
+            println!(
+                "pair={pair} retained_minute_rows={} ready=false",
+                history.minute.len()
+            );
+        }
     }
 
     #[test]

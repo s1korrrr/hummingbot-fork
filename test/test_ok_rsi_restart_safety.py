@@ -247,6 +247,7 @@ def test_direct_orchestrator_create_cannot_bypass_source_restart_guard():
 @pytest.mark.parametrize('resume_failure', [None, 'claim failed; reconciliation required'])
 async def test_pending_resume_tick_preserves_operator_pause_without_uninitialized_reports(recorder, resume_failure):
     import asyncio
+    import time
     from collections import deque
 
     from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
@@ -259,7 +260,7 @@ async def test_pending_resume_tick_preserves_operator_pause_without_uninitialize
         'max_pnl_by_controller': {'controller': '75'}, 'drawdown_exited_controllers': [],
         'stopped': False, 'operator_paused': {'controller': False}})
     connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
-    events = deque([('rsibot.operator', SimpleNamespace(data={'action': 'bot_pause_entries'}))])
+    events = deque()
 
     def initialize(strategy):
         config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT')
@@ -277,9 +278,17 @@ async def test_pending_resume_tick_preserves_operator_pause_without_uninitialize
         orchestrator._planned_resume_pending = True
         orchestrator._planned_resume_failure = resume_failure
         try:
+            strategy._operator_started_at = time.time() - 1
+            events.append(('rsibot.operator', SimpleNamespace(data={
+                'action': 'bot_pause_entries', 'bot_name': 'candidate',
+                'controller_id': 'controller', 'requested_at': time.time(),
+                'command_id': 'pending-resume-pause',
+            })))
             assert not strategy.ready_to_trade
             assert strategy.get_performance_report('controller') is None
-            with patch.object(strategy, 'send_performance_report') as publish:
+            with patch.object(strategy, 'send_performance_report') as publish, \
+                    patch('scripts.v2_with_controllers.HummingbotApplication.main_application',
+                          return_value=SimpleNamespace(instance_id='candidate')):
                 strategy.on_tick()  # Actual subclass, parent, resume gate and operator/risk methods.
                 strategy.on_tick()
                 publish.assert_not_called()
@@ -289,6 +298,7 @@ async def test_pending_resume_tick_preserves_operator_pause_without_uninitialize
             assert strategy.max_pnl_by_controller == {'controller': D('75')}
             assert strategy.controllers['controller']._operator_entry_paused
             assert recorder.load_strategy_risk_state()['operator_paused'] == {'controller': True}
+            assert recorder.has_operator_command('controller', 'pending-resume-pause')
             assert not connector.in_flight_orders
 
             # Once ownership is resolved, normal reporting and the existing loss rail must run.

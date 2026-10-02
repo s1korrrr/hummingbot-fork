@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
@@ -67,11 +68,14 @@ class NativeMarketDataHealthTest(IsolatedAsyncioTestCase):
     async def test_okx_keeps_validated_source_timestamp_without_changing_price(self):
         connector = OkxExchange.__new__(OkxExchange)
         connector.exchange_symbol_associated_to_pair = AsyncMock(return_value="BTC-USDC")
-        connector._api_request = AsyncMock(return_value={"data": [{"last": "100", "ts": "120000"}]})
+        connector._spot_ticker_lock = asyncio.Lock()
+        connector._spot_ticker_cache = None
+        connector._api_get = AsyncMock(return_value={"data": [{"instId": "BTC-USDC", "last": "100", "ts": "120000"}]})
         self.assertEqual(100.0, await connector._get_last_traded_price("BTC-USDC"))
         self.assertEqual(120.0, connector.last_traded_price_source_timestamp("BTC-USDC"))
         for timestamp in [None, "bad", "NaN", "Infinity", "-1"]:
-            connector._api_request.return_value = {"data": [{"last": "100", "ts": timestamp}]}
+            connector._spot_ticker_cache = None
+            connector._api_get.return_value = {"data": [{"instId": "BTC-USDC", "last": "100", "ts": timestamp}]}
             self.assertEqual(100.0, await connector._get_last_traded_price("BTC-USDC"))
             self.assertIsNone(connector.last_traded_price_source_timestamp("BTC-USDC"))
 
@@ -109,6 +113,106 @@ class NativeMarketDataHealthTest(IsolatedAsyncioTestCase):
         self.assertEqual("BTC-USDC", operations["pairs"][0]["pair"])
         self.assertIsNone(operations["pairs"][0]["price"]["source_at"])
         self.assertEqual("1970-01-01T00:03:00+00:00", operations["observed_at"])
+
+    def test_shared_multisymbol_runtime_operations_use_native_book_and_pool_timestamps(self):
+        from hummingbot.core.data_type.order_book_observation import OrderBookObservation
+        from hummingbot.strategy_v2.components.candle_data import Candle, CandleSnapshot, Dataset, Replica
+        from hummingbot.strategy_v2.components.data_reader import DataPool
+
+        now = 1_800_000_120
+        pairs = ("BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC", "BNB-USDC")
+
+        class Connector:
+            ready = True
+
+            def get_order_book_observation(self, pair):
+                return OrderBookObservation(now - 1, now - 0.5)
+
+        controller_provider = SimpleNamespace(connectors={"okx": Connector()})
+        contexts = {}
+        expected_source_at = {}
+        expected_published_at = {}
+        for pair in pairs:
+            spec = Dataset(connector="okx", trading_pair=pair, interval="1m", history=60)
+            rows = tuple(Candle(open_time=now - 60 * (60 - index), open=100, high=101, low=99,
+                                close=100, volume=1) for index in range(60))
+            published_at = now
+            snapshot = CandleSnapshot(dataset=spec, epoch="fixture", sequence=1,
+                                      published_at=published_at, rows=rows)
+            replica = Replica((spec,))
+            replica.begin_session()
+            self.assertTrue(replica.accept(snapshot, now=now))
+            pool = DataPool(SimpleNamespace())
+            pool.attach((spec,))
+            pool.client = SimpleNamespace(replica=replica)
+            contexts[pair] = SimpleNamespace(
+                config=SimpleNamespace(connector_name="okx", trading_pair=pair,
+                                       max_candle_age_seconds=120),
+                market_data_provider=controller_provider,
+                max_quote_age_ms=5_000,
+                runtime=SimpleNamespace(pool=pool),
+            )
+            expected_source_at[pair] = pd.Timestamp(rows[-1].open_time, unit="s", tz="UTC").isoformat()
+            expected_published_at[pair] = pd.Timestamp(published_at, unit="s", tz="UTC").isoformat()
+
+        config = SimpleNamespace(connector_name="okx", data=SimpleNamespace(mode="shared"),
+                                 owned_trading_pairs=lambda: pairs)
+        controller = SimpleNamespace(config=config, contexts=contexts, market_data_provider=controller_provider)
+        strategy = SimpleNamespace(current_timestamp=now, market_data_provider=self.provider,
+                                   controllers={"meridian": controller})
+        strategy._runtime_reconciliation_observation = lambda: {"state": "unavailable"}
+
+        operations = StrategyV2Base._build_runtime_operations_snapshot(strategy)
+
+        self.assertEqual(set(pairs), {row["pair"] for row in operations["pairs"]})
+        for row in operations["pairs"]:
+            pair = row["pair"]
+            self.assertEqual("order_book_observation", row["price"]["source"])
+            self.assertEqual("available", row["price"]["availability"])
+            self.assertEqual(pd.Timestamp(now - 1, unit="s", tz="UTC").isoformat(), row["price"]["source_at"])
+            self.assertEqual(pd.Timestamp(now - 0.5, unit="s", tz="UTC").isoformat(), row["price"]["applied_at"])
+            self.assertIsNone(row["price"]["received_at"])
+            self.assertEqual("shared_candle_snapshot", row["candle"]["source"])
+            self.assertEqual("available", row["candle"]["availability"])
+            self.assertEqual(expected_source_at[pair], row["candle"]["source_at"])
+            self.assertEqual(expected_published_at[pair], row["candle"]["published_at"])
+            self.assertIsNone(row["candle"]["received_at"])
+            self.assertEqual(60, row["candle"]["interval_seconds"])
+            self.assertEqual("open", row["candle"]["timestamp_semantics"])
+            self.assertTrue(row["candle"]["closed"])
+
+        controller_provider.connectors["okx"].ready = False
+        unavailable = StrategyV2Base._build_runtime_operations_snapshot(strategy)
+        for row in unavailable["pairs"]:
+            self.assertEqual("unavailable", row["price"]["availability"])
+            self.assertEqual("connector_not_ready", row["price"]["availability_reason"])
+            self.assertEqual("available", row["candle"]["availability"])
+
+    def test_shared_context_without_native_observations_stays_explicitly_unavailable(self):
+        now = 1_800_000_120
+        pair = "BTC-USDC"
+        self.provider._ticker_observations[("okx", pair)] = (now - 1, now - 0.5, 10.0)
+        config = SimpleNamespace(connector_name="okx", trading_pair=pair,
+                                 data=SimpleNamespace(mode="shared"), max_candle_age_seconds=120)
+        context = SimpleNamespace(config=config, max_quote_age_ms=5_000,
+                                  runtime=SimpleNamespace(pool=None))
+        controller = SimpleNamespace(
+            config=SimpleNamespace(connector_name="okx", data=SimpleNamespace(mode="shared"),
+                                   owned_trading_pairs=lambda: (pair,)),
+            contexts={pair: context}, market_data_provider=SimpleNamespace(connectors={"okx": object()}))
+        strategy = SimpleNamespace(current_timestamp=now, market_data_provider=self.provider,
+                                   controllers={"meridian": controller})
+        strategy._runtime_reconciliation_observation = lambda: {"state": "unavailable"}
+
+        row = StrategyV2Base._build_runtime_operations_snapshot(strategy)["pairs"][0]
+
+        self.assertEqual("order_book_observation", row["price"]["source"])
+        self.assertEqual("unavailable", row["price"]["availability"])
+        self.assertIsNone(row["price"]["source_at"])
+        self.assertEqual("shared_candle_snapshot", row["candle"]["source"])
+        self.assertEqual("unavailable", row["candle"]["availability"])
+        self.assertEqual("shared_dataset_unavailable", row["candle"]["availability_reason"])
+        self.assertIsNone(row["candle"]["source_at"])
 
     def test_reconciliation_reports_concrete_records_without_claiming_global_clearance(self):
         strategy = SimpleNamespace(

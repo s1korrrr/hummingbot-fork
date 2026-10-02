@@ -2,6 +2,12 @@ from decimal import Decimal
 from types import SimpleNamespace as Obj
 
 
+def _position_resume_observation(strategy):
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+
+    return StrategyV2Base._runtime_position_resume_observation(strategy)
+
+
 def test_controller_episode_and_pending_sell_are_read_only_and_allowlisted():
     from hummingbot.strategy.native_observability import controller_observation
     request = Obj(side='SELL', price=Decimal('12'), amount=Decimal('3'))
@@ -192,8 +198,12 @@ def test_actual_snapshot_function_emits_enrichment_and_preserves_legacy_count():
     strategy = Obj(_build_controller_status_entries=lambda: [entry], _get_balances_snapshot=lambda: [],
                    connectors={'okx': Obj(in_flight_orders={})}, get_active_orders=lambda name: [],
                    _runtime_status_snapshot_bot_name=lambda: 'test-bot', _build_runtime_operations_snapshot=lambda: {},
-                   current_timestamp=100, _controller_reports_valid=True, _safe_decimal=lambda value: Decimal(str(value)))
+                   current_timestamp=100, _controller_reports_valid=True, _unattended_restart_hold=False,
+                   _runtime_position_resume_observation=lambda: _position_resume_observation(strategy),
+                   _safe_decimal=lambda value: Decimal(str(value)))
     result = namespace['_build_runtime_status_snapshot'](strategy)
+    assert result['unattended_restart_hold'] is False
+    assert result['position_resume_recovery']['unfinished_claim_controllers'] == []
     assert result['active_orders_count'] == 0
     assert result['active_orders'] == []
     assert result['active_orders_status']['complete'] is True
@@ -251,6 +261,8 @@ def test_actual_snapshot_keeps_closing_executor_in_lifecycle_projection():
         _format_executor_age_short=lambda timestamp: '10s',
         current_timestamp=100,
         _controller_reports_valid=True,
+        _unattended_restart_hold=False,
+        _runtime_position_resume_observation=lambda: _position_resume_observation(strategy),
         _safe_decimal=lambda value: Decimal(str(value)),
     )
 
@@ -303,7 +315,9 @@ def test_runtime_pnl_requires_nonempty_explicit_performance_evidence():
         strategy = Obj(_build_controller_status_entries=lambda: entries, _get_balances_snapshot=lambda: [],
                        connectors={'okx': Obj(in_flight_orders={})}, get_active_orders=lambda _: [],
                        _runtime_status_snapshot_bot_name=lambda: 'test', _build_runtime_operations_snapshot=lambda: {},
-                       current_timestamp=100, _controller_reports_valid=True, _safe_decimal=lambda v: Decimal(str(v)))
+                       current_timestamp=100, _controller_reports_valid=True, _unattended_restart_hold=False,
+                       _runtime_position_resume_observation=lambda: _position_resume_observation(strategy),
+                       _safe_decimal=lambda v: Decimal(str(v)))
         snapshot = namespace['_build_runtime_status_snapshot'](strategy)
         assert snapshot['summary']['pnl_available'] is expected
         if not expected:

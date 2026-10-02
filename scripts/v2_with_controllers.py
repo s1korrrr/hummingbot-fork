@@ -12,7 +12,12 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.remote_iface.mqtt import ExternalEventFactory
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
-from hummingbot.strategy_v2.controllers.native_policy_identity import is_modular_policy, is_ok_rsi_policy
+from hummingbot.strategy_v2.controllers.native_policy_identity import (
+    is_legacy_ok_rsi_operator_policy,
+    is_meridian_operator_policy,
+    is_modular_policy,
+    is_ok_rsi_policy,
+)
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, StopExecutorAction
 
@@ -66,7 +71,7 @@ class V2WithControllers(StrategyV2Base):
         self.closed_executors_buffer: int = 30
         self._last_performance_report_timestamp = 0
         self._operator_event_queue = ExternalEventFactory.create_queue("rsibot.operator")
-        self._risk_persistence_enabled = any(is_ok_rsi_policy(c.config) or is_modular_policy(c.config)
+        self._risk_persistence_enabled = any(is_ok_rsi_policy(c.config) or self._durable_operator_policy(c.config)
                                              for c in self.controllers.values())
         self._operator_started_at = time.time()
         self._operator_watermarks = {}
@@ -79,6 +84,8 @@ class V2WithControllers(StrategyV2Base):
                 recorder = MarketsRecorder.get_instance()
                 state = recorder.load_strategy_risk_state()
                 if state is None:
+                    if any(is_meridian_operator_policy(c.config) for c in self.controllers.values()):
+                        raise RuntimeError('Meridian durable operator state absent; explicit reconciliation required')
                     if recorder.get_all_executors():
                         raise RuntimeError('Existing execution history has no durable risk state; reconcile before restart')
                 else:
@@ -126,7 +133,7 @@ class V2WithControllers(StrategyV2Base):
                  'max_pnl_by_controller': {cid: str(self.max_pnl_by_controller.get(cid, Decimal('0'))) for cid in self.controllers},
                  'drawdown_exited_controllers': sorted(set(self.drawdown_exited_controllers)),
                  'stopped': self._is_stop_triggered,
-                 'operator_paused': {cid: bool(getattr(c, '_operator_entry_paused', False)) for cid, c in self.controllers.items()}}
+                 'operator_paused': {cid: self._operator_paused(c) for cid, c in self.controllers.items()}}
         if getattr(self, '_operator_watermarks', {}):
             state['operator_watermarks'] = self._operator_watermarks.copy()
         if self._daily_entry_risk is not None:
@@ -138,6 +145,21 @@ class V2WithControllers(StrategyV2Base):
             else:
                 recorder.store_strategy_risk_state(state)
             self._last_risk_state = state
+
+    @staticmethod
+    def _durable_operator_policy(config):
+        return (is_modular_policy(config) or is_meridian_operator_policy(config)
+                or is_legacy_ok_rsi_operator_policy(config))
+
+    @staticmethod
+    def _operator_paused(controller):
+        if is_meridian_operator_policy(controller.config):
+            getter = getattr(controller, 'get_operator_state', None)
+            state = getter() if callable(getter) else None
+            if not isinstance(state, dict) or type(state.get('entry_paused')) is not bool:
+                raise ValueError('Meridian operator pause state unavailable')
+            return state['entry_paused']
+        return bool(getattr(controller, '_operator_entry_paused', False))
 
     def validate_create_action(self, action):
         # Called after fresh reports and immediately before executor creation.
@@ -158,7 +180,12 @@ class V2WithControllers(StrategyV2Base):
             self._persist_risk_state()
             buying = getattr(getattr(action, 'executor_config', None), 'side', TradeType.BUY) == TradeType.BUY
             daily_block = self._daily_entry_risk is not None and self._daily_entry_risk.paused and buying
-            return not daily_block and not self._is_stop_triggered and action.controller_id not in self.drawdown_exited_controllers
+            controller = self.controllers.get(action.controller_id)
+            operator_block = (buying and controller is not None
+                              and self._durable_operator_policy(controller.config)
+                              and self._operator_paused(controller))
+            return (not daily_block and not operator_block and not self._is_stop_triggered
+                    and action.controller_id not in self.drawdown_exited_controllers)
         except Exception:
             self._is_stop_triggered = True
             self.logger().exception('Risk check or persistence failed; new execution blocked')
@@ -191,7 +218,7 @@ class V2WithControllers(StrategyV2Base):
     def _apply_daily_entry_pause(self):
         if self._daily_entry_risk is not None and self._daily_entry_risk.paused:
             for controller in self.controllers.values():
-                if not getattr(controller, '_operator_entry_paused', False):
+                if not self._operator_paused(controller):
                     controller.set_operator_entry_pause(True, reason='daily-loss-limit', scope='global')
 
     def _observe_daily_entry_risk(self):
@@ -220,7 +247,7 @@ class V2WithControllers(StrategyV2Base):
         return watermarks
 
     def _native_operator_command_is_fresh(self, payload, targets):
-        native = [c for c in targets if is_modular_policy(c.config)]
+        native = [c for c in targets if V2WithControllers._durable_operator_policy(c.config)]
         if not native:
             return True
         if getattr(self, '_risk_reconciliation_error', None):
@@ -317,13 +344,13 @@ class V2WithControllers(StrategyV2Base):
                 if actions:
                     self.executor_orchestrator.execute_actions(actions)
             for controller in target_controllers:
-                if is_modular_policy(controller.config):
+                if self._durable_operator_policy(controller.config):
                     self._operator_watermarks[controller.config.id] = {
                         'requested_at': requested_at, 'command_id': command_id}
-            if any(is_modular_policy(c.config) for c in target_controllers):
+            if any(self._durable_operator_policy(c.config) for c in target_controllers):
                 try:
                     receipts = tuple({'controller_id': c.config.id, 'command_id': command_id,
-                                      'requested_at': requested_at} for c in target_controllers if is_modular_policy(c.config))
+                                      'requested_at': requested_at} for c in target_controllers if self._durable_operator_policy(c.config))
                     self._persist_risk_state(operator_receipts=receipts)
                 except Exception as error:
                     self._is_stop_triggered = True

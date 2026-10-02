@@ -20,7 +20,9 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     # Intentional funding purity/runtime-preparation changes are resealed in
     # docs/controllers/modular_spot/RELEASE_AUDIT_20260930.md. Crash policy
     # additions must remain outside this native source closure.
-    assert source_digest(source_root(), source_files()) == '3655f2a430c809ec56fe76fb8cb33ea53585efb8af64aff2d68fe73af7ce9379'  # noqa: documentation
+    # Sealed against the 67-file closure at origin/master bd47b0991, not a
+    # digest recalculated from the candidate under test.
+    assert source_digest(source_root(), source_files()) == '17cba31a66162942cf9a59c10ef6e68d82028e6e614b341f2521a5a6d13951c8'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

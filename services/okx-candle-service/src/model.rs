@@ -51,8 +51,46 @@ fn decimal(value: &Value, positive: bool) -> Result<(String, Decimal)> {
 }
 
 /// OKX spot row: ts,o,h,l,c,baseVol,volCcy,quoteVol,confirm.
+///
+/// Strict zero-skew contract used for cache revalidation and the shared parity fixture.
+/// Live ingestion uses [`parse_row_tolerant`] instead.
 pub fn parse_row(value: &Value, received_at: f64) -> Result<Option<Candle>> {
     let a = value.as_array().context("candle must be array")?;
+    let (confirmed, open_time) = row_fields(a)?;
+    ensure!(open_time as f64 <= received_at + 5.0, "future candle");
+    if confirmed {
+        ensure!(
+            open_time as f64 + 60.0 <= received_at,
+            "confirmed candle before close"
+        );
+    }
+    let candle = build_candle(a, open_time)?;
+    Ok(confirmed.then_some(candle))
+}
+
+/// Published status compatibility field describing the historical confirmed-bar clock skew.
+/// Confirmed bars are now withheld until their close; this value is not an early-acceptance
+/// allowance. Keep it stable for existing metrics consumers.
+pub const CLOCK_SKEW_SECS: f64 = 2.0;
+/// A forming (unconfirmed) bar may lead the local clock by at most this much.
+pub const FORMING_LEAD_SECS: f64 = 5.0;
+
+/// Outcome of the production row parser. Timing problems are classified, not errors, so one
+/// early/forming bar can never invalidate a pair or fail a whole REST page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parsed {
+    /// Confirmed, closed at or before local receipt time and fully validated.
+    Confirmed(Candle),
+    /// Confirmed and valid, but its close is still ahead of local receipt time. Hold it and
+    /// re-evaluate only when the clock reaches `open_time + 60`.
+    Deferred(Candle),
+    /// Valid forming bar at or before the local minute: liveness evidence only.
+    Forming(u64),
+    /// Unconfirmed bar that is malformed or too far ahead: ignored, never history.
+    Ignored(&'static str),
+}
+
+fn row_fields(a: &[Value]) -> Result<(bool, u64)> {
     ensure!(a.len() == 9, "candle must have nine fields");
     let confirmed = match a[8].as_str() {
         Some("0") => false,
@@ -69,14 +107,10 @@ pub fn parse_row(value: &Value, received_at: f64) -> Result<Option<Candle>> {
         ts > 0 && ts.is_multiple_of(60_000),
         "timestamp must align to minute milliseconds"
     );
-    let open_time = ts / 1000;
-    ensure!(open_time as f64 <= received_at + 5.0, "future candle");
-    if confirmed {
-        ensure!(
-            open_time as f64 + 60.0 <= received_at,
-            "confirmed candle before close"
-        );
-    }
+    Ok((confirmed, ts / 1000))
+}
+
+fn build_candle(a: &[Value], open_time: u64) -> Result<Candle> {
     let (open, o) = decimal(&a[1], true)?;
     let (high, h) = decimal(&a[2], true)?;
     let (low, l) = decimal(&a[3], true)?;
@@ -88,7 +122,7 @@ pub fn parse_row(value: &Value, received_at: f64) -> Result<Option<Candle>> {
         h >= o && h >= c && l <= o && l <= c && l <= h,
         "inconsistent OHLC"
     );
-    Ok(confirmed.then_some(Candle {
+    Ok(Candle {
         open_time,
         open,
         high,
@@ -97,7 +131,40 @@ pub fn parse_row(value: &Value, received_at: f64) -> Result<Option<Candle>> {
         volume,
         quote_volume,
         confirmed: true,
-    }))
+    })
+}
+
+/// Production parser for upstream OKX rows. Structure, decimal and geometry violations of a
+/// *confirmed* row stay hard errors. An unconfirmed (forming) row never errors: it is liveness
+/// evidence when plausible and is otherwise ignored. Every confirmed row received before its
+/// local close is `Deferred`; it becomes `Confirmed` only at or after close.
+pub fn parse_row_tolerant(value: &Value, received_at: f64) -> Result<Parsed> {
+    let a = value.as_array().context("candle must be array")?;
+    let (confirmed, open_time) = match row_fields(a) {
+        Ok(fields) => fields,
+        Err(error) => {
+            // Only a readable `confirm == "0"` row may be ignored; every other defect is fatal.
+            if a.len() == 9 && a[8].as_str() == Some("0") {
+                return Ok(Parsed::Ignored("forming_malformed"));
+            }
+            return Err(error);
+        }
+    };
+    if !confirmed {
+        if open_time as f64 > received_at + FORMING_LEAD_SECS {
+            return Ok(Parsed::Ignored("forming_future"));
+        }
+        return Ok(match build_candle(a, open_time) {
+            Ok(_) => Parsed::Forming(open_time),
+            Err(_) => Parsed::Ignored("forming_malformed"),
+        });
+    }
+    let candle = build_candle(a, open_time)?;
+    if (open_time + 60) as f64 <= received_at {
+        Ok(Parsed::Confirmed(candle))
+    } else {
+        Ok(Parsed::Deferred(candle))
+    }
 }
 
 pub fn history_valid(rows: &[Candle], capacity: usize, at: f64) -> bool {

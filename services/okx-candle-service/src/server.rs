@@ -1,4 +1,7 @@
-use crate::state::{Event, Shared};
+use crate::{
+    auth::{Auth, Consumer},
+    state::{Event, Shared},
+};
 use anyhow::{Context, Result, ensure};
 use axum::{
     Json, Router,
@@ -23,57 +26,93 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Total concurrent authenticated streams across all consumers.
+pub const GLOBAL_STREAMS: usize = 32;
+
 #[derive(Clone)]
 pub struct App {
     pub state: Shared,
-    pub token: Arc<String>,
+    pub auth: Arc<Auth>,
     pub clients: Arc<Semaphore>,
     pub stop: CancellationToken,
     pub market_picture: Option<crate::market_picture::SharedProjection>,
     pub market_picture_clients: Arc<Semaphore>,
 }
+/// Single-token router: one consumer with the whole catalog and history.
 pub fn router(
     state: Shared,
     token: String,
     stop: CancellationToken,
     market_picture: Option<crate::market_picture::SharedProjection>,
 ) -> Router {
+    router_with_auth(
+        state,
+        Auth::single(token, crate::model::MAX_HISTORY, GLOBAL_STREAMS),
+        stop,
+        market_picture,
+    )
+}
+pub fn router_with_auth(
+    state: Shared,
+    auth: Auth,
+    stop: CancellationToken,
+    market_picture: Option<crate::market_picture::SharedProjection>,
+) -> Router {
+    let total: usize = auth
+        .consumers()
+        .iter()
+        .map(|c| c.streams.available_permits())
+        .sum();
     Router::new()
         .route("/health", get(health))
+        .route("/v1/metrics", get(metrics))
         .route("/v2/market-picture/history", get(market_picture_history))
         .route("/v2/market-picture/updates", get(market_picture_updates))
         .route("/v1/stream", get(upgrade))
         .with_state(App {
             state,
-            token: Arc::new(token),
-            clients: Arc::new(Semaphore::new(32)),
+            auth: Arc::new(auth),
+            clients: Arc::new(Semaphore::new(total.clamp(GLOBAL_STREAMS, 256))),
             stop,
             market_picture,
             market_picture_clients: Arc::new(Semaphore::new(16)),
         })
 }
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    let Some(value) = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    else {
-        return false;
-    };
-    if value.len() != token.len() {
-        return false;
-    }
-    value
-        .bytes()
-        .zip(token.bytes())
-        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
-}
 async fn health(State(app): State<App>, headers: HeaderMap) -> Response {
-    if !authorized(&headers, &app.token) {
+    if app.auth.authenticate(&headers).is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     Json(app.state.lock().await.health()).into_response()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsQuery {
+    window: Option<usize>,
+}
+/// Read-only per-pair freshness, reconnect and rejection metrics plus a window digest for the
+/// active/active comparison. Scoped to the caller's pairs; no credentials, no mutation.
+async fn metrics(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<MetricsQuery>,
+) -> Response {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let window = query.window.unwrap_or(1440);
+    if !(2..=crate::model::MAX_HISTORY).contains(&window) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let at = crate::model::now();
+    let value = app
+        .state
+        .lock()
+        .await
+        .metrics(consumer.pairs.as_ref(), window, at);
+    Json(value).into_response()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,7 +135,10 @@ async fn market_picture_updates(
     headers: HeaderMap,
     Query(query): Query<MarketPictureUpdatesQuery>,
 ) -> Response {
-    if !authorized(&headers, &app.token) || headers.contains_key("origin") {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") || !consumer.allows_pair(&query.pair) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Some(interval) = crate::market_picture::Interval::parse(&query.interval) else {
@@ -165,7 +207,10 @@ async fn market_picture_history(
     headers: HeaderMap,
     Query(query): Query<MarketPictureQuery>,
 ) -> Response {
-    if !authorized(&headers, &app.token) || headers.contains_key("origin") {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") || !consumer.allows_pair(&query.pair) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Some(interval) = crate::market_picture::Interval::parse(&query.interval) else {
@@ -203,23 +248,68 @@ async fn market_picture_history(
     }
 }
 async fn upgrade(State(app): State<App>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if !authorized(&headers, &app.token) || headers.contains_key("origin") {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let Ok(consumer_permit) = consumer.streams.clone().try_acquire_owned() else {
+        app.state.lock().await.count("client_stream_cap_refused");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let Ok(permit) = app.clients.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     ws.max_message_size(131072)
         .max_frame_size(131072)
         .on_upgrade(move |socket| async move {
-            let _permit = permit;
-            if let Err(error) = serve(socket, app.clone()).await {
-                eprintln!("local stream closed: {error:#}");
-                app.state.lock().await.count("client_disconnect_errors");
+            let _permits = (permit, consumer_permit);
+            if let Err(error) = serve(socket, app.clone(), consumer.clone()).await {
+                let kind = match error.downcast_ref::<Disconnect>() {
+                    Some(Disconnect::WriteDeadline { .. }) => "client_write_deadline",
+                    Some(Disconnect::SubscribeTimeout) => "client_subscribe_timeout",
+                    Some(Disconnect::Transport(_)) => "client_transport_error",
+                    Some(Disconnect::UnexpectedMessage) => "client_unexpected_message",
+                    Some(Disconnect::Scope(_)) => "client_scope_refused",
+                    Some(Disconnect::Lagged(_)) => "client_lagged",
+                    None => "client_other_error",
+                };
+                eprintln!("local stream closed consumer={}: {error:#}", consumer.id);
+                let mut state = app.state.lock().await;
+                state.count("client_disconnect_errors");
+                state.count(kind);
             }
         })
         .into_response()
 }
+/// Why a local stream ended. Distinct causes were previously all reported as the same
+/// "deadline has elapsed" / "unexpected client message" text.
+#[derive(Debug)]
+enum Disconnect {
+    WriteDeadline { bytes: usize, limit: Duration },
+    SubscribeTimeout,
+    Transport(String),
+    UnexpectedMessage,
+    Scope(String),
+    Lagged(String),
+}
+impl std::fmt::Display for Disconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriteDeadline { bytes, limit } => write!(
+                f,
+                "client did not drain a {bytes}-byte frame within {limit:?} (slow or stalled reader)"
+            ),
+            Self::SubscribeTimeout => f.write_str("no subscription message within 5s of connect"),
+            Self::Transport(error) => write!(f, "client transport error: {error}"),
+            Self::UnexpectedMessage => f.write_str("unexpected client message"),
+            Self::Scope(why) => write!(f, "subscription outside consumer scope: {why}"),
+            Self::Lagged(why) => write!(f, "client lagged behind the producer backlog: {why}"),
+        }
+    }
+}
+impl std::error::Error for Disconnect {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Subscription {
@@ -228,12 +318,19 @@ struct Subscription {
     pairs: Vec<String>,
     history: usize,
 }
+/// Two seconds for control-sized frames plus one second per 512 KiB, so a full-history
+/// snapshot is not judged by the same deadline as a heartbeat. Capped at 20 seconds.
+pub fn write_deadline(bytes: usize) -> Duration {
+    Duration::from_secs(2) + Duration::from_secs_f64((bytes as f64 / 524_288.0).min(18.0))
+}
 async fn send(socket: &mut WebSocket, value: Value) -> Result<()> {
-    timeout(
-        Duration::from_secs(2),
-        socket.send(Message::Text(value.to_string().into())),
-    )
-    .await??;
+    let text = value.to_string();
+    let bytes = text.len();
+    let limit = write_deadline(bytes);
+    timeout(limit, socket.send(Message::Text(text.into())))
+        .await
+        .map_err(|_| Disconnect::WriteDeadline { bytes, limit })?
+        .map_err(|error| Disconnect::Transport(error.to_string()))?;
     Ok(())
 }
 fn filter(event: Event, sent: &mut BTreeMap<String, u64>) -> Option<Event> {
@@ -248,10 +345,12 @@ fn filter(event: Event, sent: &mut BTreeMap<String, u64>) -> Option<Event> {
     Some(event)
 }
 
-async fn serve(mut socket: WebSocket, app: App) -> Result<()> {
+async fn serve(mut socket: WebSocket, app: App, consumer: Arc<Consumer>) -> Result<()> {
     let message = timeout(Duration::from_secs(5), socket.recv())
-        .await?
-        .context("no subscription")??;
+        .await
+        .map_err(|_| Disconnect::SubscribeTimeout)?
+        .context("no subscription")?
+        .map_err(|error| Disconnect::Transport(error.to_string()))?;
     let Message::Text(text) = message else {
         anyhow::bail!("subscription must be text");
     };
@@ -267,6 +366,16 @@ async fn serve(mut socket: WebSocket, app: App) -> Result<()> {
             sub.history >= 2 && sub.history <= s.capacity,
             "history outside capacity"
         );
+        if sub.history > consumer.max_history {
+            return Err(Disconnect::Scope(format!(
+                "history {} above the consumer ceiling {}",
+                sub.history, consumer.max_history
+            ))
+            .into());
+        }
+        if let Some(pair) = sub.pairs.iter().find(|pair| !consumer.allows_pair(pair)) {
+            return Err(Disconnect::Scope(format!("pair {pair} not granted")).into());
+        }
         ensure!(
             sub.pairs.len() <= s.pairs.len()
                 && sub.pairs.iter().collect::<BTreeSet<_>>().len() == sub.pairs.len(),
@@ -302,7 +411,7 @@ async fn serve(mut socket: WebSocket, app: App) -> Result<()> {
                         match receiver.try_recv() {
                             Ok(frame) => if let Some(frame) = filter(frame,&mut sent) { queued.push(frame); },
                             Err(broadcast::error::TryRecvError::Empty) => break,
-                            Err(error) => return Err(error.into()),
+                            Err(error) => return Err(Disconnect::Lagged(error.to_string()).into()),
                         }
                     }
                     let mut heartbeat = s.envelope("heartbeat");
@@ -313,14 +422,15 @@ async fn serve(mut socket: WebSocket, app: App) -> Result<()> {
                 send(&mut socket,heartbeat).await?;
             }
             frame = receiver.recv() => {
-                if let Some(event) = filter(frame?,&mut sent) { send(&mut socket,event.into_frame(sub.history)).await?; }
+                if let Some(event) = filter(frame.map_err(|error| Disconnect::Lagged(error.to_string()))?,&mut sent) { send(&mut socket,event.into_frame(sub.history)).await?; }
             }
             message = socket.recv() => {
                 match message {
-                    Some(Ok(Message::Ping(v))) => { timeout(Duration::from_secs(2),socket.send(Message::Pong(v))).await??; },
+                    Some(Ok(Message::Ping(v))) => { timeout(Duration::from_secs(2),socket.send(Message::Pong(v))).await.map_err(|_| Disconnect::WriteDeadline { bytes: 0, limit: Duration::from_secs(2) })?.map_err(|error| Disconnect::Transport(error.to_string()))?; },
                     Some(Ok(Message::Pong(_))) => {},
                     None | Some(Ok(Message::Close(_))) => break,
-                    _ => anyhow::bail!("unexpected client message"),
+                    Some(Err(error)) => return Err(Disconnect::Transport(error.to_string()).into()),
+                    Some(Ok(_)) => return Err(Disconnect::UnexpectedMessage.into()),
                 }
             }
         }

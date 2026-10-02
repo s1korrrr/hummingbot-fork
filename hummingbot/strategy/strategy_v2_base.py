@@ -870,15 +870,122 @@ class StrategyV2Base(StrategyPyBase):
             for connector, pair in controller_market_pairs(controller):
                 if not isinstance(connector, str) or not isinstance(pair, str):
                     continue
+                contexts = getattr(controller, "contexts", None)
+                context = contexts.get(pair) if isinstance(contexts, dict) else None
+                symbol_config = getattr(context, "config", None)
+                interval = getattr(config, "interval", getattr(symbol_config, "interval", None))
+                candle_connector = getattr(config, "candles_connector", None)
+                if candle_connector is None:
+                    candle_connector = getattr(symbol_config, "candles_connector", None)
+                candle_pair = getattr(config, "candles_trading_pair", None)
+                if candle_pair is None:
+                    candle_pair = getattr(symbol_config, "candles_trading_pair", None)
                 observation = self.market_data_provider.get_market_data_health(
-                    connector, pair, getattr(config, "interval", None), observed_at=float(self.current_timestamp),
-                    candle_connector=getattr(config, "candles_connector", None),
-                    candle_pair=getattr(config, "candles_trading_pair", None))
+                    connector, pair, interval, observed_at=float(self.current_timestamp),
+                    candle_connector=candle_connector, candle_pair=candle_pair)
+                if (isinstance(contexts, dict)
+                        and getattr(getattr(config, "data", None), "mode", None) == "shared"):
+                    observation.update(StrategyV2Base._runtime_operations_context_market_data_health(
+                        self, controller, context, connector, pair, float(self.current_timestamp)))
                 observation["controller_id"] = controller_id
                 pairs.append(observation)
         return {"schema_version": 1,
                 "observed_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
                 "pairs": pairs, "reconciliation": self._runtime_reconciliation_observation()}
+
+    def _runtime_operations_context_market_data_health(self, controller, context, connector, pair,
+                                                       observed_at: float) -> Dict[str, Any]:
+        """Project a symbol context's existing native book and candle observations.
+
+        Context-based controllers may wrap or replace the strategy-level market-data provider.
+        Read only their cached observations; never start a feed or request new market data.
+        """
+        timestamp = MarketDataProvider._observation_timestamp
+        if context is None:
+            return {
+                "price": {"source": "order_book_observation", "source_at": None, "received_at": None,
+                          "applied_at": None, "timestamp_semantics": "exchange_event_and_local_application",
+                          "availability": "unavailable", "availability_reason": "symbol_context_missing"},
+                "candle": {"source": "shared_candle_snapshot", "source_at": None, "published_at": None,
+                           "received_at": None, "interval_seconds": None, "timestamp_semantics": None,
+                           "closed": None, "last_expected_closed_at": None, "connector": connector,
+                           "pair": pair, "availability": "unavailable",
+                           "availability_reason": "symbol_context_missing"},
+            }
+        symbol_config = getattr(context, "config", None)
+        provider = getattr(controller, "market_data_provider", None)
+        source_now = observed_at
+        provider_clock = getattr(provider, "time", None)
+        if callable(provider_clock):
+            try:
+                candidate_now = provider_clock()
+                if isinstance(candidate_now, (int, float)) and not isinstance(candidate_now, bool) \
+                        and np.isfinite(candidate_now):
+                    source_now = float(candidate_now)
+            except Exception:
+                pass
+
+        price = {"source": "order_book_observation", "source_at": None, "received_at": None,
+                 "applied_at": None, "timestamp_semantics": "exchange_event_and_local_application",
+                 "availability": "unavailable", "availability_reason": "observation_missing"}
+        connectors = getattr(provider, "connectors", None)
+        native_connector = connectors.get(connector) if isinstance(connectors, dict) else None
+        getter = getattr(native_connector, "get_order_book_observation", None)
+        try:
+            book = getter(pair) if callable(getter) else None
+            event_at = getattr(book, "event_timestamp", None)
+            applied_at = getattr(book, "applied_timestamp", None)
+            valid_times = all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                              and np.isfinite(value) for value in (event_at, applied_at, source_now))
+            if valid_times:
+                price.update(source_at=timestamp(event_at), applied_at=timestamp(applied_at),
+                             availability_reason="stale_or_invalid_timing")
+                maximum_age_ms = getattr(context, "max_quote_age_ms", None)
+                if getattr(native_connector, "ready", False) is not True:
+                    price["availability_reason"] = "connector_not_ready"
+                elif (isinstance(maximum_age_ms, (int, float)) and not isinstance(maximum_age_ms, bool)
+                        and np.isfinite(maximum_age_ms) and maximum_age_ms > 0
+                        and event_at <= applied_at
+                        and 0 <= source_now - event_at <= maximum_age_ms / 1000
+                        and 0 <= source_now - applied_at <= maximum_age_ms / 1000):
+                    price.update(availability="available", availability_reason=None)
+                else:
+                    price["availability"] = "stale"
+        except Exception:
+            price["availability_reason"] = "observation_read_failed"
+
+        runtime = getattr(context, "runtime", None)
+        pool = getattr(runtime, "pool", None)
+        candle = {"source": "shared_candle_snapshot", "source_at": None, "published_at": None,
+                  "received_at": None, "interval_seconds": None, "timestamp_semantics": "open",
+                  "closed": None, "last_expected_closed_at": None,
+                  "connector": connector, "pair": pair, "availability": "unavailable",
+                  "availability_reason": "shared_snapshot_unavailable"}
+        try:
+            datasets = getattr(pool, "datasets", None)
+            specs = datasets.values() if isinstance(datasets, dict) else ()
+            spec = next((item for item in specs if getattr(item, "connector", None) == connector
+                         and getattr(item, "trading_pair", None) == pair), None)
+            maximum_age = getattr(symbol_config, "max_candle_age_seconds", None)
+            if spec is None or not isinstance(maximum_age, (int, float)) or isinstance(maximum_age, bool):
+                candle["availability_reason"] = "shared_dataset_unavailable"
+                return {"price": price, "candle": candle}
+            snapshot = pool.snapshot(spec, now=source_now, max_age=maximum_age)
+            last = snapshot.rows[-1]
+            seconds = spec.seconds
+            source_at = timestamp(last.open_time)
+            published_at = timestamp(snapshot.published_at)
+            closed = bool(getattr(last, "confirmed", False) is True
+                          and last.open_time + seconds <= source_now)
+            candle.update(source_at=source_at, published_at=published_at, interval_seconds=seconds,
+                          closed=closed, availability="available" if closed else "stale",
+                          availability_reason=None if closed else "latest_candle_not_closed")
+            if seconds <= 43200 and 86400 % seconds == 0:
+                candle["last_expected_closed_at"] = timestamp(source_now // seconds * seconds - seconds)
+        except Exception:
+            # Do not leak arbitrary transport errors or represent an absent cache as zero age.
+            candle["availability"] = "unavailable"
+        return {"price": price, "candle": candle}
 
     def _runtime_position_resume_observation(self) -> Dict[str, Any]:
         orchestrator = getattr(self, 'executor_orchestrator', None)

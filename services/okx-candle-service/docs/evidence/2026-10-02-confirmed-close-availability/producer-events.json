@@ -1,0 +1,634 @@
+{
+  "deferred_candle": {
+    "epoch": "df0640ad-098b-4d82-ab94-b2cb7fabad6f",
+    "pair": "BTC-USDC",
+    "published_at": 1790955350.269417,
+    "received_at": 1790955299.9,
+    "row": {
+      "close": "100.5",
+      "confirmed": true,
+      "high": "101",
+      "low": "99",
+      "open": "100",
+      "open_time": 1790955240,
+      "quote_volume": "100.5",
+      "volume": "1"
+    },
+    "sequence": 2,
+    "type": "candle",
+    "v": 1
+  },
+  "fixture": "sanitized actual State producer snapshot and deferred candle event",
+  "generated_at_ms": 1790955350257,
+  "snapshot": {
+    "epoch": "df0640ad-098b-4d82-ab94-b2cb7fabad6f",
+    "pair": "BTC-USDC",
+    "published_at": 1790955350.268182,
+    "received_at": 1790955350.256821,
+    "rows": [
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790951700,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790951760,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790951820,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790951880,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790951940,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952000,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952060,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952120,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952180,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952240,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952300,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952360,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952420,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952480,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952540,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952600,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952660,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952720,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952780,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952840,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952900,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790952960,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953020,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953080,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953140,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953200,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953260,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953320,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953380,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953440,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953500,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953560,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953620,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953680,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953740,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953800,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953860,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953920,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790953980,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954040,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954100,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954160,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954220,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954280,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954340,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954400,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954460,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954520,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954580,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954640,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954700,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954760,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954820,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954880,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790954940,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790955000,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790955060,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790955120,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790955180,
+        "quote_volume": "100",
+        "volume": "1"
+      },
+      {
+        "close": "100",
+        "confirmed": true,
+        "high": "101",
+        "low": "99",
+        "open": "100",
+        "open_time": 1790955240,
+        "quote_volume": "100",
+        "volume": "1"
+      }
+    ],
+    "sequence": 1,
+    "type": "snapshot",
+    "v": 1
+  }
+}

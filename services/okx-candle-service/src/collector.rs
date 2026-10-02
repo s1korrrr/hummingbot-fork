@@ -1,6 +1,6 @@
 use crate::{
-    history::{HistoryPager, PageRequest},
-    model::{Candle, now, parse_row},
+    history::{HistoryPager, PageRequest, StaleRestPage},
+    model::{Candle, Parsed, now, parse_row_tolerant},
     state::Shared,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -42,6 +42,33 @@ impl Pace {
     }
 }
 
+/// Independent public WebSocket lanes per pair group. Rows from every lane are merged and
+/// deduplicated by `State::ingest`, and a pair stays online while any lane is acknowledged.
+pub const LANES: u8 = 2;
+
+/// Full-jitter exponential reconnect delay: `min(30, 2^attempt)` seconds scaled into
+/// `[0.5, 1.0)` by `unit` (a uniform draw in `[0, 1)`), so lanes never reconnect in lockstep.
+pub fn reconnect_delay(attempt: u32, unit: f64) -> Duration {
+    let base = f64::from(2u32.saturating_pow(attempt.min(5))).min(30.0);
+    Duration::from_secs_f64(base * (0.5 + 0.5 * unit.clamp(0.0, 0.999_999)))
+}
+
+/// Seed retry delay: exponential per consecutive failure with jitter. A stale REST edge
+/// retries quickly (it usually clears within seconds); other failures start slower.
+pub fn seed_retry_delay(failures: u32, stale_page: bool, unit: f64) -> Duration {
+    let base = if stale_page { 3.0 } else { 10.0 };
+    let grown =
+        (base * f64::from(2u32.saturating_pow(failures.saturating_sub(1).min(4)))).min(60.0);
+    Duration::from_secs_f64(grown * (0.75 + 0.5 * unit.clamp(0.0, 0.999_999)))
+}
+
+/// Uniform draw in `[0, 1)` without an extra dependency.
+pub fn unit_random() -> f64 {
+    let bytes = *uuid::Uuid::new_v4().as_bytes();
+    let n = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")) >> 11;
+    n as f64 / (1u64 << 53) as f64
+}
+
 pub async fn run(state: Shared, pairs: Vec<String>, stop: CancellationToken) -> Result<()> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -52,24 +79,29 @@ pub async fn run(state: Shared, pairs: Vec<String>, stop: CancellationToken) -> 
     let mut tasks = tokio::task::JoinSet::new();
     let connect_pace = Pace::new(Duration::from_millis(1050));
     for chunk in pairs.chunks(100) {
-        let (state, pairs, pace, stop) = (
-            state.clone(),
-            chunk.to_vec(),
-            connect_pace.clone(),
-            stop.clone(),
-        );
-        tasks.spawn(async move {
-            let mut backoff = 1;
-            loop {
-                let started = Instant::now();
-                let outcome = tokio::select! { _ = stop.cancelled() => break, r = connection(state.clone(), &pairs, pace.clone()) => r };
-                let reason = if let Err(error) = outcome { eprintln!("public candle connection: {error:#}"); "upstream_disconnected" } else { "upstream_closed" };
-                state.lock().await.disconnected(&pairs, reason);
-                if started.elapsed() > Duration::from_secs(60) { backoff = 1; }
-                tokio::select! { _ = stop.cancelled() => break, _ = sleep(Duration::from_secs(backoff)) => {} }
-                backoff = (backoff * 2).min(30);
-            }
-        });
+        for lane in 0..LANES {
+            let (state, pairs, pace, stop) = (
+                state.clone(),
+                chunk.to_vec(),
+                connect_pace.clone(),
+                stop.clone(),
+            );
+            tasks.spawn(async move {
+                // Lane n starts n*15 s after lane 0 so the two sockets never share a fate window.
+                let stagger = Duration::from_secs(15 * u64::from(lane));
+                tokio::select! { _ = stop.cancelled() => return, _ = sleep(stagger) => {} }
+                let mut attempt = 0u32;
+                loop {
+                    let started = Instant::now();
+                    let outcome = tokio::select! { _ = stop.cancelled() => break, r = connection(state.clone(), &pairs, pace.clone(), lane) => r };
+                    let reason = if let Err(error) = outcome { eprintln!("public candle connection lane={lane}: {error:#}"); "upstream_disconnected" } else { "upstream_closed" };
+                    state.lock().await.lane_disconnected(&pairs, lane, reason);
+                    if started.elapsed() > Duration::from_secs(60) { attempt = 0; }
+                    tokio::select! { _ = stop.cancelled() => break, _ = sleep(reconnect_delay(attempt, unit_random())) => {} }
+                    attempt = attempt.saturating_add(1);
+                }
+            });
+        }
     }
     tasks.spawn(repair_loop(state.clone(), client, stop.clone()));
     tokio::select! {
@@ -82,7 +114,7 @@ pub async fn run(state: Shared, pairs: Vec<String>, stop: CancellationToken) -> 
     Ok(())
 }
 
-async fn connection(state: Shared, pairs: &[String], pace: Pace) -> Result<()> {
+async fn connection(state: Shared, pairs: &[String], pace: Pace, lane: u8) -> Result<()> {
     pace.acquire().await;
     state.lock().await.count("connection_attempts");
     let config = WebSocketConfig::default()
@@ -93,7 +125,7 @@ async fn connection(state: Shared, pairs: &[String], pace: Pace) -> Result<()> {
         connect_async_with_config(WS, Some(config), false),
     )
     .await??;
-    session(state, pairs, socket, SessionTiming::production()).await
+    session_lane(state, pairs, socket, SessionTiming::production(), lane).await
 }
 
 // Private injection boundary for offline protocol tests. Production callers always
@@ -116,11 +148,25 @@ impl SessionTiming {
     }
 }
 
+#[cfg(test)]
 async fn session<S>(
+    state: Shared,
+    pairs: &[String],
+    socket: WebSocketStream<S>,
+    timing: SessionTiming,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    session_lane(state, pairs, socket, timing, 0).await
+}
+
+async fn session_lane<S>(
     state: Shared,
     pairs: &[String],
     mut socket: WebSocketStream<S>,
     timing: SessionTiming,
+    lane: u8,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -139,7 +185,7 @@ where
     let catalog: BTreeSet<_> = pairs.iter().cloned().collect();
     let mut acknowledged = BTreeSet::new();
     let ack_deadline = Instant::now() + timing.acknowledgement;
-    let mut next_ping = Instant::now() + timing.ping;
+    let mut next_ping = Instant::now() + timing.ping + timing.ping * u32::from(lane) / 3;
     let mut pong_deadline: Option<Instant> = None;
     let mut timer = interval(timing.check);
     loop {
@@ -173,7 +219,7 @@ where
                     ensure!(frame["arg"]["channel"] == "candle1m", "wrong acknowledged channel");
                     let pair = frame["arg"]["instId"].as_str().context("missing ack pair")?;
                     ensure!(catalog.contains(pair), "unexpected ack pair");
-                    acknowledged.insert(pair.to_string()); state.lock().await.acknowledge(pair); continue;
+                    acknowledged.insert(pair.to_string()); state.lock().await.acknowledge_lane(pair, lane); continue;
                 }
                 ensure!(frame["arg"]["channel"] == "candle1m", "wrong candle channel");
                 let pair = frame["arg"]["instId"].as_str().context("missing candle pair")?;
@@ -182,24 +228,41 @@ where
                 ensure!(catalog.contains(pair), "candle received for unrequested pair");
                 let rows = frame["data"].as_array().context("missing candle data")?;
                 ensure!(!rows.is_empty() && rows.len() <= 300, "invalid candle batch size");
-                let parsed: Result<Vec<_>> = rows.iter().map(|row| parse_row(row, received_at)).collect();
-                let mut parsed: Vec<_> = match parsed {
-                    Ok(rows) => rows.into_iter().flatten().collect(),
-                    Err(error) => {
-                        eprintln!("invalid public candle {pair}: {error:#}");
-                        state.lock().await.reject_pair_data(pair);
-                        continue;
+                let mut confirmed = Vec::new();
+                let mut deferred = Vec::new();
+                let mut ignored = Vec::new();
+                let mut head: Option<(u64, bool)> = None;
+                let mut fatal = None;
+                for row in rows {
+                    match parse_row_tolerant(row, received_at) {
+                        Ok(Parsed::Confirmed(candle)) => {
+                            if head.is_none_or(|(open, _)| candle.open_time >= open) { head = Some((candle.open_time, true)); }
+                            confirmed.push(candle);
+                        }
+                        Ok(Parsed::Deferred(candle)) => deferred.push(candle),
+                        Ok(Parsed::Forming(open_time)) => {
+                            if head.is_none_or(|(open, _)| open_time > open) { head = Some((open_time, false)); }
+                        }
+                        Ok(Parsed::Ignored(reason)) => ignored.push(reason),
+                        Err(error) => { fatal = Some(error); break; }
                     }
-                };
-                parsed.sort_by_key(|r| r.open_time);
+                }
+                if let Some(error) = fatal {
+                    eprintln!("invalid public candle {pair}: {error:#}");
+                    state.lock().await.reject_pair_data(pair);
+                    continue;
+                }
+                confirmed.sort_by_key(|r| r.open_time);
                 let mut state = state.lock().await;
                 state.count("upstream_frames");
                 if !acknowledged.contains(pair) { state.count("buffered_before_ack"); }
-                for row in parsed { state.ingest(pair, row, received_at); }
-                // All raw rows passed the strict parser, including forming OHLC.
-                // The forming head is liveness evidence, never confirmed history.
-                if let Some(head)=rows.iter().max_by_key(|r|r[0].as_str().unwrap().parse::<u64>().unwrap()) {
-                    state.observe_live_head(pair,head[0].as_str().unwrap().parse::<u64>().unwrap()/1000,head[8]=="1",received_at);
+                for reason in ignored { state.note_rejected(pair, reason); }
+                for candle in deferred { state.defer(pair, candle, received_at); }
+                for row in confirmed { state.ingest(pair, row, received_at); }
+                // The newest plausible bar, forming or confirmed, is liveness evidence only;
+                // bars ahead of the local clock never become a head.
+                if let Some((open_time, confirmed)) = head {
+                    state.observe_live_head(pair, open_time, confirmed, received_at);
                 }
             }
         }
@@ -247,7 +310,9 @@ async fn fetch_page(
     ensure!(rows.len() <= 300, "REST returned too many rows");
     let mut parsed = std::collections::BTreeMap::new();
     for row in rows {
-        if let Some(row) = parse_row(row, received_at)?
+        // The forming bar, unconfirmed noise and confirmed bars not yet closed on the local
+        // clock are skipped, never fatal: only confirmed, closed rows enter a seed.
+        if let Parsed::Confirmed(row) = parse_row_tolerant(row, received_at)?
             && let Some(old) = parsed.insert(row.open_time, row.clone())
         {
             ensure!(old == row, "conflicting REST rows");
@@ -277,22 +342,36 @@ where
     }
 }
 
+/// Result of one seed attempt, reported back to the repair loop for retry scheduling.
+enum SeedOutcome {
+    Seeded,
+    Failed { stale_page: bool },
+}
+
 async fn repair_loop(state: Shared, client: reqwest::Client, stop: CancellationToken) {
     let pace = Pace::new(Duration::from_millis(210));
-    let mut jobs = tokio::task::JoinSet::new();
-    let mut tick = interval(Duration::from_secs(2));
+    let mut jobs: tokio::task::JoinSet<(String, SeedOutcome)> = tokio::task::JoinSet::new();
+    let mut tick = interval(Duration::from_secs(1));
     let mut retry_after = std::collections::BTreeMap::new();
+    let mut failures: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     loop {
         tokio::select! {
             _ = stop.cancelled() => break,
             _ = tick.tick() => {
                 let mut s = state.lock().await;
+                // Reconcile confirmed bars only when the local clock reaches their close.
+                s.release_deferred(now());
                 let stale: Vec<_> = s.pairs.iter().filter(|(_,p)| p.ready && p.rows.back().is_none_or(|r| now() - (r.open_time + 60) as f64 > 90.0)).map(|(name,_)|name.clone()).collect();
                 for pair in stale { s.invalidate(&pair, "stale_confirmed_history"); }
             }
             Some(result) = jobs.join_next(), if !jobs.is_empty() => {
                 match result {
-                    Ok(pair) => { retry_after.insert(pair, Instant::now()+Duration::from_secs(10)); },
+                    Ok((pair, SeedOutcome::Seeded)) => { failures.remove(&pair); retry_after.remove(&pair); },
+                    Ok((pair, SeedOutcome::Failed { stale_page })) => {
+                        let count = failures.entry(pair.clone()).or_default();
+                        *count += 1;
+                        retry_after.insert(pair, Instant::now() + seed_retry_delay(*count, stale_page, unit_random()));
+                    },
                     Err(error) => { eprintln!("seed task failed: {error}"); stop.cancel(); break; }
                 }
             }
@@ -322,7 +401,8 @@ async fn repair_loop(state: Shared, client: reqwest::Client, stop: CancellationT
                 .map(|r| r.as_ref().clone())
                 .collect();
             drop(s);
-            retry_after.insert(pair.clone(), Instant::now() + Duration::from_secs(10));
+            // Minimum spacing even if the job result is lost; completion replaces it.
+            retry_after.insert(pair.clone(), Instant::now() + Duration::from_secs(3));
             let (state, client, pace) = (state.clone(), client.clone(), pace.clone());
             jobs.spawn(async move {
                 let result = fetch_history(history, base, &pace, |request| {
@@ -336,18 +416,29 @@ async fn repair_loop(state: Shared, client: reqwest::Client, stop: CancellationT
                 })
                 .await;
                 let mut s = state.lock().await;
-                match result {
-                    Ok((rows, at)) => s.apply_seed(&pair, generation, rows, at),
+                let outcome = match result {
+                    Ok((rows, at)) => {
+                        if s.apply_seed(&pair, generation, rows, at) {
+                            SeedOutcome::Seeded
+                        } else {
+                            SeedOutcome::Failed { stale_page: false }
+                        }
+                    }
                     Err(error) => {
+                        let stale_page = error.downcast_ref::<StaleRestPage>().is_some();
                         eprintln!("public REST seed {pair}: {error:#}");
                         if s.pairs[&pair].generation == generation && !s.pairs[&pair].ready {
                             s.pairs.get_mut(&pair).unwrap().seeding = false;
                             s.invalidate(&pair, "rest_seed_failed");
                         }
                         s.count("seed_failures");
+                        if stale_page {
+                            s.count("seed_stale_page");
+                        }
+                        SeedOutcome::Failed { stale_page }
                     }
-                }
-                pair
+                };
+                (pair, outcome)
             });
         }
     }

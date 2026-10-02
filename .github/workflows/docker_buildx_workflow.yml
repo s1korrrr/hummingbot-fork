@@ -24,6 +24,13 @@ jobs:
   verify_pr:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
+    # Keep each architecture's Conda/build layers on a separate ephemeral disk.
+    # The combined build exhausted the hosted runner before it could save logs.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
     steps:
       - name: Checkout exact pull request head
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -34,6 +41,17 @@ jobs:
         id: source_metadata
         shell: bash
         run: echo "build_date=$(git show -s --format=%cI HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Reclaim unused SDK space on the hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This job builds the pinned Linux Conda runtime; these preinstalled
+          # SDKs are unused. Restrict cleanup to the disposable hosted runner.
+          test "${RUNNER_ENVIRONMENT}" = "github-hosted"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
@@ -53,7 +71,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: false
           build-args: |
             SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}

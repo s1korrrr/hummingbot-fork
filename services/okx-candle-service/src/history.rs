@@ -4,6 +4,18 @@ use anyhow::{Result, ensure};
 use std::collections::BTreeMap;
 
 pub const PAGE_SIZE: usize = 300;
+
+/// The newest confirmed REST row is older than the freshness bound or closes in the future of
+/// the local clock. Distinct from other seed errors so the repair
+/// loop can retry it quickly: a lagging REST edge or a corrected clock resolves within seconds.
+#[derive(Debug)]
+pub struct StaleRestPage;
+impl std::fmt::Display for StaleRestPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("initial REST page is stale or future")
+    }
+}
+impl std::error::Error for StaleRestPage {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageRequest {
     pub after_ms: Option<u64>,
@@ -73,10 +85,9 @@ impl HistoryPager {
         );
         if self.initial_at.is_none() {
             let newest = page.iter().map(|r| r.open_time).max().unwrap();
-            ensure!(
-                at - (newest + 60) as f64 <= 90.0 && (newest + 60) as f64 <= at,
-                "initial REST page is stale or future"
-            );
+            if !(at - (newest + 60) as f64 <= 90.0 && (newest + 60) as f64 <= at) {
+                return Err(StaleRestPage.into());
+            }
             self.initial_at = Some(at);
         }
         let oldest = page.iter().map(|r| r.open_time).min().unwrap();

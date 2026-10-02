@@ -397,6 +397,12 @@ class MarketDataProvider:
         elif connector_config is not None:
             # Provide empty strings for all config keys (for public data access without auth)
             api_keys = {key: "" for key in connector_config.__class__.model_fields.keys() if key != "connector"}
+            if connector_name == "okx":
+                # Region selects the public REST host; it is not an authentication secret.
+                region = connector_config.okx_registration_sub_domain
+                if region not in ("www", "app", "my"):
+                    raise ValueError("Invalid OKX public connector registration region")
+                api_keys["okx_registration_sub_domain"] = region
         else:
             # No config found, return empty dict
             api_keys = {}

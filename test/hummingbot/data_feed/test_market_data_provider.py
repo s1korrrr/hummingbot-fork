@@ -510,6 +510,37 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
 
         self.assertEqual(result, {"api_key": "", "secret_key": ""})
 
+    def test_public_okx_connector_preserves_region_without_credentials(self):
+        from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+        from hummingbot.connector.exchange.okx.okx_utils import OKXConfigMap
+
+        for region, domain in [("www", "https://www.okx.com/"),
+                               ("app", "https://us.okx.com/"),
+                               ("my", "https://eea.okx.com/")]:
+            with self.subTest(region=region):
+                config = OKXConfigMap(okx_api_key="private-key", okx_secret_key="private-secret",
+                                      okx_passphrase="private-passphrase", okx_registration_sub_domain=region)
+                with patch('hummingbot.client.settings.AllConnectorSettings.get_connector_config_keys',
+                           return_value=config):
+                    params = MarketDataProvider.get_connector_config_map("okx")
+                self.assertEqual(params["okx_registration_sub_domain"], region)
+                for field in ("okx_api_key", "okx_secret_key", "okx_passphrase"):
+                    self.assertEqual(params[field], "")
+                connector = OkxExchange(trading_required=False, trading_pairs=[], **params)
+                self.assertFalse(connector.is_trading_required)
+                self.assertEqual(connector.domain, domain)
+
+    def test_public_okx_connector_rejects_invalid_region(self):
+        from hummingbot.connector.exchange.okx.okx_utils import OKXConfigMap
+
+        for region in ("", "unknown", None):
+            with self.subTest(region=region):
+                config = OKXConfigMap.model_construct(okx_registration_sub_domain=region)
+                with patch('hummingbot.client.settings.AllConnectorSettings.get_connector_config_keys',
+                           return_value=config):
+                    with self.assertRaisesRegex(ValueError, "Invalid OKX public connector registration region"):
+                        MarketDataProvider.get_connector_config_map("okx")
+
     def test_get_connector_with_fallback_existing_connector(self):
         # Test when connector exists in self.connectors
         result = self.provider.get_connector_with_fallback("mock_connector")

@@ -1,6 +1,12 @@
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import time
+from collections import defaultdict
 from decimal import Decimal
+from pathlib import Path
 from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_lifecycle import make_executor, tracked
 from types import SimpleNamespace
 from unittest import TestCase
@@ -21,7 +27,10 @@ from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLCon
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.executors import planned_position_resume as resume
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
-from hummingbot.strategy_v2.executors.planned_position_resume import validate_position
+from hummingbot.strategy_v2.executors.planned_position_resume import (
+    validate_position,
+    validate_suspended_terminal_position,
+)
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
     TrailingStop,
@@ -31,6 +40,19 @@ from hummingbot.strategy_v2.executors.position_executor.position_executor import
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
+
+TEST_NATIVE_OKX_KEYS = {
+    'okx_api_key': 'test-api-key',
+    'okx_secret_key': 'test-secret-key',
+    'okx_passphrase': 'test-passphrase',
+    'okx_registration_sub_domain': 'www',
+}
+
+
+@pytest.fixture(autouse=True)
+def native_okx_test_keys(monkeypatch):
+    monkeypatch.setattr(resume.Security, 'api_keys',
+                        classmethod(lambda cls, connector: TEST_NATIVE_OKX_KEYS.copy()))
 
 
 class ResumeValidationTests(TestCase):
@@ -125,6 +147,93 @@ class ResumeValidationTests(TestCase):
         self.assertEqual(result['config']['timestamp'], 100)
         self.assertEqual(result['entry']['client_order_id'], 'entry-1')
         self.assertEqual(result['net_base'], '1')
+
+    def _suspended_terminal_pair(self):
+        config = {**json.loads(json.dumps(self.row['config'])), 'id': 'ok-rsi-bnb',
+                  'controller_id': 'ok-rsi-bnb', 'trading_pair': 'BNB-USDC'}
+        order = json.loads(json.dumps(self.order))
+        order['trading_pair'] = 'BNB-USDC'
+        for fill in order['order_fills'].values():
+            fill['trading_pair'] = 'BNB-USDC'
+        custom = {**self.custom, 'order_ids': ['entry-1']}
+        before_custom = {**custom, 'execution_order_snapshots': [order]}
+        before_custom.pop('held_position_orders', None)
+        after_custom = {**before_custom, 'restart_suspended': {
+            'reason': 'planned_restart', 'timestamp': 200,
+            'remaining_position_amount_base': '1'}}
+        stopped = {**self.row, 'id': 'ok-rsi-bnb', 'controller_id': 'ok-rsi-bnb', 'config': config,
+                   'custom_info': after_custom, 'close_type': None, 'close_timestamp': None}
+        before = json.loads(json.dumps(stopped))
+        return before, stopped
+
+    def test_restart_suspended_terminal_requires_and_preserves_exact_single_entry(self):
+        before, stopped = self._suspended_terminal_pair()
+        result = validate_suspended_terminal_position(before, stopped)
+        self.assertEqual(result['resume_kind'], 'restart_suspended_terminal_v1')
+        self.assertEqual(result['net_base'], '1')
+        self.assertEqual(result['trailing']['trailing_state'], 'waiting')
+        self.assertEqual(stopped['close_type'], None)
+        self.assertNotIn('held_position_orders', stopped['custom_info'])
+
+    def test_restart_suspended_terminal_rejects_foreign_controller_scope(self):
+        before, stopped = self._suspended_terminal_pair()
+        for row in (before, stopped):
+            row['controller_id'] = 'other-controller'
+            row['config']['controller_id'] = 'other-controller'
+            row['config']['id'] = row['id']
+        with self.assertRaisesRegex(ValueError, 'V1 BNB owner'):
+            validate_suspended_terminal_position(before, stopped)
+
+    def test_signed_base_fee_matches_native_buy_and_sell_ownership(self):
+        receipt = {'executed_amount_base': '.2', 'order_fills': {
+            'fill': {'fill_base_amount': '.2', 'fee': {'percent': '0', 'flat_fees': [
+                {'token': 'BNB', 'amount': '.001'}]}}}}
+        self.assertEqual(resume.position_hold_net_base({**receipt, 'trade_type': 'BUY'}, 'BNB'), Decimal('.199'))
+        self.assertEqual(resume.position_hold_net_base({**receipt, 'trade_type': 'SELL'}, 'BNB'), Decimal('-.201'))
+
+    def test_restart_suspended_terminal_rejects_lifecycle_and_ownership_changes(self):
+        cases = [
+            ('status', 'inactive with no close type'),
+            ('close_type', 'inactive with no close type'),
+            ('close_timestamp', 'no close type or close timestamp'),
+            ('marker', 'terminal preflight must match stopped row exactly'),
+            ('exit', 'terminal preflight must match stopped row exactly'),
+            ('trailing', 'terminal preflight must match stopped row exactly'),
+        ]
+        for mutation, match in cases:
+            with self.subTest(mutation=mutation):
+                before, stopped = self._suspended_terminal_pair()
+                if mutation == 'status':
+                    stopped['status'] = 2
+                elif mutation == 'close_type':
+                    stopped['close_type'] = CloseType.TRAILING_STOP.value
+                elif mutation == 'close_timestamp':
+                    stopped['close_timestamp'] = 201
+                elif mutation == 'marker':
+                    stopped['custom_info']['restart_suspended'] = None
+                elif mutation == 'exit':
+                    stopped['custom_info']['execution_order_snapshots'].append(self.order)
+                else:
+                    stopped['custom_info']['trailing_move_count'] = -1
+                with self.assertRaisesRegex(ValueError, match):
+                    validate_suspended_terminal_position(before, stopped)
+
+    def test_stopped_terminal_preflight_must_be_identical_and_unclosed(self):
+        before, stopped = self._suspended_terminal_pair()
+        stopped['close_timestamp'] = 201
+        with self.assertRaisesRegex(ValueError, 'no close type or close timestamp'):
+            validate_suspended_terminal_position(stopped, stopped)
+
+        before, stopped = self._suspended_terminal_pair()
+        before['status'] = 2
+        before['is_active'] = True
+        with self.assertRaisesRegex(ValueError, 'already be inactive and unclosed'):
+            validate_suspended_terminal_position(before, stopped)
+
+        before, stopped = self._suspended_terminal_pair()
+        before['custom_info']['restart_suspended']['timestamp'] = 199
+        with self.assertRaisesRegex(ValueError, 'terminal preflight must match stopped row exactly'):
+            validate_suspended_terminal_position(before, stopped)
 
     def test_zero_fill_exit_identity_is_rejected(self):
         self.custom['order_ids'].append('unreported-exit')
@@ -299,20 +408,26 @@ class ResumeValidationTests(TestCase):
             resume.validate_legacy_post_only_repair_transition(before, row)
 
 
-async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_pair='ETH-USDT', controller_id='owner'):
+async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_pair='ETH-USDT', controller_id='owner',
+                          executor_id=None, script_config='owner.yml', controller_config='owner.yml'):
     db = tmp_path / 'stopped.sqlite'
     preflight = tmp_path / 'preflight.sqlite'
     root = tmp_path / 'runtime'
-    for file in (*resume.SOURCES, 'conf/scripts/owner.yml', 'conf/controllers/owner.yml', 'conf/conf_client.yml', 'conf/connectors/okx.yml'):
+    for file in (*resume.SOURCES, f'conf/scripts/{script_config}', f'conf/controllers/{controller_config}',
+                 'conf/conf_client.yml', 'conf/connectors/okx.yml'):
         path = root / file
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text((resume.ROOT / file).read_text() if file in resume.SOURCES else 'id: owner\n')
-    (root / 'conf/scripts/owner.yml').write_text('script_file_name: v2_with_controllers.py\ncontrollers_config: [owner.yml]\n')
-    (root / 'conf/controllers/owner.yml').write_text(f'id: {controller_id}\nconnector_name: okx\ntrading_pair: {trading_pair}\n')
+    (root / f'conf/scripts/{script_config}').write_text(
+        f'script_file_name: v2_with_controllers.py\ncontrollers_config: [{controller_config}]\n')
+    (root / f'conf/controllers/{controller_config}').write_text(
+        f'id: {controller_id}\nconnector_name: okx\ntrading_pair: {trading_pair}\n')
     manager = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS, db_path=str(db))
-    recorder = MarketsRecorder(manager, [], 'owner.yml', 'v2_with_controllers',
+    recorder = MarketsRecorder(manager, [], script_config, 'v2_with_controllers',
                                market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False))
     executor = make_executor()
+    if executor_id is not None:
+        executor.config.id = executor_id
     executor.config.controller_id = controller_id
     executor.config.trading_pair = trading_pair
 
@@ -376,24 +491,25 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
     unrelated = pair_tracked('unrelated', TradeType.BUY, unrelated_amount, OrderState.FILLED).order.to_json()
     if Decimal(unrelated_amount):
         recorder.store_or_update_position_hold_ledger_entries(controller_id, 'other-executor', 'okx', trading_pair, [unrelated])
+    base_asset, quote_asset = trading_pair.split('-')
     with manager.get_new_session() as session:
         receipts = [executor._held_position_orders[0]] + ([unrelated] if Decimal(unrelated_amount) else [])
         if getattr(executor.config, 'entry_chain_contract', None) == resume.ACQUISITION_CHAIN_V1:
-            session.add(Order(id='entry-old', config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
-                              symbol=trading_pair, base_asset='ETH', quote_asset=trading_pair.split('-')[1],
+            session.add(Order(id='entry-old', config_file_path=script_config, strategy='v2_with_controllers', market='okx',
+                              symbol=trading_pair, base_asset=base_asset, quote_asset=quote_asset,
                               creation_timestamp=1000, order_type='LIMIT', amount=Decimal('1'), leverage=1,
                               price=Decimal('100'), last_status='OrderCancelled', last_update_timestamp=2000,
                               exchange_order_id='venue-old', position='NIL'))
         for receipt in receipts:
             oid = receipt['client_order_id']
-            session.add(Order(id=oid, config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
-                              symbol=trading_pair, base_asset='ETH', quote_asset=trading_pair.split('-')[1], creation_timestamp=1000,
+            session.add(Order(id=oid, config_file_path=script_config, strategy='v2_with_controllers', market='okx',
+                              symbol=trading_pair, base_asset=base_asset, quote_asset=quote_asset, creation_timestamp=1000,
                               order_type='LIMIT', amount=Decimal(receipt['amount']), leverage=1, price=Decimal('100'),
                               last_status='BuyOrderCompleted', last_update_timestamp=2000, exchange_order_id=oid,
                               position='NIL'))
             for tid, fill in receipt['order_fills'].items():
-                session.add(TradeFill(config_file_path='owner.yml', strategy='v2_with_controllers', market='okx',
-                                      symbol=trading_pair, base_asset='ETH', quote_asset=trading_pair.split('-')[1], timestamp=2000,
+                session.add(TradeFill(config_file_path=script_config, strategy='v2_with_controllers', market='okx',
+                                      symbol=trading_pair, base_asset=base_asset, quote_asset=quote_asset, timestamp=2000,
                                       order_id=oid, trade_type='BUY', order_type='LIMIT', price=Decimal(fill['fill_price']),
                                       amount=Decimal(fill['fill_base_amount']), leverage=1, trade_fee=fill['fee'],
                                       trade_fee_in_quote=Decimal(0), exchange_trade_id=tid, position='NIL'))
@@ -403,8 +519,9 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
                              unrealized_pnl_quote=Decimal('0'), realized_pnl_quote=Decimal('0'), cum_fees_quote=Decimal('0')))
         session.commit()
     entry = executor._held_position_orders[0]
-    evidence = {'schema': 1, 'owner': 'test-owner', 'script_config': 'owner.yml', 'owner_stopped': True, 'venue_open_orders': [], 'observed_at': 1000,
-                'expires_at': 1800, 'config_paths': ['conf/scripts/owner.yml', 'conf/controllers/owner.yml', 'conf/conf_client.yml', 'conf/connectors/okx.yml'],
+    evidence = {'schema': 1, 'owner': 'test-owner', 'script_config': script_config, 'owner_stopped': True, 'venue_open_orders': [], 'observed_at': 1000,
+                'expires_at': 1800, 'config_paths': [f'conf/scripts/{script_config}', f'conf/controllers/{controller_config}', 'conf/conf_client.yml', 'conf/connectors/okx.yml'],
+                'continuity_executors': [],
                 'executors': [{'executor_id': executor.config.id, 'client_order_id': 'entry',
                                'exchange_order_id': 'entry', 'trading_pair': trading_pair, 'state': 'filled',
                                'filled_base': '1', 'filled_quote': '100', 'net_base': '1',
@@ -424,7 +541,8 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
         'finished_at': datetime.fromtimestamp(1000, timezone.utc).isoformat(),
         'controller_pairs': {controller_id: trading_pair}, 'selected_executor_ids': [executor.config.id],
         'pending_before': pending, 'pending_after': pending,
-        'balance_coverage': [{'asset': 'ETH', 'owned_residual': '1', 'cash_balance': '10',
+        'continuity_executors': [],
+        'balance_coverage': [{'asset': base_asset, 'owned_residual': '1', 'cash_balance': '10',
                               'available_balance': '10', 'covered': True}],
         'selected_executors': [{'executor_id': executor.config.id, 'controller_id': controller_id, 'pair': trading_pair,
                                'venue_orders': [{'raw_order': {'clOrdId': 'entry', 'ordId': 'entry',
@@ -434,7 +552,7 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
                                                  'raw_fills': [{'tradeId': 'entry', 'ordId': 'entry',
                                                                 'instId': trading_pair, 'side': 'buy',
                                                                 'fillSz': '1', 'fillPx': '100',
-                                                                'fee': '0', 'feeCcy': 'ETH'}],
+                                                                'fee': '0', 'feeCcy': base_asset}],
                                                  'receipt': {'blockers': []},
                                                  'local_fill_comparisons': [{'matched': True}]}]}]}
     if getattr(executor.config, 'entry_chain_contract', None) == resume.ACQUISITION_CHAIN_V1:
@@ -448,6 +566,722 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
             'raw_fills': [], 'receipt': {'blockers': []}, 'local_fill_comparisons': [],
         })
     return db, preflight, root, recorder, executor, evidence
+
+
+def write_fleet_owner_snapshot(path, owner, *, active_amount=None):
+    base = 'BNB'
+    with sqlite3.connect(path) as connection:
+        connection.execute('CREATE TABLE Metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+        connection.execute('CREATE TABLE Executors (id TEXT PRIMARY KEY, controller_id TEXT, status INTEGER, '
+                           'is_active INTEGER, close_type INTEGER, config TEXT, custom_info TEXT)')
+        connection.execute('CREATE TABLE PositionHoldLedger (id TEXT PRIMARY KEY, controller_id TEXT, '
+                           'executor_id TEXT, connector_name TEXT, trading_pair TEXT, order_side TEXT, '
+                           'client_order_id TEXT, order_payload TEXT)')
+        connection.execute('CREATE TABLE Position (id TEXT PRIMARY KEY, connector_name TEXT, '
+                           'trading_pair TEXT, amount BIGINT)')
+        connection.execute('CREATE TABLE "Order" (id TEXT PRIMARY KEY, config_file_path TEXT)')
+        connection.execute('INSERT INTO Metadata VALUES (?, ?)', ('native-test', 'fixture'))
+        ledger_amount = Decimal('.25') if owner == 'rsi_modular_v2' else Decimal(0)
+        if ledger_amount:
+            receipt = {'trade_type': 'BUY', 'executed_amount_base': str(ledger_amount),
+                       'order_fills': {'v2-trade': {
+                           'fill_base_amount': str(ledger_amount), 'fill_price': '100',
+                           'fill_quote_amount': str(ledger_amount * 100),
+                           'fee': {'percent': '0', 'flat_fees': [{'token': base, 'amount': '.001'}]}}}}
+            connection.execute('INSERT INTO PositionHoldLedger VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                               ('v2-held-row', 'v2-owner', 'v2-held-executor', 'okx', 'BNB-USDC',
+                                'BUY', 'v2-held-order', json.dumps(receipt, sort_keys=True)))
+            connection.execute('INSERT INTO "Order" VALUES (?, ?)',
+                               ('v2-held-order', 'rsi_modular_v2.yml'))
+            connection.execute('INSERT INTO Position VALUES (?, ?, ?, ?)',
+                               ('v2-position', 'okx', 'BNB-USDC', 249000))
+        if active_amount is not None:
+            executor = make_executor()
+            executor.config.id = 'v3-active-bnb'
+            executor.config.controller_id = 'v3-bnb-controller'
+            executor.config.trading_pair = 'BNB-USDC'
+            executor.config.amount = Decimal(active_amount)
+            active_amount = Decimal(active_amount)
+            native_order = InFlightOrder('v3-entry-order', 'BNB-USDC', OrderType.LIMIT, TradeType.BUY,
+                                         active_amount, 1, Decimal('100'), exchange_order_id='v3-entry-order')
+            native_order.update_with_trade_update(TradeUpdate(
+                'v3-trade', 'v3-entry-order', 'v3-entry-order', 'BNB-USDC', 2, Decimal('100'),
+                active_amount, active_amount * Decimal('100'), AddedToCostTradeFee()))
+            native_order.current_state = OrderState.FILLED
+            order_payload = native_order.to_json()
+            order_payload['trading_pair'] = 'BNB-USDC'
+            for fill in order_payload['order_fills'].values():
+                fill['trading_pair'] = 'BNB-USDC'
+            connection.execute('INSERT INTO Executors VALUES (?, ?, ?, ?, ?, ?, ?)',
+                               (executor.config.id, executor.config.controller_id, 2, 1, None,
+                                executor.config.model_dump_json(),
+                                json.dumps({'remaining_position_amount_base': str(active_amount),
+                                            'execution_order_snapshots': [order_payload],
+                                            'order_ids': ['v3-entry-order']}, sort_keys=True)))
+            connection.execute('INSERT INTO "Order" VALUES (?, ?)',
+                               ('v3-entry-order', 'meridian_v3.yml'))
+            connection.execute('INSERT INTO Position VALUES (?, ?, ?, ?)',
+                               ('v3-position', 'okx', 'BNB-USDC',
+                                int(Decimal(active_amount) * Decimal(1_000_000))))
+        elif owner == 'meridian_v3':
+            connection.execute('INSERT INTO Position VALUES (?, ?, ?, ?)',
+                               ('v3-position', 'okx', 'BNB-USDC', 0))
+    return path
+
+
+def attach_fleet_ownership(evidence, tmp_path, *, now=1000):
+    snapshots = {
+        'rsi_modular_v2': write_fleet_owner_snapshot(tmp_path / 'v2-owner.sqlite', 'rsi_modular_v2'),
+        'meridian_v3': write_fleet_owner_snapshot(
+            tmp_path / 'v3-owner.sqlite', 'meridian_v3', active_amount=Decimal('.2')),
+    }
+    observations = []
+    total = defaultdict(Decimal)
+    for owner, script_config in resume.FLEET_OWNERS.items():
+        path = snapshots[owner]
+        inspected = resume.inspect_fleet_owner_snapshot(path, owner)
+        tables_hash = inspected['tables_digest']
+        residuals = inspected['owned_residual_by_asset']
+        for asset, amount in residuals.items():
+            total[asset] += Decimal(amount)
+        observations.append({
+            'owner': owner, 'script_config': script_config,
+            'observed_at': now, 'database_snapshot_path': str(path),
+            'database_snapshot_sha256': __import__('hashlib').sha256(path.read_bytes()).hexdigest(),
+            'source_identity': {'container_id': 'c' * 64, 'image_id': 'sha256:' + 'b' * 64,
+                                'engine_source_sha256': 'd' * 64},
+            'tables_digest': tables_hash, 'owned_residual_by_asset': residuals,
+        })
+    bundle = {'schema': 1, 'observed_at': now,
+              'expires_at': now + 200, 'owner_observations': observations}
+    evidence['fleet_ownership'] = bundle
+    report = evidence['reconciliation']
+    for row in report['balance_coverage']:
+        row['owned_residual'] = str(Decimal(row['owned_residual']) + total.get(row['asset'], Decimal(0)))
+    resume.seal_fleet_ownership(bundle, TEST_NATIVE_OKX_KEYS, evidence)
+    report['fleet_ownership_authenticator'] = bundle['authenticator']
+    return evidence
+
+
+async def suspended_terminal_fixture(tmp_path):
+    db, preflight, root, recorder, executor, evidence = await stopped_fixture(
+        tmp_path, unrelated_amount='.2', trading_pair='BNB-USDC', controller_id='ok-rsi-bnb',
+        executor_id='terminal-executor-id', script_config='ok_rsi.yml', controller_config='ok_rsi_bnb.yml')
+    with sqlite3.connect(db) as connection:
+        row = connection.execute('SELECT custom_info FROM Executors WHERE id=?', (executor.config.id,)).fetchone()
+        custom = json.loads(row[0])
+        snapshots = [executor._open_order.order.to_json()]
+        custom['execution_order_snapshots'] = snapshots
+        custom['order_ids'] = [executor._open_order.order.client_order_id]
+        custom.pop('held_position_orders', None)
+        custom['restart_suspended'] = {
+            'timestamp': 200, 'wall_timestamp': 200, 'reason': 'planned_restart',
+            'remaining_position_amount_base': '1',
+        }
+        connection.execute('UPDATE Executors SET status=4, is_active=0, close_type=NULL, close_timestamp=NULL, '
+                           'custom_info=? WHERE id=?', (resume.canonical(custom), executor.config.id))
+        connection.execute('DELETE FROM PositionHoldLedger WHERE executor_id=?', (executor.config.id,))
+        connection.execute('UPDATE Position SET amount=? WHERE controller_id=? AND connector_name=? AND trading_pair=?',
+                           (200000, executor.config.controller_id, 'okx', executor.config.trading_pair))
+        risk_state = {'version': 1, 'controllers': ['ok-rsi-bnb'], 'max_global_pnl': '0',
+                      'max_pnl_by_controller': {'ok-rsi-bnb': '0'}, 'drawdown_exited_controllers': [],
+                      'stopped': False, 'operator_paused': {'ok-rsi-bnb': True}}
+        connection.execute('INSERT OR REPLACE INTO Metadata(key, value) VALUES (?, ?)',
+                           ('strategy-risk:ok_rsi.yml', json.dumps(risk_state, sort_keys=True)))
+    with sqlite3.connect(db) as source, sqlite3.connect(preflight) as destination:
+        source.backup(destination)
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    evidence['reconciliation']['balance_coverage'][0]['owned_residual'] = '1.2'
+    evidence = attach_fleet_ownership(evidence, tmp_path)
+    return db, preflight, root, recorder, executor, evidence
+
+
+async def terminal_with_suspended_sol_fixture(tmp_path):
+    db, preflight, root, recorder, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    sol = make_executor()
+    sol.config.id = 'sol-continuity-executor'
+    sol.config.controller_id = 'ok-rsi-sol'
+    sol.config.trading_pair = 'SOL-USDC'
+    sol.config.entry_order_policy = 'single_attempt'
+    sol._open_order = tracked('sol-entry', TradeType.BUY, '1', OrderState.FILLED)
+    order_payload = sol._open_order.order.to_json()
+    order_payload['trading_pair'] = 'SOL-USDC'
+    for fill in order_payload['order_fills'].values():
+        fill['trading_pair'] = 'SOL-USDC'
+    sol._open_order.order = InFlightOrder.from_json(order_payload)
+    sol._entry_submitted = True
+    sol._entry_lifecycle = {'state': 'managing_fill', 'stop_reason': None}
+    sol._trailing_stop_trigger_pct = Decimal('.017')
+    sol._trailing_stop_move_count = 2
+    sol._trailing_stop_armed_timestamp = 900
+    sol._trailing_stop_last_update_timestamp = 950
+    recorder.store_or_update_executor(sol)
+    risk_state = {'version': 1, 'controllers': ['ok-rsi-bnb', 'ok-rsi-sol'], 'max_global_pnl': '0',
+                  'max_pnl_by_controller': {'ok-rsi-bnb': '0', 'ok-rsi-sol': '0'},
+                  'drawdown_exited_controllers': [], 'stopped': False,
+                  'operator_paused': {'ok-rsi-bnb': True, 'ok-rsi-sol': True}}
+    with sqlite3.connect(db) as connection:
+        connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                           (json.dumps(risk_state, sort_keys=True), 'strategy-risk:ok_rsi.yml'))
+    with sqlite3.connect(db) as source, sqlite3.connect(preflight) as destination:
+        source.backup(destination)
+    with patch('hummingbot.strategy_v2.executors.executor_orchestrator.Security.api_keys', return_value=TEST_NATIVE_OKX_KEYS.copy()), \
+            patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.position_executor.position_executor.time.time', return_value=1000):
+        assert sol.suspend_for_restart()
+        sol._advance_restart_suspend()
+    assert sol.is_restart_suspended
+    assert sol.status == RunnableStatus.RUNNING and sol.close_type is None
+    script_path = root / 'conf/scripts/ok_rsi.yml'
+    script_path.write_text('script_file_name: v2_with_controllers.py\n'
+                           'controllers_config: [ok_rsi_bnb.yml, ok_rsi_sol.yml]\n')
+    sol_controller_path = root / 'conf/controllers/ok_rsi_sol.yml'
+    sol_controller_path.write_text('id: ok-rsi-sol\nconnector_name: okx\ntrading_pair: SOL-USDC\n')
+    evidence['config_paths'].append('conf/controllers/ok_rsi_sol.yml')
+    evidence['continuity_executors'] = [{'executor_id': sol.config.id}]
+    report = evidence['reconciliation']
+    report['controller_pairs']['ok-rsi-sol'] = 'SOL-USDC'
+    for phase in ('pending_before', 'pending_after'):
+        report[phase].append({'pair': 'SOL-USDC', 'regular': [], 'regular_count': 0, 'algo_count': 0,
+                              'algos': {kind: [] for kind in resume.SPOT_ALGO_TYPES}})
+    report['balance_coverage'].append({'asset': 'SOL', 'owned_residual': '1', 'cash_balance': '10',
+                                       'available_balance': '10', 'covered': True})
+    sol_order = sol._open_order.order
+    raw_fills = []
+    for trade_id, fill in sol_order.to_json()['order_fills'].items():
+        flat_fees = fill['fee']['flat_fees']
+        fee_ccy = flat_fees[0]['token'] if flat_fees else 'SOL'
+        fee_amount = sum((Decimal(row['amount']) for row in flat_fees), Decimal(0))
+        raw_fills.append({'tradeId': str(trade_id), 'ordId': sol_order.exchange_order_id,
+                          'instId': 'SOL-USDC', 'side': 'buy',
+                          'fillSz': fill['fill_base_amount'], 'fillPx': fill['fill_price'],
+                          'fee': str(-fee_amount), 'feeCcy': fee_ccy})
+    report['continuity_executors'] = [{
+        'executor_id': sol.config.id, 'controller_id': 'ok-rsi-sol', 'pair': 'SOL-USDC',
+        'venue_orders': [{
+            'raw_order': {'clOrdId': sol_order.client_order_id, 'ordId': sol_order.exchange_order_id,
+                          'instId': 'SOL-USDC', 'side': 'buy', 'state': 'filled', 'tdMode': 'cash',
+                          'sz': str(sol_order.amount), 'accFillSz': str(sol_order.executed_amount_base)},
+            'raw_fills': raw_fills, 'receipt': {'blockers': []},
+            'local_fill_comparisons': [{'matched': True} for _ in raw_fills],
+        }],
+    }]
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    return db, preflight, root, recorder, terminal, sol, evidence
+
+
+@pytest.mark.asyncio
+async def test_terminal_singleton_claim_preserves_independent_suspended_sol_continuity(tmp_path):
+    db, preflight, root, recorder, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    assert evidence['reconciliation']['balance_coverage'][0]['owned_residual'] == '1.649'
+    assert resume.inspect_fleet_owner_snapshot(
+        next(row['database_snapshot_path'] for row in evidence['fleet_ownership']['owner_observations']
+             if row['owner'] == 'rsi_modular_v2'), 'rsi_modular_v2')['owned_residual_by_asset'] == {'BNB': '0.249'}
+    assert resume.inspect_fleet_owner_snapshot(
+        next(row['database_snapshot_path'] for row in evidence['fleet_ownership']['owner_observations']
+             if row['owner'] == 'meridian_v3'), 'meridian_v3')['owned_residual_by_asset'] == {'BNB': '0.2'}
+    manifest = resume.prepare(db, preflight, evidence, now=1000, root=root,
+                              terminal_suspended_executor_ids=(terminal.config.id,),
+                              continuity_executor_ids=(sol.config.id,))
+    assert [row['executor_id'] for row in manifest['continuity_rows']] == [sol.config.id]
+    assert resume.pending_manifest(db, now=1001, root=root) == manifest
+    with resume.connect(db) as connection:
+        before_sol = dict(connection.execute('SELECT * FROM Executors WHERE id=?', (sol.config.id,)).fetchone())
+    strategy = terminal._strategy
+    strategy.controllers = {
+        'ok-rsi-bnb': SimpleNamespace(config=SimpleNamespace(connector_name='okx', trading_pair='BNB-USDC')),
+        'ok-rsi-sol': SimpleNamespace(config=SimpleNamespace(connector_name='okx', trading_pair='SOL-USDC')),
+    }
+    strategy.markets = {'okx': {'BNB-USDC', 'SOL-USDC'}}
+    strategy.ready_to_trade = True
+    strategy.market_data_provider = MagicMock(ready=True)
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    connector = strategy.connectors['okx']
+    connector.in_flight_orders = {}
+    connector.get_price_by_type.return_value = Decimal('100')
+    connector.get_balance.side_effect = lambda asset: Decimal('1.649') if asset == 'BNB' else Decimal('10')
+    connector.get_available_balance.side_effect = lambda asset: Decimal('1.649') if asset == 'BNB' else Decimal('10')
+    connector._order_tracker.fetch_order.return_value = None
+    with patch('hummingbot.strategy_v2.executors.executor_orchestrator.Security.api_keys', return_value=TEST_NATIVE_OKX_KEYS.copy()), \
+            patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+                  side_effect=lambda path: resume.pending_manifest(path, now=1001, root=root)), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+                  side_effect=lambda path, value: resume.claim(path, value, now=1001)), \
+            patch.object(PositionExecutor, 'get_trading_rules', return_value=terminal.trading_rules), \
+            patch.object(PositionExecutor, 'start') as start:
+        orchestrator = ExecutorOrchestrator(strategy)
+        assert orchestrator._planned_resume_pending
+        assert orchestrator.resume_planned_positions_if_ready()
+    restored = {item.config.id: item for group in orchestrator.active_executors.values() for item in group}
+    assert set(restored) == {terminal.config.id, sol.config.id}
+    assert restored[terminal.config.id]._planned_resume_id == manifest['id']
+    assert restored[sol.config.id]._restart_restored['suspended'] is True
+    assert restored[sol.config.id]._trailing_stop_trigger_pct == Decimal('.017')
+    assert restored[sol.config.id]._trailing_stop_move_count == 2
+    assert restored[sol.config.id].amount_to_close == Decimal('1')
+    assert start.call_count == 2
+    with resume.connect(db) as connection:
+        after_sol = connection.execute('SELECT * FROM Executors WHERE id=?', (sol.config.id,)).fetchone()
+        assert before_sol == dict(after_sol)
+        assert connection.execute('SELECT amount FROM Position WHERE controller_id=? AND connector_name=? AND trading_pair=?',
+                                  ('ok-rsi-bnb', 'okx', 'BNB-USDC')).fetchone()[0] == 200000
+    assert {row.client_order_id for row in recorder.get_all_position_hold_ledger_entries()} == {'unrelated'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('mutation', 'message'), [
+    ('unmarked', 'exact planned-restart marker'),
+    ('trailing', 'state, fills, orders, or trailing state changed'),
+    ('config', 'identity/configuration changed'),
+])
+async def test_terminal_mode_rejects_unproven_or_drifting_sol_continuity(tmp_path, mutation, message):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    with sqlite3.connect(db) as connection:
+        if mutation == 'unmarked':
+            custom = json.loads(connection.execute('SELECT custom_info FROM Executors WHERE id=?',
+                                                   (sol.config.id,)).fetchone()[0])
+            custom.pop('restart_suspended')
+            connection.execute('UPDATE Executors SET custom_info=? WHERE id=?',
+                               (resume.canonical(custom), sol.config.id))
+        elif mutation == 'trailing':
+            custom = json.loads(connection.execute('SELECT custom_info FROM Executors WHERE id=?',
+                                                   (sol.config.id,)).fetchone()[0])
+            custom['trailing_move_count'] = 3
+            connection.execute('UPDATE Executors SET custom_info=? WHERE id=?',
+                               (resume.canonical(custom), sol.config.id))
+        else:
+            config = json.loads(connection.execute('SELECT config FROM Executors WHERE id=?',
+                                                   (sol.config.id,)).fetchone()[0])
+            config['trading_pair'] = 'ETH-USDC'
+            connection.execute('UPDATE Executors SET config=? WHERE id=?',
+                               (resume.canonical(config), sol.config.id))
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    with pytest.raises(ValueError, match=message):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,),
+                       continuity_executor_ids=(sol.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_terminal_mode_rejects_unlisted_running_executor_and_generic_mode_stays_strict(tmp_path):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    with pytest.raises(ValueError, match='unfinished executor set differs from explicit'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,))
+    with pytest.raises(ValueError, match='database still has unfinished executors'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root)
+
+
+@pytest.mark.asyncio
+async def test_terminal_mode_rejects_changed_durable_risk_state(tmp_path):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    with sqlite3.connect(db) as connection:
+        state = json.loads(connection.execute('SELECT value FROM Metadata WHERE key=?',
+                                              ('strategy-risk:ok_rsi.yml',)).fetchone()[0])
+        state['max_global_pnl'] = '0.01'
+        connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                           (json.dumps(state, sort_keys=True), 'strategy-risk:ok_rsi.yml'))
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    with pytest.raises(ValueError, match='durable V1 risk state changed'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,),
+                       continuity_executor_ids=(sol.config.id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('marked', [False, True])
+async def test_terminal_mode_rejects_unselected_positive_terminal_inventory(tmp_path, marked):
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    with sqlite3.connect(db) as connection:
+        columns = [row[1] for row in connection.execute('PRAGMA table_info(Executors)')]
+        selected = dict(zip(columns, connection.execute('SELECT * FROM Executors WHERE id=?',
+                                                        (terminal.config.id,)).fetchone()))
+        custom = json.loads(selected['custom_info'])
+        custom['remaining_position_amount_base'] = '.05'
+        custom['order_ids'] = ['unselected-terminal-entry']
+        if marked:
+            custom['restart_suspended']['remaining_position_amount_base'] = '.05'
+        else:
+            custom.pop('restart_suspended', None)
+        selected.update(id='unselected-terminal', custom_info=resume.canonical(custom))
+        placeholders = ', '.join('?' for _ in columns)
+        connection.execute(f"INSERT INTO Executors ({', '.join(columns)}) VALUES ({placeholders})",
+                           [selected[column] for column in columns])
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    with pytest.raises(ValueError, match='positive terminal inventory|exact singleton selection'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('field', 'value'), [
+    ('stopped', True),
+    ('max_global_pnl', 'NaN'),
+    ('max_pnl_by_controller', {}),
+])
+async def test_terminal_mode_rejects_native_invalid_risk_state_before_claim(tmp_path, field, value):
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    for database_path in (db, preflight):
+        with sqlite3.connect(database_path) as connection:
+            state = json.loads(connection.execute('SELECT value FROM Metadata WHERE key=?',
+                                                  ('strategy-risk:ok_rsi.yml',)).fetchone()[0])
+            state[field] = value
+            connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                               (json.dumps(state, sort_keys=True), 'strategy-risk:ok_rsi.yml'))
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    with pytest.raises(ValueError, match='durably paused|risk peak state'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_terminal_mode_rejects_tampered_fleet_owner_residual_even_with_recomputed_bundle_hash(tmp_path):
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    bundle = evidence['fleet_ownership']
+    v3 = next(row for row in bundle['owner_observations'] if row['owner'] == 'meridian_v3')
+    v3['owned_residual_by_asset']['BNB'] = '.1'
+    resume.seal_fleet_ownership(bundle, TEST_NATIVE_OKX_KEYS, evidence)
+    evidence['reconciliation']['fleet_ownership_authenticator'] = bundle['authenticator']
+    with pytest.raises(ValueError, match='residual differs from native ledger and executor receipts'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_fleet_owner_snapshot_order_script_must_match_declared_owner(tmp_path):
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    v3 = next(row for row in evidence['fleet_ownership']['owner_observations']
+              if row['owner'] == 'meridian_v3')
+    with sqlite3.connect(v3['database_snapshot_path']) as connection:
+        connection.execute('UPDATE "Order" SET config_file_path=? WHERE id=?',
+                           ('rsi_modular_v2.yml', 'v3-entry-order'))
+    with pytest.raises(ValueError, match='not bound to its owner script'):
+        resume.inspect_fleet_owner_snapshot(v3['database_snapshot_path'], 'meridian_v3')
+
+
+def test_fleet_owner_snapshot_rechecks_sidecars_after_read(tmp_path, monkeypatch):
+    path = write_fleet_owner_snapshot(tmp_path / 'v2-owner.sqlite', 'rsi_modular_v2')
+    original = resume._derive_owner_residuals
+
+    def materialize_wal(connection, owner):
+        result = original(connection, owner)
+        Path(str(path) + '-wal').write_bytes(b'wal appeared while snapshot was read')
+        return result
+
+    monkeypatch.setattr(resume, '_derive_owner_residuals', materialize_wal)
+    with pytest.raises(ValueError, match='uncheckpointed SQLite sidecars'):
+        resume.inspect_fleet_owner_snapshot(path, 'rsi_modular_v2')
+
+
+@pytest.mark.asyncio
+async def test_fleet_bundle_authenticator_must_match_native_v1_credentials(tmp_path):
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    evidence['fleet_ownership']['authenticator'] = 'f' * 64
+    with pytest.raises(ValueError, match='authenticator does not match'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,))
+
+
+@pytest.mark.parametrize('keys', [{}, {'okx_api_key': 'a', 'okx_secret_key': 'b'},
+                                  {'okx_api_key': 'a', 'okx_secret_key': 'b', 'okx_passphrase': ''}])
+def test_fleet_authentication_rejects_missing_native_okx_credentials(keys):
+    with pytest.raises(ValueError, match='decrypted native OKX credential set'):
+        resume.verify_fleet_ownership({'authenticator': 'x'}, keys)
+
+
+def test_fleet_authentication_binds_optional_native_okx_subdomain():
+    bundle = {'schema': 1, 'observed_at': 1, 'expires_at': 2, 'owner_observations': []}
+    keys = {**TEST_NATIVE_OKX_KEYS, 'okx_registration_sub_domain': 'app'}
+    resume.seal_fleet_ownership(bundle, keys, {})
+    assert resume.verify_fleet_ownership(bundle, keys)
+    with pytest.raises(ValueError, match='authenticator does not match'):
+        resume.verify_fleet_ownership(bundle, {**keys, 'okx_registration_sub_domain': 'my'})
+
+
+@pytest.mark.asyncio
+async def test_fleet_bundle_authenticator_binds_all_source_and_snapshot_evidence(tmp_path):
+    _, _, _, _, _, evidence = await suspended_terminal_fixture(tmp_path)
+    bundle = evidence['fleet_ownership']
+    bundle['owner_observations'][0]['source_identity']['container_id'] = 'e' * 64
+    with pytest.raises(ValueError, match='authenticator does not match'):
+        resume.validate_fleet_ownership(evidence, 1000, TEST_NATIVE_OKX_KEYS)
+
+
+@pytest.mark.asyncio
+async def test_fleet_bundle_authenticator_binds_v1_wallet_and_raw_venue_evidence(tmp_path):
+    _, _, _, _, _, evidence = await suspended_terminal_fixture(tmp_path)
+    evidence['reconciliation']['balance_coverage'][0]['cash_balance'] = '999'
+    with pytest.raises(ValueError, match='sealed recovery evidence changed'):
+        resume.validate_fleet_ownership(evidence, 1000, TEST_NATIVE_OKX_KEYS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.environ.get('RSIBOT_EPHEMERAL_SECURITY_TEST') != '1',
+                    reason='runs only inside a disposable native Hummingbot test container')
+async def test_terminal_prepare_cli_unlocks_encrypted_native_config_in_fresh_process(tmp_path):
+    from pydantic import SecretStr
+
+    from hummingbot.client.config.config_crypt import (
+        PASSWORD_VERIFICATION_PATH,
+        ETHKeyFileSecretManger,
+        store_password_verification,
+    )
+    from hummingbot.client.config.config_helpers import get_connector_config_yml_path
+    from hummingbot.connector.exchange.okx.okx_utils import OKXConfigMap
+
+    connector_path = get_connector_config_yml_path('okx')
+    if connector_path.exists() or PASSWORD_VERIFICATION_PATH.exists():
+        pytest.skip('disposable image contains pre-existing encrypted connector state')
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    now = time.time()
+    evidence = refresh_stopped_evidence(db, evidence, now)
+    bundle = evidence['fleet_ownership']
+    bundle['observed_at'] = now
+    bundle['expires_at'] = now + 200
+    for observation in bundle['owner_observations']:
+        observation['observed_at'] = now
+    resume.seal_fleet_ownership(bundle, TEST_NATIVE_OKX_KEYS, evidence)
+    evidence['reconciliation']['fleet_ownership_authenticator'] = bundle['authenticator']
+    evidence_path = tmp_path / 'prepare-evidence.json'
+    evidence_path.write_text(resume.canonical(evidence))
+    password = 'ephemeral-test-password'
+    password_path = tmp_path / 'native-password'
+    password_path.write_text(password + '\n')
+    password_path.chmod(0o600)
+    manager = ETHKeyFileSecretManger(password)
+    Security = resume.Security
+    Security.secrets_manager = manager
+    try:
+        store_password_verification(manager)
+        Security.update_secure_config(ClientConfigAdapter(OKXConfigMap(
+            okx_api_key=SecretStr(TEST_NATIVE_OKX_KEYS['okx_api_key']),
+            okx_secret_key=SecretStr(TEST_NATIVE_OKX_KEYS['okx_secret_key']),
+            okx_passphrase=SecretStr(TEST_NATIVE_OKX_KEYS['okx_passphrase']),
+            okx_registration_sub_domain=TEST_NATIVE_OKX_KEYS['okx_registration_sub_domain'],
+        )))
+        command = [sys.executable, '-m', 'hummingbot.strategy_v2.executors.planned_position_resume',
+                   'prepare', '--db', str(db), '--preflight-db', str(preflight), '--evidence', str(evidence_path),
+                   '--runtime-root', str(root), '--password-file', str(password_path),
+                   '--restart-suspended-terminal-executor-id', terminal.config.id]
+        process = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+        assert process.returncode == 0, process.stderr
+        assert terminal.config.id in process.stdout
+        assert all(secret not in process.stdout + process.stderr
+                   for secret in (*TEST_NATIVE_OKX_KEYS.values(), password))
+    finally:
+        Security.remove_secure_config('okx')
+        PASSWORD_VERIFICATION_PATH.unlink(missing_ok=True)
+        Security.secrets_manager = None
+
+
+@pytest.mark.asyncio
+async def test_terminal_mode_aggregates_v1_held_inventory_across_unselected_pairs(tmp_path):
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    receipt = {'trade_type': 'BUY', 'executed_amount_base': '.5', 'executed_amount_quote': '50',
+               'order_fills': {'eth-held-trade': {'fill_base_amount': '.5', 'fill_price': '100',
+                                                  'fill_quote_amount': '50',
+                                                  'fee': {'percent': '0', 'flat_fees': []}}}}
+    with sqlite3.connect(db) as connection:
+        connection.execute('INSERT INTO PositionHoldLedger '
+                           '(id, controller_id, executor_id, connector_name, trading_pair, position_side, order_side, '
+                           'timestamp, client_order_id, exchange_order_id, price, amount, executed_amount_base, '
+                           'executed_amount_quote, cumulative_fee_paid_quote, order_payload) '
+                           'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                           ('eth-held-row', 'ok-rsi-eth', 'eth-held-executor', 'okx', 'ETH-USDC', 'BUY', 'BUY',
+                            1000, 'eth-held-order', 'eth-held-order', 100, 500000, 500000, 50000000, 0,
+                            json.dumps(receipt, sort_keys=True)))
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    evidence['reconciliation']['balance_coverage'].append({
+        'asset': 'ETH', 'owned_residual': '.5', 'cash_balance': '10',
+        'available_balance': '10', 'covered': True})
+    bundle = evidence['fleet_ownership']
+    resume.seal_fleet_ownership(bundle, TEST_NATIVE_OKX_KEYS, evidence)
+    evidence['reconciliation']['fleet_ownership_authenticator'] = bundle['authenticator']
+    manifest = resume.prepare(db, preflight, evidence, now=1000, root=root,
+                              terminal_suspended_executor_ids=(terminal.config.id,))
+    assert any(row['asset'] == 'ETH' and row['owned_residual'] == '.5'
+               for row in manifest['evidence']['reconciliation']['balance_coverage'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('mutation', 'message'), [
+    ('missing', 'fresh raw SOL venue order selection differs'),
+    ('fill', 'fresh SOL venue fill values differ'),
+    ('fee', 'fresh SOL venue fee amount or currency differs'),
+])
+async def test_terminal_mode_requires_fresh_exact_sol_raw_order_and_fill_proof(tmp_path, mutation, message):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    proof = evidence['reconciliation']['continuity_executors'][0]['venue_orders'][0]
+    if mutation == 'missing':
+        evidence['reconciliation']['continuity_executors'] = []
+    elif mutation == 'fill':
+        proof['raw_fills'][0]['fillPx'] = '101'
+    else:
+        proof['raw_fills'][0]['fee'] = '-0.01'
+    with pytest.raises(ValueError, match=message):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,),
+                       continuity_executor_ids=(sol.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_terminal_mode_rejects_sol_inventory_not_conserved_by_fresh_net_entry(tmp_path):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    for database_path in (db, preflight):
+        with sqlite3.connect(database_path) as connection:
+            row = connection.execute('SELECT custom_info FROM Executors WHERE id=?',
+                                     (sol.config.id,)).fetchone()
+            custom = json.loads(row[0])
+            custom['remaining_position_amount_base'] = '0.9'
+            if custom.get('restart_suspended'):
+                custom['restart_suspended']['remaining_position_amount_base'] = '0.9'
+            connection.execute('UPDATE Executors SET custom_info=? WHERE id=?',
+                               (resume.canonical(custom), sol.config.id))
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    with pytest.raises(ValueError, match='fresh SOL venue net entry differs from suspended inventory'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,),
+                       continuity_executor_ids=(sol.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_restart_suspended_terminal_claims_exact_target_and_rebuilds_other_bags_once(tmp_path):
+    db, preflight, root, recorder, old, evidence = await suspended_terminal_fixture(tmp_path)
+    manifest = resume.prepare(db, preflight, evidence, now=1000, root=root,
+                              terminal_suspended_executor_ids=(old.config.id,))
+    position = manifest['positions'][0]
+    assert old.config.id != old.config.controller_id
+    assert position['preflight']['status'] == 4
+    assert position['preflight']['custom_info']['restart_suspended']['reason'] == 'planned_restart'
+    assert position['resume_kind'] == 'restart_suspended_terminal_v1'
+    assert position['net_base'] == '1'
+    assert position['ownership_archive']['ledger_rows'] == []
+    assert len(position['ownership_archive']['position_rows']) == 1
+    assert resume.pending_manifest(db, now=1001, root=root) == manifest
+
+    strategy = old._strategy
+    strategy.controllers = {'ok-rsi-bnb': SimpleNamespace(config=SimpleNamespace(connector_name='okx', trading_pair='BNB-USDC'))}
+    strategy.markets = {'okx': {'BNB-USDC'}}
+    strategy.ready_to_trade = True
+    strategy.market_data_provider = MagicMock(ready=True)
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    connector = strategy.connectors['okx']
+    connector.in_flight_orders = {}
+    connector.get_price_by_type.return_value = Decimal('100')
+    connector.get_available_balance.return_value = Decimal('1.649')
+    connector.get_balance.return_value = Decimal('1.649')
+    connector._order_tracker.fetch_order.return_value = None
+    with patch('hummingbot.strategy_v2.executors.executor_orchestrator.Security.api_keys', return_value=TEST_NATIVE_OKX_KEYS.copy()), \
+            patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+                  side_effect=lambda path: resume.pending_manifest(path, now=1001, root=root)), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+                  side_effect=lambda path, value: resume.claim(path, value, now=1001)), \
+            patch.object(PositionExecutor, 'get_trading_rules', return_value=old.trading_rules), \
+            patch.object(PositionExecutor, 'start') as start:
+        orchestrator = ExecutorOrchestrator(strategy)
+        assert orchestrator._planned_resume_pending
+        assert orchestrator.resume_planned_positions_if_ready()
+        start.assert_called_once()
+
+    restored = orchestrator.active_executors['ok-rsi-bnb']
+    assert len(restored) == 1
+    assert restored[0].config.id == old.config.id
+    assert restored[0].amount_to_close == Decimal('1')
+    assert restored[0]._planned_resume_id == manifest['id']
+    assert sum(p.buy_amount_base - p.sell_amount_base for p in orchestrator.positions_held['ok-rsi-bnb']) == Decimal('.2')
+    assert len(orchestrator.get_all_reports()['ok-rsi-bnb']['executors']) == 1
+    assert {row.client_order_id for row in recorder.get_all_position_hold_ledger_entries()} == {'unrelated'}
+    with resume.connect(db) as connection:
+        assert connection.execute('SELECT amount FROM Position WHERE controller_id=? AND connector_name=? AND trading_pair=?',
+                                  ('ok-rsi-bnb', 'okx', 'BNB-USDC')).fetchone()[0] == 200000
+    claimed = resume.inspect_manifest(db)[0]
+    assert claimed['state'] == 'claimed'
+    assert recorder.get_all_executors()[0].status == RunnableStatus.RUNNING
+    with pytest.raises(ValueError, match='already consumed'):
+        resume.claim(db, manifest, now=1002)
+
+
+@pytest.mark.asyncio
+async def test_restart_suspended_terminal_rejects_mixed_executor_selection(tmp_path):
+    db, preflight, root, _, old, evidence = await suspended_terminal_fixture(tmp_path)
+    evidence['executors'].append({'executor_id': 'ordinary-executor-id'})
+
+    with pytest.raises(ValueError, match='selection must contain only the suspended terminal executor'):
+        resume.prepare(db, preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(old.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_restart_suspended_terminal_startup_checks_total_verified_owner_inventory(tmp_path):
+    db, preflight, root, recorder, old, evidence = await suspended_terminal_fixture(tmp_path)
+    resume.prepare(db, preflight, evidence, now=1000, root=root,
+                   terminal_suspended_executor_ids=(old.config.id,))
+    strategy = old._strategy
+    strategy.controllers = {'ok-rsi-bnb': SimpleNamespace(
+        config=SimpleNamespace(connector_name='okx', trading_pair='BNB-USDC'))}
+    strategy.markets = {'okx': {'BNB-USDC'}}
+    strategy.ready_to_trade = True
+    strategy.market_data_provider = MagicMock(ready=True)
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    connector = strategy.connectors['okx']
+    connector.in_flight_orders = {}
+    connector.get_price_by_type.return_value = Decimal('100')
+    connector.get_available_balance.return_value = Decimal('1.1')
+    connector.get_balance.return_value = Decimal('1.1')
+    connector._order_tracker.fetch_order.return_value = None
+    with patch('hummingbot.strategy_v2.executors.executor_orchestrator.Security.api_keys', return_value=TEST_NATIVE_OKX_KEYS.copy()), \
+            patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+                  side_effect=lambda path: resume.pending_manifest(path, now=1001, root=root)), \
+            patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+                  side_effect=lambda path, value: resume.claim(path, value, now=1001)):
+        orchestrator = ExecutorOrchestrator(strategy)
+        assert orchestrator.resume_planned_positions_if_ready()
+
+    assert orchestrator._resume_preflight_failed is True
+    assert 'all verified owner inventory' in orchestrator._planned_resume_failure
+    assert resume.inspect_manifest(db)[0]['state'] == 'prepared'
+    assert old.config.id not in {executor.config.id for executors in orchestrator.active_executors.values()
+                                 for executor in executors}
+
+
+@pytest.mark.asyncio
+async def test_restart_suspended_terminal_startup_rechecks_unlocked_credential_identity(tmp_path):
+    db, preflight, root, recorder, old, evidence = await suspended_terminal_fixture(tmp_path)
+    resume.prepare(db, preflight, evidence, now=1000, root=root,
+                   terminal_suspended_executor_ids=(old.config.id,))
+    strategy = old._strategy
+    strategy.controllers = {'ok-rsi-bnb': SimpleNamespace(
+        config=SimpleNamespace(connector_name='okx', trading_pair='BNB-USDC'))}
+    strategy.markets = {'okx': {'BNB-USDC'}}
+    strategy.ready_to_trade = True
+    strategy.market_data_provider = MagicMock(ready=True)
+    strategy.market_data_provider.get_price_by_type.return_value = Decimal('100')
+    connector = strategy.connectors['okx']
+    connector.in_flight_orders = {}
+    connector.get_price_by_type.return_value = Decimal('100')
+    connector.get_available_balance.return_value = Decimal('2')
+    connector.get_balance.return_value = Decimal('2')
+    connector._order_tracker.fetch_order.return_value = None
+    with (
+        patch(
+            'hummingbot.strategy_v2.executors.executor_orchestrator.Security.api_keys',
+            return_value={'okx_api_key': 'different-api-key', 'okx_secret_key': 'different-secret',
+                          'okx_passphrase': 'different-passphrase'},
+        ),
+        patch.object(MarketsRecorder, 'get_instance', return_value=recorder),
+        patch('hummingbot.strategy_v2.executors.executor_orchestrator.pending_manifest',
+              side_effect=lambda path: resume.pending_manifest(path, now=1001, root=root)),
+        patch('hummingbot.strategy_v2.executors.executor_orchestrator.claim',
+              side_effect=lambda path, value: resume.claim(path, value, now=1001)),
+    ):
+        orchestrator = ExecutorOrchestrator(strategy)
+        orchestrator.resume_planned_positions_if_ready()
+    assert orchestrator._resume_preflight_failed is True
+    assert 'authenticator does not match current native OKX credentials' in orchestrator._planned_resume_failure
+    assert resume.inspect_manifest(db)[0]['state'] == 'prepared'
 
 
 @pytest.mark.asyncio
@@ -768,6 +1602,10 @@ def refresh_stopped_evidence(db, evidence, now):
     fresh['reconciliation']['database'].update(sha256=sha, sha256_after=sha)
     fresh['reconciliation']['started_at'] = datetime.fromtimestamp(now - 10, timezone.utc).isoformat()
     fresh['reconciliation']['finished_at'] = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    if 'fleet_ownership' in fresh:
+        bundle = fresh['fleet_ownership']
+        resume.seal_fleet_ownership(bundle, TEST_NATIVE_OKX_KEYS, fresh)
+        fresh['reconciliation']['fleet_ownership_authenticator'] = bundle['authenticator']
     return fresh
 
 

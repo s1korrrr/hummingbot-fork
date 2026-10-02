@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
+from hummingbot.client.config.security import Security
 from hummingbot.client.native_lifecycle import ShutdownResult
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
@@ -18,7 +19,12 @@ from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount, base_fee_quote_amount
-from hummingbot.strategy_v2.executors.planned_position_resume import STARTUP_SEALED_RESTORE, claim, pending_manifest
+from hummingbot.strategy_v2.executors.planned_position_resume import (
+    STARTUP_SEALED_RESTORE,
+    claim,
+    pending_manifest,
+    verify_fleet_ownership,
+)
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.executors.restart_continuity import (
     RestartContinuityError,
@@ -706,6 +712,47 @@ class ExecutorOrchestrator:
             executor = executor_class(self.strategy, config, self.executors_update_interval, self.executors_max_retries)
             executor.hydrate_planned_position(position, manifest["id"])
             instances.append(executor)
+        terminal_resume = any(position.get("resume_kind") == "restart_suspended_terminal_v1"
+                              for position in manifest["positions"])
+        if terminal_resume:
+            evidence = manifest.get("evidence", {})
+            fleet = evidence.get("fleet_ownership")
+            verify_fleet_ownership(fleet, Security.api_keys("okx"), evidence)
+            if evidence.get("reconciliation", {}).get("fleet_ownership_authenticator") \
+                    != fleet["authenticator"]:
+                raise ValueError("Planned terminal resume fleet ownership authenticator binding changed")
+            coverage_rows = manifest.get("evidence", {}).get("reconciliation", {}).get("balance_coverage")
+            if not isinstance(coverage_rows, list) or not coverage_rows:
+                raise ValueError("Planned terminal resume has no verified all-owner balance coverage")
+            connector_names = {executor.config.connector_name for executor in instances}
+            if len(connector_names) != 1:
+                raise ValueError("Planned terminal resume spans unsupported connector ownership")
+            connector_name = next(iter(connector_names))
+            connector = self.strategy.connectors[connector_name]
+            covered_assets = set()
+            for row in coverage_rows:
+                asset = row.get("asset")
+                if not isinstance(asset, str) or not asset or asset in covered_assets:
+                    raise ValueError("Planned terminal resume balance coverage is ambiguous")
+                if row.get("covered") is not True:
+                    raise ValueError("Planned terminal resume owner balance proof is not covered")
+                covered_assets.add(asset)
+                try:
+                    owned = Decimal(str(row["owned_residual"]))
+                    cash_balance = Decimal(str(connector.get_balance(asset)))
+                    available_balance = Decimal(str(connector.get_available_balance(asset)))
+                except Exception as error:
+                    raise ValueError("Planned terminal resume current owner balance is unavailable") from error
+                if (not owned.is_finite() or owned < 0 or not cash_balance.is_finite()
+                        or not available_balance.is_finite() or cash_balance < owned
+                        or available_balance < owned):
+                    raise ValueError("Planned terminal resume balance does not cover all verified owner inventory")
+                key = connector_name, asset
+                if key in required_base and owned < required_base[key]:
+                    raise ValueError("Planned terminal resume coverage is below selected inventory")
+                required_base[key] = max(required_base.get(key, Decimal(0)), owned)
+            if not set(asset for connector, asset in required_base if connector == connector_name) <= covered_assets:
+                raise ValueError("Planned terminal resume balance coverage omits selected inventory")
         for (connector_name, base), amount in required_base.items():
             available = Decimal(str(self.strategy.connectors[connector_name].get_available_balance(base)))
             if not available.is_finite() or available < amount:

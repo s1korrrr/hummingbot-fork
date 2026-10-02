@@ -121,7 +121,14 @@ class ServiceCandleHub:
             await self._wake.wait()
             await asyncio.sleep(self.coalesce_seconds)
             self._wake.clear()
-            await self._reconcile()
+            try:
+                await self._reconcile()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The supervisor must outlive one failed rebuild; feeds report the error until the next attach.
+                self.error = f"{type(exc).__name__}: {exc}"
+                self.logger().exception(f"Service candle stream supervision failed | error={self.error}")
 
     async def _close_client(self) -> None:
         client, self.client = self.client, None
@@ -214,6 +221,8 @@ def configure_service_candles(policy: DataPolicy, *, history: int = CONSTANTS.SE
         return _HUB
     _HUB = hub
     CandlesFactory.route("okx", CONSTANTS.SERVICE_CONNECTOR)
+    hub.logger().info(f"Service candles enabled: okx spot candles are read from the shared candle service, not OKX | "
+                      f"origin={hub.origin} history={hub.history}")
     return hub
 
 

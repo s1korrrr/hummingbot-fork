@@ -9,11 +9,18 @@ Offline and read-only. Run it inside the V1 engine image with `--network none`; 
 * ``--cache-dir``      a copy of the service cache (``<PAIR>.json``): the bars the service publishes.
 * ``--conf-dir``       a copy of V1's ``conf/controllers/ok_rsi_*.yml``.
 
-For every sampled closed minute ``t`` it (1) builds the frame the controller receives from the service feed (3660 bars
-ending at ``t``, through `OKXServiceCandles` and `MarketDataProvider.get_candles_df`), (2) checks it equals, exactly,
-the frame the native OKX feed holds for the same confirmed rows, (3) runs the real controller's
-``update_processed_data`` on it and compares the indicator and decision columns with the row V1 recorded for ``t``.
-Exit status is non-zero when an enforced comparison fails.
+Two checks per pair, both enforced (exit status is non-zero when either fails):
+
+* projection: V1 stores each row of its newest feature window as the newest evaluation projects it, so one
+  service-fed evaluation at the newest recorded minute must reproduce every stored indicator row inside that window
+  (RSI 1e-6 absolute, ATR, ATR %, EMA, Bollinger, MACD histogram 1e-9 relative), and the frame it received must equal,
+  exactly, the frame the native OKX feed holds for the same confirmed rows;
+* decision time: for the freshest ``--fresh-minutes`` of recorded rows, one evaluation per minute, oldest first, on
+  the 3660 service bars ending at that minute (through `OKXServiceCandles` and `MarketDataProvider.get_candles_df`),
+  compared with the row V1 recorded at decision time. Older stored rows were overwritten by later projections whose
+  window position has less history, so they differ from decision-time values by up to about 5e-3 RSI points and are
+  not an oracle for this check. Decision columns (signal, regime, thresholds) are reported but not enforced: they
+  depend on position and executor state the replay does not have.
 """
 import argparse
 import asyncio
@@ -156,59 +163,115 @@ class Replay:
         return values, observation
 
 
+def load_recorded(conn, pair, since):
+    names = ["ts", "open", "high", "low", "close", "volume", *NUMERIC, *DECISION_NUMERIC, *DECISION_TEXT, "signal"]
+    query = ("select candle_timestamp, open_price, high_price, low_price, close_price, volume, "
+             + ", ".join(NUMERIC + DECISION_NUMERIC + DECISION_TEXT) + ", signal "
+             "from ChartSnapshot where pair=? and interval='1m' and candle_timestamp>=? and rsi is not null "
+             "order by candle_timestamp")
+    return [dict(zip(names, row)) for row in conn.execute(query, (pair, since * 1000))]
+
+
+def indicator_differences(rec, values):
+    bad = []
+    for key in NUMERIC:
+        tolerance = {"absolute": RSI_ABS_TOL, "relative": 0.0} if key == "rsi" else {}
+        if not close_enough(rec[key], values.get(key), **tolerance):
+            bad.append(key)
+    return bad
+
+
+def bar_matches(rec, frame, t):
+    last = frame.iloc[-1]
+    return bool(frame["timestamp"].iloc[-1] == t and all(
+        close_enough(rec[key], last[key]) for key in ("open", "high", "low", "close", "volume")))
+
+
+def decision_differences(rec, observation):
+    bad = [key for key in DECISION_NUMERIC if rec[key] is not None and not close_enough(rec[key], observation.get(key))]
+    bad += [key for key in DECISION_TEXT if rec[key] is not None and rec[key] != observation.get(key)]
+    if rec["signal"] is not None and observation.get("signal") is not None \
+            and float(rec["signal"]) != float(observation["signal"]):
+        bad.append("signal")
+    return bad
+
+
+async def projection_check(pair, args, cache_rows, recorded, counts, examples):
+    """V1 stores every row of its newest feature window as that evaluation projects it, so one service-fed
+    evaluation at the newest recorded minute must reproduce all stored rows inside the window."""
+    replay = Replay(pair, args.conf_dir, cache_rows)
+    await replay.start()
+    newest = recorded[-1]["ts"] // 1000
+    frame, shape_equal = await replay.decide(newest)
+    window = replay.controller.max_records
+    counts["projection_frame_equal_native"] += shape_equal
+    for rec in recorded:
+        t = rec["ts"] // 1000
+        if (newest - t) // 60 >= window:
+            counts["projection_outside_feature_window"] += 1
+            continue
+        values, _ = replay.computed(t)
+        bad = indicator_differences(rec, values)
+        counts["projection_rows"] += 1
+        counts["projection_indicators_equal"] += not bad
+        for key in bad:
+            counts["projection_differs_" + key] += 1
+        if bad and len(examples) < 5:
+            examples.append({"projection_open_time": t, "indicator_diff": bad})
+
+
+async def decision_check(pair, args, cache_rows, recorded, counts, examples):
+    """Replay the minutes whose recorded values are decision-time: one evaluation per minute, oldest first."""
+    replay = Replay(pair, args.conf_dir, cache_rows)
+    await replay.start()
+    newest = recorded[-1]["ts"] // 1000
+    fresh = [rec for rec in recorded if (newest - rec["ts"] // 1000) <= args.fresh_minutes * 60]
+    fresh = fresh[::args.step]
+    for rec in fresh:
+        t = rec["ts"] // 1000
+        if t not in replay.index or replay.index[t] + 1 < HISTORY:
+            counts["no_service_window"] += 1
+            continue
+        frame, shape_equal = await replay.decide(t)
+        values, observation = replay.computed(t)
+        bad = indicator_differences(rec, values)
+        decision_bad = decision_differences(rec, observation)
+        ok_bar = bar_matches(rec, frame, t)
+        counts["decision_rows"] += 1
+        counts["decision_frame_equal_native"] += shape_equal
+        counts["decision_bar_equal_recorded"] += ok_bar
+        counts["decision_indicators_equal"] += not bad
+        counts["decision_columns_equal_informational"] += not decision_bad
+        for key in bad:
+            counts["decision_differs_" + key] += 1
+        for key in decision_bad:
+            counts["informational_differs_" + key] += 1
+        if (not shape_equal or not ok_bar or bad) and len(examples) < 5:
+            examples.append({"decision_open_time": t, "shape_equal": shape_equal, "bar_ok": ok_bar,
+                             "indicator_diff": bad})
+
+
 async def run(args):
     conn = open_copy(args.recorder_copy)
     report, failed = {}, False
     for pair in args.pairs:
         cache_rows = load_cache(args.cache_dir, pair)
-        replay = Replay(pair, args.conf_dir, cache_rows)
-        await replay.start()
-        counts, examples = Counter(), []
-        query = ("select candle_timestamp, open_price, high_price, low_price, close_price, volume, "
-                 + ", ".join(NUMERIC + DECISION_NUMERIC + DECISION_TEXT) + ", signal "
-                 "from ChartSnapshot where pair=? and interval='1m' and candle_timestamp>=? and rsi is not null "
-                 "order by candle_timestamp")
-        names = ["ts", "open", "high", "low", "close", "volume", *NUMERIC, *DECISION_NUMERIC, *DECISION_TEXT,
-                 "signal"]
-        recorded = [dict(zip(names, r)) for r in conn.execute(query, (pair, args.since * 1000))]
-        recorded = recorded[::args.step][-args.limit:] if args.limit else recorded[::args.step]
-        started = time.time()
-        for rec in recorded:
-            t = rec["ts"] // 1000
-            if t not in replay.index or replay.index[t] + 1 < HISTORY:
-                counts["no_service_window"] += 1
-                continue
-            frame, shape_equal = await replay.decide(t)
-            counts["rows"] += 1
-            counts["frame_equal_native"] += shape_equal
-            last = frame.iloc[-1]
-            bar_ok = bool(frame["timestamp"].iloc[-1] == t and all(
-                close_enough(rec[key], last[key]) for key in ("open", "high", "low", "close", "volume")))
-            counts["bar_equal_recorded"] += bool(bar_ok)
-            values, observation = replay.computed(t)
-            bad = []
-            for key in NUMERIC:
-                tolerance = {"absolute": RSI_ABS_TOL, "relative": 0.0} if key == "rsi" else {}
-                if not close_enough(rec[key], values.get(key), **tolerance):
-                    bad.append(key)
-            counts["indicators_equal"] += not bad
-            decision_bad = [key for key in DECISION_NUMERIC if rec[key] is not None and not close_enough(
-                rec[key], observation.get(key))]
-            decision_bad += [key for key in DECISION_TEXT if rec[key] is not None and rec[key] != observation.get(key)]
-            if rec["signal"] is not None and observation.get("signal") is not None \
-                    and float(rec["signal"]) != float(observation["signal"]):
-                decision_bad.append("signal")
-            counts["decision_rows"] += 1
-            counts["decisions_equal"] += not decision_bad
-            for key in bad + decision_bad:
-                counts["differs_" + key] += 1
-            if (not shape_equal or not bar_ok or bad or decision_bad) and len(examples) < 5:
-                examples.append({"open_time": t, "shape_equal": shape_equal, "bar_ok": bar_ok,
-                                 "indicator_diff": bad, "decision_diff": decision_bad})
-        report[pair] = {**{k: int(v) for k, v in counts.items()}, "seconds": round(time.time() - started, 1), "examples": examples}
-        enforced = counts["rows"] and not (counts["rows"] == counts["frame_equal_native"] == counts["bar_equal_recorded"]
-                                           == counts["indicators_equal"])
-        failed = failed or bool(enforced)
+        recorded = load_recorded(conn, pair, args.since)
+        if not recorded:
+            report[pair] = {"error": "no recorded rows since --since"}
+            failed = True
+            continue
+        counts, examples, started = Counter(), [], time.time()
+        await projection_check(pair, args, cache_rows, recorded, counts, examples)
+        await decision_check(pair, args, cache_rows, recorded, counts, examples)
+        report[pair] = {**{k: int(v) for k, v in counts.items()}, "seconds": round(time.time() - started, 1),
+                        "examples": examples}
+        enforced = (counts["projection_rows"] == counts["projection_indicators_equal"]
+                    and counts["projection_frame_equal_native"] == 1
+                    and counts["decision_rows"] == counts["decision_frame_equal_native"]
+                    == counts["decision_bar_equal_recorded"] == counts["decision_indicators_equal"]
+                    and counts["projection_rows"] > 0 and counts["decision_rows"] > 0)
+        failed = failed or not enforced
     print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if failed else 0
 
@@ -219,9 +282,10 @@ def main():
     parser.add_argument("--cache-dir", required=True)
     parser.add_argument("--conf-dir", required=True)
     parser.add_argument("--pairs", nargs="+", default=["BNB-USDC", "BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC"])
-    parser.add_argument("--since", type=int, required=True, help="first candle open time (epoch s) to replay")
-    parser.add_argument("--step", type=int, default=1, help="replay every Nth recorded row")
-    parser.add_argument("--limit", type=int, default=0, help="replay at most the last N sampled rows per pair")
+    parser.add_argument("--since", type=int, required=True, help="first candle open time (epoch s) to compare")
+    parser.add_argument("--fresh-minutes", type=int, default=120,
+                        help="replay decision-time evaluations only for recorded rows this young (see the module note)")
+    parser.add_argument("--step", type=int, default=1, help="replay every Nth fresh row")
     sys.exit(asyncio.run(run(parser.parse_args())))
 
 

@@ -289,6 +289,29 @@ class TestUnavailableAndReconnect(ServiceFeedCase):
         self.assertIn("service candle client unavailable", feed.unavailable_reason)
         self.assertIsNotNone(hub.error)
 
+    async def test_supervisor_survives_an_unexpected_rebuild_failure(self):
+        reset_service_candles()
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("unexpected")
+            return FakeClient(*args, **kwargs)
+        hub = configure_service_candles(policy(), history=HISTORY, clock=lambda: self.now[0], client_factory=flaky,
+                                        coalesce_seconds=0)
+        first = OKXServiceCandles(PAIR, "1m", 50)
+        first.start()
+        self.addCleanup(first.stop)
+        await self.settle()
+        self.assertIn("RuntimeError: unexpected", first.unavailable_reason)
+        second = OKXServiceCandles("BTC-USDC", "1m", 50)
+        second.start()
+        self.addCleanup(second.stop)
+        await self.settle()
+        self.assertIsNone(hub.error)
+        self.assertEqual(sorted(hub.client.by_pair), [PAIR, "BTC-USDC"])
+
     async def test_status_reports_the_shared_stream(self):
         feed = await self.feed()
         await self.serve(feed)
@@ -435,6 +458,12 @@ class TestBounds(unittest.TestCase):
                                              token_file="/run/candles/token")):
             with self.assertRaises(PolicyError):
                 ServiceCandleHub(bad)
+
+    def test_enabling_is_logged_once(self):
+        with self.assertLogs(ServiceCandleHub.logger(), level="INFO") as logs:
+            configure_service_candles(policy(), history=HISTORY)
+            configure_service_candles(policy(), history=HISTORY)
+        self.assertEqual(sum("Service candles enabled" in record.getMessage() for record in logs.records), 1)
 
     def test_one_process_one_stream_configuration(self):
         hub = configure_service_candles(policy(), history=HISTORY)

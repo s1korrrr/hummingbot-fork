@@ -33,6 +33,25 @@ class ReplayHarnessGuards(unittest.TestCase):
         self.assertTrue(replay.close_enough(None, None))
         self.assertFalse(replay.close_enough(None, 1.0))
 
+    def test_indicator_comparison_names_the_differing_columns(self):
+        recorded = {key: 1.0 for key in replay.NUMERIC}
+        replayed = dict(recorded)
+        self.assertEqual(replay.indicator_differences(recorded, replayed), [])
+        replayed["atr"] = 1.0 + 1e-6
+        replayed["rsi"] = 1.0 + 5e-7
+        self.assertEqual(replay.indicator_differences(recorded, replayed), ["atr"])
+        replayed["rsi"] = 1.0 + 5e-3
+        self.assertEqual(replay.indicator_differences(recorded, replayed), ["rsi", "atr"])
+        self.assertEqual(replay.indicator_differences(recorded, {}), list(replay.NUMERIC))
+
+    def test_bar_comparison_requires_the_same_open_time_and_prices(self):
+        import pandas as pd
+        frame = pd.DataFrame([dict(timestamp=60.0, open=1.0, high=2.0, low=0.5, close=1.5, volume=3.0)])
+        rec = dict(open=1.0, high=2.0, low=0.5, close=1.5, volume=3.0)
+        self.assertTrue(replay.bar_matches(rec, frame, 60))
+        self.assertFalse(replay.bar_matches(rec, frame, 120))
+        self.assertFalse(replay.bar_matches({**rec, "close": 1.51}, frame, 60))
+
     def test_okx_array_matches_the_exchange_shape(self):
         row = dict(open_time=1790933520, open="775.1", high="775.1", low="775.1", close="775.1", volume="0",
                    quote_volume="0", confirmed=True)

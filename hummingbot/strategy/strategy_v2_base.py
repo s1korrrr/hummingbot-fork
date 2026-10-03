@@ -1361,10 +1361,31 @@ class StrategyV2Base(StrategyPyBase):
         Initialize the controllers based on the provided configuration.
         """
         controllers_configs = self.config.load_controller_configs()
+        self._validate_direct_ok_rsi_candle_policy(controllers_configs)
         for controller_config in controllers_configs:
             self.add_controller(controller_config)
             self._controller_configs_pending_persistence.append(controller_config)
         self._persist_controller_configs_if_safe()
+
+    def _validate_direct_ok_rsi_candle_policy(self, controllers_configs, *, compare_running=False):
+        """Preflight the process-wide OKX feed route before creating any direct OK RSI feed."""
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+        from hummingbot.strategy_v2.components.candle_transport import validate_origin
+
+        def source(config):
+            if config.data is None:
+                return None
+            return validate_origin(config.data.origin), config.data.token_file
+
+        direct = [config for config in controllers_configs if type(config) is OKRSIControllerConfig]
+        sources = {source(config) for config in direct}
+        if len(sources) > 1:
+            raise ValueError("direct OK RSI candle policy must be uniform across controllers")
+        if compare_running and direct:
+            running = [controller.config for controller in self.controllers.values()
+                       if type(getattr(controller, "config", None)) is OKRSIControllerConfig]
+            if running and any(source(config) not in sources for config in running):
+                raise ValueError("direct OK RSI candle policy change requires a restart")
 
     def _persist_controller_configs_if_safe(self):
         """Persist controller rows only after startup ownership transfer is safe."""
@@ -1443,6 +1464,7 @@ class StrategyV2Base(StrategyPyBase):
             self._last_config_update_ts = self.current_timestamp
             try:
                 controllers_configs = self.config.load_controller_configs(reload_changed_modules=True)
+                self._validate_direct_ok_rsi_candle_policy(controllers_configs, compare_running=True)
                 for controller_config in controllers_configs:
                     if controller_config.id in self._controller_restart_required:
                         continue

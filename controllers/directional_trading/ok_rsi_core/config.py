@@ -50,7 +50,8 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     legacy_controller_ids: List[str] = hl_rsi.Field(default_factory=list)
     durable_candle_watermark_enabled: bool = hl_rsi.Field(default=False)
     # Opt-in: read confirmed 1m candles from the shared candle service (same keys as V2's `data`). Omitted, the native
-    # OKX feed is used unchanged. `candles_connector` stays the `okx` identity namespace either way.
+    # OKX feed is used. All direct OK RSI controllers in one strategy must choose the same source because the OKX feed
+    # route is process-wide. `candles_connector` stays the `okx` identity namespace either way.
     data: Optional[DataPolicy] = hl_rsi.Field(default=None, json_schema_extra={"is_updatable": False})
     episode_enabled: bool = hl_rsi.Field(default=False)
     episode_adaptive_entry_pricing: bool = False

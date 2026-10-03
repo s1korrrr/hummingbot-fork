@@ -145,21 +145,24 @@ Contract and primary references: [entry-risk enrollment](../strategy_v2/entry-ri
 [SQLite transaction semantics](https://www.sqlite.org/lang_transaction.html),
 and [OKX V5 spot quantity/fee contracts](https://app.okx.com/docs-v5/en/).
 
-## Addendum (2026-10-03 16:00 UTC): terminal planned suspensions
+## Addendum (2026-10-03 16:00 UTC): terminal planned suspensions (superseded)
 
-The V3 live cutover on this branch exposed one more restore gap: a planned
-suspension of a previously restored executor is checkpointed `TERMINATED`
-with no close type and the `restart_suspended` marker, because the generic
-`RunnableBase.stop()` during shutdown flips the status after the marker is
-written. `continuity_plan` ignored such rows. Commit `cc0daba46` adds
-`is_terminal_suspended`, rebuilds a marker row whose remaining amount matches
-its checkpoint exactly like a RUNNING suspended row, refuses a marker/
-checkpoint mismatch, and keeps the explicit planned-resume manifest path in
-charge when one owns terminal rows on that boot. Three regressions in
-`test_restart_continuity.py`; in-image runs: 167 passed/1 skipped (restart
-continuity, planned resume, recovery inventory) and 375 passed (Meridian and
-recovery selection). Live: V3's BNB executor was restored exactly at both
-restarts. V1's BNB row has the same shape and would also be rebuilt by this
-rule; its evidence-bound path remains available and still owns rows named by a
-prepared manifest. Root record: rsibot
+The V3 live cutover exposed a restore gap: an older planned suspension of a
+previously restored executor had been checkpointed `TERMINATED` with no close
+type and a `restart_suspended` marker. Commit `cc0daba46` temporarily admitted
+marker-only terminal restoration. Its historical in-image checks passed 167
+tests/1 skipped (restart continuity, planned resume, recovery inventory) and
+375 tests (Meridian and recovery selection); V3's BNB executor was restored at
+both restarts under that deployed version. Root record: rsibot
 `docs/reports/2026-10-03-v3-entry-recovery-cutover.md`.
+
+The marker-only terminal restoration described above was superseded by the
+subsequent lifecycle and ownership correction. The current restart path keeps
+new planned suspensions RUNNING while their control loops stop. An older
+TERMINATED row without a close type remains an unresolved ownership obligation;
+its `restart_suspended` marker alone cannot authorize restoration. V1's older
+BNB row therefore requires the sealed planned-position manifest, exact original
+preflight and stopped-state receipts, native order/fill and peer-continuity proof,
+and a successful claim before the executor can resume. A failure leaves entries
+fenced for reviewed forward repair. The V3 restoration reported above describes
+that historical deployment, not a standing authorization for marker-only replay.

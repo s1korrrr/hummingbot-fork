@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 import pandas as pd
 
 import hummingbot.strategy.strategy_v2_base as strategy_v2_base_module
+from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
@@ -22,6 +23,7 @@ from hummingbot.core.data_type.common import PositionAction, PositionMode, Trade
 from hummingbot.core.event.events import OrderType
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.components.data_reader import DataPolicy
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
@@ -148,6 +150,69 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         recorder.store_controller_config.assert_called_once_with(controller_config)
         self.assertEqual(events, ['claim', 'store'])
         self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    @staticmethod
+    def _direct_ok_rsi_config(controller_id: str, *, origin: str = None):
+        data = (DataPolicy(mode="shared", transport="stream", origin=origin,
+                           token_file="/tmp/test-candle-token") if origin else None)
+        return OKRSIControllerConfig(id=controller_id, data=data)
+
+    def test_mixed_direct_ok_rsi_candle_policies_fail_before_controller_creation(self):
+        configs = [self._direct_ok_rsi_config("service", origin="http://127.0.0.1:8100"),
+                   self._direct_ok_rsi_config("native")]
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                patch.object(self.strategy, "add_controller") as add_controller:
+            with self.assertRaisesRegex(ValueError, "direct OK RSI candle policy"):
+                self.strategy.initialize_controllers()
+        add_controller.assert_not_called()
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    def test_conflicting_direct_ok_rsi_service_sources_fail_before_controller_creation(self):
+        configs = [self._direct_ok_rsi_config("first", origin="http://127.0.0.1:8100"),
+                   self._direct_ok_rsi_config("second", origin="http://127.0.0.1:8101")]
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                patch.object(self.strategy, "add_controller") as add_controller:
+            with self.assertRaisesRegex(ValueError, "direct OK RSI candle policy"):
+                self.strategy.initialize_controllers()
+        add_controller.assert_not_called()
+
+    def test_uniform_direct_ok_rsi_candle_policies_allow_controller_creation(self):
+        for origin in (None, "http://127.0.0.1:8100"):
+            with self.subTest(origin=origin):
+                configs = [self._direct_ok_rsi_config("first", origin=origin),
+                           self._direct_ok_rsi_config("second", origin=origin)]
+                with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                        patch.object(self.strategy, "add_controller") as add_controller, \
+                        patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+                    self.strategy.initialize_controllers()
+                self.assertEqual(add_controller.call_count, 2)
+
+    def test_direct_ok_rsi_policy_guard_does_not_restrict_subclass_composition(self):
+        class CompositionConfig(OKRSIControllerConfig):
+            pass
+
+        configs = [self._direct_ok_rsi_config("direct"),
+                   CompositionConfig(id="composed", data=DataPolicy(
+                       mode="shared", transport="stream", origin="http://127.0.0.1:8100",
+                       token_file="/tmp/test-candle-token"))]
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                patch.object(self.strategy, "add_controller") as add_controller, \
+                patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+            self.strategy.initialize_controllers()
+        self.assertEqual(add_controller.call_count, 2)
+
+    def test_direct_ok_rsi_candle_policy_reload_does_not_change_existing_source(self):
+        native = self._direct_ok_rsi_config("direct")
+        self.strategy.controllers = {"direct": MagicMock(config=native)}
+        self.strategy.config_update_interval = 0
+        service = self._direct_ok_rsi_config("direct", origin="http://127.0.0.1:8100")
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=[service]), \
+                patch.object(type(self.strategy), "current_timestamp", new_callable=PropertyMock, return_value=100), \
+                patch.object(self.strategy, "add_controller") as add_controller:
+            self.strategy.update_controllers_configs()
+        add_controller.assert_not_called()
+        self.strategy.controllers["direct"].update_config.assert_not_called()
+        self.assertIn("direct OK RSI candle policy", self.strategy._last_controller_reload_error)
 
     def test_controller_config_persistence_is_immediate_without_pending_resume(self):
         controller_config = MagicMock(id='controller-1')

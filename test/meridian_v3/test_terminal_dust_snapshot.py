@@ -1,4 +1,5 @@
 """Terminal native dust remains owned inventory in the unified portfolio snapshot."""
+import copy
 from decimal import Decimal as D
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -124,6 +125,66 @@ def test_two_completed_sublot_residuals_remain_owned_when_sum_exceeds_one_lot():
     assert asset.basis_quote == asset.quantity * D(85000)
     assert result.attributed_nav_quote == D(500) + asset.quantity * asset.mark
     assert asset.sellable_quantity == 0
+
+
+def test_current_same_id_overlay_cannot_erase_persisted_sublot_dust():
+    portfolio, rows, fills, _ = snapshot_case()
+    del rows[1:]
+    del fills[2:]
+    persisted = rows[0]
+    current = copy.deepcopy(persisted)
+    current.custom_info['execution_receipt']['residual_dust_base'] = '0'
+    portfolio.owner.executors_info = [current]
+    portfolio.recorder.return_value.get_all_executors = lambda: [persisted]
+    portfolio._tick = None
+    portfolio.evidence = MeridianPortfolio.evidence.__get__(portfolio, MeridianPortfolio)
+    with pytest.raises(PolicyError, match='terminal dust'):
+        take_snapshot(portfolio)
+
+
+def test_matching_current_terminal_proof_preserves_recorded_dust():
+    portfolio, rows, _, _ = snapshot_case()
+    portfolio.owner.executors_info = copy.deepcopy(rows)
+    portfolio.recorder.return_value.get_all_executors = lambda: rows
+    portfolio._tick = None
+    portfolio.evidence = MeridianPortfolio.evidence.__get__(portfolio, MeridianPortfolio)
+    result = take_snapshot(portfolio)
+    assert result.reconciled
+    assert result.assets[0].quantity == D('0.000000011454')
+
+
+def test_matching_current_numeric_projection_can_differ_in_decimal_scale():
+    portfolio, rows, _, _ = snapshot_case()
+    current = copy.deepcopy(rows)
+    current[0].close_timestamp = 1000.0
+    current[0].custom_info['execution_receipt']['entry_gross_quote'] = '51.0000'
+    portfolio.owner.executors_info = current
+    portfolio.recorder.return_value.get_all_executors = lambda: rows
+    portfolio._tick = None
+    portfolio.evidence = MeridianPortfolio.evidence.__get__(portfolio, MeridianPortfolio)
+    assert take_snapshot(portfolio).reconciled
+
+
+def test_current_same_id_overlay_cannot_change_native_ownership():
+    portfolio, rows, _, _ = snapshot_case()
+    current = copy.deepcopy(rows)
+    current[0].config.trading_pair = 'ETH-USDC'
+    portfolio.owner.executors_info = current
+    portfolio.recorder.return_value.get_all_executors = lambda: rows
+    portfolio._tick = None
+    portfolio.evidence = MeridianPortfolio.evidence.__get__(portfolio, MeridianPortfolio)
+    with pytest.raises(PolicyError, match='terminal dust proof'):
+        take_snapshot(portfolio)
+
+
+def test_duplicate_current_executor_identity_cannot_overwrite_native_proof():
+    portfolio, rows, _, _ = snapshot_case()
+    portfolio.owner.executors_info = [copy.deepcopy(rows[0]), copy.deepcopy(rows[0])]
+    portfolio.recorder.return_value.get_all_executors = lambda: rows
+    portfolio._tick = None
+    portfolio.evidence = MeridianPortfolio.evidence.__get__(portfolio, MeridianPortfolio)
+    with pytest.raises(PolicyError, match='duplicate'):
+        take_snapshot(portfolio)
 
 
 def test_completed_zero_fill_cancelled_reprice_does_not_hide_proven_terminal_dust():

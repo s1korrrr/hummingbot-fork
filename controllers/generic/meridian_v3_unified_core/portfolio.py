@@ -112,8 +112,66 @@ class MeridianPortfolio:
         """Every recorded executor of this recorder, with current active state preferred."""
         if self._tick is not None:
             return self._tick[0]
-        rows = {info.id: info for info in self.recorder().get_all_executors()}
-        rows.update({info.id: info for info in self.owner.executors_info})
+        rows = {}
+        for info in self.recorder().get_all_executors():
+            if not isinstance(info.id, str) or not info.id or info.id in rows:
+                raise PolicyError('duplicate or missing recorded executor identity')
+            rows[info.id] = info
+        current_ids = set()
+        for info in self.owner.executors_info:
+            if not isinstance(info.id, str) or not info.id or info.id in current_ids:
+                raise PolicyError('duplicate or missing current executor identity')
+            current_ids.add(info.id)
+            recorded = rows.get(info.id)
+            if recorded is not None:
+                recorded_custom = recorded.custom_info or {}
+                recorded_receipt = recorded_custom.get('execution_receipt') or {}
+                recorded_dust = decimal(recorded_receipt.get('residual_dust_base', '0'), 'recorded terminal dust')
+                if recorded_dust > 0:
+                    current_custom = info.custom_info or {}
+                    current_receipt = current_custom.get('execution_receipt') or {}
+                    current_dust = decimal(current_receipt.get('residual_dust_base', '0'), 'current terminal dust')
+                    if current_dust != recorded_dust:
+                        raise PolicyError('current executor erased recorded terminal dust')
+
+                    def terminal_proof(row, custom):
+                        config = getattr(row, 'config', None)
+                        if config is None or getattr(config, 'side', None) is None:
+                            raise PolicyError('terminal dust configuration unavailable')
+                        receipt = custom.get('execution_receipt')
+                        if not isinstance(receipt, dict):
+                            raise PolicyError('terminal dust receipt unavailable')
+                        receipt = dict(receipt)
+                        for field in ('residual_dust_base', 'remaining_owned_base', 'entry_gross_base',
+                                      'entry_gross_quote', 'exit_gross_base', 'exit_gross_quote'):
+                            receipt[field] = decimal(receipt.get(field), f'terminal dust {field}').normalize()
+                        close_quantity = custom.get('close_quantity')
+                        if not isinstance(close_quantity, dict):
+                            raise PolicyError('terminal dust lot unavailable')
+                        close_quantity = dict(close_quantity)
+                        close_quantity['quantity_increment'] = decimal(
+                            close_quantity.get('quantity_increment'), 'terminal dust lot', positive=True).normalize()
+                        return digest({
+                            'controller_id': row.controller_id,
+                            'config_controller_id': config.controller_id,
+                            'connector_name': config.connector_name,
+                            'trading_pair': config.trading_pair,
+                            'side': config.side.name,
+                            'level_id': config.level_id,
+                            'close_type': None if row.close_type is None else row.close_type.value,
+                            'close_timestamp': decimal(row.close_timestamp, 'terminal dust close time',
+                                                       positive=True).normalize(),
+                            'is_done': row.is_done,
+                            'is_active': row.is_active,
+                            'receipt': receipt,
+                            'order_ids': custom.get('order_ids'),
+                            'orders': custom.get('execution_order_snapshots'),
+                            'lot': close_quantity,
+                            'entry_state': (custom.get('entry_lifecycle') or {}).get('state'),
+                        })
+                    if terminal_proof(recorded, recorded_custom) != terminal_proof(info, current_custom):
+                        raise PolicyError('current executor changed recorded terminal dust proof')
+            rows[info.id] = info
         return tuple(rows.values())
 
     def begin_tick(self):

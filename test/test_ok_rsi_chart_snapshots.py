@@ -89,6 +89,7 @@ def test_tick_continues_executor_decisions_when_chart_persistence_fails():
     owner = SimpleNamespace(
         controllers={'a': object()}, update_executors_info=Mock(),
         _unattended_restart_hold=False,
+        _persist_controller_configs_if_safe=Mock(),
         _sync_runtime_state_to_db_if_due=Mock(), _write_chart_snapshots_if_due=Mock(side_effect=RuntimeError('disk full')),
         _write_runtime_status_snapshot_if_due=Mock(), update_controllers_configs=Mock(),
         market_data_provider=SimpleNamespace(ready=True), _is_stop_triggered=False,

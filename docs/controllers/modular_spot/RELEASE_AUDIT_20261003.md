@@ -62,3 +62,22 @@ introduced.
 The source contract follows [OKX API v5](https://www.okx.com/docs-v5/en/) actual
 fee currency and sign, as normalized by this fork's OKX connector, and the native
 `ExecutorOrchestrator._trade_fill_order_record` / `PositionHold` accounting.
+
+## Native candle ownership follow-up — 3 October 2026
+
+The frozen 67-file V2 modular source closure has a later, separately identified
+change: its digest advances from
+`9803842ea19120739feeb0c367c6999f5d19f2a1514cde41653dad5d66fc7885` to
+`05dd2199882fcf1662dde6b774e7613e437c292586ffdf34fe0b28f798db011a`. A
+comparison of the exact source-file list shows that only
+`modular_spot_core/native_composition.py` changed inside the closure. The
+additional OK RSI config validation change in `directional_trading/ok_rsi_core/config.py`
+is outside this 67-file closure and remains governed by its own controller
+source identity.
+
+The composition now reports that it does not own the direct OK RSI candle
+service route; its native candle provider remains the source for shared
+composition data. The 67 paths and their inclusion rules are unchanged. This
+updates the current closure golden only; prior manifests, release identities,
+and historical bindings retain their recorded digests. The native image's
+source identity remains a separate deployment and recovery gate.

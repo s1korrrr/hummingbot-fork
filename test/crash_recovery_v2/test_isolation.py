@@ -17,11 +17,12 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     from hummingbot.strategy_v2.components.recipe_contract import source_records
     rows = source_records(source_root(), source_files())
     assert not any(name.endswith(('market_stress_v1.py', 'recovery_evidence_v1.py', 'terminal_dust.py')) for name, _ in rows)
-    # The intentional signed-fee parsing and valuation correction is recorded in
+    # The signed-fee and native candle-ownership changes are recorded in
     # docs/controllers/modular_spot/RELEASE_AUDIT_20261003.md. The independently
-    # compared 67-file closure changes only native_funding.py; crash and V3-only
-    # dust modules must remain outside it. Historical bindings are not rewritten.
-    assert source_digest(source_root(), source_files()) == '9803842ea19120739feeb0c367c6999f5d19f2a1514cde41653dad5d66fc7885'  # noqa: documentation
+    # compared 67-file closure changes only native_composition.py in the latest
+    # source update; crash and V3-only dust modules remain outside it. Historical
+    # bindings are not rewritten.
+    assert source_digest(source_root(), source_files()) == '05dd2199882fcf1662dde6b774e7613e437c292586ffdf34fe0b28f798db011a'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

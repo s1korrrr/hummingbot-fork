@@ -59,11 +59,11 @@ These run inside the sanitized compiled environment with `PYTHONPATH=/home/hummi
 python -m pytest test/test_hl_rsi_entry_control.py test/meridian_v3 test/test_ok_rsi_admission_safety.py test/test_ok_rsi_dust_inventory.py test/test_ok_rsi_entry_boundary_regressions.py test/hummingbot/strategy_v2/executors/test_order_accounting.py -q -rs --tb=short -p no:cacheprovider
 python -m pytest test/hummingbot/connector/exchange/paper_trade/test_terminal_dust_roundtrip.py -q --tb=short --log-cli-level=INFO -p no:cacheprovider
 python -m pytest test/test_ok_rsi_candle_aggregation.py -q -p no:cacheprovider
-pre-commit run --files <intentional changed paths>
+git diff --name-only --diff-filter=ACMR -z 479b2d34b214573f82cb51623b99201f56c19469 HEAD | xargs -0 pre-commit run --files
 git diff --check 479b2d34b214573f82cb51623b99201f56c19469
 ```
 
-Exact Docker argv, image IDs, UTC start/end, exit codes, workflow targets, baseline failures, coverage configuration/XML, source manifests and private replay arithmetic are retained locally under `~/.local/share/rsibot/validation/capital-audit-20261003T085300Z`. Only the sanitized report and command manifest are committed. Expected adversarial/fault-injection logs are distinct from successful paper startup/lifecycle logs. The accounting run's inherited coverage configuration emitted an include-ignored harness warning; the separate scoped run fixes coverage measurement without suppressing application errors. Initial no-exec Arrow and coverage pre-import harness failures are preserved; neither is counted as a successful application check.
+Exact Docker argv, image IDs, UTC start/end, exit codes, workflow targets, baseline failures, coverage configuration/XML, source manifests and private replay arithmetic are retained locally under `~/.local/share/rsibot/validation/capital-audit-20261003T085300Z`. The sanitized report, command manifest and archived task plan are committed; private replay artifacts remain local. Expected adversarial/fault-injection logs are distinct from successful paper startup/lifecycle logs. The accounting run's inherited coverage configuration emitted an include-ignored harness warning; the separate scoped run fixes coverage measurement without suppressing application errors. Initial no-exec Arrow and coverage pre-import harness failures are preserved; neither is counted as a successful application check.
 
 ## Production observation — 10:53 UTC
 

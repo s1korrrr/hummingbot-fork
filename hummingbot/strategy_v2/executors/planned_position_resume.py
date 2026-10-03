@@ -534,7 +534,8 @@ def validate_v1_terminal_inventory_population(connection, selected_terminal_ids,
             require(row['status'] == 4 and row['close_type'] == 10
                     and abs(held_by_executor[row['id']] - remaining) < Decimal('0.000001'),
                     'V1 positive terminal inventory lacks complete held-ledger ownership')
-    require(candidates == selected_terminal_ids,
+    require(candidates - continuity_executor_ids == selected_terminal_ids
+            and candidates <= selected_terminal_ids | continuity_executor_ids,
             'V1 planned-suspended terminal inventory is not the exact singleton selection')
 
 
@@ -694,8 +695,12 @@ def validate_nonselected_suspended_continuity(preflight, stopped):
             and preflight.get('type') == stopped.get('type') == 'position_executor'
             and preflight.get('config') == stopped.get('config'),
             'nonselected continuity executor identity/configuration changed')
-    require(preflight.get('status') == stopped.get('status') == 2
-            and preflight.get('is_active') in (True, 1) and stopped.get('is_active') in (True, 1)
+    terminalized = (stopped.get('status') == 4 and stopped.get('is_active') in (False, 0)
+                    and stopped.get('is_trading') in (False, 0))
+    require(preflight.get('status') == 2 and stopped.get('status') in (2, 4)
+            and preflight.get('is_active') in (True, 1)
+            and (terminalized or stopped.get('is_active') in (True, 1))
+            and (not terminalized or preflight.get('is_trading') in (True, 1))
             and preflight.get('close_type') is None and stopped.get('close_type') is None
             and preflight.get('close_timestamp') is None and stopped.get('close_timestamp') is None,
             'nonselected continuity executor is not RUNNING and restart-suspended')
@@ -715,6 +720,9 @@ def validate_nonselected_suspended_continuity(preflight, stopped):
     before_outer, after_outer = dict(preflight), dict(stopped)
     before_outer.pop('custom_info', None)
     after_outer.pop('custom_info', None)
+    if terminalized:
+        for key in ('status', 'is_active', 'is_trading'):
+            after_outer[key] = before_outer[key]
     require(before_outer == after_outer,
             'nonselected continuity executor lifecycle or accounting fields changed')
     try:
@@ -732,7 +740,7 @@ def validate_nonselected_suspended_continuity(preflight, stopped):
     require(stopped.get('controller_id') == 'ok-rsi-sol' and config.controller_id == 'ok-rsi-sol'
             and config.connector_name == 'okx' and config.trading_pair == 'SOL-USDC',
             'nonselected continuity is restricted to the identified V1 SOL owner')
-    info = SimpleNamespace(id=stopped['id'], type=stopped['type'], status=stopped['status'],
+    info = SimpleNamespace(id=stopped['id'], type=stopped['type'], status=2,
                            close_type=stopped['close_type'], controller_id=stopped['controller_id'],
                            config=config, custom_info={**after_custom, 'restart_suspended': after_marker})
     try:
@@ -1772,7 +1780,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
     with connect(preflight_path) as preflight, connect(db_path) as stopped:
         unfinished_ids = {row[0] for row in stopped.execute('SELECT id FROM Executors WHERE status != 4')}
         if terminal_suspended_executor_ids:
-            require(unfinished_ids == continuity_executor_ids,
+            require(unfinished_ids <= continuity_executor_ids,
                     'unfinished executor set differs from explicit nonselected continuity selection')
             for executor_id in sorted(continuity_executor_ids):
                 before = preflight.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
@@ -1796,7 +1804,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
         connection.execute('BEGIN IMMEDIATE')
         unfinished_ids = {row[0] for row in connection.execute('SELECT id FROM Executors WHERE status != 4')}
         if terminal_suspended_executor_ids:
-            require(unfinished_ids == continuity_executor_ids,
+            require(unfinished_ids <= continuity_executor_ids,
                     'unfinished executor set differs from explicit nonselected continuity selection')
         else:
             require(not unfinished_ids and not continuity_executor_ids,
@@ -1956,6 +1964,16 @@ def claim(db_path, manifest, now=None, root=ROOT):
                 custom['planned_position_resume_compatibility_v1'] = marker
             connection.execute('UPDATE Executors SET status=2, is_active=1, close_type=NULL, close_timestamp=NULL, '
                                'custom_info=? WHERE id=?', (canonical(custom), position['executor_id']))
+        for continuation in manifest.get('continuity_rows', []):
+            current = connection.execute('SELECT status FROM Executors WHERE id=?',
+                                         (continuation['executor_id'],)).fetchone()
+            if current is not None and current['status'] == 4:
+                changed = connection.execute(
+                    'UPDATE Executors SET status=2, is_active=1, is_trading=1 '
+                    'WHERE id=? AND status=4 AND is_active=0 AND is_trading=0 '
+                    'AND close_type IS NULL AND close_timestamp IS NULL',
+                    (continuation['executor_id'],)).rowcount
+                require(changed == 1, 'sealed nonselected terminal continuation changed during claim')
         connection.execute(f'UPDATE {TABLE} SET state=\'claimed\', claimed_at=? WHERE id=?', (now, manifest['id']))
 
 

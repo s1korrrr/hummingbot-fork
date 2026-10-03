@@ -30,7 +30,7 @@ from hummingbot.strategy_v2.executors.restart_continuity import (
     RestartContinuityError,
     continuity_plan,
     is_continuity_candidate,
-    is_terminal_suspended,
+    is_terminal_unresolved,
 )
 
 if TYPE_CHECKING:
@@ -336,7 +336,7 @@ class ExecutorOrchestrator:
         for executor in db_executors:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
-                if not executor.is_done:
+                if not executor.is_done or is_terminal_unresolved(executor):
                     self._record_unfinished_claim(controller_id, executor.id, executor.config,
                                                   (executor.custom_info or {}).get('planned_position_resume'))
                     self.recovery_required.setdefault(controller_id, []).append(executor.id)
@@ -358,12 +358,10 @@ class ExecutorOrchestrator:
                     self._non_hold_order_ids.update(self._owned_order_keys(executor))
                     resumed.add(executor.id)
                     continue
-            # A planned suspension flipped to TERMINATED by the shutdown stop is still unfinished,
-            # unless an explicit planned-resume manifest owns terminal rows on this boot.
-            unfinished = not executor.is_done or (
-                self._restart_continuity and is_terminal_suspended(executor)
-                and not self._resume_preflight_failed and self._planned_resume_failure is None)
-            if unfinished and self._executor_restore is None and self._restart_continuity:
+            # A terminal suspension remains unresolved unless a sealed manifest claimed it.
+            terminal_unresolved = is_terminal_unresolved(executor)
+            unfinished = not executor.is_done or terminal_unresolved
+            if unfinished and not terminal_unresolved and self._executor_restore is None and self._restart_continuity:
                 restored = self._restore_continuity_executor(controller_id, executor)
                 if restored is not None:
                     keys = self._owned_order_keys(executor)
@@ -490,8 +488,9 @@ class ExecutorOrchestrator:
         infos = getter() if callable(getter) else None
         if not isinstance(infos, (list, tuple)):
             return False
-        return any((not info.is_done or is_terminal_suspended(info)) and info.controller_id in self.strategy.controllers
-                   and is_continuity_candidate(info) for info in infos)
+        return any(info.controller_id in self.strategy.controllers
+                   and (is_terminal_unresolved(info) or (not info.is_done and is_continuity_candidate(info)))
+                   for info in infos)
 
     def _continuity_executor_class(self, controller, config):
         # A controller whose tranches run a PositionExecutor subclass names it; otherwise a

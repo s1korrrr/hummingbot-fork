@@ -968,8 +968,14 @@ async def test_terminal_daily_risk_transition_archive_is_rechecked_before_startu
 
 
 @pytest.mark.asyncio
-async def test_terminal_singleton_claim_preserves_independent_suspended_sol_continuity(tmp_path):
+@pytest.mark.parametrize('sol_terminalized', [False, True])
+async def test_terminal_singleton_claim_preserves_independent_suspended_sol_continuity(tmp_path, sol_terminalized):
     db, preflight, root, recorder, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    if sol_terminalized:
+        with sqlite3.connect(db) as connection:
+            connection.execute('UPDATE Executors SET status=4, is_active=0, is_trading=0 WHERE id=?',
+                               (sol.config.id,))
+        evidence = refresh_stopped_evidence(db, evidence, 1000)
     assert evidence['reconciliation']['balance_coverage'][0]['owned_residual'] == '1.649'
     assert resume.inspect_fleet_owner_snapshot(
         next(row['database_snapshot_path'] for row in evidence['fleet_ownership']['owner_observations']
@@ -1020,7 +1026,10 @@ async def test_terminal_singleton_claim_preserves_independent_suspended_sol_cont
     assert start.call_count == 2
     with resume.connect(db) as connection:
         after_sol = connection.execute('SELECT * FROM Executors WHERE id=?', (sol.config.id,)).fetchone()
-        assert before_sol == dict(after_sol)
+        expected_sol = dict(before_sol)
+        if sol_terminalized:
+            expected_sol.update(status=2, is_active=1, is_trading=1)
+        assert expected_sol == dict(after_sol)
         assert connection.execute('SELECT amount FROM Position WHERE controller_id=? AND connector_name=? AND trading_pair=?',
                                   ('ok-rsi-bnb', 'okx', 'BNB-USDC')).fetchone()[0] == 200000
     assert {row.client_order_id for row in recorder.get_all_position_hold_ledger_entries()} == {'unrelated'}
@@ -1032,9 +1041,14 @@ async def test_terminal_singleton_claim_preserves_independent_suspended_sol_cont
     ('trailing', 'state, fills, orders, or trailing state changed'),
     ('config', 'identity/configuration changed'),
 ])
-async def test_terminal_mode_rejects_unproven_or_drifting_sol_continuity(tmp_path, mutation, message):
+@pytest.mark.parametrize('sol_terminalized', [False, True])
+async def test_terminal_mode_rejects_unproven_or_drifting_sol_continuity(
+        tmp_path, mutation, message, sol_terminalized):
     db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
     with sqlite3.connect(db) as connection:
+        if sol_terminalized:
+            connection.execute('UPDATE Executors SET status=4, is_active=0, is_trading=0 WHERE id=?',
+                               (sol.config.id,))
         if mutation == 'unmarked':
             custom = json.loads(connection.execute('SELECT custom_info FROM Executors WHERE id=?',
                                                    (sol.config.id,)).fetchone()[0])
@@ -1061,12 +1075,21 @@ async def test_terminal_mode_rejects_unproven_or_drifting_sol_continuity(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_terminal_mode_rejects_unlisted_running_executor_and_generic_mode_stays_strict(tmp_path):
+@pytest.mark.parametrize('sol_terminalized', [False, True])
+async def test_terminal_mode_rejects_unlisted_running_executor_and_generic_mode_stays_strict(
+        tmp_path, sol_terminalized):
     db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
-    with pytest.raises(ValueError, match='unfinished executor set differs from explicit'):
+    if sol_terminalized:
+        with sqlite3.connect(db) as connection:
+            connection.execute('UPDATE Executors SET status=4, is_active=0, is_trading=0 WHERE id=?',
+                               (sol.config.id,))
+        evidence = refresh_stopped_evidence(db, evidence, 1000)
+    with pytest.raises(ValueError, match=('explicit nonselected SOL executor reconciliation selection differs'
+                                          if sol_terminalized else 'unfinished executor set differs from explicit')):
         resume.prepare(db, preflight, evidence, now=1000, root=root,
                        terminal_suspended_executor_ids=(terminal.config.id,))
-    with pytest.raises(ValueError, match='database still has unfinished executors'):
+    with pytest.raises(ValueError, match=('explicit nonselected SOL executor reconciliation selection differs'
+                                          if sol_terminalized else 'database still has unfinished executors')):
         resume.prepare(db, preflight, evidence, now=1000, root=root)
 
 

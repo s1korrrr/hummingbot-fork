@@ -507,7 +507,22 @@ class PositionExecutor(ExecutorBase):
             for tracked in self._unique_orders([*self._entry_orders(), *self._exit_orders()]):
                 if tracked.order is not None:
                     tracked.order = InFlightOrder.from_json(tracked.order.to_json())
+        if self.is_restart_suspended and self.close_type is None and self.status == RunnableStatus.RUNNING:
+            self.terminated.set()
+            self.unregister_events()
+            return
         super().stop()
+
+    def _control_loop_finished(self, task):
+        if (task is self._control_loop_task and self.is_restart_suspended
+                and self.close_type is None and self.status == RunnableStatus.RUNNING):
+            if task.cancelled() or task.exception() is None:
+                self.terminated.set()
+                return
+            error = task.exception()
+            self.logger().error("Suspended executor control loop failed",
+                                exc_info=(type(error), error, error.__traceback__))
+        super()._control_loop_finished(task)
 
     @property
     def is_perpetual(self) -> bool:

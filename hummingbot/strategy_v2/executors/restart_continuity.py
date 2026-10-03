@@ -6,18 +6,17 @@ went away. The executor row is the durable record: a planned restart suspends
 the executor (row stays RUNNING, ``restart_suspended`` marker), a crash leaves
 the last checkpoint (trailing moves are checkpointed synchronously).
 
-At boot, every unfinished row with complete order snapshots is rebuilt into the
-original executor. Orders that were not terminal in the snapshot are handed back
-to the connector's order tracker so venue status/fill polling reconciles them;
-the executor then shares the tracker's live ``InFlightOrder`` object.
+At boot, unfinished RUNNING rows with complete order snapshots are rebuilt into
+the original executor. Orders that were not terminal in the snapshot are handed
+back to the connector's order tracker so venue status/fill polling reconciles
+them; the executor then shares the tracker's live ``InFlightOrder`` object.
 
 Rows that cannot be rebuilt are reported, never used to block order flow.
 
-A planned suspension writes its marker and checkpoint while the row is RUNNING;
-the generic executor ``stop()`` that follows during process shutdown can flip the
-status to TERMINATED before the final checkpoint. Such a row (TERMINATED, no close
-type, ``restart_suspended`` marker whose remaining amount matches the checkpoint)
-is still the suspended executor and is rebuilt exactly like a RUNNING one.
+A planned suspension keeps its durable row RUNNING while the control loop exits.
+An older row already flipped to TERMINATED without a close type remains an
+unresolved ownership obligation. It can resume only through the separately
+sealed planned-position manifest, not a marker-only continuity plan.
 """
 import copy
 from dataclasses import dataclass, field
@@ -112,12 +111,6 @@ def continuity_plan(info) -> Optional[ContinuityPlan]:
         return None
     status = _status(info.status)
     custom = dict(info.custom_info or {})
-    if is_terminal_suspended(info):
-        marker_remaining = custom[RESTART_SUSPEND_KEY].get("remaining_position_amount_base")
-        if (marker_remaining is None
-                or str(marker_remaining) != str(custom.get("remaining_position_amount_base"))):
-            raise RestartContinuityError("Terminal suspended row remaining amount differs from its marker")
-        status = RunnableStatus.RUNNING
     if status not in (RunnableStatus.RUNNING, RunnableStatus.SHUTTING_DOWN):
         return None
     snapshots = custom.get("execution_order_snapshots")
@@ -168,17 +161,15 @@ def continuity_plan(info) -> Optional[ContinuityPlan]:
     return plan
 
 
-def is_terminal_suspended(info) -> bool:
-    """A planned suspension whose row was flipped to TERMINATED (no close type) by the shutdown stop."""
+def is_terminal_unresolved(info) -> bool:
+    """A terminal position without a proven close remains unresolved, even if its marker is missing."""
     if info is None or getattr(info, "type", None) != "position_executor":
         return False
     try:
         status = _status(info.status)
     except (ValueError, TypeError):
         return False
-    custom = info.custom_info or {}
-    return (status == RunnableStatus.TERMINATED and _close_type(info.close_type) is None
-            and isinstance(custom, dict) and isinstance(custom.get(RESTART_SUSPEND_KEY), dict))
+    return status == RunnableStatus.TERMINATED and _close_type(info.close_type) is None
 
 
 def is_continuity_candidate(info) -> bool:

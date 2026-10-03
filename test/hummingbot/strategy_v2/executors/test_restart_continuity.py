@@ -115,6 +115,48 @@ def test_planned_suspend_keeps_row_running_with_exact_trailing(recorder):
     assert row.custom_info['trailing_move_count'] == 3
 
 
+def test_planned_suspend_control_loop_completion_keeps_durable_row_running(recorder):
+    executor = live_executor(trigger='.012', moves=3)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        executor.suspend_for_restart()
+        executor._advance_restart_suspend()
+        task = asyncio.get_event_loop().create_future()
+        task.set_result(None)
+        executor._control_loop_task = task
+        executor._control_loop_finished(task)
+        recorder.store_or_update_executor(executor)
+    assert executor.status == RunnableStatus.RUNNING
+    row = recorder.get_all_executors()[0]
+    assert row.status == RunnableStatus.RUNNING and row.is_active
+
+
+def test_planned_suspend_faulted_control_loop_does_not_preserve_running_row(recorder, caplog):
+    executor = live_executor(trigger='.012', moves=3)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        executor.suspend_for_restart()
+        executor._advance_restart_suspend()
+        task = asyncio.get_event_loop().create_future()
+        task.set_exception(RuntimeError('suspended control task failed'))
+        executor._control_loop_task = task
+        with caplog.at_level(logging.ERROR):
+            executor._control_loop_finished(task)
+        recorder.store_or_update_executor(executor)
+    assert executor.status == RunnableStatus.TERMINATED
+    assert recorder.get_all_executors()[0].status == RunnableStatus.TERMINATED
+    assert 'Suspended executor control loop failed' in caplog.text
+
+
+def test_planned_suspend_explicit_stop_keeps_durable_row_running(recorder):
+    executor = live_executor(trigger='.012', moves=3)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        executor.suspend_for_restart()
+        executor._advance_restart_suspend()
+        executor.stop()
+        recorder.store_or_update_executor(executor)
+    assert executor.status == RunnableStatus.RUNNING
+    assert recorder.get_all_executors()[0].status == RunnableStatus.RUNNING
+
+
 def test_suspend_waits_for_resting_entry_cancel_then_keeps_partial_fill(recorder):
     executor = live_executor(entry_fill='.4', entry_state=OrderState.PARTIALLY_FILLED)
     executor.cancel_open_order = MagicMock()
@@ -529,8 +571,8 @@ def test_sealed_restored_down_only_fill_keeps_executor_and_drawdown_hold_is_visi
     assert 'Entry acquisition stopped reason=position_hold' in caplog.text
 
 
-def test_terminal_suspended_row_restores_exactly(recorder):
-    """The shutdown stop() can flip a suspended row to TERMINATED before its final checkpoint."""
+def test_terminal_suspended_row_requires_evidence_bound_planned_resume(recorder):
+    """An old terminal marker alone cannot revive a position or bypass the recovery manifest."""
     executor = live_executor(trigger='.015', moves=5)
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
         executor.suspend_for_restart()
@@ -541,13 +583,10 @@ def test_terminal_suspended_row_restores_exactly(recorder):
     assert row.status == RunnableStatus.TERMINATED and row.close_type is None
     assert row.custom_info['restart_suspended']['reason'] == 'planned_restart'
     orchestrator, start = boot(recorder, booting_strategy())
-    again = restored(orchestrator)
-    assert again.config.id == executor.config.id
-    assert again.amount_to_close == D('1')
-    assert again._trailing_stop_trigger_pct == D('.015') and again._trailing_stop_move_count == 5
-    assert again._restart_restored['suspended'] is True
-    assert orchestrator.recovery_required == {}
-    start.assert_called_once()
+    assert continuity_plan(row) is None
+    assert orchestrator.active_executors.get('controller', []) == []
+    assert orchestrator.recovery_required == {'controller': [executor.config.id]}
+    start.assert_not_called()
 
 
 def test_terminal_suspended_row_with_marker_mismatch_is_reported_not_restored(recorder):
@@ -556,6 +595,20 @@ def test_terminal_suspended_row_with_marker_mismatch_is_reported_not_restored(re
         executor.suspend_for_restart()
         executor._advance_restart_suspend()
         executor._restart_suspended['remaining_position_amount_base'] = '0.5'
+        executor._status = RunnableStatus.TERMINATED
+        recorder.store_or_update_executor(executor)
+    orchestrator, start = boot(recorder, booting_strategy())
+    assert orchestrator.active_executors.get('controller', []) == []
+    assert orchestrator.recovery_required == {'controller': [executor.config.id]}
+    start.assert_not_called()
+
+
+def test_terminal_position_with_missing_marker_remains_unresolved(recorder):
+    executor = live_executor(trigger='.015', moves=5)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        executor.suspend_for_restart()
+        executor._advance_restart_suspend()
+        executor._restart_suspended = None
         executor._status = RunnableStatus.TERMINATED
         recorder.store_or_update_executor(executor)
     orchestrator, start = boot(recorder, booting_strategy())

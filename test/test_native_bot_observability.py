@@ -275,6 +275,95 @@ def test_actual_snapshot_keeps_closing_executor_in_lifecycle_projection():
     assert result['summary']['lifecycle_executor_count'] == 1
 
 
+def test_actual_snapshot_uses_each_native_instrument_for_multisymbol_rows():
+    # Meridian can have no controller-level trading pair. Each native row must
+    # retain its own instrument rather than inheriting the controller ID.
+    controller_id = 'meridian-v3'
+    controller = Obj(config=Obj(connector_name='okx'), get_custom_info=lambda: {})
+
+    def executor(executor_id, trading_pair, *, active):
+        return Obj(
+            id=executor_id,
+            controller_id=controller_id,
+            config=Obj(connector_name='okx', trading_pair=trading_pair,
+                       amount=Decimal('1'), price=Decimal('100'), side='BUY'),
+            custom_info={},
+            side='BUY',
+            type='position_executor',
+            status=Obj(name='RUNNING' if active else 'SHUTTING_DOWN'),
+            close_type=None,
+            timestamp=90,
+            net_pnl_quote=Decimal('0'),
+            net_pnl_pct=Decimal('0'),
+            filled_amount_quote=Decimal('0'),
+            is_active=active,
+            is_done=False,
+        )
+
+    entry = {
+        'controller_id': controller_id,
+        'controller': controller,
+        # This reproduces the prior fallback when get_status_summary() is {}.
+        'summary': {'pair': controller_id, 'price': 'n/a'},
+        'executors': [
+            executor('active-bnb', 'BNB-USDC', active=True),
+            executor('active-eth', 'ETH-USDC', active=True),
+            executor('closing-sol', 'SOL-USDC', active=False),
+            executor('missing-pair', None, active=True),
+        ],
+        'positions': [Obj(trading_pair='XRP-USDC', side='BUY', amount=Decimal('2'),
+                          breakeven_price=Decimal('1'), unrealized_pnl_quote=Decimal('0'),
+                          realized_pnl_quote=Decimal('0'), cum_fees_quote=Decimal('0'))],
+        'performance': None,
+    }
+    strategy = Obj(
+        _build_controller_status_entries=lambda: [entry],
+        _get_balances_snapshot=lambda: [],
+        connectors={'okx': Obj(in_flight_orders={})},
+        get_active_orders=lambda _: [],
+        _runtime_status_snapshot_bot_name=lambda: 'test-bot',
+        _build_runtime_operations_snapshot=lambda: {},
+        _compact_side_label=lambda value: value,
+        _compact_executor_type=lambda value: 'position',
+        _compact_enum_label=lambda value: value.name.replace('_', '-').lower() if value else None,
+        _format_executor_age_short=lambda timestamp: '10s',
+        current_timestamp=100,
+        _controller_reports_valid=True,
+        _unattended_restart_hold=False,
+        _runtime_position_resume_observation=lambda: _position_resume_observation(strategy),
+        _safe_decimal=lambda value: Decimal(str(value or '0')),
+    )
+
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    result = StrategyV2Base._build_runtime_status_snapshot(strategy)
+
+    active = {row['executor_id']: row for row in result['active_executors']}
+    lifecycle = {row['executor_id']: row for row in result['lifecycle_executors']}
+    assert active['active-bnb']['pair'] == 'BNB-USDC'
+    assert active['active-eth']['pair'] == 'ETH-USDC'
+    assert active['missing-pair']['pair'] is None
+    assert lifecycle['closing-sol']['pair'] == 'SOL-USDC'
+    assert result['positions_held'][0]['pair'] == 'XRP-USDC'
+    assert all(row['controller_id'] == controller_id for row in active.values())
+    assert all(row['controller_id'] == controller_id for row in lifecycle.values())
+    assert result['positions_held'][0]['controller_id'] == controller_id
+
+
+def test_controller_status_does_not_fabricate_pair_from_controller_id():
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+
+    class NoLoggerNeeded:
+        pass
+
+    no_pair = Obj(config=Obj(), get_status_summary=lambda: {})
+    malformed_pair = Obj(config=Obj(), get_status_summary=lambda: {'pair': 42})
+    configured_pair = Obj(config=Obj(trading_pair='BNB-USDC'), get_status_summary=lambda: {})
+
+    assert StrategyV2Base._safe_controller_status_summary(NoLoggerNeeded(), 'meridian-v3', no_pair)['pair'] is None
+    assert StrategyV2Base._safe_controller_status_summary(NoLoggerNeeded(), 'meridian-v3', malformed_pair)['pair'] is None
+    assert StrategyV2Base._safe_controller_status_summary(NoLoggerNeeded(), 'meridian-v3', configured_pair)['pair'] == 'BNB-USDC'
+
+
 def test_pending_sell_receipt_preserves_cancellation_and_expiry():
     from hummingbot.strategy.native_observability import controller_observation
     request = Obj(side='SELL', price=Decimal('12'), amount=Decimal('3'), expires_at=1789066790)

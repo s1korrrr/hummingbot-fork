@@ -1005,7 +1005,7 @@ class StrategyV2Base(StrategyPyBase):
         balances = self._get_balances_snapshot()
         focus_queue = [
             {
-                "pair": entry["summary"].get("pair", entry["controller_id"]),
+                "pair": entry["summary"].get("pair"),
                 "focus": entry["summary"].get("focus", ""),
             }
             for entry in controller_entries
@@ -1020,7 +1020,7 @@ class StrategyV2Base(StrategyPyBase):
 
         for entry in controller_entries:
             summary = entry["summary"]
-            pair = summary.get("pair", entry["controller_id"])
+            pair = summary.get("pair")
             controllers.append(
                 {
                     **controller_observation(entry),
@@ -1040,10 +1040,13 @@ class StrategyV2Base(StrategyPyBase):
             for executor in entry["executors"]:
                 if executor.is_done:
                     continue
+                executor_pair = getattr(getattr(executor, "config", None), "trading_pair", None)
+                if not isinstance(executor_pair, str) or not executor_pair.strip():
+                    executor_pair = None
                 side = self._compact_side_label(executor.side or getattr(executor.config, "side", None))
                 lifecycle_row = {
                     **executor_observation(executor, entry["controller_id"]),
-                    "pair": pair,
+                    "pair": executor_pair,
                     "side": side.lower() if side else None,
                     "executor_type": self._compact_executor_type(executor.type),
                     "status": (self._compact_enum_label(executor.status) or "unknown").lower(),
@@ -1058,10 +1061,13 @@ class StrategyV2Base(StrategyPyBase):
                     active_executors.append(lifecycle_row)
 
             for position in entry["positions"]:
+                position_pair = getattr(position, "trading_pair", None)
+                if not isinstance(position_pair, str) or not position_pair.strip():
+                    position_pair = None
                 positions_held.append(
                     {
                         "controller_id": entry["controller_id"],
-                        "pair": pair,
+                        "pair": position_pair,
                         "side": getattr(position.side, "name", str(position.side)).lower(),
                         "amount_base": float(self._safe_decimal(position.amount)),
                         "value_quote": float(self._safe_decimal(position.amount) * self._safe_decimal(position.breakeven_price)),
@@ -1597,7 +1603,9 @@ class StrategyV2Base(StrategyPyBase):
             self.logger().error(f"Error building status summary for controller {controller_id}: {e}", exc_info=True)
 
         config = getattr(controller, "config", None)
-        trading_pair = summary.get("pair") or getattr(config, "trading_pair", None) or controller_id
+        trading_pair = summary.get("pair") or getattr(config, "trading_pair", None)
+        if not isinstance(trading_pair, str) or not trading_pair.strip():
+            trading_pair = None
         normalized_summary = {
             "controller_id": controller_id,
             "pair": trading_pair,

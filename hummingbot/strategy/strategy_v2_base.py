@@ -351,6 +351,7 @@ class StrategyV2Base(StrategyPyBase):
         self._controllers_started = False
         self._last_controller_reload_error: Optional[str] = None
         self._controller_restart_required: Dict[str, str] = {}
+        self._controller_configs_pending_persistence: List[ControllerConfigBase] = []
         self._last_runtime_db_sync_ts: float = 0
         self._last_runtime_status_snapshot_ts: float = 0
         self._last_chart_snapshot_prune_ts: float = 0
@@ -370,6 +371,7 @@ class StrategyV2Base(StrategyPyBase):
             strategy=self,
             initial_positions_by_controller=self._collect_initial_positions()
         )
+        self._persist_controller_configs_if_safe()
 
     # -------------------------------------------------------------------------
     # Shared methods (simple + V2 modes)
@@ -405,6 +407,7 @@ class StrategyV2Base(StrategyPyBase):
                 return
             if not self.executor_orchestrator.resume_planned_positions_if_ready():
                 return
+            self._persist_controller_configs_if_safe()
             self.update_executors_info()
             self._sync_runtime_state_to_db_if_due()
             try:
@@ -1360,7 +1363,23 @@ class StrategyV2Base(StrategyPyBase):
         controllers_configs = self.config.load_controller_configs()
         for controller_config in controllers_configs:
             self.add_controller(controller_config)
-            MarketsRecorder.get_instance().store_controller_config(controller_config)
+            self._controller_configs_pending_persistence.append(controller_config)
+        self._persist_controller_configs_if_safe()
+
+    def _persist_controller_configs_if_safe(self):
+        """Persist controller rows only after startup ownership transfer is safe."""
+        if not self._controller_configs_pending_persistence:
+            return
+        orchestrator = getattr(self, "executor_orchestrator", None)
+        if orchestrator is None or getattr(orchestrator, "_planned_resume_pending", False) is True:
+            return
+        if (getattr(orchestrator, "_resume_preflight_failed", False) is True
+                or getattr(orchestrator, "_planned_resume_failure", None)):
+            return
+        recorder = MarketsRecorder.get_instance()
+        for controller_config in self._controller_configs_pending_persistence:
+            recorder.store_controller_config(controller_config)
+        self._controller_configs_pending_persistence.clear()
 
     def add_controller(self, config: ControllerConfigBase):
         try:

@@ -14,6 +14,7 @@ import pandas as pd
 
 import hummingbot.strategy.strategy_v2_base as strategy_v2_base_module
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
 from hummingbot.core.clock import Clock
 from hummingbot.core.clock_mode import ClockMode
@@ -113,6 +114,86 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
                 self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
         sell.assert_not_called()
+
+    def test_controller_config_persistence_waits_for_successful_startup_resume(self):
+        controller_config = MagicMock(id='controller-1')
+        recorder = MagicMock()
+        events = []
+        recorder.store_controller_config.side_effect = lambda config: events.append('store')
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        self.strategy.executor_orchestrator._resume_preflight_failed = False
+        self.strategy.executor_orchestrator._planned_resume_failure = None
+        with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+                patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[controller_config]), \
+                patch.object(self.strategy, 'add_controller'):
+            self.strategy.initialize_controllers()
+            recorder.store_controller_config.assert_not_called()
+
+            def successful_claim():
+                events.append('claim')
+                self.strategy.executor_orchestrator._planned_resume_pending = False
+                return True
+
+            self.strategy.executor_orchestrator.resume_planned_positions_if_ready.side_effect = successful_claim
+            self.strategy.update_executors_info = MagicMock()
+            self.strategy._sync_runtime_state_to_db_if_due = MagicMock()
+            self.strategy._write_chart_snapshots_if_due = MagicMock()
+            self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+            self.strategy.update_controllers_configs = MagicMock()
+            self.strategy.market_data_provider.ready = True
+            self.strategy.determine_executor_actions = MagicMock(return_value=[])
+
+            self.strategy.on_tick()
+
+        recorder.store_controller_config.assert_called_once_with(controller_config)
+        self.assertEqual(events, ['claim', 'store'])
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    def test_controller_config_persistence_is_immediate_without_pending_resume(self):
+        controller_config = MagicMock(id='controller-1')
+        recorder = MagicMock()
+        self.strategy.executor_orchestrator._planned_resume_pending = False
+        self.strategy.executor_orchestrator._resume_preflight_failed = False
+        self.strategy.executor_orchestrator._planned_resume_failure = None
+        with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+                patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[controller_config]), \
+                patch.object(self.strategy, 'add_controller'):
+            self.strategy.initialize_controllers()
+
+        recorder.store_controller_config.assert_called_once_with(controller_config)
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    def test_controller_config_persistence_stays_deferred_after_resume_failure(self):
+        controller_config = MagicMock(id='controller-1')
+        recorder = MagicMock()
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        self.strategy.executor_orchestrator._resume_preflight_failed = False
+        self.strategy.executor_orchestrator._planned_resume_failure = None
+        with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+                patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[controller_config]), \
+                patch.object(self.strategy, 'add_controller'):
+            self.strategy.initialize_controllers()
+            self.strategy.executor_orchestrator._planned_resume_pending = True
+
+            def failed_claim():
+                self.strategy.executor_orchestrator._planned_resume_pending = False
+                self.strategy.executor_orchestrator._resume_preflight_failed = True
+                self.strategy.executor_orchestrator._planned_resume_failure = 'preflight rejected'
+                return True
+
+            self.strategy.executor_orchestrator.resume_planned_positions_if_ready.side_effect = failed_claim
+            self.strategy.update_executors_info = MagicMock()
+            self.strategy._sync_runtime_state_to_db_if_due = MagicMock()
+            self.strategy._write_chart_snapshots_if_due = MagicMock()
+            self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+            self.strategy.update_controllers_configs = MagicMock()
+            self.strategy.market_data_provider.ready = True
+            self.strategy.determine_executor_actions = MagicMock(return_value=[])
+
+            self.strategy.on_tick()
+
+        recorder.store_controller_config.assert_not_called()
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [controller_config])
 
     def unfinished_claim_orchestrator(self):
         # A real orchestrator instance, so any admission guard it defines is consulted.

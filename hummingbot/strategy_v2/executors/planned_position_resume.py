@@ -185,7 +185,7 @@ def position_hold_net_base(receipt, base_asset):
     require(trade_type in ('BUY', 'SELL'), 'held ledger side is invalid')
     gross = decimal(receipt.get('executed_amount_base', 0))
     fee = base_fee_amount(receipt, base_asset)
-    require(gross >= 0 and fee >= 0, 'held ledger base-fee amount is invalid')
+    require(gross >= 0, 'held ledger gross amount is invalid')
     sign = Decimal(1) if trade_type == 'BUY' else Decimal(-1)
     return sign * gross - fee
 
@@ -247,7 +247,8 @@ def _validated_receipt_net_base(receipt, pair, expected_trade_type=None):
             require(isinstance(item, dict) and item.get('token') in (base, quote),
                     'fleet native fill fee asset is unsupported')
             amount = decimal(item.get('amount'))
-            require(amount >= 0, 'fleet native fill fee is negative')
+            # Native actual-currency fees are signed: a maker rebate is negative
+            # and adds owned base. The exact fill match below validates it.
             fees[item['token']] += amount
         base_fee = fees[base]
         signed_gross = size if trade_type == 'BUY' else -size

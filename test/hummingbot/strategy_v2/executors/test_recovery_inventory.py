@@ -180,6 +180,25 @@ def test_held_fill_explicit_identity_cannot_disagree_with_native_key(tmp_path, f
         resume.inspect_fleet_owner_snapshot(path, 'rsi_modular_v2')
 
 
+def test_native_base_rebate_in_held_inventory_is_not_rejected_as_a_negative_fee(tmp_path):
+    from hummingbot.model.exact_order_values import TradeFillExact
+    from hummingbot.model.position import Position
+    path = write_fleet_owner_snapshot(tmp_path / 'v2.sqlite', 'rsi_modular_v2')
+    fee = {'percent': '0', 'flat_fees': [{'token': 'BNB', 'amount': '-.001'}]}
+    with sqlite3.connect(path) as connection:
+        payload = json.loads(connection.execute('SELECT order_payload FROM PositionHoldLedger').fetchone()[0])
+        payload['order_fills']['v2-trade']['fee'] = fee
+        connection.execute('UPDATE PositionHoldLedger SET order_payload=?', (json.dumps(payload),))
+    engine = create_engine(f'sqlite:///{path}')
+    with engine.begin() as connection:
+        connection.execute(TradeFill.__table__.update().values(
+            trade_fee=fee, trade_fee_in_quote=Decimal('-.1'), exact_trade_fee_in_quote='-.1'))
+        connection.execute(TradeFillExact.__table__.update().values(fee_in_quote='-.1'))
+        connection.execute(Position.__table__.update().values(amount=Decimal('.251')))
+    engine.dispose()
+    assert resume.inspect_fleet_owner_snapshot(path, 'rsi_modular_v2')['owned_residual_by_asset'] == {'BNB': '0.251'}
+
+
 def test_conservation_is_per_asset_and_has_no_sublot_tolerance():
     from hummingbot.strategy_v2.executors.recovery_inventory import require_inventory_conservation
     with pytest.raises(ValueError):

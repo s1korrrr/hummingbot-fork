@@ -30,6 +30,7 @@ from hummingbot.strategy_v2.executors.restart_continuity import (
     RestartContinuityError,
     continuity_plan,
     is_continuity_candidate,
+    is_terminal_suspended,
 )
 
 if TYPE_CHECKING:
@@ -357,7 +358,12 @@ class ExecutorOrchestrator:
                     self._non_hold_order_ids.update(self._owned_order_keys(executor))
                     resumed.add(executor.id)
                     continue
-            if not executor.is_done and self._executor_restore is None and self._restart_continuity:
+            # A planned suspension flipped to TERMINATED by the shutdown stop is still unfinished,
+            # unless an explicit planned-resume manifest owns terminal rows on this boot.
+            unfinished = not executor.is_done or (
+                self._restart_continuity and is_terminal_suspended(executor)
+                and not self._resume_preflight_failed and self._planned_resume_failure is None)
+            if unfinished and self._executor_restore is None and self._restart_continuity:
                 restored = self._restore_continuity_executor(controller_id, executor)
                 if restored is not None:
                     keys = self._owned_order_keys(executor)
@@ -367,7 +373,7 @@ class ExecutorOrchestrator:
                     resumed.add(executor.id)
                     self._restored_pending_bind = restored_executors
                     continue
-            if not executor.is_done:
+            if unfinished:
                 self._record_unfinished_claim(controller_id, executor.id, executor.config,
                                               (executor.custom_info or {}).get('planned_position_resume'))
                 # A position executor restart continuity could not rebuild: its order
@@ -484,7 +490,7 @@ class ExecutorOrchestrator:
         infos = getter() if callable(getter) else None
         if not isinstance(infos, (list, tuple)):
             return False
-        return any(not info.is_done and info.controller_id in self.strategy.controllers
+        return any((not info.is_done or is_terminal_suspended(info)) and info.controller_id in self.strategy.controllers
                    and is_continuity_candidate(info) for info in infos)
 
     def _continuity_executor_class(self, controller, config):

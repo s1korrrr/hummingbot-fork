@@ -527,3 +527,48 @@ def test_sealed_restored_down_only_fill_keeps_executor_and_drawdown_hold_is_visi
     assert f'Executor stop requested | controller=controller executor={executor_id} keep_position=True' in caplog.text
     assert 'pending_close_type=POSITION_HOLD' in caplog.text
     assert 'Entry acquisition stopped reason=position_hold' in caplog.text
+
+
+def test_terminal_suspended_row_restores_exactly(recorder):
+    """The shutdown stop() can flip a suspended row to TERMINATED before its final checkpoint."""
+    executor = live_executor(trigger='.015', moves=5)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        executor.suspend_for_restart()
+        executor._advance_restart_suspend()
+        executor._status = RunnableStatus.TERMINATED  # RunnableBase.stop() during process shutdown
+        recorder.store_or_update_executor(executor)
+    row = recorder.get_all_executors()[0]
+    assert row.status == RunnableStatus.TERMINATED and row.close_type is None
+    assert row.custom_info['restart_suspended']['reason'] == 'planned_restart'
+    orchestrator, start = boot(recorder, booting_strategy())
+    again = restored(orchestrator)
+    assert again.config.id == executor.config.id
+    assert again.amount_to_close == D('1')
+    assert again._trailing_stop_trigger_pct == D('.015') and again._trailing_stop_move_count == 5
+    assert again._restart_restored['suspended'] is True
+    assert orchestrator.recovery_required == {}
+    start.assert_called_once()
+
+
+def test_terminal_suspended_row_with_marker_mismatch_is_reported_not_restored(recorder):
+    executor = live_executor(trigger='.015', moves=5)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        executor.suspend_for_restart()
+        executor._advance_restart_suspend()
+        executor._restart_suspended['remaining_position_amount_base'] = '0.5'
+        executor._status = RunnableStatus.TERMINATED
+        recorder.store_or_update_executor(executor)
+    orchestrator, start = boot(recorder, booting_strategy())
+    assert orchestrator.active_executors.get('controller', []) == []
+    assert orchestrator.recovery_required == {'controller': [executor.config.id]}
+    start.assert_not_called()
+
+
+def test_terminal_closed_row_is_not_a_continuity_candidate(recorder):
+    executor = live_executor()
+    executor._status = RunnableStatus.TERMINATED
+    executor.close_type = CloseType.TAKE_PROFIT
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+        recorder.store_or_update_executor(executor)
+    row = recorder.get_all_executors()[0]
+    assert continuity_plan(row) is None

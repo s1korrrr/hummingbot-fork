@@ -12,6 +12,12 @@ to the connector's order tracker so venue status/fill polling reconciles them;
 the executor then shares the tracker's live ``InFlightOrder`` object.
 
 Rows that cannot be rebuilt are reported, never used to block order flow.
+
+A planned suspension writes its marker and checkpoint while the row is RUNNING;
+the generic executor ``stop()`` that follows during process shutdown can flip the
+status to TERMINATED before the final checkpoint. Such a row (TERMINATED, no close
+type, ``restart_suspended`` marker whose remaining amount matches the checkpoint)
+is still the suspended executor and is rebuilt exactly like a RUNNING one.
 """
 import copy
 from dataclasses import dataclass, field
@@ -105,9 +111,15 @@ def continuity_plan(info) -> Optional[ContinuityPlan]:
     if info is None or getattr(info, "type", None) != "position_executor":
         return None
     status = _status(info.status)
+    custom = dict(info.custom_info or {})
+    if is_terminal_suspended(info):
+        marker_remaining = custom[RESTART_SUSPEND_KEY].get("remaining_position_amount_base")
+        if (marker_remaining is None
+                or str(marker_remaining) != str(custom.get("remaining_position_amount_base"))):
+            raise RestartContinuityError("Terminal suspended row remaining amount differs from its marker")
+        status = RunnableStatus.RUNNING
     if status not in (RunnableStatus.RUNNING, RunnableStatus.SHUTTING_DOWN):
         return None
-    custom = dict(info.custom_info or {})
     snapshots = custom.get("execution_order_snapshots")
     if not isinstance(snapshots, list):
         return None
@@ -154,6 +166,19 @@ def continuity_plan(info) -> Optional[ContinuityPlan]:
         # A terminal zero-fill entry owns nothing; the executor ends normally on start.
         plan.notes.append("terminal_zero_fill_entry")
     return plan
+
+
+def is_terminal_suspended(info) -> bool:
+    """A planned suspension whose row was flipped to TERMINATED (no close type) by the shutdown stop."""
+    if info is None or getattr(info, "type", None) != "position_executor":
+        return False
+    try:
+        status = _status(info.status)
+    except (ValueError, TypeError):
+        return False
+    custom = info.custom_info or {}
+    return (status == RunnableStatus.TERMINATED and _close_type(info.close_type) is None
+            and isinstance(custom, dict) and isinstance(custom.get(RESTART_SUSPEND_KEY), dict))
 
 
 def is_continuity_candidate(info) -> bool:

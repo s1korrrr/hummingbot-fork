@@ -1772,13 +1772,18 @@ class HLRSIController(DirectionalTradingControllerBase):
         config = getattr(executor, "config", None)
         lifecycle = custom.get("entry_lifecycle")
         acquisition = custom.get("entry_acquisition")
+        # Standard PositionExecutor publishes only entry_lifecycle. A configured
+        # acquisition subtype, or any supplied acquisition record, must still prove
+        # its terminal acquisition state before the native dust proof can proceed.
+        acquisition_required = hasattr(config, "entry_acquisition_policy") or "entry_acquisition" in custom
         closed_exit_types = {
             CloseType.TIME_LIMIT, CloseType.STOP_LOSS, CloseType.TAKE_PROFIT,
             CloseType.EXPIRED, CloseType.EARLY_STOP, CloseType.TRAILING_STOP, CloseType.COMPLETED,
         }
         if (not self._executor_is_done(executor) or getattr(executor, "is_active", True)
                 or not isinstance(lifecycle, dict) or lifecycle.get("state") != "managing_fill"
-                or not isinstance(acquisition, dict) or acquisition.get("state") != "managing_fill"
+                or (acquisition_required and (
+                    not isinstance(acquisition, dict) or acquisition.get("state") != "managing_fill"))
                 or getattr(executor, "close_type", None) not in closed_exit_types
                 or self._positive_decimal(getattr(executor, "close_timestamp", None)) is None
                 or getattr(config, "type", None) != "position_executor"

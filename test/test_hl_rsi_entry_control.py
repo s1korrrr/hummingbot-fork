@@ -9,10 +9,14 @@ import pytest
 
 from controllers.directional_trading.hl_rsi import HLRSIController, HLRSIControllerConfig
 from hummingbot.connector.markets_recorder import MarketsRecorder
-from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
-from hummingbot.strategy_v2.models.executors import CloseType
+from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 
 
 @pytest.fixture(autouse=True)
@@ -420,6 +424,77 @@ def test_completed_trailing_exit_with_native_fee_dust_retains_owned_exposure():
     assert instance._last_gate_reason[TradeType.BUY] != 'exposure_unavailable'
 
 
+def test_standard_position_executor_closed_dust_keeps_buy_admission_and_exact_exposure():
+    instance = _controller()
+    config = PositionExecutorConfig(
+        id='standard-dust', controller_id=instance.config.id, timestamp=1,
+        connector_name=instance.config.connector_name, trading_pair=instance.config.trading_pair,
+        side=TradeType.BUY, amount=D('1'), entry_price=D('100'), entry_order_policy='single_attempt',
+    )
+    strategy = MagicMock()
+    strategy.current_timestamp = 1000
+    strategy.connectors = {config.connector_name: MagicMock()}
+    rules = instance.market_data_provider.get_trading_rules.return_value
+    with patch.object(PositionExecutor, 'get_trading_rules', return_value=rules):
+        native = PositionExecutor(strategy, config)
+    native.get_price = MagicMock(return_value=D('100'))
+    for attribute, side, amount, fee in (
+        ('_open_order', TradeType.BUY, D('1'), D('0.0019')),
+        ('_close_order', TradeType.SELL, D('0.998'), D('0')),
+    ):
+        order = InFlightOrder(
+            client_order_id=attribute, exchange_order_id=attribute, trading_pair=config.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=side, amount=amount, price=D('100'),
+            creation_timestamp=1, initial_state=OrderState.FILLED,
+        )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id=attribute, client_order_id=attribute, exchange_order_id=attribute,
+            trading_pair=config.trading_pair, fill_price=D('100'), fill_base_amount=amount,
+            fill_quote_amount=amount * 100, fill_timestamp=2,
+            fee=AddedToCostTradeFee(flat_fees=[TokenAmount('HYPE', fee)]),
+        ))
+        tracked = TrackedOrder(attribute)
+        tracked.order = order
+        setattr(native, attribute, tracked)
+    native._entry_lifecycle['state'] = 'managing_fill'
+    native._close_quantity['quantity_increment'] = '0.001'
+    native.close_type = CloseType.TRAILING_STOP
+    native.close_timestamp = 1000
+    native._status = RunnableStatus.TERMINATED
+    row = native.executor_info
+    assert 'entry_acquisition' not in row.custom_info
+    assert row.custom_info['execution_receipt']['residual_dust_base'] == D('0.0001')
+    instance.executors_info = [row]
+
+    # One acquired base minus the base fee and sale leaves 0.0001, worth 0.01 quote.
+    assert instance._get_total_position_value_usd() == D('0.01')
+    assert instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'ready'
+
+
+def test_configured_acquisition_without_its_record_keeps_exposure_unavailable():
+    instance, executor = _completed_dust_exit()
+    executor.config.entry_acquisition_policy = 'down_only_maker_v1'
+    del executor.custom_info['entry_acquisition']
+
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+@pytest.mark.parametrize('has_policy', [False, True])
+@pytest.mark.parametrize('acquisition', [None, {}, [], 'managing_fill', {'state': 'reconciliation_required'}])
+def test_supplied_invalid_acquisition_cannot_release_closed_dust_exposure(has_policy, acquisition):
+    instance, executor = _completed_dust_exit()
+    if has_policy:
+        executor.config.entry_acquisition_policy = 'down_only_maker_v1'
+    executor.custom_info['entry_acquisition'] = acquisition
+
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
 def test_native_persisted_scalar_buy_side_keeps_terminal_dust_and_visible_capital():
     instance, seed = _completed_dust_exit()
     seed.side = TradeType.BUY.value  # Native JSON-backed ExecutorInfo restores this scalar.
@@ -709,6 +784,7 @@ def test_same_venue_order_claimed_as_buy_and_sell_does_not_release_exposure():
     assert not instance._get_total_position_value_usd().is_finite()
 
 
+@pytest.mark.parametrize('standard_executor', [False, True])
 @pytest.mark.parametrize('tamper', [
     'missing_snapshots', 'wrong_fill_fee', 'unfilled_exit', 'wrong_pair',
     'missing_receipt', 'active_executor', 'partial_executor', 'held_owner',
@@ -720,11 +796,13 @@ def test_same_venue_order_claimed_as_buy_and_sell_does_not_release_exposure():
     'duplicate_trade_id',
     'reconciliation_required',
 ])
-def test_unverified_closed_exit_dust_keeps_exposure_unavailable(tamper):
+def test_unverified_closed_exit_dust_keeps_exposure_unavailable(tamper, standard_executor):
     instance, executor = _completed_dust_exit()
     custom = executor.custom_info
     receipt = custom['execution_receipt']
     snapshots = custom['execution_order_snapshots']
+    if standard_executor:
+        del custom['entry_acquisition']
     if tamper == 'missing_snapshots':
         del custom['execution_order_snapshots']
     elif tamper == 'wrong_fill_fee':

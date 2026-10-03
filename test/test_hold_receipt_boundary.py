@@ -3,7 +3,7 @@
 Run inside the Hummingbot checkout:
     python -m pytest -q test/test_hold_receipt_boundary.py
 
-The two controller methods and decimal validation are extracted from source;
+The controller methods, trade-side enum and decimal validation are extracted from source;
 no bot/connector is instantiated. Recorder availability and executor terminal
 ownership are deliberately supplied by the harness. This is a persistence
 boundary counterprobe, NOT the native Hummingbot suite or exchange validation.
@@ -11,6 +11,7 @@ boundary counterprobe, NOT the native Hummingbot suite or exchange validation.
 import ast
 import os
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,8 +39,10 @@ def _compile(nodes, namespace, filename):
 def classes():
     namespace = dict(Decimal=Decimal, InvalidOperation=InvalidOperation, TypeDecorator=TypeDecorator,
                      JSON=JSON, BigInteger=BigInteger, Column=Column, Index=Index, Text=Text,
-                     Any=Any, Dict=Dict, List=List, Optional=Optional, Tuple=Tuple,
+                     Any=Any, Dict=Dict, List=List, Optional=Optional, Tuple=Tuple, Enum=Enum,
                      HummingbotBase=declarative_base())
+    path = "hummingbot/core/data_type/common.py"
+    _compile([_node(path, "TradeType")], namespace, path)
     path = "hummingbot/model/decimal_type_decorator.py"
     _compile([_node(path, "SqliteDecimal")], namespace, path)
     path = "hummingbot/model/position_hold_ledger.py"
@@ -47,7 +50,7 @@ def classes():
     path = "controllers/directional_trading/hl_rsi.py"
     controller = _node(path, "HLRSIController")
     wanted = {"_executor_hold_required_fills", "_executor_hold_released_to_bag",
-              "_finite_nonnegative_base", "_hold_ledger_cumulative_receipt"}
+              "_finite_nonnegative_base", "_hold_ledger_cumulative_receipt", "_executor_trade_side"}
     controller.body = [n for n in controller.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
     controller.bases = []
     controller.decorator_list = []

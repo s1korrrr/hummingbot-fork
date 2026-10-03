@@ -249,6 +249,7 @@ class OKRSIControllerTest(unittest.TestCase):
         )
         recorder = MarketsRecorder.__new__(MarketsRecorder)
         recorder._sql_manager = manager
+        recorder._executor_reads = recorder._executor_scope = None
         state = ControllerCandleWatermarkState(
             namespace=ControllerCandleWatermarkNamespace(
                 controller_id=controller.config.id,
@@ -1620,6 +1621,7 @@ class OKRSIControllerTest(unittest.TestCase):
             controller._regime_detector.detect = MagicMock(wraps=original_detect)
 
         recorder = self._install_temp_watermark(controllers[0], timestamp=persisted_timestamp)
+        self.assertEqual(recorder.get_executors_by_controller(controllers[0].config.id), [])
         # This test exercises watermark first-writer admission after a completed
         # clear setup. Entry admission uses an explicit shared durable test store.
         from controllers.directional_trading.ok_rsi_core.entry_decisions import (

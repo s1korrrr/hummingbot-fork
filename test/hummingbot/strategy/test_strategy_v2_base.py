@@ -14,6 +14,8 @@ import pandas as pd
 
 import hummingbot.strategy.strategy_v2_base as strategy_v2_base_module
 from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
+from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
@@ -89,6 +91,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                         self.strategy = StrategyV2Base({self.connector_name: self.connector}, config=self.strategy_config)
                         # Set mocks to strategy attributes
                         self.strategy.executor_orchestrator = MockExecutorOrchestrator.return_value
+                        self.strategy.executor_orchestrator._claimed_resume_unresolved = {}
                         self.strategy.market_data_provider = MockMarketDataProvider.return_value
                         self.strategy.controllers = {'controller_1': MagicMock(), 'controller_2': MagicMock()}
         self.strategy.logger().setLevel(1)
@@ -150,6 +153,144 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         recorder.store_controller_config.assert_called_once_with(controller_config)
         self.assertEqual(events, ['claim', 'store'])
         self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    async def test_real_ok_rsi_controller_task_waits_for_recovery_claim_before_metadata_writes(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController
+        from controllers.directional_trading.ok_rsi_core.entry_decisions import MetadataEntryDecisionStore
+        from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(directory) / "startup-ordering.sqlite"),
+            )
+            previous_recorder = MarketsRecorder._shared_instance
+            recorder = MarketsRecorder(
+                manager, [], "ok_rsi.yml", "v2_with_controllers",
+                market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False),
+            )
+            store = MetadataEntryDecisionStore(
+                manager, "ok_rsi.yml", "ok-rsi-startup", "okx", "BTC-USDC", "1m",
+            )
+            provider = MagicMock()
+            provider.ready = True
+            provider.time.return_value = 180.0
+            controller = OKRSIController(
+                OKRSIControllerConfig(
+                    id="ok-rsi-startup", connector_name="okx", trading_pair="BTC-USDC",
+                    strict_hmm_mode=False,
+                ),
+                market_data_provider=provider,
+                actions_queue=asyncio.Queue(),
+                entry_decision_store=store,
+            )
+            controller.update_interval = 0.001
+            controller.initialize_candles = MagicMock()
+            controller._last_evaluated_candle_timestamp = 60.0
+
+            async def update_processed_data():
+                controller.processed_data = {
+                    "signal": 0,
+                    "candle_timestamp": 60,
+                    "data_health": {"ready": True},
+                    "signal_state": {"raw_buy_candidate": False, "condition_ok": True},
+                }
+
+            controller.update_processed_data = update_processed_data
+            controller.executors_update_event.set()
+            self.strategy.controllers = {controller.config.id: controller}
+            orchestrator = self.strategy.executor_orchestrator
+            orchestrator._planned_resume_pending = True
+            orchestrator._resume_preflight_failed = False
+            orchestrator._planned_resume_failure = None
+            orchestrator.resume_planned_positions_if_ready.return_value = False
+            events = []
+            self.strategy.update_executors_info = lambda: events.append('reports')
+            original_start = controller.start
+            controller.start = lambda: (events.append('start'), original_start())[1]
+            self.strategy._sync_runtime_state_to_db_if_due = MagicMock()
+            self.strategy._write_chart_snapshots_if_due = MagicMock()
+            self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+            self.strategy.update_controllers_configs = MagicMock()
+            self.strategy.determine_executor_actions = MagicMock(return_value=[])
+            self.strategy.market_data_provider.ready = True
+
+            def persisted_row_counts():
+                with manager.engine.connect() as connection:
+                    return {
+                        table: connection.exec_driver_sql(f'SELECT COUNT(*) FROM "{table}"').scalar_one()
+                        for table in ("Controllers", "Executors", "Order", "Position", "Metadata")
+                    }
+
+            try:
+                with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+                    before = persisted_row_counts()
+                    self.strategy.start(self.clock, self.start_timestamp)
+                    await asyncio.sleep(0.02)
+                    self.assertIsNone(store.load())
+                    self.assertNotEqual(controller.status, RunnableStatus.RUNNING)
+                    self.assertEqual(persisted_row_counts(), before)
+
+                    def successful_claim():
+                        orchestrator._planned_resume_pending = False
+                        return True
+
+                    orchestrator.resume_planned_positions_if_ready.side_effect = successful_claim
+                    self.strategy.on_tick()
+                    for _ in range(20):
+                        if store.load() is not None:
+                            break
+                        await asyncio.sleep(0.01)
+                    controller.stop()
+                    task = controller._control_loop_task
+                    if task is not None:
+                        await asyncio.wait_for(task, timeout=1)
+                    self.assertIsNotNone(store.load())
+                    self.assertEqual(persisted_row_counts()["Order"], before["Order"])
+                    self.assertEqual(events[:2], ['reports', 'start'])
+            finally:
+                controller.stop()
+                if controller._control_loop_task is not None and not controller._control_loop_task.done():
+                    await asyncio.wait_for(controller._control_loop_task, timeout=1)
+                manager.engine.dispose()
+                MarketsRecorder._shared_instance = previous_recorder
+
+    def test_controller_start_is_idempotent_for_ordinary_startup(self):
+        controller = MagicMock()
+        self.strategy.controllers = {"controller-1": controller}
+        orchestrator = self.strategy.executor_orchestrator
+        orchestrator._planned_resume_pending = False
+        orchestrator._resume_preflight_failed = False
+        orchestrator._planned_resume_failure = None
+
+        self.strategy.start(self.clock, self.start_timestamp)
+        self.strategy.start(self.clock, self.start_timestamp + 1)
+
+        controller.start.assert_called_once_with()
+        self.assertTrue(self.strategy._controllers_started)
+
+    def test_controller_start_remains_fenced_on_preflight_failure_and_unattended_hold(self):
+        controller = MagicMock()
+        self.strategy.controllers = {"controller-1": controller}
+        orchestrator = self.strategy.executor_orchestrator
+        orchestrator._planned_resume_pending = False
+        orchestrator._resume_preflight_failed = True
+        orchestrator._planned_resume_failure = "recovery ownership proof rejected"
+
+        self.strategy.start(self.clock, self.start_timestamp)
+        controller.start.assert_not_called()
+        self.assertFalse(self.strategy._controllers_started)
+
+        orchestrator._resume_preflight_failed = False
+        orchestrator._planned_resume_failure = None
+        orchestrator._claimed_resume_unresolved = {"controller-1": {"executor": ("okx", "BTC-USDC")}}
+        self.strategy._start_controllers_if_safe()
+        controller.start.assert_not_called()
+
+        orchestrator._claimed_resume_unresolved = {}
+        self.strategy._unattended_restart_hold = True
+        self.strategy._start_controllers_if_safe()
+        controller.start.assert_not_called()
 
     @staticmethod
     def _direct_ok_rsi_config(controller_id: str, *, origin: str = None):

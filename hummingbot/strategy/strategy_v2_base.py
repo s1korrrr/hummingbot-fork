@@ -357,6 +357,7 @@ class StrategyV2Base(StrategyPyBase):
         self._last_chart_snapshot_prune_ts: float = 0
         self.mqtt_enabled = False
         self._pub: Optional[ETopicPublisher] = None
+        self._controller_start_requested = False
 
         self.actions_queue = asyncio.Queue()
         self.listen_to_executor_actions_task: asyncio.Task = asyncio.create_task(self.listen_to_executor_actions())
@@ -409,6 +410,7 @@ class StrategyV2Base(StrategyPyBase):
                 return
             self._persist_controller_configs_if_safe()
             self.update_executors_info()
+            self._start_controllers_if_safe()
             self._sync_runtime_state_to_db_if_due()
             try:
                 self._write_chart_snapshots_if_due()
@@ -429,6 +431,7 @@ class StrategyV2Base(StrategyPyBase):
         """
         self._is_stop_triggered = True
         self._controllers_started = False
+        self._controller_start_requested = False
 
         # Stop controllers FIRST to prevent new executor actions
         for controller in self.controllers.values():
@@ -1326,10 +1329,10 @@ class StrategyV2Base(StrategyPyBase):
             self.mqtt_enabled = True
             self._pub = ETopicPublisher("performance", use_bot_prefix=True)
 
-        # Start controllers
-        for controller in self.controllers.values():
-            controller.start()
-        self._controllers_started = True
+        # A prepared native recovery must claim its sealed ownership before a
+        # controller task can write durable per-candle decisions or enqueue work.
+        self._controller_start_requested = True
+        self._start_controllers_if_safe()
 
     def apply_initial_setting(self):
         """
@@ -1401,6 +1404,22 @@ class StrategyV2Base(StrategyPyBase):
         for controller_config in self._controller_configs_pending_persistence:
             recorder.store_controller_config(controller_config)
         self._controller_configs_pending_persistence.clear()
+
+    def _start_controllers_if_safe(self):
+        """Start controller loops only after any prepared owner claim succeeds."""
+        if not self._controller_start_requested or self._controllers_started or self._unattended_restart_hold:
+            return
+        orchestrator = getattr(self, "executor_orchestrator", None)
+        if orchestrator is None:
+            return
+        if (getattr(orchestrator, "_planned_resume_pending", False) is True
+                or getattr(orchestrator, "_resume_preflight_failed", False) is True
+                or getattr(orchestrator, "_planned_resume_failure", None)
+                or getattr(orchestrator, "_claimed_resume_unresolved", None)):
+            return
+        for controller in self.controllers.values():
+            controller.start()
+        self._controllers_started = True
 
     def add_controller(self, config: ControllerConfigBase):
         try:

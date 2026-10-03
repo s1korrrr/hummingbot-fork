@@ -77,6 +77,133 @@ async def test_pending_enrollment_tick_waits_for_report_initialization_without_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('blocker', ['pending', 'preflight_failed', 'claim_failed', 'unresolved'])
+async def test_pending_or_failed_ownership_does_not_initialize_daily_risk(recorder, blocker):
+    recorder.store_strategy_risk_state(pending_state())
+    strategy = make_runner(recorder)
+    try:
+        before = recorder.load_strategy_risk_state()
+        strategy._controller_reports_valid = True
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('-12.5'))}}
+        orchestrator = strategy.executor_orchestrator
+        if blocker == 'pending':
+            orchestrator._planned_resume_pending = True
+        elif blocker == 'preflight_failed':
+            orchestrator._resume_preflight_failed = True
+        elif blocker == 'claim_failed':
+            orchestrator._planned_resume_failure = 'sealed claim rejected'
+        else:
+            orchestrator._claimed_resume_unresolved = {OWNER: {'executor': ('okx', 'BTC-USDC')}}
+
+        with patch.object(StrategyV2Base, 'on_tick'), \
+                patch('scripts.v2_with_controllers.time.time', return_value=1002):
+            strategy.on_tick()
+            assert not strategy.validate_create_action(SimpleNamespace(
+                controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.BUY)))
+
+        assert strategy._daily_entry_risk is None
+        assert strategy._entry_risk_enrollment.pending
+        assert strategy.max_global_pnl is None
+        assert recorder.load_strategy_risk_state() == before
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
+async def test_successful_ownership_claim_initializes_daily_risk_once(recorder):
+    recorder.store_strategy_risk_state(pending_state())
+    strategy = make_runner(recorder)
+    try:
+        strategy._controller_reports_valid = True
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('-12.5'))}}
+        with patch.object(StrategyV2Base, 'on_tick'), \
+                patch('scripts.v2_with_controllers.time.time', side_effect=[1002, 1003]):
+            strategy.on_tick()
+            first = recorder.load_strategy_risk_state()
+            strategy.on_tick()
+            second = recorder.load_strategy_risk_state()
+
+        assert first['daily_entry_risk']['baseline_quote'] == '-12.5'
+        assert first['entry_risk_enrollment']['initialized_at'] == 1002
+        assert second['daily_entry_risk']['baseline_quote'] == first['daily_entry_risk']['baseline_quote']
+        assert second['entry_risk_enrollment']['initialized_at'] == first['entry_risk_enrollment']['initialized_at']
+        assert second['daily_entry_risk']['last_timestamp'] == 1003
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
+async def test_first_create_validation_waits_for_fresh_report_after_claim(recorder):
+    from hummingbot.core.data_type.common import TradeType
+
+    recorder.store_strategy_risk_state(pending_state())
+    strategy = make_runner(recorder)
+    try:
+        strategy.executor_orchestrator._planned_resume_pending = False
+        strategy._controller_reports_valid = False
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('9999'))}}
+        sell = SimpleNamespace(controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.SELL))
+
+        with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+                patch('scripts.v2_with_controllers.time.time', return_value=1002):
+            assert not strategy.validate_create_action(sell)
+            assert strategy._daily_entry_risk is None
+            assert strategy._entry_risk_enrollment.pending
+            assert recorder.load_strategy_risk_state().get('daily_entry_risk') is None
+
+            strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+                pnl_available=True, global_pnl_quote=D('-7.25'))}}
+            strategy._controller_reports_valid = True
+            assert strategy.validate_create_action(sell)
+
+        state = recorder.load_strategy_risk_state()
+        assert state['daily_entry_risk']['baseline_quote'] == '-7.25'
+        assert state['entry_risk_enrollment']['initialized_at'] == 1002
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
+async def test_operator_pause_remains_durable_but_resume_waits_for_claim(recorder):
+    from hummingbot.client.hummingbot_application import HummingbotApplication
+
+    state = {'version': 1, 'controllers': [OWNER], 'max_global_pnl': '0',
+             'max_pnl_by_controller': {OWNER: '0'}, 'drawdown_exited_controllers': [], 'stopped': False,
+             'operator_paused': {OWNER: True},
+             'daily_entry_risk': {'schema_version': 1, 'limit_quote': '1000', 'utc_day': 0,
+                                  'baseline_quote': '0', 'last_pnl_quote': '0', 'last_timestamp': 1000,
+                                  'paused': False, 'breach_day': None}}
+    recorder.store_strategy_risk_state(state)
+    strategy = make_runner(recorder)
+    try:
+        before_daily = recorder.load_strategy_risk_state()['daily_entry_risk']
+        strategy.executor_orchestrator._planned_resume_pending = True
+        strategy._operator_started_at = 999
+        pause = {'action': 'bot_pause_entries', 'bot_name': 'candidate', 'controller_id': OWNER,
+                 'requested_at': 1002.0, 'command_id': 'pause-during-recovery'}
+        resume = {**pause, 'action': 'bot_resume_entries', 'requested_at': 1003.0,
+                  'command_id': 'resume-during-recovery'}
+        with patch.object(StrategyV2Base, 'on_tick'), \
+                patch('scripts.v2_with_controllers.time.time', return_value=1004), \
+                patch.object(HummingbotApplication, 'main_application',
+                             return_value=SimpleNamespace(instance_id='candidate')):
+            strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=pause)))
+            strategy.on_tick()
+            strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=resume)))
+            strategy.on_tick()
+
+        assert strategy.controllers[OWNER].paused
+        assert recorder.load_strategy_risk_state()['daily_entry_risk'] == before_daily
+        assert recorder.has_operator_command(OWNER, 'pause-during-recovery')
+        assert not recorder.has_operator_command(OWNER, 'resume-during-recovery')
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
 async def test_approved_pending_enrollment_stays_fenced_and_samples_actual_native_pnl(recorder):
     recorder.store_strategy_risk_state(pending_state())
     strategy = make_runner(recorder)

@@ -205,6 +205,8 @@ class V2WithControllers(StrategyV2Base):
                     or any(self.controllers.get(owner.config.id) is not owner for owner in self._funding_scope_owners)):
                 raise ValueError('Funded controller topology changed; restart and reconcile explicitly')
             self.process_operator_events()
+            if not self._ownership_recovery_complete():
+                return False
             self.check_manual_kill_switch()
             self.control_max_drawdown()
             self._observe_daily_entry_risk()
@@ -237,17 +239,31 @@ class V2WithControllers(StrategyV2Base):
     def on_tick(self):
         super().on_tick()
         self.process_operator_events()
-        # The parent defers report initialization until planned ownership is restored.
-        if not self._is_stop_triggered and not self.executor_orchestrator._planned_resume_pending:
-            self.check_manual_kill_switch()
-            self.control_max_drawdown()
-            self._observe_daily_entry_risk()
-            self.send_performance_report()
-        try:
-            self._persist_risk_state()
-        except Exception:
-            self._is_stop_triggered = True
-            self.logger().exception('Unable to persist risk state; new execution blocked')
+        # Risk marks and their durable projection must not advance against an
+        # unclaimed startup snapshot. The entry fence and operator events remain
+        # observable while recovery is pending or unresolved.
+        if self._ownership_recovery_complete():
+            if not self._is_stop_triggered:
+                self.check_manual_kill_switch()
+                self.control_max_drawdown()
+                self._observe_daily_entry_risk()
+                self.send_performance_report()
+            try:
+                self._persist_risk_state()
+            except Exception:
+                self._is_stop_triggered = True
+                self.logger().exception('Unable to persist risk state; new execution blocked')
+
+    def _ownership_recovery_complete(self):
+        orchestrator = getattr(self, 'executor_orchestrator', None)
+        if orchestrator is None or getattr(self, '_unattended_restart_hold', False):
+            return False
+        return not any((
+            getattr(orchestrator, '_planned_resume_pending', False),
+            getattr(orchestrator, '_resume_preflight_failed', False),
+            getattr(orchestrator, '_planned_resume_failure', None),
+            getattr(orchestrator, '_claimed_resume_unresolved', None),
+        ))
 
     def _apply_daily_entry_pause(self):
         if self._daily_entry_risk is not None and self._daily_entry_risk.paused:
@@ -359,6 +375,10 @@ class V2WithControllers(StrategyV2Base):
                 continue
             if not self._native_operator_command_is_fresh(payload, target_controllers):
                 self.logger().warning('Rejected stale, duplicate or incorrectly addressed native operator command')
+                continue
+            if (action in {'global_resume_entries', 'bot_resume_entries'}
+                    and not self._ownership_recovery_complete()):
+                self.logger().warning('Entry resume rejected until native ownership recovery is complete')
                 continue
             if action in {'global_resume_entries', 'bot_resume_entries'} and self._daily_entry_risk is not None:
                 self._observe_daily_entry_risk()

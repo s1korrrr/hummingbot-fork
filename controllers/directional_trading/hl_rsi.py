@@ -1816,6 +1816,7 @@ class HLRSIController(DirectionalTradingControllerBase):
                 return None
             totals = {"BUY": [Decimal("0"), Decimal("0")], "SELL": [Decimal("0"), Decimal("0")]}
             entry_base_fee = Decimal("0")
+            exit_base_fee = Decimal("0")
             seen_orders = set()
             seen_exchange_orders = set()
             seen_trades = set()
@@ -1886,6 +1887,8 @@ class HLRSIController(DirectionalTradingControllerBase):
                 if side == "BUY":
                     fee = base_fee_amount(order, self.config.trading_pair.split("-")[0])
                     entry_base_fee += fee
+                else:
+                    exit_base_fee += base_fee_amount(order, self.config.trading_pair.split("-")[0])
             authorized = self._positive_decimal(getattr(executor.config, "amount", None))
             if (seen_orders != set(order_ids) or authorized is None
                     or not all(totals[side][0] > 0 for side in totals)
@@ -1894,7 +1897,8 @@ class HLRSIController(DirectionalTradingControllerBase):
                     or totals["BUY"][1] != self._positive_decimal(receipt.get("entry_gross_quote"))
                     or totals["SELL"][0] != self._positive_decimal(receipt.get("exit_gross_base"))
                     or totals["SELL"][1] != self._positive_decimal(receipt.get("exit_gross_quote"))
-                    or totals["BUY"][0] - entry_base_fee != filled or totals["SELL"][0] != closed):
+                    or totals["BUY"][0] - entry_base_fee != filled or totals["SELL"][0] != closed
+                    or totals["BUY"][0] - entry_base_fee - totals["SELL"][0] - exit_base_fee != dust):
                 return None
             return dust
         except (AttributeError, ArithmeticError, InvalidOperation, KeyError, TypeError, ValueError):

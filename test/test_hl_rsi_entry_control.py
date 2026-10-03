@@ -657,6 +657,33 @@ def test_native_base_fee_rebate_can_leave_proven_sublot_residue():
     assert instance._get_total_position_value_usd() == D('0.01')
 
 
+@pytest.mark.parametrize('sell_base_fee', ['0.00001', '-0.00001'])
+def test_sell_base_fee_or_rebate_invalidates_executor_dust_receipt(sell_base_fee):
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee']['flat_fees'] = [{'token': 'HYPE', 'amount': sell_base_fee}]
+
+    assert not instance._get_total_position_value_usd().is_finite()
+
+
+def test_sell_percent_fee_charged_in_base_invalidates_executor_dust_receipt():
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee']['percent'] = '0.00001'
+    sell_fill['fee']['percent_token'] = 'HYPE'
+
+    assert not instance._get_total_position_value_usd().is_finite()
+
+
+@pytest.mark.parametrize('sell_quote_fee', ['0.01', '-0.01'])
+def test_sell_quote_fee_or_rebate_does_not_change_executor_base_dust(sell_quote_fee):
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee']['flat_fees'] = [{'token': 'USDC', 'amount': sell_quote_fee}]
+
+    assert instance._get_total_position_value_usd() == D('0.01')
+
+
 def test_same_venue_order_claimed_as_buy_and_sell_does_not_release_exposure():
     instance, row = _completed_dust_exit()
     buy, sell = row.custom_info['execution_order_snapshots']

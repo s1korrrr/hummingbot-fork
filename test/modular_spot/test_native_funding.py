@@ -83,6 +83,39 @@ def test_base_fee_inventory_uses_native_remaining_fee_attribution():
     assert projected['inventory_cost'] == D('20')
 
 
+@pytest.mark.parametrize(('side', 'token', 'rebate', 'quantity', 'cash', 'cost'), [
+    ('BUY', 'BTC', '-.01', '1.01', '40', '40'),
+    ('BUY', 'USDC', '-.1', '1', '39.9', '39.9'),
+    ('SELL', 'BTC', '-.01', '.51', '15', '20.4'),
+    ('SELL', 'USDC', '-.1', '.5', '14.9', '20'),
+])
+def test_signed_native_rebate_preserves_independent_inventory_and_cash(side, token, rebate, quantity, cash, cost):
+    """Actual-currency rebates change owned units or cash; they are not negative inventory."""
+    rows = [] if side == 'BUY' else [fill('buy', '1', 'BUY', '1', '40')]
+    row = fill('rebated', '2', side, '1' if side == 'BUY' else '.5', '40' if side == 'BUY' else '50')
+    row.trade_fee = {'percent': '0', 'flat_fees': [{'token': token, 'amount': rebate}]}
+    valued = D(rebate) * (row.price_decimal if token == 'BTC' else D(1))
+    row.trade_fee_in_quote = valued
+    row.exact_trade_fee_in_quote = str(valued)
+    rows.append(row)
+    projected = funding_projection(rows, 'okx', 'BTC-USDC')
+    assert projected['inventory_base'] == D(quantity)
+    assert projected['cash_used'] == D(cash)
+    assert projected['inventory_cost'] == D(cost)
+
+
+def test_signed_fee_validation_keeps_finite_supported_asset_and_cost_bounds():
+    for token, amount in [('BNB', '-.1'), ('BTC', 'NaN'), ('USDC', 'Infinity')]:
+        row = fill('buy', '1', 'BUY', '1', '40')
+        row.trade_fee = {'percent': '0', 'flat_fees': [{'token': token, 'amount': amount}]}
+        with pytest.raises(ValueError):
+            funding_projection([row], 'okx', 'BTC-USDC')
+    # A rebate greater than acquisition cash would manufacture negative cost.
+    row = fill('buy', '1', 'BUY', '1', '40', '-41')
+    with pytest.raises(ValueError, match='acquisition cost'):
+        funding_projection([row], 'okx', 'BTC-USDC')
+
+
 def test_single_attempt_release_accepts_post_only_repair_entry_set():
     """One post-only cancel plus one filled replacement releases under single_attempt.
 
@@ -95,6 +128,40 @@ def test_single_attempt_release_accepts_post_only_repair_entry_set():
     fills = store.recorder.get_trades_for_config('modular.yml')
     orders = store.recorder.get_orders_for_config_and_market('modular.yml', None)
     store._validate_release(info, info.custom_info['entry_reconciliation'], D('1'), fills, orders, claim_for(info.config))
+
+
+def test_single_attempt_release_accepts_exact_signed_base_rebate_and_keeps_fee_cap():
+    from test.acquisition_chain_v2.test_funding_edges import (
+        base_fee,
+        chain_config,
+        executor_info,
+        make_store,
+        native_order,
+        recorded_fills,
+        recorded_orders,
+    )
+
+    from hummingbot.core.data_type.in_flight_order import OrderState
+    from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
+
+    config = chain_config()
+    orders = [native_order('first', '100', timestamp=1),
+              native_order('second', '98', state=OrderState.FILLED, timestamp=2,
+                           fills=[('fill-1', '.25', 3, base_fee('-.00025')),
+                                  ('fill-2', '.75', 4, base_fee('-.00075'))])]
+    info = executor_info(config, orders)
+    store = make_store([info], recorded_fills(orders), recorded_orders(orders))
+    assert store.reconcile()['released_intents'] == 1
+    assert D(store.assess()['inventory_cost']) == D('98')
+    assert D(store.assess()['available_quote']) == D('52')
+
+    costly = native_order('costly', '98', state=OrderState.FILLED, timestamp=2,
+                          fills=[('expensive', '1', 3, AddedToCostTradeFee(
+                              flat_fees=[TokenAmount('USDC', D('1'))]))])
+    costly_info = executor_info(config, [costly])
+    costly_store = make_store([costly_info], recorded_fills([costly]), recorded_orders([costly]))
+    with pytest.raises(ValueError, match='Actual native fee exceeds funded bound'):
+        costly_store.reconcile()
 
 
 def test_single_attempt_release_rejects_two_filled_entry_orders():

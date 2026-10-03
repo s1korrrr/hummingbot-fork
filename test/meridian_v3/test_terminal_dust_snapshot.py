@@ -403,3 +403,31 @@ def test_duplicate_native_exchange_order_identity_across_executors_is_rejected()
     rows[1].custom_info['execution_order_snapshots'][0]['exchange_order_id'] = 'exchange-entry-0'
     with pytest.raises(PolicyError):
         take_snapshot(portfolio)
+
+
+@pytest.mark.parametrize('side,token', [('BUY', 'BTC'), ('BUY', 'USDC'), ('SELL', 'BTC'), ('SELL', 'USDC')])
+def test_native_terminal_dust_retains_signed_maker_rebates(side, token):
+    portfolio, rows, fills, _ = snapshot_case()
+    index = 0 if side == 'BUY' else 1
+    previous = fills[index]
+    fee = D('-0.000000001') if token == 'BTC' else D('-0.000085')
+    replacement = native_fill(previous.order_id, previous.exchange_trade_id, side,
+                              previous.amount_decimal, previous.price_decimal,
+                              {'percent': '0', 'flat_fees': [{'token': token, 'amount': str(fee)}]})
+    fills[index] = replacement
+    order = rows[0].custom_info['execution_order_snapshots'][index]
+    order['order_fills'] = {replacement.exchange_trade_id: snapshot_fill(
+        replacement, replacement.order_id, order['exchange_order_id'])}
+    dust = D('0.000000002902') - (fee if token == 'BTC' else D(0))
+    rows[0].custom_info['execution_receipt']['residual_dust_base'] = str(dust)
+    result = take_snapshot(portfolio)
+    [asset] = result.assets
+    # BUY rebates increase acquired base or reduce quote acquisition cost. SELL
+    # rebates affect disposal proceeds/quantity; they do not increase entry cost.
+    entry_base = D('0.0006') - (fee if side == 'BUY' and token == 'BTC' else D(0))
+    entry_quote = D('51') + (fee if side == 'BUY' and token == 'USDC' else D(0))
+    expected_basis = dust * entry_quote / entry_base + D('0.000000008552') * D(85000)
+    assert result.reconciled
+    assert asset.quantity == dust + D('0.000000008552')
+    assert abs(asset.basis_quote - expected_basis) < D('1e-24')
+    assert asset.sellable_quantity == 0

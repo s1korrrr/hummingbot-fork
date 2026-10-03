@@ -211,7 +211,7 @@ def test_conservation_is_per_asset_and_has_no_sublot_tolerance():
 @pytest.mark.parametrize('source', [
     'hummingbot/model/executors.py', 'hummingbot/model/decimal_type_decorator.py',
     'hummingbot/strategy_v2/executors/recovery_inventory.py',
-    'controllers/generic/modular_spot_core/terminal_dust.py',
+    'controllers/generic/meridian_v3_unified_core/terminal_dust.py',
 ])
 async def test_prepared_claim_is_invalid_after_native_inventory_parser_drift(tmp_path, source):
     db, preflight, root, _, _, evidence = await stopped_fixture(tmp_path)
@@ -225,7 +225,7 @@ async def test_prepared_claim_is_invalid_after_native_inventory_parser_drift(tmp
 def test_signed_base_rebate_stays_owned_and_quote_fee_does_not_remove_base():
     from test.meridian_v3.test_terminal_dust_snapshot import native_fill
 
-    from controllers.generic.modular_spot_core.terminal_dust import filled_base
+    from controllers.generic.meridian_v3_unified_core.terminal_dust import filled_base
     buy = native_fill('entry', 'buy', 'BUY', '1', '100',
                       {'percent': '0', 'flat_fees': [{'token': 'BTC', 'amount': '-.001'}]})
     sell = native_fill('exit', 'sell', 'SELL', '1', '100',

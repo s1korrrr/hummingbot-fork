@@ -12,12 +12,12 @@ from decimal import Decimal
 
 from controllers.generic import meridian_v3_recipe as recipe
 from controllers.generic.meridian_v3_portfolio import BNBMRFeatures, BNBMRObservation, MeridianPortfolioRecipe
+from controllers.generic.meridian_v3_unified_core.terminal_dust import filled_base, terminal_dust
 from controllers.generic.modular_spot_core.bag import HeldBag
 from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError, decimal, identity
 from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 from controllers.generic.modular_spot_core.native_funding import funding_projection
 from controllers.generic.modular_spot_core.signals import signal_decision
-from controllers.generic.modular_spot_core.terminal_dust import filled_base, terminal_dust
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, ObservationRef, Opportunity
 from hummingbot.strategy_v2.components.recipe_contract import digest

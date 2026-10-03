@@ -54,7 +54,7 @@ SOURCES = (
     'hummingbot/core/data_type/common.py',
     'hummingbot/core/data_type/in_flight_order.py',
     'hummingbot/core/data_type/trade_fee.py',
-    'controllers/generic/modular_spot_core/terminal_dust.py',
+    'controllers/generic/meridian_v3_unified_core/terminal_dust.py',
     'controllers/generic/modular_spot_core/inventory.py',
     'controllers/generic/modular_spot_core/native_funding.py',
     'controllers/generic/modular_spot_core/domain.py',

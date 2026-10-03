@@ -5,11 +5,10 @@ complete immutable native evidence and an independently bound lot increment.
 """
 from decimal import Decimal
 
+from controllers.generic.modular_spot_core.domain import PolicyError, decimal
+from controllers.generic.modular_spot_core.native_funding import funding_projection
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.strategy_v2.models.executors import CloseType
-
-from .domain import PolicyError, decimal
-from .native_funding import funding_projection
 
 ZERO = Decimal('0')
 

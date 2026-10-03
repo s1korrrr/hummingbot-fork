@@ -47,9 +47,9 @@ def native_inventory_proof(connection, script_config, quantity_increments=None):
     must compare total held/active/selected/dust ownership with the fill totals.
     """
     # Local imports avoid the native funding/orchestrator startup import cycle.
+    from controllers.generic.meridian_v3_unified_core.terminal_dust import terminal_dust
     from controllers.generic.modular_spot_core.domain import decimal
     from controllers.generic.modular_spot_core.inventory import InventoryView
-    from controllers.generic.modular_spot_core.terminal_dust import terminal_dust
     from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 
     tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}

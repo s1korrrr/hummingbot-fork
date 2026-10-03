@@ -67,14 +67,17 @@ def funding_projection(fills, connector, pair):
                 or fill.trade_type not in ('BUY', 'SELL')):
             raise ValueError('Foreign or non-spot funding fill')
         record = ExecutorOrchestrator._trade_fill_order_record(fill)
-        decimal(fill.trade_fee_in_quote_decimal, 'native valued fee', minimum=None)
-        quote_fee = ZERO
+        valued_fee = decimal(fill.trade_fee_in_quote_decimal, 'native valued fee', minimum=None)
+        quote_fee = actual_quote_fee = ZERO
         for fee in fill.trade_fee['flat_fees']:
             amount = decimal(fee['amount'], 'actual fee', minimum=None)
             if fee['token'] not in (base, quote):
                 raise ValueError('Third-token funding fee is unsupported')
             if fee['token'] == quote:
                 quote_fee += amount
+            actual_quote_fee += amount * (fill.price_decimal if fee['token'] == base else Decimal('1'))
+        if actual_quote_fee != valued_fee:
+            raise ValueError('Native valued fee differs from actual currency fees')
         amount, price = fill.amount_decimal, fill.price_decimal
         notional = amount * price
         cash += (notional if fill.trade_type == 'BUY' else -notional) + quote_fee

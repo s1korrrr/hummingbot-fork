@@ -116,6 +116,39 @@ def test_signed_fee_validation_keeps_finite_supported_asset_and_cost_bounds():
         funding_projection([row], 'okx', 'BTC-USDC')
 
 
+@pytest.mark.parametrize(('token', 'actual_fee', 'recorded_quote_fee'), [
+    ('USDC', '0', '-.1'),       # Invented quote rebate.
+    ('USDC', '0', '.1'),        # Invented quote charge.
+    ('USDC', '.1', '-.1'),     # Recorded sign contradicts actual quote fee.
+    ('USDC', '-.1', '.1'),     # Recorded sign contradicts actual quote rebate.
+    ('BTC', '.01', '-.4'),    # Recorded sign contradicts base fee at fill price.
+    ('BTC', '-.01', '.4'),    # Recorded sign contradicts base rebate at fill price.
+])
+def test_native_quote_fee_valuation_must_equal_actual_currency_fees(token, actual_fee, recorded_quote_fee):
+    row = fill('buy', '1', 'BUY', '1', '40')
+    row.trade_fee = {'percent': '0', 'flat_fees': [{'token': token, 'amount': actual_fee}]}
+    row.trade_fee_in_quote = D(recorded_quote_fee)
+    row.exact_trade_fee_in_quote = recorded_quote_fee
+    with pytest.raises(ValueError):
+        funding_projection([row], 'okx', 'BTC-USDC')
+
+
+@pytest.mark.parametrize(('base_fee', 'quote_fee', 'valued_fee', 'quantity', 'cash'), [
+    ('.01', '-.1', '.3', '.99', '39.9'),
+    ('-.01', '.1', '-.3', '1.01', '40.1'),
+])
+def test_mixed_signed_actual_fees_match_exact_native_quote_valuation(base_fee, quote_fee, valued_fee, quantity, cash):
+    row = fill('buy', '1', 'BUY', '1', '40')
+    row.trade_fee = {'percent': '0', 'flat_fees': [{'token': 'BTC', 'amount': base_fee},
+                                                   {'token': 'USDC', 'amount': quote_fee}]}
+    row.trade_fee_in_quote = D(valued_fee)
+    row.exact_trade_fee_in_quote = valued_fee
+    projection = funding_projection([row], 'okx', 'BTC-USDC')
+    assert projection['inventory_base'] == D(quantity)
+    assert projection['cash_used'] == D(cash)
+    assert projection['inventory_cost'] == D(cash)
+
+
 def test_single_attempt_release_accepts_post_only_repair_entry_set():
     """One post-only cancel plus one filled replacement releases under single_attempt.
 

@@ -13,6 +13,7 @@ FEES = {
     "flat_both": lambda: AddedToCostTradeFee(flat_fees=[TokenAmount("ETH", D("0.0001")), TokenAmount("USDC", D("0.1"))]),
     "percent_base": lambda: AddedToCostTradeFee(percent=D("0.001"), percent_token="ETH"),
     "percent_quote": lambda: AddedToCostTradeFee(percent=D("0.001"), percent_token="USDC"),
+    "added_untokened": lambda: AddedToCostTradeFee(percent=D("0.001")),
     "deducted_untokened": lambda: DeductedFromReturnsTradeFee(percent=D("0.0008")),
 }
 
@@ -32,3 +33,17 @@ def order(side, fees):
 def test_in_flight_base_fee_equals_the_full_order_record(side, kinds):
     live = order(side, [FEES[kind]() for kind in kinds])
     assert in_flight_base_fee(live, "ETH") == base_fee_amount(live.to_json(), "ETH")
+
+
+@pytest.mark.parametrize('side,fee,expected', [
+    (TradeType.BUY, AddedToCostTradeFee(percent=D('.001')), D('0')),
+    (TradeType.BUY, DeductedFromReturnsTradeFee(percent=D('.001')), D('.0001')),
+    (TradeType.SELL, AddedToCostTradeFee(percent=D('.001')), D('.0001')),
+    (TradeType.SELL, DeductedFromReturnsTradeFee(percent=D('.001')), D('0')),
+    (TradeType.SELL, AddedToCostTradeFee(percent=D('-.001')), D('-.0001')),
+    (TradeType.SELL, AddedToCostTradeFee(percent=D('.001'), percent_token='USDC'), D('0')),
+])
+def test_implicit_spot_percent_fee_asset_matches_cost_or_returns(side, fee, expected):
+    live = order(side, [fee])
+    assert base_fee_amount(live.to_json(), 'ETH') == expected
+    assert in_flight_base_fee(live, 'ETH') == expected

@@ -675,6 +675,23 @@ def test_sell_percent_fee_charged_in_base_invalidates_executor_dust_receipt():
     assert not instance._get_total_position_value_usd().is_finite()
 
 
+@pytest.mark.parametrize('percent', ['0.00001', '-0.00001'])
+def test_implicit_sell_added_cost_percent_base_fee_invalidates_executor_dust_receipt(percent):
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee'].update(fee_type='AddedToCost', percent=percent, percent_token=None)
+
+    assert not instance._get_total_position_value_usd().is_finite()
+
+
+def test_explicit_sell_quote_percent_fee_preserves_executor_base_dust():
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee'].update(fee_type='AddedToCost', percent='0.00001', percent_token='USDC')
+
+    assert instance._get_total_position_value_usd() == D('0.01')
+
+
 @pytest.mark.parametrize('sell_quote_fee', ['0.01', '-0.01'])
 def test_sell_quote_fee_or_rebate_does_not_change_executor_base_dust(sell_quote_fee):
     instance, row = _completed_dust_exit()

@@ -386,6 +386,9 @@ def _derive_owner_residuals(connection, owner, quantity_increments=None):
         totals[asset] += amount
         ledger_by_executor[row['executor_id']] += amount
 
+    # persist_native_state writes Position from positions_held only. Keep that
+    # subtotal distinct from inventory still owned by active executors.
+    held_totals = dict(totals)
     executor_rows = connection.execute('SELECT * FROM Executors ORDER BY id').fetchall()
     active_ids = set()
     for row in executor_rows:
@@ -410,15 +413,35 @@ def _derive_owner_residuals(connection, owner, quantity_increments=None):
                     'fleet active executor lacks exact order snapshots')
             net = Decimal(0)
             local_seen = set()
+            local_orders = set()
             for snapshot in snapshots:
                 order = InFlightOrder.from_json(snapshot)
-                require(order.trading_pair == pair and order.current_state is OrderState.FILLED
-                        and order.executed_amount_base == order.amount,
-                        'fleet active executor contains an open or partial order')
-                order_record = connection.execute('SELECT config_file_path FROM "Order" WHERE id=?',
+                require(order.trading_pair == pair and order.client_order_id not in local_orders,
+                        'fleet active executor contains a foreign or duplicate order')
+                local_orders.add(order.client_order_id)
+                order_record = connection.execute('SELECT * FROM "Order" WHERE id=?',
                                                   (order.client_order_id,)).fetchone()
                 require(order_record is not None and order_record['config_file_path'] == script_config,
                         'fleet active native Order is not bound to its owner script')
+                if order.current_state is OrderState.CANCELED:
+                    # A settled, unfilled maker predecessor contributes no inventory.
+                    # The snapshot alone cannot establish cancellation or no fills.
+                    require(order.executed_amount_base == 0 and order.executed_amount_quote == 0
+                            and not order.order_fills
+                            and not any(fill.order_id == order.client_order_id for fill in native_fills)
+                            and order_record['market'] == 'okx' and order_record['symbol'] == pair
+                            and order.exchange_order_id
+                            and order_record['exchange_order_id'] == order.exchange_order_id
+                            and order_record['last_status'] == 'OrderCancelled',
+                            'fleet canceled predecessor lacks exact zero-fill ownership proof')
+                    cancellation = connection.execute(
+                        'SELECT 1 FROM OrderStatus WHERE order_id=? AND status=? AND timestamp=?',
+                        (order.client_order_id, 'OrderCancelled', order_record['last_update_timestamp'])).fetchone()
+                    require(cancellation is not None,
+                            'fleet canceled predecessor lacks a matching native cancellation event')
+                    continue
+                require(order.current_state is OrderState.FILLED and order.executed_amount_base == order.amount,
+                        'fleet active executor contains an open or partial order')
                 order_payload = order.to_json()
                 order_fills = order_payload.get('order_fills') or {}
                 fill_keys = {(order.client_order_id, str(trade_id)) for trade_id in order_fills}
@@ -449,7 +472,7 @@ def _derive_owner_residuals(connection, owner, quantity_increments=None):
 
     require(active_ids == {row['id'] for row in executor_rows if row['status'] in (2, 3)},
             'fleet active executor classification is incomplete')
-    # Position is a managed/held projection and may omit completed physical dust.
+    # Position is a held projection: it excludes active inventory and physical dust.
     position_rows = connection.execute('SELECT connector_name, trading_pair, amount FROM Position').fetchall()
     projected = defaultdict(Decimal)
     for row in position_rows:
@@ -461,7 +484,7 @@ def _derive_owner_residuals(connection, owner, quantity_increments=None):
         if amount:
             projected[row['trading_pair'].split('-')[0]] += amount
     for asset, amount in projected.items():
-        require(amount > 0 and abs(amount - totals[asset]) < Decimal('0.000001'),
+        require(amount > 0 and abs(amount - held_totals.get(asset, Decimal(0))) < Decimal('0.000001'),
                 'fleet positive position projection is not explained by exact receipts')
     for asset, amount in dust_totals.items():
         totals[asset] += amount

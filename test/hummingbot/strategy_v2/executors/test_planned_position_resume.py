@@ -631,8 +631,8 @@ def write_fleet_owner_snapshot(path, owner, *, active_amount=None):
                                 json.dumps({'remaining_position_amount_base': str(active_amount),
                                             'execution_order_snapshots': [order_payload],
                                             'order_ids': ['v3-entry-order']}, sort_keys=True)))
-            native_positions.append(('v3-position', 'v3-bnb-controller', 'BNB-USDC', active_amount))
-            native_fills.append(('meridian_v3.yml', 'v3-entry-order', 'v3-trade', 'BUY',
+            # Native Position persists positions_held; active executor inventory is separate.
+            native_fills.append((resume.FLEET_OWNERS[owner], 'v3-entry-order', 'v3-trade', 'BUY',
                                  active_amount, Decimal('100'), AddedToCostTradeFee().to_json()))
         elif owner == 'meridian_v3':
             native_positions.append(('v3-position', 'v3-bnb-controller', 'BNB-USDC', Decimal(0)))

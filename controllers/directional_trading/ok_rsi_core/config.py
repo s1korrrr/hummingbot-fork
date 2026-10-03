@@ -235,7 +235,7 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         if candles_connector != "okx":
             raise ValueError("OK RSI requires OKX spot candles")
         object.__setattr__(self, "candles_connector", candles_connector)
-        if self.data is not None and (
+        if self.uses_candle_service and (
             self.data.mode != "shared"
             or self.data.transport != "stream"
             or self.data.source_profile != "native"
@@ -244,8 +244,11 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
             raise ValueError(
                 "OK RSI data must be omitted or use mode shared, transport stream, native profile and no symbols"
             )
-        if service_requested and self.data is None:
-            raise ValueError("candles_connector okx_service requires a shared stream data block (origin, token_file)")
+        if service_requested:
+            if self.data is None:
+                raise ValueError("candles_connector okx_service requires a shared stream data block (origin, token_file)")
+            if not self.uses_candle_service:
+                raise ValueError("candles_connector okx_service selects the direct OK RSI candle service")
 
         candles_trading_pair = str(self.candles_trading_pair or self.trading_pair).strip().upper()
         if candles_trading_pair != self.trading_pair:

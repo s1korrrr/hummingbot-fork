@@ -29,6 +29,35 @@ FAMILIES = [
 ]
 
 
+@pytest.mark.parametrize('mode,transport', [('native', None), ('shared', 'stream'), ('shared', 'snapshot')])
+def test_ok_rsi_composition_data_is_owned_once_by_native_provider(mode, transport, monkeypatch):
+    from hummingbot.data_feed.candles_feed.okx_service_candles import service_hub
+
+    def unexpected_service_route(*args, **kwargs):
+        raise AssertionError('composition must not configure the direct OK RSI candle service')
+
+    monkeypatch.setattr(service_hub, 'configure_service_candles', unexpected_service_route)
+    data = (DataPolicy() if mode == 'native' else
+            DataPolicy(mode='shared', transport=transport, origin='http://127.0.0.1:8100', token_file='/unused'))
+    config = ModularOKRSIControllerConfig(id='modular_spot_data_owner', data=data)
+    assert config.data.mode == mode
+    assert config.uses_candle_service is False
+    controller = ModularOKRSIController(config, provider(), asyncio.Queue())
+    assert (controller.shared_candles is not None) is (mode == 'shared')
+
+
+def test_default_ok_rsi_composition_uses_native_data_without_service():
+    config = ModularOKRSIControllerConfig(id='modular_spot_native_default')
+    assert config.data.mode == 'native'
+    assert config.uses_candle_service is False
+
+
+def test_ok_rsi_composition_rejects_direct_service_selector():
+    data = DataPolicy(mode='shared', transport='stream', origin='http://127.0.0.1:8100', token_file='/unused')
+    with pytest.raises(ValueError, match='direct OK RSI candle service'):
+        ModularOKRSIControllerConfig(id='modular_spot_data_owner', candles_connector='okx_service', data=data)
+
+
 def provider():
     value = MagicMock()
     value.ready = True

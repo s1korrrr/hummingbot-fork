@@ -122,6 +122,13 @@ class NativeCompositionFields(BaseModel):
     """Additional fields; all strategy parameters come from the actual native schema."""
     _native_family: ClassVar[str]
     _public_module: ClassVar[str | None] = None
+
+    @property
+    def uses_candle_service(self) -> bool:
+        # Shared composition candles are owned by NativeCandleProvider, not the
+        # direct OK RSI service route inherited through its native controller.
+        return False
+
     execution_mode: Literal['live', 'paper'] = 'live'
     execution_enabled: StrictBool = Field(default=False, json_schema_extra={'is_updatable': True})
     data: DataPolicy = Field(default_factory=DataPolicy)

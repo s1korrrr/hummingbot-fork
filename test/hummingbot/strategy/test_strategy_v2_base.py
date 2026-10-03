@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 import pandas as pd
 
 import hummingbot.strategy.strategy_v2_base as strategy_v2_base_module
-from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
@@ -156,6 +155,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
     async def test_real_ok_rsi_controller_task_waits_for_recovery_claim_before_metadata_writes(self):
         from controllers.directional_trading.ok_rsi import OKRSIController
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
         from controllers.directional_trading.ok_rsi_core.entry_decisions import MetadataEntryDecisionStore
         from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 
@@ -294,6 +294,11 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
     @staticmethod
     def _direct_ok_rsi_config(controller_id: str, *, origin: str = None):
+        # Other native tests intentionally purge and re-import ``controllers``.
+        # Resolve the class from the current module instance at call time so the
+        # fixture has the same identity as StrategyV2Base's runtime import.
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+
         data = (DataPolicy(mode="shared", transport="stream", origin=origin,
                            token_file="/tmp/test-candle-token") if origin else None)
         return OKRSIControllerConfig(id=controller_id, data=data)
@@ -329,6 +334,8 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                 self.assertEqual(add_controller.call_count, 2)
 
     def test_direct_ok_rsi_policy_guard_does_not_restrict_subclass_composition(self):
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+
         class CompositionConfig(OKRSIControllerConfig):
             pass
 

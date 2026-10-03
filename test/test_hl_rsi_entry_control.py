@@ -427,12 +427,18 @@ def test_native_persisted_scalar_buy_side_keeps_terminal_dust_and_visible_capita
     assert instance._filter_same_side(TradeType.BUY) == [seed]
 
 
-def test_missing_native_buy_side_with_owned_history_cannot_vanish_from_capital():
+@pytest.mark.parametrize('side,config_side', [
+    (None, TradeType.BUY),
+    (TradeType.SELL.value, TradeType.BUY),
+    (TradeType.BUY.value, TradeType.SELL),
+])
+def test_invalid_native_buy_side_with_owned_history_cannot_vanish_from_capital(side, config_side):
     instance = _controller()
     seed = _buy_executor(
         filled_base=D('0.2'), remaining_base=D('0.2'),
         accounting_owner='executor', receipt_remaining=D('0.2'))
-    seed.side = None
+    seed.side = side
+    seed.config.side = config_side
     instance.executors_info = []
     recorder = MagicMock()
     recorder.get_executors_by_controller.return_value = [seed]

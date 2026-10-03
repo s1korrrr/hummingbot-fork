@@ -2300,8 +2300,7 @@ class HLRSIController(DirectionalTradingControllerBase):
                 price = self._decimal_or_none(self._get_mid_price())
                 if price is None or price <= 0:
                     return Decimal("Infinity")
-                if not self._inventory_is_dust(amount, price):
-                    held_value = amount * price
+                held_value = amount * price
             dust = self._terminal_dust_reserve_base()
             if dust is None:
                 return Decimal("Infinity")

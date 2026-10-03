@@ -22,6 +22,7 @@ from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, O
 from hummingbot.strategy_v2.components.recipe_contract import digest
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
 from hummingbot.strategy_v2.controllers.portfolio_target_store_v3 import NativeTargetStore
+from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.portfolio_v3.contracts import AssetState, Commitment, PortfolioSnapshot
 from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import (
     CAPITAL_DOMAIN_UNPROVEN,
@@ -277,6 +278,60 @@ class MeridianPortfolio:
         return target
 
     # ------------------------------------------------------------------ native snapshot
+    def terminal_dust(self, views, evidence, fills, pair, amount_step):
+        """Retain completed tranche dust in owned quantity and cost, never sell authority.
+
+        The native executor reports dust separately from its managed remainder.
+        Individual sublot residuals can accumulate above one lot across exits.
+        Inventory ownership is already validated by the symbol inventory reader;
+        the fill comparison below still rejects any unexplained aggregate amount.
+        """
+        by_id = {info.id: info for info in evidence}
+        amount, basis, used_orders, trade_ids = ZERO, ZERO, set(), set()
+        for key, view in views.items():
+            info = by_id[key]
+            receipt = info.custom_info['execution_receipt']
+            dust = decimal(receipt.get('residual_dust_base', '0'), 'terminal dust')
+            if dust == 0:
+                continue
+            step = decimal(info.custom_info['close_quantity']['quantity_increment'], 'dust lot', positive=True)
+            if (not view.terminal or info.is_active or not info.is_done or view.held
+                    or view.remaining_base != 0 or receipt['accounting_owner'] != 'executor'
+                    or decimal(receipt['remaining_owned_base'], 'dust remainder') != 0
+                    or step != amount_step or dust >= step or view.entry_quote <= 0
+                    or info.close_type != CloseType.TRAILING_STOP
+                    or decimal(info.close_timestamp, 'dust close time', positive=True) <= 0):
+                raise PolicyError('unverified native terminal dust')
+            order_ids = info.custom_info['order_ids']
+            if (not isinstance(order_ids, list) or not order_ids
+                    or any(not isinstance(key, str) or not key for key in order_ids)
+                    or len(set(order_ids)) != len(order_ids) or used_orders.intersection(order_ids)):
+                raise PolicyError('terminal dust order identity unavailable')
+            selected = [fill for fill in fills if fill.order_id in order_ids]
+            if {fill.order_id for fill in selected} != set(order_ids):
+                raise PolicyError('terminal dust native fills incomplete')
+            totals = {'BUY': [ZERO, ZERO], 'SELL': [ZERO, ZERO]}
+            for fill in selected:
+                if (fill.symbol != pair or fill.trade_type not in totals or not fill.exchange_trade_id
+                        or fill.exchange_trade_id in trade_ids):
+                    raise PolicyError('terminal dust native fill identity invalid')
+                trade_ids.add(fill.exchange_trade_id)
+                filled = decimal(fill.amount_decimal, 'dust fill amount', positive=True)
+                price = decimal(fill.price_decimal, 'dust fill price', positive=True)
+                totals[fill.trade_type][0] += filled
+                totals[fill.trade_type][1] += filled * price
+            if (totals['BUY'][0] <= 0 or totals['SELL'][0] <= 0
+                    or totals['BUY'] != [decimal(receipt['entry_gross_base'], 'dust entry base'),
+                                         decimal(receipt['entry_gross_quote'], 'dust entry quote')]
+                    or totals['SELL'] != [decimal(receipt['exit_gross_base'], 'dust exit base'),
+                                          decimal(receipt['exit_gross_quote'], 'dust exit quote')]
+                    or filled_base(selected, pair) != dust):
+                raise PolicyError('terminal dust native fill arithmetic mismatch')
+            used_orders.update(order_ids)
+            amount += dust
+            basis += dust * view.entry_price
+        return amount, basis
+
     def snapshot(self, now_ms):
         """Attributed fixed-envelope state from native fills, executors, positions and books.
 
@@ -320,10 +375,12 @@ class MeridianPortfolio:
             projection = funding_projection(pair_fills, config.connector_name, pair)
             consumed += projection['cash_used']
             loose = {key: v for key, v in views.items() if not v.held}
-            quantity = held.amount + sum((v.remaining_base for v in loose.values()), ZERO)
-            if abs(filled_base(pair_fills, pair) - quantity) > book['amount_step']:
+            dust, dust_basis = self.terminal_dust(loose, evidence, pair_fills, pair, book['amount_step'])
+            quantity = held.amount + sum((v.remaining_base for v in loose.values()), ZERO) + dust
+            difference = abs(filled_base(pair_fills, pair) - quantity)
+            if difference > (ZERO if dust > 0 else book['amount_step']):
                 holds.append(f'{NATIVE_INVENTORY_MISMATCH}:{pair}')
-            basis = (held.amount * held.breakeven_price + held.remaining_fees_quote
+            basis = (held.amount * held.breakeven_price + held.remaining_fees_quote + dust_basis
                      + sum((v.remaining_base * v.entry_price for v in loose.values()), ZERO))
             for key, view in loose.items():
                 unfilled = max(view.planned_quote - view.entry_quote, ZERO)

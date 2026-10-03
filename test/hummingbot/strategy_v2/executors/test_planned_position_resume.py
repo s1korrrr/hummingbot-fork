@@ -939,6 +939,174 @@ async def test_terminal_claim_accepts_only_archived_prospective_daily_risk_enrol
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('case', [
+    'normal', 'insert_failure', 'risk', 'decision', 'position', 'fee',
+    'new_order', 'extra_metadata', 'archive', 'config', 'source',
+])
+async def test_failed_preclaim_forward_repair_supersedes_only_unclaimed_manifest_atomically(tmp_path, case):
+    import hashlib
+
+    from hummingbot.strategy_v2.migrations.entry_risk import financial_state_digest
+
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    keys = ['ok-rsi-entry-decision:test-' + str(index) for index in range(5)]
+    initial_decision = json.dumps({'version': 1, 'candle': 600, 'armed': True,
+                                   'consumed_candle': 0, 'authorization': None}, sort_keys=True)
+    for path in (db, preflight):
+        with sqlite3.connect(path) as connection:
+            connection.executemany('INSERT INTO Metadata(key, value) VALUES (?, ?)',
+                                   [(key, initial_decision) for key in keys])
+    bound_preflight = tmp_path / 'bound-forward-preflight.sqlite'
+    with sqlite3.connect(preflight) as source, sqlite3.connect(bound_preflight) as destination:
+        source.backup(destination)
+        destination.execute('PRAGMA journal_mode=DELETE').fetchone()
+    preflight = bound_preflight
+    stopped_backup = tmp_path / 'sealed-stopped.sqlite'
+    with sqlite3.connect(db) as source, sqlite3.connect(stopped_backup) as destination:
+        source.backup(destination)
+        destination.execute('PRAGMA journal_mode=DELETE').fetchone()
+    preflight_sha = hashlib.sha256(preflight.read_bytes()).hexdigest()
+    evidence['preflight_sha256'] = preflight_sha
+    (root / 'conf/scripts/ok_rsi.yml').write_text(
+        (root / 'conf/scripts/ok_rsi.yml').read_text() + "max_daily_loss_quote: '1000'\n")
+    apply_prospective_daily_enrollment(db)
+    evidence = refresh_stopped_evidence(db, evidence, 1002)
+    old = resume.prepare(db, preflight, evidence, now=1002, root=root,
+                         terminal_suspended_executor_ids=(terminal.config.id,),
+                         continuity_executor_ids=(sol.config.id,))
+    with sqlite3.connect(db) as connection:
+        for key in keys:
+            current = json.loads(initial_decision)
+            current['candle'] = 960
+            connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                               (json.dumps(current, sort_keys=True), key))
+        connection.execute('UPDATE Position SET timestamp=1003000, unrealized_pnl_quote=1000000')
+        archive = json.loads(connection.execute(
+            'SELECT value FROM Metadata WHERE key=?',
+            (old['risk_transition_binding']['archive_key'],)).fetchone()[0])
+        archived_after = archive['after']
+        from hummingbot.strategy_v2.models.entry_risk_enrollment import EntryRiskEnrollment
+        enrollment = EntryRiskEnrollment.model_validate(archived_after['entry_risk_enrollment'])
+        daily, initialized = enrollment.start(1003, Decimal('5'))
+        daily.observe(1003.5, Decimal('6'))
+        failed_risk = {**archived_after, 'entry_risk_enrollment': initialized.snapshot(),
+                       'daily_entry_risk': daily.snapshot()}
+        connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                           (resume.canonical(failed_risk), 'strategy-risk:ok_rsi.yml'))
+    fresh = refresh_stopped_evidence(db, evidence, 1004)
+    old_files_digest = resume.digest(old['files'])
+    source_transition = {'old_files_sha256': old_files_digest, 'new_files_sha256': old_files_digest}
+    with sqlite3.connect(stopped_backup) as before, sqlite3.connect(db) as current:
+        stopped_financial = financial_state_digest(before)
+        current_financial = financial_state_digest(current)
+    archive_key = old['risk_transition_binding']['archive_key']
+    with sqlite3.connect(db) as connection:
+        archive = connection.execute('SELECT value FROM Metadata WHERE key=?', (archive_key,)).fetchone()[0]
+    new_decision = json.dumps({'version': 1, 'candle': 960, 'armed': True,
+                               'consumed_candle': 0, 'authorization': None}, sort_keys=True)
+    boot = {'process_sha256': 'a' * 64, 'venue_sha256': 'b' * 64,
+            'image_sha256': 'sha256:' + 'c' * 64, 'started_at': 1002, 'finished_at': 1003.7,
+            'venue_observed_at': 1003.8}
+    process_path, venue_path = tmp_path / 'failed-boot-process.json', tmp_path / 'failed-boot-venue.json'
+    process = {'container_id': 'synthetic-container', 'image': boot['image_sha256'],
+               'started_at': 1002, 'finished_at': 1003.7, 'running': False, 'exit_code': 0}
+    venue = {'observed_at': 1003.8, 'http_methods': ['GET'], 'native_application_started': False,
+             'window_begin_ms': 1000000, 'window_end_ms': 1005700,
+             'fills': {'code': '0', 'data': [], 'msg': ''}, 'pending': [
+                 {'pair': pair, 'regular': [], 'regular_count': 0,
+                  'algos': {name: [] for name in resume.SPOT_ALGO_TYPES}, 'algo_count': 0}
+                 for pair in evidence['reconciliation']['controller_pairs'].values()],
+             'container_proof': process}
+    process_path.write_text(json.dumps(process))
+    venue_path.write_text(json.dumps(venue))
+    boot['process_sha256'] = hashlib.sha256(process_path.read_bytes()).hexdigest()
+    boot['venue_sha256'] = hashlib.sha256(venue_path.read_bytes()).hexdigest()
+    proof = {'schema_version': 1, 'kind': 'v1_failed_preclaim_startup_forward_repair',
+             'old_manifest_id': old['id'], 'old_manifest_sha256': resume.digest(old),
+             'stopped_backup_sha256': hashlib.sha256(stopped_backup.read_bytes()).hexdigest(),
+             'failed_boot': boot,
+             'original_preflight_sha256': preflight_sha, 'source_transition': source_transition,
+             'risk_archive_sha256': hashlib.sha256(archive.encode()).hexdigest(),
+             'stopped_financial_state_sha256': stopped_financial,
+             'current_financial_state_sha256': current_financial,
+             'failed_boot_risk_state': failed_risk, 'pending_risk_state': archived_after,
+             'decision_values': {key: {'before': initial_decision, 'after': new_decision} for key in keys},
+             'position_marks': {}}
+    if case == 'insert_failure':
+        with sqlite3.connect(db) as connection:
+            connection.execute("CREATE TRIGGER reject_forward_repair BEFORE INSERT ON PlannedPositionResume "
+                               "BEGIN SELECT RAISE(ABORT, 'forced insert failure'); END")
+            connection.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        fresh = refresh_stopped_evidence(db, fresh, 1004)
+        with patch.object(resume, '_forward_repair_precheck', return_value=proof):
+            with pytest.raises(sqlite3.IntegrityError, match='forced insert failure'):
+                resume.prepare(db, preflight, fresh, now=1004, root=root,
+                               terminal_suspended_executor_ids=(terminal.config.id,),
+                               continuity_executor_ids=(sol.config.id,),
+                               supersede_prepared_id=old['id'], stopped_backup_path=stopped_backup,
+                               reviewed_source_transition=source_transition,
+                               failed_boot_process_proof_path=process_path,
+                               failed_boot_venue_proof_path=venue_path)
+        rows = resume.inspect_manifest(db)
+        assert len(rows) == 1 and rows[0]['state'] == 'prepared'
+        with sqlite3.connect(db) as connection:
+            assert json.loads(connection.execute(
+                'SELECT value FROM Metadata WHERE key=?', ('strategy-risk:ok_rsi.yml',)).fetchone()[0]) == failed_risk
+        return
+    with patch.object(resume, '_forward_repair_precheck', return_value=proof):
+        replacement = resume.prepare(
+            db, preflight, fresh, now=1004, root=root,
+            terminal_suspended_executor_ids=(terminal.config.id,),
+            continuity_executor_ids=(sol.config.id,),
+            supersede_prepared_id=old['id'], stopped_backup_path=stopped_backup,
+            reviewed_source_transition=source_transition,
+            failed_boot_process_proof_path=process_path,
+            failed_boot_venue_proof_path=venue_path)
+    rows = {row['id']: row for row in resume.inspect_manifest(db)}
+    assert rows[old['id']]['state'] == 'superseded' and rows[old['id']]['claimed_at'] is None
+    assert rows[replacement['id']]['state'] == 'prepared'
+    assert resume.pending_manifest(db, now=1005, root=root) == replacement
+    if case != 'normal':
+        if case in {'config', 'source'}:
+            path = root / ('conf/scripts/ok_rsi.yml' if case == 'config' else resume.SOURCES[0])
+            path.write_text(path.read_text() + '\n# changed after sealing\n')
+        else:
+            with sqlite3.connect(db) as connection:
+                if case == 'risk':
+                    connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                                       (resume.canonical(failed_risk), 'strategy-risk:ok_rsi.yml'))
+                elif case == 'decision':
+                    connection.execute('UPDATE Metadata SET value=? WHERE key=?', (initial_decision, keys[0]))
+                elif case == 'position':
+                    connection.execute('UPDATE Position SET timestamp=timestamp+1')
+                elif case == 'fee':
+                    connection.execute('UPDATE TradeFillExact SET fee_in_quote=?', ('1',))
+                elif case == 'new_order':
+                    connection.execute('UPDATE "Order" SET last_status=?', ('New',))
+                elif case == 'extra_metadata':
+                    connection.execute('INSERT INTO Metadata(key, value) VALUES (?, ?)', ('other-key', '1'))
+                else:
+                    connection.execute('UPDATE Metadata SET value=? WHERE key=?', ('{}', archive_key))
+        with pytest.raises(ValueError):
+            resume.pending_manifest(db, now=1005, root=root)
+        assert {row['id']: row['state'] for row in resume.inspect_manifest(db)} == {
+            old['id']: 'superseded', replacement['id']: 'prepared'}
+        return
+    repeated = refresh_stopped_evidence(db, fresh, 1006)
+    with patch.object(resume, '_forward_repair_precheck', return_value=proof):
+        with pytest.raises(ValueError, match='forward repair|prepared'):
+            resume.prepare(db, preflight, repeated, now=1006, root=root,
+                           terminal_suspended_executor_ids=(terminal.config.id,),
+                           continuity_executor_ids=(sol.config.id,),
+                           supersede_prepared_id=old['id'], stopped_backup_path=stopped_backup,
+                           reviewed_source_transition=source_transition,
+                           failed_boot_process_proof_path=process_path,
+                           failed_boot_venue_proof_path=venue_path)
+    resume.claim(db, replacement, now=1005, root=root)
+    assert resume.pending_manifest(db, now=1006, root=root) is None
+
+
+@pytest.mark.asyncio
 async def test_terminal_daily_risk_enrollment_requires_exact_staged_limit(tmp_path):
     db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
     (root / 'conf/scripts/ok_rsi.yml').write_text(

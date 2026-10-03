@@ -79,6 +79,111 @@ def financial_state_digest_before_prospective_daily_enrollment(connection, scrip
         omitted_metadata_keys=(archive_key,))
 
 
+def validate_stopped_forward_repair_delta(before, current, *, script_config, controller_pairs, archive_key,
+                                          observed_at, failed_boot_started_at=None, failed_boot_finished_at=None):
+    """Prove the only post-enrollment boot writes are five candle marks and held-position valuations.
+
+    `before` is a consistent SQLite backup of the stopped owner before risk enrollment. The
+    caller must separately bind that backup to the original owner and its immutable risk archive.
+    This function deliberately does not infer venue prices or authorize an executor claim.
+    """
+    _require(script_config == 'ok_rsi.yml' and isinstance(controller_pairs, dict)
+             and set(controller_pairs) == {'ok-rsi-bnb', 'ok-rsi-btc', 'ok-rsi-eth', 'ok-rsi-sol', 'ok-rsi-xrp'},
+             'Forward repair is restricted to the five V1 OK-RSI owners')
+    _require(type(observed_at) in (int, float) and math.isfinite(observed_at) and observed_at > 0,
+             'Forward repair observation time is invalid')
+    _require(type(failed_boot_started_at) in (int, float) and math.isfinite(failed_boot_started_at)
+             and type(failed_boot_finished_at) in (int, float) and math.isfinite(failed_boot_finished_at)
+             and 0 < failed_boot_started_at < failed_boot_finished_at <= observed_at,
+             'Forward repair failed-boot window is invalid')
+    expected_decisions = {
+        'ok-rsi-entry-decision:' + json.dumps([script_config, cid, 'okx', pair, '1m'], separators=(',', ':'))
+        for cid, pair in controller_pairs.items()
+    }
+    _require(len(expected_decisions) == 5, 'Forward repair decision scope is invalid')
+    available_before = {row[0] for row in before.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    available_current = {row[0] for row in current.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    _require(set(TABLES) <= available_before and set(TABLES) <= available_current,
+             'Forward repair complete native financial tables are required')
+    decision_values = {}
+    marks = {}
+    for table in TABLES:
+        if table not in available_before:
+            continue
+        old_schema = before.execute('SELECT sql FROM sqlite_master WHERE name=?', (table,)).fetchone()[0]
+        new_schema = current.execute('SELECT sql FROM sqlite_master WHERE name=?', (table,)).fetchone()[0]
+        _require(old_schema == new_schema, 'Forward repair financial table schema changed')
+        columns = [row[1] for row in before.execute(f'PRAGMA table_info("{table}")')]
+        order = ','.join('"' + name.replace('"', '""') + '"' for name in columns)
+        old_rows = [dict(zip(columns, row)) for row in before.execute(f'SELECT * FROM "{table}" ORDER BY {order}')]
+        new_rows = [dict(zip(columns, row)) for row in current.execute(f'SELECT * FROM "{table}" ORDER BY {order}')]
+        if table == 'Metadata':
+            old_values = {row['key']: row['value'] for row in old_rows}
+            new_values = {row['key']: row['value'] for row in new_rows}
+            risk_key = 'strategy-risk:' + script_config
+            _require(set(old_values) == set(new_values) - {archive_key}
+                     and expected_decisions <= set(old_values) and archive_key in new_values,
+                     'Forward repair Metadata keys changed outside the risk archive')
+            for key in old_values:
+                if key == risk_key:
+                    continue  # The exact archived transition is validated by the caller.
+                if key not in expected_decisions:
+                    _require(old_values[key] == new_values[key], 'Forward repair unrelated Metadata changed')
+                    continue
+                try:
+                    old, new = json.loads(old_values[key]), json.loads(new_values[key])
+                except (TypeError, ValueError):
+                    raise ValueError('Forward repair entry decision is malformed') from None
+                fields = {'version', 'candle', 'armed', 'consumed_candle', 'authorization'}
+                _require(isinstance(old, dict) and isinstance(new, dict)
+                         and set(old) == fields and set(new) == fields
+                         and old['version'] == new['version'] == 1
+                         and type(old['candle']) is int and type(new['candle']) is int
+                         and old['candle'] > 0 and new['candle'] > old['candle']
+                         and (new['candle'] - old['candle']) % 60 == 0
+                         and failed_boot_started_at - 60 <= new['candle'] <= failed_boot_finished_at
+                         and all(old[field] == new[field] for field in fields - {'candle'})
+                         and type(old['armed']) is bool and type(new['armed']) is bool
+                         and type(old['consumed_candle']) is int
+                         and 0 <= old['consumed_candle'] <= old['candle'],
+                         'Forward repair entry decision differs beyond monotonic candle time')
+                decision_values[key] = {'before': old_values[key], 'after': new_values[key]}
+        elif table == 'Position':
+            old_positions = {row['id']: row for row in old_rows}
+            new_positions = {row['id']: row for row in new_rows}
+            _require(len(old_positions) == len(old_rows) and len(new_positions) == len(new_rows)
+                     and set(old_positions) == set(new_positions),
+                     'Forward repair held-position identity changed')
+            for position_id, old in old_positions.items():
+                new = new_positions[position_id]
+                _require(all(old[field] == new[field]
+                             for field in old if field not in {'timestamp', 'unrealized_pnl_quote'}),
+                         'Forward repair held-position inventory, cost or fees changed')
+                _require(type(old['timestamp']) is int and type(new['timestamp']) is int
+                         and old['timestamp'] <= new['timestamp'] <= observed_at * 1000
+                         and type(new['unrealized_pnl_quote']) is int
+                         and type(new['amount']) is int and new['amount'] > 0
+                         and type(new['breakeven_price']) is int and new['breakeven_price'] > 0
+                         and new['side'] == 'BUY'
+                         and Decimal(new['breakeven_price']) / 10**6
+                         + Decimal(new['unrealized_pnl_quote']) / Decimal(new['amount']) > 0,
+                         'Forward repair held-position mark is invalid')
+                if old != new:
+                    _require(failed_boot_started_at * 1000 <= new['timestamp']
+                             <= failed_boot_finished_at * 1000,
+                             'Forward repair held-position mark is outside failed boot')
+                    marks[position_id] = {'before': [old['timestamp'], old['unrealized_pnl_quote']],
+                                          'after': [new['timestamp'], new['unrealized_pnl_quote']]}
+        else:
+            _require(old_rows == new_rows, f'Forward repair {table} rows changed')
+    _require(set(decision_values) == expected_decisions and len(marks) == 5,
+             'Forward repair requires the exact five observed decision and mark updates')
+    return {'schema_version': 1, 'kind': 'v1_failed_preclaim_startup_forward_repair',
+            'stopped_financial_state_sha256': financial_state_digest(before),
+            'current_financial_state_sha256': financial_state_digest(current),
+            'decision_values': decision_values, 'position_marks': marks}
+
+
 def _validate_state(state, controllers):
     _require(isinstance(state, dict) and type(state.get('version')) is int and state['version'] in (1, 2),
              'Invalid native risk state version')

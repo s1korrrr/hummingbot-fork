@@ -36,9 +36,13 @@ from hummingbot.strategy_v2.executors.recovery_inventory import (
 )
 from hummingbot.strategy_v2.executors.restart_continuity import RestartContinuityError, continuity_plan
 from hummingbot.strategy_v2.migrations.entry_risk import (
+    financial_state_digest,
     financial_state_digest_before_prospective_daily_enrollment,
     validate_prospective_daily_enrollment_archive,
+    validate_stopped_forward_repair_delta,
 )
+from hummingbot.strategy_v2.models.daily_entry_risk import DailyEntryRisk
+from hummingbot.strategy_v2.models.entry_risk_enrollment import EntryRiskEnrollment
 from hummingbot.strategy_v2.models.executors import CloseType
 
 TABLE = 'PlannedPositionResume'
@@ -1600,8 +1604,29 @@ def validate_reconciliation(db_path, evidence, now, *, terminal_suspended_execut
 
 def consumed_history(connection, pending_id=None):
     """Read immutable consumed receipts; another prepared or unknown row blocks reuse."""
-    rows = ([dict(row) for row in connection.execute(f'SELECT * FROM {TABLE} ORDER BY id')
-             if row['id'] != pending_id] if TABLE in tables(connection) else [])
+    all_rows = ([dict(row) for row in connection.execute(f'SELECT * FROM {TABLE} ORDER BY id')]
+                if TABLE in tables(connection) else [])
+    superseded = [row for row in all_rows if row['state'] == 'superseded']
+    require(len(superseded) <= 1, 'multiple forward repair predecessors are unsupported')
+    for old_row in superseded:
+        require(old_row['claimed_at'] is None, 'superseded manifest was previously claimed')
+        try:
+            old = json.loads(old_row['payload'])
+            successors = [row for row in all_rows if row['state'] in ('prepared', 'claimed')
+                          and json.loads(row['payload']).get('forward_repair', {}).get('old_manifest_id')
+                          == old_row['id']]
+            require(len(successors) == 1, 'superseded manifest has no unique successor')
+            successor = json.loads(successors[0]['payload'])
+            proof = successor['forward_repair']
+            require(old['schema'] == 1 and old['id'] == old_row['id']
+                    and proof['old_manifest_sha256'] == digest(old)
+                    and old['created_at'] <= successor['created_at']
+                    and {position['executor_id'] for position in old['positions']}
+                    == {position['executor_id'] for position in successor['positions']},
+                    'superseded manifest or forward repair link differs')
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('invalid forward repair predecessor history') from None
+    rows = [row for row in all_rows if row['id'] != pending_id and row['state'] != 'superseded']
     payloads = {}
     for row in rows:
         require(row['state'] == 'claimed', 'manifest history contains an unconsumed or unknown state')
@@ -1761,6 +1786,167 @@ def risk_transition_binding(connection, script_config, controllers, before_state
         expected_native_state_sha256=expected_native_state)
 
 
+def _validated_failed_boot_receipts(process_path, venue_path, controller_pairs, old_created_at, observed_at):
+    """Check the bounded stopped boot and GET-only venue observations; seal hashes, not private IDs."""
+    require(process_path is not None and venue_path is not None,
+            'forward repair requires failed-boot process and venue receipts')
+    process_path, venue_path = Path(process_path), Path(venue_path)
+    process, venue = json.loads(process_path.read_text()), json.loads(venue_path.read_text())
+    require(isinstance(process, dict) and set(process) == {
+        'container_id', 'image', 'started_at', 'finished_at', 'running', 'exit_code'},
+        'forward repair process receipt is malformed')
+    started, finished = process['started_at'], process['finished_at']
+    require(isinstance(process['container_id'], str) and process['container_id']
+            and isinstance(process['image'], str) and process['image'].startswith('sha256:')
+            and len(process['image']) == 71
+            and all(char in '0123456789abcdef' for char in process['image'][7:])
+            and process['running'] is False and type(process['exit_code']) is int and process['exit_code'] == 0
+            and type(started) in (int, float) and type(finished) in (int, float)
+            and math.isfinite(started) and math.isfinite(finished)
+            and old_created_at <= started < finished <= observed_at,
+            'forward repair failed-boot process is outside the unclaimed preparation window')
+    require(isinstance(venue, dict) and set(venue) == {
+        'observed_at', 'http_methods', 'native_application_started', 'window_begin_ms',
+        'window_end_ms', 'fills', 'pending', 'container_proof'},
+        'forward repair venue receipt is malformed')
+    require(venue['container_proof'] == process and venue['http_methods'] == ['GET']
+            and venue['native_application_started'] is False
+            and type(venue['observed_at']) in (int, float) and math.isfinite(venue['observed_at'])
+            and finished <= venue['observed_at'] <= observed_at
+            and type(venue['window_begin_ms']) is int and type(venue['window_end_ms']) is int
+            and started * 1000 - 5000 <= venue['window_begin_ms'] <= started * 1000
+            and finished * 1000 <= venue['window_end_ms'] <= finished * 1000 + 5000,
+            'forward repair venue read is not bound to the failed boot window')
+    fills = venue['fills']
+    require(isinstance(fills, dict) and set(fills) == {'code', 'data', 'msg'}
+            and fills['code'] == '0' and fills['data'] == []
+            and isinstance(fills['msg'], str), 'forward repair venue fills are incomplete or nonempty')
+    pending = venue['pending']
+    require(isinstance(pending, list) and len(pending) == 5
+            and {item.get('pair') for item in pending if isinstance(item, dict)} == set(controller_pairs.values()),
+            'forward repair venue pending pair scope differs')
+    for item in pending:
+        require(set(item) == {'pair', 'regular', 'regular_count', 'algos', 'algo_count'}
+                and item['regular'] == [] and type(item['regular_count']) is int and item['regular_count'] == 0
+                and isinstance(item['algos'], dict) and set(item['algos']) == set(SPOT_ALGO_TYPES)
+                and all(value == [] for value in item['algos'].values())
+                and type(item['algo_count']) is int and item['algo_count'] == 0,
+                'forward repair venue pending orders are incomplete or nonempty')
+    return {'process_sha256': _preflight_file_sha256(process_path),
+            'venue_sha256': _preflight_file_sha256(venue_path),
+            'image_sha256': process['image'], 'started_at': started, 'finished_at': finished,
+            'venue_observed_at': venue['observed_at']}
+
+
+def _forward_repair_precheck(db_path, preflight_path, stopped_backup_path, evidence, old_id,
+                             reviewed_source_transition, files, now, root,
+                             failed_boot_process_proof_path, failed_boot_venue_proof_path):
+    """Bind one failed, unclaimed V1 boot to its immutable stopped-owner risk source."""
+    require(isinstance(old_id, str) and old_id and isinstance(reviewed_source_transition, dict)
+            and set(reviewed_source_transition) == {'old_files_sha256', 'new_files_sha256'},
+            'explicit reviewed source transition and prepared manifest ID required')
+    stopped_backup_path = Path(stopped_backup_path)
+    require(stopped_backup_path.resolve() not in {Path(db_path).resolve(), Path(preflight_path).resolve()},
+            'forward repair requires a separate sealed stopped-owner backup')
+    stopped_backup_sha = validate_preflight_file_binding(
+        stopped_backup_path, {'preflight_sha256': _preflight_file_sha256(stopped_backup_path)})
+    with connect(preflight_path) as preflight, connect(stopped_backup_path) as before, connect(db_path) as current:
+        require(TABLE in tables(current), 'forward repair has no prepared manifest')
+        row = current.execute(f'SELECT * FROM {TABLE} WHERE id=?', (old_id,)).fetchone()
+        require(row is not None and row['state'] == 'prepared' and row['claimed_at'] is None,
+                'forward repair requires the exact unclaimed prepared manifest')
+        old = json.loads(row['payload'])
+        require(old.get('schema') == 1 and old.get('id') == old_id
+                and old.get('terminal_suspended_executor_ids')
+                and old.get('risk_transition_binding') is not None
+                and old.get('forward_repair') is None,
+                'forward repair predecessor scope is unsupported')
+        require(old['created_at'] <= now and old['evidence']['script_config'] == evidence['script_config']
+                and old['evidence']['preflight_sha256'] == evidence.get('preflight_sha256')
+                and old['evidence']['config_paths'] == evidence['config_paths']
+                and old['evidence']['reconciliation']['controller_pairs']
+                == evidence['reconciliation']['controller_pairs'],
+                'forward repair original owner/preflight scope differs')
+        boot = _validated_failed_boot_receipts(
+            failed_boot_process_proof_path, failed_boot_venue_proof_path,
+            evidence['reconciliation']['controller_pairs'], old['created_at'], evidence['observed_at'])
+        validate_preflight_file_binding(preflight_path, old['evidence'])
+        require(database_digest(preflight) == old['preflight_digest']
+                and database_digest(before) == old['database_digest'],
+                'forward repair original preflight or stopped financial rows differ')
+        require(risk_state_value(preflight, evidence['script_config'])
+                == risk_state_value(before, evidence['script_config']),
+                'forward repair original stopped risk state differs')
+        require(reviewed_source_transition['old_files_sha256'] == digest(old['files'])
+                and reviewed_source_transition['new_files_sha256'] == digest(files)
+                and {key: value for key, value in old['files'].items() if key.startswith('conf/')}
+                == {key: value for key, value in files.items() if key.startswith('conf/')},
+                'forward repair source transition or owner configuration differs')
+        require(old['evidence']['owner'] == evidence['owner']
+                and {proof['executor_id'] for proof in old['evidence']['executors']}
+                == {proof['executor_id'] for proof in evidence['executors']}
+                and {proof['executor_id'] for proof in old['evidence'].get('continuity_executors', [])}
+                == {proof['executor_id'] for proof in evidence.get('continuity_executors', [])},
+                'forward repair executor selection differs')
+        script_config = evidence['script_config']
+        controllers = old['risk_controllers']
+        current_state = risk_state_value(current, script_config)
+        before_state = risk_state_value(before, script_config)
+        transition = old['risk_transition_binding']
+        archive_key = transition['archive_key']
+        archive = current.execute('SELECT value FROM Metadata WHERE key=?', (archive_key,)).fetchone()
+        require(archive is not None, 'forward repair original risk archive is missing')
+        archived = json.loads(archive['value'])
+        pending_state = archived['after']
+        require(digest(pending_state) == old['risk_state_digest']
+                and current_state.get('version') == 2 and current_state.get('stopped') is False
+                and set(current_state.get('operator_paused', {})) == set(controllers)
+                and all(value is True for value in current_state['operator_paused'].values())
+                and set(current_state) == set(pending_state) | {'daily_entry_risk'}
+                and all(current_state[key] == pending_state[key]
+                        for key in pending_state if key != 'entry_risk_enrollment'),
+                'forward repair failed-boot risk changed outside first daily enrollment')
+        pending_enrollment = pending_state['entry_risk_enrollment']
+        failed_enrollment = current_state['entry_risk_enrollment']
+        require(isinstance(pending_enrollment, dict) and isinstance(failed_enrollment, dict)
+                and set(failed_enrollment) == set(pending_enrollment)
+                and all(failed_enrollment[key] == pending_enrollment[key]
+                        for key in pending_enrollment if key not in {'initialized_at', 'initial_pnl_quote'})
+                and pending_enrollment['initialized_at'] is None
+                and pending_enrollment['initial_pnl_quote'] is None,
+                'forward repair enrollment identity or policy changed')
+        enrollment = EntryRiskEnrollment.model_validate(failed_enrollment)
+        daily = DailyEntryRisk.model_validate(current_state['daily_entry_risk'])
+        enrollment.validate_daily_state(daily)
+        require(not enrollment.pending and boot['started_at'] <= enrollment.initialized_at
+                <= daily.last_timestamp <= boot['finished_at']
+                and daily.paused is False and daily.breach_day is None
+                and daily.baseline_quote == enrollment.initial_pnl_quote,
+                'forward repair requires only unbreached failed-boot daily observations')
+        backup_digest = financial_state_digest(before)
+        validated = validate_prospective_daily_enrollment_archive(
+            archive_key, archive['value'], script_config=script_config, controllers=controllers,
+            before_state=before_state, current_state=pending_state,
+            configured_limit=staged_daily_entry_limit(script_config, root),
+            expected_native_state_sha256=backup_digest)
+        require(validated == transition, 'forward repair original archived transition differs')
+        delta = validate_stopped_forward_repair_delta(
+            before, current, script_config=script_config,
+            controller_pairs=evidence['reconciliation']['controller_pairs'], archive_key=archive_key,
+            observed_at=evidence['observed_at'], failed_boot_started_at=boot['started_at'],
+            failed_boot_finished_at=boot['finished_at'])
+        require(delta['stopped_financial_state_sha256'] == backup_digest,
+                'forward repair stopped backup digest differs')
+        return {'schema_version': 1, 'old_manifest_id': old_id, 'old_manifest_sha256': digest(old),
+                'stopped_backup_sha256': stopped_backup_sha,
+                'failed_boot': boot,
+                'original_preflight_sha256': evidence['preflight_sha256'],
+                'source_transition': reviewed_source_transition,
+                'risk_archive_sha256': hashlib.sha256(archive['value'].encode()).hexdigest(),
+                'failed_boot_risk_state': current_state, 'pending_risk_state': pending_state,
+                **delta}
+
+
 def validate_risk_state_binding(connection, manifest, root=ROOT):
     if not manifest.get('terminal_suspended_executor_ids'):
         return None
@@ -1782,9 +1968,40 @@ def validate_risk_state_binding(connection, manifest, root=ROOT):
         current = digest(current_state)
         require(current == manifest.get('risk_state_digest'),
                 'durable V1 risk state changed after terminal preparation')
-        validated = risk_transition_binding(connection, script_config, controllers,
-                                            before_state=None, current_state=current_state,
-                                            configured_limit=configured_limit)
+        repair = manifest.get('forward_repair')
+        if repair is None:
+            validated = risk_transition_binding(connection, script_config, controllers,
+                                                before_state=None, current_state=current_state,
+                                                configured_limit=configured_limit)
+        else:
+            require(isinstance(repair, dict) and repair.get('schema_version') == 1
+                    and repair.get('kind') == 'v1_failed_preclaim_startup_forward_repair'
+                    and repair.get('original_preflight_sha256')
+                    == manifest['evidence'].get('preflight_sha256')
+                    and repair.get('source_transition', {}).get('new_files_sha256')
+                    == digest(manifest['files'])
+                    and financial_state_digest(connection)
+                    == repair.get('current_financial_state_sha256'),
+                    'forward repair bound native financial state changed')
+            archive_key = transition['archive_key']
+            archive = connection.execute('SELECT value FROM Metadata WHERE key=?', (archive_key,)).fetchone()
+            require(archive is not None
+                    and hashlib.sha256(archive['value'].encode()).hexdigest()
+                    == repair.get('risk_archive_sha256'),
+                    'forward repair original risk archive changed')
+            values = repair.get('decision_values')
+            require(isinstance(values, dict) and len(values) == 5,
+                    'forward repair decision scope changed')
+            for key, value in values.items():
+                row = connection.execute('SELECT value FROM Metadata WHERE key=?', (key,)).fetchone()
+                require(row is not None and row['value'] == value['after'],
+                        'forward repair decision record changed')
+            validated = validate_prospective_daily_enrollment_archive(
+                archive_key, archive['value'], script_config=script_config,
+                controllers=controllers, current_state=current_state,
+                configured_limit=configured_limit,
+                expected_before_state_sha256=transition['before_state_sha256'],
+                expected_native_state_sha256=repair['stopped_financial_state_sha256'])
         require(validated == transition,
                 'native V1 daily-risk transition receipt changed after terminal preparation')
     require(current == manifest.get('risk_state_digest'),
@@ -1801,7 +2018,9 @@ def validate_history_binding(connection, manifest):
 
 def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
             legacy_transition_executor_ids=(), terminal_suspended_executor_ids=(),
-            continuity_executor_ids=()):
+            continuity_executor_ids=(), supersede_prepared_id=None,
+            stopped_backup_path=None, reviewed_source_transition=None,
+            failed_boot_process_proof_path=None, failed_boot_venue_proof_path=None):
     """Register only; caller must stop the owner and reconcile the venue first."""
     now = time.time() if now is None else now
     validate_preflight_file_binding(preflight_path, evidence)
@@ -1847,6 +2066,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
                 'suspended terminal mode is restricted to the V1 OK-RSI script')
     required_controllers = {f"conf/controllers/{name}" for name in script['controllers_config']}
     require(required_controllers <= set(config_paths), 'all configured controller files must be bound')
+    files = bound_files(config_paths, root)
     controllers = [yaml.safe_load((Path(root) / name).read_text()) for name in required_controllers]
     require({row['id']: row['trading_pair'] for row in controllers} == evidence['reconciliation']['controller_pairs']
             and all(row['connector_name'] == 'okx' for row in controllers), 'controller owner/pair binding differs')
@@ -1858,6 +2078,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
                 'suspended terminal mode requires one executor under the exact V1 BNB controller owner')
         risk_controllers = sorted(row['id'] for row in controllers)
         risk_transition_proof = None
+        forward_repair = None
         with connect(preflight_path) as preflight, connect(db_path) as stopped:
             preflight_state = risk_state_value(preflight, evidence['script_config'])
             preflight_risk = risk_state_digest(preflight, evidence['script_config'], risk_controllers)
@@ -1868,17 +2089,31 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
                         'durable V1 risk state changed between preflight and stopped snapshots')
             else:
                 configured_limit = staged_daily_entry_limit(evidence['script_config'], root)
-                risk_transition_proof = risk_transition_binding(
-                    stopped, evidence['script_config'], risk_controllers,
-                    before_state=preflight_state, current_state=current_state,
-                    configured_limit=configured_limit)
+                if supersede_prepared_id is not None:
+                    require(stopped_backup_path is not None and reviewed_source_transition is not None,
+                            'forward repair requires the sealed stopped backup and reviewed source transition')
+                    forward_repair = _forward_repair_precheck(
+                        db_path, preflight_path, stopped_backup_path, evidence,
+                        supersede_prepared_id, reviewed_source_transition, files, now, root,
+                        failed_boot_process_proof_path, failed_boot_venue_proof_path)
+                    old_manifest = next(row for row in inspect_manifest(db_path)
+                                        if row['id'] == supersede_prepared_id)
+                    risk_transition_proof = json.loads(old_manifest['payload'])['risk_transition_binding']
+                else:
+                    risk_transition_proof = risk_transition_binding(
+                        stopped, evidence['script_config'], risk_controllers,
+                        before_state=preflight_state, current_state=current_state,
+                        configured_limit=configured_limit)
                 require(risk_transition_proof['before_state_sha256'] == preflight_risk,
                         'daily-risk enrollment receipt differs from original preflight state')
-                stopped_risk = digest(current_state)
+                stopped_risk = digest(forward_repair['pending_risk_state'] if forward_repair is not None
+                                      else current_state)
     else:
+        require(supersede_prepared_id is None, 'forward repair is restricted to V1 terminal mode')
         risk_controllers = []
         stopped_risk = None
         risk_transition_proof = None
+        forward_repair = None
     with connect(preflight_path) as preflight, connect(db_path) as stopped:
         unfinished_ids = {row[0] for row in stopped.execute('SELECT id FROM Executors WHERE status != 4')}
         if terminal_suspended_executor_ids:
@@ -1901,7 +2136,6 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
                             terminal_suspended_executor_ids=terminal_suspended_executor_ids,
                             continuity_executor_ids=continuity_executor_ids,
                             preflight_db_path=preflight_path)
-    files = bound_files(config_paths, root)
     with connect(preflight_path) as preflight, connect(db_path, writable=True) as connection:
         connection.execute('BEGIN IMMEDIATE')
         validate_preflight_file_binding(preflight_path, evidence)
@@ -1919,7 +2153,34 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
             require(before is not None and after is not None,
                     'nonselected continuity executor is missing from preflight or stopped database')
             continuity_rows.append(validate_nonselected_suspended_continuity(before, after))
-        history = consumed_history(connection)
+        if forward_repair is not None:
+            old_row = connection.execute(f'SELECT * FROM {TABLE} WHERE id=?',
+                                         (supersede_prepared_id,)).fetchone()
+            require(old_row is not None and old_row['state'] == 'prepared'
+                    and old_row['claimed_at'] is None
+                    and digest(json.loads(old_row['payload'])) == forward_repair['old_manifest_sha256']
+                    and financial_state_digest(connection)
+                    == forward_repair['current_financial_state_sha256']
+                    and risk_state_value(connection, evidence['script_config'])
+                    == forward_repair['failed_boot_risk_state'],
+                    'forward repair owner state changed before transaction')
+            require(validate_preflight_file_binding(
+                stopped_backup_path,
+                {'preflight_sha256': forward_repair['stopped_backup_sha256']})
+                == forward_repair['stopped_backup_sha256']
+                and _preflight_file_sha256(failed_boot_process_proof_path)
+                == forward_repair['failed_boot']['process_sha256']
+                and _preflight_file_sha256(failed_boot_venue_proof_path)
+                == forward_repair['failed_boot']['venue_sha256']
+                and bound_files(config_paths, root) == files,
+                'forward repair stopped backup or target source changed before transaction')
+            connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                               (canonical(forward_repair['pending_risk_state']),
+                                'strategy-risk:' + evidence['script_config']))
+            forward_repair['failed_boot_financial_state_sha256'] = forward_repair.pop(
+                'current_financial_state_sha256')
+            forward_repair['current_financial_state_sha256'] = financial_state_digest(connection)
+        history = consumed_history(connection, pending_id=supersede_prepared_id)
         require(all(decimal(now) >= decimal(row['claimed_at']) for row in history),
                 'new manifest predates consumed history')
         positions = []
@@ -1973,8 +2234,15 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
                     'risk_controllers': risk_controllers, 'risk_state_digest': stopped_risk,
                     'risk_transition_binding': risk_transition_proof,
                     'files': files, 'evidence': evidence, 'positions': positions}
+        if forward_repair is not None:
+            manifest['forward_repair'] = forward_repair
         connection.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} (id TEXT PRIMARY KEY, state TEXT NOT NULL, '
                            'payload TEXT NOT NULL, claimed_at REAL)')
+        if forward_repair is not None:
+            changed = connection.execute(
+                f"UPDATE {TABLE} SET state='superseded' WHERE id=? AND state='prepared' AND claimed_at IS NULL",
+                (supersede_prepared_id,)).rowcount
+            require(changed == 1, 'forward repair predecessor was already consumed or changed')
         connection.execute(f'INSERT INTO {TABLE} VALUES (?, ?, ?, NULL)', (manifest['id'], 'prepared', canonical(manifest)))
     return manifest
 

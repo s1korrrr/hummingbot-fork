@@ -1,8 +1,21 @@
 """Dust inventory stays accounted but does not pin EXITS or block a fresh buy."""
 from decimal import Decimal
 from test.test_ok_rsi_sell_policy import controller, position
+from unittest.mock import MagicMock, patch
 
+import pytest
+
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import TradeType
+
+
+@pytest.fixture(autouse=True)
+def _complete_native_history():
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = []
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        yield recorder
 
 
 def dust_position(bot):

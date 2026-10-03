@@ -604,9 +604,23 @@ class HLRSIController(DirectionalTradingControllerBase):
                 (not getattr(x, "is_done", not x.is_active) if a else True)
                 and x.connector_name == self.config.connector_name
                 and x.trading_pair == self.config.trading_pair
-                and x.side == s
+                and self._executor_trade_side(x) == s
             ),
         )
+
+    @staticmethod
+    def _executor_trade_side(executor) -> Optional[TradeType]:
+        side = getattr(executor, "side", None)
+        if isinstance(side, TradeType):
+            return side
+        if type(side) is int:
+            try:
+                return TradeType(side)
+            except ValueError:
+                return None
+        if isinstance(side, str) and side in TradeType.__members__:
+            return TradeType[side]
+        return None
 
     def _get_mid_price(self) -> Optional[Decimal]:
         try:
@@ -1567,11 +1581,13 @@ class HLRSIController(DirectionalTradingControllerBase):
         if getattr(self, "_hold_ledger_pass", _HOLD_LEDGER_UNSET) is not _HOLD_LEDGER_UNSET:
             return False
         self._hold_ledger_pass = self._load_hold_ledger_rows()
+        self._native_executor_history_pass = self._load_native_executor_history()
         return True
 
     def _end_hold_ledger_pass(self, owned: bool) -> None:
         if owned:
             self._hold_ledger_pass = _HOLD_LEDGER_UNSET
+            self._native_executor_history_pass = _HOLD_LEDGER_UNSET
 
     def _executor_hold_required_fills(self, executor) -> Optional[List[Tuple[str, Decimal, Decimal, Decimal]]]:
         custom = self._executor_custom_info(executor)
@@ -1658,8 +1674,8 @@ class HLRSIController(DirectionalTradingControllerBase):
         want_id = str(executor_id)
         connector = self.config.connector_name
         pair = self.config.trading_pair
-        expected_side = getattr(getattr(executor, "side", None), "name", getattr(executor, "side", None))
-        expected_side_name = None if expected_side in (None, "") else str(expected_side).upper()
+        expected_side = self._executor_trade_side(executor)
+        expected_side_name = expected_side.name if expected_side is not None else None
         matched: Dict[str, Tuple[Decimal, Decimal, Decimal]] = {}
         for row in rows:
             if str(getattr(row, "executor_id", "") or "") != want_id:
@@ -1754,13 +1770,21 @@ class HLRSIController(DirectionalTradingControllerBase):
                                    filled: Decimal, closed: Decimal) -> Optional[Decimal]:
         """Recognize only a completed, fill-proven sub-lot write-off, never an open commitment."""
         config = getattr(executor, "config", None)
+        lifecycle = custom.get("entry_lifecycle")
+        acquisition = custom.get("entry_acquisition")
+        closed_exit_types = {
+            CloseType.TIME_LIMIT, CloseType.STOP_LOSS, CloseType.TAKE_PROFIT,
+            CloseType.EXPIRED, CloseType.EARLY_STOP, CloseType.TRAILING_STOP, CloseType.COMPLETED,
+        }
         if (not self._executor_is_done(executor) or getattr(executor, "is_active", True)
-                or getattr(executor, "close_type", None) != CloseType.TRAILING_STOP
+                or not isinstance(lifecycle, dict) or lifecycle.get("state") != "managing_fill"
+                or not isinstance(acquisition, dict) or acquisition.get("state") != "managing_fill"
+                or getattr(executor, "close_type", None) not in closed_exit_types
                 or self._positive_decimal(getattr(executor, "close_timestamp", None)) is None
                 or getattr(config, "type", None) != "position_executor"
                 or getattr(executor, "connector_name", None) != self.config.connector_name
                 or getattr(executor, "trading_pair", None) != self.config.trading_pair
-                or getattr(executor, "side", None) != TradeType.BUY
+                or self._executor_trade_side(executor) != TradeType.BUY
                 or getattr(config, "id", None) != getattr(executor, "id", None)
                 or getattr(config, "connector_name", None) != self.config.connector_name
                 or getattr(config, "trading_pair", None) != self.config.trading_pair
@@ -1774,8 +1798,8 @@ class HLRSIController(DirectionalTradingControllerBase):
             return None
         remaining = self._decimal_or_none(custom["remaining_position_amount_base"])
         receipt_remaining = self._decimal_or_none(receipt["remaining_owned_base"])
-        dust = self._positive_decimal(receipt.get("residual_dust_base"))
-        if remaining != 0 or receipt_remaining != 0 or dust is None or filled - closed != dust:
+        valid_dust, dust = self._finite_nonnegative_base(receipt.get("residual_dust_base"))
+        if remaining != 0 or receipt_remaining != 0 or not valid_dust or dust is None or filled - closed != dust:
             return None
         try:
             rules = self.market_data_provider.get_trading_rules(self.config.connector_name, self.config.trading_pair)
@@ -1793,6 +1817,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             totals = {"BUY": [Decimal("0"), Decimal("0")], "SELL": [Decimal("0"), Decimal("0")]}
             entry_base_fee = Decimal("0")
             seen_orders = set()
+            seen_exchange_orders = set()
             seen_trades = set()
             for order in snapshots:
                 if not isinstance(order, dict):
@@ -1800,19 +1825,31 @@ class HLRSIController(DirectionalTradingControllerBase):
                 oid = order.get("client_order_id")
                 exchange_oid = order.get("exchange_order_id")
                 side = order.get("trade_type")
+                state = str(order.get("last_state"))
                 if (oid not in order_ids or oid in seen_orders or side not in totals
-                        or not isinstance(exchange_oid, str) or not exchange_oid
                         or order.get("trading_pair") != self.config.trading_pair
-                        or str(order.get("last_state")) != str(OrderState.FILLED.value)):
+                        or state not in {str(OrderState.FILLED.value), str(OrderState.CANCELED.value)}):
                     return None
                 seen_orders.add(oid)
                 fills = order.get("order_fills")
-                if not isinstance(fills, dict) or not fills:
+                if not isinstance(fills, dict):
                     return None
-                base = self._positive_decimal(order.get("executed_amount_base"))
-                quote = self._positive_decimal(order.get("executed_amount_quote"))
-                if base is None or quote is None:
+                valid_base, base = self._finite_nonnegative_base(order.get("executed_amount_base"))
+                valid_quote, quote = self._finite_nonnegative_base(order.get("executed_amount_quote"))
+                if not valid_base or not valid_quote or base is None or quote is None:
                     return None
+                if (base == 0 or quote == 0):
+                    if state != str(OrderState.CANCELED.value) or base != 0 or quote != 0 or fills:
+                        return None
+                    if exchange_oid not in (None, ""):
+                        if not isinstance(exchange_oid, str) or exchange_oid in seen_exchange_orders:
+                            return None
+                        seen_exchange_orders.add(exchange_oid)
+                    continue
+                if (not isinstance(exchange_oid, str) or not exchange_oid
+                        or exchange_oid in seen_exchange_orders or not fills):
+                    return None
+                seen_exchange_orders.add(exchange_oid)
                 fill_base = fill_quote = Decimal("0")
                 for trade_id, fill in fills.items():
                     if (not isinstance(trade_id, str) or not trade_id or trade_id in seen_trades
@@ -1832,13 +1869,13 @@ class HLRSIController(DirectionalTradingControllerBase):
                         return None
                     percent = self._decimal_or_none(fee.get("percent"))
                     flat = fee.get("flat_fees")
-                    if percent is None or percent < 0 or not isinstance(flat, list):
+                    if percent is None or not isinstance(flat, list):
                         return None
                     for item in flat:
                         if not isinstance(item, dict) or not item.get("token"):
                             return None
                         fee_amount = self._decimal_or_none(item.get("amount"))
-                        if fee_amount is None or fee_amount < 0:
+                        if fee_amount is None:
                             return None
                     fill_base += amount
                     fill_quote += cost
@@ -1848,8 +1885,6 @@ class HLRSIController(DirectionalTradingControllerBase):
                 totals[side][1] += quote
                 if side == "BUY":
                     fee = base_fee_amount(order, self.config.trading_pair.split("-")[0])
-                    if fee < 0:
-                        return None
                     entry_base_fee += fee
             authorized = self._positive_decimal(getattr(executor.config, "amount", None))
             if (seen_orders != set(order_ids) or authorized is None
@@ -1904,6 +1939,199 @@ class HLRSIController(DirectionalTradingControllerBase):
         if authorized is None or authorized < 0 or owned > authorized:
             return None
         return owned
+
+    def _load_native_executor_history(self) -> Optional[List]:
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is None:
+            return None
+        try:
+            history = recorder.get_executors_by_controller(self.config.id)
+        except Exception:
+            return None
+        if not isinstance(history, list):
+            return None
+        return history
+
+    def _terminal_dust_reserve_base(self) -> Optional[Decimal]:
+        """Complete native terminal history owns sub-lot base even after executor closure."""
+        history = getattr(self, "_native_executor_history_pass", _HOLD_LEDGER_UNSET)
+        if history is _HOLD_LEDGER_UNSET:
+            history = self._load_native_executor_history()
+        if history is None:
+            return None
+        by_id = {}
+        visible_ids = set()
+        for executor in history:
+            executor_id = getattr(executor, "id", None)
+            config = getattr(executor, "config", None)
+            if (getattr(executor, "controller_id", None) != self.config.id
+                    or getattr(config, "controller_id", None) != self.config.id
+                    or not isinstance(executor_id, str) or not executor_id or executor_id in by_id):
+                return None
+            if (getattr(executor, "connector_name", None) == self.config.connector_name
+                    and getattr(executor, "trading_pair", None) == self.config.trading_pair):
+                native_side = self._executor_trade_side(executor)
+                if (native_side not in (TradeType.BUY, TradeType.SELL)
+                        or self._executor_trade_side(config) != native_side
+                        or getattr(config, "connector_name", None) != self.config.connector_name
+                        or getattr(config, "trading_pair", None) != self.config.trading_pair):
+                    return None
+            by_id[executor_id] = executor
+        for executor in self.executors_info:
+            if (getattr(executor, "connector_name", None) != self.config.connector_name
+                    or getattr(executor, "trading_pair", None) != self.config.trading_pair):
+                continue
+            executor_id = getattr(executor, "id", None)
+            config = getattr(executor, "config", None)
+            if (getattr(executor, "controller_id", None) != self.config.id
+                    or getattr(config, "controller_id", None) != self.config.id
+                    or not isinstance(executor_id, str) or not executor_id or executor_id in visible_ids):
+                return None
+            visible_side = self._executor_trade_side(executor)
+            if (visible_side not in (TradeType.BUY, TradeType.SELL)
+                    or self._executor_trade_side(config) != visible_side
+                    or getattr(config, "connector_name", None) != self.config.connector_name
+                    or getattr(config, "trading_pair", None) != self.config.trading_pair):
+                return None
+            persisted = by_id.get(executor_id)
+            if persisted is not None:
+                if (getattr(persisted, "connector_name", None) != self.config.connector_name
+                        or getattr(persisted, "trading_pair", None) != self.config.trading_pair
+                        or self._executor_trade_side(persisted) != visible_side):
+                    return None
+                persisted_info = self._executor_custom_info(persisted)
+                persisted_receipt = persisted_info.get("execution_receipt") or {}
+                visible_info = self._executor_custom_info(executor)
+                visible_receipt = visible_info.get("execution_receipt") or {}
+                persisted_orders = persisted_info.get("order_ids") or []
+                visible_orders = visible_info.get("order_ids") or []
+                if (not isinstance(persisted_orders, list) or not isinstance(visible_orders, list)
+                        or any(not isinstance(oid, str) or not oid for oid in persisted_orders + visible_orders)
+                        or not set(persisted_orders).issubset(set(visible_orders))):
+                    return None
+                valid, persisted_fill = self._finite_nonnegative_base(
+                    persisted_info.get("open_order_filled_amount_base"))
+                valid_visible, visible_fill = self._finite_nonnegative_base(
+                    visible_info.get("open_order_filled_amount_base"))
+                if (not valid or not valid_visible
+                        or (persisted_fill is not None
+                            and (visible_fill is None or visible_fill < persisted_fill))):
+                    return None
+                valid, persisted_dust = self._finite_nonnegative_base(
+                    persisted_receipt.get("residual_dust_base"))
+                if not valid:
+                    return None
+                if persisted_dust:
+                    valid, visible_dust = self._finite_nonnegative_base(
+                        visible_receipt.get("residual_dust_base"))
+                    if (not valid or visible_dust != persisted_dust
+                            or visible_receipt.get("accounting_owner") != "executor"):
+                        return None
+                    valid, filled = self._finite_nonnegative_base(
+                        persisted_info.get("open_order_filled_amount_base"))
+                    valid_closed, closed = self._finite_nonnegative_base(
+                        persisted_info.get("close_order_filled_amount_base"))
+                    if (not valid or not valid_closed or filled is None or closed is None
+                            or self._verified_closed_exit_dust(
+                                persisted, persisted_info, persisted_receipt, filled, closed) != persisted_dust):
+                        return None
+                persisted_owned = self._executor_owned_base(persisted)
+                persisted_outstanding = self._executor_outstanding_base(persisted)
+                visible_owned = self._executor_owned_base(executor)
+                visible_outstanding = self._executor_outstanding_base(executor)
+                if (persisted_owned is None or persisted_outstanding is None
+                        or visible_owned is None or visible_outstanding is None):
+                    return None
+                if (persisted_owned + persisted_outstanding > visible_owned + visible_outstanding
+                        or (not self._executor_is_done(persisted) and self._executor_is_done(executor))):
+                    valid_closed, closed = self._finite_nonnegative_base(
+                        visible_info.get("close_order_filled_amount_base"))
+                    complete_exit = (visible_fill is not None and valid_closed and closed is not None
+                                     and self._verified_closed_exit_dust(
+                                         executor, visible_info, visible_receipt, visible_fill, closed) is not None)
+                    if not complete_exit and not self._executor_hold_released_to_bag(executor):
+                        return None
+            by_id[executor_id] = executor  # live report is newer than the native persisted row
+            visible_ids.add(executor_id)
+        reserve = Decimal("0")
+        used_client_orders = set()
+        used_exchange_orders = set()
+        used_trades = set()
+        for executor in by_id.values():
+            if (getattr(executor, "connector_name", None) != self.config.connector_name
+                    or getattr(executor, "trading_pair", None) != self.config.trading_pair
+                    or self._executor_trade_side(executor) != TradeType.BUY):
+                continue
+            custom = self._executor_custom_info(executor)
+            order_ids = custom.get("order_ids") or []
+            if not isinstance(order_ids, list) or any(not isinstance(oid, str) or not oid for oid in order_ids):
+                return None
+            if len(order_ids) != len(set(order_ids)) or used_client_orders.intersection(order_ids):
+                return None
+            used_client_orders.update(order_ids)
+            snapshots = custom.get("execution_order_snapshots") or []
+            if not isinstance(snapshots, list):
+                return None
+            for order in snapshots:
+                if not isinstance(order, dict):
+                    return None
+                exchange_id = order.get("exchange_order_id")
+                if exchange_id is not None:
+                    if not isinstance(exchange_id, str) or not exchange_id or exchange_id in used_exchange_orders:
+                        return None
+                    used_exchange_orders.add(exchange_id)
+                fills = order.get("order_fills") or {}
+                if not isinstance(fills, dict) or used_trades.intersection(fills):
+                    return None
+                used_trades.update(fills)
+            receipt = custom.get("execution_receipt") or {}
+            if not isinstance(receipt, dict):
+                return None
+            valid, dust = self._finite_nonnegative_base(receipt.get("residual_dust_base"))
+            if not valid:
+                return None
+            if not dust:
+                if executor.id not in visible_ids:
+                    if not self._executor_is_done(executor):
+                        return None
+                    if self._executor_claims_held_position(executor):
+                        if not self._executor_hold_released_to_bag(executor):
+                            return None
+                    elif receipt.get("accounting_owner") == "executor":
+                        owned = self._executor_reported_owned_base(executor)
+                        if owned is None or owned > 0:
+                            return None
+                    elif receipt.get("accounting_owner") is None:
+                        # Pre-receipt EXPIRED rows may be provably flat from the
+                        # complete native executor row. Never infer zero from
+                        # missing fields or a partially filled old entry.
+                        measures = [custom.get(key) for key in (
+                            "remaining_position_amount_base", "open_order_filled_amount_base",
+                            "open_order_filled_amount_quote", "close_order_filled_amount_base")]
+                        measures.append(getattr(executor, "filled_amount_quote", None))
+                        if (getattr(executor, "close_type", None) != CloseType.EXPIRED
+                                or getattr(executor, "is_active", True)
+                                or self._positive_decimal(getattr(executor, "close_timestamp", None)) is None
+                                or any(self._finite_nonnegative_base(value) != (True, Decimal("0"))
+                                       for value in measures)
+                                or custom.get("held_position_orders")
+                                or custom.get("execution_order_snapshots")):
+                            return None
+                    else:
+                        return None
+                elif self._executor_is_done(executor) and receipt.get("accounting_owner") == "executor":
+                    if self._executor_reported_owned_base(executor) is None:
+                        return None
+                continue
+            valid, filled = self._finite_nonnegative_base(custom.get("open_order_filled_amount_base"))
+            valid_closed, closed = self._finite_nonnegative_base(custom.get("close_order_filled_amount_base"))
+            if not valid or not valid_closed or filled is None or closed is None:
+                return None
+            proven = self._verified_closed_exit_dust(executor, custom, receipt, filled, closed)
+            if proven != dust:
+                return None
+            reserve += dust
+        return reserve
 
     def _executor_owned_base(self, executor) -> Optional[Decimal]:
         if getattr(getattr(executor, "config", None), "type", None) == "order_executor":
@@ -1965,8 +2193,13 @@ class HLRSIController(DirectionalTradingControllerBase):
             if gross_values and any(item != gross_values[0] for item in gross_values[1:]):
                 return None
             used = gross_values[0] if gross_values else filled
-            if used > authorized or filled > used:
+            if used > authorized:
                 return None
+            if filled > used:
+                valid, closed = self._finite_nonnegative_base(custom.get("close_order_filled_amount_base"))
+                if (not valid or closed is None or
+                        self._verified_closed_exit_dust(executor, custom, receipt, filled, closed) is None):
+                    return None
             remainder = authorized - used
         if remainder == 0 or self._executor_acquisition_remainder_reconciled(executor):
             return Decimal("0")
@@ -2069,7 +2302,16 @@ class HLRSIController(DirectionalTradingControllerBase):
                     return Decimal("Infinity")
                 if not self._inventory_is_dust(amount, price):
                     held_value = amount * price
-            return held_value + self._get_active_buy_executor_position_value_usd()
+            dust = self._terminal_dust_reserve_base()
+            if dust is None:
+                return Decimal("Infinity")
+            if dust > 0:
+                price = self._decimal_or_none(self._get_mid_price())
+                if price is None or price <= 0:
+                    return Decimal("Infinity")
+            else:
+                price = Decimal("0")
+            return held_value + self._get_active_buy_executor_position_value_usd() + dust * price
         except (InvalidOperation, ValueError, TypeError, AttributeError):
             return Decimal("Infinity")
 
@@ -2239,6 +2481,13 @@ class HLRSIController(DirectionalTradingControllerBase):
         return f"{vol}-{trend}"
 
     def get_status_summary(self) -> Dict[str, object]:
+        owned = self._begin_hold_ledger_pass()
+        try:
+            return self._status_summary_under_hold_pass()
+        finally:
+            self._end_hold_ledger_pass(owned)
+
+    def _status_summary_under_hold_pass(self) -> Dict[str, object]:
         if not self.config:
             return {}
 
@@ -2254,7 +2503,8 @@ class HLRSIController(DirectionalTradingControllerBase):
 
         mid_price = self._get_mid_price()
         pos_usd = self._get_total_position_value_usd()
-        util = self._get_position_utilization()
+        max_pos = getattr(self.config, "max_total_position_usd", Decimal("0"))
+        util = 0.0 if max_pos <= 0 else float(min(Decimal("1"), pos_usd / max_pos))
         active_buys = self._filter_same_side(TradeType.BUY, active_only=True)
         active_sells = self._filter_same_side(TradeType.SELL, active_only=True)
         held_bags = [
@@ -2278,7 +2528,10 @@ class HLRSIController(DirectionalTradingControllerBase):
         buy_gate = self._compact_gate_reason(self._last_gate_reason.get(TradeType.BUY))
         sell_gate = self._compact_gate_reason(self._last_gate_reason.get(TradeType.SELL))
 
-        if loss_pause_active:
+        exposure_unavailable = not pos_usd.is_finite()
+        if exposure_unavailable:
+            state_label = "UNAVAILABLE"
+        elif loss_pause_active:
             state_label = "PAUSED"
         elif flash_crash_active:
             state_label = "FLASH-CD"
@@ -2301,7 +2554,9 @@ class HLRSIController(DirectionalTradingControllerBase):
         else:
             state_label = "FLAT"
 
-        if loss_pause_active:
+        if exposure_unavailable:
+            note = "exposure unavailable"
+        elif loss_pause_active:
             note = "loss pause"
         elif flash_crash_active:
             note = "flash cooldown"
@@ -2345,10 +2600,10 @@ class HLRSIController(DirectionalTradingControllerBase):
             attention_score += 20
         attention_score += int(util * 10)
 
-        relevant_gate = sell_gate if (pos_usd > 0 or current_signal < 0 or len(active_sells) > 0) else buy_gate
-        exposure_text = (
-            f"${float(pos_usd):.0f}/${float(self.config.max_total_position_usd):.0f} ({util:.0%})"
-        )
+        relevant_gate = ("exposure-unavailable" if exposure_unavailable else
+                         sell_gate if (pos_usd > 0 or current_signal < 0 or len(active_sells) > 0) else buy_gate)
+        exposure_text = ("unavailable" if exposure_unavailable else
+                         f"${float(pos_usd):.0f}/${float(self.config.max_total_position_usd):.0f} ({util:.0%})")
 
         rsi_value = indicators.get("rsi")
         rsi_buy_threshold = float(self.config.rsi_buy_threshold)
@@ -2471,8 +2726,9 @@ class HLRSIController(DirectionalTradingControllerBase):
             runner_fraction = max(Decimal("0"), Decimal("1") - scout_fraction)
             scout_quote = usd_per_entry * scout_fraction if usd_per_entry > 0 else None
             runner_quote = usd_per_entry * runner_fraction if usd_per_entry > 0 else None
-            held_value, active_value, untracked_value = self._inventory_reconciliation_values(mid_price)
-            managed_value = (held_value or Decimal("0")) + active_value
+            held_value, active_value, dust_value, untracked_value = self._inventory_reconciliation_values(mid_price)
+            managed_value = ((held_value or Decimal("0")) + active_value + dust_value
+                             if dust_value is not None else None)
 
             plan_anchor = (
                 f"scout {self._status_money_label(scout_quote)} ({float(scout_fraction) * 100:.0f}%)"
@@ -2519,8 +2775,9 @@ class HLRSIController(DirectionalTradingControllerBase):
             sellable_label = f"{sellable_amount:.4f}/{held_amount:.4f}{base_suffix}"
         else:
             sellable_label = f"{held_amount:.4f}{base_suffix}"
-        held_value, active_value, untracked_value = self._inventory_reconciliation_values(mid_price)
-        managed_value = (held_value or Decimal("0")) + active_value
+        held_value, active_value, dust_value, untracked_value = self._inventory_reconciliation_values(mid_price)
+        managed_value = ((held_value or Decimal("0")) + active_value + dust_value
+                         if dust_value is not None else None)
         plan_liquidity = f"sell {sellable_label} · {self._inventory_reconciliation_label(mid_price)}"
 
         plan_slice = (
@@ -5782,26 +6039,42 @@ class HLRSIController(DirectionalTradingControllerBase):
     def _inventory_reconciliation_values(
         self,
         current_price: Optional[Decimal],
-    ) -> Tuple[Optional[Decimal], Decimal, Optional[Decimal]]:
+    ) -> Tuple[Optional[Decimal], Decimal, Optional[Decimal], Optional[Decimal]]:
+        owned = self._begin_hold_ledger_pass()
+        try:
+            return self._inventory_reconciliation_values_under_hold_pass(current_price)
+        finally:
+            self._end_hold_ledger_pass(owned)
+
+    def _inventory_reconciliation_values_under_hold_pass(
+        self,
+        current_price: Optional[Decimal],
+    ) -> Tuple[Optional[Decimal], Decimal, Optional[Decimal], Optional[Decimal]]:
         inventory = self._aggregate_held_inventory(TradeType.BUY)
         held_value: Optional[Decimal] = None
         if current_price is not None and current_price > 0:
             held_value = inventory.total_amount * current_price
         active_value = self._get_active_buy_executor_position_value_usd()
+        dust = self._terminal_dust_reserve_base()
+        dust_value: Optional[Decimal] = None
+        if dust is not None and current_price is not None and current_price > 0:
+            dust_value = dust * current_price
         base_balance = self._get_base_balance()
         untracked_value: Optional[Decimal] = None
-        if base_balance is not None and current_price is not None and current_price > 0:
+        if (base_balance is not None and current_price is not None and current_price > 0
+                and dust_value is not None and active_value.is_finite()):
             wallet_value = base_balance * current_price
-            managed_value = (held_value or Decimal("0")) + active_value
+            managed_value = (held_value or Decimal("0")) + active_value + dust_value
             untracked_value = max(wallet_value - managed_value, Decimal("0"))
-        return held_value, active_value, untracked_value
+        return held_value, active_value, dust_value, untracked_value
 
     def _inventory_reconciliation_label(self, current_price: Optional[Decimal]) -> str:
         inventory = self._aggregate_held_inventory(TradeType.BUY)
-        held_value, active_value, untracked_value = self._inventory_reconciliation_values(current_price)
+        held_value, active_value, dust_value, untracked_value = self._inventory_reconciliation_values(current_price)
         parts = [
             f"H{self._status_compact_money_label(held_value)}",
             f"A{self._status_compact_money_label(active_value)}",
+            f"D{self._status_compact_money_label(dust_value)}",
             f"U{self._status_compact_money_label(untracked_value)}",
         ]
         shortfall_value = self._inventory_balance_shortfall_value(current_price, inventory)

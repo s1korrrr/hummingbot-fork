@@ -425,6 +425,9 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
     manager = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS, db_path=str(db))
     recorder = MarketsRecorder(manager, [], script_config, 'v2_with_controllers',
                                market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+    from hummingbot.model.exact_order_values import TradeFillExact
+    TradeFill.__table__.create(recorder.sql_manager.engine, checkfirst=True)
+    TradeFillExact.__table__.create(recorder.sql_manager.engine, checkfirst=True)
     executor = make_executor()
     if executor_id is not None:
         executor.config.id = executor_id
@@ -512,7 +515,13 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
                                       symbol=trading_pair, base_asset=base_asset, quote_asset=quote_asset, timestamp=2000,
                                       order_id=oid, trade_type='BUY', order_type='LIMIT', price=Decimal(fill['fill_price']),
                                       amount=Decimal(fill['fill_base_amount']), leverage=1, trade_fee=fill['fee'],
-                                      trade_fee_in_quote=Decimal(0), exchange_trade_id=tid, position='NIL'))
+                                      trade_fee_in_quote=Decimal(0), exact_amount=str(fill['fill_base_amount']),
+                                      exact_price=str(fill['fill_price']), exact_trade_fee_in_quote='0',
+                                      exact_receipt_source='order_filled_event_v1',
+                                      exchange_trade_id=tid, position='NIL'))
+                session.add(TradeFillExact(market='okx', order_id=oid, exchange_trade_id=tid,
+                                           amount=str(fill['fill_base_amount']), price=str(fill['fill_price']),
+                                           fee_in_quote='0'))
         session.add(Position(id='aggregate', controller_id=controller_id, connector_name='okx', side='BUY',
                              trading_pair=trading_pair, timestamp=1000, volume_traded_quote=Decimal('120'),
                              amount=Decimal('1') + Decimal(unrelated_amount), breakeven_price=Decimal('100'),
@@ -569,7 +578,14 @@ async def stopped_fixture(tmp_path, armed=False, unrelated_amount='.2', trading_
 
 
 def write_fleet_owner_snapshot(path, owner, *, active_amount=None):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    from hummingbot.model.exact_order_values import TradeFillExact
+
     base = 'BNB'
+    native_positions = []
+    native_fills = []
     with sqlite3.connect(path) as connection:
         connection.execute('CREATE TABLE Metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         connection.execute('CREATE TABLE Executors (id TEXT PRIMARY KEY, controller_id TEXT, status INTEGER, '
@@ -577,9 +593,6 @@ def write_fleet_owner_snapshot(path, owner, *, active_amount=None):
         connection.execute('CREATE TABLE PositionHoldLedger (id TEXT PRIMARY KEY, controller_id TEXT, '
                            'executor_id TEXT, connector_name TEXT, trading_pair TEXT, order_side TEXT, '
                            'client_order_id TEXT, order_payload TEXT)')
-        connection.execute('CREATE TABLE Position (id TEXT PRIMARY KEY, connector_name TEXT, '
-                           'trading_pair TEXT, amount BIGINT)')
-        connection.execute('CREATE TABLE "Order" (id TEXT PRIMARY KEY, config_file_path TEXT)')
         connection.execute('INSERT INTO Metadata VALUES (?, ?)', ('native-test', 'fixture'))
         ledger_amount = Decimal('.25') if owner == 'rsi_modular_v2' else Decimal(0)
         if ledger_amount:
@@ -591,10 +604,10 @@ def write_fleet_owner_snapshot(path, owner, *, active_amount=None):
             connection.execute('INSERT INTO PositionHoldLedger VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                                ('v2-held-row', 'v2-owner', 'v2-held-executor', 'okx', 'BNB-USDC',
                                 'BUY', 'v2-held-order', json.dumps(receipt, sort_keys=True)))
-            connection.execute('INSERT INTO "Order" VALUES (?, ?)',
-                               ('v2-held-order', 'rsi_modular_v2.yml'))
-            connection.execute('INSERT INTO Position VALUES (?, ?, ?, ?)',
-                               ('v2-position', 'okx', 'BNB-USDC', 249000))
+            native_positions.append(('v2-position', 'v2-owner', 'BNB-USDC', Decimal('.249')))
+            native_fills.append(('rsi_modular_v2.yml', 'v2-held-order', 'v2-trade', 'BUY',
+                                 Decimal('.25'), Decimal('100'),
+                                 {'percent': '0', 'flat_fees': [{'token': base, 'amount': '.001'}]}))
         if active_amount is not None:
             executor = make_executor()
             executor.config.id = 'v3-active-bnb'
@@ -618,14 +631,45 @@ def write_fleet_owner_snapshot(path, owner, *, active_amount=None):
                                 json.dumps({'remaining_position_amount_base': str(active_amount),
                                             'execution_order_snapshots': [order_payload],
                                             'order_ids': ['v3-entry-order']}, sort_keys=True)))
-            connection.execute('INSERT INTO "Order" VALUES (?, ?)',
-                               ('v3-entry-order', 'meridian_v3.yml'))
-            connection.execute('INSERT INTO Position VALUES (?, ?, ?, ?)',
-                               ('v3-position', 'okx', 'BNB-USDC',
-                                int(Decimal(active_amount) * Decimal(1_000_000))))
+            native_positions.append(('v3-position', 'v3-bnb-controller', 'BNB-USDC', active_amount))
+            native_fills.append(('meridian_v3.yml', 'v3-entry-order', 'v3-trade', 'BUY',
+                                 active_amount, Decimal('100'), AddedToCostTradeFee().to_json()))
         elif owner == 'meridian_v3':
-            connection.execute('INSERT INTO Position VALUES (?, ?, ?, ?)',
-                               ('v3-position', 'okx', 'BNB-USDC', 0))
+            native_positions.append(('v3-position', 'v3-bnb-controller', 'BNB-USDC', Decimal(0)))
+
+    from hummingbot.model.position import Position as NativePosition
+
+    engine = create_engine(f'sqlite:///{Path(path).resolve()}')
+    NativePosition.__table__.create(engine, checkfirst=True)
+    Order.__table__.create(engine, checkfirst=True)
+    TradeFill.__table__.create(engine, checkfirst=True)
+    TradeFillExact.__table__.create(engine, checkfirst=True)
+    with Session(engine) as session:
+        for position_id, controller_id, pair, amount in native_positions:
+            session.add(NativePosition(id=position_id, controller_id=controller_id, connector_name='okx',
+                                       side='BUY', trading_pair=pair, timestamp=1,
+                                       volume_traded_quote=amount * Decimal('100'), amount=amount,
+                                       breakeven_price=Decimal('100'), unrealized_pnl_quote=Decimal(0),
+                                       realized_pnl_quote=Decimal(0), cum_fees_quote=Decimal(0)))
+        for script_config, order_id, trade_id, trade_type, amount, price, fee in native_fills:
+            session.add(Order(id=order_id, config_file_path=script_config, strategy='v2_with_controllers',
+                              market='okx', symbol='BNB-USDC', base_asset='BNB', quote_asset='USDC',
+                              creation_timestamp=1, order_type='LIMIT', amount=amount, leverage=1,
+                              price=price, last_status='BuyOrderCompleted', last_update_timestamp=2,
+                              exchange_order_id=order_id, position='NIL'))
+            quote_fee = sum((Decimal(row['amount']) * (price if row['token'] == base else 1)
+                             for row in fee['flat_fees']), Decimal(0))
+            session.add(TradeFill(config_file_path=script_config, strategy='v2_with_controllers', market='okx',
+                                  symbol='BNB-USDC', base_asset='BNB', quote_asset='USDC', timestamp=2,
+                                  order_id=order_id, trade_type=trade_type, order_type='LIMIT', price=price,
+                                  amount=amount, leverage=1, trade_fee=fee, trade_fee_in_quote=quote_fee,
+                                  exact_amount=str(amount), exact_price=str(price), exact_trade_fee_in_quote=str(quote_fee),
+                                  exact_receipt_source='order_filled_event_v1', exchange_trade_id=trade_id,
+                                  position='NIL'))
+            session.add(TradeFillExact(market='okx', order_id=order_id, exchange_trade_id=trade_id,
+                                       amount=str(amount), price=str(price), fee_in_quote=str(quote_fee)))
+        session.commit()
+    engine.dispose()
     return path
 
 
@@ -651,6 +695,7 @@ def attach_fleet_ownership(evidence, tmp_path, *, now=1000):
             'source_identity': {'container_id': 'c' * 64, 'image_id': 'sha256:' + 'b' * 64,
                                 'engine_source_sha256': 'd' * 64},
             'tables_digest': tables_hash, 'owned_residual_by_asset': residuals,
+            'quantity_increments': {},
         })
     bundle = {'schema': 1, 'observed_at': now,
               'expires_at': now + 200, 'owner_observations': observations}
@@ -716,6 +761,31 @@ async def terminal_with_suspended_sol_fixture(tmp_path):
     sol._trailing_stop_armed_timestamp = 900
     sol._trailing_stop_last_update_timestamp = 950
     recorder.store_or_update_executor(sol)
+    from hummingbot.model.exact_order_values import TradeFillExact
+    sol_base, sol_quote = sol.config.trading_pair.split('-')
+    sol_order = sol._open_order.order
+    with recorder.sql_manager.get_new_session() as session:
+        session.add(Order(id=sol_order.client_order_id, config_file_path='ok_rsi.yml',
+                          strategy='v2_with_controllers', market='okx', symbol=sol.config.trading_pair,
+                          base_asset=sol_base, quote_asset=sol_quote, creation_timestamp=1000,
+                          order_type='LIMIT', amount=sol_order.amount, leverage=1, price=Decimal('100'),
+                          last_status='BuyOrderCompleted', last_update_timestamp=1000,
+                          exchange_order_id=sol_order.exchange_order_id, position='NIL'))
+        for trade_id, fill in sol_order.to_json()['order_fills'].items():
+            amount = str(fill['fill_base_amount'])
+            price = str(fill['fill_price'])
+            session.add(TradeFill(config_file_path='ok_rsi.yml', strategy='v2_with_controllers', market='okx',
+                                  symbol=sol.config.trading_pair, base_asset=sol_base, quote_asset=sol_quote,
+                                  timestamp=1000, order_id=sol_order.client_order_id, trade_type='BUY',
+                                  order_type='LIMIT', price=Decimal(price), amount=Decimal(amount), leverage=1,
+                                  trade_fee=fill['fee'], trade_fee_in_quote=Decimal(0), exact_amount=amount,
+                                  exact_price=price, exact_trade_fee_in_quote='0',
+                                  exact_receipt_source='order_filled_event_v1', exchange_trade_id=str(trade_id),
+                                  position='NIL'))
+            session.add(TradeFillExact(market='okx', order_id=sol_order.client_order_id,
+                                       exchange_trade_id=str(trade_id), amount=amount, price=price,
+                                       fee_in_quote='0'))
+        session.commit()
     risk_state = {'version': 1, 'controllers': ['ok-rsi-bnb', 'ok-rsi-sol'], 'max_global_pnl': '0',
                   'max_pnl_by_controller': {'ok-rsi-bnb': '0', 'ok-rsi-sol': '0'},
                   'drawdown_exited_controllers': [], 'stopped': False,
@@ -956,7 +1026,7 @@ async def test_fleet_owner_snapshot_order_script_must_match_declared_owner(tmp_p
     with sqlite3.connect(v3['database_snapshot_path']) as connection:
         connection.execute('UPDATE "Order" SET config_file_path=? WHERE id=?',
                            ('rsi_modular_v2.yml', 'v3-entry-order'))
-    with pytest.raises(ValueError, match='not bound to its owner script'):
+    with pytest.raises(ValueError, match='native fill lacks its owner Order'):
         resume.inspect_fleet_owner_snapshot(v3['database_snapshot_path'], 'meridian_v3')
 
 
@@ -964,8 +1034,8 @@ def test_fleet_owner_snapshot_rechecks_sidecars_after_read(tmp_path, monkeypatch
     path = write_fleet_owner_snapshot(tmp_path / 'v2-owner.sqlite', 'rsi_modular_v2')
     original = resume._derive_owner_residuals
 
-    def materialize_wal(connection, owner):
-        result = original(connection, owner)
+    def materialize_wal(connection, owner, quantity_increments=None):
+        result = original(connection, owner, quantity_increments=quantity_increments)
         Path(str(path) + '-wal').write_bytes(b'wal appeared while snapshot was read')
         return result
 
@@ -1077,7 +1147,7 @@ async def test_terminal_prepare_cli_unlocks_encrypted_native_config_in_fresh_pro
 
 @pytest.mark.asyncio
 async def test_terminal_mode_aggregates_v1_held_inventory_across_unselected_pairs(tmp_path):
-    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    db, preflight, root, recorder, terminal, evidence = await suspended_terminal_fixture(tmp_path)
     receipt = {'trade_type': 'BUY', 'executed_amount_base': '.5', 'executed_amount_quote': '50',
                'order_fills': {'eth-held-trade': {'fill_base_amount': '.5', 'fill_price': '100',
                                                   'fill_quote_amount': '50',
@@ -1091,6 +1161,24 @@ async def test_terminal_mode_aggregates_v1_held_inventory_across_unselected_pair
                            ('eth-held-row', 'ok-rsi-eth', 'eth-held-executor', 'okx', 'ETH-USDC', 'BUY', 'BUY',
                             1000, 'eth-held-order', 'eth-held-order', 100, 500000, 500000, 50000000, 0,
                             json.dumps(receipt, sort_keys=True)))
+    from hummingbot.model.exact_order_values import TradeFillExact
+    with recorder.sql_manager.get_new_session() as session:
+        session.add(Order(id='eth-held-order', config_file_path='ok_rsi.yml', strategy='v2_with_controllers',
+                          market='okx', symbol='ETH-USDC', base_asset='ETH', quote_asset='USDC',
+                          creation_timestamp=1000, order_type='LIMIT', amount=Decimal('.5'), leverage=1,
+                          price=Decimal('100'), last_status='BuyOrderCompleted', last_update_timestamp=1000,
+                          exchange_order_id='eth-held-order', position='NIL'))
+        session.add(TradeFill(config_file_path='ok_rsi.yml', strategy='v2_with_controllers', market='okx',
+                              symbol='ETH-USDC', base_asset='ETH', quote_asset='USDC', timestamp=1000,
+                              order_id='eth-held-order', trade_type='BUY', order_type='LIMIT',
+                              price=Decimal('100'), amount=Decimal('.5'), leverage=1,
+                              trade_fee=receipt['order_fills']['eth-held-trade']['fee'],
+                              trade_fee_in_quote=Decimal(0), exact_amount='.5', exact_price='100',
+                              exact_trade_fee_in_quote='0', exact_receipt_source='order_filled_event_v1',
+                              exchange_trade_id='eth-held-trade', position='NIL'))
+        session.add(TradeFillExact(market='okx', order_id='eth-held-order',
+                                   exchange_trade_id='eth-held-trade', amount='.5', price='100', fee_in_quote='0'))
+        session.commit()
     evidence = refresh_stopped_evidence(db, evidence, 1000)
     evidence['reconciliation']['balance_coverage'].append({
         'asset': 'ETH', 'owned_residual': '.5', 'cash_balance': '10',

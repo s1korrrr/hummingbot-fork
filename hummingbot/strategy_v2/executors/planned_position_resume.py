@@ -29,6 +29,11 @@ from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.executors.position_executor.position_executor import validate_planned_entry_reconciliation
+from hummingbot.strategy_v2.executors.recovery_inventory import (
+    corroborate_order_receipt,
+    native_inventory_proof,
+    require_inventory_conservation,
+)
 from hummingbot.strategy_v2.executors.restart_continuity import RestartContinuityError, continuity_plan
 from hummingbot.strategy_v2.models.executors import CloseType
 
@@ -41,6 +46,19 @@ SOURCES = (
     'hummingbot/strategy_v2/executors/position_executor/data_types.py',
     'hummingbot/strategy_v2/executors/executor_orchestrator.py',
     'hummingbot/strategy_v2/executors/restart_continuity.py',
+    'hummingbot/strategy_v2/executors/recovery_inventory.py',
+    'hummingbot/model/exact_order_values.py',
+    'hummingbot/model/trade_fill.py',
+    'hummingbot/model/executors.py',
+    'hummingbot/model/decimal_type_decorator.py',
+    'hummingbot/core/data_type/common.py',
+    'hummingbot/core/data_type/in_flight_order.py',
+    'hummingbot/core/data_type/trade_fee.py',
+    'controllers/generic/modular_spot_core/terminal_dust.py',
+    'controllers/generic/modular_spot_core/inventory.py',
+    'controllers/generic/modular_spot_core/native_funding.py',
+    'controllers/generic/modular_spot_core/domain.py',
+    'hummingbot/strategy_v2/components/domain.py',
     'hummingbot/strategy_v2/executors/order_accounting.py',
     'hummingbot/strategy/strategy_v2_base.py',
     'scripts/v2_with_controllers.py',
@@ -271,12 +289,13 @@ def _require_no_snapshot_sidecars(path):
             'fleet ownership snapshot has uncheckpointed SQLite sidecars')
 
 
-def _derive_owner_residuals(connection, owner):
+def _derive_owner_residuals(connection, owner, quantity_increments=None):
     """Derive positive spot inventory from unique held receipts and active exact executor receipts."""
     totals = defaultdict(Decimal)
     ledger_by_executor = defaultdict(Decimal)
     seen_fills = set()
     script_config = FLEET_OWNERS[owner]
+    dust_totals, fill_totals, native_fills = native_inventory_proof(connection, script_config, quantity_increments)
     risk_row = connection.execute('SELECT value FROM Metadata WHERE key=?',
                                   (f'strategy-risk:{script_config}',)).fetchone()
     risk_controllers = None
@@ -310,6 +329,7 @@ def _derive_owner_residuals(connection, owner):
             require(key not in seen_fills, 'fleet native fill is duplicated across ownership rows')
             seen_fills.add(key)
         amount = _validated_receipt_net_base(receipt, pair, row['order_side'])
+        corroborate_order_receipt(receipt, pair, row['client_order_id'], row['order_side'], native_fills)
         require(amount == position_hold_net_base(receipt, pair.split('-')[0]),
                 'fleet held receipt net amount differs from native held accounting')
         asset = pair.split('-')[0]
@@ -362,6 +382,7 @@ def _derive_owner_residuals(connection, owner):
                     seen_fills.add(key)
                 receipt = dict(order_payload, trade_type=order.trade_type.name,
                                executed_amount_base=str(order.executed_amount_base))
+                corroborate_order_receipt(receipt, pair, order.client_order_id, order.trade_type.name, native_fills)
                 net += _validated_receipt_net_base(receipt, pair, order.trade_type.name)
             require(remaining > 0 and net == remaining,
                     'fleet active executor remaining inventory differs from exact fills')
@@ -372,9 +393,13 @@ def _derive_owner_residuals(connection, owner):
             require(row['status'] == 4 and row['close_type'] == 10
                     and ledger_by_executor[row['id']] == remaining,
                     'fleet terminal positive inventory lacks matching held-ledger ownership')
+        else:
+            require(row['status'] == 4 and row['is_active'] == 0 and row['close_type'] is not None,
+                    'fleet terminal executor has unresolved lifecycle ownership')
 
     require(active_ids == {row['id'] for row in executor_rows if row['status'] in (2, 3)},
             'fleet active executor classification is incomplete')
+    # Position is a managed/held projection and may omit completed physical dust.
     position_rows = connection.execute('SELECT connector_name, trading_pair, amount FROM Position').fetchall()
     projected = defaultdict(Decimal)
     for row in position_rows:
@@ -388,19 +413,22 @@ def _derive_owner_residuals(connection, owner):
     for asset, amount in projected.items():
         require(amount > 0 and abs(amount - totals[asset]) < Decimal('0.000001'),
                 'fleet positive position projection is not explained by exact receipts')
+    for asset, amount in dust_totals.items():
+        totals[asset] += amount
+    require_inventory_conservation(totals, fill_totals)
     result = {asset: format(amount, 'f') for asset, amount in sorted(totals.items()) if amount}
     require(all(decimal(amount) > 0 for amount in result.values()),
             'fleet ownership contains non-positive net inventory')
     return result
 
 
-def inspect_fleet_owner_snapshot(path, owner):
+def inspect_fleet_owner_snapshot(path, owner, *, quantity_increments=None):
     """Read and classify one frozen owner snapshot without writing to it."""
     require(owner in FLEET_OWNERS, 'fleet owner is not a supported V2/V3 identity')
     path = Path(path)
     connection, file_hash, tables_hash, before_stat = _owner_snapshot_readonly(path)
     try:
-        residuals = _derive_owner_residuals(connection, owner)
+        residuals = _derive_owner_residuals(connection, owner, quantity_increments)
         after_stat = path.stat()
         after_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         require((before_stat.st_dev, before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns)
@@ -434,7 +462,7 @@ def validate_fleet_ownership(evidence, now, native_keys):
     for item in observations:
         required = {'owner', 'script_config', 'observed_at',
                     'database_snapshot_path', 'database_snapshot_sha256', 'source_identity', 'tables_digest',
-                    'owned_residual_by_asset'}
+                    'owned_residual_by_asset', 'quantity_increments'}
         require(isinstance(item, dict) and set(item) == required,
                 'fleet owner observation has an invalid shape')
         owner = item['owner']
@@ -451,7 +479,8 @@ def validate_fleet_ownership(evidence, now, native_keys):
                 and len(identity['engine_source_sha256']) == 64
                 and all(char in '0123456789abcdef' for char in identity['engine_source_sha256']),
                 'fleet owner source identity is incomplete')
-        derived_snapshot = inspect_fleet_owner_snapshot(item['database_snapshot_path'], owner)
+        derived_snapshot = inspect_fleet_owner_snapshot(item['database_snapshot_path'], owner,
+                                                        quantity_increments=item['quantity_increments'])
         require(derived_snapshot['database_snapshot_sha256'] == item['database_snapshot_sha256']
                 and derived_snapshot['tables_digest'] == item['tables_digest'],
                 'fleet owner database snapshot digest differs')
@@ -485,6 +514,8 @@ def validate_v1_terminal_inventory_population(connection, selected_terminal_ids,
     for row in connection.execute('SELECT * FROM Executors'):
         custom = json.loads(row['custom_info'] or '{}')
         require(isinstance(custom, dict), 'V1 executor custom state is malformed')
+        require(row['close_type'] is not None or row['id'] in selected_terminal_ids | continuity_executor_ids,
+                'V1 unselected executor has unresolved lifecycle ownership')
         remaining = decimal(custom.get('remaining_position_amount_base', 0))
         if row['status'] == 4 and not row['is_active'] and row['close_type'] is None \
                 and row['close_timestamp'] is None and remaining > 0:
@@ -1411,6 +1442,8 @@ def validate_reconciliation(db_path, evidence, now, *, terminal_suspended_execut
         with connect(db_path) as connection:
             validate_v1_terminal_inventory_population(
                 connection, terminal_suspended_executor_ids, continuity_executor_ids)
+            dust_totals, fill_totals, native_fills = native_inventory_proof(
+                connection, 'ok_rsi.yml', evidence.get('quantity_increments'))
             seen_fills = set()
             for row in connection.execute('SELECT * FROM PositionHoldLedger ORDER BY id'):
                 require(row['client_order_id'] not in selected_order_ids,
@@ -1424,10 +1457,14 @@ def validate_reconciliation(db_path, evidence, now, *, terminal_suspended_execut
                     require(key not in seen_fills, 'V1 held fill is duplicated across ownership rows')
                     seen_fills.add(key)
                 net_base = _validated_receipt_net_base(receipt, pair, row['order_side'])
+                corroborate_order_receipt(receipt, pair, row['client_order_id'], row['order_side'], native_fills)
                 require(net_base == position_hold_net_base(receipt, pair.split('-')[0]),
                         'V1 held receipt differs from exact fill accounting')
                 base = pair.split('-')[0]
                 expected_balances[base] = expected_balances.get(base, Decimal(0)) + net_base
+            for asset, amount in dust_totals.items():
+                expected_balances[asset] = expected_balances.get(asset, Decimal(0)) + amount
+            require_inventory_conservation(expected_balances, fill_totals)
     fleet_ownership = None
     if terminal_suspended_executor_ids:
         fleet_ownership = validate_fleet_ownership(evidence, now, Security.api_keys('okx'))

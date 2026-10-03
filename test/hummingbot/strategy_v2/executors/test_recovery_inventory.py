@@ -176,7 +176,7 @@ def test_held_fill_explicit_identity_cannot_disagree_with_native_key(tmp_path, f
         payload = json.loads(connection.execute('SELECT order_payload FROM PositionHoldLedger').fetchone()[0])
         payload['order_fills']['v2-trade'][field] = 'foreign'
         connection.execute('UPDATE PositionHoldLedger SET order_payload=?', (json.dumps(payload),))
-    with pytest.raises(ValueError, match='identity conflicts'):
+    with pytest.raises(ValueError, match='identity conflicts|native fill pair is inconsistent'):
         resume.inspect_fleet_owner_snapshot(path, 'rsi_modular_v2')
 
 

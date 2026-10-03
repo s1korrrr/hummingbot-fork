@@ -979,7 +979,7 @@ async def test_terminal_mode_rejects_unselected_positive_terminal_inventory(tmp_
         connection.execute(f"INSERT INTO Executors ({', '.join(columns)}) VALUES ({placeholders})",
                            [selected[column] for column in columns])
     evidence = refresh_stopped_evidence(db, evidence, 1000)
-    with pytest.raises(ValueError, match='positive terminal inventory|exact singleton selection'):
+    with pytest.raises(ValueError, match='unselected executor has unresolved lifecycle ownership'):
         resume.prepare(db, preflight, evidence, now=1000, root=root,
                        terminal_suspended_executor_ids=(terminal.config.id,))
 

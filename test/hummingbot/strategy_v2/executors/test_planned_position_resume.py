@@ -741,6 +741,60 @@ async def suspended_terminal_fixture(tmp_path):
     return db, preflight, root, recorder, executor, evidence
 
 
+@pytest.mark.asyncio
+async def test_terminal_prepare_binds_optional_preflight_file_digest_before_writing(tmp_path):
+    import hashlib
+
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    bound_preflight = tmp_path / 'bound-preflight.sqlite'
+    with sqlite3.connect(f'file:{preflight}?mode=ro', uri=True) as source, \
+            sqlite3.connect(bound_preflight) as destination:
+        source.backup(destination)
+        destination.execute('PRAGMA journal_mode=DELETE').fetchone()
+    evidence['preflight_sha256'] = hashlib.sha256(bound_preflight.read_bytes()).hexdigest()
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    manifest = resume.prepare(db, bound_preflight, evidence, now=1000, root=root,
+                              terminal_suspended_executor_ids=(terminal.config.id,))
+    assert manifest['positions'][0]['executor_id'] == terminal.config.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('binding', ['wrong_evidence_hash', 'wrong_attestation_hash', 'substituted_path'])
+async def test_terminal_prepare_rejects_preflight_digest_mismatch_before_database_write(tmp_path, binding):
+    import hashlib
+    db, preflight, root, _, terminal, evidence = await suspended_terminal_fixture(tmp_path)
+    bound_preflight = tmp_path / 'bound-preflight.sqlite'
+    with sqlite3.connect(f'file:{preflight}?mode=ro', uri=True) as source, \
+            sqlite3.connect(bound_preflight) as destination:
+        source.backup(destination)
+        destination.execute('PRAGMA journal_mode=DELETE').fetchone()
+    actual_hash = hashlib.sha256(bound_preflight.read_bytes()).hexdigest()
+    evidence['preflight_sha256'] = actual_hash
+    if binding == 'wrong_evidence_hash':
+        evidence['preflight_sha256'] = '0' * 64
+    elif binding == 'wrong_attestation_hash':
+        evidence['stopped_owner_attestation'] = {'preflight_sha256': '0' * 64}
+    else:
+        evidence['stopped_owner_attestation'] = {'preflight_sha256': actual_hash}
+    evidence = refresh_stopped_evidence(db, evidence, 1000)
+    supplied_preflight = bound_preflight
+    if binding == 'substituted_path':
+        supplied_preflight = tmp_path / 'substituted-preflight.sqlite'
+        with sqlite3.connect(f'file:{bound_preflight}?mode=ro', uri=True) as source, \
+                sqlite3.connect(supplied_preflight) as destination:
+            source.backup(destination)
+            destination.execute("INSERT INTO Metadata(key, value) VALUES ('unrelated-substitution', '1')")
+            destination.commit()
+            destination.execute('PRAGMA journal_mode=DELETE').fetchone()
+
+    before = hashlib.sha256(db.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match='preflight database'):
+        resume.prepare(db, supplied_preflight, evidence, now=1000, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,))
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == before
+    assert resume.inspect_manifest(db) == []
+
+
 async def terminal_with_suspended_sol_fixture(tmp_path):
     db, preflight, root, recorder, terminal, evidence = await suspended_terminal_fixture(tmp_path)
     sol = make_executor()

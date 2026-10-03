@@ -106,6 +106,38 @@ def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
+def _preflight_file_sha256(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def validate_preflight_file_binding(preflight_path, evidence):
+    """Bind collected stopped-owner proof to the exact immutable preflight file."""
+    expected = evidence.get('preflight_sha256')
+    attestation = evidence.get('stopped_owner_attestation')
+    if expected is None and attestation is None:
+        return None
+    path = Path(preflight_path)
+    for suffix in ('-wal', '-shm'):
+        sidecar = Path(str(path) + suffix)
+        require(not sidecar.exists() or sidecar.stat().st_size == 0,
+                'bound preflight database has uncheckpointed SQLite sidecars')
+    try:
+        actual = _preflight_file_sha256(path)
+    except OSError as error:
+        raise ValueError('bound preflight database is unavailable') from error
+    if expected is not None:
+        require(isinstance(expected, str) and len(expected) == 64
+                and all(char in '0123456789abcdef' for char in expected)
+                and expected == actual,
+                'preflight database digest differs from collected evidence')
+    if attestation is not None:
+        require(isinstance(attestation, dict)
+                and attestation.get('preflight_sha256') == actual,
+                'stopped-owner attestation preflight database digest differs')
+    return actual
+
+
 def _validated_native_okx_keys(native_keys):
     require(isinstance(native_keys, dict) and OKX_REQUIRED_KEY_FIELDS <= set(native_keys)
             and set(native_keys) <= OKX_ALLOWED_KEY_FIELDS
@@ -1772,6 +1804,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
             continuity_executor_ids=()):
     """Register only; caller must stop the owner and reconcile the venue first."""
     now = time.time() if now is None else now
+    validate_preflight_file_binding(preflight_path, evidence)
     require(evidence.get('schema') == 1 and evidence.get('owner_stopped') is True
             and evidence.get('venue_open_orders') == [], 'stopped owner and zero venue open orders proof required')
     require(0 <= now - evidence['observed_at'] <= 300 and now < evidence['expires_at'] <= now + 900,
@@ -1871,6 +1904,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
     files = bound_files(config_paths, root)
     with connect(preflight_path) as preflight, connect(db_path, writable=True) as connection:
         connection.execute('BEGIN IMMEDIATE')
+        validate_preflight_file_binding(preflight_path, evidence)
         unfinished_ids = {row[0] for row in connection.execute('SELECT id FROM Executors WHERE status != 4')}
         if terminal_suspended_executor_ids:
             require(unfinished_ids <= continuity_executor_ids,

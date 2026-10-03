@@ -41,12 +41,15 @@ class NativeTerminalDustRoundtripTests(IsolatedAsyncioTestCase):
         previous = MarketsRecorder._shared_instance
         self.addCleanup(setattr, MarketsRecorder, '_shared_instance', previous)
         oracle = RateOracle()
-        oracle.set_price(PAIR, D('100'))
         previous_oracle = RateOracle._shared_instance
         RateOracle._shared_instance = oracle
         self.addCleanup(setattr, RateOracle, '_shared_instance', previous_oracle)
 
     async def test_two_completed_base_fee_exits_reload_with_exact_inventory_and_no_sell_authority(self):
+        with self.assertNoLogs(level='WARNING'):
+            await self._exercise_roundtrip()
+
+    async def _exercise_roundtrip(self):
         rule = TradingRule(PAIR, min_order_size=D('.01'), min_price_increment=D('.01'),
                            min_base_amount_increment=D('.01'), min_notional_size=D('1'))
         fee_schema = TradeFeeSchema(
@@ -58,7 +61,12 @@ class NativeTerminalDustRoundtripTests(IsolatedAsyncioTestCase):
         market.tick(1000)
         market.set_order_book(PAIR, 1, 1000, [(D('99'), D('10'))], [(D('101'), D('10'))])
         with tempfile.TemporaryDirectory(prefix='native-terminal-dust-') as directory:
-            manager = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+            client_config = ClientConfigAdapter(ClientConfigMap())
+            # Client configuration changes the oracle quote token and clears its prices.
+            # Seed the actual offline conversion after that reset; never start its network.
+            RateOracle.get_instance().set_price(PAIR, D('100'))
+            self.assertEqual(RateOracle.get_instance().get_pair_rate('USDC-BTC'), D('.01'))
+            manager = SQLConnectionManager(client_config, SQLConnectionType.TRADE_FILLS,
                                            db_path=str(Path(directory) / 'paper.sqlite'))
             recorder = MarketsRecorder(manager, [market], 'native-terminal-dust', 'v2_with_controllers',
                                        MarketDataCollectionConfigMap(market_data_collection_enabled=False))

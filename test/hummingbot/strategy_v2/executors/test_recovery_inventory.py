@@ -159,6 +159,181 @@ def test_native_exact_companion_conflict_or_orphan_is_rejected(tmp_path, change)
         inspect(path)
 
 
+def test_exact_companion_without_additive_fill_columns_preserves_its_exact_values(tmp_path):
+    from hummingbot.strategy_v2.executors.recovery_inventory import native_inventory_proof
+
+    path = write_fleet_owner_snapshot(tmp_path / 'native.sqlite', 'rsi_modular_v2')
+    with sqlite3.connect(path) as connection:
+        connection.execute('UPDATE TradeFill SET exact_amount=NULL, exact_price=NULL, '
+                           'exact_trade_fee_in_quote=NULL, exact_receipt_source=NULL')
+    with resume.connect(path) as connection:
+        _, totals, fills = native_inventory_proof(connection, 'rsi_modular_v2.yml', {})
+    assert totals == {'BNB': Decimal('.249')}
+    assert fills[0].amount_decimal == Decimal('.25')
+    assert fills[0].has_exact_receipt
+
+
+def _legacy_held_fill_snapshot(path, *, remove_exact=True, exact_amount='.25', exact_price='100'):
+    """Turn the native fixture into the old TradeFill schema plus exact held-order event."""
+    with sqlite3.connect(path) as connection:
+        for column, kind in (('position_side', 'TEXT'), ('timestamp', 'BIGINT'),
+                             ('exchange_order_id', 'TEXT'), ('price', 'BIGINT'), ('amount', 'BIGINT'),
+                             ('executed_amount_base', 'BIGINT'), ('executed_amount_quote', 'BIGINT'),
+                             ('cumulative_fee_paid_quote', 'BIGINT')):
+            connection.execute(f'ALTER TABLE PositionHoldLedger ADD COLUMN {column} {kind}')
+        fill = connection.execute(
+            'SELECT market, order_id, exchange_trade_id, symbol, timestamp, trade_fee, amount, price '
+            'FROM TradeFill').fetchone()
+        order = connection.execute(
+            'SELECT exchange_order_id FROM "Order" WHERE id=?', (fill[1],)).fetchone()
+        ledger = connection.execute(
+            'SELECT order_payload FROM PositionHoldLedger WHERE client_order_id=?', (fill[1],)).fetchone()
+        payload = json.loads(ledger[0])
+        exact = payload['order_fills']['v2-trade']
+        amount, price = Decimal(exact_amount), Decimal(exact_price)
+        quote_amount = amount * price
+        fee = exact['fee']
+        quote_fee = sum((Decimal(item['amount']) * (price if item['token'] == 'BNB' else 1)
+                         for item in fee['flat_fees']), Decimal(0))
+        exact.update({
+            'trade_id': fill[2], 'client_order_id': fill[1], 'exchange_order_id': order[0],
+            'trading_pair': fill[3], 'fill_timestamp': 10,
+            'fill_base_amount': str(amount), 'fill_price': str(price),
+            'fill_quote_amount': str(quote_amount),
+        })
+        payload.update({
+            'client_order_id': fill[1], 'exchange_order_id': order[0],
+            'trading_pair': fill[3], 'amount': '.3', 'price': '100', 'trade_type': 'BUY',
+            'creation_timestamp': 9000, 'last_update_timestamp': 11000,
+            'executed_amount_base': str(amount), 'executed_amount_quote': str(quote_amount),
+            'cumulative_fee_paid_quote': str(quote_fee),
+        })
+        connection.execute('UPDATE PositionHoldLedger SET order_payload=? WHERE client_order_id=?',
+                           (json.dumps(payload, sort_keys=True), fill[1]))
+        connection.execute('UPDATE PositionHoldLedger SET exchange_order_id=?,executed_amount_base=?, '
+                           'executed_amount_quote=?,cumulative_fee_paid_quote=?,amount=?,price=?,timestamp=? '
+                           'WHERE client_order_id=?',
+                           (order[0], int(amount * 1_000_000), int(quote_amount * 1_000_000),
+                            int(quote_fee * 1_000_000), 300000, 100000000, 10000, fill[1]))
+        connection.execute('UPDATE "Order" SET amount=?,price=?,creation_timestamp=9000,last_update_timestamp=11000 '
+                           'WHERE id=?', (300000, 100000000, fill[1]))
+        connection.execute('UPDATE TradeFill SET timestamp=10000 WHERE order_id=?', (fill[1],))
+        if remove_exact:
+            connection.execute('UPDATE TradeFill SET exact_amount=NULL, exact_price=NULL, '
+                               'exact_trade_fee_in_quote=NULL, exact_receipt_source=NULL WHERE order_id=?',
+                               (fill[1],))
+            connection.execute('DELETE FROM TradeFillExact WHERE market=? AND order_id=? AND exchange_trade_id=?',
+                               (fill[0], fill[1], fill[2]))
+    return path
+
+
+def test_legacy_tradefill_uses_complete_exact_native_held_order_receipt_without_writing(tmp_path):
+    from hummingbot.strategy_v2.executors.recovery_inventory import native_inventory_proof
+
+    path = _legacy_held_fill_snapshot(write_fleet_owner_snapshot(tmp_path / 'v2.sqlite', 'rsi_modular_v2'))
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    connection = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        dust, totals, fills = native_inventory_proof(connection, 'rsi_modular_v2.yml', {})
+    finally:
+        connection.close()
+    assert dust == {}
+    assert totals == {'BNB': Decimal('.249')}
+    assert len(fills) == 1
+    assert fills[0].amount_decimal == Decimal('.25')
+    assert fills[0].price_decimal == Decimal('100')
+    assert fills[0].native_receipt_source == 'position_hold_order_snapshot_v1'
+    from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+    assert ExecutorOrchestrator._trade_fill_order_record(fills[0])['precision'] == 'position_hold_order_snapshot_v1'
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_legacy_held_order_snapshot_preserves_sub_six_decimal_fill_precision(tmp_path):
+    from hummingbot.strategy_v2.executors.recovery_inventory import native_inventory_proof
+
+    path = _legacy_held_fill_snapshot(write_fleet_owner_snapshot(tmp_path / 'v2.sqlite', 'rsi_modular_v2'),
+                                      exact_amount='.25000041', exact_price='100.00000039')
+    connection = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        _, totals, fills = native_inventory_proof(connection, 'rsi_modular_v2.yml', {})
+    finally:
+        connection.close()
+    assert totals == {'BNB': Decimal('.24900041')}
+    assert fills[0].amount_decimal == Decimal('.25000041')
+    assert fills[0].price_decimal == Decimal('100.00000039')
+
+
+def test_exact_event_receipt_rejects_conflicting_complete_held_snapshot(tmp_path):
+    from hummingbot.strategy_v2.executors.recovery_inventory import native_inventory_proof
+
+    path = _legacy_held_fill_snapshot(write_fleet_owner_snapshot(tmp_path / 'v2.sqlite', 'rsi_modular_v2'),
+                                      remove_exact=False)
+    with sqlite3.connect(path) as connection:
+        payload = json.loads(connection.execute('SELECT order_payload FROM PositionHoldLedger').fetchone()[0])
+        payload['order_fills']['v2-trade']['fill_base_amount'] = '.251'
+        payload['order_fills']['v2-trade']['fill_quote_amount'] = '25.1'
+        connection.execute('UPDATE PositionHoldLedger SET order_payload=?', (json.dumps(payload),))
+    connection = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        with pytest.raises(ValueError, match='conflicts|differs'):
+            native_inventory_proof(connection, 'rsi_modular_v2.yml', {})
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('mutation', [
+    'missing_trade', 'wrong_pair', 'wrong_exchange_order', 'wrong_fee', 'wrong_quote',
+    'wrong_timestamp', 'duplicate_trade', 'legacy_projection_conflict', 'wrong_order_aggregate',
+    'wrong_ledger_fee_projection', 'third_fee_currency', 'percent_fee', 'wrong_side',
+])
+def test_legacy_held_order_fallback_rejects_incomplete_or_conflicting_provenance(tmp_path, mutation):
+    from hummingbot.strategy_v2.executors.recovery_inventory import native_inventory_proof
+
+    path = _legacy_held_fill_snapshot(write_fleet_owner_snapshot(tmp_path / 'v2.sqlite', 'rsi_modular_v2'))
+    with sqlite3.connect(path) as connection:
+        row = connection.execute('SELECT order_payload FROM PositionHoldLedger').fetchone()
+        payload = json.loads(row[0])
+        fill = payload['order_fills']['v2-trade']
+        if mutation == 'missing_trade':
+            payload['order_fills'] = {}
+        elif mutation == 'wrong_pair':
+            fill['trading_pair'] = 'BTC-USDC'
+        elif mutation == 'wrong_exchange_order':
+            fill['exchange_order_id'] = 'other-order'
+        elif mutation == 'wrong_fee':
+            fill['fee']['flat_fees'][0]['amount'] = '.002'
+        elif mutation == 'wrong_quote':
+            fill['fill_quote_amount'] = '24.99'
+        elif mutation == 'wrong_timestamp':
+            fill['fill_timestamp'] = 999
+        elif mutation == 'duplicate_trade':
+            payload['order_fills']['duplicate'] = dict(fill)
+        elif mutation == 'legacy_projection_conflict':
+            connection.execute('UPDATE TradeFill SET amount=249000 WHERE order_id=?',
+                               (payload['client_order_id'],))
+        elif mutation == 'wrong_order_aggregate':
+            payload['executed_amount_quote'] = '26'
+        elif mutation == 'wrong_ledger_fee_projection':
+            connection.execute('UPDATE PositionHoldLedger SET cumulative_fee_paid_quote=99999')
+        elif mutation == 'third_fee_currency':
+            fill['fee']['flat_fees'][0]['token'] = 'ETH'
+        elif mutation == 'percent_fee':
+            fill['fee']['percent'] = '.001'
+        elif mutation == 'wrong_side':
+            payload['trade_type'] = 'SELL'
+        connection.execute('UPDATE PositionHoldLedger SET order_payload=?', (json.dumps(payload),))
+    connection = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        with pytest.raises(ValueError):
+            native_inventory_proof(connection, 'rsi_modular_v2.yml', {})
+    finally:
+        connection.close()
+
+
 def test_same_asset_totals_do_not_allow_a_forged_held_fill_identity(tmp_path):
     path = write_fleet_owner_snapshot(tmp_path / 'v2.sqlite', 'rsi_modular_v2')
     with sqlite3.connect(path) as connection:

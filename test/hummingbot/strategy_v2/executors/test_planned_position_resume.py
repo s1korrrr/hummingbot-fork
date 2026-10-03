@@ -840,6 +840,133 @@ async def terminal_with_suspended_sol_fixture(tmp_path):
     return db, preflight, root, recorder, terminal, sol, evidence
 
 
+def apply_prospective_daily_enrollment(db, *, limit_quote='1000', command_id='approved-risk-1000'):
+    from hummingbot.strategy_v2.migrations.entry_risk import apply_entry_risk_transition, plan_entry_risk_transition
+
+    request = {
+        'command_id': command_id, 'requested_at': 1000,
+        'limit_quote': limit_quote, 'controllers': ['ok-rsi-bnb', 'ok-rsi-sol'],
+        'owner_stopped': True, 'entries_fenced': True, 'allow_new_risk_scope': False,
+    }
+    with sqlite3.connect(db) as connection:
+        proposal = plan_entry_risk_transition(connection, 'ok_rsi.yml', request)
+        apply_entry_risk_transition(connection, proposal, now=1001)
+    return proposal
+
+
+@pytest.mark.asyncio
+async def test_terminal_claim_accepts_only_archived_prospective_daily_risk_enrollment(tmp_path):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    with sqlite3.connect(preflight) as connection:
+        raw_preflight_risk = connection.execute(
+            'SELECT value FROM Metadata WHERE key=?', ('strategy-risk:ok_rsi.yml',)).fetchone()[0]
+    assert raw_preflight_risk != resume.canonical(json.loads(raw_preflight_risk))
+    script_path = root / 'conf/scripts/ok_rsi.yml'
+    script_path.write_text(script_path.read_text() + "max_daily_loss_quote: '1000'\n")
+    proposal = apply_prospective_daily_enrollment(db)
+
+    with sqlite3.connect(preflight) as connection:
+        original = json.loads(connection.execute(
+            'SELECT value FROM Metadata WHERE key=?', ('strategy-risk:ok_rsi.yml',)).fetchone()[0])
+    assert original['version'] == 1 and 'entry_risk_enrollment' not in original
+
+    evidence = refresh_stopped_evidence(db, evidence, 1002)
+    manifest = resume.prepare(
+        db, preflight, evidence, now=1002, root=root,
+        terminal_suspended_executor_ids=(terminal.config.id,),
+        continuity_executor_ids=(sol.config.id,),
+    )
+    binding = manifest['risk_transition_binding']
+    assert binding['archive_key'] == proposal['archive_key']
+    assert binding['transition_id'] == proposal['transition_id']
+    assert binding['limit_quote'] == '1000'
+    assert resume.pending_manifest(db, now=1003, root=root) == manifest
+    resume.claim(db, manifest, now=1003, root=root)
+
+
+@pytest.mark.asyncio
+async def test_terminal_daily_risk_enrollment_requires_exact_staged_limit(tmp_path):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    (root / 'conf/scripts/ok_rsi.yml').write_text(
+        (root / 'conf/scripts/ok_rsi.yml').read_text() + "max_daily_loss_quote: '1000'\n")
+    apply_prospective_daily_enrollment(db, limit_quote='50', command_id='wrong-limit')
+    evidence = refresh_stopped_evidence(db, evidence, 1002)
+
+    with pytest.raises(ValueError, match='limit differs from staged runner configuration'):
+        resume.prepare(db, preflight, evidence, now=1002, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,),
+                       continuity_executor_ids=(sol.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_terminal_daily_risk_enrollment_rejects_unarchived_native_state_drift(tmp_path):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    (root / 'conf/scripts/ok_rsi.yml').write_text(
+        (root / 'conf/scripts/ok_rsi.yml').read_text() + "max_daily_loss_quote: '1000'\n")
+    apply_prospective_daily_enrollment(db)
+    with sqlite3.connect(db) as connection:
+        state = json.loads(connection.execute(
+            'SELECT value FROM Metadata WHERE key=?', ('strategy-risk:ok_rsi.yml',)).fetchone()[0])
+        state['max_global_pnl'] = '1'
+        connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                           (resume.canonical(state), 'strategy-risk:ok_rsi.yml'))
+    evidence = refresh_stopped_evidence(db, evidence, 1002)
+
+    with pytest.raises(ValueError, match='changed preserved history or current pending state'):
+        resume.prepare(db, preflight, evidence, now=1002, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,),
+                       continuity_executor_ids=(sol.config.id,))
+
+
+@pytest.mark.asyncio
+async def test_terminal_daily_risk_enrollment_rejects_unrelated_metadata_drift(tmp_path):
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    (root / 'conf/scripts/ok_rsi.yml').write_text(
+        (root / 'conf/scripts/ok_rsi.yml').read_text() + "max_daily_loss_quote: '1000'\n")
+    apply_prospective_daily_enrollment(db)
+    with sqlite3.connect(db) as connection:
+        connection.execute('INSERT INTO Metadata(key, value) VALUES (?, ?)',
+                           ('unrelated-maintenance-state', '{"unchanged":true}'))
+    evidence = refresh_stopped_evidence(db, evidence, 1002)
+
+    with pytest.raises(ValueError, match='pre-state digest does not match'):
+        resume.prepare(db, preflight, evidence, now=1002, root=root,
+                       terminal_suspended_executor_ids=(terminal.config.id,),
+                       continuity_executor_ids=(sol.config.id,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tamper', ['delete', 'rehashed_edit'])
+async def test_terminal_daily_risk_transition_archive_is_rechecked_before_startup(tmp_path, tamper):
+    import hashlib
+
+    db, preflight, root, _, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
+    (root / 'conf/scripts/ok_rsi.yml').write_text(
+        (root / 'conf/scripts/ok_rsi.yml').read_text() + "max_daily_loss_quote: '1000'\n")
+    proposal = apply_prospective_daily_enrollment(db)
+    evidence = refresh_stopped_evidence(db, evidence, 1002)
+    resume.prepare(db, preflight, evidence, now=1002, root=root,
+                   terminal_suspended_executor_ids=(terminal.config.id,),
+                   continuity_executor_ids=(sol.config.id,))
+    with sqlite3.connect(db) as connection:
+        if tamper == 'delete':
+            connection.execute('DELETE FROM Metadata WHERE key=?', (proposal['archive_key'],))
+        else:
+            archive = json.loads(connection.execute('SELECT value FROM Metadata WHERE key=?',
+                                                    (proposal['archive_key'],)).fetchone()[0])
+            archive['native_state_sha256'] = hashlib.sha256(b'changed').hexdigest()
+            unsigned = {key: value for key, value in archive.items() if key != 'transition_id'}
+            archive['transition_id'] = resume.digest(unsigned)
+            connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                               (resume.canonical(archive), proposal['archive_key']))
+
+    with pytest.raises(ValueError, match=(
+        'database binding changed|transition archive is unavailable|transition receipt changed|'
+            'pre-state digest does not match')):
+        resume.pending_manifest(db, now=1003, root=root)
+    assert resume.inspect_manifest(db)[0]['state'] == 'prepared'
+
+
 @pytest.mark.asyncio
 async def test_terminal_singleton_claim_preserves_independent_suspended_sol_continuity(tmp_path):
     db, preflight, root, recorder, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)

@@ -1131,6 +1131,9 @@ class ExecutorOrchestrator:
                 Decimal(str(trade_fill.trade_fee_in_quote)) != Decimal(int(quote_fee * 1000000)) / 1000000):
             raise ValueError("Native quote fee encoding conflicts with exact receipt")
         ExecutorOrchestrator._validate_reconciliation_fee(trade_fill.trade_fee)
+        source = getattr(trade_fill, 'native_receipt_source', 'order_filled_event_v1')
+        if source not in ('order_filled_event_v1', 'position_hold_order_snapshot_v1'):
+            raise ValueError('Unsupported native fill receipt provenance')
         executed_amount_quote = price * executed_amount_base
         client_order_id = f"{trade_fill.order_id}:{trade_fill.exchange_trade_id}"
         return {
@@ -1142,7 +1145,7 @@ class ExecutorOrchestrator:
             "executed_amount_base": executed_amount_base,
             "executed_amount_quote": executed_amount_quote,
             "cumulative_fee_paid_quote": quote_fee,
-            "precision": "event_exact",
+            "precision": "event_exact" if source == 'order_filled_event_v1' else source,
             "amount": executed_amount_base,
             "order_fills": {str(trade_fill.exchange_trade_id): {
                 "fill_base_amount": str(executed_amount_base), "fill_price": str(price),

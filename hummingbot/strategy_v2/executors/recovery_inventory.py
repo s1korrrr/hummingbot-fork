@@ -39,6 +39,176 @@ def _model_row(model, row):
     return model(**values)
 
 
+class _VerifiedHeldFill:
+    """In-memory fill view backed by one exact native held-order snapshot."""
+
+    def __init__(self, native, *, amount, price, fee_in_quote, exchange_order_id):
+        self._native = native
+        self.amount_decimal = amount
+        self.price_decimal = price
+        self.trade_fee_in_quote_decimal = fee_in_quote
+        self.native_order_exchange_id = exchange_order_id
+        self.native_receipt_source = 'position_hold_order_snapshot_v1'
+        self.has_exact_receipt = True
+
+    def __getattr__(self, name):
+        return getattr(self._native, name)
+
+
+def _quote_fee_from_snapshot(fee, base_asset, quote_asset, price, validate_fee):
+    """Value exact base/quote flat fees at this fill, rejecting unvalued fee currencies."""
+    validate_fee(fee)
+    _require(Decimal(str(fee['percent'])) == 0, 'native fallback percent fee is unsupported')
+    quote_fee = Decimal(0)
+    for item in fee['flat_fees']:
+        amount = Decimal(str(item['amount']))
+        if not amount.is_finite():
+            raise ValueError('native fallback fee is non-finite')
+        if item['token'] == base_asset:
+            quote_fee += amount * price
+        elif item['token'] == quote_asset:
+            quote_fee += amount
+        else:
+            raise ValueError('native fallback fee currency cannot be valued exactly')
+    if not quote_fee.is_finite():
+        raise ValueError('native fallback quote fee is non-finite')
+    return quote_fee
+
+
+def _order_snapshot_receipts(connection, script_config, fills_by_order, validate_fee):
+    """Validate complete held order snapshots for orders containing legacy fills.
+
+    InFlightOrder timestamps are seconds; recorder Order/TradeFill timestamps are
+    milliseconds. Each event time must lie within the recorded native order
+    lifecycle. Event receipt time and exchange fill time need not be identical.
+    """
+    from hummingbot.model.position_hold_ledger import PositionHoldLedger
+
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if 'PositionHoldLedger' not in tables:
+        return {}
+    result = {}
+    for order_id, native_fills in fills_by_order.items():
+        needs_fallback = any(values.precision != 'event_exact' for _, _, values in native_fills)
+        ledger_rows = connection.execute(
+            'SELECT * FROM PositionHoldLedger WHERE client_order_id=?', (order_id,)).fetchall()
+        if not ledger_rows:
+            _require(not needs_fallback, 'legacy native fill lacks one unique held order snapshot')
+            continue
+        if len(ledger_rows) != 1:
+            _require(not needs_fallback, 'legacy native fill lacks one unique held order snapshot')
+            continue
+        ledger = ledger_rows[0]
+        order = connection.execute('SELECT * FROM "Order" WHERE id=?', (order_id,)).fetchone()
+        if order is None:
+            _require(not needs_fallback, 'legacy held snapshot lacks its native Order')
+            continue
+        try:
+            payload = json.loads(ledger['order_payload']) if isinstance(ledger['order_payload'], str) else ledger['order_payload']
+        except (TypeError, ValueError):
+            _require(not needs_fallback, 'legacy held order snapshot is malformed')
+            continue
+        required_top = {'client_order_id', 'exchange_order_id', 'trading_pair', 'trade_type', 'order_fills',
+                        'executed_amount_base', 'executed_amount_quote'}
+        required_fill = {'trade_id', 'client_order_id', 'exchange_order_id', 'trading_pair',
+                         'fill_timestamp', 'fill_base_amount', 'fill_price', 'fill_quote_amount', 'fee'}
+        complete_snapshot = (isinstance(payload, dict) and required_top <= payload.keys()
+                             and isinstance(payload.get('order_fills'), dict)
+                             and all(isinstance(receipt, dict) and required_fill <= receipt.keys()
+                                     for receipt in payload['order_fills'].values()))
+        if not needs_fallback and not complete_snapshot:
+            continue
+        _require(complete_snapshot, 'legacy held order snapshot is incomplete')
+        _require(order is not None and order['config_file_path'] == script_config
+                 and order['market'] == 'okx' and order['symbol'] == native_fills[0][0].symbol
+                 and order['base_asset'] == native_fills[0][0].base_asset
+                 and order['quote_asset'] == native_fills[0][0].quote_asset
+                 and order['leverage'] == 1 and order['position'] in (None, '', 'NIL')
+                 and isinstance(order['exchange_order_id'], str) and bool(order['exchange_order_id']),
+                 'legacy native fill order owner or exchange identity differs')
+        pair = order['symbol']
+        base, quote = order['base_asset'], order['quote_asset']
+        _require(ledger['connector_name'] == 'okx' and ledger['trading_pair'] == pair
+                 and ledger['order_side'] in ('BUY', 'SELL')
+                 and ledger['client_order_id'] == order_id
+                 and ledger['exchange_order_id'] == order['exchange_order_id'],
+                 'legacy held order ledger identity differs')
+        _require(payload.get('client_order_id') == order_id
+                 and payload.get('exchange_order_id') == order['exchange_order_id']
+                 and payload.get('trading_pair') == pair
+                 and payload.get('trade_type') == ledger['order_side']
+                 and isinstance(payload.get('order_fills'), dict),
+                 'legacy held order snapshot owner is incomplete')
+        by_trade_id = {str(fill.exchange_trade_id): (fill, companion, values)
+                       for fill, companion, values in native_fills}
+        snapshots = payload['order_fills']
+        _require(set(snapshots) == set(by_trade_id) and len(snapshots) == len(by_trade_id),
+                 'legacy held order fill set differs from native TradeFill history')
+        _require(order['creation_timestamp'] > 0
+                 and order['last_update_timestamp'] >= order['creation_timestamp'],
+                 'legacy native order lifecycle timestamp is invalid')
+        aggregate_base = Decimal(0)
+        aggregate_quote = Decimal(0)
+        aggregate_fee_quote = Decimal(0)
+        for trade_id, (fill, companion, values) in by_trade_id.items():
+            receipt = snapshots[trade_id]
+            required = {'trade_id', 'client_order_id', 'exchange_order_id', 'trading_pair',
+                        'fill_timestamp', 'fill_base_amount', 'fill_price', 'fill_quote_amount', 'fee'}
+            _require(isinstance(receipt, dict) and required <= receipt.keys()
+                     and str(receipt['trade_id']) == trade_id
+                     and receipt['client_order_id'] == order_id
+                     and receipt['exchange_order_id'] == order['exchange_order_id']
+                     and receipt['trading_pair'] == pair,
+                     'legacy held fill identity is incomplete or conflicting')
+            amount = Decimal(str(receipt['fill_base_amount']))
+            price = Decimal(str(receipt['fill_price']))
+            quote_amount = Decimal(str(receipt['fill_quote_amount']))
+            fill_timestamp = Decimal(str(receipt['fill_timestamp']))
+            _require(all(value.is_finite() and value > 0
+                         for value in (amount, price, quote_amount, fill_timestamp))
+                     and amount * price == quote_amount,
+                     'legacy held fill amount, price, quote, or timestamp is invalid')
+            _require(order['creation_timestamp'] <= fill_timestamp * 1000 <= order['last_update_timestamp']
+                     and order['creation_timestamp'] <= fill.timestamp <= order['last_update_timestamp'],
+                     'legacy held fill timestamp is outside its native order lifecycle')
+            _require(fill.trade_type == ledger['order_side'] and fill.trade_fee == receipt['fee']
+                     and Decimal(fill.amount) == Decimal(int(amount * 1_000_000)) / 1_000_000
+                     and Decimal(fill.price) == Decimal(int(price * 1_000_000)) / 1_000_000,
+                     'legacy held fill conflicts with its six-decimal native TradeFill projection')
+            fee_quote = _quote_fee_from_snapshot(receipt['fee'], base, quote, price, validate_fee)
+            _require(fill.trade_fee_in_quote is not None
+                     and Decimal(fill.trade_fee_in_quote) == Decimal(int(fee_quote * 1_000_000)) / 1_000_000,
+                     'legacy held exact quote fee conflicts with its native six-decimal projection')
+            if values.precision == 'event_exact':
+                _require(values.amount == amount and values.price == price
+                         and (values.fee_in_quote is None or values.fee_in_quote == fee_quote),
+                         'native exact fill companion conflicts with held order snapshot')
+            aggregate_base += amount
+            aggregate_quote += quote_amount
+            aggregate_fee_quote += fee_quote
+            if values.precision != 'event_exact':
+                result[(fill.market, pair, order_id, trade_id)] = _VerifiedHeldFill(
+                    fill, amount=amount, price=price, fee_in_quote=fee_quote,
+                    exchange_order_id=order['exchange_order_id'])
+        for field, expected in (('executed_amount_base', aggregate_base),
+                                ('executed_amount_quote', aggregate_quote)):
+            try:
+                actual = Decimal(str(payload[field]))
+            except (KeyError, ArithmeticError, TypeError, ValueError):
+                raise ValueError('legacy held order aggregate is incomplete') from None
+            _require(actual.is_finite() and actual == expected,
+                     'legacy held order aggregate conflicts with exact fills')
+        native_ledger = _model_row(PositionHoldLedger, ledger)
+        _require(Decimal(native_ledger.executed_amount_base)
+                 == Decimal(int(aggregate_base * 1_000_000)) / 1_000_000
+                 and Decimal(native_ledger.executed_amount_quote)
+                 == Decimal(int(aggregate_quote * 1_000_000)) / 1_000_000
+                 and Decimal(native_ledger.cumulative_fee_paid_quote)
+                 == Decimal(int(aggregate_fee_quote * 1_000_000)) / 1_000_000,
+                 'legacy held ledger aggregate conflicts with exact fills')
+    return result
+
+
 def native_inventory_proof(connection, script_config, quantity_increments=None):
     """Return proven terminal dust and all fee-net fills, each grouped by base asset.
 
@@ -64,8 +234,22 @@ def native_inventory_proof(connection, script_config, quantity_increments=None):
     _require(isinstance(lots, dict), 'native lot evidence must be a pair map')
     lots = {pair: decimal(value, 'native lot evidence', positive=True) for pair, value in lots.items()}
     fills, fill_totals, seen = [], defaultdict(Decimal), set()
-    for raw in connection.execute('SELECT * FROM TradeFill'):
-        fill = _model_row(TradeFill, raw)
+    exact_fill_groups = defaultdict(list)
+    native_rows = [_model_row(TradeFill, raw) for raw in connection.execute('SELECT * FROM TradeFill')]
+    for fill in native_rows:
+        companion = None
+        if 'TradeFillExact' in tables:
+            exact = connection.execute('SELECT * FROM TradeFillExact WHERE market=? AND order_id=? '
+                                       'AND exchange_trade_id=?',
+                                       (fill.market, fill.order_id, fill.exchange_trade_id)).fetchone()
+            if exact is not None:
+                companion = _model_row(TradeFillExact, exact)
+        values = recorded_values(fill, companion)
+        exact_fill_groups[fill.order_id].append((fill, companion, values))
+    held_snapshot_fills = _order_snapshot_receipts(
+        connection, script_config, exact_fill_groups, ExecutorOrchestrator._validate_reconciliation_fee)
+
+    for fill in native_rows:
         _require(fill.config_file_path == script_config and fill.market == 'okx'
                  and fill.symbol == f'{fill.base_asset}-{fill.quote_asset}'
                  and fill.leverage == 1 and fill.position in (None, '', 'NIL')
@@ -85,27 +269,39 @@ def native_inventory_proof(connection, script_config, quantity_increments=None):
         _require(fill.exchange_trade_id not in (None, '') and key not in seen,
                  'native exchange fill identity is missing or duplicated')
         seen.add(key)
-        companion = None
-        if 'TradeFillExact' in tables:
-            exact = connection.execute('SELECT * FROM TradeFillExact WHERE market=? AND order_id=? '
-                                       'AND exchange_trade_id=?',
-                                       (fill.market, fill.order_id, fill.exchange_trade_id)).fetchone()
-            if exact is not None:
-                companion = _model_row(TradeFillExact, exact)
+        companion = next(companion for grouped_fill, companion, _ in exact_fill_groups[fill.order_id]
+                         if grouped_fill.exchange_trade_id == fill.exchange_trade_id)
         values = recorded_values(fill, companion)
-        _require(values.precision == 'event_exact', 'native fill lacks exact event precision for recovery')
-        # Keep the original six-decimal columns intact. Attach proven exact event
-        # values only to this detached in-memory model for the shared proof reader.
-        fill.exact_amount = str(values.amount)
-        fill.exact_price = str(values.price)
-        fill.exact_trade_fee_in_quote = None if values.fee_in_quote is None else str(values.fee_in_quote)
-        fill.exact_receipt_source = 'order_filled_event_v1'
-        ExecutorOrchestrator._trade_fill_order_record(fill)  # validates native fee and exact scalar contracts
+        if values.precision == 'event_exact':
+            receipt_source = 'order_filled_event_v1'
+            # Companions may be the only exact representation in older schemas.
+            # These are detached models: retain proven event values without
+            # writing or rounding the historical recorder columns.
+            fill.exact_amount = str(values.amount)
+            fill.exact_price = str(values.price)
+            fill.exact_trade_fee_in_quote = None if values.fee_in_quote is None else str(values.fee_in_quote)
+            fill.exact_receipt_source = receipt_source
+            exact_fill = fill
+            amount = values.amount
+        else:
+            key = (fill.market, fill.symbol, fill.order_id, str(fill.exchange_trade_id))
+            exact_fill = held_snapshot_fills.get(key)
+            _require(exact_fill is not None,
+                     'native fill lacks exact event or complete held-order snapshot provenance')
+            receipt_source = exact_fill.native_receipt_source
+            amount = exact_fill.amount_decimal
+        if exact_fill is not fill:
+            exact_fill.native_order_exchange_id = order['exchange_order_id']
+            # Keep the event source distinct; this record is only a scalar/fee
+            # contract check and is never persisted or advertised as event_exact.
+            ExecutorOrchestrator._trade_fill_order_record(exact_fill)
+        else:
+            fill.native_receipt_source = receipt_source
+            ExecutorOrchestrator._trade_fill_order_record(fill)
         base_fee = sum((decimal(item['amount'], 'native base fee', minimum=None) for item in fill.trade_fee['flat_fees']
                         if item['token'] == fill.base_asset), ZERO)
-        fill_totals[fill.base_asset] += (fill.amount_decimal if fill.trade_type == 'BUY'
-                                         else -fill.amount_decimal) - base_fee
-        fills.append(fill)
+        fill_totals[fill.base_asset] += (amount if fill.trade_type == 'BUY' else -amount) - base_fee
+        fills.append(exact_fill)
 
     rows = list(connection.execute('SELECT * FROM Executors ORDER BY id'))
     evidence, selected = [], defaultdict(dict)

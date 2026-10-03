@@ -35,6 +35,10 @@ from hummingbot.strategy_v2.executors.recovery_inventory import (
     require_inventory_conservation,
 )
 from hummingbot.strategy_v2.executors.restart_continuity import RestartContinuityError, continuity_plan
+from hummingbot.strategy_v2.migrations.entry_risk import (
+    financial_state_digest_before_prospective_daily_enrollment,
+    validate_prospective_daily_enrollment_archive,
+)
 from hummingbot.strategy_v2.models.executors import CloseType
 
 TABLE = 'PlannedPositionResume'
@@ -66,6 +70,9 @@ SOURCES = (
     'hummingbot/connector/exchange/okx/okx_exchange.py',
     'hummingbot/connector/exchange/okx/native_reconciliation.py',
     'hummingbot/strategy_v2/models/executors_info.py',
+    'hummingbot/strategy_v2/migrations/entry_risk.py',
+    'hummingbot/strategy_v2/models/daily_entry_risk.py',
+    'hummingbot/strategy_v2/models/entry_risk_enrollment.py',
     'hummingbot/strategy_v2/controllers/native_policy_identity.py',
     'controllers/directional_trading/ok_rsi_core/down_only_entry_execution.py',
     'controllers/directional_trading/ok_rsi_core/down_only_entry.py',
@@ -1562,17 +1569,10 @@ def validate_continuity_bindings(connection, continuity_rows):
 
 
 def risk_state_digest(connection, script_config, expected_controllers):
-    require('Metadata' in tables(connection), 'durable V1 strategy risk state is unavailable')
-    row = connection.execute('SELECT value FROM Metadata WHERE key=?',
-                             (f'strategy-risk:{script_config}',)).fetchone()
-    require(row is not None, 'durable V1 strategy risk state is unavailable')
-    try:
-        state = json.loads(row['value'])
-    except (TypeError, ValueError):
-        raise ValueError('durable V1 strategy risk state is malformed') from None
+    state = risk_state_value(connection, script_config)
     controllers = set(expected_controllers)
     paused = state.get('operator_paused') if isinstance(state, dict) else None
-    require(isinstance(state, dict) and state.get('version') == 1
+    require(isinstance(state, dict) and type(state.get('version')) is int and state.get('version') == 1
             and isinstance(state.get('controllers'), list)
             and set(state['controllers']) == controllers
             and isinstance(state.get('max_pnl_by_controller'), dict)
@@ -1604,13 +1604,80 @@ def risk_state_digest(connection, script_config, expected_controllers):
     return digest(state)
 
 
-def validate_risk_state_binding(connection, manifest):
+def risk_state_value(connection, script_config):
+    require('Metadata' in tables(connection), 'durable V1 strategy risk state is unavailable')
+    row = connection.execute('SELECT value FROM Metadata WHERE key=?',
+                             (f'strategy-risk:{script_config}',)).fetchone()
+    require(row is not None, 'durable V1 strategy risk state is unavailable')
+    try:
+        state = json.loads(row['value'])
+    except (TypeError, ValueError):
+        raise ValueError('durable V1 risk state is malformed') from None
+    require(isinstance(state, dict), 'durable V1 risk state is malformed')
+    return state
+
+
+def staged_daily_entry_limit(script_config, root=ROOT):
+    script_path = Path(root) / 'conf/scripts' / script_config
+    try:
+        script = yaml.safe_load(script_path.read_text())
+        value = script.get('max_daily_loss_quote') if isinstance(script, dict) else None
+        require(type(value) in (str, int), 'staged V1 daily entry limit must be a quoted decimal or integer')
+        limit = decimal(value)
+    except (OSError, TypeError, ValueError, ArithmeticError):
+        raise ValueError('staged V1 daily entry limit is unavailable or malformed') from None
+    require(value is not None and limit.is_finite() and limit > 0,
+            'staged V1 daily entry limit is unavailable or malformed')
+    return str(limit)
+
+
+def risk_transition_binding(connection, script_config, controllers, before_state, current_state, configured_limit):
+    enrollment = current_state.get('entry_risk_enrollment')
+    require(isinstance(enrollment, dict) and isinstance(enrollment.get('command_id'), str),
+            'pending native V1 daily enrollment receipt is unavailable')
+    archive_key = 'strategy-risk-transition:' + digest([script_config, enrollment['command_id']])
+    row = connection.execute('SELECT value FROM Metadata WHERE key=?', (archive_key,)).fetchone()
+    require(row is not None, 'native V1 daily-risk transition archive is unavailable')
+    try:
+        archived = json.loads(row['value'])
+    except (TypeError, ValueError):
+        raise ValueError('native V1 daily-risk transition archive is malformed') from None
+    require(isinstance(archived, dict) and isinstance(archived.get('before'), dict),
+            'native V1 daily-risk transition archive is malformed')
+    expected_native_state = financial_state_digest_before_prospective_daily_enrollment(
+        connection, script_config, archived['before'], archive_key)
+    return validate_prospective_daily_enrollment_archive(
+        archive_key, row['value'], script_config=script_config, controllers=controllers,
+        before_state=before_state, current_state=current_state, configured_limit=configured_limit,
+        expected_native_state_sha256=expected_native_state)
+
+
+def validate_risk_state_binding(connection, manifest, root=ROOT):
     if not manifest.get('terminal_suspended_executor_ids'):
         return None
     controllers = manifest.get('risk_controllers')
     require(isinstance(controllers, list) and controllers,
             'sealed V1 risk controller set is unavailable')
-    current = risk_state_digest(connection, manifest['evidence']['script_config'], controllers)
+    script_config = manifest['evidence']['script_config']
+    current_state = risk_state_value(connection, script_config)
+    transition = manifest.get('risk_transition_binding')
+    if transition is None:
+        current = risk_state_digest(connection, script_config, controllers)
+    else:
+        require(isinstance(transition, dict), 'sealed V1 daily-risk transition binding is malformed')
+        require(bound_files(manifest['evidence']['config_paths'], root) == manifest['files'],
+                'V1 source/config binding changed after daily-risk enrollment')
+        configured_limit = staged_daily_entry_limit(script_config, root)
+        require(configured_limit == transition.get('limit_quote'),
+                'staged V1 daily entry limit changed after preparation')
+        current = digest(current_state)
+        require(current == manifest.get('risk_state_digest'),
+                'durable V1 risk state changed after terminal preparation')
+        validated = risk_transition_binding(connection, script_config, controllers,
+                                            before_state=None, current_state=current_state,
+                                            configured_limit=configured_limit)
+        require(validated == transition,
+                'native V1 daily-risk transition receipt changed after terminal preparation')
     require(current == manifest.get('risk_state_digest'),
             'durable V1 risk state changed after terminal preparation')
     return current
@@ -1680,14 +1747,28 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
         require({row['id']: row['trading_pair'] for row in controllers}.get('ok-rsi-bnb') == 'BNB-USDC',
                 'suspended terminal mode requires one executor under the exact V1 BNB controller owner')
         risk_controllers = sorted(row['id'] for row in controllers)
+        risk_transition_proof = None
         with connect(preflight_path) as preflight, connect(db_path) as stopped:
+            preflight_state = risk_state_value(preflight, evidence['script_config'])
             preflight_risk = risk_state_digest(preflight, evidence['script_config'], risk_controllers)
-            stopped_risk = risk_state_digest(stopped, evidence['script_config'], risk_controllers)
-        require(preflight_risk == stopped_risk,
-                'durable V1 risk state changed between preflight and stopped snapshots')
+            current_state = risk_state_value(stopped, evidence['script_config'])
+            if current_state.get('version') == 1:
+                stopped_risk = risk_state_digest(stopped, evidence['script_config'], risk_controllers)
+                require(preflight_risk == stopped_risk,
+                        'durable V1 risk state changed between preflight and stopped snapshots')
+            else:
+                configured_limit = staged_daily_entry_limit(evidence['script_config'], root)
+                risk_transition_proof = risk_transition_binding(
+                    stopped, evidence['script_config'], risk_controllers,
+                    before_state=preflight_state, current_state=current_state,
+                    configured_limit=configured_limit)
+                require(risk_transition_proof['before_state_sha256'] == preflight_risk,
+                        'daily-risk enrollment receipt differs from original preflight state')
+                stopped_risk = digest(current_state)
     else:
         risk_controllers = []
         stopped_risk = None
+        risk_transition_proof = None
     with connect(preflight_path) as preflight, connect(db_path) as stopped:
         unfinished_ids = {row[0] for row in stopped.execute('SELECT id FROM Executors WHERE status != 4')}
         if terminal_suspended_executor_ids:
@@ -1779,6 +1860,7 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
                     'claimed_history_digest': digest(history), 'continuity_rows': continuity_rows,
                     'terminal_suspended_executor_ids': sorted(terminal_suspended_executor_ids),
                     'risk_controllers': risk_controllers, 'risk_state_digest': stopped_risk,
+                    'risk_transition_binding': risk_transition_proof,
                     'files': files, 'evidence': evidence, 'positions': positions}
         connection.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} (id TEXT PRIMARY KEY, state TEXT NOT NULL, '
                            'payload TEXT NOT NULL, claimed_at REAL)')
@@ -1809,7 +1891,7 @@ def pending_manifest(db_path, now=None, root=ROOT):
         validate_history_binding(connection, manifest)
         require(database_digest(connection) == manifest['database_digest'], 'database binding changed')
         validate_continuity_bindings(connection, manifest.get('continuity_rows', []))
-        validate_risk_state_binding(connection, manifest)
+        validate_risk_state_binding(connection, manifest, root)
         proofs = {proof['executor_id']: proof for proof in manifest['evidence']['executors']}
         for position in manifest['positions']:
             row = connection.execute('SELECT * FROM Executors WHERE id=?', (position['executor_id'],)).fetchone()
@@ -1834,7 +1916,7 @@ def pending_manifest(db_path, now=None, root=ROOT):
     return manifest
 
 
-def claim(db_path, manifest, now=None):
+def claim(db_path, manifest, now=None, root=ROOT):
     now = time.time() if now is None else now
     with connect(db_path, writable=True) as connection:
         connection.execute('BEGIN IMMEDIATE')
@@ -1845,7 +1927,7 @@ def claim(db_path, manifest, now=None):
         validate_history_binding(connection, manifest)
         require(database_digest(connection) == manifest['database_digest'], 'database changed before claim')
         validate_continuity_bindings(connection, manifest.get('continuity_rows', []))
-        validate_risk_state_binding(connection, manifest)
+        validate_risk_state_binding(connection, manifest, root)
         for position in manifest['positions']:
             record = connection.execute('SELECT * FROM Executors WHERE id=?', (position['executor_id'],)).fetchone()
             require(digest(decode_row(record)) == position['stopped_digest'], 'executor changed before claim')

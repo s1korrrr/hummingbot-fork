@@ -6031,7 +6031,8 @@ class HLRSIController(DirectionalTradingControllerBase):
         base_balance = self._get_base_balance()
         managed_value = self._get_total_position_value_usd()
         idle_value: Optional[Decimal] = None
-        if base_balance is not None and current_price is not None and current_price > 0:
+        if (base_balance is not None and current_price is not None and current_price > 0
+                and managed_value.is_finite()):
             wallet_value = base_balance * current_price
             idle_value = max(wallet_value - managed_value, Decimal("0"))
         return f"idle wallet {self._status_money_label(idle_value)}"

@@ -620,6 +620,7 @@ def test_unavailable_complete_native_history_blocks_buy_and_is_reported_as_unava
     assert summary['state'] == 'UNAVAILABLE'
     assert summary['gate'] == 'exposure-unavailable'
     assert summary['exposure'] == 'unavailable'
+    assert summary['plan_liquidity'] == 'idle $n/a'
 
 
 @pytest.mark.parametrize('close_type', [CloseType.TAKE_PROFIT, CloseType.TIME_LIMIT, CloseType.STOP_LOSS])

@@ -318,8 +318,7 @@ class MeridianPortfolio:
                     or info.close_type in (None, CloseType.POSITION_HOLD)
                     or decimal(info.close_timestamp, 'dust close time', positive=True) <= 0):
                 raise PolicyError('unverified native terminal dust')
-            if (not isinstance(lifecycle, dict) or lifecycle.get('state') != 'managing_fill'
-                    or lifecycle.get('state') == 'reconciliation_required'):
+            if not isinstance(lifecycle, dict) or lifecycle.get('state') != 'managing_fill':
                 raise PolicyError('terminal dust entry lifecycle is unresolved')
             order_ids = custom.get('order_ids')
             snapshots = custom.get('execution_order_snapshots')
@@ -345,7 +344,7 @@ class MeridianPortfolio:
                         or not isinstance(exchange_order_id, str) or not exchange_order_id
                         or exchange_order_id in exchange_order_ids
                         or order.get('trading_pair') != pair or trade_type not in {'BUY', 'SELL'}
-                        or state not in {OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED}):
+                        or state not in {OrderState.CANCELED, OrderState.FILLED}):
                     raise PolicyError('terminal dust order identity invalid')
                 exchange_order_ids.add(exchange_order_id)
                 order_by_id[order_id] = order
@@ -400,8 +399,6 @@ class MeridianPortfolio:
                 if fill.order_id in order_ids and getattr(fill, 'symbol', None) != pair:
                     raise PolicyError('terminal dust order has a foreign-market fill')
             selected = [fill for fill in pair_fills if fill.order_id in order_ids]
-            if {fill.order_id for fill in selected} - set(order_ids):
-                raise PolicyError('terminal dust native fill order mismatch')
             fills_by_order = {}
             for fill in selected:
                 trade_id = str(fill.exchange_trade_id)

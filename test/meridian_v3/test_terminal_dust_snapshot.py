@@ -281,7 +281,8 @@ def test_unfinished_or_unproved_residual_cannot_reconcile_inventory(change):
 
 
 @pytest.mark.parametrize('change', ['close_type', 'entry_amount', 'exit_amount', 'native_amount',
-                                    'native_fee', 'duplicate_order', 'duplicate_trade', 'missing_trade', 'foreign_pair'])
+                                    'native_fee', 'duplicate_order', 'duplicate_trade', 'missing_trade',
+                                    'foreign_pair', 'failed_order'])
 def test_terminal_dust_requires_completed_matching_native_fill_lineage(change):
     portfolio, rows, fills, _ = snapshot_case()
     row, receipt = rows[0], rows[0].custom_info['execution_receipt']
@@ -301,6 +302,8 @@ def test_terminal_dust_requires_completed_matching_native_fill_lineage(change):
         fills[1].exchange_trade_id = fills[0].exchange_trade_id
     elif change == 'missing_trade':
         fills[0].exchange_trade_id = None
+    elif change == 'failed_order':
+        row.custom_info['execution_order_snapshots'][0]['last_state'] = '6'
     else:
         fills[0].symbol = 'ETH-USDC'
     with pytest.raises((PolicyError, ValueError)):

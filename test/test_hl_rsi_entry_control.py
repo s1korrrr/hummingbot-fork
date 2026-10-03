@@ -4,12 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from controllers.directional_trading.hl_rsi import HLRSIController, HLRSIControllerConfig
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import PriceType, TradeType
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType
 
 
 def _provider(*, mid=D('100')):
@@ -131,6 +133,11 @@ def _buy_executor(
         net_pnl_pct=net_pnl_pct,
         config=SimpleNamespace(
             type='position_executor',
+            id=executor_id,
+            connector_name='hyperliquid',
+            trading_pair='HYPE-USDC',
+            side=TradeType.BUY,
+            leverage=1,
             amount=amount,
             entry_price=entry_price,
             price=working_price,
@@ -333,6 +340,140 @@ def test_terminated_leftover_owned_stays_reserved_until_hold_transfer():
     with _use_hold_ledger([_ledger_row(executor_id=transferred.id, client_order_id='OID-held')]):
         assert instance._executor_owned_base(transferred) == D('0')
         assert instance._get_total_position_value_usd() == D('40')
+
+
+def _completed_dust_exit():
+    instance = _controller()
+    executor = _buy_executor(
+        amount=D('1'), filled_base=D('0.9981'), remaining_base=D('0'),
+        is_active=False, is_done=True, accounting_owner='executor',
+        receipt_remaining=D('0'), entry_gross_base=D('1'),
+        terminal_exchange_timestamp=1000, close_timestamp=1000.0,
+        order_ids=['buy-1', 'sell-1'],
+    )
+    executor.close_type = CloseType.TRAILING_STOP
+    executor.custom_info['close_order_filled_amount_base'] = D('0.998')
+    executor.custom_info['close_quantity'] = {'quantity_increment': '0.001'}
+    executor.custom_info['execution_receipt'].update({
+        'entry_gross_quote': D('100'), 'exit_gross_base': D('0.998'),
+        'exit_gross_quote': D('99.8'), 'residual_dust_base': D('0.0001'),
+    })
+    executor.custom_info['execution_order_snapshots'] = [
+        {
+            'client_order_id': 'buy-1', 'exchange_order_id': 'exchange-buy-1',
+            'trading_pair': 'HYPE-USDC',
+            'trade_type': 'BUY', 'last_state': '5',
+            'executed_amount_base': '1', 'executed_amount_quote': '100',
+            'order_fills': {'buy-fill': {
+                'trade_id': 'buy-fill', 'client_order_id': 'buy-1',
+                'exchange_order_id': 'exchange-buy-1', 'trading_pair': 'HYPE-USDC',
+                'fill_base_amount': '1',
+                'fill_price': '100', 'fill_quote_amount': '100',
+                'fee': {'fee_type': 'AddedToCost', 'percent': '0', 'percent_token': 'HYPE',
+                        'flat_fees': [{'token': 'HYPE', 'amount': '0.0019'}]},
+            }},
+        },
+        {
+            'client_order_id': 'sell-1', 'exchange_order_id': 'exchange-sell-1',
+            'trading_pair': 'HYPE-USDC',
+            'trade_type': 'SELL', 'last_state': '5',
+            'executed_amount_base': '0.998', 'executed_amount_quote': '99.8',
+            'order_fills': {'sell-fill': {
+                'trade_id': 'sell-fill', 'client_order_id': 'sell-1',
+                'exchange_order_id': 'exchange-sell-1', 'trading_pair': 'HYPE-USDC',
+                'fill_base_amount': '0.998',
+                'fill_price': '100', 'fill_quote_amount': '99.8',
+                'fee': {'fee_type': 'DeductedFromReturns', 'percent': '0',
+                        'percent_token': 'USDC', 'flat_fees': []},
+            }},
+        },
+    ]
+    instance.executors_info = [executor]
+    return instance, executor
+
+
+def test_completed_trailing_exit_with_native_fee_dust_has_finite_exposure():
+    instance, _ = _completed_dust_exit()
+
+    assert instance._get_total_position_value_usd() == D('0')
+    assert instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] != 'exposure_unavailable'
+
+
+@pytest.mark.parametrize('tamper', [
+    'missing_snapshots', 'wrong_fill_fee', 'unfilled_exit', 'wrong_pair',
+    'missing_receipt', 'active_executor', 'partial_executor', 'held_owner',
+    'negative_dust', 'nonfinite_dust', 'excess_dust', 'coordinated_false_dust',
+    'wrong_config_connector', 'perpetual_connector', 'wrong_config_pair',
+    'wrong_config_side', 'leveraged_config', 'nonfinite_close_time',
+    'negative_other_token_fee', 'wrong_lot_receipt',
+    'foreign_fill_pair', 'foreign_exchange_id', 'mismatched_trade_id',
+    'duplicate_trade_id',
+])
+def test_unverified_closed_exit_dust_keeps_exposure_unavailable(tamper):
+    instance, executor = _completed_dust_exit()
+    custom = executor.custom_info
+    receipt = custom['execution_receipt']
+    snapshots = custom['execution_order_snapshots']
+    if tamper == 'missing_snapshots':
+        del custom['execution_order_snapshots']
+    elif tamper == 'wrong_fill_fee':
+        snapshots[0]['order_fills']['buy-fill']['fee']['flat_fees'][0]['amount'] = '0.0001'
+    elif tamper == 'unfilled_exit':
+        snapshots[1]['last_state'] = '4'
+    elif tamper == 'wrong_pair':
+        snapshots[1]['trading_pair'] = 'OTHER-USDC'
+    elif tamper == 'missing_receipt':
+        del receipt['remaining_owned_base']
+    elif tamper == 'active_executor':
+        executor.is_active = True
+    elif tamper == 'partial_executor':
+        executor.is_done = False
+    elif tamper == 'held_owner':
+        receipt['accounting_owner'] = 'held_position'
+    elif tamper == 'negative_dust':
+        receipt['residual_dust_base'] = '-0.0001'
+    elif tamper == 'nonfinite_dust':
+        receipt['residual_dust_base'] = 'NaN'
+    elif tamper == 'excess_dust':
+        custom['open_order_filled_amount_base'] = D('0.9995')
+        receipt['residual_dust_base'] = D('0.0015')
+    elif tamper == 'coordinated_false_dust':
+        custom['open_order_filled_amount_base'] = D('0.9982')
+        receipt['residual_dust_base'] = D('0.0002')
+    elif tamper == 'wrong_config_connector':
+        executor.config.connector_name = 'okx_perpetual'
+    elif tamper == 'perpetual_connector':
+        object.__setattr__(instance.config, 'connector_name', 'okx_perpetual')
+        executor.connector_name = 'okx_perpetual'
+        executor.config.connector_name = 'okx_perpetual'
+    elif tamper == 'wrong_config_pair':
+        executor.config.trading_pair = 'OTHER-USDC'
+    elif tamper == 'wrong_config_side':
+        executor.config.side = TradeType.SELL
+    elif tamper == 'leveraged_config':
+        executor.config.leverage = 2
+    elif tamper == 'nonfinite_close_time':
+        executor.close_timestamp = float('nan')
+    elif tamper == 'negative_other_token_fee':
+        snapshots[0]['order_fills']['buy-fill']['fee']['flat_fees'].append(
+            {'token': 'USDC', 'amount': '-0.01'})
+    elif tamper == 'wrong_lot_receipt':
+        custom['close_quantity']['quantity_increment'] = '0.01'
+    elif tamper == 'foreign_fill_pair':
+        snapshots[0]['order_fills']['buy-fill']['trading_pair'] = 'OTHER-USDC'
+    elif tamper == 'foreign_exchange_id':
+        snapshots[0]['order_fills']['buy-fill']['exchange_order_id'] = 'foreign-order'
+    elif tamper == 'mismatched_trade_id':
+        snapshots[0]['order_fills']['buy-fill']['trade_id'] = 'foreign-fill'
+    elif tamper == 'duplicate_trade_id':
+        fill = snapshots[1]['order_fills'].pop('sell-fill')
+        fill['trade_id'] = 'buy-fill'
+        snapshots[1]['order_fills']['buy-fill'] = fill
+
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
 
 
 def test_position_hold_without_held_bag_refuses_new_buy():

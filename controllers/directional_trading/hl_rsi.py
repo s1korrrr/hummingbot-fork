@@ -34,12 +34,14 @@ from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy_v2.controllers.directional_trading_controller_base import (
     DirectionalTradingControllerBase,
     DirectionalTradingControllerConfigBase,
 )
+from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
     ExecutionStrategy,
@@ -1748,6 +1750,121 @@ class HLRSIController(DirectionalTradingControllerBase):
             if self._executor_counts_toward_buy_capital(executor)
         ]
 
+    def _verified_closed_exit_dust(self, executor, custom: Dict, receipt: Dict,
+                                   filled: Decimal, closed: Decimal) -> Optional[Decimal]:
+        """Recognize only a completed, fill-proven sub-lot write-off, never an open commitment."""
+        config = getattr(executor, "config", None)
+        if (not self._executor_is_done(executor) or getattr(executor, "is_active", True)
+                or getattr(executor, "close_type", None) != CloseType.TRAILING_STOP
+                or self._positive_decimal(getattr(executor, "close_timestamp", None)) is None
+                or getattr(config, "type", None) != "position_executor"
+                or getattr(executor, "connector_name", None) != self.config.connector_name
+                or getattr(executor, "trading_pair", None) != self.config.trading_pair
+                or getattr(executor, "side", None) != TradeType.BUY
+                or getattr(config, "id", None) != getattr(executor, "id", None)
+                or getattr(config, "connector_name", None) != self.config.connector_name
+                or getattr(config, "trading_pair", None) != self.config.trading_pair
+                or getattr(config, "side", None) != TradeType.BUY
+                or self._decimal_or_none(getattr(config, "leverage", None)) != 1
+                or ExecutorBase.is_perpetual_connector(self.config.connector_name)
+                or receipt.get("accounting_owner") != "executor"
+                or custom.get("held_position_orders")
+                or custom.get("remaining_position_amount_base") is None
+                or receipt.get("remaining_owned_base") is None):
+            return None
+        remaining = self._decimal_or_none(custom["remaining_position_amount_base"])
+        receipt_remaining = self._decimal_or_none(receipt["remaining_owned_base"])
+        dust = self._positive_decimal(receipt.get("residual_dust_base"))
+        if remaining != 0 or receipt_remaining != 0 or dust is None or filled - closed != dust:
+            return None
+        try:
+            rules = self.market_data_provider.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+            quantum = self._positive_decimal(getattr(rules, "min_base_amount_increment", None))
+            close_quantity = custom.get("close_quantity")
+            recorded_quantum = (self._positive_decimal(close_quantity.get("quantity_increment"))
+                                if isinstance(close_quantity, dict) else None)
+            if quantum is None or recorded_quantum != quantum or dust >= quantum:
+                return None
+            order_ids = custom.get("order_ids")
+            snapshots = custom.get("execution_order_snapshots")
+            if (not isinstance(order_ids, list) or not isinstance(snapshots, list) or len(order_ids) != len(snapshots)
+                    or len(order_ids) < 2 or len(set(order_ids)) != len(order_ids)):
+                return None
+            totals = {"BUY": [Decimal("0"), Decimal("0")], "SELL": [Decimal("0"), Decimal("0")]}
+            entry_base_fee = Decimal("0")
+            seen_orders = set()
+            seen_trades = set()
+            for order in snapshots:
+                if not isinstance(order, dict):
+                    return None
+                oid = order.get("client_order_id")
+                exchange_oid = order.get("exchange_order_id")
+                side = order.get("trade_type")
+                if (oid not in order_ids or oid in seen_orders or side not in totals
+                        or not isinstance(exchange_oid, str) or not exchange_oid
+                        or order.get("trading_pair") != self.config.trading_pair
+                        or str(order.get("last_state")) != str(OrderState.FILLED.value)):
+                    return None
+                seen_orders.add(oid)
+                fills = order.get("order_fills")
+                if not isinstance(fills, dict) or not fills:
+                    return None
+                base = self._positive_decimal(order.get("executed_amount_base"))
+                quote = self._positive_decimal(order.get("executed_amount_quote"))
+                if base is None or quote is None:
+                    return None
+                fill_base = fill_quote = Decimal("0")
+                for trade_id, fill in fills.items():
+                    if (not isinstance(trade_id, str) or not trade_id or trade_id in seen_trades
+                            or not isinstance(fill, dict) or fill.get("trade_id") != trade_id
+                            or fill.get("client_order_id") != oid
+                            or fill.get("exchange_order_id") != exchange_oid
+                            or fill.get("trading_pair") != self.config.trading_pair):
+                        return None
+                    seen_trades.add(trade_id)
+                    amount = self._positive_decimal(fill.get("fill_base_amount"))
+                    price = self._positive_decimal(fill.get("fill_price"))
+                    cost = self._positive_decimal(fill.get("fill_quote_amount"))
+                    fee = fill.get("fee")
+                    if amount is None or price is None or cost is None or amount * price != cost or not isinstance(fee, dict):
+                        return None
+                    if fee.get("fee_type") not in {"AddedToCost", "DeductedFromReturns"}:
+                        return None
+                    percent = self._decimal_or_none(fee.get("percent"))
+                    flat = fee.get("flat_fees")
+                    if percent is None or percent < 0 or not isinstance(flat, list):
+                        return None
+                    for item in flat:
+                        if not isinstance(item, dict) or not item.get("token"):
+                            return None
+                        fee_amount = self._decimal_or_none(item.get("amount"))
+                        if fee_amount is None or fee_amount < 0:
+                            return None
+                    fill_base += amount
+                    fill_quote += cost
+                if fill_base != base or fill_quote != quote:
+                    return None
+                totals[side][0] += base
+                totals[side][1] += quote
+                if side == "BUY":
+                    fee = base_fee_amount(order, self.config.trading_pair.split("-")[0])
+                    if fee < 0:
+                        return None
+                    entry_base_fee += fee
+            authorized = self._positive_decimal(getattr(executor.config, "amount", None))
+            if (seen_orders != set(order_ids) or authorized is None
+                    or not all(totals[side][0] > 0 for side in totals)
+                    or totals["BUY"][0] > authorized or totals["SELL"][0] > filled
+                    or totals["BUY"][0] != self._positive_decimal(receipt.get("entry_gross_base"))
+                    or totals["BUY"][1] != self._positive_decimal(receipt.get("entry_gross_quote"))
+                    or totals["SELL"][0] != self._positive_decimal(receipt.get("exit_gross_base"))
+                    or totals["SELL"][1] != self._positive_decimal(receipt.get("exit_gross_quote"))
+                    or totals["BUY"][0] - entry_base_fee != filled or totals["SELL"][0] != closed):
+                return None
+            return dust
+        except (AttributeError, ArithmeticError, InvalidOperation, KeyError, TypeError, ValueError):
+            return None
+
     def _executor_reported_owned_base(self, executor) -> Optional[Decimal]:
         custom = self._executor_custom_info(executor)
         receipt = custom.get("execution_receipt") or {}
@@ -1772,6 +1889,11 @@ class HLRSIController(DirectionalTradingControllerBase):
             derived = filled - (closed or Decimal("0"))
             if derived < 0:
                 return None
+            if measures and any(item != derived for item in measures):
+                dust = self._verified_closed_exit_dust(executor, custom, receipt, filled, closed or Decimal("0"))
+                if dust is None:
+                    return None
+                derived -= dust
             measures.append(derived)
         if not measures:
             return None

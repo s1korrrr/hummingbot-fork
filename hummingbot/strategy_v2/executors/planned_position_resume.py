@@ -26,7 +26,7 @@ from hummingbot.connector.exchange.okx.native_reconciliation import SPOT_ALGO_TY
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1, validate_acquisition_chain
-from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
+from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount, base_fee_quote_amount
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.executors.position_executor.position_executor import validate_planned_entry_reconciliation
 from hummingbot.strategy_v2.executors.recovery_inventory import (
@@ -81,6 +81,12 @@ SOURCES = (
 STARTUP_SEALED_RESTORE = 'startup-sealed-restore'  # legacy V1 marker written by local sealed restore
 TRAILING_KEYS = ('trailing_state', 'trailing_stop_trigger_pct', 'trailing_move_count',
                  'trailing_armed_timestamp', 'trailing_last_update_timestamp')
+SOL_MARK_ONLY_CUSTOM = frozenset({
+    'close_price', 'current_market_price', 'trailing_current_price',
+    'distance_to_trailing_activation_pct', 'distance_to_trailing_trigger_pct',
+    'open_order_age_seconds',
+})
+SOL_MARK_ONLY_OUTER = frozenset({'net_pnl_quote', 'net_pnl_pct'})
 BOUND_TABLES = ('Executors', 'Order', 'OrderStatus', 'TradeFill', 'OrderExact', 'TradeFillExact',
                 'PositionHoldLedger', 'Position')
 FLEET_OWNERS = {'rsi_modular_v2': 'rsi_modular_v2.yml', 'meridian_v3': 'meridian_v3.yml'}
@@ -715,11 +721,21 @@ def validate_nonselected_suspended_continuity(preflight, stopped):
         } and after_marker.get('reason') == 'planned_restart',
         'nonselected continuity row lacks the exact planned-restart marker',
     )
+    for key in SOL_MARK_ONLY_CUSTOM:
+        require(key in before_custom and key in after_custom,
+                'nonselected SOL mark projection is incomplete')
+        before_custom.pop(key)
+        after_custom.pop(key)
     require(before_custom == after_custom,
             'nonselected continuity executor state, fills, orders, or trailing state changed')
     before_outer, after_outer = dict(preflight), dict(stopped)
     before_outer.pop('custom_info', None)
     after_outer.pop('custom_info', None)
+    for key in SOL_MARK_ONLY_OUTER:
+        require(key in before_outer and key in after_outer,
+                'nonselected SOL PnL projection is incomplete')
+        before_outer.pop(key)
+        after_outer.pop(key)
     if terminalized:
         for key in ('status', 'is_active', 'is_trading'):
             after_outer[key] = before_outer[key]
@@ -754,10 +770,63 @@ def validate_nonselected_suspended_continuity(preflight, stopped):
             and plan.entry_orders[0].executed_amount_base == plan.entry_orders[0].amount
             and plan.entry_orders[0].amount > 0,
             'nonselected SOL executor does not satisfy native restart-continuity requirements')
+    validate_nonselected_sol_mark_projection(preflight, stopped, plan.entry_orders[0], config)
     return {'executor_id': stopped['id'], 'preflight': preflight, 'stopped_digest': digest(stopped),
             'remaining_position_amount_base': str(remaining), 'controller_id': stopped['controller_id'],
             'connector_name': config.connector_name, 'trading_pair': config.trading_pair,
             'restart_suspended': after_marker}
+
+
+def validate_nonselected_sol_mark_projection(preflight, stopped, order, config):
+    """Only current mark and elapsed age may drift; fill-net cost and trailing state stay sealed."""
+    before, after = preflight['custom_info'], stopped['custom_info']
+    price = decimal(after['current_market_price'])
+    require(price > 0 and decimal(after['close_price']) == price
+            and decimal(after['trailing_current_price']) == price,
+            'nonselected SOL current mark projection differs')
+    before_age, after_age = decimal(before['open_order_age_seconds']), decimal(after['open_order_age_seconds'])
+    require(0 <= before_age <= after_age and math.isfinite(float(after_age)),
+            'nonselected SOL open-order age moved backward or is invalid')
+    receipt = order.to_json()
+    gross_quote = decimal(receipt['executed_amount_quote'])
+    cost = gross_quote - base_fee_quote_amount(receipt, 'SOL')
+    owned = decimal(after['remaining_position_amount_base'])
+    expected_owned = decimal(receipt['executed_amount_base']) - base_fee_amount(receipt, 'SOL')
+    fee_quote = decimal(receipt['cumulative_fee_paid_quote'])
+    require(cost > 0 and owned > 0 and owned == expected_owned
+            and math.isfinite(float(cost)) and math.isfinite(float(fee_quote))
+            and float(decimal(stopped['filled_amount_quote'])) == float(cost)
+            and float(decimal(stopped['cum_fees_quote'])) == float(fee_quote),
+            'nonselected SOL acquisition cost or native fee projection differs')
+    # PositionExecutor uses fee-net cost per owned unit and charges total valued
+    # fees once. SQLite stores these report-only columns as binary floats.
+    basis = cost / owned
+    fee_pct = fee_quote / cost
+    trailing = config.triple_barrier_config.trailing_stop
+    require(trailing is not None, 'nonselected SOL trailing configuration disappeared')
+    activation = decimal(after['trailing_activation_price'])
+    require(activation == basis * (Decimal(1) + fee_pct + decimal(trailing.activation_price))
+            and decimal(after['distance_to_trailing_activation_pct'])
+            == max(activation - price, Decimal(0)) / price,
+            'nonselected SOL activation projection differs from sealed cost or current mark')
+    trigger = after['trailing_trigger_price']
+    trigger_pct = after['trailing_stop_trigger_pct']
+    if trigger is None:
+        require(trigger_pct is None and after['distance_to_trailing_trigger_pct'] is None,
+                'nonselected SOL trigger distance exists without an armed trigger')
+    else:
+        trigger_price = decimal(trigger)
+        require(trigger_pct is not None
+                and trigger_price == basis * (Decimal(1) + fee_pct + decimal(trigger_pct))
+                and decimal(after['distance_to_trailing_trigger_pct'])
+                == max(price - trigger_price, Decimal(0)) / price,
+                'nonselected SOL trigger projection differs from sealed cost or current mark')
+    expected_quote = ((price - basis) / basis) * cost - fee_quote
+    expected_pct = expected_quote / cost
+    require(math.isfinite(float(expected_quote)) and math.isfinite(float(expected_pct))
+            and float(decimal(stopped['net_pnl_quote'])) == float(expected_quote)
+            and float(decimal(stopped['net_pnl_pct'])) == float(expected_pct),
+            'nonselected SOL mark PnL differs from sealed fill cost and fee')
 
 
 def validate_continuity_venue_order(native_order, venue):

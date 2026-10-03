@@ -967,14 +967,42 @@ async def test_terminal_daily_risk_transition_archive_is_rechecked_before_startu
     assert resume.inspect_manifest(db)[0]['state'] == 'prepared'
 
 
+def apply_synthetic_sol_mark_drift(connection, executor_id):
+    """The real V1 snapshots change mark/PnL/age fields while order and trail facts stay fixed."""
+    connection.row_factory = sqlite3.Row
+    row = connection.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+    custom = json.loads(row['custom_info'])
+    mark = Decimal(str(custom['current_market_price'])) + Decimal('.03')
+    custom['close_price'] = str(mark)
+    custom['current_market_price'] = str(mark)
+    custom['trailing_current_price'] = str(mark)
+    activation = Decimal(str(custom['trailing_activation_price']))
+    custom['distance_to_trailing_activation_pct'] = str(max(activation - mark, Decimal(0)) / mark)
+    trigger = custom['trailing_trigger_price']
+    if trigger is not None:
+        custom['distance_to_trailing_trigger_pct'] = str(max(mark - Decimal(str(trigger)), Decimal(0)) / mark)
+    custom['open_order_age_seconds'] = float(custom['open_order_age_seconds']) + 820.0
+    cost = Decimal(str(row['filled_amount_quote']))
+    owned = Decimal(str(custom['remaining_position_amount_base']))
+    fees = Decimal(str(row['cum_fees_quote']))
+    net = mark * owned - cost - fees
+    connection.execute('UPDATE Executors SET custom_info=?, net_pnl_quote=?, net_pnl_pct=? WHERE id=?',
+                       (resume.canonical(custom), float(net), float(net / cost), executor_id))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('sol_terminalized', [False, True])
-async def test_terminal_singleton_claim_preserves_independent_suspended_sol_continuity(tmp_path, sol_terminalized):
+@pytest.mark.parametrize('sol_mark_drift', [False, True])
+async def test_terminal_singleton_claim_preserves_independent_suspended_sol_continuity(
+        tmp_path, sol_terminalized, sol_mark_drift):
     db, preflight, root, recorder, terminal, sol, evidence = await terminal_with_suspended_sol_fixture(tmp_path)
-    if sol_terminalized:
+    if sol_terminalized or sol_mark_drift:
         with sqlite3.connect(db) as connection:
-            connection.execute('UPDATE Executors SET status=4, is_active=0, is_trading=0 WHERE id=?',
-                               (sol.config.id,))
+            if sol_mark_drift:
+                apply_synthetic_sol_mark_drift(connection, sol.config.id)
+            if sol_terminalized:
+                connection.execute('UPDATE Executors SET status=4, is_active=0, is_trading=0 WHERE id=?',
+                                   (sol.config.id,))
         evidence = refresh_stopped_evidence(db, evidence, 1000)
     assert evidence['reconciliation']['balance_coverage'][0]['owned_residual'] == '1.649'
     assert resume.inspect_fleet_owner_snapshot(
@@ -1033,6 +1061,56 @@ async def test_terminal_singleton_claim_preserves_independent_suspended_sol_cont
         assert connection.execute('SELECT amount FROM Position WHERE controller_id=? AND connector_name=? AND trading_pair=?',
                                   ('ok-rsi-bnb', 'okx', 'BNB-USDC')).fetchone()[0] == 200000
     assert {row.client_order_id for row in recorder.get_all_position_hold_ledger_entries()} == {'unrelated'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('mutation', 'message'), [
+    ('mark_mismatch', 'current mark projection differs'),
+    ('nonfinite_mark', 'non-finite receipt'),
+    ('age_backward', 'open-order age moved backward'),
+    ('age_overflow', 'open-order age moved backward'),
+    ('activation_distance', 'activation projection differs'),
+    ('pnl_mismatch', 'mark PnL differs'),
+    ('cost_mismatch', 'lifecycle or accounting fields changed'),
+    ('remaining_mismatch', 'state, fills, orders, or trailing state changed'),
+    ('trailing_high_water', 'state, fills, orders, or trailing state changed'),
+])
+async def test_nonselected_sol_mark_drift_rejects_unproven_financial_or_trailing_change(
+        tmp_path, mutation, message):
+    db, preflight, _, _, _, sol, _ = await terminal_with_suspended_sol_fixture(tmp_path)
+    with sqlite3.connect(db) as connection:
+        apply_synthetic_sol_mark_drift(connection, sol.config.id)
+        row = connection.execute('SELECT * FROM Executors WHERE id=?', (sol.config.id,)).fetchone()
+        custom = json.loads(row['custom_info'])
+        if mutation == 'mark_mismatch':
+            custom['close_price'] = str(Decimal(custom['close_price']) + 1)
+        elif mutation == 'nonfinite_mark':
+            custom['current_market_price'] = 'NaN'
+        elif mutation == 'age_backward':
+            custom['open_order_age_seconds'] = -1
+        elif mutation == 'age_overflow':
+            custom['open_order_age_seconds'] = '1e1000'
+        elif mutation == 'activation_distance':
+            custom['distance_to_trailing_activation_pct'] = '0.5'
+        elif mutation == 'remaining_mismatch':
+            custom['remaining_position_amount_base'] = '1.1'
+        elif mutation == 'trailing_high_water':
+            custom['trailing_stop_trigger_pct'] = '0.02'
+        if mutation in {'mark_mismatch', 'nonfinite_mark', 'age_backward', 'age_overflow', 'activation_distance',
+                        'remaining_mismatch', 'trailing_high_water'}:
+            connection.execute('UPDATE Executors SET custom_info=? WHERE id=?',
+                               (resume.canonical(custom), sol.config.id))
+        elif mutation == 'pnl_mismatch':
+            connection.execute('UPDATE Executors SET net_pnl_quote=? WHERE id=?',
+                               (row['net_pnl_quote'] + 1, sol.config.id))
+        else:
+            connection.execute('UPDATE Executors SET filled_amount_quote=? WHERE id=?',
+                               (row['filled_amount_quote'] + 1, sol.config.id))
+    with resume.connect(preflight) as before, resume.connect(db) as stopped:
+        old = before.execute('SELECT * FROM Executors WHERE id=?', (sol.config.id,)).fetchone()
+        current = stopped.execute('SELECT * FROM Executors WHERE id=?', (sol.config.id,)).fetchone()
+        with pytest.raises(ValueError, match=message):
+            resume.validate_nonselected_suspended_continuity(old, current)
 
 
 @pytest.mark.asyncio
@@ -1377,7 +1455,7 @@ async def test_terminal_mode_rejects_sol_inventory_not_conserved_by_fresh_net_en
             connection.execute('UPDATE Executors SET custom_info=? WHERE id=?',
                                (resume.canonical(custom), sol.config.id))
     evidence = refresh_stopped_evidence(db, evidence, 1000)
-    with pytest.raises(ValueError, match='fresh SOL venue net entry differs from suspended inventory'):
+    with pytest.raises(ValueError, match='nonselected SOL acquisition cost or native fee projection differs'):
         resume.prepare(db, preflight, evidence, now=1000, root=root,
                        terminal_suspended_executor_ids=(terminal.config.id,),
                        continuity_executor_ids=(sol.config.id,))

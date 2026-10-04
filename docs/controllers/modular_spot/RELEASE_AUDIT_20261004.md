@@ -21,7 +21,8 @@ changes a gate.
 
 Measured on the live owner after deployment: main thread 59% → 19% of a core,
 commlib threads 23% → 0%, container ~22%; no ticker timeout or other warning
-in the first 30 minutes of log monitoring (the fault previously recurred hourly).
+in the first hour after deployment (07:55–08:58 UTC); the fault previously logged 28
+times in 24 hours.
 
 ## Source identity
 

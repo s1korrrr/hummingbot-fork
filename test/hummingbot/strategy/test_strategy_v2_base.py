@@ -269,28 +269,48 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         controller.start.assert_called_once_with()
         self.assertTrue(self.strategy._controllers_started)
 
-    def test_controller_start_remains_fenced_on_preflight_failure_and_unattended_hold(self):
+    def test_controller_start_waits_only_for_a_pending_claim_and_unattended_hold(self):
         controller = MagicMock()
         self.strategy.controllers = {"controller-1": controller}
         orchestrator = self.strategy.executor_orchestrator
-        orchestrator._planned_resume_pending = False
-        orchestrator._resume_preflight_failed = True
-        orchestrator._planned_resume_failure = "recovery ownership proof rejected"
+        orchestrator._planned_resume_pending = True
+        orchestrator._resume_preflight_failed = False
+        orchestrator._planned_resume_failure = None
+        orchestrator._claimed_resume_unresolved = {}
 
         self.strategy.start(self.clock, self.start_timestamp)
         controller.start.assert_not_called()
         self.assertFalse(self.strategy._controllers_started)
 
-        orchestrator._resume_preflight_failed = False
-        orchestrator._planned_resume_failure = None
-        orchestrator._claimed_resume_unresolved = {"controller-1": {"executor": ("okx", "BTC-USDC")}}
-        self.strategy._start_controllers_if_safe()
-        controller.start.assert_not_called()
-
-        orchestrator._claimed_resume_unresolved = {}
+        orchestrator._planned_resume_pending = False
         self.strategy._unattended_restart_hold = True
         self.strategy._start_controllers_if_safe()
         controller.start.assert_not_called()
+
+        self.strategy._unattended_restart_hold = False
+        self.strategy._start_controllers_if_safe()
+        controller.start.assert_called_once_with()
+
+    def test_failed_or_unresolved_claims_never_stop_controllers(self):
+        # Restart continuity D2: a claimed row survives every later boot until it is
+        # reconciled, so a fence here would stop the whole bot on every restart.
+        for failure in ("preflight_failed", "claim_failed", "unresolved"):
+            with self.subTest(failure=failure):
+                controller = MagicMock()
+                self.strategy.controllers = {"controller-1": controller}
+                self.strategy._controllers_started = False
+                self.strategy._controller_start_requested = True
+                orchestrator = self.strategy.executor_orchestrator
+                orchestrator._planned_resume_pending = False
+                orchestrator._resume_preflight_failed = failure == "preflight_failed"
+                orchestrator._planned_resume_failure = "proof rejected" if failure == "claim_failed" else None
+                orchestrator._claimed_resume_unresolved = (
+                    {"controller-1": {"executor": ("okx", "BTC-USDC")}} if failure == "unresolved" else {})
+
+                self.strategy._start_controllers_if_safe()
+
+                controller.start.assert_called_once_with()
+                self.assertTrue(self.strategy._controllers_started)
 
     @staticmethod
     def _direct_ok_rsi_config(controller_id: str, *, origin: str = None):

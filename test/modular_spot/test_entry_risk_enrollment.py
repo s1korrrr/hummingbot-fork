@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from hummingbot.client.hummingbot_application import HummingbotApplication
 from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import TradeType
@@ -77,8 +78,7 @@ async def test_pending_enrollment_tick_waits_for_report_initialization_without_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('blocker', ['pending', 'preflight_failed', 'claim_failed', 'unresolved'])
-async def test_pending_or_failed_ownership_does_not_initialize_daily_risk(recorder, blocker):
+async def test_pending_ownership_does_not_initialize_daily_risk(recorder):
     recorder.store_strategy_risk_state(pending_state())
     strategy = make_runner(recorder)
     try:
@@ -86,15 +86,7 @@ async def test_pending_or_failed_ownership_does_not_initialize_daily_risk(record
         strategy._controller_reports_valid = True
         strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
             pnl_available=True, global_pnl_quote=D('-12.5'))}}
-        orchestrator = strategy.executor_orchestrator
-        if blocker == 'pending':
-            orchestrator._planned_resume_pending = True
-        elif blocker == 'preflight_failed':
-            orchestrator._resume_preflight_failed = True
-        elif blocker == 'claim_failed':
-            orchestrator._planned_resume_failure = 'sealed claim rejected'
-        else:
-            orchestrator._claimed_resume_unresolved = {OWNER: {'executor': ('okx', 'BTC-USDC')}}
+        strategy.executor_orchestrator._planned_resume_pending = True
 
         with patch.object(StrategyV2Base, 'on_tick'), \
                 patch('scripts.v2_with_controllers.time.time', return_value=1002):
@@ -106,6 +98,37 @@ async def test_pending_or_failed_ownership_does_not_initialize_daily_risk(record
         assert strategy._entry_risk_enrollment.pending
         assert strategy.max_global_pnl is None
         assert recorder.load_strategy_risk_state() == before
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['preflight_failed', 'claim_failed', 'unresolved'])
+async def test_failed_or_unresolved_ownership_keeps_risk_rails_and_creation(recorder, failure):
+    """Restart continuity D2: a failed or unresolved claim is reported and held, never a fence."""
+    recorder.store_strategy_risk_state(pending_state())
+    strategy = make_runner(recorder)
+    try:
+        strategy._controller_reports_valid = True
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('-12.5'))}}
+        orchestrator = strategy.executor_orchestrator
+        if failure == 'preflight_failed':
+            orchestrator._resume_preflight_failed = True
+        elif failure == 'claim_failed':
+            orchestrator._planned_resume_failure = 'sealed claim rejected'
+        else:
+            orchestrator._claimed_resume_unresolved = {OWNER: {'executor': ('okx', 'BTC-USDC')}}
+
+        with patch.object(StrategyV2Base, 'on_tick'), \
+                patch('scripts.v2_with_controllers.time.time', return_value=1002):
+            strategy.on_tick()
+            # The first fresh native mark enrolls the daily rail; SELLs are never refused by it.
+            assert strategy.validate_create_action(SimpleNamespace(
+                controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.SELL)))
+
+        assert strategy._daily_entry_risk is not None
+        assert recorder.load_strategy_risk_state()['daily_entry_risk']['baseline_quote'] == '-12.5'
     finally:
         await close(strategy)
 
@@ -589,3 +612,42 @@ class NativePaperEnrollmentTests(IsolatedAsyncioTestCase):
                 self.assertTrue(executor.is_active)
             finally:
                 await session.close()
+
+
+def enrolled_state():
+    return {'version': 1, 'controllers': [OWNER], 'max_global_pnl': '0',
+            'max_pnl_by_controller': {OWNER: '0'}, 'drawdown_exited_controllers': [], 'stopped': False,
+            'operator_paused': {OWNER: True},
+            'daily_entry_risk': {'schema_version': 1, 'limit_quote': '1000', 'utc_day': 0,
+                                 'baseline_quote': '0', 'last_pnl_quote': '0', 'last_timestamp': 1000,
+                                 'paused': False, 'breach_day': None}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('claim', ['pending', 'preflight_failed', 'claim_failed', 'unresolved'])
+async def test_operator_resume_waits_only_for_a_pending_claim(recorder, claim):
+    recorder.store_strategy_risk_state(enrolled_state())
+    strategy = make_runner(recorder)
+    try:
+        orchestrator = strategy.executor_orchestrator
+        orchestrator._planned_resume_pending = claim == 'pending'
+        orchestrator._resume_preflight_failed = claim == 'preflight_failed'
+        orchestrator._planned_resume_failure = 'sealed claim rejected' if claim == 'claim_failed' else None
+        orchestrator._claimed_resume_unresolved = (
+            {OWNER: {'executor': ('okx', 'BTC-USDC')}} if claim == 'unresolved' else {})
+        strategy._operator_started_at = 999
+        strategy._controller_reports_valid = True
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('0'))}}
+        resume = {'action': 'bot_resume_entries', 'bot_name': 'candidate', 'controller_id': OWNER,
+                  'requested_at': 1003.0, 'command_id': 'resume-1'}
+        with patch.object(StrategyV2Base, 'on_tick'), \
+                patch('scripts.v2_with_controllers.time.time', return_value=1004), \
+                patch.object(HummingbotApplication, 'main_application',
+                             return_value=SimpleNamespace(instance_id='candidate')):
+            strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=resume)))
+            strategy.on_tick()
+        assert strategy.controllers[OWNER].paused is (claim == 'pending')
+        assert not strategy._is_stop_triggered
+    finally:
+        await close(strategy)

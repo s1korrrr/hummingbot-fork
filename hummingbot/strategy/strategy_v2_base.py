@@ -1406,16 +1406,17 @@ class StrategyV2Base(StrategyPyBase):
         self._controller_configs_pending_persistence.clear()
 
     def _start_controllers_if_safe(self):
-        """Start controller loops only after any prepared owner claim succeeds."""
+        """Start controller loops once a prepared owner claim has been attempted.
+
+        Controllers wait only while the claim is still pending, so no per-candle
+        decision is written against an unclaimed snapshot. A failed claim or an
+        unresolved claimed row is reported for reconciliation and its position
+        stays in the held ledger; it never stops trading (restart continuity D2).
+        """
         if not self._controller_start_requested or self._controllers_started or self._unattended_restart_hold:
             return
         orchestrator = getattr(self, "executor_orchestrator", None)
-        if orchestrator is None:
-            return
-        if (getattr(orchestrator, "_planned_resume_pending", False) is True
-                or getattr(orchestrator, "_resume_preflight_failed", False) is True
-                or getattr(orchestrator, "_planned_resume_failure", None)
-                or getattr(orchestrator, "_claimed_resume_unresolved", None)):
+        if orchestrator is None or getattr(orchestrator, "_planned_resume_pending", False) is True:
             return
         for controller in self.controllers.values():
             controller.start()

@@ -6,7 +6,7 @@ import re
 import time
 from decimal import Decimal
 from typing import Literal
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 from pydantic import Field, model_validator
 
@@ -85,6 +85,8 @@ class DataPool:
         self.features = FeatureCache()
         self.ranking_cache = {}
         self.screen_cache = None
+        # (dataset key, history) -> (weak ref to the replica snapshot it was cut from, cut).
+        self._derived_snapshots = {}
 
     def attach(self, specs):
         for spec in specs:
@@ -112,10 +114,16 @@ class DataPool:
     def snapshot(self, spec: Dataset, *, now: float, max_age: float) -> CandleSnapshot:
         if self.client is None:
             raise DataUnavailable('shared candle client has not started')
-        self.client.replica.frame(spec.key, now=now, max_age=max_age)
-        source = self.client.replica.snapshots[spec.key]
-        return CandleSnapshot(dataset=spec, epoch=source.epoch, sequence=source.sequence,
-                              published_at=source.published_at, rows=source.rows[-spec.history:])
+        source = self.client.replica.check(spec.key, now=now, max_age=max_age)
+        # A replica snapshot is frozen and replaced, never mutated: cut it once per source
+        # object. Rebuilding revalidated every row and defeated the frame cache each call.
+        cached = self._derived_snapshots.get((spec.key, spec.history))
+        if cached is not None and cached[0]() is source and cached[1].dataset == spec:
+            return cached[1]
+        derived = CandleSnapshot(dataset=spec, epoch=source.epoch, sequence=source.sequence,
+                                 published_at=source.published_at, rows=source.rows[-spec.history:])
+        self._derived_snapshots[(spec.key, spec.history)] = (ref(source), derived)
+        return derived
 
     def entry_ready(self, spec: Dataset) -> bool:
         return self.client is not None and self.client.replica.entry_ready(spec.key)

@@ -115,3 +115,64 @@ def test_non_finite_conversion_is_never_cached():
             with pytest.raises(PolicyError):
                 snap.frame(now=6000, max_age=120)
     assert id(snap) not in _SNAPSHOT_FRAMES
+
+
+def _pool_on(replica):
+    from types import SimpleNamespace
+
+    from controllers.generic.modular_spot_core.data_reader import DataPool
+    pool = DataPool(None)
+    pool.client = SimpleNamespace(replica=replica)
+    return pool
+
+
+def test_pool_cuts_each_replica_snapshot_once_and_recuts_when_it_is_replaced():
+    from test.modular_spot.test_shared_data import dataset
+
+    from controllers.generic.modular_spot_core.candle_data import Replica
+    spec = dataset()
+    replica = Replica((dataset(),))
+    replica.begin_session()
+    replica.accept(snapshot(), now=6000)
+    pool = _pool_on(replica)
+
+    first = pool.snapshot(spec, now=6000, max_age=120)
+    assert pool.snapshot(spec, now=6000, max_age=120) is first
+    assert len(first.rows) == 60 and first.dataset == spec
+
+    replica.accept(snapshot(seq=2, at=6060, candles=rows(end=6000)), now=6060)
+    second = pool.snapshot(spec, now=6060, max_age=120)
+    assert second is not first and second.rows[-1].open_time == 6000
+
+
+def test_pool_snapshot_reuse_never_skips_the_freshness_check():
+    from test.modular_spot.test_shared_data import dataset
+
+    from controllers.generic.modular_spot_core.candle_data import Replica
+    from controllers.generic.modular_spot_core.domain import DataUnavailable
+    replica = Replica((dataset(),))
+    replica.begin_session()
+    replica.accept(snapshot(), now=6000)
+    pool = _pool_on(replica)
+    pool.snapshot(dataset(), now=6000, max_age=120)
+    with pytest.raises(DataUnavailable):
+        pool.snapshot(dataset(), now=6000 + 10_000, max_age=120)
+    replica.disconnect()
+    with pytest.raises(PolicyError):
+        pool.snapshot(dataset(), now=6000, max_age=120)
+
+
+def test_check_admits_and_refuses_exactly_like_frame():
+    from test.modular_spot.test_shared_data import dataset
+
+    from controllers.generic.modular_spot_core.candle_data import Replica
+    from controllers.generic.modular_spot_core.domain import DataUnavailable
+    replica = Replica((dataset(),))
+    replica.begin_session()
+    replica.accept(snapshot(), now=6000)
+    assert replica.check(dataset().key, now=6000, max_age=120) is replica.snapshots[dataset().key]
+    assert replica.frame(dataset().key, now=6000, max_age=120).equals(
+        snapshot().frame(now=6000, max_age=120).iloc[-dataset().history:].reset_index(drop=True))
+    for call in (replica.check, replica.frame):
+        with pytest.raises(DataUnavailable):
+            call(dataset().key, now=6000 + 10_000, max_age=120)

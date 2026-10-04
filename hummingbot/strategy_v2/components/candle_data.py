@@ -142,13 +142,18 @@ class CandleSnapshot(PolicyModel):
     def digest(self) -> str:
         return identity([self.dataset.key, [row.model_dump(mode='json') for row in self.rows]])
 
-    def frame(self, *, now: float, max_age: float) -> pd.DataFrame:
+    def check(self, *, now: float, max_age: float) -> None:
+        """Every ``frame`` admission check, without copying the frame."""
         now = float(decimal(now, 'observation time'))
         age = float(decimal(max_age, 'maximum candle age', positive=True))
         if now < self.published_at or now - (self.rows[-1].open_time + self.dataset.seconds) > age:
             raise DataUnavailable('future or stale candle snapshot')
         if len(self.rows) < self.dataset.history:
             raise DataUnavailable('candle history is warming')
+        _snapshot_frame(self)  # non-finite values raise PolicyError here as well
+
+    def frame(self, *, now: float, max_age: float) -> pd.DataFrame:
+        self.check(now=now, max_age=max_age)
         return _snapshot_frame(self).copy(deep=True)
 
 
@@ -263,14 +268,19 @@ class Replica:
         value = self.snapshots.get(key)
         return self.connected and value is not None and value.rows[-1].open_time > self.seed_bars.get(key, value.rows[-1].open_time)
 
-    def frame(self, key: str, *, now: float, max_age: float) -> pd.DataFrame:
+    def check(self, key: str, *, now: float, max_age: float) -> CandleSnapshot:
+        """Every ``frame`` admission check, without copying; returns the checked snapshot."""
         if not self.connected or key not in self.snapshots:
             raise DataUnavailable('candle reader has not synchronized')
         value = self.snapshots[key]
         if not 0 <= now - value.published_at <= self.max_transport_age:
             raise DataUnavailable('candle transport is stale')
-        frame = value.frame(now=now, max_age=max_age)
-        return frame.iloc[-self.datasets[key].history:].copy(deep=True)
+        value.check(now=now, max_age=max_age)
+        return value
+
+    def frame(self, key: str, *, now: float, max_age: float) -> pd.DataFrame:
+        value = self.check(key, now=now, max_age=max_age)
+        return _snapshot_frame(value).iloc[-self.datasets[key].history:].copy(deep=True)
 
 
 class SnapshotHub:

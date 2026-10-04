@@ -1,7 +1,7 @@
 """Durable entry decisions and queue replay; no exchange or market I/O."""
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -344,7 +344,18 @@ def test_sell_candle_can_clear_buy_setup_without_blocking_sell_on_storage_failur
             assert controller.create_actions_proposal() == ["sell"]
 
 
-def test_real_controller_constructor_sizing_queue_validation_and_restart(store):
+@pytest.fixture
+def complete_empty_native_history():
+    """Exposure fails closed without native history; this test covers sizing and queueing."""
+    from hummingbot.connector.markets_recorder import MarketsRecorder
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = []
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        yield recorder
+
+
+def test_real_controller_constructor_sizing_queue_validation_and_restart(store, complete_empty_native_history):
     import asyncio
     from decimal import Decimal
     from test.test_ok_rsi_controller import OKRSIControllerTest

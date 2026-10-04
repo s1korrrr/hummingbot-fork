@@ -11,6 +11,14 @@ from numba import njit
 
 HORIZONS_MINUTES = (1, 5, 15, 60, 240, 1440)
 ANNUAL_MINUTES = 365 * 24 * 60
+RVOL_1H_BLOCK_MINUTES = 60
+RVOL_1H_BASELINE_HOURS = 24
+RVOL_1H_REQUIRED_MINUTES = RVOL_1H_BLOCK_MINUTES * (RVOL_1H_BASELINE_HOURS + 1)
+# Hourly-return windows a correlation snapshot may publish, widest first. The
+# coefficient gate is always ceil(95% of the window); legacy 90D keeps its floor of 60.
+CORRELATION_WINDOW_HOURS = (2160, 720, 336, 168, 72, 24)
+CORRELATION_MIN_COVERAGE = 0.95
+CORRELATION_MIN_PAIRS_FLOOR = 60
 
 
 @dataclass(frozen=True)
@@ -485,6 +493,36 @@ def relative_volume(
         return None
     baseline = float(np.mean(values[1:]))
     return None if baseline == 0.0 else float(values[0] / baseline)
+
+
+def relative_volume_hourly(
+    minute_quote_volumes: Sequence[float],
+    baseline_hours: int = RVOL_1H_BASELINE_HOURS,
+) -> float | None:
+    """Last 60 minutes of quote volume over the mean of the prior non-overlapping hourly sums.
+
+    ``minute_quote_volumes`` is chronological (oldest first) and holds exactly
+    ``60 * (baseline_hours + 1)`` closed minute bars ending at the cutoff. Zero-volume
+    minutes are real observations; a zero baseline is undefined (``None``), never infinite.
+    """
+    if type(baseline_hours) is not int or baseline_hours < 1:
+        raise ValueError("baseline_hours must be a positive integer")
+    values = _finite_vector(minute_quote_volumes, name="minute quote volumes")
+    if len(values) != RVOL_1H_BLOCK_MINUTES * (baseline_hours + 1) or (values < 0).any():
+        return None
+    current = float(np.sum(values[-RVOL_1H_BLOCK_MINUTES:]))
+    prior = values[:-RVOL_1H_BLOCK_MINUTES].reshape(baseline_hours, RVOL_1H_BLOCK_MINUTES)
+    baseline = float(np.mean(np.sum(prior, axis=1)))
+    return None if baseline == 0.0 else current / baseline
+
+
+def correlation_min_pairs(window_hours: int) -> int:
+    """Paired-return floor for an allowed window: the legacy 60 pairs, or the 95% count when that is smaller (24h only)."""
+    if window_hours not in CORRELATION_WINDOW_HOURS:
+        raise ValueError("unsupported correlation window")
+    return min(
+        CORRELATION_MIN_PAIRS_FLOOR, math.ceil(window_hours * CORRELATION_MIN_COVERAGE)
+    )
 
 
 def realized_volatility_24h(closes: Sequence[float]) -> float | None:
@@ -1142,6 +1180,36 @@ def compute_asset_metrics(
             status=status,
             start=end - baseline_count * 60_000 if value is not None else None,
         )
+
+    hourly_required = RVOL_1H_REQUIRED_MINUTES
+    hourly_value = None
+    hourly_reason = "INSUFFICIENT_HISTORY"
+    if n >= hourly_required:
+        tail = volumes[-hourly_required:]
+        if isinstance(tail, np.ndarray):
+            hourly_window = tail.astype(float, copy=False)
+        else:
+            hourly_window = np.asarray(
+                [np.nan if item is None else float(item) for item in tail], dtype=float
+            )
+        if np.isnan(hourly_window).any():
+            hourly_reason = "INPUT_MISSING"
+        else:
+            hourly_value = relative_volume_hourly(hourly_window)
+            hourly_reason = None if hourly_value is not None else "ZERO_BASELINE"
+    put(
+        "rvol_1h",
+        hourly_value,
+        hourly_required,
+        count=min(n, hourly_required),
+        reason=hourly_reason,
+        status=(
+            "MISSING"
+            if hourly_reason == "INPUT_MISSING"
+            else ("UNAVAILABLE" if hourly_reason == "ZERO_BASELINE" else None)
+        ),
+        start=end - (hourly_required - 1) * 60_000 if hourly_value is not None else None,
+    )
 
     rv24h = realized_volatility_24h(close[-1441:] if n >= 1441 else close)
     put(

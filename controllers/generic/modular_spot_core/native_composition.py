@@ -1,6 +1,7 @@
 """Composition seams only: native controllers remain the policy and execution owners."""
 import ast
 import asyncio
+import hashlib
 import importlib
 import inspect
 from copy import deepcopy
@@ -17,7 +18,7 @@ from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.components.candle_aggregation import derive_higher_timeframe_candles
 from hummingbot.strategy_v2.components.candle_data import Dataset
-from hummingbot.strategy_v2.components.data_reader import DataPolicy, DataPool
+from hummingbot.strategy_v2.components.data_reader import READINESS_SCHEMA, DataPolicy, DataPool
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1
 from hummingbot.strategy_v2.models.base import RunnableStatus
 
@@ -65,21 +66,49 @@ def source_files(family, *, public_module=None):
             initializer = root.joinpath(*package[1:count]) / '__init__.py'
             if initializer.is_file() and initializer not in seen:
                 pending.append(initializer)
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    enqueue(tuple(alias.name.split('.')))
-            elif isinstance(node, ast.ImportFrom):
-                suffix = tuple(node.module.split('.')) if node.module else ()
-                module = (*package[:len(package) - node.level + 1], *suffix) if node.level else suffix
+        for reference in import_references(path.read_text()):
+            if reference[0] == 'from':
+                _, level, suffix, names = reference
+                module = (*package[:len(package) - level + 1], *suffix) if level else suffix
                 enqueue(module)
-                for alias in node.names:
-                    enqueue((*module, alias.name))
-            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                  and node.func.attr == 'import_module' and node.args
-                  and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
-                enqueue(tuple(node.args[0].value.split('.')))
+                for name in names:
+                    enqueue((*module, name))
+            else:
+                enqueue(reference[1])
     return sorted(seen)
+
+
+_IMPORT_REFERENCES: dict[str, tuple] = {}
+_IMPORT_REFERENCE_CAPACITY = 4096
+
+
+def import_references(text):
+    """Import statements of one source text, in ``ast.walk`` order.
+
+    Parsed once per distinct content: the strategy reloads controller configs every
+    few seconds and re-derives this closure for every controller, and re-parsing the
+    unchanged sources each time stalled the event loop for seconds. Relative imports
+    stay unresolved here because their meaning depends on the importing file.
+    """
+    key = hashlib.sha256(text.encode()).hexdigest()
+    cached = _IMPORT_REFERENCES.get(key)
+    if cached is not None:
+        return cached
+    references = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Import):
+            references.extend(('import', tuple(alias.name.split('.'))) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            suffix = tuple(node.module.split('.')) if node.module else ()
+            references.append(('from', node.level, suffix, tuple(alias.name for alias in node.names)))
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == 'import_module' and node.args
+              and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+            references.append(('import', tuple(node.args[0].value.split('.'))))
+    if len(_IMPORT_REFERENCES) >= _IMPORT_REFERENCE_CAPACITY:
+        _IMPORT_REFERENCES.clear()
+    cached = _IMPORT_REFERENCES[key] = tuple(references)
+    return cached
 
 
 def base_records(config):
@@ -122,6 +151,13 @@ class NativeCompositionFields(BaseModel):
     """Additional fields; all strategy parameters come from the actual native schema."""
     _native_family: ClassVar[str]
     _public_module: ClassVar[str | None] = None
+
+    @property
+    def uses_candle_service(self) -> bool:
+        # Shared composition candles are owned by NativeCandleProvider, not the
+        # direct OK RSI service route inherited through its native controller.
+        return False
+
     execution_mode: Literal['live', 'paper'] = 'live'
     execution_enabled: StrictBool = Field(default=False, json_schema_extra={'is_updatable': True})
     data: DataPolicy = Field(default_factory=DataPolicy)
@@ -217,6 +253,34 @@ class NativeCandleProvider:
             return self.pool.entry_ready(self.spec)
         except (DataUnavailable, PolicyError):
             return False
+
+    def _max_age(self):
+        return max(1, int(self.config.max_candle_age_intervals * 60 - 60))
+
+    def _frame_gate_detail(self, now):
+        """O(1) mirror of the ``get_candles_df`` failures inside ``entry_ready``; parity is tested.
+
+        Status publication must not rebuild a full candle frame on every report.
+        """
+        client = self.pool.client
+        if client is None:
+            return 'shared candle client has not started'
+        replica = client.replica
+        value = replica.snapshots.get(self.spec.key)
+        if not replica.connected or value is None:
+            return 'candle reader has not synchronized'
+        if not 0 <= now - value.published_at <= replica.max_transport_age:
+            return 'candle transport is stale'
+        if now < value.published_at or now - (value.rows[-1].open_time + value.dataset.seconds) > self._max_age():
+            return 'future or stale candle snapshot'
+        if len(value.rows) < max(value.dataset.history, self.spec.history):
+            return 'candle history is warming'
+        return None
+
+    def readiness(self):
+        """Observation only: ``entry_ready``'s two checks with reasons, on the provider clock."""
+        now = self.delegate.time()
+        return now, [self.pool.readiness(self.spec, now=now, candles_error=self._frame_gate_detail(now))]
 
 
 class NativeComposition:
@@ -340,7 +404,19 @@ class NativeComposition:
         except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError, SQLAlchemyError) as error:
             self._funding_assessment_hold = str(error) or type(error).__name__
 
+    STARTUP_RESTORE_GRACE_SECONDS: ClassVar[float] = 60.0
+
+    def _awaiting_startup_restore(self):
+        """True only within the startup grace after this controller's first action pass."""
+        now = self.market_data_provider.time()
+        first = getattr(self, '_first_action_pass_at', None)
+        if first is None:
+            return False
+        return 0 <= now - first < self.STARTUP_RESTORE_GRACE_SECONDS
+
     def determine_executor_actions(self):
+        if getattr(self, '_first_action_pass_at', None) is None:
+            self._first_action_pass_at = self.market_data_provider.time()
         self._refresh_funding_assessment()
         if self._recovery_fault:
             self.logger().warning('native recovery fault holds actions: %s', self._recovery_fault)
@@ -366,7 +442,12 @@ class NativeComposition:
             if before_trails is not None:
                 self._recovery_trails = before_trails
             self._recovery_hold = str(exc)
-            self.logger().warning('native recovery hold: %s', self._recovery_hold)
+            if self._awaiting_startup_restore():
+                # The orchestrator restores held positions only once connectors are ready,
+                # after controllers start: the hold is correct, the alarm is not.
+                self.logger().info('native recovery hold while startup positions restore: %s', self._recovery_hold)
+            else:
+                self.logger().warning('native recovery hold: %s', self._recovery_hold)
             return []
         except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError) as exc:
             if before_trails is not None:
@@ -568,7 +649,23 @@ class NativeComposition:
         if hasattr(self.config, 'profile'):
             info['modular_composition']['profile'] = self.config.profile
             info['modular_composition']['controller_name'] = self.config.controller_name
+        info['candle_readiness'] = self._candle_readiness()
         return info
+
+    def _candle_readiness(self):
+        """Projection of the shared-candle BUY gate; never raises and never changes a decision."""
+        projection = {'schema': READINESS_SCHEMA, 'status': 'available', 'reason': None,
+                      'data_mode': self.config.data.mode, 'transport': self.config.data.transport,
+                      'observed_at': None, 'clock': 'controller_market_data_provider_time', 'datasets': []}
+        if self.shared_candles is None:
+            projection.update(status='not_applicable', reason='native_candles_not_replica_gated')
+            return projection
+        try:
+            projection['observed_at'], projection['datasets'] = self.shared_candles.readiness()
+        except Exception as error:
+            projection.update(status='unavailable', reason=f'projection_error: {type(error).__name__}',
+                              observed_at=None, datasets=[])
+        return projection
 
 
 def module_for(family):

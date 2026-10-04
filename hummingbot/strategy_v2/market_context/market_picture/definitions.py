@@ -6,7 +6,15 @@ from hashlib import sha256
 from hummingbot.strategy_v2.components.recipe_contract import canonical_json
 
 from .contracts import DefinitionRefV1
-from .metrics import HORIZONS_MINUTES
+from .metrics import (
+    CORRELATION_MIN_COVERAGE,
+    CORRELATION_WINDOW_HOURS,
+    HORIZONS_MINUTES,
+    RVOL_1H_BASELINE_HOURS,
+    RVOL_1H_BLOCK_MINUTES,
+    RVOL_1H_REQUIRED_MINUTES,
+    correlation_min_pairs,
+)
 
 FEATURE_SET_VERSION = "market-picture.observation.v1"
 REGISTRY_VERSION = "market-picture.definitions.v1"
@@ -201,6 +209,25 @@ DEFINITIONS = {
         {"aggregation": "median", "source_metric": "rvol_24h", "cohort": "valid_instruments"},
         "Cross-sectional median 24-hour relative volume over valid instruments.",
     ),
+    "rvol1h": _definition(
+        "rvol1h",
+        "ratio",
+        {
+            "current_minutes": RVOL_1H_BLOCK_MINUTES,
+            "baseline_hours": RVOL_1H_BASELINE_HOURS,
+            "baseline": "mean-of-prior-non-overlapping-hourly-sums",
+            "required_minutes": RVOL_1H_REQUIRED_MINUTES,
+            "current_excluded": True,
+            "zero_baseline": "unavailable",
+        },
+        "Quote volume of the last 60 closed minutes divided by the mean of the prior 24 non-overlapping hourly sums.",
+    ),
+    "median_relative_volume_1h": _definition(
+        "median_relative_volume_1h",
+        "ratio",
+        {"aggregation": "median", "source_metric": "rvol_1h", "cohort": "valid_instruments"},
+        "Cross-sectional median hourly relative volume over valid instruments.",
+    ),
     "mean_adx14": _definition(
         "mean_adx14",
         "adx_0_100",
@@ -270,6 +297,22 @@ DEFINITIONS = {
         },
         "Pearson correlation of paired completed 1h log returns over 90 days.",
     ),
+    **{
+        f"pearson_log_1h_{hours}h": _definition(
+            f"pearson_log_1h_{hours}h",
+            "correlation_minus1_to1",
+            {
+                "interval_minutes": 60,
+                "history_hours": hours,
+                "min_coverage": CORRELATION_MIN_COVERAGE,
+                "min_pairs": correlation_min_pairs(hours),
+                "no_gap_spanning_return": True,
+            },
+            f"Pearson correlation of paired completed 1h log returns over {hours} hours.",
+        )
+        for hours in CORRELATION_WINDOW_HOURS
+        if hours != 2160
+    },
     "high_break_24h": _definition(
         "high_break_24h",
         "count",
@@ -466,6 +509,13 @@ def get_definition(definition_id: str) -> MetricDefinition:
         raise ValueError(f"unknown market-picture definition: {definition_id}") from exc
 
 
+def correlation_definition_id(window_hours: int) -> str:
+    """Definition id for one allowed hourly-return window; 2160 keeps the legacy 90D id."""
+    if window_hours not in CORRELATION_WINDOW_HOURS:
+        raise ValueError("unsupported correlation window")
+    return "pearson_log_1h_90d" if window_hours == 2160 else f"pearson_log_1h_{window_hours}h"
+
+
 def definition_for_metric(metric_id: str) -> MetricDefinition:
     """Resolve the canonical definition for frozen engine asset-metric IDs."""
     if metric_id == "price":
@@ -482,6 +532,7 @@ def definition_for_metric(metric_id: str) -> MetricDefinition:
         "atr14_percentile": "atr14_percentile_200",
         "rvol20": "rvol20",
         "rvol_24h": "rvol24h",
+        "rvol_1h": "rvol1h",
         "realized_volatility_24h": "rv24h_annualized",
     }
     try:

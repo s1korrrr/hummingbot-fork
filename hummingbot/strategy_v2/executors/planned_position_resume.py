@@ -4,24 +4,45 @@ This is an operator-assisted migration, never general crash recovery. A consumed
 claim is not replayed. Evidence contains public order receipts, never credentials.
 """
 import argparse
+import base64
 import hashlib
+import hmac
 import json
+import math
 import sqlite3
+import stat
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
+from hummingbot.client.config.security import Security
 from hummingbot.connector.exchange.okx.native_reconciliation import SPOT_ALGO_TYPES
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1, validate_acquisition_chain
-from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
+from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount, base_fee_quote_amount
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.executors.position_executor.position_executor import validate_planned_entry_reconciliation
+from hummingbot.strategy_v2.executors.recovery_inventory import (
+    corroborate_order_receipt,
+    native_inventory_proof,
+    require_inventory_conservation,
+)
+from hummingbot.strategy_v2.executors.restart_continuity import RestartContinuityError, continuity_plan
+from hummingbot.strategy_v2.migrations.entry_risk import (
+    financial_state_digest,
+    financial_state_digest_before_prospective_daily_enrollment,
+    validate_prospective_daily_enrollment_archive,
+    validate_stopped_forward_repair_delta,
+)
+from hummingbot.strategy_v2.models.daily_entry_risk import DailyEntryRisk
+from hummingbot.strategy_v2.models.entry_risk_enrollment import EntryRiskEnrollment
 from hummingbot.strategy_v2.models.executors import CloseType
 
 TABLE = 'PlannedPositionResume'
@@ -32,6 +53,20 @@ SOURCES = (
     'hummingbot/strategy_v2/executors/position_executor/position_executor.py',
     'hummingbot/strategy_v2/executors/position_executor/data_types.py',
     'hummingbot/strategy_v2/executors/executor_orchestrator.py',
+    'hummingbot/strategy_v2/executors/restart_continuity.py',
+    'hummingbot/strategy_v2/executors/recovery_inventory.py',
+    'hummingbot/model/exact_order_values.py',
+    'hummingbot/model/trade_fill.py',
+    'hummingbot/model/executors.py',
+    'hummingbot/model/decimal_type_decorator.py',
+    'hummingbot/core/data_type/common.py',
+    'hummingbot/core/data_type/in_flight_order.py',
+    'hummingbot/core/data_type/trade_fee.py',
+    'controllers/generic/meridian_v3_unified_core/terminal_dust.py',
+    'controllers/generic/modular_spot_core/inventory.py',
+    'controllers/generic/modular_spot_core/native_funding.py',
+    'controllers/generic/modular_spot_core/domain.py',
+    'hummingbot/strategy_v2/components/domain.py',
     'hummingbot/strategy_v2/executors/order_accounting.py',
     'hummingbot/strategy/strategy_v2_base.py',
     'scripts/v2_with_controllers.py',
@@ -39,6 +74,9 @@ SOURCES = (
     'hummingbot/connector/exchange/okx/okx_exchange.py',
     'hummingbot/connector/exchange/okx/native_reconciliation.py',
     'hummingbot/strategy_v2/models/executors_info.py',
+    'hummingbot/strategy_v2/migrations/entry_risk.py',
+    'hummingbot/strategy_v2/models/daily_entry_risk.py',
+    'hummingbot/strategy_v2/models/entry_risk_enrollment.py',
     'hummingbot/strategy_v2/controllers/native_policy_identity.py',
     'controllers/directional_trading/ok_rsi_core/down_only_entry_execution.py',
     'controllers/directional_trading/ok_rsi_core/down_only_entry.py',
@@ -47,8 +85,20 @@ SOURCES = (
 STARTUP_SEALED_RESTORE = 'startup-sealed-restore'  # legacy V1 marker written by local sealed restore
 TRAILING_KEYS = ('trailing_state', 'trailing_stop_trigger_pct', 'trailing_move_count',
                  'trailing_armed_timestamp', 'trailing_last_update_timestamp')
+SOL_MARK_ONLY_CUSTOM = frozenset({
+    'close_price', 'current_market_price', 'trailing_current_price',
+    'distance_to_trailing_activation_pct', 'distance_to_trailing_trigger_pct',
+    'open_order_age_seconds',
+})
+SOL_MARK_ONLY_OUTER = frozenset({'net_pnl_quote', 'net_pnl_pct'})
 BOUND_TABLES = ('Executors', 'Order', 'OrderStatus', 'TradeFill', 'OrderExact', 'TradeFillExact',
                 'PositionHoldLedger', 'Position')
+FLEET_OWNERS = {'rsi_modular_v2': 'rsi_modular_v2.yml', 'meridian_v3': 'meridian_v3.yml'}
+FLEET_TABLE_DIGEST_FORMAT = 'sqlite-native-tables-pk-ordered-v1'
+FLEET_REQUIRED_TABLES = {'Metadata', 'Executors', 'PositionHoldLedger', 'Position', 'Order'}
+FLEET_AUTHENTICATOR_DOMAIN = b'rsibot:v1-terminal-fleet-ownership:v1\0'
+OKX_REQUIRED_KEY_FIELDS = frozenset({'okx_api_key', 'okx_secret_key', 'okx_passphrase'})
+OKX_ALLOWED_KEY_FIELDS = OKX_REQUIRED_KEY_FIELDS | {'okx_registration_sub_domain'}
 SUPPORTED_ACQUISITION_CHAIN_CONTRACTS = frozenset({ACQUISITION_CHAIN_V1})
 
 
@@ -60,6 +110,113 @@ def digest(value):
     return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
+def _preflight_file_sha256(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def validate_preflight_file_binding(preflight_path, evidence):
+    """Bind collected stopped-owner proof to the exact immutable preflight file."""
+    expected = evidence.get('preflight_sha256')
+    attestation = evidence.get('stopped_owner_attestation')
+    if expected is None and attestation is None:
+        return None
+    path = Path(preflight_path)
+    for suffix in ('-wal', '-shm'):
+        sidecar = Path(str(path) + suffix)
+        require(not sidecar.exists() or sidecar.stat().st_size == 0,
+                'bound preflight database has uncheckpointed SQLite sidecars')
+    try:
+        actual = _preflight_file_sha256(path)
+    except OSError as error:
+        raise ValueError('bound preflight database is unavailable') from error
+    if expected is not None:
+        require(isinstance(expected, str) and len(expected) == 64
+                and all(char in '0123456789abcdef' for char in expected)
+                and expected == actual,
+                'preflight database digest differs from collected evidence')
+    if attestation is not None:
+        require(isinstance(attestation, dict)
+                and attestation.get('preflight_sha256') == actual,
+                'stopped-owner attestation preflight database digest differs')
+    return actual
+
+
+def _validated_native_okx_keys(native_keys):
+    require(isinstance(native_keys, dict) and OKX_REQUIRED_KEY_FIELDS <= set(native_keys)
+            and set(native_keys) <= OKX_ALLOWED_KEY_FIELDS
+            and all(isinstance(value, str) and value.strip() for value in native_keys.values()),
+            'decrypted native OKX credential set is missing required fields')
+    if 'okx_registration_sub_domain' in native_keys:
+        require(native_keys['okx_registration_sub_domain'] in {'www', 'app', 'my'},
+                'decrypted native OKX registration subdomain is invalid')
+    return native_keys
+
+
+def _fleet_auth_key(native_keys):
+    keys = _validated_native_okx_keys(native_keys)
+    return hashlib.sha256(FLEET_AUTHENTICATOR_DOMAIN + canonical(keys).encode()).digest()
+
+
+def _fleet_evidence_digest(evidence):
+    require(isinstance(evidence, dict), 'full recovery evidence is required for fleet authentication')
+    payload = dict(evidence)
+    payload.pop('fleet_ownership', None)
+    reconciliation = payload.get('reconciliation')
+    if isinstance(reconciliation, dict):
+        reconciliation = dict(reconciliation)
+        reconciliation.pop('fleet_ownership_authenticator', None)
+        payload['reconciliation'] = reconciliation
+    return digest(payload)
+
+
+def seal_fleet_ownership(bundle, native_keys, evidence):
+    """Authenticate complete recovery evidence without storing account fingerprints."""
+    _validated_native_okx_keys(native_keys)
+    bundle['sealed_evidence_sha256'] = _fleet_evidence_digest(evidence)
+    payload = {key: value for key, value in bundle.items() if key != 'authenticator'}
+    bundle['authenticator'] = hmac.new(
+        _fleet_auth_key(native_keys), FLEET_AUTHENTICATOR_DOMAIN + canonical(payload).encode(), hashlib.sha256
+    ).hexdigest()
+    return bundle
+
+
+def verify_fleet_ownership(bundle, native_keys, evidence=None):
+    """Fail closed unless the complete bundle is authenticated by unlocked native OKX keys."""
+    _validated_native_okx_keys(native_keys)
+    require(isinstance(bundle, dict) and isinstance(bundle.get('authenticator'), str),
+            'authenticated fleet ownership bundle is required')
+    payload = {key: value for key, value in bundle.items() if key != 'authenticator'}
+    expected = hmac.new(
+        _fleet_auth_key(native_keys), FLEET_AUTHENTICATOR_DOMAIN + canonical(payload).encode(), hashlib.sha256
+    ).hexdigest()
+    require(hmac.compare_digest(bundle['authenticator'], expected),
+            'fleet ownership authenticator does not match current native OKX credentials')
+    if evidence is not None:
+        require(bundle.get('sealed_evidence_sha256') == _fleet_evidence_digest(evidence),
+                'sealed recovery evidence changed after fleet authentication')
+    return True
+
+
+def unlock_native_okx(password_file):
+    """Unlock native connector config from a private password file without emitting secrets."""
+    from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
+
+    password_path = Path(password_file)
+    require(not any(path.is_symlink() for path in (password_path, *password_path.parents)),
+            'native password file traverses a symbolic link')
+    info = password_path.stat()
+    require(stat.S_ISREG(info.st_mode) and not info.st_mode & 0o077 and info.st_size <= 65536,
+            'private bounded native password file required')
+    password = password_path.read_text().rstrip('\r\n')
+    require(bool(password) and not any(char in password for char in '\x00\r\n'),
+            'native password file is empty or malformed')
+    require(Security.login(ETHKeyFileSecretManger(password)), 'native connector credential unlock failed')
+    keys = Security.api_keys('okx')
+    _validated_native_okx_keys(keys)
+    return keys
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -69,6 +226,382 @@ def decimal(value):
     result = Decimal(str(value))
     require(result.is_finite(), 'non-finite receipt')
     return result
+
+
+def position_hold_net_base(receipt, base_asset):
+    """Return the signed net base amount used by native PositionHold accounting."""
+    trade_type = receipt.get('trade_type')
+    require(trade_type in ('BUY', 'SELL'), 'held ledger side is invalid')
+    gross = decimal(receipt.get('executed_amount_base', 0))
+    fee = base_fee_amount(receipt, base_asset)
+    require(gross >= 0, 'held ledger gross amount is invalid')
+    sign = Decimal(1) if trade_type == 'BUY' else Decimal(-1)
+    return sign * gross - fee
+
+
+def _sqlite_value(value):
+    if isinstance(value, bytes):
+        return {'blob_base64': base64.b64encode(value).decode('ascii')}
+    if isinstance(value, float):
+        require(math.isfinite(value), 'native snapshot contains a non-finite SQLite value')
+    return value
+
+
+def native_snapshot_tables_digest(connection):
+    """Hash every native user table in deterministic PK order, except our own manifest table."""
+    connection.row_factory = sqlite3.Row
+    names = [row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        if row[0] != TABLE]
+    require(FLEET_REQUIRED_TABLES <= set(names), 'fleet ownership snapshot lacks required native tables')
+    snapshot = []
+    for name in names:
+        quoted = '"' + name.replace('"', '""') + '"'
+        schema = [dict(row) for row in connection.execute(f'PRAGMA table_info({quoted})')]
+        primary_key = [row['name'] for row in sorted(schema, key=lambda item: item['pk']) if row['pk']]
+        require(primary_key, f'fleet ownership table {name} has no stable primary key')
+        columns = [row['name'] for row in schema]
+        order = ', '.join('"' + column.replace('"', '""') + '"' for column in primary_key)
+        rows = [[_sqlite_value(value) for value in row]
+                for row in connection.execute(f'SELECT * FROM {quoted} ORDER BY {order}')]
+        snapshot.append({'name': name, 'schema': schema, 'columns': columns, 'rows': rows})
+    return digest({'format': FLEET_TABLE_DIGEST_FORMAT, 'tables': snapshot})
+
+
+def _validated_receipt_net_base(receipt, pair, expected_trade_type=None):
+    require(isinstance(receipt, dict), 'fleet native order receipt is malformed')
+    trade_type = str(receipt.get('trade_type', expected_trade_type or '')).upper()
+    require(trade_type in ('BUY', 'SELL') and (expected_trade_type is None or trade_type == expected_trade_type),
+            'fleet native order side is unsupported or inconsistent')
+    base, quote = pair.split('-')
+    fills = receipt.get('order_fills')
+    require(isinstance(fills, dict) and fills, 'fleet native inventory lacks exact fill receipts')
+    gross_base = Decimal(0)
+    net_base = Decimal(0)
+    for trade_id, fill in fills.items():
+        require(isinstance(fill, dict) and fill.get('trading_pair', pair) == pair,
+                'fleet native fill pair is inconsistent')
+        size = decimal(fill.get('fill_base_amount'))
+        price = decimal(fill.get('fill_price'))
+        quote_amount = decimal(fill.get('fill_quote_amount', size * price))
+        require(size > 0 and price > 0 and quote_amount == size * price,
+                'fleet native fill amount or quote is inconsistent')
+        fee = fill.get('fee')
+        require(isinstance(fee, dict) and decimal(fee.get('percent', 0)) == 0,
+                'fleet native inventory requires exact flat-fee receipts')
+        fees = defaultdict(Decimal)
+        flat_fees = fee.get('flat_fees')
+        require(isinstance(flat_fees, list), 'fleet native fill fee receipt is malformed')
+        for item in flat_fees:
+            require(isinstance(item, dict) and item.get('token') in (base, quote),
+                    'fleet native fill fee asset is unsupported')
+            amount = decimal(item.get('amount'))
+            # Native actual-currency fees are signed: a maker rebate is negative
+            # and adds owned base. The exact fill match below validates it.
+            fees[item['token']] += amount
+        base_fee = fees[base]
+        signed_gross = size if trade_type == 'BUY' else -size
+        net_base += signed_gross - base_fee
+        gross_base += size
+        require(trade_id is not None, 'fleet native trade identity is missing')
+    expected_gross = decimal(receipt.get('executed_amount_base'))
+    require(gross_base == expected_gross and expected_gross > 0,
+            'fleet native order cumulative base differs from its exact fills')
+    return net_base
+
+
+def _owner_snapshot_readonly(path):
+    path = Path(path)
+    require(path.is_absolute() and path.is_file() and not path.is_symlink(),
+            'fleet ownership snapshot path is unavailable or symbolic')
+    _require_no_snapshot_sidecars(path)
+    before_stat = path.stat()
+    file_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    connection = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute('PRAGMA query_only=ON')
+        connection.execute('BEGIN')
+        require(connection.execute('PRAGMA integrity_check').fetchone()[0] == 'ok',
+                'fleet ownership snapshot integrity check failed')
+        digest_value = native_snapshot_tables_digest(connection)
+        return connection, file_digest, digest_value, before_stat
+    except Exception:
+        connection.close()
+        raise
+
+
+def _require_no_snapshot_sidecars(path):
+    wal = Path(str(path) + '-wal')
+    shm = Path(str(path) + '-shm')
+    require((not wal.exists() or wal.stat().st_size == 0)
+            and (not shm.exists() or shm.stat().st_size == 0),
+            'fleet ownership snapshot has uncheckpointed SQLite sidecars')
+
+
+def _derive_owner_residuals(connection, owner, quantity_increments=None):
+    """Derive positive spot inventory from unique held receipts and active exact executor receipts."""
+    totals = defaultdict(Decimal)
+    ledger_by_executor = defaultdict(Decimal)
+    seen_fills = set()
+    script_config = FLEET_OWNERS[owner]
+    dust_totals, fill_totals, native_fills = native_inventory_proof(connection, script_config, quantity_increments)
+    risk_row = connection.execute('SELECT value FROM Metadata WHERE key=?',
+                                  (f'strategy-risk:{script_config}',)).fetchone()
+    risk_controllers = None
+    if risk_row is not None:
+        try:
+            risk_state = json.loads(risk_row['value'])
+            require(isinstance(risk_state, dict) and isinstance(risk_state.get('controllers'), list)
+                    and len(risk_state['controllers']) == len(set(risk_state['controllers'])),
+                    'fleet native risk metadata controller scope is malformed')
+            risk_controllers = set(risk_state['controllers'])
+        except (TypeError, ValueError):
+            raise ValueError('fleet native risk metadata is malformed') from None
+    ledger_rows = connection.execute('SELECT * FROM PositionHoldLedger ORDER BY id').fetchall()
+    for row in ledger_rows:
+        receipt = json.loads(row['order_payload'])
+        pair = row['trading_pair']
+        require(row['connector_name'] == 'okx' and '-' in pair
+                and receipt.get('client_order_id', row['client_order_id']) == row['client_order_id'],
+                'fleet held receipt owner or order identity differs')
+        order = connection.execute('SELECT config_file_path FROM "Order" WHERE id=?',
+                                   (row['client_order_id'],)).fetchone()
+        require(order is not None and order['config_file_path'] == script_config,
+                'fleet held receipt native Order is not bound to its owner script')
+        if risk_controllers is not None:
+            require(row['controller_id'] in risk_controllers,
+                    'fleet held receipt controller is outside native risk metadata')
+        fills = receipt.get('order_fills')
+        require(isinstance(fills, dict), 'fleet held receipt has no exact fills')
+        for trade_id in fills:
+            key = (row['connector_name'], pair, row['client_order_id'], str(trade_id))
+            require(key not in seen_fills, 'fleet native fill is duplicated across ownership rows')
+            seen_fills.add(key)
+        amount = _validated_receipt_net_base(receipt, pair, row['order_side'])
+        corroborate_order_receipt(receipt, pair, row['client_order_id'], row['order_side'], native_fills)
+        require(amount == position_hold_net_base(receipt, pair.split('-')[0]),
+                'fleet held receipt net amount differs from native held accounting')
+        asset = pair.split('-')[0]
+        totals[asset] += amount
+        ledger_by_executor[row['executor_id']] += amount
+
+    # persist_native_state writes Position from positions_held only. Keep that
+    # subtotal distinct from inventory still owned by active executors.
+    held_totals = dict(totals)
+    executor_rows = connection.execute('SELECT * FROM Executors ORDER BY id').fetchall()
+    active_ids = set()
+    for row in executor_rows:
+        custom = json.loads(row['custom_info'] or '{}')
+        require(isinstance(custom, dict), 'fleet executor custom state is malformed')
+        remaining_value = custom.get('remaining_position_amount_base')
+        remaining = decimal(remaining_value) if remaining_value is not None else Decimal(0)
+        active = row['status'] in (2, 3)
+        if active:
+            require(row['is_active'] == 1 and row['close_type'] is None,
+                    'fleet active executor lifecycle is inconsistent')
+            config = json.loads(row['config'])
+            require(config.get('connector_name') == 'okx' and '-' in config.get('trading_pair', '')
+                    and config.get('leverage', 1) in (1, '1', None),
+                    'fleet active executor is not supported spot inventory')
+            pair = config['trading_pair']
+            if risk_controllers is not None:
+                require(row['controller_id'] in risk_controllers,
+                        'fleet active executor controller is outside native risk metadata')
+            snapshots = custom.get('execution_order_snapshots')
+            require(isinstance(snapshots, list) and snapshots,
+                    'fleet active executor lacks exact order snapshots')
+            net = Decimal(0)
+            local_seen = set()
+            local_orders = set()
+            for snapshot in snapshots:
+                order = InFlightOrder.from_json(snapshot)
+                require(order.trading_pair == pair and order.client_order_id not in local_orders,
+                        'fleet active executor contains a foreign or duplicate order')
+                local_orders.add(order.client_order_id)
+                order_record = connection.execute('SELECT * FROM "Order" WHERE id=?',
+                                                  (order.client_order_id,)).fetchone()
+                require(order_record is not None and order_record['config_file_path'] == script_config,
+                        'fleet active native Order is not bound to its owner script')
+                if order.current_state is OrderState.CANCELED:
+                    # A settled, unfilled maker predecessor contributes no inventory.
+                    # The snapshot alone cannot establish cancellation or no fills.
+                    require(order.executed_amount_base == 0 and order.executed_amount_quote == 0
+                            and not order.order_fills
+                            and not any(fill.order_id == order.client_order_id for fill in native_fills)
+                            and order_record['market'] == 'okx' and order_record['symbol'] == pair
+                            and order.exchange_order_id
+                            and order_record['exchange_order_id'] == order.exchange_order_id
+                            and order_record['last_status'] == 'OrderCancelled',
+                            'fleet canceled predecessor lacks exact zero-fill ownership proof')
+                    cancellation = connection.execute(
+                        'SELECT 1 FROM OrderStatus WHERE order_id=? AND status=? AND timestamp=?',
+                        (order.client_order_id, 'OrderCancelled', order_record['last_update_timestamp'])).fetchone()
+                    require(cancellation is not None,
+                            'fleet canceled predecessor lacks a matching native cancellation event')
+                    continue
+                require(order.current_state is OrderState.FILLED and order.executed_amount_base == order.amount,
+                        'fleet active executor contains an open or partial order')
+                order_payload = order.to_json()
+                order_fills = order_payload.get('order_fills') or {}
+                fill_keys = {(order.client_order_id, str(trade_id)) for trade_id in order_fills}
+                require(fill_keys and not (local_seen & fill_keys),
+                        'fleet active executor contains duplicate or missing fill identities')
+                local_seen.update(fill_keys)
+                key_prefix = ('okx', pair)
+                for client_id, trade_id in fill_keys:
+                    key = (*key_prefix, client_id, trade_id)
+                    require(key not in seen_fills, 'fleet executor fill duplicates a held-ledger receipt')
+                    seen_fills.add(key)
+                receipt = dict(order_payload, trade_type=order.trade_type.name,
+                               executed_amount_base=str(order.executed_amount_base))
+                corroborate_order_receipt(receipt, pair, order.client_order_id, order.trade_type.name, native_fills)
+                net += _validated_receipt_net_base(receipt, pair, order.trade_type.name)
+            require(remaining > 0 and net == remaining,
+                    'fleet active executor remaining inventory differs from exact fills')
+            asset = pair.split('-')[0]
+            totals[asset] += net
+            active_ids.add(row['id'])
+        elif remaining > 0:
+            require(row['status'] == 4 and row['close_type'] == 10
+                    and ledger_by_executor[row['id']] == remaining,
+                    'fleet terminal positive inventory lacks matching held-ledger ownership')
+        else:
+            require(row['status'] == 4 and row['is_active'] == 0 and row['close_type'] is not None,
+                    'fleet terminal executor has unresolved lifecycle ownership')
+
+    require(active_ids == {row['id'] for row in executor_rows if row['status'] in (2, 3)},
+            'fleet active executor classification is incomplete')
+    # Position is a held projection: it excludes active inventory and physical dust.
+    position_rows = connection.execute('SELECT connector_name, trading_pair, amount FROM Position').fetchall()
+    projected = defaultdict(Decimal)
+    for row in position_rows:
+        require(row['connector_name'] == 'okx' and '-' in row['trading_pair'],
+                'fleet position projection has unsupported owner scope')
+        # Position.amount uses SqliteDecimal(6), so the raw SQLite integer is micro-base.
+        amount = decimal(row['amount']) / Decimal(1_000_000)
+        require(amount >= 0, 'fleet position projection has negative spot inventory')
+        if amount:
+            projected[row['trading_pair'].split('-')[0]] += amount
+    for asset, amount in projected.items():
+        require(amount > 0 and abs(amount - held_totals.get(asset, Decimal(0))) < Decimal('0.000001'),
+                'fleet positive position projection is not explained by exact receipts')
+    for asset, amount in dust_totals.items():
+        totals[asset] += amount
+    require_inventory_conservation(totals, fill_totals)
+    result = {asset: format(amount, 'f') for asset, amount in sorted(totals.items()) if amount}
+    require(all(decimal(amount) > 0 for amount in result.values()),
+            'fleet ownership contains non-positive net inventory')
+    return result
+
+
+def inspect_fleet_owner_snapshot(path, owner, *, quantity_increments=None):
+    """Read and classify one frozen owner snapshot without writing to it."""
+    require(owner in FLEET_OWNERS, 'fleet owner is not a supported V2/V3 identity')
+    path = Path(path)
+    connection, file_hash, tables_hash, before_stat = _owner_snapshot_readonly(path)
+    try:
+        residuals = _derive_owner_residuals(connection, owner, quantity_increments)
+        after_stat = path.stat()
+        after_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        require((before_stat.st_dev, before_stat.st_ino, before_stat.st_size, before_stat.st_mtime_ns)
+                == (after_stat.st_dev, after_stat.st_ino, after_stat.st_size, after_stat.st_mtime_ns)
+                and file_hash == after_hash and not path.is_symlink(),
+                'fleet ownership snapshot changed during read-only inspection')
+        _require_no_snapshot_sidecars(path)
+    finally:
+        connection.close()
+    return {'owner': owner, 'script_config': FLEET_OWNERS[owner],
+            'database_snapshot_path': str(Path(path)), 'database_snapshot_sha256': file_hash,
+            'tables_digest': tables_hash, 'owned_residual_by_asset': residuals}
+
+
+def validate_fleet_ownership(evidence, now, native_keys):
+    bundle = evidence.get('fleet_ownership')
+    require(isinstance(bundle, dict) and set(bundle) == {
+        'schema', 'observed_at', 'expires_at', 'owner_observations', 'sealed_evidence_sha256', 'authenticator'
+    } and bundle['schema'] == 1, 'fresh same-account fleet ownership bundle is required')
+    verify_fleet_ownership(bundle, native_keys, evidence)
+    observed_at, expires_at = decimal(bundle['observed_at']), decimal(bundle['expires_at'])
+    now_value = decimal(now)
+    require(0 <= now_value - observed_at <= 300
+            and observed_at < expires_at <= min(now_value + 300, observed_at + 300),
+            'fleet ownership observation is stale or has an excessive expiry')
+    observations = bundle['owner_observations']
+    require(isinstance(observations, list) and len(observations) == len(FLEET_OWNERS),
+            'fleet ownership must contain exactly the V2 and V3 owner observations')
+    by_owner = {}
+    total = defaultdict(Decimal)
+    for item in observations:
+        required = {'owner', 'script_config', 'observed_at',
+                    'database_snapshot_path', 'database_snapshot_sha256', 'source_identity', 'tables_digest',
+                    'owned_residual_by_asset', 'quantity_increments'}
+        require(isinstance(item, dict) and set(item) == required,
+                'fleet owner observation has an invalid shape')
+        owner = item['owner']
+        require(owner in FLEET_OWNERS and owner not in by_owner
+                and item['script_config'] == FLEET_OWNERS[owner],
+                'fleet owner or script mapping differs')
+        owner_observed = decimal(item['observed_at'])
+        require(observed_at <= owner_observed <= now_value and now_value - owner_observed <= 300
+                and owner_observed <= expires_at,
+                'fleet owner database observation is stale or outside the bundle interval')
+        identity = item['source_identity']
+        require(isinstance(identity, dict) and set(identity) == {'container_id', 'image_id', 'engine_source_sha256'}
+                and all(isinstance(value, str) and value for value in identity.values())
+                and len(identity['engine_source_sha256']) == 64
+                and all(char in '0123456789abcdef' for char in identity['engine_source_sha256']),
+                'fleet owner source identity is incomplete')
+        derived_snapshot = inspect_fleet_owner_snapshot(item['database_snapshot_path'], owner,
+                                                        quantity_increments=item['quantity_increments'])
+        require(derived_snapshot['database_snapshot_sha256'] == item['database_snapshot_sha256']
+                and derived_snapshot['tables_digest'] == item['tables_digest'],
+                'fleet owner database snapshot digest differs')
+        derived = derived_snapshot['owned_residual_by_asset']
+        reported = item['owned_residual_by_asset']
+        require(isinstance(reported, dict) and set(reported) == set(derived)
+                and all(decimal(reported[asset]) == decimal(derived[asset]) for asset in derived),
+                'fleet owner residual differs from native ledger and executor receipts')
+        for asset, amount in derived.items():
+            total[asset] += decimal(amount)
+        by_owner[owner] = item
+    require(set(by_owner) == set(FLEET_OWNERS), 'fleet ownership observation is missing an owner')
+    return {'bundle': bundle, 'by_owner': by_owner,
+            'owned_residual_by_asset': {asset: format(amount, 'f')
+                                        for asset, amount in sorted(total.items()) if amount}}
+
+
+def validate_v1_terminal_inventory_population(connection, selected_terminal_ids, continuity_executor_ids=()):
+    """Require every untransferred positive terminal V1 bag to have native ledger ownership."""
+    selected_terminal_ids = set(selected_terminal_ids)
+    continuity_executor_ids = set(continuity_executor_ids)
+    candidates = set()
+    held_by_executor = defaultdict(Decimal)
+    for row in connection.execute('SELECT executor_id, trading_pair, order_side, order_payload FROM PositionHoldLedger'):
+        receipt = json.loads(row['order_payload'])
+        pair = row['trading_pair']
+        require(isinstance(pair, str) and '-' in pair,
+                'V1 held receipt lacks a trading-pair identity')
+        receipt = dict(receipt, trade_type=receipt.get('trade_type', row['order_side']))
+        held_by_executor[row['executor_id']] += position_hold_net_base(receipt, pair.split('-')[0])
+    for row in connection.execute('SELECT * FROM Executors'):
+        custom = json.loads(row['custom_info'] or '{}')
+        require(isinstance(custom, dict), 'V1 executor custom state is malformed')
+        require(row['close_type'] is not None or row['id'] in selected_terminal_ids | continuity_executor_ids,
+                'V1 unselected executor has unresolved lifecycle ownership')
+        remaining = decimal(custom.get('remaining_position_amount_base', 0))
+        if row['status'] == 4 and not row['is_active'] and row['close_type'] is None \
+                and row['close_timestamp'] is None and remaining > 0:
+            marker = custom.get('restart_suspended')
+            if isinstance(marker, dict) and marker.get('reason') == 'planned_restart':
+                candidates.add(row['id'])
+        if remaining > 0 and row['id'] not in selected_terminal_ids | continuity_executor_ids:
+            require(row['status'] == 4 and row['close_type'] == 10
+                    and abs(held_by_executor[row['id']] - remaining) < Decimal('0.000001'),
+                    'V1 positive terminal inventory lacks complete held-ledger ownership')
+    require(candidates - continuity_executor_ids == selected_terminal_ids
+            and candidates <= selected_terminal_ids | continuity_executor_ids,
+            'V1 planned-suspended terminal inventory is not the exact singleton selection')
 
 
 def decode_row(row):
@@ -132,6 +665,281 @@ def validate_position(preflight, stopped, *, allow_legacy_post_only_repair_trans
                                          'original_config_sha256': transition['original_config_sha256']})
         return result
     return validate_position_receipts(preflight, stopped)
+
+
+def validate_suspended_terminal_position(preflight, stopped):
+    """Validate one explicitly suspended, full-entry executor stopped by its owner.
+
+    This exceptional path retains the original terminal row and requires the
+    preflight/stopped pair to prove that the same planned-restart suspension
+    owns exactly one filled BUY entry and no exit lifecycle. It is separate from
+    the normal POSITION_HOLD transfer contract because its inventory has not
+    been written to PositionHoldLedger.
+    """
+    preflight, stopped = decode_row(preflight), decode_row(stopped)
+    require(stopped.get('type') == 'position_executor', 'only PositionExecutor is supported')
+    require(preflight.get('id') == stopped.get('id')
+            and preflight.get('controller_id') == stopped.get('controller_id')
+            and preflight.get('timestamp') == stopped.get('timestamp')
+            and preflight.get('config') == stopped.get('config'),
+            'suspended preflight owner/configuration differs from stopped executor')
+    preflight_stopped = (preflight.get('status') == 4 and not preflight.get('is_active')
+                         and preflight.get('close_type') is None)
+    require(stopped.get('status') == 4 and not stopped.get('is_active')
+            and stopped.get('close_type') is None and stopped.get('close_timestamp') is None,
+            'suspended terminal executor must be inactive with no close type or close timestamp')
+    require(preflight_stopped and preflight.get('close_timestamp') is None,
+            'suspended terminal preflight must already be inactive and unclosed')
+    require(preflight == stopped,
+            'terminal preflight must match stopped row exactly')
+    before_custom = dict(preflight.get('custom_info') or {})
+    after_custom = dict(stopped.get('custom_info') or {})
+    stopped_marker = after_custom.get('restart_suspended')
+    require(isinstance(stopped_marker, dict) and stopped_marker.get('reason') == 'planned_restart',
+            'stopped row must retain the explicit planned-restart suspension marker')
+    before_marker = before_custom.get('restart_suspended')
+    require(isinstance(before_marker, dict) and before_marker.get('reason') == 'planned_restart',
+            'preflight must retain its original planned-restart marker')
+    for custom in (before_custom, after_custom):
+        marker = custom.get('restart_suspended')
+        require(not custom.get('held_position_orders'),
+                'suspended terminal executor was already transferred to held ownership')
+        require(not custom.get('exit_trigger_reason')
+                and decimal(custom.get('close_order_filled_amount_base', 0)) == 0,
+                'suspended entry has an exit trigger or fill')
+    snapshots = after_custom.get('execution_order_snapshots')
+    before_snapshots = before_custom.get('execution_order_snapshots')
+    require(isinstance(snapshots, list) and len(snapshots) == 1
+            and isinstance(before_snapshots, list) and len(before_snapshots) == 1,
+            'one exact entry snapshot is required')
+    order = InFlightOrder.from_json(snapshots[0])
+    before_order = InFlightOrder.from_json(before_snapshots[0])
+    require(order.to_json() == before_order.to_json(), 'preflight entry receipt differs from stopped entry')
+    require(order.trade_type is TradeType.BUY and order.current_state is OrderState.FILLED
+            and order.executed_amount_base == order.amount and order.amount > 0
+            and order.trading_pair == (stopped.get('config') or {}).get('trading_pair')
+            and bool(order.exchange_order_id),
+            'only one fully filled terminal BUY entry is supported')
+    for custom, marker in ((before_custom, before_marker), (after_custom, stopped_marker)):
+        if marker is not None:
+            try:
+                suspended_remaining = decimal(marker.get('remaining_position_amount_base'))
+                executor_remaining = decimal(custom.get('remaining_position_amount_base'))
+            except (ArithmeticError, TypeError, ValueError):
+                raise ValueError('suspension remaining amount is unavailable') from None
+            require(suspended_remaining == executor_remaining,
+                    'suspension remaining amount differs from executor receipt')
+    expected_ids = [order.client_order_id]
+    require(after_custom.get('order_ids') == expected_ids
+            and before_custom.get('order_ids') == expected_ids,
+            'entry ownership is not a singleton or includes an exit order')
+    # The general exact-receipt validator is shared with the POSITION_HOLD
+    # handoff path. Add the entry snapshot only to these in-memory copies; never
+    # manufacture a persisted held ledger row.
+    before_custom['held_position_orders'] = [before_snapshots[0]]
+    after_custom['held_position_orders'] = [snapshots[0]]
+    normalized_preflight = dict(preflight, custom_info=before_custom)
+    normalized_stopped = dict(stopped, custom_info=after_custom)
+    config = parse_position_config(stopped['config'])
+    require(stopped.get('controller_id') == 'ok-rsi-bnb' and config.controller_id == 'ok-rsi-bnb'
+            and config.connector_name == 'okx' and config.trading_pair == 'BNB-USDC',
+            'suspended terminal mode is restricted to the V1 BNB owner')
+    result = validate_position_receipts(normalized_preflight, normalized_stopped)
+    result['preflight'] = preflight
+    result['stopped_digest'] = digest(stopped)
+    result['resume_kind'] = 'restart_suspended_terminal_v1'
+    return result
+
+
+def validate_nonselected_suspended_continuity(preflight, stopped):
+    """Seal one unchanged SOL executor suspended by the normal V1 restart path."""
+    preflight, stopped = decode_row(preflight), decode_row(stopped)
+    require(preflight.get('id') == stopped.get('id')
+            and preflight.get('controller_id') == stopped.get('controller_id')
+            and preflight.get('timestamp') == stopped.get('timestamp')
+            and preflight.get('type') == stopped.get('type') == 'position_executor'
+            and preflight.get('config') == stopped.get('config'),
+            'nonselected continuity executor identity/configuration changed')
+    terminalized = (stopped.get('status') == 4 and stopped.get('is_active') in (False, 0)
+                    and stopped.get('is_trading') in (False, 0))
+    require(preflight.get('status') == 2 and stopped.get('status') in (2, 4)
+            and preflight.get('is_active') in (True, 1)
+            and (terminalized or stopped.get('is_active') in (True, 1))
+            and (not terminalized or preflight.get('is_trading') in (True, 1))
+            and preflight.get('close_type') is None and stopped.get('close_type') is None
+            and preflight.get('close_timestamp') is None and stopped.get('close_timestamp') is None,
+            'nonselected continuity executor is not RUNNING and restart-suspended')
+    before_custom, after_custom = dict(preflight.get('custom_info') or {}), dict(stopped.get('custom_info') or {})
+    before_marker = before_custom.pop('restart_suspended', None)
+    after_marker = after_custom.pop('restart_suspended', None)
+    require(before_marker is None,
+            'nonselected continuity preflight already has a restart-suspension marker')
+    require(
+        isinstance(after_marker, dict) and set(after_marker) == {
+            'timestamp', 'wall_timestamp', 'reason', 'remaining_position_amount_base'
+        } and after_marker.get('reason') == 'planned_restart',
+        'nonselected continuity row lacks the exact planned-restart marker',
+    )
+    for key in SOL_MARK_ONLY_CUSTOM:
+        require(key in before_custom and key in after_custom,
+                'nonselected SOL mark projection is incomplete')
+        before_custom.pop(key)
+        after_custom.pop(key)
+    require(before_custom == after_custom,
+            'nonselected continuity executor state, fills, orders, or trailing state changed')
+    before_outer, after_outer = dict(preflight), dict(stopped)
+    before_outer.pop('custom_info', None)
+    after_outer.pop('custom_info', None)
+    for key in SOL_MARK_ONLY_OUTER:
+        require(key in before_outer and key in after_outer,
+                'nonselected SOL PnL projection is incomplete')
+        before_outer.pop(key)
+        after_outer.pop(key)
+    if terminalized:
+        for key in ('status', 'is_active', 'is_trading'):
+            after_outer[key] = before_outer[key]
+    require(before_outer == after_outer,
+            'nonselected continuity executor lifecycle or accounting fields changed')
+    try:
+        marker_time = decimal(after_marker['timestamp'])
+        wall_time = decimal(after_marker['wall_timestamp'])
+        marker_amount = decimal(after_marker['remaining_position_amount_base'])
+        remaining = decimal(after_custom['remaining_position_amount_base'])
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        raise ValueError('nonselected continuity suspension timestamp or remaining amount is invalid') from None
+    require(marker_time.is_finite() and wall_time.is_finite() and marker_time >= 0
+            and wall_time >= marker_time and marker_amount > 0
+            and marker_amount == remaining,
+            'nonselected continuity suspension remaining amount differs from its executor state')
+    config = parse_position_config(stopped['config'])
+    require(stopped.get('controller_id') == 'ok-rsi-sol' and config.controller_id == 'ok-rsi-sol'
+            and config.connector_name == 'okx' and config.trading_pair == 'SOL-USDC',
+            'nonselected continuity is restricted to the identified V1 SOL owner')
+    info = SimpleNamespace(id=stopped['id'], type=stopped['type'], status=2,
+                           close_type=stopped['close_type'], controller_id=stopped['controller_id'],
+                           config=config, custom_info={**after_custom, 'restart_suspended': after_marker})
+    try:
+        plan = continuity_plan(info)
+    except (RestartContinuityError, ValueError, TypeError, KeyError, ArithmeticError) as error:
+        raise ValueError(f'nonselected SOL executor is not restorable: {type(error).__name__}') from None
+    require(plan is not None and plan.suspended and plan.status.name == 'RUNNING'
+            and plan.close_type is None and plan.open_exit_order is None
+            and len(plan.entry_orders) == 1 and len(plan.exit_orders) == 0
+            and plan.entry_orders[0].current_state is OrderState.FILLED
+            and plan.entry_orders[0].executed_amount_base == plan.entry_orders[0].amount
+            and plan.entry_orders[0].amount > 0,
+            'nonselected SOL executor does not satisfy native restart-continuity requirements')
+    validate_nonselected_sol_mark_projection(preflight, stopped, plan.entry_orders[0], config)
+    return {'executor_id': stopped['id'], 'preflight': preflight, 'stopped_digest': digest(stopped),
+            'remaining_position_amount_base': str(remaining), 'controller_id': stopped['controller_id'],
+            'connector_name': config.connector_name, 'trading_pair': config.trading_pair,
+            'restart_suspended': after_marker}
+
+
+def validate_nonselected_sol_mark_projection(preflight, stopped, order, config):
+    """Only current mark and elapsed age may drift; fill-net cost and trailing state stay sealed."""
+    before, after = preflight['custom_info'], stopped['custom_info']
+    price = decimal(after['current_market_price'])
+    require(price > 0 and decimal(after['close_price']) == price
+            and decimal(after['trailing_current_price']) == price,
+            'nonselected SOL current mark projection differs')
+    before_age, after_age = decimal(before['open_order_age_seconds']), decimal(after['open_order_age_seconds'])
+    require(0 <= before_age <= after_age and math.isfinite(float(after_age)),
+            'nonselected SOL open-order age moved backward or is invalid')
+    receipt = order.to_json()
+    gross_quote = decimal(receipt['executed_amount_quote'])
+    cost = gross_quote - base_fee_quote_amount(receipt, 'SOL')
+    owned = decimal(after['remaining_position_amount_base'])
+    expected_owned = decimal(receipt['executed_amount_base']) - base_fee_amount(receipt, 'SOL')
+    fee_quote = decimal(receipt['cumulative_fee_paid_quote'])
+    require(cost > 0 and owned > 0 and owned == expected_owned
+            and math.isfinite(float(cost)) and math.isfinite(float(fee_quote))
+            and float(decimal(stopped['filled_amount_quote'])) == float(cost)
+            and float(decimal(stopped['cum_fees_quote'])) == float(fee_quote),
+            'nonselected SOL acquisition cost or native fee projection differs')
+    # PositionExecutor uses fee-net cost per owned unit and charges total valued
+    # fees once. SQLite stores these report-only columns as binary floats.
+    basis = cost / owned
+    fee_pct = fee_quote / cost
+    trailing = config.triple_barrier_config.trailing_stop
+    require(trailing is not None, 'nonselected SOL trailing configuration disappeared')
+    activation = decimal(after['trailing_activation_price'])
+    require(activation == basis * (Decimal(1) + fee_pct + decimal(trailing.activation_price))
+            and decimal(after['distance_to_trailing_activation_pct'])
+            == max(activation - price, Decimal(0)) / price,
+            'nonselected SOL activation projection differs from sealed cost or current mark')
+    trigger = after['trailing_trigger_price']
+    trigger_pct = after['trailing_stop_trigger_pct']
+    if trigger is None:
+        require(trigger_pct is None and after['distance_to_trailing_trigger_pct'] is None,
+                'nonselected SOL trigger distance exists without an armed trigger')
+    else:
+        trigger_price = decimal(trigger)
+        require(trigger_pct is not None
+                and trigger_price == basis * (Decimal(1) + fee_pct + decimal(trigger_pct))
+                and decimal(after['distance_to_trailing_trigger_pct'])
+                == max(price - trigger_price, Decimal(0)) / price,
+                'nonselected SOL trigger projection differs from sealed cost or current mark')
+    expected_quote = ((price - basis) / basis) * cost - fee_quote
+    expected_pct = expected_quote / cost
+    require(math.isfinite(float(expected_quote)) and math.isfinite(float(expected_pct))
+            and float(decimal(stopped['net_pnl_quote'])) == float(expected_quote)
+            and float(decimal(stopped['net_pnl_pct'])) == float(expected_pct),
+            'nonselected SOL mark PnL differs from sealed fill cost and fee')
+
+
+def validate_continuity_venue_order(native_order, venue):
+    """Match a suspended SOL entry snapshot to its fresh raw OKX order and fills."""
+    require(isinstance(venue, dict) and set(venue) == {
+        'raw_order', 'raw_fills', 'receipt', 'local_fill_comparisons'
+    }, 'fresh SOL venue order proof has an invalid shape')
+    raw_order = venue['raw_order']
+    require(isinstance(raw_order, dict)
+            and raw_order.get('clOrdId') == native_order.client_order_id
+            and raw_order.get('ordId') == native_order.exchange_order_id
+            and raw_order.get('instId') == native_order.trading_pair
+            and raw_order.get('side') == 'buy' and raw_order.get('state') == 'filled'
+            and raw_order.get('tdMode') == 'cash'
+            and decimal(raw_order.get('sz')) == native_order.amount
+            and decimal(raw_order.get('accFillSz')) == native_order.executed_amount_base,
+            'fresh SOL venue order identity or cumulative fill differs')
+    local_fills = native_order.to_json().get('order_fills') or {}
+    raw_fills = venue['raw_fills']
+    require(isinstance(raw_fills, list) and len(raw_fills) == len(local_fills) > 0
+            and {str(row.get('tradeId')) for row in raw_fills} == set(local_fills),
+            'fresh SOL venue fill identities differ')
+    base, quote = native_order.trading_pair.split('-')
+    net_base = Decimal(0)
+    for raw in raw_fills:
+        trade_id = str(raw['tradeId'])
+        fill = local_fills[trade_id]
+        require(raw.get('ordId') == native_order.exchange_order_id
+                and raw.get('instId') == native_order.trading_pair and raw.get('side') == 'buy'
+                and decimal(raw.get('fillSz')) == decimal(fill['fill_base_amount'])
+                and decimal(raw.get('fillPx')) == decimal(fill['fill_price'])
+                and decimal(fill.get('fill_quote_amount', 0))
+                == decimal(raw['fillSz']) * decimal(raw['fillPx']),
+                'fresh SOL venue fill values differ from native receipt')
+        fee = fill['fee']
+        require(decimal(fee.get('percent', 0)) == 0,
+                'fresh SOL fee-token receipt is required')
+        native_fees = {}
+        for flat in fee['flat_fees']:
+            native_fees[flat['token']] = native_fees.get(flat['token'], Decimal(0)) + decimal(flat['amount'])
+        native_fees = {token: amount for token, amount in native_fees.items() if amount}
+        paid = -decimal(raw.get('fee'))
+        require(paid >= 0 and raw.get('feeCcy') in (base, quote)
+                and native_fees == ({raw['feeCcy']: paid} if paid else {}),
+                'fresh SOL venue fee amount or currency differs from native receipt')
+        net_base += decimal(raw['fillSz']) - (paid if raw['feeCcy'] == base else Decimal(0))
+    receipt = venue['receipt']
+    require(isinstance(receipt, dict) and receipt.get('blockers') == [],
+            'fresh SOL venue receipt contains blockers')
+    comparisons = venue['local_fill_comparisons']
+    require(isinstance(comparisons, list) and len(comparisons) == len(local_fills)
+            and all(isinstance(row, dict) and row.get('matched') is True for row in comparisons),
+            'fresh SOL local fill comparison is incomplete or mismatched')
+    return net_base
 
 
 def validate_legacy_post_only_repair_transition(preflight, stopped):
@@ -460,7 +1268,7 @@ def bound_files(config_paths, root=ROOT):
     return result
 
 
-def validate_receipts(connection, position, proof, *, pending_hold=False):
+def validate_receipts(connection, position, proof, *, pending_hold=False, suspended_terminal=False):
     """Match every fill to venue proof, native event storage and held owner ledger."""
     entry = position['entry']
     oid = entry['client_order_id']
@@ -542,14 +1350,20 @@ def validate_receipts(connection, position, proof, *, pending_hold=False):
                 require(decimal(exact_fill['amount']) == decimal(fill['fill_base_amount'])
                         and decimal(exact_fill['price']) == decimal(fill['fill_price']), 'exact fill companion conflicts')
     ledger = connection.execute('SELECT * FROM PositionHoldLedger WHERE client_order_id=?', (oid,)).fetchall()
-    require(len(ledger) == 1 and ledger[0]['executor_id'] == position['executor_id']
-            and ledger[0]['controller_id'] == position['controller_id']
-            and ledger[0]['connector_name'] == config['connector_name']
-            and ledger[0]['trading_pair'] == config['trading_pair'], 'held ledger owner missing or ambiguous')
-    payload = json.loads(ledger[0]['order_payload'])
-    for field in ('client_order_id', 'exchange_order_id', 'trade_type', 'executed_amount_base',
-                  'executed_amount_quote', 'order_fills'):
-        require(payload.get(field) == entry.get(field), f'held ledger receipt differs: {field}')
+    if suspended_terminal:
+        executor_ledger = connection.execute('SELECT 1 FROM PositionHoldLedger WHERE executor_id=? LIMIT 1',
+                                             (position['executor_id'],)).fetchone()
+        require(position.get('resume_kind') == 'restart_suspended_terminal_v1' and not ledger and not executor_ledger,
+                'suspended terminal entry must not already have a held ledger owner')
+    else:
+        require(len(ledger) == 1 and ledger[0]['executor_id'] == position['executor_id']
+                and ledger[0]['controller_id'] == position['controller_id']
+                and ledger[0]['connector_name'] == config['connector_name']
+                and ledger[0]['trading_pair'] == config['trading_pair'], 'held ledger owner missing or ambiguous')
+        payload = json.loads(ledger[0]['order_payload'])
+        for field in ('client_order_id', 'exchange_order_id', 'trade_type', 'executed_amount_base',
+                      'executed_amount_quote', 'order_fills'):
+            require(payload.get(field) == entry.get(field), f'held ledger receipt differs: {field}')
     # Scope aggregates are rounded projections. Only skip them at startup when
     # their inventory can be reconstructed from the complete exact ledger.
     scope = (position['controller_id'], config['connector_name'], config['trading_pair'])
@@ -559,8 +1373,7 @@ def validate_receipts(connection, position, proof, *, pending_hold=False):
     for row in scope_ledger:
         receipt = json.loads(row[0])
         require(receipt.get('order_fills'), 'scope contains unverifiable held inventory')
-        sign = Decimal(1) if receipt['trade_type'] == 'BUY' else Decimal(-1)
-        inventory += sign * decimal(receipt['executed_amount_base']) - base_fee_amount(receipt, config['trading_pair'].split('-')[0])
+        inventory += position_hold_net_base(receipt, config['trading_pair'].split('-')[0])
     aggregates = connection.execute('SELECT * FROM Position WHERE controller_id=? AND connector_name=? AND trading_pair=?', scope).fetchall()
     if aggregates:
         # Exceptional hold completion may corroborate a projection which predates
@@ -574,7 +1387,8 @@ def validate_receipts(connection, position, proof, *, pending_hold=False):
     return {'ledger_rows': [dict(row) for row in ledger], 'position_rows': [dict(row) for row in aggregates]}
 
 
-def validate_reconciliation(db_path, evidence, now):
+def validate_reconciliation(db_path, evidence, now, *, terminal_suspended_executor_ids=(),
+                            continuity_executor_ids=(), preflight_db_path=None):
     """Check the raw GET observation, not only caller-supplied success flags."""
     report = evidence['reconciliation']
     require(report.get('schema_version') == 1 and report.get('kind') == 'okx_stopped_owner_get_reconciliation'
@@ -589,7 +1403,11 @@ def validate_reconciliation(db_path, evidence, now):
     sha = hashlib.sha256(Path(db_path).read_bytes()).hexdigest()
     require(report['database']['sha256'] == report['database']['sha256_after'] == sha,
             'raw reconciliation database bytes differ')
-    selected = {proof['executor_id']: proof for proof in evidence['executors']}
+    # Validation may supplement a proof from the stopped DB; never mutate the
+    # caller's HMAC-authenticated evidence while normalizing it.
+    selected = {proof['executor_id']: dict(proof) for proof in evidence['executors']}
+    terminal_suspended_executor_ids = set(terminal_suspended_executor_ids)
+    continuity_executor_ids = set(continuity_executor_ids)
     # Native terminal child proofs live with the stopped Executor snapshot.
     # Bind that persisted proof set into the read-only venue comparison when
     # the outer evidence envelope carries only the final-order summary.
@@ -605,6 +1423,42 @@ def validate_reconciliation(db_path, evidence, now):
     require(set(report['selected_executor_ids']) == set(selected)
             and {item['executor_id'] for item in report['selected_executors']} == set(selected),
             'raw reconciliation executor selection differs')
+    continuity_evidence = evidence.get('continuity_executors', [])
+    require(isinstance(continuity_evidence, list)
+            and all(isinstance(row, dict) and set(row) == {'executor_id'} for row in continuity_evidence)
+            and {row['executor_id'] for row in continuity_evidence} == continuity_executor_ids
+            and len(continuity_evidence) == len(continuity_executor_ids),
+            'explicit nonselected SOL executor reconciliation selection differs')
+    raw_continuity = report.get('continuity_executors', [])
+    require(isinstance(raw_continuity, list)
+            and all(isinstance(row, dict)
+                    and set(row) == {'executor_id', 'controller_id', 'pair', 'venue_orders'}
+                    for row in raw_continuity)
+            and {row['executor_id'] for row in raw_continuity} == continuity_executor_ids
+            and len(raw_continuity) == len(continuity_executor_ids),
+            'fresh raw SOL venue order selection differs')
+    if continuity_executor_ids:
+        require(preflight_db_path is not None,
+                'fresh SOL venue comparison requires the bound preflight database')
+        raw_by_id = {row['executor_id']: row for row in raw_continuity}
+        with connect(preflight_db_path) as preflight, connect(db_path) as stopped:
+            for executor_id in sorted(continuity_executor_ids):
+                before = preflight.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+                after = stopped.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+                continuity = validate_nonselected_suspended_continuity(before, after)
+                row = raw_by_id[executor_id]
+                require(row['controller_id'] == continuity['controller_id']
+                        and row['pair'] == continuity['trading_pair'] == 'SOL-USDC'
+                        and len(row['venue_orders']) == 1,
+                        'fresh SOL venue owner or order scope differs')
+                custom = json.loads(after['custom_info'] or '{}')
+                snapshots = custom.get('execution_order_snapshots')
+                require(isinstance(snapshots, list) and len(snapshots) == 1,
+                        'native SOL continuity entry snapshot is not a singleton')
+                native_order = InFlightOrder.from_json(snapshots[0])
+                net_base = validate_continuity_venue_order(native_order, row['venue_orders'][0])
+                require(net_base == decimal(continuity['remaining_position_amount_base']),
+                        'fresh SOL venue net entry differs from suspended inventory')
     for phase in ('pending_before', 'pending_after'):
         require({row['pair'] for row in report[phase]} == set(report['controller_pairs'].values()),
                 'venue pending-order scope is incomplete')
@@ -699,6 +1553,69 @@ def validate_reconciliation(db_path, evidence, now):
             require(venue['receipt']['blockers'] == []
                     and all(row['matched'] is True for row in venue['local_fill_comparisons']),
                     'raw venue reconciliation contains conflicts')
+    selected_order_ids = set()
+    if terminal_suspended_executor_ids:
+        require(terminal_suspended_executor_ids <= set(selected),
+                'suspended terminal venue proof is outside the explicit executor selection')
+        for executor_id in selected:
+            with connect(db_path) as connection:
+                record = connection.execute('SELECT controller_id, config, custom_info FROM Executors WHERE id=?',
+                                            (executor_id,)).fetchone()
+            require(record is not None, 'selected executor is missing from stopped database')
+            custom = json.loads(record['custom_info'] or '{}')
+            selected_order_ids.update(custom.get('order_ids') or [])
+    if continuity_executor_ids:
+        require(terminal_suspended_executor_ids and preflight_db_path is not None,
+                'nonselected continuity rows require the explicit terminal mode and preflight snapshot')
+        with connect(preflight_db_path) as preflight, connect(db_path) as connection:
+            for executor_id in sorted(continuity_executor_ids):
+                before = preflight.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+                after = connection.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+                require(before is not None and after is not None,
+                        'nonselected continuity executor is missing from preflight or stopped database')
+                continuity = validate_nonselected_suspended_continuity(before, after)
+                marker = continuity['restart_suspended']
+                require(decimal(marker['wall_timestamp']) <= finished <= now,
+                        'nonselected SOL suspension must predate fresh stopped-owner reconciliation')
+                base = continuity['trading_pair'].split('-')[0]
+                expected_balances[base] = (expected_balances.get(base, Decimal(0))
+                                           + decimal(continuity['remaining_position_amount_base']))
+                custom = json.loads(after['custom_info'] or '{}')
+                selected_order_ids.update(custom.get('order_ids') or [])
+    if terminal_suspended_executor_ids:
+        with connect(db_path) as connection:
+            validate_v1_terminal_inventory_population(
+                connection, terminal_suspended_executor_ids, continuity_executor_ids)
+            dust_totals, fill_totals, native_fills = native_inventory_proof(
+                connection, 'ok_rsi.yml', evidence.get('quantity_increments'))
+            seen_fills = set()
+            for row in connection.execute('SELECT * FROM PositionHoldLedger ORDER BY id'):
+                require(row['client_order_id'] not in selected_order_ids,
+                        'selected or active V1 executor is duplicated in held inventory')
+                receipt = json.loads(row['order_payload'])
+                pair = row['trading_pair']
+                require(row['connector_name'] == 'okx',
+                        'V1 held inventory has unsupported connector ownership')
+                for trade_id in receipt.get('order_fills', {}):
+                    key = (pair, row['client_order_id'], str(trade_id))
+                    require(key not in seen_fills, 'V1 held fill is duplicated across ownership rows')
+                    seen_fills.add(key)
+                net_base = _validated_receipt_net_base(receipt, pair, row['order_side'])
+                corroborate_order_receipt(receipt, pair, row['client_order_id'], row['order_side'], native_fills)
+                require(net_base == position_hold_net_base(receipt, pair.split('-')[0]),
+                        'V1 held receipt differs from exact fill accounting')
+                base = pair.split('-')[0]
+                expected_balances[base] = expected_balances.get(base, Decimal(0)) + net_base
+            for asset, amount in dust_totals.items():
+                expected_balances[asset] = expected_balances.get(asset, Decimal(0)) + amount
+            require_inventory_conservation(expected_balances, fill_totals)
+    fleet_ownership = None
+    if terminal_suspended_executor_ids:
+        fleet_ownership = validate_fleet_ownership(evidence, now, Security.api_keys('okx'))
+        require(report.get('fleet_ownership_authenticator') == fleet_ownership['bundle']['authenticator'],
+                'stopped venue reconciliation is not bound to the fresh fleet ownership bundle')
+        for asset, amount in fleet_ownership['owned_residual_by_asset'].items():
+            expected_balances[asset] = expected_balances.get(asset, Decimal(0)) + decimal(amount)
     balances = {row['asset']: row for row in report['balance_coverage']}
     require(set(balances) == set(expected_balances), 'raw balance coverage is incomplete')
     for asset, amount in expected_balances.items():
@@ -710,8 +1627,29 @@ def validate_reconciliation(db_path, evidence, now):
 
 def consumed_history(connection, pending_id=None):
     """Read immutable consumed receipts; another prepared or unknown row blocks reuse."""
-    rows = ([dict(row) for row in connection.execute(f'SELECT * FROM {TABLE} ORDER BY id')
-             if row['id'] != pending_id] if TABLE in tables(connection) else [])
+    all_rows = ([dict(row) for row in connection.execute(f'SELECT * FROM {TABLE} ORDER BY id')]
+                if TABLE in tables(connection) else [])
+    superseded = [row for row in all_rows if row['state'] == 'superseded']
+    require(len(superseded) <= 1, 'multiple forward repair predecessors are unsupported')
+    for old_row in superseded:
+        require(old_row['claimed_at'] is None, 'superseded manifest was previously claimed')
+        try:
+            old = json.loads(old_row['payload'])
+            successors = [row for row in all_rows if row['state'] in ('prepared', 'claimed')
+                          and json.loads(row['payload']).get('forward_repair', {}).get('old_manifest_id')
+                          == old_row['id']]
+            require(len(successors) == 1, 'superseded manifest has no unique successor')
+            successor = json.loads(successors[0]['payload'])
+            proof = successor['forward_repair']
+            require(old['schema'] == 1 and old['id'] == old_row['id']
+                    and proof['old_manifest_sha256'] == digest(old)
+                    and old['created_at'] <= successor['created_at']
+                    and {position['executor_id'] for position in old['positions']}
+                    == {position['executor_id'] for position in successor['positions']},
+                    'superseded manifest or forward repair link differs')
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('invalid forward repair predecessor history') from None
+    rows = [row for row in all_rows if row['id'] != pending_id and row['state'] != 'superseded']
     payloads = {}
     for row in rows:
         require(row['state'] == 'claimed', 'manifest history contains an unconsumed or unknown state')
@@ -768,6 +1706,332 @@ def consumed_history(connection, pending_id=None):
     return rows
 
 
+def validate_continuity_bindings(connection, continuity_rows):
+    require(isinstance(continuity_rows, list), 'sealed nonselected continuity list is invalid')
+    executor_ids = [row.get('executor_id') for row in continuity_rows]
+    require(all(isinstance(item, str) and item for item in executor_ids)
+            and len(executor_ids) == len(set(executor_ids)),
+            'sealed nonselected continuity identities are invalid')
+    for proof in continuity_rows:
+        stopped = connection.execute('SELECT * FROM Executors WHERE id=?', (proof['executor_id'],)).fetchone()
+        require(stopped is not None, 'sealed nonselected continuity executor disappeared')
+        current = validate_nonselected_suspended_continuity(proof.get('preflight'), stopped)
+        require(current['stopped_digest'] == proof.get('stopped_digest')
+                and current['remaining_position_amount_base'] == proof.get('remaining_position_amount_base')
+                and current['controller_id'] == proof.get('controller_id')
+                and current['connector_name'] == proof.get('connector_name')
+                and current['trading_pair'] == proof.get('trading_pair'),
+                'sealed nonselected continuity executor differs from stopped state')
+    return continuity_rows
+
+
+def risk_state_digest(connection, script_config, expected_controllers):
+    state = risk_state_value(connection, script_config)
+    controllers = set(expected_controllers)
+    paused = state.get('operator_paused') if isinstance(state, dict) else None
+    require(isinstance(state, dict) and type(state.get('version')) is int and state.get('version') == 1
+            and isinstance(state.get('controllers'), list)
+            and set(state['controllers']) == controllers
+            and isinstance(state.get('max_pnl_by_controller'), dict)
+            and set(state['max_pnl_by_controller']) == controllers
+            and isinstance(state.get('drawdown_exited_controllers'), list)
+            and len(state['drawdown_exited_controllers']) == len(set(state['drawdown_exited_controllers']))
+            and set(state['drawdown_exited_controllers']) <= controllers
+            and type(state.get('stopped')) is bool and state['stopped'] is False
+            and isinstance(paused, dict) and set(paused) == controllers
+            and all(type(value) is bool and value for value in paused.values())
+            and (state.get('daily_entry_risk') is None),
+            'all configured V1 controller entries must be durably paused')
+    try:
+        peak_values = [decimal(state['max_global_pnl'])]
+        peak_values.extend(decimal(value) for value in state['max_pnl_by_controller'].values())
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        raise ValueError('durable V1 risk peak state is malformed') from None
+    require(all(value.is_finite() for value in peak_values), 'durable V1 risk peak state is non-finite')
+    watermarks = state.get('operator_watermarks', {})
+    require(isinstance(watermarks, dict) and set(watermarks) <= controllers,
+            'durable V1 operator watermark scope is malformed')
+    for value in watermarks.values():
+        require(isinstance(value, dict) and set(value) == {'requested_at', 'command_id'}
+                and isinstance(value['requested_at'], (int, float))
+                and not isinstance(value['requested_at'], bool)
+                and decimal(value['requested_at']) >= 0
+                and isinstance(value['command_id'], str) and 1 <= len(value['command_id']) <= 128,
+                'durable V1 operator watermark is malformed')
+    return digest(state)
+
+
+def risk_state_value(connection, script_config):
+    require('Metadata' in tables(connection), 'durable V1 strategy risk state is unavailable')
+    row = connection.execute('SELECT value FROM Metadata WHERE key=?',
+                             (f'strategy-risk:{script_config}',)).fetchone()
+    require(row is not None, 'durable V1 strategy risk state is unavailable')
+    try:
+        state = json.loads(row['value'])
+    except (TypeError, ValueError):
+        raise ValueError('durable V1 risk state is malformed') from None
+    require(isinstance(state, dict), 'durable V1 risk state is malformed')
+    return state
+
+
+def staged_daily_entry_limit(script_config, root=ROOT):
+    script_path = Path(root) / 'conf/scripts' / script_config
+    try:
+        script = yaml.safe_load(script_path.read_text())
+        value = script.get('max_daily_loss_quote') if isinstance(script, dict) else None
+        require(type(value) in (str, int), 'staged V1 daily entry limit must be a quoted decimal or integer')
+        limit = decimal(value)
+    except (OSError, TypeError, ValueError, ArithmeticError):
+        raise ValueError('staged V1 daily entry limit is unavailable or malformed') from None
+    require(value is not None and limit.is_finite() and limit > 0,
+            'staged V1 daily entry limit is unavailable or malformed')
+    return str(limit)
+
+
+def risk_transition_binding(connection, script_config, controllers, before_state, current_state, configured_limit):
+    enrollment = current_state.get('entry_risk_enrollment')
+    require(isinstance(enrollment, dict) and isinstance(enrollment.get('command_id'), str),
+            'pending native V1 daily enrollment receipt is unavailable')
+    archive_key = 'strategy-risk-transition:' + digest([script_config, enrollment['command_id']])
+    row = connection.execute('SELECT value FROM Metadata WHERE key=?', (archive_key,)).fetchone()
+    require(row is not None, 'native V1 daily-risk transition archive is unavailable')
+    try:
+        archived = json.loads(row['value'])
+    except (TypeError, ValueError):
+        raise ValueError('native V1 daily-risk transition archive is malformed') from None
+    require(isinstance(archived, dict) and isinstance(archived.get('before'), dict),
+            'native V1 daily-risk transition archive is malformed')
+    expected_native_state = financial_state_digest_before_prospective_daily_enrollment(
+        connection, script_config, archived['before'], archive_key)
+    return validate_prospective_daily_enrollment_archive(
+        archive_key, row['value'], script_config=script_config, controllers=controllers,
+        before_state=before_state, current_state=current_state, configured_limit=configured_limit,
+        expected_native_state_sha256=expected_native_state)
+
+
+def _validated_failed_boot_receipts(process_path, venue_path, controller_pairs, old_created_at, observed_at):
+    """Check the bounded stopped boot and GET-only venue observations; seal hashes, not private IDs."""
+    require(process_path is not None and venue_path is not None,
+            'forward repair requires failed-boot process and venue receipts')
+    process_path, venue_path = Path(process_path), Path(venue_path)
+    process, venue = json.loads(process_path.read_text()), json.loads(venue_path.read_text())
+    require(isinstance(process, dict) and set(process) == {
+        'container_id', 'image', 'started_at', 'finished_at', 'running', 'exit_code'},
+        'forward repair process receipt is malformed')
+    started, finished = process['started_at'], process['finished_at']
+    require(isinstance(process['container_id'], str) and process['container_id']
+            and isinstance(process['image'], str) and process['image'].startswith('sha256:')
+            and len(process['image']) == 71
+            and all(char in '0123456789abcdef' for char in process['image'][7:])
+            and process['running'] is False and type(process['exit_code']) is int and process['exit_code'] == 0
+            and type(started) in (int, float) and type(finished) in (int, float)
+            and math.isfinite(started) and math.isfinite(finished)
+            and old_created_at <= started < finished <= observed_at,
+            'forward repair failed-boot process is outside the unclaimed preparation window')
+    require(isinstance(venue, dict) and set(venue) == {
+        'observed_at', 'http_methods', 'native_application_started', 'window_begin_ms',
+        'window_end_ms', 'fills', 'pending', 'container_proof'},
+        'forward repair venue receipt is malformed')
+    require(venue['container_proof'] == process and venue['http_methods'] == ['GET']
+            and venue['native_application_started'] is False
+            and type(venue['observed_at']) in (int, float) and math.isfinite(venue['observed_at'])
+            and finished <= venue['observed_at'] <= observed_at
+            and type(venue['window_begin_ms']) is int and type(venue['window_end_ms']) is int
+            and started * 1000 - 5000 <= venue['window_begin_ms'] <= started * 1000
+            and finished * 1000 <= venue['window_end_ms'] <= finished * 1000 + 5000,
+            'forward repair venue read is not bound to the failed boot window')
+    fills = venue['fills']
+    require(isinstance(fills, dict) and set(fills) == {'code', 'data', 'msg'}
+            and fills['code'] == '0' and fills['data'] == []
+            and isinstance(fills['msg'], str), 'forward repair venue fills are incomplete or nonempty')
+    pending = venue['pending']
+    require(isinstance(pending, list) and len(pending) == 5
+            and {item.get('pair') for item in pending if isinstance(item, dict)} == set(controller_pairs.values()),
+            'forward repair venue pending pair scope differs')
+    for item in pending:
+        require(set(item) == {'pair', 'regular', 'regular_count', 'algos', 'algo_count'}
+                and item['regular'] == [] and type(item['regular_count']) is int and item['regular_count'] == 0
+                and isinstance(item['algos'], dict) and set(item['algos']) == set(SPOT_ALGO_TYPES)
+                and all(value == [] for value in item['algos'].values())
+                and type(item['algo_count']) is int and item['algo_count'] == 0,
+                'forward repair venue pending orders are incomplete or nonempty')
+    return {'process_sha256': _preflight_file_sha256(process_path),
+            'venue_sha256': _preflight_file_sha256(venue_path),
+            'image_sha256': process['image'], 'started_at': started, 'finished_at': finished,
+            'venue_observed_at': venue['observed_at']}
+
+
+def _forward_repair_precheck(db_path, preflight_path, stopped_backup_path, evidence, old_id,
+                             reviewed_source_transition, files, now, root,
+                             failed_boot_process_proof_path, failed_boot_venue_proof_path):
+    """Bind one failed, unclaimed V1 boot to its immutable stopped-owner risk source."""
+    require(isinstance(old_id, str) and old_id and isinstance(reviewed_source_transition, dict)
+            and set(reviewed_source_transition) == {'old_files_sha256', 'new_files_sha256'},
+            'explicit reviewed source transition and prepared manifest ID required')
+    stopped_backup_path = Path(stopped_backup_path)
+    require(stopped_backup_path.resolve() not in {Path(db_path).resolve(), Path(preflight_path).resolve()},
+            'forward repair requires a separate sealed stopped-owner backup')
+    stopped_backup_sha = validate_preflight_file_binding(
+        stopped_backup_path, {'preflight_sha256': _preflight_file_sha256(stopped_backup_path)})
+    with connect(preflight_path) as preflight, connect(stopped_backup_path) as before, connect(db_path) as current:
+        require(TABLE in tables(current), 'forward repair has no prepared manifest')
+        row = current.execute(f'SELECT * FROM {TABLE} WHERE id=?', (old_id,)).fetchone()
+        require(row is not None and row['state'] == 'prepared' and row['claimed_at'] is None,
+                'forward repair requires the exact unclaimed prepared manifest')
+        old = json.loads(row['payload'])
+        require(old.get('schema') == 1 and old.get('id') == old_id
+                and old.get('terminal_suspended_executor_ids')
+                and old.get('risk_transition_binding') is not None
+                and old.get('forward_repair') is None,
+                'forward repair predecessor scope is unsupported')
+        require(old['created_at'] <= now and old['evidence']['script_config'] == evidence['script_config']
+                and old['evidence']['preflight_sha256'] == evidence.get('preflight_sha256')
+                and old['evidence']['config_paths'] == evidence['config_paths']
+                and old['evidence']['reconciliation']['controller_pairs']
+                == evidence['reconciliation']['controller_pairs'],
+                'forward repair original owner/preflight scope differs')
+        boot = _validated_failed_boot_receipts(
+            failed_boot_process_proof_path, failed_boot_venue_proof_path,
+            evidence['reconciliation']['controller_pairs'], old['created_at'], evidence['observed_at'])
+        validate_preflight_file_binding(preflight_path, old['evidence'])
+        require(database_digest(preflight) == old['preflight_digest']
+                and database_digest(before) == old['database_digest'],
+                'forward repair original preflight or stopped financial rows differ')
+        require(risk_state_value(preflight, evidence['script_config'])
+                == risk_state_value(before, evidence['script_config']),
+                'forward repair original stopped risk state differs')
+        require(reviewed_source_transition['old_files_sha256'] == digest(old['files'])
+                and reviewed_source_transition['new_files_sha256'] == digest(files)
+                and {key: value for key, value in old['files'].items() if key.startswith('conf/')}
+                == {key: value for key, value in files.items() if key.startswith('conf/')},
+                'forward repair source transition or owner configuration differs')
+        require(old['evidence']['owner'] == evidence['owner']
+                and {proof['executor_id'] for proof in old['evidence']['executors']}
+                == {proof['executor_id'] for proof in evidence['executors']}
+                and {proof['executor_id'] for proof in old['evidence'].get('continuity_executors', [])}
+                == {proof['executor_id'] for proof in evidence.get('continuity_executors', [])},
+                'forward repair executor selection differs')
+        script_config = evidence['script_config']
+        controllers = old['risk_controllers']
+        current_state = risk_state_value(current, script_config)
+        before_state = risk_state_value(before, script_config)
+        transition = old['risk_transition_binding']
+        archive_key = transition['archive_key']
+        archive = current.execute('SELECT value FROM Metadata WHERE key=?', (archive_key,)).fetchone()
+        require(archive is not None, 'forward repair original risk archive is missing')
+        archived = json.loads(archive['value'])
+        pending_state = archived['after']
+        require(digest(pending_state) == old['risk_state_digest']
+                and current_state.get('version') == 2 and current_state.get('stopped') is False
+                and set(current_state.get('operator_paused', {})) == set(controllers)
+                and all(value is True for value in current_state['operator_paused'].values())
+                and set(current_state) == set(pending_state) | {'daily_entry_risk'}
+                and all(current_state[key] == pending_state[key]
+                        for key in pending_state if key != 'entry_risk_enrollment'),
+                'forward repair failed-boot risk changed outside first daily enrollment')
+        pending_enrollment = pending_state['entry_risk_enrollment']
+        failed_enrollment = current_state['entry_risk_enrollment']
+        require(isinstance(pending_enrollment, dict) and isinstance(failed_enrollment, dict)
+                and set(failed_enrollment) == set(pending_enrollment)
+                and all(failed_enrollment[key] == pending_enrollment[key]
+                        for key in pending_enrollment if key not in {'initialized_at', 'initial_pnl_quote'})
+                and pending_enrollment['initialized_at'] is None
+                and pending_enrollment['initial_pnl_quote'] is None,
+                'forward repair enrollment identity or policy changed')
+        enrollment = EntryRiskEnrollment.model_validate(failed_enrollment)
+        daily = DailyEntryRisk.model_validate(current_state['daily_entry_risk'])
+        enrollment.validate_daily_state(daily)
+        require(not enrollment.pending and boot['started_at'] <= enrollment.initialized_at
+                <= daily.last_timestamp <= boot['finished_at']
+                and daily.paused is False and daily.breach_day is None
+                and daily.baseline_quote == enrollment.initial_pnl_quote,
+                'forward repair requires only unbreached failed-boot daily observations')
+        backup_digest = financial_state_digest(before)
+        validated = validate_prospective_daily_enrollment_archive(
+            archive_key, archive['value'], script_config=script_config, controllers=controllers,
+            before_state=before_state, current_state=pending_state,
+            configured_limit=staged_daily_entry_limit(script_config, root),
+            expected_native_state_sha256=backup_digest)
+        require(validated == transition, 'forward repair original archived transition differs')
+        delta = validate_stopped_forward_repair_delta(
+            before, current, script_config=script_config,
+            controller_pairs=evidence['reconciliation']['controller_pairs'], archive_key=archive_key,
+            observed_at=evidence['observed_at'], failed_boot_started_at=boot['started_at'],
+            failed_boot_finished_at=boot['finished_at'])
+        require(delta['stopped_financial_state_sha256'] == backup_digest,
+                'forward repair stopped backup digest differs')
+        return {'schema_version': 1, 'old_manifest_id': old_id, 'old_manifest_sha256': digest(old),
+                'stopped_backup_sha256': stopped_backup_sha,
+                'failed_boot': boot,
+                'original_preflight_sha256': evidence['preflight_sha256'],
+                'source_transition': reviewed_source_transition,
+                'risk_archive_sha256': hashlib.sha256(archive['value'].encode()).hexdigest(),
+                'failed_boot_risk_state': current_state, 'pending_risk_state': pending_state,
+                **delta}
+
+
+def validate_risk_state_binding(connection, manifest, root=ROOT):
+    if not manifest.get('terminal_suspended_executor_ids'):
+        return None
+    controllers = manifest.get('risk_controllers')
+    require(isinstance(controllers, list) and controllers,
+            'sealed V1 risk controller set is unavailable')
+    script_config = manifest['evidence']['script_config']
+    current_state = risk_state_value(connection, script_config)
+    transition = manifest.get('risk_transition_binding')
+    if transition is None:
+        current = risk_state_digest(connection, script_config, controllers)
+    else:
+        require(isinstance(transition, dict), 'sealed V1 daily-risk transition binding is malformed')
+        require(bound_files(manifest['evidence']['config_paths'], root) == manifest['files'],
+                'V1 source/config binding changed after daily-risk enrollment')
+        configured_limit = staged_daily_entry_limit(script_config, root)
+        require(configured_limit == transition.get('limit_quote'),
+                'staged V1 daily entry limit changed after preparation')
+        current = digest(current_state)
+        require(current == manifest.get('risk_state_digest'),
+                'durable V1 risk state changed after terminal preparation')
+        repair = manifest.get('forward_repair')
+        if repair is None:
+            validated = risk_transition_binding(connection, script_config, controllers,
+                                                before_state=None, current_state=current_state,
+                                                configured_limit=configured_limit)
+        else:
+            require(isinstance(repair, dict) and repair.get('schema_version') == 1
+                    and repair.get('kind') == 'v1_failed_preclaim_startup_forward_repair'
+                    and repair.get('original_preflight_sha256')
+                    == manifest['evidence'].get('preflight_sha256')
+                    and repair.get('source_transition', {}).get('new_files_sha256')
+                    == digest(manifest['files'])
+                    and financial_state_digest(connection)
+                    == repair.get('current_financial_state_sha256'),
+                    'forward repair bound native financial state changed')
+            archive_key = transition['archive_key']
+            archive = connection.execute('SELECT value FROM Metadata WHERE key=?', (archive_key,)).fetchone()
+            require(archive is not None
+                    and hashlib.sha256(archive['value'].encode()).hexdigest()
+                    == repair.get('risk_archive_sha256'),
+                    'forward repair original risk archive changed')
+            values = repair.get('decision_values')
+            require(isinstance(values, dict) and len(values) == 5,
+                    'forward repair decision scope changed')
+            for key, value in values.items():
+                row = connection.execute('SELECT value FROM Metadata WHERE key=?', (key,)).fetchone()
+                require(row is not None and row['value'] == value['after'],
+                        'forward repair decision record changed')
+            validated = validate_prospective_daily_enrollment_archive(
+                archive_key, archive['value'], script_config=script_config,
+                controllers=controllers, current_state=current_state,
+                configured_limit=configured_limit,
+                expected_before_state_sha256=transition['before_state_sha256'],
+                expected_native_state_sha256=repair['stopped_financial_state_sha256'])
+        require(validated == transition,
+                'native V1 daily-risk transition receipt changed after terminal preparation')
+    require(current == manifest.get('risk_state_digest'),
+            'durable V1 risk state changed after terminal preparation')
+    return current
+
+
 def validate_history_binding(connection, manifest):
     history = consumed_history(connection, pending_id=manifest['id'])
     # Legacy first manifests had no history. Never infer missing history for a later handover.
@@ -776,9 +2040,13 @@ def validate_history_binding(connection, manifest):
 
 
 def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
-            legacy_transition_executor_ids=()):
+            legacy_transition_executor_ids=(), terminal_suspended_executor_ids=(),
+            continuity_executor_ids=(), supersede_prepared_id=None,
+            stopped_backup_path=None, reviewed_source_transition=None,
+            failed_boot_process_proof_path=None, failed_boot_venue_proof_path=None):
     """Register only; caller must stop the owner and reconcile the venue first."""
     now = time.time() if now is None else now
+    validate_preflight_file_binding(preflight_path, evidence)
     require(evidence.get('schema') == 1 and evidence.get('owner_stopped') is True
             and evidence.get('venue_open_orders') == [], 'stopped owner and zero venue open orders proof required')
     require(0 <= now - evidence['observed_at'] <= 300 and now < evidence['expires_at'] <= now + 900,
@@ -789,9 +2057,25 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
     if isinstance(legacy_transition_executor_ids, str):
         raise ValueError('legacy transition executor ids must be an explicit collection')
     legacy_transition_executor_ids = set(legacy_transition_executor_ids)
+    if isinstance(terminal_suspended_executor_ids, str):
+        raise ValueError('suspended terminal executor ids must be an explicit collection')
+    terminal_suspended_executor_ids = set(terminal_suspended_executor_ids)
+    if isinstance(continuity_executor_ids, str):
+        raise ValueError('nonselected continuity executor ids must be an explicit collection')
+    continuity_executor_ids = set(continuity_executor_ids)
     require(all(isinstance(item, str) and item for item in legacy_transition_executor_ids)
             and legacy_transition_executor_ids <= selected_ids,
             'legacy transition executor id is not in the explicit selection')
+    require(all(isinstance(item, str) and item for item in terminal_suspended_executor_ids)
+            and terminal_suspended_executor_ids <= selected_ids
+            and not (terminal_suspended_executor_ids & legacy_transition_executor_ids),
+            'suspended terminal executor id is not in the explicit non-overlapping selection')
+    require(all(isinstance(item, str) and item for item in continuity_executor_ids)
+            and not (continuity_executor_ids & selected_ids)
+            and not (continuity_executor_ids & terminal_suspended_executor_ids),
+            'nonselected continuity executor IDs must be explicit and disjoint from the target')
+    require(not continuity_executor_ids or terminal_suspended_executor_ids,
+            'nonselected continuity rows are admitted only with the V1 terminal singleton mode')
     config_paths = evidence['config_paths']
     require(f"conf/scripts/{evidence['script_config']}" in config_paths
             and 'conf/conf_client.yml' in config_paths and 'conf/connectors/okx.yml' in config_paths
@@ -800,28 +2084,149 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
     script = yaml.safe_load((Path(root) / f"conf/scripts/{evidence['script_config']}").read_text())
     require(script.get('script_file_name') == 'v2_with_controllers.py' and script.get('controllers_config'),
             'native controller script config required')
+    if terminal_suspended_executor_ids:
+        require(evidence['script_config'] == 'ok_rsi.yml',
+                'suspended terminal mode is restricted to the V1 OK-RSI script')
     required_controllers = {f"conf/controllers/{name}" for name in script['controllers_config']}
     require(required_controllers <= set(config_paths), 'all configured controller files must be bound')
+    files = bound_files(config_paths, root)
     controllers = [yaml.safe_load((Path(root) / name).read_text()) for name in required_controllers]
     require({row['id']: row['trading_pair'] for row in controllers} == evidence['reconciliation']['controller_pairs']
             and all(row['connector_name'] == 'okx' for row in controllers), 'controller owner/pair binding differs')
-    validate_reconciliation(db_path, evidence, now)
-    files = bound_files(config_paths, root)
+    if terminal_suspended_executor_ids:
+        require(len(terminal_suspended_executor_ids) == 1
+                and terminal_suspended_executor_ids == selected_ids,
+                'suspended terminal selection must contain only the suspended terminal executor')
+        require({row['id']: row['trading_pair'] for row in controllers}.get('ok-rsi-bnb') == 'BNB-USDC',
+                'suspended terminal mode requires one executor under the exact V1 BNB controller owner')
+        risk_controllers = sorted(row['id'] for row in controllers)
+        risk_transition_proof = None
+        forward_repair = None
+        with connect(preflight_path) as preflight, connect(db_path) as stopped:
+            preflight_state = risk_state_value(preflight, evidence['script_config'])
+            preflight_risk = risk_state_digest(preflight, evidence['script_config'], risk_controllers)
+            current_state = risk_state_value(stopped, evidence['script_config'])
+            if current_state.get('version') == 1:
+                stopped_risk = risk_state_digest(stopped, evidence['script_config'], risk_controllers)
+                require(preflight_risk == stopped_risk,
+                        'durable V1 risk state changed between preflight and stopped snapshots')
+            else:
+                configured_limit = staged_daily_entry_limit(evidence['script_config'], root)
+                if supersede_prepared_id is not None:
+                    require(stopped_backup_path is not None and reviewed_source_transition is not None,
+                            'forward repair requires the sealed stopped backup and reviewed source transition')
+                    forward_repair = _forward_repair_precheck(
+                        db_path, preflight_path, stopped_backup_path, evidence,
+                        supersede_prepared_id, reviewed_source_transition, files, now, root,
+                        failed_boot_process_proof_path, failed_boot_venue_proof_path)
+                    old_manifest = next(row for row in inspect_manifest(db_path)
+                                        if row['id'] == supersede_prepared_id)
+                    risk_transition_proof = json.loads(old_manifest['payload'])['risk_transition_binding']
+                else:
+                    risk_transition_proof = risk_transition_binding(
+                        stopped, evidence['script_config'], risk_controllers,
+                        before_state=preflight_state, current_state=current_state,
+                        configured_limit=configured_limit)
+                require(risk_transition_proof['before_state_sha256'] == preflight_risk,
+                        'daily-risk enrollment receipt differs from original preflight state')
+                stopped_risk = digest(forward_repair['pending_risk_state'] if forward_repair is not None
+                                      else current_state)
+    else:
+        require(supersede_prepared_id is None, 'forward repair is restricted to V1 terminal mode')
+        risk_controllers = []
+        stopped_risk = None
+        risk_transition_proof = None
+        forward_repair = None
+    with connect(preflight_path) as preflight, connect(db_path) as stopped:
+        unfinished_ids = {row[0] for row in stopped.execute('SELECT id FROM Executors WHERE status != 4')}
+        if terminal_suspended_executor_ids:
+            require(unfinished_ids <= continuity_executor_ids,
+                    'unfinished executor set differs from explicit nonselected continuity selection')
+            for executor_id in sorted(continuity_executor_ids):
+                before = preflight.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+                after = stopped.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+                require(before is not None and after is not None,
+                        'nonselected continuity executor is missing from preflight or stopped database')
+                continuity = validate_nonselected_suspended_continuity(before, after)
+                marker = continuity['restart_suspended']
+                require(decimal(marker['timestamp']) <= decimal(marker['wall_timestamp'])
+                        <= decimal(evidence['observed_at']) <= now,
+                        'nonselected SOL suspension must predate fresh stopped-owner reconciliation')
+        else:
+            require(not unfinished_ids and not continuity_executor_ids,
+                    'database still has unfinished executors')
+    validate_reconciliation(db_path, evidence, now,
+                            terminal_suspended_executor_ids=terminal_suspended_executor_ids,
+                            continuity_executor_ids=continuity_executor_ids,
+                            preflight_db_path=preflight_path)
     with connect(preflight_path) as preflight, connect(db_path, writable=True) as connection:
         connection.execute('BEGIN IMMEDIATE')
-        require(not connection.execute('SELECT id FROM Executors WHERE status != 4').fetchone(),
-                'database still has unfinished executors')
-        history = consumed_history(connection)
+        validate_preflight_file_binding(preflight_path, evidence)
+        unfinished_ids = {row[0] for row in connection.execute('SELECT id FROM Executors WHERE status != 4')}
+        if terminal_suspended_executor_ids:
+            require(unfinished_ids <= continuity_executor_ids,
+                    'unfinished executor set differs from explicit nonselected continuity selection')
+        else:
+            require(not unfinished_ids and not continuity_executor_ids,
+                    'database still has unfinished executors')
+        continuity_rows = []
+        for executor_id in sorted(continuity_executor_ids):
+            before = preflight.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+            after = connection.execute('SELECT * FROM Executors WHERE id=?', (executor_id,)).fetchone()
+            require(before is not None and after is not None,
+                    'nonselected continuity executor is missing from preflight or stopped database')
+            continuity_rows.append(validate_nonselected_suspended_continuity(before, after))
+        if forward_repair is not None:
+            old_row = connection.execute(f'SELECT * FROM {TABLE} WHERE id=?',
+                                         (supersede_prepared_id,)).fetchone()
+            require(old_row is not None and old_row['state'] == 'prepared'
+                    and old_row['claimed_at'] is None
+                    and digest(json.loads(old_row['payload'])) == forward_repair['old_manifest_sha256']
+                    and financial_state_digest(connection)
+                    == forward_repair['current_financial_state_sha256']
+                    and risk_state_value(connection, evidence['script_config'])
+                    == forward_repair['failed_boot_risk_state'],
+                    'forward repair owner state changed before transaction')
+            require(validate_preflight_file_binding(
+                stopped_backup_path,
+                {'preflight_sha256': forward_repair['stopped_backup_sha256']})
+                == forward_repair['stopped_backup_sha256']
+                and _preflight_file_sha256(failed_boot_process_proof_path)
+                == forward_repair['failed_boot']['process_sha256']
+                and _preflight_file_sha256(failed_boot_venue_proof_path)
+                == forward_repair['failed_boot']['venue_sha256']
+                and bound_files(config_paths, root) == files,
+                'forward repair stopped backup or target source changed before transaction')
+            connection.execute('UPDATE Metadata SET value=? WHERE key=?',
+                               (canonical(forward_repair['pending_risk_state']),
+                                'strategy-risk:' + evidence['script_config']))
+            forward_repair['failed_boot_financial_state_sha256'] = forward_repair.pop(
+                'current_financial_state_sha256')
+            forward_repair['current_financial_state_sha256'] = financial_state_digest(connection)
+        history = consumed_history(connection, pending_id=supersede_prepared_id)
         require(all(decimal(now) >= decimal(row['claimed_at']) for row in history),
                 'new manifest predates consumed history')
         positions = []
-        for proof in evidence['executors']:
+        for supplied_proof in evidence['executors']:
+            proof = dict(supplied_proof)
             identity = (proof['executor_id'],)
             before = preflight.execute('SELECT * FROM Executors WHERE id=?', identity).fetchone()
             after = connection.execute('SELECT * FROM Executors WHERE id=?', identity).fetchone()
             require(before is not None and after is not None, 'selected executor missing')
             allow_transition = proof['executor_id'] in legacy_transition_executor_ids
-            if allow_transition:
+            if proof['executor_id'] in terminal_suspended_executor_ids:
+                position = validate_suspended_terminal_position(before, after)
+                marker = (position['preflight']['custom_info'].get('restart_suspended')
+                          or decode_row(after)['custom_info'].get('restart_suspended'))
+                try:
+                    suspended_at = decimal(marker.get('wall_timestamp'))
+                    marker_timestamp = decimal(marker.get('timestamp'))
+                except (ArithmeticError, TypeError, ValueError):
+                    raise ValueError('planned-restart suspension time is unavailable') from None
+                require(marker_timestamp >= decimal(position['config']['timestamp'])
+                        and marker_timestamp <= suspended_at <= decimal(evidence['observed_at']) <= decimal(now),
+                        'planned-restart suspension must predate fresh stopped-owner reconciliation')
+            elif allow_transition:
                 require(isinstance(proof, dict), 'selected legacy executor proof missing')
                 terminal_proofs = proof.get('entry_reconciliation')
                 require(isinstance(terminal_proofs, dict), 'fresh terminal child proofs required for legacy transition')
@@ -841,14 +2246,26 @@ def prepare(db_path, preflight_path, evidence, now=None, root=ROOT, *,
                                                (position['entry']['client_order_id'],)).fetchone()
             require(native_config is not None and native_config[0] == evidence['script_config'],
                     'recorder script ownership differs')
-            position['ownership_archive'] = validate_receipts(connection, position, proof)
+            position['ownership_archive'] = validate_receipts(
+                connection, position, proof,
+                suspended_terminal=position.get('resume_kind') == 'restart_suspended_terminal_v1')
             positions.append(position)
         manifest = {'schema': 1, 'id': str(uuid.uuid4()), 'created_at': now, 'expires_at': evidence['expires_at'],
                     'database_digest': database_digest(connection), 'preflight_digest': database_digest(preflight),
-                    'claimed_history_digest': digest(history),
+                    'claimed_history_digest': digest(history), 'continuity_rows': continuity_rows,
+                    'terminal_suspended_executor_ids': sorted(terminal_suspended_executor_ids),
+                    'risk_controllers': risk_controllers, 'risk_state_digest': stopped_risk,
+                    'risk_transition_binding': risk_transition_proof,
                     'files': files, 'evidence': evidence, 'positions': positions}
+        if forward_repair is not None:
+            manifest['forward_repair'] = forward_repair
         connection.execute(f'CREATE TABLE IF NOT EXISTS {TABLE} (id TEXT PRIMARY KEY, state TEXT NOT NULL, '
                            'payload TEXT NOT NULL, claimed_at REAL)')
+        if forward_repair is not None:
+            changed = connection.execute(
+                f"UPDATE {TABLE} SET state='superseded' WHERE id=? AND state='prepared' AND claimed_at IS NULL",
+                (supersede_prepared_id,)).rowcount
+            require(changed == 1, 'forward repair predecessor was already consumed or changed')
         connection.execute(f'INSERT INTO {TABLE} VALUES (?, ?, ?, NULL)', (manifest['id'], 'prepared', canonical(manifest)))
     return manifest
 
@@ -875,23 +2292,33 @@ def pending_manifest(db_path, now=None, root=ROOT):
     with connect(db_path) as connection:
         validate_history_binding(connection, manifest)
         require(database_digest(connection) == manifest['database_digest'], 'database binding changed')
+        validate_continuity_bindings(connection, manifest.get('continuity_rows', []))
+        validate_risk_state_binding(connection, manifest, root)
         proofs = {proof['executor_id']: proof for proof in manifest['evidence']['executors']}
         for position in manifest['positions']:
             row = connection.execute('SELECT * FROM Executors WHERE id=?', (position['executor_id'],)).fetchone()
             transition = bool(position.get('legacy_transition'))
             proof = next(item for item in manifest['evidence']['executors']
                          if item['executor_id'] == position['executor_id'])
-            require(row is not None and validate_position(position['preflight'], row,
-                    allow_legacy_post_only_repair_transition=transition,
-                    terminal_proofs=proof.get('entry_reconciliation') if transition else None)
+            require(row is not None, 'sealed executor disappeared before startup')
+            if position.get('resume_kind') == 'restart_suspended_terminal_v1':
+                current_position = validate_suspended_terminal_position(position['preflight'], row)
+            else:
+                current_position = validate_position(position['preflight'], row,
+                                                     allow_legacy_post_only_repair_transition=transition,
+                                                     terminal_proofs=proof.get('entry_reconciliation') if transition else None)
+            require(current_position
                     == {key: value for key, value in position.items() if key != 'ownership_archive'},
                     'sealed position payload differs from stopped owner')
-            require(validate_receipts(connection, position, proofs[position['executor_id']]) == position['ownership_archive'],
+            require(validate_receipts(connection, position, proofs[position['executor_id']],
+                                      suspended_terminal=(position.get('resume_kind')
+                                                          == 'restart_suspended_terminal_v1'))
+                    == position['ownership_archive'],
                     'held ownership archive differs')
     return manifest
 
 
-def claim(db_path, manifest, now=None):
+def claim(db_path, manifest, now=None, root=ROOT):
     now = time.time() if now is None else now
     with connect(db_path, writable=True) as connection:
         connection.execute('BEGIN IMMEDIATE')
@@ -901,6 +2328,8 @@ def claim(db_path, manifest, now=None):
                 'resume claim already consumed or changed')
         validate_history_binding(connection, manifest)
         require(database_digest(connection) == manifest['database_digest'], 'database changed before claim')
+        validate_continuity_bindings(connection, manifest.get('continuity_rows', []))
+        validate_risk_state_binding(connection, manifest, root)
         for position in manifest['positions']:
             record = connection.execute('SELECT * FROM Executors WHERE id=?', (position['executor_id'],)).fetchone()
             require(digest(decode_row(record)) == position['stopped_digest'], 'executor changed before claim')
@@ -908,7 +2337,9 @@ def claim(db_path, manifest, now=None):
                 removed = connection.execute('DELETE FROM PositionHoldLedger WHERE id=? AND executor_id=?',
                                              (held['id'], position['executor_id'])).rowcount
                 require(removed == 1, 'selected held ownership row missing during claim')
-            for aggregate in position['ownership_archive']['position_rows']:
+            aggregates = (() if position.get('resume_kind') == 'restart_suspended_terminal_v1'
+                          else position['ownership_archive']['position_rows'])
+            for aggregate in aggregates:
                 # Multiple selected owners may share a corroborated projection.
                 connection.execute('DELETE FROM Position WHERE id=?', (aggregate['id'],))
             custom = json.loads(record['custom_info'])
@@ -927,6 +2358,16 @@ def claim(db_path, manifest, now=None):
                 custom['planned_position_resume_compatibility_v1'] = marker
             connection.execute('UPDATE Executors SET status=2, is_active=1, close_type=NULL, close_timestamp=NULL, '
                                'custom_info=? WHERE id=?', (canonical(custom), position['executor_id']))
+        for continuation in manifest.get('continuity_rows', []):
+            current = connection.execute('SELECT status FROM Executors WHERE id=?',
+                                         (continuation['executor_id'],)).fetchone()
+            if current is not None and current['status'] == 4:
+                changed = connection.execute(
+                    'UPDATE Executors SET status=2, is_active=1, is_trading=1 '
+                    'WHERE id=? AND status=4 AND is_active=0 AND is_trading=0 '
+                    'AND close_type IS NULL AND close_timestamp IS NULL',
+                    (continuation['executor_id'],)).rowcount
+                require(changed == 1, 'sealed nonselected terminal continuation changed during claim')
         connection.execute(f'UPDATE {TABLE} SET state=\'claimed\', claimed_at=? WHERE id=?', (now, manifest['id']))
 
 
@@ -938,6 +2379,12 @@ def main():
     parser.add_argument('--evidence')
     parser.add_argument('--legacy-post-only-repair-executor-id', action='append', default=[],
                         help='explicit selected executor ID eligible for the exact historical single-repair transition; repeat as needed')
+    parser.add_argument('--restart-suspended-terminal-executor-id', action='append', default=[],
+                        help='explicit selected executor ID eligible for one sealed restart_suspended terminal entry; repeat as needed')
+    parser.add_argument('--restart-continuity-executor-id', action='append', default=[],
+                        help='explicit nonselected V1 SOL executor ID eligible for exact planned-restart continuity alongside a terminal singleton')
+    parser.add_argument('--password-file', type=Path,
+                        help='private file containing the native Hummingbot password; required for terminal-mode prepare')
     parser.add_argument('--runtime-root', type=Path, default=ROOT,
                         help='Final staged source/config tree for prepare bindings; native startup uses its own root')
     args = parser.parse_args()
@@ -945,9 +2392,23 @@ def main():
         result = inspect_manifest(args.db)
     else:
         require(args.preflight_db and args.evidence, 'prepare requires --preflight-db and --evidence')
-        result = prepare(args.db, args.preflight_db, json.loads(Path(args.evidence).read_text()),
-                         root=args.runtime_root,
-                         legacy_transition_executor_ids=args.legacy_post_only_repair_executor_id or ())
+        terminal_mode = bool(args.restart_suspended_terminal_executor_id)
+        unlocked = False
+        try:
+            if terminal_mode:
+                require(args.password_file is not None,
+                        'terminal-mode prepare requires a private native password file')
+                unlocked = True
+                unlock_native_okx(args.password_file)
+            result = prepare(args.db, args.preflight_db, json.loads(Path(args.evidence).read_text()),
+                             root=args.runtime_root,
+                             legacy_transition_executor_ids=args.legacy_post_only_repair_executor_id or (),
+                             terminal_suspended_executor_ids=args.restart_suspended_terminal_executor_id or (),
+                             continuity_executor_ids=args.restart_continuity_executor_id or ())
+        finally:
+            if unlocked:
+                Security._secure_configs.clear()
+                Security.secrets_manager = None
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

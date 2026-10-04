@@ -38,6 +38,9 @@ class CandleStreamClient:
         self.sessions = 0
         self.failures = 0
         self.last_heartbeat = None
+        # Observation-only receipt times on ``clock``; never consulted by readiness or sequencing.
+        self.last_heartbeat_at = None
+        self.dataset_updated_at = {}
 
     def start(self):
         if self.task is None:
@@ -107,6 +110,7 @@ class CandleStreamClient:
         self.replica.epoch = epoch
         if kind == 'heartbeat':
             self._heartbeat(message, published)
+            self.last_heartbeat_at = now
             return
         pair = message['pair']
         if not isinstance(pair, str) or pair not in self.by_pair:
@@ -154,6 +158,7 @@ class CandleStreamClient:
         self.replica.accept(snapshot, now=now)
         self.sequences[pair] = sequence
         self.dataset_errors.pop(key, None)
+        self.dataset_updated_at[key] = now
         if len(self.update_receipts) == self.update_receipts.maxlen:
             self.receipt_overflows += 1
         self.update_receipts.append({'pair': pair, 'open_time': rows[-1].open_time,

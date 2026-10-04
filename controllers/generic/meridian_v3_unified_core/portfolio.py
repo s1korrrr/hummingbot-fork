@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from controllers.generic import meridian_v3_recipe as recipe
 from controllers.generic.meridian_v3_portfolio import BNBMRFeatures, BNBMRObservation, MeridianPortfolioRecipe
+from controllers.generic.meridian_v3_unified_core.terminal_dust import filled_base, terminal_dust
 from controllers.generic.modular_spot_core.bag import HeldBag
 from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError, decimal, identity
 from controllers.generic.modular_spot_core.native_bindings import NativeBindings
@@ -37,18 +38,6 @@ from .migration import IDENTITY_UNVERIFIED, IdentityGuard, epoch, grant_policy, 
 
 ZERO = Decimal('0')
 ERRORS = (ValueError, TypeError, ArithmeticError, KeyError, AttributeError, OSError)
-
-
-def filled_base(fills, pair):
-    """Owned base implied by native fills, net of fees charged in the base asset."""
-    base = pair.split('-')[0]
-    total = ZERO
-    for fill in fills:
-        amount = decimal(fill.amount_decimal, 'fill amount')
-        fee = sum((decimal(item['amount'], 'fill fee') for item in fill.trade_fee['flat_fees']
-                   if item['token'] == base), ZERO)
-        total += amount - fee if fill.trade_type == 'BUY' else -amount - fee
-    return total
 
 
 class MeridianPortfolio:
@@ -110,8 +99,66 @@ class MeridianPortfolio:
         """Every recorded executor of this recorder, with current active state preferred."""
         if self._tick is not None:
             return self._tick[0]
-        rows = {info.id: info for info in self.recorder().get_all_executors()}
-        rows.update({info.id: info for info in self.owner.executors_info})
+        rows = {}
+        for info in self.recorder().get_all_executors():
+            if not isinstance(info.id, str) or not info.id or info.id in rows:
+                raise PolicyError('duplicate or missing recorded executor identity')
+            rows[info.id] = info
+        current_ids = set()
+        for info in self.owner.executors_info:
+            if not isinstance(info.id, str) or not info.id or info.id in current_ids:
+                raise PolicyError('duplicate or missing current executor identity')
+            current_ids.add(info.id)
+            recorded = rows.get(info.id)
+            if recorded is not None:
+                recorded_custom = recorded.custom_info or {}
+                recorded_receipt = recorded_custom.get('execution_receipt') or {}
+                recorded_dust = decimal(recorded_receipt.get('residual_dust_base', '0'), 'recorded terminal dust')
+                if recorded_dust > 0:
+                    current_custom = info.custom_info or {}
+                    current_receipt = current_custom.get('execution_receipt') or {}
+                    current_dust = decimal(current_receipt.get('residual_dust_base', '0'), 'current terminal dust')
+                    if current_dust != recorded_dust:
+                        raise PolicyError('current executor erased recorded terminal dust')
+
+                    def terminal_proof(row, custom):
+                        config = getattr(row, 'config', None)
+                        if config is None or getattr(config, 'side', None) is None:
+                            raise PolicyError('terminal dust configuration unavailable')
+                        receipt = custom.get('execution_receipt')
+                        if not isinstance(receipt, dict):
+                            raise PolicyError('terminal dust receipt unavailable')
+                        receipt = dict(receipt)
+                        for field in ('residual_dust_base', 'remaining_owned_base', 'entry_gross_base',
+                                      'entry_gross_quote', 'exit_gross_base', 'exit_gross_quote'):
+                            receipt[field] = decimal(receipt.get(field), f'terminal dust {field}').normalize()
+                        close_quantity = custom.get('close_quantity')
+                        if not isinstance(close_quantity, dict):
+                            raise PolicyError('terminal dust lot unavailable')
+                        close_quantity = dict(close_quantity)
+                        close_quantity['quantity_increment'] = decimal(
+                            close_quantity.get('quantity_increment'), 'terminal dust lot', positive=True).normalize()
+                        return digest({
+                            'controller_id': row.controller_id,
+                            'config_controller_id': config.controller_id,
+                            'connector_name': config.connector_name,
+                            'trading_pair': config.trading_pair,
+                            'side': config.side.name,
+                            'level_id': config.level_id,
+                            'close_type': None if row.close_type is None else row.close_type.value,
+                            'close_timestamp': decimal(row.close_timestamp, 'terminal dust close time',
+                                                       positive=True).normalize(),
+                            'is_done': row.is_done,
+                            'is_active': row.is_active,
+                            'receipt': receipt,
+                            'order_ids': custom.get('order_ids'),
+                            'orders': custom.get('execution_order_snapshots'),
+                            'lot': close_quantity,
+                            'entry_state': (custom.get('entry_lifecycle') or {}).get('state'),
+                        })
+                    if terminal_proof(recorded, recorded_custom) != terminal_proof(info, current_custom):
+                        raise PolicyError('current executor changed recorded terminal dust proof')
+            rows[info.id] = info
         return tuple(rows.values())
 
     def begin_tick(self):
@@ -277,6 +324,10 @@ class MeridianPortfolio:
         return target
 
     # ------------------------------------------------------------------ native snapshot
+    def terminal_dust(self, views, evidence, fills, pair, amount_step):
+        return terminal_dust(views, evidence, fills, pair, amount_step,
+                             connector=self.owner.config.connector_name)
+
     def snapshot(self, now_ms):
         """Attributed fixed-envelope state from native fills, executors, positions and books.
 
@@ -320,10 +371,12 @@ class MeridianPortfolio:
             projection = funding_projection(pair_fills, config.connector_name, pair)
             consumed += projection['cash_used']
             loose = {key: v for key, v in views.items() if not v.held}
-            quantity = held.amount + sum((v.remaining_base for v in loose.values()), ZERO)
-            if abs(filled_base(pair_fills, pair) - quantity) > book['amount_step']:
+            dust, dust_basis = self.terminal_dust(loose, evidence, fills, pair, book['amount_step'])
+            quantity = held.amount + sum((v.remaining_base for v in loose.values()), ZERO) + dust
+            difference = abs(filled_base(pair_fills, pair) - quantity)
+            if difference > (ZERO if dust > 0 else book['amount_step']):
                 holds.append(f'{NATIVE_INVENTORY_MISMATCH}:{pair}')
-            basis = (held.amount * held.breakeven_price + held.remaining_fees_quote
+            basis = (held.amount * held.breakeven_price + held.remaining_fees_quote + dust_basis
                      + sum((v.remaining_base * v.entry_price for v in loose.values()), ZERO))
             for key, view in loose.items():
                 unfilled = max(view.planned_quote - view.entry_quote, ZERO)

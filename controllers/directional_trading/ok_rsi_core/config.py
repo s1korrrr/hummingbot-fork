@@ -12,6 +12,7 @@ from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.core.data_type.common import OrderType, PositionMode
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
 from hummingbot.data_feed.candles_feed.okx_spot_candles.constants import INTERVALS as OKX_CANDLE_INTERVALS
+from hummingbot.strategy_v2.components.data_reader import DataPolicy
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy
 
 
@@ -21,6 +22,10 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         # the public controller remains in directional_trading.ok_rsi.
         from controllers.directional_trading.ok_rsi import OKRSIController
         return OKRSIController
+
+    @property
+    def uses_candle_service(self) -> bool:
+        return self.data is not None
 
     controller_name: str = "ok_rsi"
     controller_type: str = "directional_trading"
@@ -44,6 +49,10 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
     position_mode: PositionMode = PositionMode.ONEWAY
     legacy_controller_ids: List[str] = hl_rsi.Field(default_factory=list)
     durable_candle_watermark_enabled: bool = hl_rsi.Field(default=False)
+    # Opt-in: read confirmed 1m candles from the shared candle service (same keys as V2's `data`). Omitted, the native
+    # OKX feed is used. All direct OK RSI controllers in one strategy must choose the same source because the OKX feed
+    # route is process-wide. `candles_connector` stays the `okx` identity namespace either way.
+    data: Optional[DataPolicy] = hl_rsi.Field(default=None, json_schema_extra={"is_updatable": False})
     episode_enabled: bool = hl_rsi.Field(default=False)
     episode_adaptive_entry_pricing: bool = False
     episode_adaptive_reserved_entry: bool = False
@@ -220,9 +229,27 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
         candles_connector = str(self.candles_connector or "okx").strip().lower()
         if candles_connector == "okx_paper_trade":
             candles_connector = "okx"
+        service_requested = candles_connector == "okx_service"
+        if service_requested:
+            # Selector alias, normalized like okx_paper_trade: the namespace of watermarks and recorder rows stays okx.
+            candles_connector = "okx"
         if candles_connector != "okx":
             raise ValueError("OK RSI requires OKX spot candles")
         object.__setattr__(self, "candles_connector", candles_connector)
+        if self.uses_candle_service and (
+            self.data.mode != "shared"
+            or self.data.transport != "stream"
+            or self.data.source_profile != "native"
+            or self.data.symbols
+        ):
+            raise ValueError(
+                "OK RSI data must be omitted or use mode shared, transport stream, native profile and no symbols"
+            )
+        if service_requested:
+            if self.data is None:
+                raise ValueError("candles_connector okx_service requires a shared stream data block (origin, token_file)")
+            if not self.uses_candle_service:
+                raise ValueError("candles_connector okx_service selects the direct OK RSI candle service")
 
         candles_trading_pair = str(self.candles_trading_pair or self.trading_pair).strip().upper()
         if candles_trading_pair != self.trading_pair:

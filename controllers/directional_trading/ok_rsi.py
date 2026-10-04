@@ -158,6 +158,10 @@ class OKRSIController(hl_rsi.HLRSIController):
         )
         self._down_only_pending_configs = {}
         self._down_only_claimed_ids = set()
+        if getattr(config, "uses_candle_service", False) is True:
+            # Before the base class initializes candle feeds: routes the OKX spot selector to the shared service.
+            from hummingbot.data_feed.candles_feed.okx_service_candles.service_hub import configure_service_candles
+            configure_service_candles(config.data).expect(config.candles_trading_pair or config.trading_pair)
         super().__init__(config, *args, **kwargs)
         self._last_trailing_selection: Optional[ContinuousTrailingSelection] = None
         self._watermark_namespace: Optional[ControllerCandleWatermarkNamespace] = None

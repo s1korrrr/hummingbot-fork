@@ -16,13 +16,14 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     from controllers.generic.modular_spot import source_files, source_root
     from hummingbot.strategy_v2.components.recipe_contract import source_records
     rows = source_records(source_root(), source_files())
-    assert not any(name.endswith(('market_stress_v1.py', 'recovery_evidence_v1.py')) for name, _ in rows)
-    # Intentional funding purity/runtime-preparation changes are resealed in
-    # docs/controllers/modular_spot/RELEASE_AUDIT_20260930.md. Crash policy
-    # additions must remain outside this native source closure.
-    # Sealed against the 67-file closure at origin/master bd47b0991, not a
-    # digest recalculated from the candidate under test.
-    assert source_digest(source_root(), source_files()) == '17cba31a66162942cf9a59c10ef6e68d82028e6e614b341f2521a5a6d13951c8'  # noqa: documentation
+    assert not any(name.endswith(('market_stress_v1.py', 'recovery_evidence_v1.py', 'terminal_dust.py')) for name, _ in rows)
+    # The signed-fee and native candle-ownership changes are recorded in
+    # docs/controllers/modular_spot/RELEASE_AUDIT_20261003.md, and the V2 runtime
+    # root-cause changes in RELEASE_AUDIT_20261004.md: the same 67-file closure,
+    # with native_composition.py and the candle_data, candle_stream and
+    # data_reader components changed; crash and V3-only dust modules remain
+    # outside it. Historical bindings are not rewritten.
+    assert source_digest(source_root(), source_files()) == 'f8fff1774cb401f06097bf55aee534d066f142db68eb209d13a88d8612d2308a'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

@@ -4,12 +4,23 @@ from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_l
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
+
+
+@pytest.fixture(autouse=True)
+def _complete_native_history():
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = []
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        yield recorder
 
 
 def controller():
@@ -21,7 +32,7 @@ def controller():
         min_price_increment=D('.01'), min_order_size=D('.001'),
         min_base_amount_increment=D('.001'), min_notional_size=D('1'), min_order_value=D('1'))
     provider.quantize_order_amount.side_effect = lambda connector, pair, amount: amount
-    config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT',
+    config = OKRSIControllerConfig(id='main', connector_name='okx', trading_pair='ETH-USDT',
                                    use_adaptive_trailing=False, strict_hmm_mode=False,
                                    usd_per_entry=D('25'), max_total_position_usd=D('100'))
     result = OKRSIController(config, provider, asyncio.Queue())
@@ -31,13 +42,13 @@ def controller():
     return result
 
 
-def _ledger_row(*, executor_id, client_order_id='held', connector_name='okx',
+def _ledger_row(*, executor_id, client_order_id=None, connector_name='okx',
                 trading_pair='ETH-USDT', position_side=None,
                 executed_amount_base='.4', executed_amount_quote='40',
                 cumulative_fee_paid_quote='0'):
     return SimpleNamespace(
         executor_id=executor_id,
-        client_order_id=client_order_id,
+        client_order_id=client_order_id or f'held-{executor_id}',
         connector_name=connector_name,
         trading_pair=trading_pair,
         position_side=position_side,
@@ -50,6 +61,7 @@ def _ledger_row(*, executor_id, client_order_id='held', connector_name='okx',
 def _use_hold_ledger(rows):
     recorder = MagicMock()
     recorder.get_position_hold_ledger_entries_by_controller.return_value = list(rows)
+    recorder.get_executors_by_controller.return_value = []
     return patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder)
 
 
@@ -162,7 +174,7 @@ def _hold_transferring(*, leftover=D('.4')):
 def _hold_done(*, leftover=D('.4'), executor_id='hold-done', close_timestamp=1000.0):
     transferring = make_executor()
     transferring.config.amount = leftover
-    transferring._open_order = tracked('held', TradeType.BUY, str(leftover), OrderState.FILLED)
+    transferring._open_order = tracked(f'held-{executor_id}', TradeType.BUY, str(leftover), OrderState.FILLED)
     transferring._status = RunnableStatus.TERMINATED
     transferring.close_type = CloseType.POSITION_HOLD
     transferring.close_timestamp = close_timestamp

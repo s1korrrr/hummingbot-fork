@@ -89,6 +89,8 @@ def test_tick_continues_executor_decisions_when_chart_persistence_fails():
     owner = SimpleNamespace(
         controllers={'a': object()}, update_executors_info=Mock(),
         _unattended_restart_hold=False,
+        _persist_controller_configs_if_safe=Mock(),
+        _start_controllers_if_safe=Mock(),
         _sync_runtime_state_to_db_if_due=Mock(), _write_chart_snapshots_if_due=Mock(side_effect=RuntimeError('disk full')),
         _write_runtime_status_snapshot_if_due=Mock(), update_controllers_configs=Mock(),
         market_data_provider=SimpleNamespace(ready=True), _is_stop_triggered=False,
@@ -96,6 +98,7 @@ def test_tick_continues_executor_decisions_when_chart_persistence_fails():
         executor_orchestrator=SimpleNamespace(resume_planned_positions_if_ready=Mock(return_value=True),
                                               execute_action=Mock()), logger=Mock())
     StrategyV2Base.on_tick(owner)
+    owner._start_controllers_if_safe.assert_called_once_with()
     owner.executor_orchestrator.execute_action.assert_called_once_with('risk-action')
     owner.logger().exception.assert_called_once()
 

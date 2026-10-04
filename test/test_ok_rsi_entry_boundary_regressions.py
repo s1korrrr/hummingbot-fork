@@ -31,6 +31,15 @@ from hummingbot.strategy_v2.executors.executor_orchestrator import PositionHold
 from hummingbot.strategy_v2.models.base import RunnableStatus
 
 
+@pytest.fixture(autouse=True)
+def _complete_native_history():
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = []
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        yield recorder
+
+
 def test_missing_receipt_deadline_keeps_submitted_identity():
     executor, _, _ = make_executor()
     executor.control_open_order()
@@ -180,7 +189,7 @@ def _capital_controller():
         min_base_amount_increment=Decimal(".001"), min_notional_size=Decimal("1"), min_order_value=Decimal("1"))
     provider.quantize_order_amount.side_effect = lambda connector, pair, amount: amount
     config = OKRSIControllerConfig(
-        id="controller", connector_name="okx", trading_pair="ETH-USDC",
+        id="ok-rsi", connector_name="okx", trading_pair="ETH-USDC",
         use_adaptive_trailing=False, strict_hmm_mode=False,
         usd_per_entry=Decimal("25"), max_total_position_usd=Decimal("100"),
         max_executors_per_side=6,

@@ -351,11 +351,13 @@ class StrategyV2Base(StrategyPyBase):
         self._controllers_started = False
         self._last_controller_reload_error: Optional[str] = None
         self._controller_restart_required: Dict[str, str] = {}
+        self._controller_configs_pending_persistence: List[ControllerConfigBase] = []
         self._last_runtime_db_sync_ts: float = 0
         self._last_runtime_status_snapshot_ts: float = 0
         self._last_chart_snapshot_prune_ts: float = 0
         self.mqtt_enabled = False
         self._pub: Optional[ETopicPublisher] = None
+        self._controller_start_requested = False
 
         self.actions_queue = asyncio.Queue()
         self.listen_to_executor_actions_task: asyncio.Task = asyncio.create_task(self.listen_to_executor_actions())
@@ -370,6 +372,7 @@ class StrategyV2Base(StrategyPyBase):
             strategy=self,
             initial_positions_by_controller=self._collect_initial_positions()
         )
+        self._persist_controller_configs_if_safe()
 
     # -------------------------------------------------------------------------
     # Shared methods (simple + V2 modes)
@@ -405,7 +408,9 @@ class StrategyV2Base(StrategyPyBase):
                 return
             if not self.executor_orchestrator.resume_planned_positions_if_ready():
                 return
+            self._persist_controller_configs_if_safe()
             self.update_executors_info()
+            self._start_controllers_if_safe()
             self._sync_runtime_state_to_db_if_due()
             try:
                 self._write_chart_snapshots_if_due()
@@ -426,6 +431,7 @@ class StrategyV2Base(StrategyPyBase):
         """
         self._is_stop_triggered = True
         self._controllers_started = False
+        self._controller_start_requested = False
 
         # Stop controllers FIRST to prevent new executor actions
         for controller in self.controllers.values():
@@ -1005,7 +1011,7 @@ class StrategyV2Base(StrategyPyBase):
         balances = self._get_balances_snapshot()
         focus_queue = [
             {
-                "pair": entry["summary"].get("pair", entry["controller_id"]),
+                "pair": entry["summary"].get("pair"),
                 "focus": entry["summary"].get("focus", ""),
             }
             for entry in controller_entries
@@ -1020,7 +1026,7 @@ class StrategyV2Base(StrategyPyBase):
 
         for entry in controller_entries:
             summary = entry["summary"]
-            pair = summary.get("pair", entry["controller_id"])
+            pair = summary.get("pair")
             controllers.append(
                 {
                     **controller_observation(entry),
@@ -1040,10 +1046,13 @@ class StrategyV2Base(StrategyPyBase):
             for executor in entry["executors"]:
                 if executor.is_done:
                     continue
+                executor_pair = getattr(getattr(executor, "config", None), "trading_pair", None)
+                if not isinstance(executor_pair, str) or not executor_pair.strip():
+                    executor_pair = None
                 side = self._compact_side_label(executor.side or getattr(executor.config, "side", None))
                 lifecycle_row = {
                     **executor_observation(executor, entry["controller_id"]),
-                    "pair": pair,
+                    "pair": executor_pair,
                     "side": side.lower() if side else None,
                     "executor_type": self._compact_executor_type(executor.type),
                     "status": (self._compact_enum_label(executor.status) or "unknown").lower(),
@@ -1058,10 +1067,13 @@ class StrategyV2Base(StrategyPyBase):
                     active_executors.append(lifecycle_row)
 
             for position in entry["positions"]:
+                position_pair = getattr(position, "trading_pair", None)
+                if not isinstance(position_pair, str) or not position_pair.strip():
+                    position_pair = None
                 positions_held.append(
                     {
                         "controller_id": entry["controller_id"],
-                        "pair": pair,
+                        "pair": position_pair,
                         "side": getattr(position.side, "name", str(position.side)).lower(),
                         "amount_base": float(self._safe_decimal(position.amount)),
                         "value_quote": float(self._safe_decimal(position.amount) * self._safe_decimal(position.breakeven_price)),
@@ -1317,10 +1329,10 @@ class StrategyV2Base(StrategyPyBase):
             self.mqtt_enabled = True
             self._pub = ETopicPublisher("performance", use_bot_prefix=True)
 
-        # Start controllers
-        for controller in self.controllers.values():
-            controller.start()
-        self._controllers_started = True
+        # A prepared native recovery must claim its sealed ownership before a
+        # controller task can write durable per-candle decisions or enqueue work.
+        self._controller_start_requested = True
+        self._start_controllers_if_safe()
 
     def apply_initial_setting(self):
         """
@@ -1352,9 +1364,62 @@ class StrategyV2Base(StrategyPyBase):
         Initialize the controllers based on the provided configuration.
         """
         controllers_configs = self.config.load_controller_configs()
+        self._validate_direct_ok_rsi_candle_policy(controllers_configs)
         for controller_config in controllers_configs:
             self.add_controller(controller_config)
-            MarketsRecorder.get_instance().store_controller_config(controller_config)
+            self._controller_configs_pending_persistence.append(controller_config)
+        self._persist_controller_configs_if_safe()
+
+    def _validate_direct_ok_rsi_candle_policy(self, controllers_configs, *, compare_running=False):
+        """Preflight the process-wide OKX feed route before creating any direct OK RSI feed."""
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+        from hummingbot.strategy_v2.components.candle_transport import validate_origin
+
+        def source(config):
+            if config.data is None:
+                return None
+            return validate_origin(config.data.origin), config.data.token_file
+
+        direct = [config for config in controllers_configs if type(config) is OKRSIControllerConfig]
+        sources = {source(config) for config in direct}
+        if len(sources) > 1:
+            raise ValueError("direct OK RSI candle policy must be uniform across controllers")
+        if compare_running and direct:
+            running = [controller.config for controller in self.controllers.values()
+                       if type(getattr(controller, "config", None)) is OKRSIControllerConfig]
+            if running and any(source(config) not in sources for config in running):
+                raise ValueError("direct OK RSI candle policy change requires a restart")
+
+    def _persist_controller_configs_if_safe(self):
+        """Persist controller rows only after startup ownership transfer is safe."""
+        if not self._controller_configs_pending_persistence:
+            return
+        orchestrator = getattr(self, "executor_orchestrator", None)
+        if orchestrator is None or getattr(orchestrator, "_planned_resume_pending", False) is True:
+            return
+        if (getattr(orchestrator, "_resume_preflight_failed", False) is True
+                or getattr(orchestrator, "_planned_resume_failure", None)):
+            return
+        recorder = MarketsRecorder.get_instance()
+        for controller_config in self._controller_configs_pending_persistence:
+            recorder.store_controller_config(controller_config)
+        self._controller_configs_pending_persistence.clear()
+
+    def _start_controllers_if_safe(self):
+        """Start controller loops only after any prepared owner claim succeeds."""
+        if not self._controller_start_requested or self._controllers_started or self._unattended_restart_hold:
+            return
+        orchestrator = getattr(self, "executor_orchestrator", None)
+        if orchestrator is None:
+            return
+        if (getattr(orchestrator, "_planned_resume_pending", False) is True
+                or getattr(orchestrator, "_resume_preflight_failed", False) is True
+                or getattr(orchestrator, "_planned_resume_failure", None)
+                or getattr(orchestrator, "_claimed_resume_unresolved", None)):
+            return
+        for controller in self.controllers.values():
+            controller.start()
+        self._controllers_started = True
 
     def add_controller(self, config: ControllerConfigBase):
         try:
@@ -1418,6 +1483,7 @@ class StrategyV2Base(StrategyPyBase):
             self._last_config_update_ts = self.current_timestamp
             try:
                 controllers_configs = self.config.load_controller_configs(reload_changed_modules=True)
+                self._validate_direct_ok_rsi_candle_policy(controllers_configs, compare_running=True)
                 for controller_config in controllers_configs:
                     if controller_config.id in self._controller_restart_required:
                         continue
@@ -1597,7 +1663,9 @@ class StrategyV2Base(StrategyPyBase):
             self.logger().error(f"Error building status summary for controller {controller_id}: {e}", exc_info=True)
 
         config = getattr(controller, "config", None)
-        trading_pair = summary.get("pair") or getattr(config, "trading_pair", None) or controller_id
+        trading_pair = summary.get("pair") or getattr(config, "trading_pair", None)
+        if not isinstance(trading_pair, str) or not trading_pair.strip():
+            trading_pair = None
         normalized_summary = {
             "controller_id": controller_id,
             "pair": trading_pair,

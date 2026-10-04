@@ -78,6 +78,7 @@ class V2WithControllers(StrategyV2Base):
         self._last_risk_state = None
         self._risk_reconciliation_error: Optional[str] = None
         self._daily_entry_risk = None
+        self._entry_risk_enrollment = None
         if self._risk_persistence_enabled:
             try:
                 self._validate_modular_loss_limits()
@@ -89,8 +90,20 @@ class V2WithControllers(StrategyV2Base):
                     if recorder.get_all_executors():
                         raise RuntimeError('Existing execution history has no durable risk state; reconcile before restart')
                 else:
-                    if state.get('version') != 1 or set(state['controllers']) != set(self.controllers):
+                    if (type(state.get('version')) is not int or state['version'] not in (1, 2)
+                            or set(state['controllers']) != set(self.controllers)):
                         raise ValueError('Risk state version or controller scope mismatch')
+                    if state.get('version') == 2:
+                        from hummingbot.strategy_v2.models.entry_risk_enrollment import EntryRiskEnrollment
+                        self._entry_risk_enrollment = EntryRiskEnrollment.model_validate(state.get('entry_risk_enrollment'))
+                        if self._entry_risk_enrollment.limit_quote != self.config.max_daily_loss_quote:
+                            raise ValueError('Approved enrollment daily limit differs from configuration')
+                        if (not self._entry_risk_enrollment.historical_peaks_available
+                                and (self.config.max_global_drawdown_quote is not None
+                                     or self.config.max_controller_drawdown_quote is not None)):
+                            raise ValueError('Historical drawdown limits require historical peak reconciliation')
+                    elif state.get('entry_risk_enrollment') is not None:
+                        raise ValueError('Entry risk enrollment requires risk state version 2')
                     if (set(state['max_pnl_by_controller']) != set(self.controllers)
                             or set(state['operator_paused']) != set(self.controllers)
                             or not set(state['drawdown_exited_controllers']).issubset(self.controllers)
@@ -98,10 +111,21 @@ class V2WithControllers(StrategyV2Base):
                             or any(type(paused) is not bool for paused in state['operator_paused'].values())):
                         raise ValueError('Incomplete or invalid durable risk state')
                     self._operator_watermarks = self._validate_operator_watermarks(state.get('operator_watermarks', {}))
-                    self.max_global_pnl = Decimal(state['max_global_pnl'])
-                    self.max_pnl_by_controller = {key: Decimal(value) for key, value in state['max_pnl_by_controller'].items()}
-                    if not self.max_global_pnl.is_finite() or any(not x.is_finite() for x in self.max_pnl_by_controller.values()):
-                        raise ValueError('Non-finite persisted risk peak')
+                    pending = self._entry_risk_enrollment is not None and self._entry_risk_enrollment.pending
+                    if pending and (state.get('daily_entry_risk') is not None
+                                    or not all(state['operator_paused'].values())):
+                        raise ValueError('Pending enrollment requires an entry fence and no prior daily baseline')
+                    if pending and not self._entry_risk_enrollment.historical_peaks_available:
+                        if (state['max_global_pnl'] is not None
+                                or any(value is not None for value in state['max_pnl_by_controller'].values())):
+                            raise ValueError('Unrecorded historical peaks must remain explicitly unavailable')
+                        self.max_global_pnl = None
+                        self.max_pnl_by_controller = dict(state['max_pnl_by_controller'])
+                    else:
+                        self.max_global_pnl = Decimal(state['max_global_pnl'])
+                        self.max_pnl_by_controller = {key: Decimal(value) for key, value in state['max_pnl_by_controller'].items()}
+                        if not self.max_global_pnl.is_finite() or any(not x.is_finite() for x in self.max_pnl_by_controller.values()):
+                            raise ValueError('Non-finite persisted risk peak')
                     if self.config.max_daily_loss_quote is None and state.get('daily_entry_risk') is not None:
                         raise ValueError('Persisted daily loss limit removed; explicit reconciliation required')
                     self.drawdown_exited_controllers = state['drawdown_exited_controllers']
@@ -110,11 +134,14 @@ class V2WithControllers(StrategyV2Base):
                         self.controllers[cid].set_operator_entry_pause(paused, reason='restored', scope='bot')
                     for cid in self.drawdown_exited_controllers:
                         self.controllers[cid].stop()
-                if self.config.max_daily_loss_quote is not None:
+                if self.config.max_daily_loss_quote is not None and not (
+                        self._entry_risk_enrollment is not None and self._entry_risk_enrollment.pending):
                     from hummingbot.strategy_v2.models.daily_entry_risk import DailyEntryRisk
                     self._daily_entry_risk = (DailyEntryRisk.new(self.config.max_daily_loss_quote, time.time())
                                               if state is None else DailyEntryRisk.restore(
                                                   state.get('daily_entry_risk'), self.config.max_daily_loss_quote))
+                    if self._entry_risk_enrollment is not None:
+                        self._entry_risk_enrollment.validate_daily_state(self._daily_entry_risk)
                     self._apply_daily_entry_pause()
                 self._persist_risk_state()
             except Exception as error:
@@ -128,9 +155,11 @@ class V2WithControllers(StrategyV2Base):
         if getattr(self, '_risk_reconciliation_error', None) is not None:
             # Preserve missing/malformed evidence; defaults cannot reconstruct account peaks.
             return
-        state = {'version': 1, 'controllers': sorted(self.controllers),
-                 'max_global_pnl': str(self.max_global_pnl),
-                 'max_pnl_by_controller': {cid: str(self.max_pnl_by_controller.get(cid, Decimal('0'))) for cid in self.controllers},
+        enrollment = getattr(self, '_entry_risk_enrollment', None)
+        state = {'version': 2 if enrollment is not None else 1, 'controllers': sorted(self.controllers),
+                 'max_global_pnl': None if self.max_global_pnl is None else str(self.max_global_pnl),
+                 'max_pnl_by_controller': {cid: (None if self.max_pnl_by_controller.get(cid, Decimal('0')) is None else
+                                                 str(self.max_pnl_by_controller.get(cid, Decimal('0')))) for cid in self.controllers},
                  'drawdown_exited_controllers': sorted(set(self.drawdown_exited_controllers)),
                  'stopped': self._is_stop_triggered,
                  'operator_paused': {cid: self._operator_paused(c) for cid, c in self.controllers.items()}}
@@ -138,6 +167,8 @@ class V2WithControllers(StrategyV2Base):
             state['operator_watermarks'] = self._operator_watermarks.copy()
         if self._daily_entry_risk is not None:
             state['daily_entry_risk'] = self._daily_entry_risk.snapshot()
+        if enrollment is not None:
+            state['entry_risk_enrollment'] = enrollment.snapshot()
         if state != self._last_risk_state or operator_receipts:
             recorder = MarketsRecorder.get_instance()
             if operator_receipts:
@@ -174,6 +205,8 @@ class V2WithControllers(StrategyV2Base):
                     or any(self.controllers.get(owner.config.id) is not owner for owner in self._funding_scope_owners)):
                 raise ValueError('Funded controller topology changed; restart and reconcile explicitly')
             self.process_operator_events()
+            if not self._ownership_recovery_complete():
+                return False
             self.check_manual_kill_switch()
             self.control_max_drawdown()
             self._observe_daily_entry_risk()
@@ -198,22 +231,39 @@ class V2WithControllers(StrategyV2Base):
             return f"EXECUTION BLOCKED: risk reconciliation required: {error}\n\n{status}"
         if self._is_stop_triggered:
             return f"EXECUTION BLOCKED: strategy stop is latched; verify durable risk state before restart.\n\n{status}"
+        enrollment = getattr(self, '_entry_risk_enrollment', None)
+        if enrollment is not None and enrollment.pending:
+            return f"ENTRIES PAUSED: daily loss enrollment awaits a fresh complete native PnL report.\n\n{status}"
         return status
 
     def on_tick(self):
         super().on_tick()
         self.process_operator_events()
-        # The parent defers report initialization until planned ownership is restored.
-        if not self._is_stop_triggered and not self.executor_orchestrator._planned_resume_pending:
-            self.check_manual_kill_switch()
-            self.control_max_drawdown()
-            self._observe_daily_entry_risk()
-            self.send_performance_report()
-        try:
-            self._persist_risk_state()
-        except Exception:
-            self._is_stop_triggered = True
-            self.logger().exception('Unable to persist risk state; new execution blocked')
+        # Risk marks and their durable projection must not advance against an
+        # unclaimed startup snapshot. The entry fence and operator events remain
+        # observable while recovery is pending or unresolved.
+        if self._ownership_recovery_complete():
+            if not self._is_stop_triggered:
+                self.check_manual_kill_switch()
+                self.control_max_drawdown()
+                self._observe_daily_entry_risk()
+                self.send_performance_report()
+            try:
+                self._persist_risk_state()
+            except Exception:
+                self._is_stop_triggered = True
+                self.logger().exception('Unable to persist risk state; new execution blocked')
+
+    def _ownership_recovery_complete(self):
+        orchestrator = getattr(self, 'executor_orchestrator', None)
+        if orchestrator is None or getattr(self, '_unattended_restart_hold', False):
+            return False
+        return not any((
+            getattr(orchestrator, '_planned_resume_pending', False),
+            getattr(orchestrator, '_resume_preflight_failed', False),
+            getattr(orchestrator, '_planned_resume_failure', None),
+            getattr(orchestrator, '_claimed_resume_unresolved', None),
+        ))
 
     def _apply_daily_entry_pause(self):
         if self._daily_entry_risk is not None and self._daily_entry_risk.paused:
@@ -222,17 +272,39 @@ class V2WithControllers(StrategyV2Base):
                     controller.set_operator_entry_pause(True, reason='daily-loss-limit', scope='global')
 
     def _observe_daily_entry_risk(self):
-        if self._daily_entry_risk is None:
+        enrollment = getattr(self, '_entry_risk_enrollment', None)
+        pending = enrollment is not None and enrollment.pending
+        if self._daily_entry_risk is None and not pending:
             return
-        values = [self._drawdown_pnl(cid) for cid in self.controllers]
-        if any(value is None for value in values):
+        expected_limit = enrollment.limit_quote if pending else self._daily_entry_risk.limit_quote
+        if self.config.max_daily_loss_quote != expected_limit:
+            raise ValueError('Daily loss limit changed; explicit reconciliation required')
+        if pending:
+            if not all(self._operator_paused(c) for c in self.controllers.values()):
+                raise ValueError('Entry fence removed before native risk enrollment')
+            if getattr(self, '_controller_reports_valid', True) is False:
+                return  # Startup is still collecting reports; keep the durable entry fence.
+        values = {cid: self._drawdown_pnl(cid) for cid in self.controllers}
+        if any(value is None for value in values.values()):
             raise ValueError('Native PnL unavailable for daily entry risk')
-        self._daily_entry_risk.observe(time.time(), sum(values, Decimal('0')))
+        pnl = sum(values.values(), Decimal('0'))
+        if pending:
+            risk, completed = enrollment.start(time.time(), pnl)
+            if not enrollment.historical_peaks_available:
+                self.max_global_pnl = pnl
+                self.max_pnl_by_controller = values.copy()
+            self._daily_entry_risk, self._entry_risk_enrollment = risk, completed
+            # Establish the native baseline durably before any new create action.
+            self._persist_risk_state()
+        else:
+            self._daily_entry_risk.observe(time.time(), pnl)
         self._apply_daily_entry_pause()
 
     def _build_runtime_status_snapshot(self):
         result = super()._build_runtime_status_snapshot()
         result['daily_entry_risk'] = self._daily_entry_risk.snapshot() if self._daily_entry_risk is not None else None
+        enrollment = getattr(self, '_entry_risk_enrollment', None)
+        result['entry_risk_enrollment'] = enrollment.snapshot() if enrollment is not None else None
         return result
 
     def _validate_operator_watermarks(self, watermarks):
@@ -251,6 +323,10 @@ class V2WithControllers(StrategyV2Base):
         if not native:
             return True
         if getattr(self, '_risk_reconciliation_error', None):
+            return False
+        enrollment = getattr(self, '_entry_risk_enrollment', None)
+        if (enrollment is not None and enrollment.pending
+                and payload.get('action') in ('global_resume_entries', 'bot_resume_entries')):
             return False
         timestamp, command_id = payload.get('requested_at'), payload.get('command_id')
         bot_id = HummingbotApplication.main_application().instance_id
@@ -299,6 +375,10 @@ class V2WithControllers(StrategyV2Base):
                 continue
             if not self._native_operator_command_is_fresh(payload, target_controllers):
                 self.logger().warning('Rejected stale, duplicate or incorrectly addressed native operator command')
+                continue
+            if (action in {'global_resume_entries', 'bot_resume_entries'}
+                    and not self._ownership_recovery_complete()):
+                self.logger().warning('Entry resume rejected until native ownership recovery is complete')
                 continue
             if action in {'global_resume_entries', 'bot_resume_entries'} and self._daily_entry_risk is not None:
                 self._observe_daily_entry_risk()
@@ -359,6 +439,11 @@ class V2WithControllers(StrategyV2Base):
                     raise RuntimeError(self._risk_reconciliation_error) from error
 
     def _validate_modular_loss_limits(self):
+        enrollment = getattr(self, '_entry_risk_enrollment', None)
+        if (enrollment is not None and not enrollment.historical_peaks_available
+                and (self.config.max_global_drawdown_quote is not None
+                     or self.config.max_controller_drawdown_quote is not None)):
+            raise ValueError('Historical drawdown limits require historical peak reconciliation')
         if not any(is_modular_policy(c.config) for c in self.controllers.values()):
             return
         if any(isinstance(value, bool) for value in (

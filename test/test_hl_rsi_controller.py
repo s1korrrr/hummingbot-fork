@@ -5,7 +5,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import yaml
 
@@ -13,6 +13,10 @@ from hummingbot.core.data_type.common import PriceType, TradeType
 
 ROOT_PATH = Path(__file__).resolve().parent.parent
 ROOT_PATH_STR = str(ROOT_PATH)
+# The Hyperliquid config pack is operator-local: conf/*.yml is gitignored and the
+# MQTT compose is not part of this tree. Its contract tests run where it exists.
+LOCAL_CONFIG_PACK = (ROOT_PATH / "conf" / "scripts" / "hl_rsi.yml").is_file()
+LOCAL_MQTT_COMPOSE = (ROOT_PATH / "docker-compose.mqtt.yml").is_file()
 
 
 def ensure_local_controller_imports():
@@ -93,9 +97,17 @@ class HLRSIControllerTest(unittest.TestCase):
             )
 
     def test_sell_only_blocks_buy_signal_at_executor_boundary(self):
+        from hummingbot.connector.markets_recorder import MarketsRecorder
+
+        # Explicit complete empty native history, so exposure is finite and the
+        # trade-mode gate (not the fail-closed exposure gate) is what refuses BUY.
+        recorder = MagicMock()
+        recorder.get_executors_by_controller.return_value = []
+        recorder.get_position_hold_ledger_entries_by_controller.return_value = []
         controller = self._controller(trade_mode="sell_only", base_balance=Decimal("2"))
 
-        self.assertFalse(controller.can_create_executor(1))
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            self.assertFalse(controller.can_create_executor(1))
         self.assertEqual(controller._last_gate_reason[TradeType.BUY], "trade_mode_sell_only")
 
     def test_sell_only_refuses_direct_buy_executor_construction(self):
@@ -125,6 +137,7 @@ class HLRSIControllerTest(unittest.TestCase):
         self.assertEqual(controller._get_sellable_inventory_amount(), Decimal("0"))
         self.assertFalse(controller._has_buy_inventory())
 
+    @unittest.skipUnless(LOCAL_CONFIG_PACK, "local Hyperliquid config pack absent")
     def test_local_config_pack_loads_through_strategy_v2_discovery(self):
         from scripts.v2_with_controllers import V2WithControllersConfig
 
@@ -148,6 +161,7 @@ class HLRSIControllerTest(unittest.TestCase):
         self.assertTrue(all(not config.manual_kill_switch for config in loaded))
         self.assertTrue(all(config.usd_per_entry == Decimal("25") for config in loaded))
 
+    @unittest.skipUnless(LOCAL_CONFIG_PACK, "local Hyperliquid config pack absent")
     def test_buy_sell_configs_preserve_matching_rsi_v5_profile_parameters(self):
         identity_keys = {
             "controller_name",
@@ -202,6 +216,7 @@ class HLRSIControllerTest(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertTrue(actions[0].keep_position)
 
+    @unittest.skipUnless(LOCAL_MQTT_COMPOSE, "local MQTT compose absent")
     def test_minimal_mqtt_compose_exposes_only_loopback_broker_port(self):
         payload = yaml.safe_load((ROOT_PATH / "docker-compose.mqtt.yml").read_text())
 

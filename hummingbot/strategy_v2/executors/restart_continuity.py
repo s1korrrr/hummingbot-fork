@@ -6,12 +6,17 @@ went away. The executor row is the durable record: a planned restart suspends
 the executor (row stays RUNNING, ``restart_suspended`` marker), a crash leaves
 the last checkpoint (trailing moves are checkpointed synchronously).
 
-At boot, every unfinished row with complete order snapshots is rebuilt into the
-original executor. Orders that were not terminal in the snapshot are handed back
-to the connector's order tracker so venue status/fill polling reconciles them;
-the executor then shares the tracker's live ``InFlightOrder`` object.
+At boot, unfinished RUNNING rows with complete order snapshots are rebuilt into
+the original executor. Orders that were not terminal in the snapshot are handed
+back to the connector's order tracker so venue status/fill polling reconciles
+them; the executor then shares the tracker's live ``InFlightOrder`` object.
 
 Rows that cannot be rebuilt are reported, never used to block order flow.
+
+A planned suspension keeps its durable row RUNNING while the control loop exits.
+An older row already flipped to TERMINATED without a close type remains an
+unresolved ownership obligation. It can resume only through the separately
+sealed planned-position manifest, not a marker-only continuity plan.
 """
 import copy
 from dataclasses import dataclass, field
@@ -105,9 +110,9 @@ def continuity_plan(info) -> Optional[ContinuityPlan]:
     if info is None or getattr(info, "type", None) != "position_executor":
         return None
     status = _status(info.status)
+    custom = dict(info.custom_info or {})
     if status not in (RunnableStatus.RUNNING, RunnableStatus.SHUTTING_DOWN):
         return None
-    custom = dict(info.custom_info or {})
     snapshots = custom.get("execution_order_snapshots")
     if not isinstance(snapshots, list):
         return None
@@ -154,6 +159,17 @@ def continuity_plan(info) -> Optional[ContinuityPlan]:
         # A terminal zero-fill entry owns nothing; the executor ends normally on start.
         plan.notes.append("terminal_zero_fill_entry")
     return plan
+
+
+def is_terminal_unresolved(info) -> bool:
+    """A terminal position without a proven close remains unresolved, even if its marker is missing."""
+    if info is None or getattr(info, "type", None) != "position_executor":
+        return False
+    try:
+        status = _status(info.status)
+    except (ValueError, TypeError):
+        return False
+    return status == RunnableStatus.TERMINATED and _close_type(info.close_type) is None
 
 
 def is_continuity_candidate(info) -> bool:

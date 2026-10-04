@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
+from hummingbot.client.config.security import Security
 from hummingbot.client.native_lifecycle import ShutdownResult
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import PositionAction, PositionMode, PriceType, TradeType
@@ -18,12 +19,18 @@ from hummingbot.model.position import Position
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount, base_fee_quote_amount
-from hummingbot.strategy_v2.executors.planned_position_resume import STARTUP_SEALED_RESTORE, claim, pending_manifest
+from hummingbot.strategy_v2.executors.planned_position_resume import (
+    STARTUP_SEALED_RESTORE,
+    claim,
+    pending_manifest,
+    verify_fleet_ownership,
+)
 from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
 from hummingbot.strategy_v2.executors.restart_continuity import (
     RestartContinuityError,
     continuity_plan,
     is_continuity_candidate,
+    is_terminal_unresolved,
 )
 
 if TYPE_CHECKING:
@@ -329,7 +336,7 @@ class ExecutorOrchestrator:
         for executor in db_executors:
             controller_id = executor.controller_id
             if controller_id not in self.strategy.controllers:
-                if not executor.is_done:
+                if not executor.is_done or is_terminal_unresolved(executor):
                     self._record_unfinished_claim(controller_id, executor.id, executor.config,
                                                   (executor.custom_info or {}).get('planned_position_resume'))
                     self.recovery_required.setdefault(controller_id, []).append(executor.id)
@@ -351,7 +358,10 @@ class ExecutorOrchestrator:
                     self._non_hold_order_ids.update(self._owned_order_keys(executor))
                     resumed.add(executor.id)
                     continue
-            if not executor.is_done and self._executor_restore is None and self._restart_continuity:
+            # A terminal suspension remains unresolved unless a sealed manifest claimed it.
+            terminal_unresolved = is_terminal_unresolved(executor)
+            unfinished = not executor.is_done or terminal_unresolved
+            if unfinished and not terminal_unresolved and self._executor_restore is None and self._restart_continuity:
                 restored = self._restore_continuity_executor(controller_id, executor)
                 if restored is not None:
                     keys = self._owned_order_keys(executor)
@@ -361,7 +371,7 @@ class ExecutorOrchestrator:
                     resumed.add(executor.id)
                     self._restored_pending_bind = restored_executors
                     continue
-            if not executor.is_done:
+            if unfinished:
                 self._record_unfinished_claim(controller_id, executor.id, executor.config,
                                               (executor.custom_info or {}).get('planned_position_resume'))
                 # A position executor restart continuity could not rebuild: its order
@@ -412,6 +422,8 @@ class ExecutorOrchestrator:
                 self._wallet_sale_position_summaries.append(position)
                 continue  # Validate this historical synthetic summary against exact receipts before any report.
             if not self._is_valid_stored_position(position):
+                if self._is_closed_stored_position(position):
+                    continue  # A fully exited summary row holds nothing; not a corrupt record.
                 self.logger().warning(
                     f"Skipping invalid stored position | controller={controller_id} "
                     f"pair={position.trading_pair} side={position.side} amount={position.amount} "
@@ -478,8 +490,9 @@ class ExecutorOrchestrator:
         infos = getter() if callable(getter) else None
         if not isinstance(infos, (list, tuple)):
             return False
-        return any(not info.is_done and info.controller_id in self.strategy.controllers
-                   and is_continuity_candidate(info) for info in infos)
+        return any(info.controller_id in self.strategy.controllers
+                   and (is_terminal_unresolved(info) or (not info.is_done and is_continuity_candidate(info)))
+                   for info in infos)
 
     def _continuity_executor_class(self, controller, config):
         # A controller whose tranches run a PositionExecutor subclass names it; otherwise a
@@ -706,6 +719,47 @@ class ExecutorOrchestrator:
             executor = executor_class(self.strategy, config, self.executors_update_interval, self.executors_max_retries)
             executor.hydrate_planned_position(position, manifest["id"])
             instances.append(executor)
+        terminal_resume = any(position.get("resume_kind") == "restart_suspended_terminal_v1"
+                              for position in manifest["positions"])
+        if terminal_resume:
+            evidence = manifest.get("evidence", {})
+            fleet = evidence.get("fleet_ownership")
+            verify_fleet_ownership(fleet, Security.api_keys("okx"), evidence)
+            if evidence.get("reconciliation", {}).get("fleet_ownership_authenticator") \
+                    != fleet["authenticator"]:
+                raise ValueError("Planned terminal resume fleet ownership authenticator binding changed")
+            coverage_rows = manifest.get("evidence", {}).get("reconciliation", {}).get("balance_coverage")
+            if not isinstance(coverage_rows, list) or not coverage_rows:
+                raise ValueError("Planned terminal resume has no verified all-owner balance coverage")
+            connector_names = {executor.config.connector_name for executor in instances}
+            if len(connector_names) != 1:
+                raise ValueError("Planned terminal resume spans unsupported connector ownership")
+            connector_name = next(iter(connector_names))
+            connector = self.strategy.connectors[connector_name]
+            covered_assets = set()
+            for row in coverage_rows:
+                asset = row.get("asset")
+                if not isinstance(asset, str) or not asset or asset in covered_assets:
+                    raise ValueError("Planned terminal resume balance coverage is ambiguous")
+                if row.get("covered") is not True:
+                    raise ValueError("Planned terminal resume owner balance proof is not covered")
+                covered_assets.add(asset)
+                try:
+                    owned = Decimal(str(row["owned_residual"]))
+                    cash_balance = Decimal(str(connector.get_balance(asset)))
+                    available_balance = Decimal(str(connector.get_available_balance(asset)))
+                except Exception as error:
+                    raise ValueError("Planned terminal resume current owner balance is unavailable") from error
+                if (not owned.is_finite() or owned < 0 or not cash_balance.is_finite()
+                        or not available_balance.is_finite() or cash_balance < owned
+                        or available_balance < owned):
+                    raise ValueError("Planned terminal resume balance does not cover all verified owner inventory")
+                key = connector_name, asset
+                if key in required_base and owned < required_base[key]:
+                    raise ValueError("Planned terminal resume coverage is below selected inventory")
+                required_base[key] = max(required_base.get(key, Decimal(0)), owned)
+            if not set(asset for connector, asset in required_base if connector == connector_name) <= covered_assets:
+                raise ValueError("Planned terminal resume balance coverage omits selected inventory")
         for (connector_name, base), amount in required_base.items():
             available = Decimal(str(self.strategy.connectors[connector_name].get_available_balance(base)))
             if not available.is_finite() or available < amount:
@@ -783,9 +837,17 @@ class ExecutorOrchestrator:
         try:
             amount = Decimal(str(position.amount))
             breakeven = Decimal(str(position.breakeven_price))
+            # NaN orders raise InvalidOperation; a bad row is skipped, never fatal to startup.
+            return amount > Decimal("0") and breakeven > Decimal("0")
         except Exception:
             return False
-        return amount > Decimal("0") and breakeven > Decimal("0")
+
+    @staticmethod
+    def _is_closed_stored_position(position: Position) -> bool:
+        try:
+            return Decimal(str(position.amount)) == Decimal("0")
+        except Exception:
+            return False
 
     def _current_position_scopes(self) -> Set[PositionScope]:
         position_scopes: Set[PositionScope] = set()
@@ -1084,6 +1146,9 @@ class ExecutorOrchestrator:
                 Decimal(str(trade_fill.trade_fee_in_quote)) != Decimal(int(quote_fee * 1000000)) / 1000000):
             raise ValueError("Native quote fee encoding conflicts with exact receipt")
         ExecutorOrchestrator._validate_reconciliation_fee(trade_fill.trade_fee)
+        source = getattr(trade_fill, 'native_receipt_source', 'order_filled_event_v1')
+        if source not in ('order_filled_event_v1', 'position_hold_order_snapshot_v1'):
+            raise ValueError('Unsupported native fill receipt provenance')
         executed_amount_quote = price * executed_amount_base
         client_order_id = f"{trade_fill.order_id}:{trade_fill.exchange_trade_id}"
         return {
@@ -1095,7 +1160,7 @@ class ExecutorOrchestrator:
             "executed_amount_base": executed_amount_base,
             "executed_amount_quote": executed_amount_quote,
             "cumulative_fee_paid_quote": quote_fee,
-            "precision": "event_exact",
+            "precision": "event_exact" if source == 'order_filled_event_v1' else source,
             "amount": executed_amount_base,
             "order_fills": {str(trade_fill.exchange_trade_id): {
                 "fill_base_amount": str(executed_amount_base), "fill_price": str(price),

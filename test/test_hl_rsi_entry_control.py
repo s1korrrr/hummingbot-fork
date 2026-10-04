@@ -1,15 +1,32 @@
 import asyncio
+import copy
 from decimal import Decimal as D
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from controllers.directional_trading.hl_rsi import HLRSIController, HLRSIControllerConfig
 from hummingbot.connector.markets_recorder import MarketsRecorder
-from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+
+
+@pytest.fixture(autouse=True)
+def _complete_native_history():
+    """Each synthetic controller starts with explicit complete empty native history."""
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = []
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        yield recorder
 
 
 def _provider(*, mid=D('100')):
@@ -121,6 +138,7 @@ def _buy_executor(
         custom['held_position_orders'] = list(held_position_orders)
     return SimpleNamespace(
         id=executor_id,
+        controller_id='hl-rsi-entry-control',
         is_active=is_active,
         is_done=is_done,
         close_timestamp=close_timestamp,
@@ -131,6 +149,12 @@ def _buy_executor(
         net_pnl_pct=net_pnl_pct,
         config=SimpleNamespace(
             type='position_executor',
+            id=executor_id,
+            controller_id='hl-rsi-entry-control',
+            connector_name='hyperliquid',
+            trading_pair='HYPE-USDC',
+            side=TradeType.BUY,
+            leverage=1,
             amount=amount,
             entry_price=entry_price,
             price=working_price,
@@ -160,6 +184,7 @@ def _ledger_row(*, executor_id, client_order_id='OID-1', connector_name='hyperli
 def _use_hold_ledger(rows):
     recorder = MagicMock()
     recorder.get_position_hold_ledger_entries_by_controller.return_value = list(rows)
+    recorder.get_executors_by_controller.return_value = []
     return patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder)
 
 
@@ -333,6 +358,513 @@ def test_terminated_leftover_owned_stays_reserved_until_hold_transfer():
     with _use_hold_ledger([_ledger_row(executor_id=transferred.id, client_order_id='OID-held')]):
         assert instance._executor_owned_base(transferred) == D('0')
         assert instance._get_total_position_value_usd() == D('40')
+
+
+def _completed_dust_exit():
+    instance = _controller()
+    executor = _buy_executor(
+        amount=D('1'), filled_base=D('0.9981'), remaining_base=D('0'),
+        is_active=False, is_done=True, accounting_owner='executor',
+        receipt_remaining=D('0'), entry_gross_base=D('1'),
+        lifecycle='managing_fill', terminal_exchange_timestamp=1000, close_timestamp=1000.0,
+        order_ids=['buy-1', 'sell-1'],
+    )
+    executor.close_type = CloseType.TRAILING_STOP
+    executor.custom_info['entry_acquisition'] = {'state': 'managing_fill'}
+    executor.custom_info['close_order_filled_amount_base'] = D('0.998')
+    executor.custom_info['close_quantity'] = {'quantity_increment': '0.001'}
+    executor.custom_info['execution_receipt'].update({
+        'entry_gross_quote': D('100'), 'exit_gross_base': D('0.998'),
+        'exit_gross_quote': D('99.8'), 'residual_dust_base': D('0.0001'),
+    })
+    executor.custom_info['execution_order_snapshots'] = [
+        {
+            'client_order_id': 'buy-1', 'exchange_order_id': 'exchange-buy-1',
+            'trading_pair': 'HYPE-USDC',
+            'trade_type': 'BUY', 'last_state': '5',
+            'executed_amount_base': '1', 'executed_amount_quote': '100',
+            'order_fills': {'buy-fill': {
+                'trade_id': 'buy-fill', 'client_order_id': 'buy-1',
+                'exchange_order_id': 'exchange-buy-1', 'trading_pair': 'HYPE-USDC',
+                'fill_base_amount': '1',
+                'fill_price': '100', 'fill_quote_amount': '100',
+                'fee': {'fee_type': 'AddedToCost', 'percent': '0', 'percent_token': 'HYPE',
+                        'flat_fees': [{'token': 'HYPE', 'amount': '0.0019'}]},
+            }},
+        },
+        {
+            'client_order_id': 'sell-1', 'exchange_order_id': 'exchange-sell-1',
+            'trading_pair': 'HYPE-USDC',
+            'trade_type': 'SELL', 'last_state': '5',
+            'executed_amount_base': '0.998', 'executed_amount_quote': '99.8',
+            'order_fills': {'sell-fill': {
+                'trade_id': 'sell-fill', 'client_order_id': 'sell-1',
+                'exchange_order_id': 'exchange-sell-1', 'trading_pair': 'HYPE-USDC',
+                'fill_base_amount': '0.998',
+                'fill_price': '100', 'fill_quote_amount': '99.8',
+                'fee': {'fee_type': 'DeductedFromReturns', 'percent': '0',
+                        'percent_token': 'USDC', 'flat_fees': []},
+            }},
+        },
+    ]
+    instance.executors_info = [executor]
+    return instance, executor
+
+
+def test_completed_trailing_exit_with_native_fee_dust_retains_owned_exposure():
+    instance, _ = _completed_dust_exit()
+
+    assert instance._get_total_position_value_usd() == D('0.01')
+    held, active, dust, free = instance._inventory_reconciliation_values(D('100'))
+    assert held == D('0')
+    assert active == D('0')
+    assert dust == D('0.01')
+    assert free == instance._get_base_balance() * D('100') - dust
+    assert instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] != 'exposure_unavailable'
+
+
+def test_standard_position_executor_closed_dust_keeps_buy_admission_and_exact_exposure():
+    instance = _controller()
+    config = PositionExecutorConfig(
+        id='standard-dust', controller_id=instance.config.id, timestamp=1,
+        connector_name=instance.config.connector_name, trading_pair=instance.config.trading_pair,
+        side=TradeType.BUY, amount=D('1'), entry_price=D('100'), entry_order_policy='single_attempt',
+    )
+    strategy = MagicMock()
+    strategy.current_timestamp = 1000
+    strategy.connectors = {config.connector_name: MagicMock()}
+    rules = instance.market_data_provider.get_trading_rules.return_value
+    with patch.object(PositionExecutor, 'get_trading_rules', return_value=rules):
+        native = PositionExecutor(strategy, config)
+    native.get_price = MagicMock(return_value=D('100'))
+    for attribute, side, amount, fee in (
+        ('_open_order', TradeType.BUY, D('1'), D('0.0019')),
+        ('_close_order', TradeType.SELL, D('0.998'), D('0')),
+    ):
+        order = InFlightOrder(
+            client_order_id=attribute, exchange_order_id=attribute, trading_pair=config.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=side, amount=amount, price=D('100'),
+            creation_timestamp=1, initial_state=OrderState.FILLED,
+        )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id=attribute, client_order_id=attribute, exchange_order_id=attribute,
+            trading_pair=config.trading_pair, fill_price=D('100'), fill_base_amount=amount,
+            fill_quote_amount=amount * 100, fill_timestamp=2,
+            fee=AddedToCostTradeFee(flat_fees=[TokenAmount('HYPE', fee)]),
+        ))
+        tracked = TrackedOrder(attribute)
+        tracked.order = order
+        setattr(native, attribute, tracked)
+    native._entry_lifecycle['state'] = 'managing_fill'
+    native._close_quantity['quantity_increment'] = '0.001'
+    native.close_type = CloseType.TRAILING_STOP
+    native.close_timestamp = 1000
+    native._status = RunnableStatus.TERMINATED
+    row = native.executor_info
+    assert 'entry_acquisition' not in row.custom_info
+    assert row.custom_info['execution_receipt']['residual_dust_base'] == D('0.0001')
+    instance.executors_info = [row]
+
+    # One acquired base minus the base fee and sale leaves 0.0001, worth 0.01 quote.
+    assert instance._get_total_position_value_usd() == D('0.01')
+    assert instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'ready'
+
+
+def test_configured_acquisition_without_its_record_keeps_exposure_unavailable():
+    instance, executor = _completed_dust_exit()
+    executor.config.entry_acquisition_policy = 'down_only_maker_v1'
+    del executor.custom_info['entry_acquisition']
+
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+@pytest.mark.parametrize('has_policy', [False, True])
+@pytest.mark.parametrize('acquisition', [None, {}, [], 'managing_fill', {'state': 'reconciliation_required'}])
+def test_supplied_invalid_acquisition_cannot_release_closed_dust_exposure(has_policy, acquisition):
+    instance, executor = _completed_dust_exit()
+    if has_policy:
+        executor.config.entry_acquisition_policy = 'down_only_maker_v1'
+    executor.custom_info['entry_acquisition'] = acquisition
+
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
+
+
+def test_native_persisted_scalar_buy_side_keeps_terminal_dust_and_visible_capital():
+    instance, seed = _completed_dust_exit()
+    seed.side = TradeType.BUY.value  # Native JSON-backed ExecutorInfo restores this scalar.
+    assert instance._get_total_position_value_usd() == D('0.01')
+    assert instance._filter_same_side(TradeType.BUY) == [seed]
+
+
+@pytest.mark.parametrize('side,config_side', [
+    (None, TradeType.BUY),
+    (TradeType.SELL.value, TradeType.BUY),
+    (TradeType.BUY.value, TradeType.SELL),
+])
+def test_invalid_native_buy_side_with_owned_history_cannot_vanish_from_capital(side, config_side):
+    instance = _controller()
+    seed = _buy_executor(
+        filled_base=D('0.2'), remaining_base=D('0.2'),
+        accounting_owner='executor', receipt_remaining=D('0.2'))
+    seed.side = side
+    seed.config.side = config_side
+    instance.executors_info = []
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [seed]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+
+
+def _distinct_dust_executor(seed, number):
+    row = copy.deepcopy(seed)
+    row.id = f'executor-{number}'
+    row.config.id = row.id
+    ids = []
+    for order in row.custom_info['execution_order_snapshots']:
+        order_id = f'{order["client_order_id"]}-{number}'
+        order['client_order_id'] = order_id
+        fill = next(iter(order['order_fills'].values()))
+        fill['client_order_id'] = order_id
+        fill['exchange_order_id'] = f'{fill["exchange_order_id"]}-{number}'
+        fill['trade_id'] = f'{fill["trade_id"]}-{number}'
+        order['exchange_order_id'] = fill['exchange_order_id']
+        order['order_fills'] = {fill['trade_id']: fill}
+        ids.append(order_id)
+    row.custom_info['order_ids'] = ids
+    return row
+
+
+def test_completed_sublot_residues_aggregate_into_owned_capital_without_sell_authority():
+    instance, seed = _completed_dust_exit()
+    rows = [_distinct_dust_executor(seed, n) for n in range(11)]
+    instance.executors_info = rows
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = rows
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert instance._get_total_position_value_usd() == D('0.11')
+        assert instance._get_sellable_inventory_amount() == D('0')
+
+
+def test_native_history_reserves_terminal_dust_omitted_from_recent_executor_report():
+    instance, seed = _completed_dust_exit()
+    instance.executors_info = []
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [_distinct_dust_executor(seed, n) for n in range(11)]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert instance._get_total_position_value_usd() == D('0.11')
+
+
+def test_incomplete_older_terminal_receipt_cannot_be_silently_treated_as_flat():
+    instance, seed = _completed_dust_exit()
+    instance.executors_info = []
+    del seed.custom_info['execution_receipt']['residual_dust_base']
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [seed]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+
+
+def test_unseen_unfinished_buy_in_complete_history_blocks_entry():
+    instance, seed = _completed_dust_exit()
+    instance.executors_info = []
+    seed.is_done = False
+    seed.is_active = True
+    seed.custom_info['execution_receipt']['residual_dust_base'] = D('0')
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [seed]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+
+
+def test_unseen_positive_terminal_without_owner_blocks_entry():
+    instance, seed = _completed_dust_exit()
+    instance.executors_info = []
+    seed.custom_info['execution_receipt'].pop('accounting_owner')
+    seed.custom_info['execution_receipt']['residual_dust_base'] = D('0')
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [seed]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+
+
+def test_duplicate_visible_executor_identity_blocks_entry():
+    instance, seed = _completed_dust_exit()
+    instance.executors_info = [seed, copy.deepcopy(seed)]
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [seed]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+
+
+def test_recent_same_id_overlay_cannot_erase_persisted_terminal_dust():
+    instance, seed = _completed_dust_exit()
+    recent = copy.deepcopy(seed)
+    recent.custom_info['execution_receipt'].pop('residual_dust_base')
+    recent.custom_info['execution_receipt'].pop('accounting_owner')
+    recent.custom_info['execution_receipt']['remaining_owned_base'] = D('0')
+    recent.custom_info['remaining_position_amount_base'] = D('0')
+    recent.custom_info['open_order_filled_amount_base'] = D('0')
+    recent.custom_info['close_order_filled_amount_base'] = D('0')
+    instance.executors_info = [recent]
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [seed]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+        assert instance.get_status_summary()['gate'] == 'exposure-unavailable'
+
+
+def test_recent_same_id_overlay_cannot_erase_persisted_unfinished_owned_base():
+    instance = _controller()
+    persisted = _buy_executor(
+        filled_base=D('0.2'), remaining_base=D('0.2'),
+        accounting_owner='executor', receipt_remaining=D('0.2'),
+        order_ids=['owned-entry'])
+    recent = copy.deepcopy(persisted)
+    recent.is_done = True
+    recent.is_active = False
+    recent.custom_info['remaining_position_amount_base'] = D('0')
+    recent.custom_info['open_order_filled_amount_base'] = D('0')
+    recent.custom_info['execution_receipt'].clear()
+    recent.custom_info['order_ids'] = []
+    recent.custom_info['entry_lifecycle']['state'] = 'ended_no_fill'
+    instance.executors_info = [recent]
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [persisted]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert not instance._get_total_position_value_usd().is_finite()
+        assert not instance.can_create_executor(1)
+
+
+def test_recent_same_id_proven_complete_exit_can_release_persisted_owned_base():
+    instance, recent = _completed_dust_exit()
+    persisted = _buy_executor(
+        filled_base=D('0.998'), remaining_base=D('0.998'),
+        accounting_owner='executor', receipt_remaining=D('0.998'),
+        order_ids=['buy-1'])
+    recent.custom_info['open_order_filled_amount_base'] = D('0.998')
+    recent.custom_info['execution_receipt']['entry_gross_base'] = D('1')
+    recent.custom_info['execution_receipt']['residual_dust_base'] = D('0')
+    recent.custom_info['execution_order_snapshots'][0]['order_fills']['buy-fill']['fee']['flat_fees'][0]['amount'] = '0.002'
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.return_value = [persisted]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        assert instance._get_total_position_value_usd() == D('0')
+        recent.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']['exchange_order_id'] = 'wrong'
+        assert not instance._get_total_position_value_usd().is_finite()
+
+
+def test_composed_status_reads_complete_native_history_once():
+    instance, seed = _completed_dust_exit()
+    recorder = MagicMock()
+    recorder.get_executors_by_controller.side_effect = [[seed], []]
+    recorder.get_position_hold_ledger_entries_by_controller.return_value = []
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        summary = instance.get_status_summary()
+    assert recorder.get_executors_by_controller.call_count == 1
+    assert summary['state'] != 'UNAVAILABLE'
+    assert summary['exposure'] != 'unavailable'
+
+
+def test_unavailable_complete_native_history_blocks_buy_and_is_reported_as_unavailable():
+    instance, _ = _completed_dust_exit()
+    with patch.object(MarketsRecorder, 'get_existing_instance', return_value=None):
+        assert not instance.can_create_executor(1)
+        summary = instance.get_status_summary()
+    assert summary['state'] == 'UNAVAILABLE'
+    assert summary['gate'] == 'exposure-unavailable'
+    assert summary['exposure'] == 'unavailable'
+    assert summary['plan_liquidity'] == 'idle $n/a'
+
+
+@pytest.mark.parametrize('close_type', [CloseType.TAKE_PROFIT, CloseType.TIME_LIMIT, CloseType.STOP_LOSS])
+def test_other_native_completed_spot_exits_retain_proven_dust(close_type):
+    instance, row = _completed_dust_exit()
+    row.close_type = close_type
+    assert instance._get_total_position_value_usd() == D('0.01')
+
+
+def test_zero_fill_cancelled_entry_predecessor_does_not_invent_a_fill():
+    instance, row = _completed_dust_exit()
+    row.custom_info['order_ids'].insert(0, 'cancelled-entry')
+    row.custom_info['execution_order_snapshots'].insert(0, {
+        'client_order_id': 'cancelled-entry', 'exchange_order_id': None,
+        'trading_pair': 'HYPE-USDC', 'trade_type': 'BUY', 'last_state': '3',
+        'executed_amount_base': '0', 'executed_amount_quote': '0', 'order_fills': {},
+    })
+    assert instance._get_total_position_value_usd() == D('0.01')
+
+
+def test_native_base_fee_rebate_can_leave_proven_sublot_residue():
+    instance, row = _completed_dust_exit()
+    custom = row.custom_info
+    custom['open_order_filled_amount_base'] = D('1.0019')
+    custom['close_order_filled_amount_base'] = D('1.0018')
+    buy, sell = custom['execution_order_snapshots']
+    buy['order_fills']['buy-fill']['fee']['flat_fees'][0]['amount'] = '-0.0019'
+    sell['executed_amount_base'] = '1.0018'
+    sell['executed_amount_quote'] = '100.18'
+    sell['order_fills']['sell-fill']['fill_base_amount'] = '1.0018'
+    sell['order_fills']['sell-fill']['fill_quote_amount'] = '100.18'
+    custom['execution_receipt']['exit_gross_base'] = D('1.0018')
+    custom['execution_receipt']['exit_gross_quote'] = D('100.18')
+    assert instance._get_total_position_value_usd() == D('0.01')
+
+
+@pytest.mark.parametrize('sell_base_fee', ['0.00001', '-0.00001'])
+def test_sell_base_fee_or_rebate_invalidates_executor_dust_receipt(sell_base_fee):
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee']['flat_fees'] = [{'token': 'HYPE', 'amount': sell_base_fee}]
+
+    assert not instance._get_total_position_value_usd().is_finite()
+
+
+def test_sell_percent_fee_charged_in_base_invalidates_executor_dust_receipt():
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee']['percent'] = '0.00001'
+    sell_fill['fee']['percent_token'] = 'HYPE'
+
+    assert not instance._get_total_position_value_usd().is_finite()
+
+
+@pytest.mark.parametrize('percent', ['0.00001', '-0.00001'])
+def test_implicit_sell_added_cost_percent_base_fee_invalidates_executor_dust_receipt(percent):
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee'].update(fee_type='AddedToCost', percent=percent, percent_token=None)
+
+    assert not instance._get_total_position_value_usd().is_finite()
+
+
+def test_explicit_sell_quote_percent_fee_preserves_executor_base_dust():
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee'].update(fee_type='AddedToCost', percent='0.00001', percent_token='USDC')
+
+    assert instance._get_total_position_value_usd() == D('0.01')
+
+
+@pytest.mark.parametrize('sell_quote_fee', ['0.01', '-0.01'])
+def test_sell_quote_fee_or_rebate_does_not_change_executor_base_dust(sell_quote_fee):
+    instance, row = _completed_dust_exit()
+    sell_fill = row.custom_info['execution_order_snapshots'][1]['order_fills']['sell-fill']
+    sell_fill['fee']['flat_fees'] = [{'token': 'USDC', 'amount': sell_quote_fee}]
+
+    assert instance._get_total_position_value_usd() == D('0.01')
+
+
+def test_same_venue_order_claimed_as_buy_and_sell_does_not_release_exposure():
+    instance, row = _completed_dust_exit()
+    buy, sell = row.custom_info['execution_order_snapshots']
+    sell['exchange_order_id'] = buy['exchange_order_id']
+    sell['order_fills']['sell-fill']['exchange_order_id'] = buy['exchange_order_id']
+    assert not instance._get_total_position_value_usd().is_finite()
+
+
+@pytest.mark.parametrize('standard_executor', [False, True])
+@pytest.mark.parametrize('tamper', [
+    'missing_snapshots', 'wrong_fill_fee', 'unfilled_exit', 'wrong_pair',
+    'missing_receipt', 'active_executor', 'partial_executor', 'held_owner',
+    'negative_dust', 'nonfinite_dust', 'excess_dust', 'coordinated_false_dust',
+    'wrong_config_connector', 'perpetual_connector', 'wrong_config_pair',
+    'wrong_config_side', 'leveraged_config', 'nonfinite_close_time',
+    'nonfinite_other_token_fee', 'wrong_lot_receipt',
+    'foreign_fill_pair', 'foreign_exchange_id', 'mismatched_trade_id',
+    'duplicate_trade_id',
+    'reconciliation_required',
+])
+def test_unverified_closed_exit_dust_keeps_exposure_unavailable(tamper, standard_executor):
+    instance, executor = _completed_dust_exit()
+    custom = executor.custom_info
+    receipt = custom['execution_receipt']
+    snapshots = custom['execution_order_snapshots']
+    if standard_executor:
+        del custom['entry_acquisition']
+    if tamper == 'missing_snapshots':
+        del custom['execution_order_snapshots']
+    elif tamper == 'wrong_fill_fee':
+        snapshots[0]['order_fills']['buy-fill']['fee']['flat_fees'][0]['amount'] = '0.0001'
+    elif tamper == 'unfilled_exit':
+        snapshots[1]['last_state'] = '4'
+    elif tamper == 'wrong_pair':
+        snapshots[1]['trading_pair'] = 'OTHER-USDC'
+    elif tamper == 'missing_receipt':
+        del receipt['remaining_owned_base']
+    elif tamper == 'active_executor':
+        executor.is_active = True
+    elif tamper == 'partial_executor':
+        executor.is_done = False
+    elif tamper == 'held_owner':
+        receipt['accounting_owner'] = 'held_position'
+    elif tamper == 'negative_dust':
+        receipt['residual_dust_base'] = '-0.0001'
+    elif tamper == 'nonfinite_dust':
+        receipt['residual_dust_base'] = 'NaN'
+    elif tamper == 'excess_dust':
+        custom['open_order_filled_amount_base'] = D('0.9995')
+        receipt['residual_dust_base'] = D('0.0015')
+    elif tamper == 'coordinated_false_dust':
+        custom['open_order_filled_amount_base'] = D('0.9982')
+        receipt['residual_dust_base'] = D('0.0002')
+    elif tamper == 'wrong_config_connector':
+        executor.config.connector_name = 'okx_perpetual'
+    elif tamper == 'perpetual_connector':
+        object.__setattr__(instance.config, 'connector_name', 'okx_perpetual')
+        executor.connector_name = 'okx_perpetual'
+        executor.config.connector_name = 'okx_perpetual'
+    elif tamper == 'wrong_config_pair':
+        executor.config.trading_pair = 'OTHER-USDC'
+    elif tamper == 'wrong_config_side':
+        executor.config.side = TradeType.SELL
+    elif tamper == 'leveraged_config':
+        executor.config.leverage = 2
+    elif tamper == 'nonfinite_close_time':
+        executor.close_timestamp = float('nan')
+    elif tamper == 'nonfinite_other_token_fee':
+        snapshots[0]['order_fills']['buy-fill']['fee']['flat_fees'].append(
+            {'token': 'USDC', 'amount': 'NaN'})
+    elif tamper == 'wrong_lot_receipt':
+        custom['close_quantity']['quantity_increment'] = '0.01'
+    elif tamper == 'foreign_fill_pair':
+        snapshots[0]['order_fills']['buy-fill']['trading_pair'] = 'OTHER-USDC'
+    elif tamper == 'foreign_exchange_id':
+        snapshots[0]['order_fills']['buy-fill']['exchange_order_id'] = 'foreign-order'
+    elif tamper == 'mismatched_trade_id':
+        snapshots[0]['order_fills']['buy-fill']['trade_id'] = 'foreign-fill'
+    elif tamper == 'duplicate_trade_id':
+        fill = snapshots[1]['order_fills'].pop('sell-fill')
+        fill['trade_id'] = 'buy-fill'
+        snapshots[1]['order_fills']['buy-fill'] = fill
+    elif tamper == 'reconciliation_required':
+        custom['entry_lifecycle']['state'] = 'reconciliation_required'
+        custom.setdefault('entry_acquisition', {})['state'] = 'reconciliation_required'
+
+    assert not instance._get_total_position_value_usd().is_finite()
+    assert not instance.can_create_executor(1)
+    assert instance._last_gate_reason[TradeType.BUY] == 'exposure_unavailable'
 
 
 def test_position_hold_without_held_bag_refuses_new_buy():

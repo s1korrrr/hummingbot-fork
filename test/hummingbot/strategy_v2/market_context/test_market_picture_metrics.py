@@ -16,6 +16,7 @@ from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     correlate_hourly_closes,
     correlate_hourly_return_vectors,
     correlation_30d_trend,
+    correlation_min_pairs,
     count_predicate,
     dense_hourly_correlation_matrix,
     dense_hourly_correlation_row,
@@ -32,6 +33,7 @@ from hummingbot.strategy_v2.market_context.market_picture.metrics import (
     prepare_hourly_log_returns_from_validated_closes,
     realized_volatility_24h,
     relative_volume,
+    relative_volume_hourly,
     return_percent,
     return_percent_decimal,
 )
@@ -363,6 +365,7 @@ def test_asset_metric_builder_emits_all_frozen_asset_keys_and_feature_specific_s
         "atr14_percentile",
         "rvol20",
         "rvol_24h",
+        "rvol_1h",
         "atr14_percent",
         "realized_volatility_24h",
         "relative_24h_btc",
@@ -373,6 +376,8 @@ def test_asset_metric_builder_emits_all_frozen_asset_keys_and_feature_specific_s
     assert metrics["return_10080m"].computation_status == "VALID"
     assert metrics["rvol20"].value == pytest.approx(5.0)
     assert metrics["rvol_24h"].value == pytest.approx(5.0)
+    # Last hour is 59*2 + 10 = 128 against a 120 baseline hour.
+    assert metrics["rvol_1h"].value == pytest.approx(128.0 / 120.0)
     assert metrics["atr14_percentile"].value == pytest.approx(0.0)
     assert metrics["relative_24h_btc"].value is not None
     assert metrics["relative_24h_bnb"].computation_status == "UNAVAILABLE"
@@ -457,3 +462,98 @@ def test_hourly_correlation_exact_95_percent_pair_boundary():
     right[2051] = np.nan
     rejected = correlate_hourly_return_vectors(left, right)
     assert rejected.sample_count == 2051 and rejected.value is None
+
+
+def _zero_inflated_minutes(hours: int, *, last_minute: float = 0.0) -> list[float]:
+    """One 60-unit trade per hour at a drifting minute, all other minutes zero; oldest first."""
+    volumes = [0.0] * (hours * 60)
+    for hour in range(hours):
+        volumes[hour * 60 + (hour * 7) % 59] = 60.0
+    volumes[-1] = last_minute
+    return volumes
+
+
+def _bars_with_volumes(volumes, cutoff=1_800_000_000_000):
+    n = len(volumes)
+    close = tuple(100.0 + 0.001 * (i % 50) for i in range(n))
+    return AssetBarsV1(
+        instrument_id="okx:spot:BNB-USDC",
+        close_times_ms=tuple(cutoff - (n - i - 1) * 60_000 for i in range(n)),
+        high=tuple(value + 0.5 for value in close),
+        low=tuple(value - 0.5 for value in close),
+        close=close,
+        quote_volume=tuple(volumes),
+        cutoff_ms=cutoff,
+    )
+
+
+def test_relative_volume_hourly_matches_independent_block_arithmetic():
+    volumes = [float((i * 37) % 11) for i in range(1500)]
+    current = sum(volumes[-60:])
+    blocks = [sum(volumes[hour * 60 : hour * 60 + 60]) for hour in range(24)]  # noqa: E203
+    assert relative_volume_hourly(volumes) == pytest.approx(current / (sum(blocks) / 24))
+    # The evaluated hour is excluded from its own baseline.
+    assert relative_volume_hourly([0.0] * 1440 + [1.0] * 60) is None
+    assert relative_volume_hourly([1.0] * 1500) == pytest.approx(1.0)
+    assert relative_volume_hourly([1.0] * 1440 + [3.0] * 60) == pytest.approx(3.0)
+
+
+def test_relative_volume_hourly_rejects_wrong_length_negative_and_nonpositive_baseline():
+    assert relative_volume_hourly([1.0] * 1499) is None
+    assert relative_volume_hourly([1.0] * 1501) is None
+    assert relative_volume_hourly([1.0] * 1499 + [-1.0]) is None
+    assert relative_volume_hourly([0.0] * 1500) is None  # zero baseline is never infinite
+    assert relative_volume_hourly([1.0] * 120, baseline_hours=1) == pytest.approx(1.0)
+    with pytest.raises(ValueError):
+        relative_volume_hourly([1.0] * 1500, baseline_hours=0)
+    with pytest.raises(ValueError):
+        relative_volume_hourly([1.0] * 1499 + [float("nan")])
+
+
+def test_zero_inflated_thin_book_single_minute_ratio_is_below_one_but_hourly_ratio_is_about_one():
+    volumes = _zero_inflated_minutes(25)
+    assert sum(volumes[-60:]) == 60.0
+    single_minute = relative_volume([volumes[-1], *reversed(volumes[-1441:-1])], 1440)
+    assert single_minute is not None and single_minute < 0.01
+    assert relative_volume_hourly(volumes) == pytest.approx(1.0)
+
+    metrics = compute_asset_metrics(_bars_with_volumes(volumes))
+    assert metrics["rvol_24h"].value < 0.01
+    assert metrics["rvol_1h"].value == pytest.approx(1.0)
+    observed = metrics["rvol_1h"]
+    assert (observed.computation_status, observed.reason_codes) == ("VALID", ())
+    assert (observed.sample_count, observed.required_samples) == (1500, 1500)
+    assert observed.window_start_ms == 1_800_000_000_000 - 1499 * 60_000
+
+
+def test_rvol_1h_statuses_zero_baseline_warming_and_missing_input():
+    zero = compute_asset_metrics(_bars_with_volumes([0.0] * 1440 + [5.0] * 60))["rvol_1h"]
+    assert (zero.value, zero.computation_status, zero.reason_codes) == (None, "UNAVAILABLE", ("ZERO_BASELINE",))
+    all_zero = compute_asset_metrics(_bars_with_volumes([0.0] * 1600))["rvol_1h"]
+    assert all_zero.value is None and all_zero.reason_codes == ("ZERO_BASELINE",)
+
+    warming = compute_asset_metrics(_bars_with_volumes([1.0] * 1499))["rvol_1h"]
+    assert (warming.value, warming.computation_status, warming.reason_codes) == (None, "WARMING", ("INSUFFICIENT_HISTORY",))
+    assert (warming.sample_count, warming.required_samples) == (1499, 1500)
+
+    gappy = [1.0] * 1600
+    gappy[-700] = None
+    missing = compute_asset_metrics(_bars_with_volumes(gappy))["rvol_1h"]
+    assert (missing.value, missing.computation_status, missing.reason_codes) == (None, "MISSING", ("INPUT_MISSING",))
+    # A hole older than the 1,500-minute window does not invalidate the metric.
+    old_hole = [1.0] * 1600
+    old_hole[3] = None
+    assert compute_asset_metrics(_bars_with_volumes(old_hole))["rvol_1h"].value == pytest.approx(1.0)
+
+
+def test_correlation_min_pairs_follows_the_95_percent_rule_with_the_legacy_floor():
+    assert {hours: correlation_min_pairs(hours) for hours in (2160, 720, 336, 168, 72, 24)} == {
+        2160: 60,
+        720: 60,
+        336: 60,
+        168: 60,
+        72: 60,
+        24: 23,
+    }
+    with pytest.raises(ValueError):
+        correlation_min_pairs(100)

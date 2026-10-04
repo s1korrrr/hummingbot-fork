@@ -2,6 +2,7 @@
 import asyncio
 import math
 import sqlite3
+import weakref
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Literal
@@ -141,21 +142,46 @@ class CandleSnapshot(PolicyModel):
     def digest(self) -> str:
         return identity([self.dataset.key, [row.model_dump(mode='json') for row in self.rows]])
 
-    def frame(self, *, now: float, max_age: float) -> pd.DataFrame:
+    def check(self, *, now: float, max_age: float) -> None:
+        """Every ``frame`` admission check, without copying the frame."""
         now = float(decimal(now, 'observation time'))
         age = float(decimal(max_age, 'maximum candle age', positive=True))
         if now < self.published_at or now - (self.rows[-1].open_time + self.dataset.seconds) > age:
             raise DataUnavailable('future or stale candle snapshot')
         if len(self.rows) < self.dataset.history:
             raise DataUnavailable('candle history is warming')
-        values = [{'timestamp': r.open_time, 'open': float(r.open), 'high': float(r.high),
-                   'low': float(r.low), 'close': float(r.close), 'volume': float(r.volume)} for r in self.rows]
-        if all(r.quote_volume is not None for r in self.rows):
-            for value, row in zip(values, self.rows):
-                value['quote_asset_volume'] = float(row.quote_volume)
-        if any(not math.isfinite(value) for row in values for value in row.values()):
-            raise PolicyError('candle values exceed the native feature representation')
-        return pd.DataFrame(values)
+        _snapshot_frame(self)  # non-finite values raise PolicyError here as well
+
+    def frame(self, *, now: float, max_age: float) -> pd.DataFrame:
+        self.check(now=now, max_age=max_age)
+        return _snapshot_frame(self).copy(deep=True)
+
+
+_SNAPSHOT_FRAMES: dict[int, pd.DataFrame] = {}
+
+
+def _snapshot_frame(snapshot: 'CandleSnapshot') -> pd.DataFrame:
+    """The float feature frame of one immutable snapshot, converted once.
+
+    A snapshot is frozen, so its conversion never changes; consumers asked for it
+    several times per tick and rebuilt thousands of rows each time. Keyed by object
+    identity (pydantic equality would include any private cache) and evicted when the
+    snapshot is collected. Callers receive copies, so the cached frame is never mutated.
+    """
+    key = id(snapshot)
+    cached = _SNAPSHOT_FRAMES.get(key)
+    if cached is not None:
+        return cached
+    values = [{'timestamp': r.open_time, 'open': float(r.open), 'high': float(r.high),
+               'low': float(r.low), 'close': float(r.close), 'volume': float(r.volume)} for r in snapshot.rows]
+    if all(r.quote_volume is not None for r in snapshot.rows):
+        for value, row in zip(values, snapshot.rows):
+            value['quote_asset_volume'] = float(row.quote_volume)
+    if any(not math.isfinite(value) for row in values for value in row.values()):
+        raise PolicyError('candle values exceed the native feature representation')
+    cached = _SNAPSHOT_FRAMES[key] = pd.DataFrame(values)
+    weakref.finalize(snapshot, _SNAPSHOT_FRAMES.pop, key, None)
+    return cached
 
 
 class Replica:
@@ -242,14 +268,19 @@ class Replica:
         value = self.snapshots.get(key)
         return self.connected and value is not None and value.rows[-1].open_time > self.seed_bars.get(key, value.rows[-1].open_time)
 
-    def frame(self, key: str, *, now: float, max_age: float) -> pd.DataFrame:
+    def check(self, key: str, *, now: float, max_age: float) -> CandleSnapshot:
+        """Every ``frame`` admission check, without copying; returns the checked snapshot."""
         if not self.connected or key not in self.snapshots:
             raise DataUnavailable('candle reader has not synchronized')
         value = self.snapshots[key]
         if not 0 <= now - value.published_at <= self.max_transport_age:
             raise DataUnavailable('candle transport is stale')
-        frame = value.frame(now=now, max_age=max_age)
-        return frame.iloc[-self.datasets[key].history:].copy(deep=True)
+        value.check(now=now, max_age=max_age)
+        return value
+
+    def frame(self, key: str, *, now: float, max_age: float) -> pd.DataFrame:
+        value = self.check(key, now=now, max_age=max_age)
+        return _snapshot_frame(value).iloc[-self.datasets[key].history:].copy(deep=True)
 
 
 class SnapshotHub:

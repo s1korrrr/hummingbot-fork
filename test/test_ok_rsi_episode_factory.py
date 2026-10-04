@@ -1,5 +1,5 @@
 from decimal import Decimal
-from test.test_ok_rsi_episode_runtime import actions, setup_controller
+from test.test_ok_rsi_episode_runtime import actions, setup_controller, thin_scout_release_action
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -67,12 +67,7 @@ def test_disabled_controller_retains_default_executor_mapping():
     assert controller.get_executor_class_for_config(config) is None
 
 
-def test_native_orchestrator_constructs_once_and_rejects_duplicate_before_start():
-    from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutor
-    from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
-    controller, _ = setup_controller()
-    action = actions(controller)[0]
-    from hummingbot.connector.markets_recorder import MarketsRecorder
+def orchestrator_harness(controller):
     from hummingbot.strategy_v2.models.base import RunnableStatus
     controller._status = RunnableStatus.RUNNING
     connector = MagicMock()
@@ -86,6 +81,37 @@ def test_native_orchestrator_constructs_once_and_rejects_duplicate_before_start(
     recorder.get_all_positions.return_value = []
     recorder.get_all_position_hold_ledger_entries.return_value = []
     recorder.get_trades_for_config.return_value = []
+    return strategy, recorder
+
+
+def test_native_orchestrator_rejects_episode_buy_before_construction():
+    # Episode BUY admission is blocked until it adopts the single-attempt decision
+    # gate (docs/controllers/ok-rsi-single-attempt-entry.md).
+    from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutor
+    from hummingbot.connector.markets_recorder import MarketsRecorder
+    from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+    controller, _ = setup_controller()
+    action = actions(controller)[0]
+    assert action.executor_config.side == TradeType.BUY
+    strategy, recorder = orchestrator_harness(controller)
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(EpisodeOrderExecutor, "start", autospec=True) as start:
+        orchestrator = ExecutorOrchestrator(strategy, executors_max_retries=0)
+        orchestrator.create_executor(action)
+    assert orchestrator.active_executors[controller.config.id] == []
+    recorder.store_or_update_executor.assert_not_called()
+    assert start.call_count == 0
+    assert "single-attempt decision support" in controller._entry_decision_error
+
+
+def test_native_orchestrator_constructs_once_and_rejects_duplicate_before_start():
+    from controllers.directional_trading.ok_rsi_core.execution import EpisodeOrderExecutor
+    from hummingbot.connector.markets_recorder import MarketsRecorder
+    from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+    controller, _ = setup_controller(episode_thin_scout_release=True)
+    action = thin_scout_release_action(controller)
+    assert action.executor_config.side == TradeType.SELL
+    strategy, recorder = orchestrator_harness(controller)
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
             patch.object(EpisodeOrderExecutor, "start", autospec=True) as start:
         orchestrator = ExecutorOrchestrator(strategy, executors_max_retries=0)

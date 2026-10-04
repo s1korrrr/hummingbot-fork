@@ -1,6 +1,7 @@
 """Composition seams only: native controllers remain the policy and execution owners."""
 import ast
 import asyncio
+import hashlib
 import importlib
 import inspect
 from copy import deepcopy
@@ -65,21 +66,49 @@ def source_files(family, *, public_module=None):
             initializer = root.joinpath(*package[1:count]) / '__init__.py'
             if initializer.is_file() and initializer not in seen:
                 pending.append(initializer)
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    enqueue(tuple(alias.name.split('.')))
-            elif isinstance(node, ast.ImportFrom):
-                suffix = tuple(node.module.split('.')) if node.module else ()
-                module = (*package[:len(package) - node.level + 1], *suffix) if node.level else suffix
+        for reference in import_references(path.read_text()):
+            if reference[0] == 'from':
+                _, level, suffix, names = reference
+                module = (*package[:len(package) - level + 1], *suffix) if level else suffix
                 enqueue(module)
-                for alias in node.names:
-                    enqueue((*module, alias.name))
-            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                  and node.func.attr == 'import_module' and node.args
-                  and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
-                enqueue(tuple(node.args[0].value.split('.')))
+                for name in names:
+                    enqueue((*module, name))
+            else:
+                enqueue(reference[1])
     return sorted(seen)
+
+
+_IMPORT_REFERENCES: dict[str, tuple] = {}
+_IMPORT_REFERENCE_CAPACITY = 4096
+
+
+def import_references(text):
+    """Import statements of one source text, in ``ast.walk`` order.
+
+    Parsed once per distinct content: the strategy reloads controller configs every
+    few seconds and re-derives this closure for every controller, and re-parsing the
+    unchanged sources each time stalled the event loop for seconds. Relative imports
+    stay unresolved here because their meaning depends on the importing file.
+    """
+    key = hashlib.sha256(text.encode()).hexdigest()
+    cached = _IMPORT_REFERENCES.get(key)
+    if cached is not None:
+        return cached
+    references = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.Import):
+            references.extend(('import', tuple(alias.name.split('.'))) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            suffix = tuple(node.module.split('.')) if node.module else ()
+            references.append(('from', node.level, suffix, tuple(alias.name for alias in node.names)))
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == 'import_module' and node.args
+              and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+            references.append(('import', tuple(node.args[0].value.split('.'))))
+    if len(_IMPORT_REFERENCES) >= _IMPORT_REFERENCE_CAPACITY:
+        _IMPORT_REFERENCES.clear()
+    cached = _IMPORT_REFERENCES[key] = tuple(references)
+    return cached
 
 
 def base_records(config):
@@ -375,7 +404,19 @@ class NativeComposition:
         except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError, SQLAlchemyError) as error:
             self._funding_assessment_hold = str(error) or type(error).__name__
 
+    STARTUP_RESTORE_GRACE_SECONDS: ClassVar[float] = 60.0
+
+    def _awaiting_startup_restore(self):
+        """True only within the startup grace after this controller's first action pass."""
+        now = self.market_data_provider.time()
+        first = getattr(self, '_first_action_pass_at', None)
+        if first is None:
+            return False
+        return 0 <= now - first < self.STARTUP_RESTORE_GRACE_SECONDS
+
     def determine_executor_actions(self):
+        if getattr(self, '_first_action_pass_at', None) is None:
+            self._first_action_pass_at = self.market_data_provider.time()
         self._refresh_funding_assessment()
         if self._recovery_fault:
             self.logger().warning('native recovery fault holds actions: %s', self._recovery_fault)
@@ -401,7 +442,12 @@ class NativeComposition:
             if before_trails is not None:
                 self._recovery_trails = before_trails
             self._recovery_hold = str(exc)
-            self.logger().warning('native recovery hold: %s', self._recovery_hold)
+            if self._awaiting_startup_restore():
+                # The orchestrator restores held positions only once connectors are ready,
+                # after controllers start: the hold is correct, the alarm is not.
+                self.logger().info('native recovery hold while startup positions restore: %s', self._recovery_hold)
+            else:
+                self.logger().warning('native recovery hold: %s', self._recovery_hold)
             return []
         except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError) as exc:
             if before_trails is not None:

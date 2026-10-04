@@ -2,6 +2,7 @@
 import asyncio
 import math
 import sqlite3
+import weakref
 from decimal import Decimal
 from pathlib import Path
 from typing import Callable, Literal
@@ -148,14 +149,34 @@ class CandleSnapshot(PolicyModel):
             raise DataUnavailable('future or stale candle snapshot')
         if len(self.rows) < self.dataset.history:
             raise DataUnavailable('candle history is warming')
-        values = [{'timestamp': r.open_time, 'open': float(r.open), 'high': float(r.high),
-                   'low': float(r.low), 'close': float(r.close), 'volume': float(r.volume)} for r in self.rows]
-        if all(r.quote_volume is not None for r in self.rows):
-            for value, row in zip(values, self.rows):
-                value['quote_asset_volume'] = float(row.quote_volume)
-        if any(not math.isfinite(value) for row in values for value in row.values()):
-            raise PolicyError('candle values exceed the native feature representation')
-        return pd.DataFrame(values)
+        return _snapshot_frame(self).copy(deep=True)
+
+
+_SNAPSHOT_FRAMES: dict[int, pd.DataFrame] = {}
+
+
+def _snapshot_frame(snapshot: 'CandleSnapshot') -> pd.DataFrame:
+    """The float feature frame of one immutable snapshot, converted once.
+
+    A snapshot is frozen, so its conversion never changes; consumers asked for it
+    several times per tick and rebuilt thousands of rows each time. Keyed by object
+    identity (pydantic equality would include any private cache) and evicted when the
+    snapshot is collected. Callers receive copies, so the cached frame is never mutated.
+    """
+    key = id(snapshot)
+    cached = _SNAPSHOT_FRAMES.get(key)
+    if cached is not None:
+        return cached
+    values = [{'timestamp': r.open_time, 'open': float(r.open), 'high': float(r.high),
+               'low': float(r.low), 'close': float(r.close), 'volume': float(r.volume)} for r in snapshot.rows]
+    if all(r.quote_volume is not None for r in snapshot.rows):
+        for value, row in zip(values, snapshot.rows):
+            value['quote_asset_volume'] = float(row.quote_volume)
+    if any(not math.isfinite(value) for row in values for value in row.values()):
+        raise PolicyError('candle values exceed the native feature representation')
+    cached = _SNAPSHOT_FRAMES[key] = pd.DataFrame(values)
+    weakref.finalize(snapshot, _SNAPSHOT_FRAMES.pop, key, None)
+    return cached
 
 
 class Replica:

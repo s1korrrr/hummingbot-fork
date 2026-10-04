@@ -5174,8 +5174,11 @@ class HLRSIController(DirectionalTradingControllerBase):
 
     def validate_executor_config(self, config) -> bool:
         if not super().validate_executor_config(config):
+            self._record_gate_reason(config.side, "manual_kill_switch" if self.config.manual_kill_switch
+                                     else "controller_stopped")
             return False
         if config.connector_name != self.config.connector_name or config.trading_pair != self.config.trading_pair:
+            self._record_gate_reason(config.side, "executor_scope_mismatch")
             return False
         now = self.market_data_provider.time()
         if config.timestamp is None or not 0 <= now - config.timestamp <= max(5.0, 2 * self.update_interval):
@@ -5187,20 +5190,24 @@ class HLRSIController(DirectionalTradingControllerBase):
         amount = self._decimal_or_none(config.amount)
         mid_price = self._decimal_or_none(self._get_mid_price())
         if amount is None or amount <= 0 or mid_price is None or mid_price <= 0:
+            self._record_gate_reason(config.side, "invalid_amount" if amount is None or amount <= 0 else "price_unavailable")
             return False
         if config.side == TradeType.BUY:
             if not self.can_create_executor(1):
                 return False
             entry = self._decimal_or_none(getattr(config, "entry_price", None))
             if entry is None or entry <= 0:
+                self._record_gate_reason(TradeType.BUY, "invalid_entry_price")
                 return False
             if self._get_total_position_value_usd() + amount * max(entry, mid_price) > self.config.max_total_position_usd:
                 self._record_gate_reason(TradeType.BUY, "max_position")
                 return False
         else:
             if self.config.strict_hmm_mode and (self.processed_data or {}).get("regime_error"):
+                self._record_gate_reason(TradeType.SELL, "regime_error")
                 return False
             if self._filter_same_side(TradeType.SELL, active_only=True):
+                self._record_gate_reason(TradeType.SELL, "sell_active")
                 return False
             if amount > self._get_sellable_inventory_amount():
                 self._record_gate_reason(TradeType.SELL, "inventory_unavailable")

@@ -13,6 +13,11 @@ from .candle_data import MAX_CANDLE_HISTORY, Candle, CandleSnapshot, Replica
 from .candle_transport import MAX_MESSAGE, read_token, validate_origin
 from .domain import DataUnavailable, PolicyError
 
+# After a missed heartbeat deadline, frames already delivered during an event-loop stall are read
+# for this long (and at most this many) before the session is declared dead.
+HEARTBEAT_GRACE_SECONDS = 1.0
+HEARTBEAT_GRACE_FRAMES = 256
+
 
 class CandleStreamClient:
     """Bounded incremental wire-v1 reader with fail-closed resynchronization."""
@@ -191,12 +196,42 @@ class CandleStreamClient:
         await ws.send_json({'v': 1, 'op': 'subscribe', 'pairs': sorted(self.by_pair), 'history': self.history})
         while True:
             remaining = 10 - (time.monotonic() - self.last_heartbeat)
+            try:
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await self._receive(ws, remaining)
+            except asyncio.TimeoutError:
+                # Both the deadline found expired and a receive that timed out while this loop was
+                # stalled may hide a heartbeat the server already delivered.
+                if not await self._heartbeat_already_delivered(ws):
+                    raise DataUnavailable('candle stream heartbeat deadline expired') from None
+
+    async def _receive(self, ws, timeout):
+        message = await asyncio.wait_for(ws.receive(), timeout=timeout)
+        if message.type != aiohttp.WSMsgType.TEXT:
+            raise DataUnavailable('candle stream closed or non-text frame')
+        self.apply(json.loads(message.data))
+
+    async def _heartbeat_already_delivered(self, ws):
+        """A missed deadline may be this process's own stalled event loop, not a silent server.
+
+        Frames the server sent while the loop was stalled are read for a short grace; only a
+        heartbeat among them keeps the session (busy data frames never extend the deadline).
+        Freshness for decisions is still bounded by the replica's transport age.
+        """
+        missed = self.last_heartbeat
+        deadline = asyncio.get_running_loop().time() + HEARTBEAT_GRACE_SECONDS
+        for _ in range(HEARTBEAT_GRACE_FRAMES):
+            remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise DataUnavailable('candle stream heartbeat deadline expired')
-            message = await asyncio.wait_for(ws.receive(), timeout=remaining)
-            if message.type != aiohttp.WSMsgType.TEXT:
-                raise DataUnavailable('candle stream closed or non-text frame')
-            self.apply(json.loads(message.data))
+                break
+            try:
+                await self._receive(ws, remaining)
+            except asyncio.TimeoutError:
+                break
+            if self.last_heartbeat != missed:
+                return True
+        return False
 
     async def run(self):
         delay = .5

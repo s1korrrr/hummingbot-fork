@@ -66,3 +66,26 @@ assess, admit and reconcile, which stops all new V2 entries. Roll back to an ima
 change only while the funding state holds no
 `native_insufficient_balance_before_submission_v1` release; after the first one,
 roll forward instead.
+
+## Stream heartbeat after an event-loop stall
+
+On 2026-10-04 15:10–16:10 UTC the host was overloaded (load 38–46 on 14 cores) and the owners'
+event loops stalled. `CandleStreamClient.consume` measured its 10 s heartbeat deadline on the local
+monotonic clock before reading the socket, so a stall longer than the deadline tore down a healthy
+session although the server's heartbeat was already delivered; each reconnect re-subscribed the full
+history (V1: 3660 rows x 5 pairs), which deepened the stall (V1 logged ~420 "transport is stale" /
+"stream disconnected (TimeoutError)" warnings in two hours; how they split between receive-wait
+timeouts and reconnect timeouts was not determined). After a missed deadline, whether found at the top of the loop or as
+a receive that timed out during the stall, the client now reads frames already delivered for a 1 s
+grace (at most 256 frames); only a heartbeat among them keeps the session, busy data frames never
+extend it, and a silent server still fails. Decision freshness remains bounded by the replica's
+transport age, so a stall long enough that the buffered frames are older than 10 s still
+reconnects (applying a stale frame is refused).
+Regression: a real loopback server heartbeating every second while the client loop is blocked for
+10.2 s ends the session before the change and keeps it after (`test_candle_stream_stall.py`).
+
+The closure digest changes from
+`8d6a84f876daa5a5969ea6ed15f8417c8c6241f6866038a89ffcc293f41e237a` to
+`156119946b518b04a0116a6db993057e1ff96dee59e8fa99c973bab9c7889a7d` (same 67 paths; the
+`candle_stream` component changed). V3's sealed recipe source binds this closure, so adopting it on
+V3 requires a re-sealed release and a `code_upgrade` identity migration.

@@ -22,8 +22,9 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     # root-cause changes in RELEASE_AUDIT_20261004.md: the same 67-file closure,
     # with native_composition.py, native_funding.py and the candle_data,
     # candle_stream and data_reader components changed; crash and V3-only dust
-    # modules remain outside it. Historical bindings are not rewritten.
-    assert source_digest(source_root(), source_files()) == '8d6a84f876daa5a5969ea6ed15f8417c8c6241f6866038a89ffcc293f41e237a'  # noqa: documentation
+    # modules remain outside it. Historical bindings are not rewritten. The
+    # stalled-loop heartbeat drain in candle_stream is recorded there as well.
+    assert source_digest(source_root(), source_files()) == '156119946b518b04a0116a6db993057e1ff96dee59e8fa99c973bab9c7889a7d'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

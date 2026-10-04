@@ -185,11 +185,49 @@ def test_transport_opt_in_and_native_path_unchanged():
 def test_missing_heartbeat_deadline_is_not_reset_by_busy_data():
     async def scenario():
         reader = client()
-        ws = SimpleNamespace(send_json=lambda value: asyncio.sleep(0))
-        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock:
+
+        async def silent():
+            await asyncio.sleep(3600)
+
+        ws = SimpleNamespace(send_json=lambda value: asyncio.sleep(0), receive=silent)
+        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock, \
+                patch('controllers.generic.modular_spot_core.candle_stream.HEARTBEAT_GRACE_SECONDS', 0.05):
             clock.monotonic.side_effect = [0, 11]
             with pytest.raises(DataUnavailable, match='heartbeat deadline'):
                 await reader.consume(ws)
+    asyncio.run(scenario())
+
+
+def frames(*items, now=None):
+    queue = deque(items)
+
+    async def receive():
+        item = queue.popleft()
+        if now is not None:
+            now[0] = item['published_at']  # the adapter clock follows the delivered publication
+        return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=__import__('json').dumps(item))
+    return receive
+
+
+def test_heartbeat_delivered_during_a_stalled_event_loop_keeps_the_session():
+    """The deadline passed on this process's clock, but the server's heartbeat was already waiting."""
+    async def scenario():
+        now = [6000]
+        reader = client(clock=lambda: now[0])
+        receive = frames(message(), message('heartbeat', at=6001), now=now)
+
+        async def closing():
+            if reader.last_heartbeat == 11.5:
+                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, data=None)
+            return await receive()
+
+        ws = SimpleNamespace(send_json=lambda value: asyncio.sleep(0), receive=closing)
+        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock:
+            clock.monotonic.side_effect = [0, 1, 11, 11.5, 12]
+            with pytest.raises(DataUnavailable, match='closed or non-text'):
+                await reader.consume(ws)
+        assert reader.last_heartbeat == 11.5
+        assert reader.replica.snapshots[dataset().key].published_at == 6001
     asyncio.run(scenario())
 
 
@@ -311,18 +349,59 @@ def test_same_origin_different_transports_never_share_a_pool():
 
 def test_busy_frames_cannot_extend_missing_heartbeat_deadline():
     async def scenario():
-        reader = client()
+        now = [6000]
+        reader = client(clock=lambda: now[0])
 
         async def send(value):
             pass
 
-        async def receive():
-            return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=__import__('json').dumps(message()))
-
-        ws = SimpleNamespace(send_json=send, receive=receive)
-        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock:
+        candles = [message('candle', sequence=n, at=6000 + 60 * (n - 1)) for n in range(2, 6)]
+        ws = SimpleNamespace(send_json=send, receive=frames(message(), *candles, now=now))
+        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock, \
+                patch('controllers.generic.modular_spot_core.candle_stream.HEARTBEAT_GRACE_FRAMES', 3):
             clock.monotonic.side_effect = [0, 1, 11]
             with pytest.raises(DataUnavailable, match='heartbeat deadline'):
                 await reader.consume(ws)
-        assert len(reader.update_receipts) == 1
+        assert len(reader.update_receipts) == 4  # the snapshot plus the three bounded grace frames
+    asyncio.run(scenario())
+
+
+def test_receive_timeout_during_a_stall_reads_the_delivered_heartbeat():
+    """The stall usually lands inside the receive wait: its timeout fires before the buffered frame is read."""
+    async def scenario():
+        now = [6000]
+        reader = client(clock=lambda: now[0])
+        delivered = frames(message(), message('heartbeat', at=6001), now=now)
+        calls = []
+
+        async def receive():
+            calls.append(1)
+            if len(calls) == 2:
+                raise asyncio.TimeoutError  # the receive wait expired while the loop was stalled
+            if reader.last_heartbeat == 9.5:
+                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, data=None)
+            return await delivered()
+
+        ws = SimpleNamespace(send_json=lambda value: asyncio.sleep(0), receive=receive)
+        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock:
+            clock.monotonic.side_effect = [0, 1, 2, 9.5, 9.6]
+            with pytest.raises(DataUnavailable, match='closed or non-text'):
+                await reader.consume(ws)
+        assert reader.last_heartbeat == 9.5
+    asyncio.run(scenario())
+
+
+def test_receive_timeout_from_a_silent_server_still_ends_the_session():
+    async def scenario():
+        reader = client()
+
+        async def silent():
+            raise asyncio.TimeoutError
+
+        ws = SimpleNamespace(send_json=lambda value: asyncio.sleep(0), receive=silent)
+        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock, \
+                patch('controllers.generic.modular_spot_core.candle_stream.HEARTBEAT_GRACE_SECONDS', 0.05):
+            clock.monotonic.side_effect = [0, 1]
+            with pytest.raises(DataUnavailable, match='heartbeat deadline'):
+                await reader.consume(ws)
     asyncio.run(scenario())

@@ -175,6 +175,36 @@ class TestExecutorOrchestrator(unittest.TestCase):
             self.orchestrator.create_executor(action)
         self.assertEqual(start_mock.call_count, 1)
 
+    def test_rejected_executor_log_names_the_controller_gate_reason(self):
+        connector = MagicMock(spec=ExchangePyBase)
+        connector.get_available_balance.return_value = Decimal("1000")
+        connector.in_flight_orders = {}
+        connector.trading_rules = {"ETH-USDC": TradingRule("ETH-USDC", min_order_size=Decimal("0.01"),
+                                                           min_price_increment=Decimal("0.01"),
+                                                           min_base_amount_increment=Decimal("0.01"),
+                                                           min_notional_size=Decimal("1"))}
+        self.mock_strategy.connectors["okx"] = connector
+        self.mock_strategy.markets["okx"] = {"ETH-USDC"}
+        controller = MagicMock()
+        controller.validate_executor_config.return_value = False
+        controller._last_gate_reason = {TradeType.BUY: "stale_action", TradeType.SELL: None}
+        controller._funding_assessment_hold = controller._funding_hold = None
+        controller._recovery_fault = controller._recovery_hold = None
+        self.mock_strategy.controllers["ok-rsi"] = controller
+        config = PositionExecutorConfig(id="stale-intent", timestamp=1_000, controller_id="ok-rsi",
+                                        connector_name="okx", trading_pair="ETH-USDC", side=TradeType.BUY,
+                                        entry_price=Decimal("100"), amount=Decimal("1"))
+        self.orchestrator.active_executors["ok-rsi"] = []
+        logger = MagicMock()
+        with patch.object(self.orchestrator, "logger", return_value=logger), \
+                patch.object(MarketsRecorder.get_instance(), "store_or_update_executor") as persist:
+            self.orchestrator.create_executor(CreateExecutorAction(controller_id="ok-rsi", executor_config=config))
+        persist.assert_not_called()
+        message, *args = logger.warning.call_args.args
+        self.assertIn("gate=%s", message)
+        self.assertIn("stale_action", args)
+        self.assertEqual(self.orchestrator.active_executors["ok-rsi"], [])
+
     def test_unfinished_legacy_down_only_executor_is_reported_and_retains_receipt(self):
         config = DownOnlyMakerPositionExecutorConfig(
             id="intent-1",

@@ -2007,10 +2007,12 @@ class ExecutorOrchestrator:
                 controller.executors_info = reports.get(controller_id, [])
             validator = getattr(controller, "validate_executor_config", None)
             if validator is not None and not validator(executor_config):
+                gates = getattr(controller, '_last_gate_reason', None)
                 self.logger().warning(
-                    "Rejected executor %s | controller=%s pair=%s side=%s funding=%s recovery=%s",
+                    "Rejected executor %s | controller=%s pair=%s side=%s gate=%s funding=%s recovery=%s",
                     executor_config.id, controller_id, executor_config.trading_pair,
-                    executor_config.side.name, getattr(controller, '_funding_assessment_hold', None)
+                    executor_config.side.name, gates.get(executor_config.side) if isinstance(gates, dict) else None,
+                    getattr(controller, '_funding_assessment_hold', None)
                     or getattr(controller, '_funding_hold', None),
                     getattr(controller, '_recovery_fault', None) or getattr(controller, '_recovery_hold', None))
                 return

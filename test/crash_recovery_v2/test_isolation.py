@@ -18,11 +18,12 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     rows = source_records(source_root(), source_files())
     assert not any(name.endswith(('market_stress_v1.py', 'recovery_evidence_v1.py', 'terminal_dust.py')) for name, _ in rows)
     # The signed-fee and native candle-ownership changes are recorded in
-    # docs/controllers/modular_spot/RELEASE_AUDIT_20261003.md. The independently
-    # compared 67-file closure changes only native_composition.py in the latest
-    # source update; crash and V3-only dust modules remain outside it. Historical
-    # bindings are not rewritten.
-    assert source_digest(source_root(), source_files()) == '05dd2199882fcf1662dde6b774e7613e437c292586ffdf34fe0b28f798db011a'  # noqa: documentation
+    # docs/controllers/modular_spot/RELEASE_AUDIT_20261003.md, and the V2 runtime
+    # root-cause changes in RELEASE_AUDIT_20261004.md: the same 67-file closure,
+    # with native_composition.py and the candle_data, candle_stream and
+    # data_reader components changed; crash and V3-only dust modules remain
+    # outside it. Historical bindings are not rewritten.
+    assert source_digest(source_root(), source_files()) == 'f8fff1774cb401f06097bf55aee534d066f142db68eb209d13a88d8612d2308a'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

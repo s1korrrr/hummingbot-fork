@@ -422,6 +422,8 @@ class ExecutorOrchestrator:
                 self._wallet_sale_position_summaries.append(position)
                 continue  # Validate this historical synthetic summary against exact receipts before any report.
             if not self._is_valid_stored_position(position):
+                if self._is_closed_stored_position(position):
+                    continue  # A fully exited summary row holds nothing; not a corrupt record.
                 self.logger().warning(
                     f"Skipping invalid stored position | controller={controller_id} "
                     f"pair={position.trading_pair} side={position.side} amount={position.amount} "
@@ -835,9 +837,17 @@ class ExecutorOrchestrator:
         try:
             amount = Decimal(str(position.amount))
             breakeven = Decimal(str(position.breakeven_price))
+            # NaN orders raise InvalidOperation; a bad row is skipped, never fatal to startup.
+            return amount > Decimal("0") and breakeven > Decimal("0")
         except Exception:
             return False
-        return amount > Decimal("0") and breakeven > Decimal("0")
+
+    @staticmethod
+    def _is_closed_stored_position(position: Position) -> bool:
+        try:
+            return Decimal(str(position.amount)) == Decimal("0")
+        except Exception:
+            return False
 
     def _current_position_scopes(self) -> Set[PositionScope]:
         position_scopes: Set[PositionScope] = set()

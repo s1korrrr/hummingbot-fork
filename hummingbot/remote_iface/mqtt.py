@@ -36,6 +36,7 @@ from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.pubsub import PubSub
 from hummingbot.core.utils.async_utils import call_sync, safe_ensure_future
 from hummingbot.notifier.notifier_base import NotifierBase
+from hummingbot.remote_iface import commlib_compat
 from hummingbot.remote_iface.messages import (
     MQTT_STATUS_CODE,
     BalanceLimitCommandMessage,
@@ -53,6 +54,9 @@ from hummingbot.remote_iface.messages import (
     StatusUpdateMessage,
     StopCommandMessage,
 )
+
+# One RPC endpoint thread per command must not spin the GIL away from the event loop.
+commlib_compat.install()
 
 mqtts_logger: HummingbotLogger = None
 

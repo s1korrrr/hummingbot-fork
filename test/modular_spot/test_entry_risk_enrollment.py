@@ -77,8 +77,7 @@ async def test_pending_enrollment_tick_waits_for_report_initialization_without_r
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('blocker', ['pending', 'preflight_failed', 'claim_failed', 'unresolved'])
-async def test_pending_or_failed_ownership_does_not_initialize_daily_risk(recorder, blocker):
+async def test_pending_ownership_does_not_initialize_daily_risk(recorder):
     recorder.store_strategy_risk_state(pending_state())
     strategy = make_runner(recorder)
     try:
@@ -86,15 +85,7 @@ async def test_pending_or_failed_ownership_does_not_initialize_daily_risk(record
         strategy._controller_reports_valid = True
         strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
             pnl_available=True, global_pnl_quote=D('-12.5'))}}
-        orchestrator = strategy.executor_orchestrator
-        if blocker == 'pending':
-            orchestrator._planned_resume_pending = True
-        elif blocker == 'preflight_failed':
-            orchestrator._resume_preflight_failed = True
-        elif blocker == 'claim_failed':
-            orchestrator._planned_resume_failure = 'sealed claim rejected'
-        else:
-            orchestrator._claimed_resume_unresolved = {OWNER: {'executor': ('okx', 'BTC-USDC')}}
+        strategy.executor_orchestrator._planned_resume_pending = True
 
         with patch.object(StrategyV2Base, 'on_tick'), \
                 patch('scripts.v2_with_controllers.time.time', return_value=1002):
@@ -106,6 +97,37 @@ async def test_pending_or_failed_ownership_does_not_initialize_daily_risk(record
         assert strategy._entry_risk_enrollment.pending
         assert strategy.max_global_pnl is None
         assert recorder.load_strategy_risk_state() == before
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['preflight_failed', 'claim_failed', 'unresolved'])
+async def test_failed_or_unresolved_ownership_keeps_risk_rails_and_creation(recorder, failure):
+    """Restart continuity D2: a failed or unresolved claim is reported and held, never a fence."""
+    recorder.store_strategy_risk_state(pending_state())
+    strategy = make_runner(recorder)
+    try:
+        strategy._controller_reports_valid = True
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('-12.5'))}}
+        orchestrator = strategy.executor_orchestrator
+        if failure == 'preflight_failed':
+            orchestrator._resume_preflight_failed = True
+        elif failure == 'claim_failed':
+            orchestrator._planned_resume_failure = 'sealed claim rejected'
+        else:
+            orchestrator._claimed_resume_unresolved = {OWNER: {'executor': ('okx', 'BTC-USDC')}}
+
+        with patch.object(StrategyV2Base, 'on_tick'), \
+                patch('scripts.v2_with_controllers.time.time', return_value=1002):
+            strategy.on_tick()
+            # The first fresh native mark enrolls the daily rail; SELLs are never refused by it.
+            assert strategy.validate_create_action(SimpleNamespace(
+                controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.SELL)))
+
+        assert strategy._daily_entry_risk is not None
+        assert recorder.load_strategy_risk_state()['daily_entry_risk']['baseline_quote'] == '-12.5'
     finally:
         await close(strategy)
 

@@ -241,7 +241,7 @@ class V2WithControllers(StrategyV2Base):
         self.process_operator_events()
         # Risk marks and their durable projection must not advance against an
         # unclaimed startup snapshot. The entry fence and operator events remain
-        # observable while recovery is pending or unresolved.
+        # observable while the claim is pending.
         if self._ownership_recovery_complete():
             if not self._is_stop_triggered:
                 self.check_manual_kill_switch()
@@ -255,15 +255,13 @@ class V2WithControllers(StrategyV2Base):
                 self.logger().exception('Unable to persist risk state; new execution blocked')
 
     def _ownership_recovery_complete(self):
+        # Only a pending claim defers risk rails and creation. A failed or
+        # unresolved claim is reported and held; risk rails keep running and
+        # orders are never fenced (restart continuity D2).
         orchestrator = getattr(self, 'executor_orchestrator', None)
         if orchestrator is None or getattr(self, '_unattended_restart_hold', False):
             return False
-        return not any((
-            getattr(orchestrator, '_planned_resume_pending', False),
-            getattr(orchestrator, '_resume_preflight_failed', False),
-            getattr(orchestrator, '_planned_resume_failure', None),
-            getattr(orchestrator, '_claimed_resume_unresolved', None),
-        ))
+        return getattr(orchestrator, '_planned_resume_pending', False) is not True
 
     def _apply_daily_entry_pause(self):
         if self._daily_entry_risk is not None and self._daily_entry_risk.paused:

@@ -5,7 +5,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import yaml
 
@@ -93,9 +93,17 @@ class HLRSIControllerTest(unittest.TestCase):
             )
 
     def test_sell_only_blocks_buy_signal_at_executor_boundary(self):
+        from hummingbot.connector.markets_recorder import MarketsRecorder
+
+        # Explicit complete empty native history, so exposure is finite and the
+        # trade-mode gate (not the fail-closed exposure gate) is what refuses BUY.
+        recorder = MagicMock()
+        recorder.get_executors_by_controller.return_value = []
+        recorder.get_position_hold_ledger_entries_by_controller.return_value = []
         controller = self._controller(trade_mode="sell_only", base_balance=Decimal("2"))
 
-        self.assertFalse(controller.can_create_executor(1))
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            self.assertFalse(controller.can_create_executor(1))
         self.assertEqual(controller._last_gate_reason[TradeType.BUY], "trade_mode_sell_only")
 
     def test_sell_only_refuses_direct_buy_executor_construction(self):

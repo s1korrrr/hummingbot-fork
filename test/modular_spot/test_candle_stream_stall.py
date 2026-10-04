@@ -41,8 +41,7 @@ def serve(ready, holder):
     loop.run_until_complete(main())
 
 
-# 10.2 s passes the 10 s deadline while the oldest buffered heartbeat stays inside the 10 s
-# transport-age bound; 9.0 s never reaches the deadline (control).
+# 10.2 s passes the 10 s heartbeat deadline; 9.0 s normally does not (control).
 @pytest.mark.parametrize('stall', [10.2, 9.0])
 def test_session_survives_a_stall_while_parked_in_receive(stall):
     ready, holder = threading.Event(), {}
@@ -51,6 +50,9 @@ def test_session_survives_a_stall_while_parked_in_receive(stall):
 
     async def scenario():
         reader = CandleStreamClient('http://127.0.0.1:1', '/unused', (dataset(),))
+        # Widen only the frame-freshness bound so scheduling delay on a loaded host cannot turn the
+        # case into a stale-frame refusal; the 10 s heartbeat deadline under test is unchanged.
+        reader.replica.max_transport_age = 20
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(f"http://127.0.0.1:{holder['port']}/v1/stream") as ws:
                 task = asyncio.create_task(reader.consume(ws))

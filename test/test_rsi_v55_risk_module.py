@@ -303,6 +303,12 @@ def _load_module(path: Path, module_name: str):
     return module
 
 
+# _install_module creates empty-path stand-ins for missing parent packages. They
+# must leave with the class, or later real ``controllers`` imports in the same
+# process resolve against a package that has no search path.
+_STUB_PARENT_PACKAGES = ("controllers", "controllers.directional_trading")
+
+
 class RSIv55RiskModuleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -310,7 +316,8 @@ class RSIv55RiskModuleTests(unittest.TestCase):
             name: module
             for name, module in sys.modules.items()
             if (
-                name == "pandas_ta"
+                name in _STUB_PARENT_PACKAGES
+                or name == "pandas_ta"
                 or name == "hummingbot"
                 or name.startswith("hummingbot.")
                 or name == "controllers.directional_trading.rsi_signals"
@@ -336,7 +343,8 @@ class RSIv55RiskModuleTests(unittest.TestCase):
         for name in [
             module_name for module_name in sys.modules
             if (
-                module_name == "pandas_ta"
+                module_name in _STUB_PARENT_PACKAGES
+                or module_name == "pandas_ta"
                 or module_name == "hummingbot"
                 or module_name.startswith("hummingbot.")
                 or module_name == "controllers.directional_trading.rsi_signals"

@@ -666,6 +666,11 @@ class HLRSIController(DirectionalTradingControllerBase):
             f"Operator entry pause {'enabled' if enabled else 'disabled'} | "
             f"pair={self.config.trading_pair} scope={scope or 'n/a'} reason={reason or 'n/a'}"
         )
+        if not enabled:
+            # The pause refusal is no longer current; the next gate check sets the real reason.
+            for side, gate in list(self._last_gate_reason.items()):
+                if gate == "operator_pause":
+                    self._record_gate_reason(side, None)
 
     def get_operator_state(self) -> dict:
         return {
@@ -3951,6 +3956,29 @@ class HLRSIController(DirectionalTradingControllerBase):
         ):
             self._pending_buy_confirmation = previous_setup
 
+    def _apply_buy_market_condition(self, signal: int, atr_pct: Optional[float], regime_error,
+                                    previous_setup: Optional[BuyConfirmationSetup]) -> Tuple[int, bool, str]:
+        """Veto a signal on market condition; returns (signal, condition_ok, condition_reason).
+
+        A vetoed BUY never reaches the executor gate, so its reason is recorded
+        here as well; otherwise the published BUY gate keeps an older, unrelated
+        refusal (for example a lifted operator pause) indefinitely.
+        """
+        buy_signal = signal > 0
+        if regime_error is not None and self.config.strict_hmm_mode:
+            reason = "strict_hmm"
+        elif buy_signal and atr_pct is not None and atr_pct < self.config.min_atr_pct_to_trade:
+            self._restore_buy_confirmation_after_veto(previous_setup)
+            reason = "low_vol"
+        elif buy_signal and atr_pct is not None and atr_pct > self.config.max_atr_pct_to_trade:
+            self._restore_buy_confirmation_after_veto(previous_setup)
+            reason = "high_vol"
+        else:
+            return signal, True, "ok"
+        if buy_signal:
+            self._record_gate_reason(TradeType.BUY, reason)
+        return 0, False, reason
+
     # -----------------------------------------------------------------------
     # Regime-aware RSI thresholds (from v1)
     # -----------------------------------------------------------------------
@@ -4460,23 +4488,8 @@ class HLRSIController(DirectionalTradingControllerBase):
             )
 
         # --- Market condition filter for BUY ---
-        condition_ok = True
-        condition_reason = "ok"
-        if regime_error is not None and self.config.strict_hmm_mode:
-            condition_ok = False
-            condition_reason = "strict_hmm"
-            signal = 0
-        elif signal > 0 and atr_pct is not None:
-            if atr_pct < self.config.min_atr_pct_to_trade:
-                self._restore_buy_confirmation_after_veto(pending_setup_before_signal)
-                condition_ok = False
-                condition_reason = "low_vol"
-                signal = 0
-            elif atr_pct > self.config.max_atr_pct_to_trade:
-                self._restore_buy_confirmation_after_veto(pending_setup_before_signal)
-                condition_ok = False
-                condition_reason = "high_vol"
-                signal = 0
+        signal, condition_ok, condition_reason = self._apply_buy_market_condition(
+            signal, atr_pct, regime_error, pending_setup_before_signal)
         if signal <= 0:
             self._last_buy_signal_role = None
 

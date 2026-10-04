@@ -1001,7 +1001,7 @@ def test_reserved_adaptive_entry_persists_then_operator_pause_stops_native_order
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context() | {"timestamp": 10140},
     ):
-        stopped = runtime_actions(controller)
+        stopped = controller.determine_executor_actions()  # stops pass the BUY block: checked end to end
 
     assert len(stopped) == 1
     assert isinstance(stopped[0], StopExecutorAction)
@@ -1035,7 +1035,7 @@ def test_manual_kill_returns_only_stop_for_active_episode_order():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context() | {"timestamp": 10080},
     ):
-        stopped = runtime_actions(controller)
+        stopped = controller.determine_executor_actions()  # stops pass the BUY block: checked end to end
 
     assert len(stopped) == 1
     assert isinstance(stopped[0], StopExecutorAction)

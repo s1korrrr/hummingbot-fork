@@ -1,6 +1,8 @@
 """Opt-in, process-local sharing for modular controllers; native providers are untouched."""
 import asyncio
 import inspect
+import math
+import re
 import time
 from decimal import Decimal
 from typing import Literal
@@ -42,6 +44,30 @@ class DataPolicy(PolicyModel):
         elif self.origin is not None or self.token_file is not None or self.symbols:
             raise ValueError('remote dataset options require shared mode')
         return self
+
+
+READINESS_SCHEMA = 'shared_candle_readiness.v1'
+_BEARER = re.compile(r'(?i)\b(bearer)\s+\S+')
+_TOKEN_SHAPE = re.compile(r'[A-Za-z0-9_\-+/=.]{32,}')
+
+
+def sanitize_stream_error(value):
+    """Bounded operator text for a reader error; credentials and token-shaped values never leave."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return type(value).__name__
+    text = _BEARER.sub(lambda match: match.group(1) + ' <redacted>', value)
+    return _TOKEN_SHAPE.sub('<redacted>', text)[:256]
+
+
+def _age(now, stamp):
+    if type(stamp) not in (int, float) or not math.isfinite(stamp):
+        return None, 'not_recorded'
+    age = now - stamp
+    if age < 0:
+        return None, 'clock_regressed'
+    return age, None
 
 
 def dataset_for(config, pair=None):
@@ -93,6 +119,87 @@ class DataPool:
 
     def entry_ready(self, spec: Dataset) -> bool:
         return self.client is not None and self.client.replica.entry_ready(spec.key)
+
+    def readiness(self, spec: Dataset, *, now: float, candles_error=None) -> dict:
+        """Read-only projection of state the reader already holds; never changes a gate.
+
+        ``candles_error`` is the caller's frame-gate failure text (or ``None``) and
+        ``entry_ready`` combines it with this pool's replica gate as the BUY path
+        does. Unknowable fields are ``None`` with an explicit reason.
+        """
+        client = self.client
+        replica = None if client is None else client.replica
+        snapshot = None if replica is None else replica.snapshots.get(spec.key)
+        nulls = {}
+        result = {'trading_pair': spec.trading_pair, 'interval': spec.interval, 'dataset_key': spec.key,
+                  'client_state': ('not_started' if replica is None
+                                   else 'connected' if replica.connected else 'disconnected'),
+                  'entry_ready': candles_error is None and self.entry_ready(spec)}
+        if replica is None:
+            reason = 'reader_not_started'
+        elif not replica.connected:
+            reason = 'replica_disconnected'
+        elif snapshot is None:
+            reason = 'dataset_unavailable'
+        elif candles_error is not None:
+            reason = 'candles_unavailable'
+        elif not result['entry_ready']:
+            reason = 'awaiting_post_seed_candle'
+        else:
+            reason = None
+        result['entry_ready_reason'] = None if result['entry_ready'] else (reason or 'unclassified')
+        result['entry_ready_detail'] = (sanitize_stream_error(candles_error)
+                                        if not result['entry_ready'] and candles_error is not None else None)
+        missing = ('reader_not_started' if replica is None
+                   else 'dataset_not_synchronized' if snapshot is None else None)
+        if snapshot is not None:
+            latest = snapshot.rows[-1].open_time
+            seed = replica.seed_bars.get(spec.key)
+            result.update(last_closed_candle_open_time=latest,
+                          last_closed_candle_close_time=latest + spec.seconds,
+                          seed_candle_open_time=seed, replica_sequence=snapshot.sequence,
+                          replica_epoch=snapshot.epoch, source_published_at=snapshot.published_at)
+            if seed is None:
+                nulls['seed_candle_open_time'] = 'not_recorded'
+            age, why = _age(now, snapshot.published_at)
+            result['source_publication_age_seconds'] = age
+            if why:
+                nulls['source_publication_age_seconds'] = why
+        else:
+            for name in ('last_closed_candle_open_time', 'last_closed_candle_close_time', 'seed_candle_open_time',
+                         'replica_sequence', 'replica_epoch', 'source_published_at',
+                         'source_publication_age_seconds'):
+                result[name] = None
+                nulls[name] = missing
+        result['replica_revision'] = None if replica is None else replica.revision
+        if replica is None:
+            nulls['replica_revision'] = 'reader_not_started'
+        for name, stamp, absent in (
+                ('receive_age_seconds',
+                 None if client is None else getattr(client, 'dataset_updated_at', {}).get(spec.key),
+                 'no_dataset_update_received'),
+                ('heartbeat_age_seconds', getattr(client, 'last_heartbeat_at', None), 'no_heartbeat_received')):
+            if client is None:
+                result[name], nulls[name] = None, 'reader_not_started'
+            elif self.policy.transport != 'stream':
+                result[name], nulls[name] = None, 'not_recorded_by_snapshot_transport'
+            elif stamp is None:
+                result[name], nulls[name] = None, absent
+            else:
+                result[name], why = _age(now, stamp)
+                if why:
+                    nulls[name] = why
+        result['stream_error'] = sanitize_stream_error(getattr(client, 'error', None))
+        dataset_errors = getattr(client, 'dataset_errors', None)
+        result['dataset_error'] = (sanitize_stream_error(dataset_errors.get(spec.key))
+                                   if isinstance(dataset_errors, dict) else None)
+        for name, attribute in (('stream_sessions', 'sessions'), ('stream_failures', 'failures')):
+            value = getattr(client, attribute, None)
+            result[name] = value if type(value) is int else None
+            if result[name] is None:
+                nulls[name] = 'reader_not_started' if client is None else 'not_recorded_by_transport'
+        result['null_reasons'] = nulls
+        return result
 
     def screen(self, config, *, now: float):
         policy = config.universe

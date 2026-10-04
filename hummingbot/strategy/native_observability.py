@@ -24,6 +24,17 @@ ENTRY_ACQUISITION_FIELDS = ('policy', 'intent_id', 'state', 'terminal_reason', '
                             'reprice_count', 'rest_seconds', 'total_max_age_seconds',
                             'queue_fill_status', 'fee_economics_status')
 
+CANDLE_READINESS_STRINGS = {'trading_pair': 32, 'interval': 8, 'dataset_key': 128, 'client_state': 32,
+                            'entry_ready_reason': 64, 'entry_ready_detail': 256, 'replica_epoch': 128,
+                            'stream_error': 256, 'dataset_error': 256}
+CANDLE_READINESS_INTEGERS = ('last_closed_candle_open_time', 'last_closed_candle_close_time',
+                             'seed_candle_open_time', 'replica_sequence', 'replica_revision',
+                             'stream_sessions', 'stream_failures')
+CANDLE_READINESS_NUMBERS = ('source_published_at', 'source_publication_age_seconds',
+                            'receive_age_seconds', 'heartbeat_age_seconds')
+CANDLE_READINESS_UNAVAILABLE = {'schema': 'shared_candle_readiness.v1', 'status': 'unavailable',
+                                'reason': 'invalid_candle_readiness_projection', 'datasets': []}
+
 
 def number(value):
     if value is None or isinstance(value, bool):
@@ -77,6 +88,61 @@ def strategy_components_observation(source):
             raise ValueError('Invalid component string')
         else:
             result[name] = value
+    return result
+
+
+def _bounded_text(value, limit):
+    if value is not None and (not isinstance(value, str) or len(value) > limit):
+        raise ValueError('Invalid candle readiness text')
+    return value
+
+
+def _finite(value, *, integer):
+    if value is None:
+        return None
+    kinds = (int,) if integer else (int, float)
+    if type(value) not in kinds or not math.isfinite(value) or not 0 <= value <= 10**15:
+        raise ValueError('Invalid candle readiness number')
+    return value
+
+
+def candle_readiness_observation(source):
+    """Allowlist the shared-candle BUY-gate projection; it carries no decision or credential."""
+    if (not isinstance(source, dict) or source.get('schema') != 'shared_candle_readiness.v1'
+            or source.get('status') not in ('available', 'not_applicable', 'unavailable')):
+        raise ValueError('Invalid candle readiness schema')
+    result = {'schema': source['schema'], 'status': source['status'],
+              'reason': _bounded_text(source.get('reason'), 128)}
+    for key in ('data_mode', 'transport', 'clock'):
+        if key in source:
+            result[key] = _bounded_text(source[key], 64)
+    if 'observed_at' in source:
+        result['observed_at'] = _finite(source['observed_at'], integer=False)
+    datasets = source.get('datasets')
+    if not isinstance(datasets, list) or len(datasets) > 16:
+        raise ValueError('Invalid candle readiness datasets')
+    result['datasets'] = []
+    for row in datasets:
+        if not isinstance(row, dict) or type(row.get('entry_ready')) is not bool:
+            raise ValueError('Invalid candle readiness dataset')
+        item = {'entry_ready': row['entry_ready']}
+        for key, limit in CANDLE_READINESS_STRINGS.items():
+            if key in row:
+                item[key] = _bounded_text(row[key], limit)
+        for key in CANDLE_READINESS_INTEGERS:
+            if key in row:
+                item[key] = _finite(row[key], integer=True)
+        for key in CANDLE_READINESS_NUMBERS:
+            if key in row:
+                item[key] = _finite(row[key], integer=False)
+        if 'null_reasons' in row:
+            reasons = row['null_reasons']
+            if (not isinstance(reasons, dict) or len(reasons) > 32
+                    or any(not isinstance(k, str) or len(k) > 64 or not isinstance(v, str) or not 0 < len(v) <= 64
+                           for k, v in reasons.items())):
+                raise ValueError('Invalid candle readiness null reasons')
+            item['null_reasons'] = dict(reasons)
+        result['datasets'].append({key: item[key] for key in row if key in item})
     return result
 
 
@@ -178,6 +244,11 @@ def controller_observation(entry):
             source = custom.get(name)
             if isinstance(source, dict):
                 result['custom_info'][name] = {key: scalar(source[key]) for key in fields if key in source}
+        if 'candle_readiness' in custom:
+            try:
+                result['custom_info']['candle_readiness'] = candle_readiness_observation(custom['candle_readiness'])
+            except ValueError:
+                result['custom_info']['candle_readiness'] = dict(CANDLE_READINESS_UNAVAILABLE)
         if 'strategy_components' in custom:
             result['custom_info']['strategy_components'] = strategy_components_observation(custom['strategy_components'])
         if getattr(controller.config, 'controller_name', None) == 'cross_venue_event_v2' and 'event_projection' in custom:

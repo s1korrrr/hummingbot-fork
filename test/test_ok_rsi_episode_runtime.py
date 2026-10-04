@@ -37,9 +37,17 @@ def context():
                 hostile=False, cascade=False)
 
 
+def runtime_actions(controller):
+    # OKRSIController.determine_executor_actions deliberately filters episode BUY
+    # requests until episode entries adopt the single-attempt decision gate
+    # (docs/controllers/ok-rsi-single-attempt-entry.md). These tests cover the
+    # episode runtime and its native factory, so they read the runtime directly.
+    return controller._episode_runtime.determine_actions()
+
+
 def actions(controller):
     with patch("controllers.directional_trading.ok_rsi_core.runtime.completed_market_context", return_value=context()):
-        return controller.determine_executor_actions()
+        return runtime_actions(controller)
 
 
 def test_durable_reservation_precedes_action_and_restart_never_redispatches():
@@ -52,6 +60,17 @@ def test_durable_reservation_precedes_action_and_restart_never_redispatches():
     restarted, _ = setup_controller(store=store)
     assert actions(restarted) == []
     assert request_id in restarted._episode_runtime.state.orders
+
+
+def test_controller_withholds_reserved_episode_buy_until_single_attempt_support():
+    controller, store = setup_controller()
+    with patch("controllers.directional_trading.ok_rsi_core.runtime.completed_market_context", return_value=context()):
+        assert controller.determine_executor_actions() == []
+    reserved = controller._episode_runtime.state.orders
+    assert len(reserved) == 1 and next(iter(reserved.values())).request.side == "BUY"
+    assert "single-attempt decision support" in controller._entry_decision_error
+    buy = next(iter(reserved.values())).request
+    assert buy.id in store.load(controller.config.id)[-1].payload["state"]["orders"]
 
 
 def test_scout_probe_config_maps_and_persists_exact_native_receipt():
@@ -337,7 +356,8 @@ def test_strength_runner_maps_to_policy_and_runtime_status():
     assert status["exit_policy"] == "DEEP_RECOVERY_STRENGTH_RUNNER_V6"
 
 
-def test_thin_scout_release_receipt_maps_to_executor_and_status():
+def thin_scout_release_action(controller):
+    """Return the runtime's episode SELL action for a filled thin scout release."""
     from controllers.directional_trading.ok_rsi_core.episode import (
         EpisodeState,
         OrderProgress,
@@ -345,7 +365,6 @@ def test_thin_scout_release_receipt_maps_to_executor_and_status():
         Transition,
     )
 
-    controller, _ = setup_controller(episode_thin_scout_release=True)
     runtime = controller._episode_runtime
     buy = OrderRequest(
         id="scout-buy-1",
@@ -411,7 +430,14 @@ def test_thin_scout_release_receipt_maps_to_executor_and_status():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context(),
     ), patch("controllers.directional_trading.ok_rsi_core.runtime.transition", return_value=result):
-        created = controller.determine_executor_actions()[0]
+        # Episode SELL exits pass the controller's BUY-only admission filter.
+        return controller.determine_executor_actions()[0]
+
+
+def test_thin_scout_release_receipt_maps_to_executor_and_status():
+    controller, _ = setup_controller(episode_thin_scout_release=True)
+    runtime = controller._episode_runtime
+    created = thin_scout_release_action(controller)
 
     executor = created.executor_config.model_copy(update={"controller_id": controller.config.id})
     assert executor.episode_intent == "THIN_SCOUT_RELEASE"
@@ -715,7 +741,7 @@ def test_recovery_aware_scout_maps_context_and_persists_route_receipt():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=recovery_context,
     ):
-        assert controller.determine_executor_actions() == []
+        assert runtime_actions(controller) == []
     assert controller._episode_runtime.reason == "recovery_scout_deferred"
     assert controller._episode_runtime.state.episode_id is None
 
@@ -726,7 +752,7 @@ def test_recovery_aware_scout_maps_context_and_persists_route_receipt():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=next_context,
     ):
-        created = restarted.determine_executor_actions()
+        created = runtime_actions(restarted)
 
     assert len(created) == 1
     executor = created[0].executor_config
@@ -755,14 +781,14 @@ def test_rebound_scout_persists_setup_then_emits_exact_owner_receipt():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=first_context,
     ):
-        assert restarted.determine_executor_actions() == []
+        assert runtime_actions(restarted) == []
     restarted.market_data_provider.time.return_value = 10140
     second_context = context() | {"timestamp": 10140, "low": Decimal("93.1")}
     with patch(
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=second_context,
     ):
-        created = restarted.determine_executor_actions()
+        created = runtime_actions(restarted)
 
     assert len(created) == 1
     executor = created[0].executor_config
@@ -780,7 +806,7 @@ def test_recovery_rebound_setup_survives_restart_and_emits_route_receipt():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=recovery_context,
     ):
-        assert controller.determine_executor_actions() == []
+        assert runtime_actions(controller) == []
     armed = controller._episode_runtime.status()
     assert armed["setup_policy"] == "RECOVERY_REBOUND_SCOUT_V1"
     assert armed["setup_started_at"] == 10020
@@ -801,7 +827,7 @@ def test_recovery_rebound_setup_survives_restart_and_emits_route_receipt():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=cleared_context,
     ):
-        assert restarted.determine_executor_actions() == []
+        assert runtime_actions(restarted) == []
     assert restarted._episode_runtime.status()["setup_confirmation_started_at"] == 10080
 
     for timestamp in (10140, 10200):
@@ -815,7 +841,7 @@ def test_recovery_rebound_setup_survives_restart_and_emits_route_receipt():
             "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
             return_value=followup,
         ):
-            created = restarted.determine_executor_actions()
+            created = runtime_actions(restarted)
 
     assert len(created) == 1
     executor = created[0].executor_config
@@ -910,7 +936,7 @@ def test_reference_fallback_maps_terminal_proven_parent_to_native_child():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context() | {"timestamp": parent.episode_expires_at},
     ):
-        created = controller.determine_executor_actions()
+        created = runtime_actions(controller)
 
     assert len(created) == 1
     child = created[0].executor_config
@@ -968,14 +994,14 @@ def test_reserved_adaptive_entry_persists_then_operator_pause_stops_native_order
             "markup": True,
         },
     ):
-        assert controller.determine_executor_actions() == []
+        assert runtime_actions(controller) == []
 
     controller._operator_entry_paused = True
     with patch(
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context() | {"timestamp": 10140},
     ):
-        stopped = controller.determine_executor_actions()
+        stopped = controller.determine_executor_actions()  # stops pass the BUY block: checked end to end
 
     assert len(stopped) == 1
     assert isinstance(stopped[0], StopExecutorAction)
@@ -1009,7 +1035,7 @@ def test_manual_kill_returns_only_stop_for_active_episode_order():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context() | {"timestamp": 10080},
     ):
-        stopped = controller.determine_executor_actions()
+        stopped = controller.determine_executor_actions()  # stops pass the BUY block: checked end to end
 
     assert len(stopped) == 1
     assert isinstance(stopped[0], StopExecutorAction)
@@ -1168,13 +1194,13 @@ def test_direct_factory_rejects_changed_rebound_setup_receipt():
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context() | {"timestamp": 10080, "low": Decimal("93.1")},
     ):
-        assert controller.determine_executor_actions() == []
+        assert runtime_actions(controller) == []
     controller.market_data_provider.time.return_value = 10140
     with patch(
         "controllers.directional_trading.ok_rsi_core.runtime.completed_market_context",
         return_value=context() | {"timestamp": 10140, "low": Decimal("93.1")},
     ):
-        created = controller.determine_executor_actions()[0]
+        created = runtime_actions(controller)[0]
 
     with pytest.raises(ValueError, match="authorization"):
         controller.get_executor_class_for_config(

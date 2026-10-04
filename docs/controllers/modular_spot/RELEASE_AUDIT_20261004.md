@@ -58,3 +58,11 @@ next full-size admission succeeds; an owned order keeps the full reserve.
 The closure digest changes again, from
 `f8fff1774cb401f06097bf55aee534d066f142db68eb209d13a88d8612d2308a` to
 `8d6a84f876daa5a5969ea6ed15f8417c8c6241f6866038a89ffcc293f41e237a` (same 67 paths; `native_funding.py` changed).
+
+Rollback is forward-only once a release exists. Earlier `native_funding.py` sends a
+release without a terminal entry receipt to `_validate_release`, which raises
+`PolicyError: Native terminal reconciliation scope or quantity differs` on every
+assess, admit and reconcile, which stops all new V2 entries. Roll back to an image without this
+change only while the funding state holds no
+`native_insufficient_balance_before_submission_v1` release; after the first one,
+roll forward instead.

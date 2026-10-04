@@ -364,3 +364,44 @@ def test_busy_frames_cannot_extend_missing_heartbeat_deadline():
                 await reader.consume(ws)
         assert len(reader.update_receipts) == 4  # the snapshot plus the three bounded grace frames
     asyncio.run(scenario())
+
+
+def test_receive_timeout_during_a_stall_reads_the_delivered_heartbeat():
+    """The stall usually lands inside the receive wait: its timeout fires before the buffered frame is read."""
+    async def scenario():
+        now = [6000]
+        reader = client(clock=lambda: now[0])
+        delivered = frames(message(), message('heartbeat', at=6001), now=now)
+        calls = []
+
+        async def receive():
+            calls.append(1)
+            if len(calls) == 2:
+                raise asyncio.TimeoutError  # the receive wait expired while the loop was stalled
+            if reader.last_heartbeat == 9.5:
+                return SimpleNamespace(type=aiohttp.WSMsgType.CLOSE, data=None)
+            return await delivered()
+
+        ws = SimpleNamespace(send_json=lambda value: asyncio.sleep(0), receive=receive)
+        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock:
+            clock.monotonic.side_effect = [0, 1, 2, 9.5, 9.6]
+            with pytest.raises(DataUnavailable, match='closed or non-text'):
+                await reader.consume(ws)
+        assert reader.last_heartbeat == 9.5
+    asyncio.run(scenario())
+
+
+def test_receive_timeout_from_a_silent_server_still_ends_the_session():
+    async def scenario():
+        reader = client()
+
+        async def silent():
+            raise asyncio.TimeoutError
+
+        ws = SimpleNamespace(send_json=lambda value: asyncio.sleep(0), receive=silent)
+        with patch('controllers.generic.modular_spot_core.candle_stream.time') as clock, \
+                patch('controllers.generic.modular_spot_core.candle_stream.HEARTBEAT_GRACE_SECONDS', 0.05):
+            clock.monotonic.side_effect = [0, 1]
+            with pytest.raises(DataUnavailable, match='heartbeat deadline'):
+                await reader.consume(ws)
+    asyncio.run(scenario())

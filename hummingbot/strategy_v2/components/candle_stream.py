@@ -196,11 +196,15 @@ class CandleStreamClient:
         await ws.send_json({'v': 1, 'op': 'subscribe', 'pairs': sorted(self.by_pair), 'history': self.history})
         while True:
             remaining = 10 - (time.monotonic() - self.last_heartbeat)
-            if remaining <= 0:
+            try:
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await self._receive(ws, remaining)
+            except asyncio.TimeoutError:
+                # Both the deadline found expired and a receive that timed out while this loop was
+                # stalled may hide a heartbeat the server already delivered.
                 if not await self._heartbeat_already_delivered(ws):
-                    raise DataUnavailable('candle stream heartbeat deadline expired')
-                continue
-            await self._receive(ws, remaining)
+                    raise DataUnavailable('candle stream heartbeat deadline expired') from None
 
     async def _receive(self, ws, timeout):
         message = await asyncio.wait_for(ws.receive(), timeout=timeout)

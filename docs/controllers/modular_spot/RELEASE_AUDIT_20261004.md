@@ -37,3 +37,32 @@ bindings keep their actual identities; the live V2 controllers carry no
 `recipe_binding`. The deployed V2 owner carried its funding ledger and held
 recovery across this code upgrade through the existing native mechanism
 (logged), with a verified continuity restart.
+
+## Funding release for a never-submitted executor
+
+`ExecutorBase.on_start` runs `validate_sufficient_balance()` before any order is
+created; on a short wallet the executor closes `INSUFFICIENT_BALANCE` with no order
+and no terminal entry receipt. `NativeFundingStore` released claims only from such
+a receipt, so the full commitment stayed reserved permanently. V1, V2 and V3 share
+one OKX account without cross-process reservation, so this is an ordinary race.
+`native_funding.py` now releases, with a persisted idempotent receipt
+(`native_insufficient_balance_before_submission_v1`), only a claim whose executor is
+terminal, `INSUFFICIENT_BALANCE`, with zero acquired quantity and no order ids,
+snapshots, owned orders or entry receipt. Anything that ever owned an order keeps
+its full commitment until native reconciliation proves it.
+
+Regression (real DownOnlyMaker executor failing its own budget check, real
+`NativeFundingStore`): 100.300 USDC stayed pending before the change; 0 after; the
+next full-size admission succeeds; an owned order keeps the full reserve.
+
+The closure digest changes again, from
+`f8fff1774cb401f06097bf55aee534d066f142db68eb209d13a88d8612d2308a` to
+`8d6a84f876daa5a5969ea6ed15f8417c8c6241f6866038a89ffcc293f41e237a` (same 67 paths; `native_funding.py` changed).
+
+Rollback is forward-only once a release exists. Earlier `native_funding.py` sends a
+release without a terminal entry receipt to `_validate_release`, which raises
+`PolicyError: Native terminal reconciliation scope or quantity differs` on every
+assess, admit and reconcile, which stops all new V2 entries. Roll back to an image without this
+change only while the funding state holds no
+`native_insufficient_balance_before_submission_v1` release; after the first one,
+roll forward instead.

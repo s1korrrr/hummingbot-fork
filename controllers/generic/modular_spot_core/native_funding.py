@@ -17,6 +17,7 @@ from hummingbot.core.data_type.common import TradeType
 from hummingbot.model.metadata import Metadata
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1, validate_acquisition_chain
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator, PositionHold
+from hummingbot.strategy_v2.models.executors import CloseType
 
 from .config import PolicyModel
 from .domain import PolicyError, decimal, identity
@@ -569,6 +570,13 @@ class NativeFundingStore:
                 for pair in pairs:
                     projection['pending_by_pair'][pair] += reserved
                 continue
+            never_submitted = self._never_submitted_release(info, quantity)
+            if never_submitted is not None and released in (None, never_submitted):
+                # Its own pre-submission budget check stopped it before any order
+                # existed, so no venue commitment can remain to reserve.
+                if reconcile or released is not None:
+                    state['releases'][executor_id] = never_submitted
+                continue
             receipt = (info.custom_info or {}).get('entry_reconciliation') if info is not None else None
             legacy_orders = (receipt.get('orders') if isinstance(receipt, dict)
                              and receipt.get('source') == 'native_terminal_entry_set_v1' else None)
@@ -601,6 +609,23 @@ class NativeFundingStore:
                 pending += reserved
                 projection['pending_by_pair'][info.config.trading_pair] += reserved
         return projection, pending, infos
+
+    @staticmethod
+    def _never_submitted_release(info, quantity):
+        """Release receipt for an executor that closed INSUFFICIENT_BALANCE before any order.
+
+        `ExecutorBase.on_start` runs `validate_sufficient_balance()` before creating an
+        order and closes INSUFFICIENT_BALANCE without a terminal entry receipt. Any
+        owned order id, order snapshot, fill or receipt means a submission may exist,
+        so the commitment stays reserved until native reconciliation proves it.
+        """
+        custom = (info.custom_info or {}) if info is not None else {}
+        if (info is None or quantity != ZERO or info.is_active
+                or getattr(info, 'close_type', None) != CloseType.INSUFFICIENT_BALANCE
+                or custom.get('entry_reconciliation') is not None or custom.get('order_ids')
+                or custom.get('execution_order_snapshots') or ExecutorOrchestrator._owned_order_keys(info)):
+            return None
+        return {'schema': 1, 'source': 'native_insufficient_balance_before_submission_v1', 'executor_id': info.id}
 
     def _validate_release(self, info, receipt, quantity, fills, orders, claim=None):
         if info is None or not isinstance(receipt, dict):

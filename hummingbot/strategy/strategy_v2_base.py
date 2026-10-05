@@ -1095,10 +1095,36 @@ class StrategyV2Base(StrategyPyBase):
                         for sale in getattr(entry.get("performance"), "wallet_sales", [])]
         balance_value_quote = round(sum(row["value_quote"] for row in balances), 6)
         positions_value_quote = round(sum(row["value_quote"] for row in positions_held), 6)
-        realized_pnl_quote = round(sum(row["realized_pnl_quote"] for row in positions_held), 6)
-        unrealized_pnl_quote = round(sum(row["unrealized_pnl_quote"] for row in positions_held), 6)
         fees_quote = round(sum(row["fees_quote"] for row in positions_held)
                            + float(sum((Decimal(sale["fees_quote"]) for sale in wallet_sales), Decimal("0"))), 6)
+
+        # PnL is the controllers' native performance report (closed, active and held), the
+        # same accounting the daily loss rail uses. Executor PnL is already net of its fees;
+        # held-position fees are listed in fees_quote, so realized is stated before them and
+        # consumers' realized - fees and realized + unrealized - fees give the native values.
+        def native_total(field):
+            """Sum of one native report field, or None unless every report states a finite value."""
+            total = Decimal("0")
+            for entry in controller_entries:
+                value = getattr(entry.get("performance"), field, None)
+                try:
+                    value = Decimal(str(value)) if value is not None else None
+                except ArithmeticError:
+                    value = None
+                if value is None or not value.is_finite():
+                    return None
+                total += value
+            return total
+
+        realized_pnl_quote = unrealized_pnl_quote = net_pnl_quote = None
+        if pnl_available:
+            totals = [native_total(field) for field in ("realized_pnl_quote", "unrealized_pnl_quote", "global_pnl_quote")]
+            if any(value is None for value in totals):
+                pnl_available = False  # an available flag without finite values is not PnL evidence
+            else:
+                realized_pnl_quote = round(float(totals[0]) + fees_quote, 6)
+                unrealized_pnl_quote = round(float(totals[1]), 6)
+                net_pnl_quote = round(float(totals[2]), 6)
 
         return {
             "schema_version": 1,
@@ -1126,10 +1152,10 @@ class StrategyV2Base(StrategyPyBase):
                 "positions_held_count": len(positions_held),
                 "controller_count": len(controllers),
                 "positions_value_quote": positions_value_quote,
-                "realized_pnl_quote": realized_pnl_quote if pnl_available else None,
-                "unrealized_pnl_quote": unrealized_pnl_quote if pnl_available else None,
+                "realized_pnl_quote": realized_pnl_quote,
+                "unrealized_pnl_quote": unrealized_pnl_quote,
                 "fees_quote": fees_quote,
-                "net_pnl_quote": round(realized_pnl_quote + unrealized_pnl_quote - fees_quote, 6) if pnl_available else None,
+                "net_pnl_quote": net_pnl_quote,
             },
         }
 

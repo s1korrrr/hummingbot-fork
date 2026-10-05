@@ -26,6 +26,7 @@ from hummingbot.core.data_type.common import MarketDict, PositionMode, PriceType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.event.events import OrderType, PositionAction
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.core.utils import loop_watchdog
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.logger import HummingbotLogger
@@ -1348,6 +1349,10 @@ class StrategyV2Base(StrategyPyBase):
         :param timestamp: Current time.
         """
         self._last_timestamp = timestamp
+        try:
+            loop_watchdog.start(asyncio.get_running_loop())  # Names the code behind any loop stall.
+        except RuntimeError:
+            pass  # Offline harnesses drive the strategy without a running loop: nothing to watch.
         self.apply_initial_setting()
         # Check if MQTT is enabled at runtime
         from hummingbot.client.hummingbot_application import HummingbotApplication

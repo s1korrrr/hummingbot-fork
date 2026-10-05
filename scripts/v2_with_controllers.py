@@ -217,12 +217,25 @@ class V2WithControllers(StrategyV2Base):
             operator_block = (buying and controller is not None
                               and self._durable_operator_policy(controller.config)
                               and self._operator_paused(controller))
+            self._risk_check_recovered()
             return (not daily_block and not operator_block and not self._is_stop_triggered
                     and action.controller_id not in self.drawdown_exited_controllers)
-        except Exception:
-            self._is_stop_triggered = True
-            self.logger().exception('Risk check or persistence failed; new execution blocked')
+        except Exception as error:
+            # Refuse this action only. A transient read/write failure is not a strategy stop:
+            # latching one would persist `stopped` and block every later order, exits included.
+            self._risk_check_failed('Risk check or persistence failed; this action is refused', error)
             return False
+
+    def _risk_check_failed(self, message, error):
+        failure = f'{type(error).__name__}: {error}'
+        if getattr(self, '_risk_check_failure', None) != failure:
+            self.logger().exception(f'{message}: {failure}')
+        self._risk_check_failure = failure
+
+    def _risk_check_recovered(self):
+        if getattr(self, '_risk_check_failure', None) is not None:
+            self.logger().info(f'Risk check recovered after: {self._risk_check_failure}')
+            self._risk_check_failure = None
 
     def format_status(self) -> str:
         status = super().format_status()
@@ -231,6 +244,9 @@ class V2WithControllers(StrategyV2Base):
             return f"EXECUTION BLOCKED: risk reconciliation required: {error}\n\n{status}"
         if self._is_stop_triggered:
             return f"EXECUTION BLOCKED: strategy stop is latched; verify durable risk state before restart.\n\n{status}"
+        failure = getattr(self, '_risk_check_failure', None)
+        if failure is not None:
+            return f"NEW EXECUTIONS REFUSED: risk check failing: {failure}\n\n{status}"
         enrollment = getattr(self, '_entry_risk_enrollment', None)
         if enrollment is not None and enrollment.pending:
             return f"ENTRIES PAUSED: daily loss enrollment awaits a fresh complete native PnL report.\n\n{status}"
@@ -244,15 +260,20 @@ class V2WithControllers(StrategyV2Base):
         # observable while the claim is pending.
         if self._ownership_recovery_complete():
             if not self._is_stop_triggered:
-                self.check_manual_kill_switch()
-                self.control_max_drawdown()
-                self._observe_daily_entry_risk()
+                try:
+                    self.check_manual_kill_switch()
+                    self.control_max_drawdown()
+                    self._observe_daily_entry_risk()
+                except Exception as error:
+                    # Creation re-runs these rails and refuses while they fail; reporting continues.
+                    self._risk_check_failed('Risk rails unavailable; new executions are refused', error)
                 self.send_performance_report()
             try:
                 self._persist_risk_state()
-            except Exception:
-                self._is_stop_triggered = True
-                self.logger().exception('Unable to persist risk state; new execution blocked')
+            except Exception as error:
+                # Every create re-runs the risk check and persistence, so a failing store
+                # refuses new executions until it recovers; it does not latch a stop.
+                self._risk_check_failed('Unable to persist risk state; retrying next tick', error)
 
     def _ownership_recovery_complete(self):
         # Only a pending claim defers risk rails and creation. A failed or

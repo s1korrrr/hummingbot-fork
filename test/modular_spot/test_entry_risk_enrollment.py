@@ -315,9 +315,11 @@ async def test_failed_initial_sample_cannot_admit_orders_or_publish_a_baseline(r
                 patch.object(strategy, 'check_manual_kill_switch'), \
                 patch.object(recorder, 'store_strategy_risk_state',
                              side_effect=OSError('injected write failure') if failure == 'write_failure' else original):
-            assert not strategy.validate_create_action(SimpleNamespace(
-                controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.BUY)))
-        assert strategy._is_stop_triggered
+            buy = SimpleNamespace(controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.BUY))
+            assert not strategy.validate_create_action(buy)
+            assert not strategy.validate_create_action(buy)  # refused for as long as the failure holds
+        # Refusal is per action: a failed sample is not a durable strategy stop.
+        assert not strategy._is_stop_triggered
         assert recorder.load_strategy_risk_state() == before
     finally:
         await close(strategy)

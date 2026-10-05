@@ -254,8 +254,13 @@ async def test_meridian_buy_admission_reads_typed_operator_state_and_fails_close
             controller.paused = True
             assert not strategy.validate_create_action(buy)
             assert strategy.validate_create_action(sell)
+            typed_state = controller.get_operator_state
             controller.get_operator_state = lambda: {"entry_paused": "yes"}
             assert not strategy.validate_create_action(buy)
-            assert strategy._is_stop_triggered
+            assert not strategy.validate_create_action(sell)  # durable state is unreadable: refuse while it lasts
+            assert not strategy._is_stop_triggered
+            controller.get_operator_state = typed_state
+            assert not strategy.validate_create_action(buy)  # still paused
+            assert strategy.validate_create_action(sell)  # readable again: exits proceed, nothing latched
     finally:
         await close_runner(strategy)

@@ -2285,6 +2285,7 @@ class PositionExecutor(ExecutorBase):
             net_pnl_pct = self.get_net_pnl_pct()
             if self._trailing_stop_trigger_pct is None:
                 if net_pnl_pct > self.config.triple_barrier_config.trailing_stop.activation_price:
+                    persisted = self._trailing_state()
                     self._trailing_stop_trigger_pct = self._floored_trailing_trigger_pct(
                         net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
                     )
@@ -2292,7 +2293,7 @@ class PositionExecutor(ExecutorBase):
                     self._trailing_floor_hold = False
                     self._trailing_stop_armed_timestamp = self._strategy.current_timestamp
                     self._trailing_stop_last_update_timestamp = self._strategy.current_timestamp
-                    if not self._checkpoint_trailing_state():
+                    if not self._checkpoint_trailing_state(persisted):
                         return
                     trailing_snapshot = self._trailing_status_snapshot()
                     self.logger().info(
@@ -2337,12 +2338,13 @@ class PositionExecutor(ExecutorBase):
                     net_pnl_pct - self.config.triple_barrier_config.trailing_stop.trailing_delta
                 )
                 if new_trigger > self._trailing_stop_trigger_pct:
+                    persisted = self._trailing_state()
                     previous_trigger = self._trailing_stop_trigger_pct
                     previous_trigger_price = self._price_for_net_pnl_pct(previous_trigger)
                     self._trailing_stop_trigger_pct = new_trigger
                     self._trailing_stop_move_count += 1
                     self._trailing_stop_last_update_timestamp = self._strategy.current_timestamp
-                    if not self._checkpoint_trailing_state():
+                    if not self._checkpoint_trailing_state(persisted):
                         return
                     trailing_snapshot = self._trailing_status_snapshot()
                     self.logger().info(
@@ -2354,14 +2356,27 @@ class PositionExecutor(ExecutorBase):
                         )
                     )
 
-    def _checkpoint_trailing_state(self) -> bool:
-        """Commit a changed high-water before another tick can use it to authorize an exit."""
+    def _trailing_state(self) -> tuple:
+        return (self._trailing_stop_trigger_pct, self._trailing_stop_move_count, self._trailing_floor_hold,
+                self._trailing_stop_armed_timestamp, self._trailing_stop_last_update_timestamp)
+
+    def _checkpoint_trailing_state(self, persisted: tuple) -> bool:
+        """Commit a changed high-water before another tick can use it to authorize an exit.
+
+        A failed write restores the last persisted trailing state, so only durable state can
+        authorize an exit, and the next tick retries. It is not a fill conflict: latching one
+        would stop this position's exits until a manual repair.
+        """
         if self.open_filled_amount <= Decimal("0"):
             return True
         try:
             MarketsRecorder.get_instance().store_or_update_executor(self)
         except Exception as error:
-            self._mark_fill_reconciliation_required(f"Trailing checkpoint failed: {type(error).__name__}")
+            (self._trailing_stop_trigger_pct, self._trailing_stop_move_count, self._trailing_floor_hold,
+             self._trailing_stop_armed_timestamp, self._trailing_stop_last_update_timestamp) = persisted
+            self.logger().error(self._log_message(
+                f"Trailing checkpoint failed: {type(error).__name__}: {error}; "
+                f"keeping the persisted trailing state and retrying next tick"))
             return False
         return True
 

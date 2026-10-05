@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
@@ -94,7 +95,8 @@ def test_partial_entry_has_timeout_and_trailing_protection():
     executor._open_order = tracked('entry', TradeType.BUY, '.4', OrderState.PARTIALLY_FILLED)
     assert executor._should_cancel_stale_unfilled_open_limit_order()
     executor.get_price.return_value = D('105')
-    executor.control_barriers()
+    with patch.object(MarketsRecorder, 'get_instance', return_value=MagicMock()):
+        executor.control_barriers()
     assert executor._trailing_stop_trigger_pct is not None
 
 

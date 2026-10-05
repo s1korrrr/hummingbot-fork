@@ -1531,6 +1531,68 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.update_executors_info.assert_not_called()
         self.strategy.executor_orchestrator.execute_actions.assert_not_called()
 
+    async def _listen_once(self, actions):
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[actions, asyncio.CancelledError])
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+
+    def _refusal_controller(self):
+        controller = MagicMock(status=RunnableStatus.RUNNING)
+        controller.config.manual_kill_switch = False
+        self.strategy.controllers = {"controller_1": controller}
+        self.strategy._is_stop_triggered = False
+        self.strategy._controller_reports_valid = True
+        self.strategy.update_executors_info = MagicMock()
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+        return controller
+
+    async def test_create_refused_by_risk_validation_is_reported_to_its_controller(self):
+        controller = self._refusal_controller()
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.validate_create_action = MagicMock(return_value=False)
+        await self._listen_once([action])
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+        controller.create_action_refused.assert_called_once_with(action)
+
+    async def test_create_refused_for_unavailable_controller_is_reported(self):
+        controller = self._refusal_controller()
+        controller.status = RunnableStatus.TERMINATED
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.validate_create_action = MagicMock(return_value=True)
+        await self._listen_once([action])
+        controller.create_action_refused.assert_called_once_with(action)
+
+    async def test_creates_dropped_by_a_pending_resume_are_reported(self):
+        controller = self._refusal_controller()
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        await self._listen_once([action])
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+        controller.create_action_refused.assert_called_once_with(action)
+
+    async def test_orchestrator_create_failure_reports_the_failed_and_unprocessed_creates(self):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+        controller = self._refusal_controller()
+        first = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        second = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        stop = StopExecutorAction(controller_id="controller_1", executor_id="existing", keep_position=True)
+        self.strategy.validate_create_action = MagicMock(return_value=True)
+        self.strategy.executor_orchestrator.execute_actions = MagicMock(
+            side_effect=RuntimeError("Insufficient unreserved USDC"))
+        await self._listen_once([first, stop, second])
+        self.assertEqual(controller.create_action_refused.call_args_list, [call(first), call(second)])
+
+    async def test_controller_without_the_refusal_hook_is_unchanged(self):
+        controller = self._refusal_controller()
+        del controller.create_action_refused
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.validate_create_action = MagicMock(return_value=False)
+        await self._listen_once([action])
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()
         # Simulate some actions being returned, followed by an exception to break the loop.

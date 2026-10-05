@@ -1524,8 +1524,10 @@ class StrategyV2Base(StrategyPyBase):
         Asynchronously listen to actions from the controllers and execute them.
         """
         while True:
+            pending = []
             try:
                 actions = await self.actions_queue.get()
+                pending = list(actions)
                 if self._unattended_restart_hold:
                     continue
                 if getattr(self.executor_orchestrator, "_planned_resume_pending", False) is True:
@@ -1543,6 +1545,7 @@ class StrategyV2Base(StrategyPyBase):
                             self.logger().warning(f"Rejected queued create for stopped or unavailable controller {action.controller_id}")
                             continue
                     self.executor_orchestrator.execute_actions([action])
+                    pending.remove(action)
                     self.update_executors_info()
                 for controller_id in {action.controller_id for action in actions}:
                     controller = self.controllers.get(controller_id)
@@ -1553,6 +1556,26 @@ class StrategyV2Base(StrategyPyBase):
                 raise
             except Exception as e:
                 self.logger().error(f"Error executing action: {e}", exc_info=True)
+            finally:
+                self._report_refused_creates(pending)
+
+    def _report_refused_creates(self, actions):
+        """Tell each owner which of its queued creates never became an executor.
+
+        A controller that reserves decision state when it proposes an entry releases it in
+        its validator, but the creates skipped or failed above never reach that validator.
+        The hook is optional; controllers without it are unaffected.
+        """
+        for action in actions:
+            if not isinstance(action, CreateExecutorAction):
+                continue
+            refused = getattr(self.controllers.get(action.controller_id), "create_action_refused", None)
+            if not callable(refused):
+                continue
+            try:
+                refused(action)
+            except Exception:
+                self.logger().exception(f"Refused create release failed for {action.controller_id}")
 
     def update_executors_info(self):
         """

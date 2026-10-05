@@ -25,6 +25,10 @@ def _load_module(path: Path, module_name: str):
     return module
 
 
+# The real (empty) parent packages, never empty-path stand-ins: a stand-in installed at
+# collection time would shadow ``controllers`` for every later import in the process.
+import controllers.directional_trading  # noqa: E402,F401
+
 ROOT = Path(__file__).resolve().parents[1]
 _load_module(
     ROOT / "controllers" / "directional_trading" / "rsi_v55_risk.py",

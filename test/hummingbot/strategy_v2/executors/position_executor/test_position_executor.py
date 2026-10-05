@@ -748,6 +748,22 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         self.assertNotEqual(executor._entry_lifecycle.get("state"), "reconciliation_required")
         self.strategy.sell.assert_not_called()
 
+    def test_persistent_trailing_checkpoint_failure_logs_once_and_logs_recovery(self):
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        recorder = MagicMock()
+        recorder.store_or_update_executor.side_effect = IOError("database is locked")
+        with patch.object(MarketsRecorder, "get_instance", return_value=recorder), \
+                patch.object(executor, "logger") as logger:
+            executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.10"))
+            for _ in range(5):
+                executor.control_trailing_stop()
+            self.assertEqual(logger.return_value.error.call_count, 1)
+            recorder.store_or_update_executor.side_effect = None
+            executor.control_trailing_stop()
+        self.assertEqual(executor._trailing_stop_trigger_pct, Decimal("0.08"))
+        self.assertTrue(any("recovered" in str(c) for c in logger.return_value.info.call_args_list))
+
     def test_other_unfinished_owner_never_blocks_direct_position_sell(self):
         executor = self.get_position_executor_running_from_config(
             self.get_position_config_market_long_with_trailing())

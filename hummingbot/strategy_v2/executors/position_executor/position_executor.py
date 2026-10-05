@@ -2374,10 +2374,16 @@ class PositionExecutor(ExecutorBase):
         except Exception as error:
             (self._trailing_stop_trigger_pct, self._trailing_stop_move_count, self._trailing_floor_hold,
              self._trailing_stop_armed_timestamp, self._trailing_stop_last_update_timestamp) = persisted
-            self.logger().error(self._log_message(
-                f"Trailing checkpoint failed: {type(error).__name__}: {error}; "
-                f"keeping the persisted trailing state and retrying next tick"))
+            failure = f"{type(error).__name__}: {error}"
+            if getattr(self, "_trailing_checkpoint_failure", None) != failure:
+                self.logger().error(self._log_message(
+                    f"Trailing checkpoint failed: {failure}; keeping the persisted trailing state and retrying each tick"))
+            self._trailing_checkpoint_failure = failure
             return False
+        if getattr(self, "_trailing_checkpoint_failure", None) is not None:
+            self.logger().info(self._log_message(
+                f"Trailing checkpoint recovered after: {self._trailing_checkpoint_failure}"))
+            self._trailing_checkpoint_failure = None
         return True
 
     async def validate_sufficient_balance(self):

@@ -259,11 +259,13 @@ class V2WithControllers(StrategyV2Base):
         # unclaimed startup snapshot. The entry fence and operator events remain
         # observable while the claim is pending.
         if self._ownership_recovery_complete():
+            rails_ok = False
             if not self._is_stop_triggered:
                 try:
                     self.check_manual_kill_switch()
                     self.control_max_drawdown()
                     self._observe_daily_entry_risk()
+                    rails_ok = True
                 except Exception as error:
                     # Creation re-runs these rails and refuses while they fail; reporting continues.
                     self._risk_check_failed('Risk rails unavailable; new executions are refused', error)
@@ -274,6 +276,9 @@ class V2WithControllers(StrategyV2Base):
                 # Every create re-runs the risk check and persistence, so a failing store
                 # refuses new executions until it recovers; it does not latch a stop.
                 self._risk_check_failed('Unable to persist risk state; retrying next tick', error)
+            else:
+                if rails_ok:
+                    self._risk_check_recovered()
 
     def _ownership_recovery_complete(self):
         # Only a pending claim defers risk rails and creation. A failed or

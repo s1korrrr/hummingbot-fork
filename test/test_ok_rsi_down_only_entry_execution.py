@@ -1317,3 +1317,53 @@ async def test_first_post_only_repair_honors_shared_cooldown_after_real_place():
     assert executor.place_order.call_args.kwargs["price"] == Decimal("100")
     assert executor._entry_intent_created_at == intent_created
     assert executor.config.entry_total_max_age_seconds == 300
+
+
+@pytest.mark.asyncio
+async def test_legacy_latch_after_post_only_repair_cancels_the_live_child() -> None:
+    """Live V1 2026-10-05 (and 09-29, 10-01): OKX canceled a post-only parent (source 31) and the
+    executor placed its post-only repair child. Under the legacy contract that predecessor cancel
+    latches acquisition executor-wide (test_chain_edges, frozen), but the stop then never canceled
+    the still-resting child: the stamp was read as the child's own cancellation, so the child kept
+    resting outside its bounds and deadline and filled 16 minutes later."""
+    executor, connector, prices = make_executor()
+    executor._open_order = tracked_order(price="2379.63")
+    executor._entry_current_price = Decimal("2379.63")
+    executor.config.entry_price = Decimal("2379.63")
+    executor.config.maximum_acceptable_price = Decimal("2379.63")
+    executor.config.decision_best_bid = Decimal("2379.63")
+    executor.config.decision_best_ask = Decimal("2379.64")
+    executor._entry_submitted = True
+    executor._open_order.order.cancel_source = "31"
+    executor._open_order.order.current_state = OrderState.CANCELED
+    install_terminal_reconciliation(connector, executor._open_order)
+    prices[PriceType.BestBid] = Decimal("2379.08")
+    prices[PriceType.BestAsk] = Decimal("2379.62")
+    executor.place_order = MagicMock(side_effect=["child-1"])
+
+    executor.process_order_canceled_event(0, connector, OrderCancelledEvent(12, "parent"))
+    await finish_reconciliation(executor)
+    executor.control_open_order()
+    executor.control_open_order()
+    assert executor.place_order.call_count == 1
+    assert executor._open_order.order_id == "child-1"
+
+    # The repair child rests on the venue: tracked OPEN and reported OPEN by the exchange.
+    child = tracked_order("child-1", price="2379.08").order
+    executor.get_in_flight_order = MagicMock(side_effect=lambda connector_name, order_id: (
+        child if order_id == "child-1" else None))
+    executor.update_tracked_orders_with_order_id("child-1")
+    connector._request_order_status = AsyncMock(return_value=OrderUpdate(
+        trading_pair="ETH-USDC", update_timestamp=20, new_state=OrderState.OPEN,
+        client_order_id="child-1", exchange_order_id="exchange-child-1"))
+    executor._strategy.current_timestamp = 20
+    executor._strategy.cancel.reset_mock()
+    await executor._reconcile_expired_entry()
+    executor.control_open_order()
+
+    # Legacy contract preserved: the predecessor cancel latches the executor-wide stop ...
+    assert executor._entry_stop_reason == "exchange_canceled"
+    # ... and a stopped acquisition must not leave its live child resting: it is canceled.
+    cancels = [c.kwargs.get("order_id") for c in executor._strategy.cancel.call_args_list]
+    assert cancels == ["child-1"]
+    assert executor.get_custom_info()["entry_acquisition"]["state"] == "cancel_pending"

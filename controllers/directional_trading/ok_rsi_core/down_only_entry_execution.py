@@ -637,6 +637,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._entry_reprice_cancel_confirmed = True
             self._entry_lifecycle.update({
                 "state": "reconciliation_pending",
+                "cancel_event_order_id": event.order_id,
                 "cancel_event_timestamp": event.timestamp,
                 "cancel_event_observed_timestamp": self._strategy.current_timestamp,
                 "cancel_source": getattr(order, "cancel_source", None),
@@ -650,6 +651,7 @@ class DownOnlyMakerPositionExecutor(PositionExecutor):
             self._entry_reprice_cancel_confirmed = True
             self._entry_lifecycle.update({
                 "state": "reconciliation_pending",
+                "cancel_event_order_id": event.order_id,
                 "cancel_event_timestamp": event.timestamp,
                 "cancel_event_observed_timestamp": self._strategy.current_timestamp,
                 "cancel_source": OKX_POST_ONLY_CANCEL_SOURCE,

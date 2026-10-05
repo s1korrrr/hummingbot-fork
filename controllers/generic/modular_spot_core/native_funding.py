@@ -596,7 +596,8 @@ class NativeFundingStore:
                 # An in-progress parent keeps its entire remaining commitment,
                 # even when the previous child is terminal and the next child
                 # has been authorized but has no exchange order ID yet.
-                chain = validate_acquisition_chain(info.config, info.custom_info, receipt, require_closed=False)
+                chain = validate_acquisition_chain(info.config, info.custom_info, receipt, require_closed=False,
+                                                   allow_unacknowledged_tail=True)
             if released is not None or (reconcile and receipt is not None and not defer_legacy_release
                                         and (chain is None or chain['membership_closed'])):
                 self._validate_release(info, receipt, quantity, fills, orders, state['claims'][executor_id])

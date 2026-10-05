@@ -155,10 +155,10 @@ def in_flight_case():
 
 def test_open_chain_child_in_submission_keeps_the_chain_open_for_peer_funding():
     config, custom, proofs = in_flight_case()
-    assert validate_acquisition_chain(config, custom, proofs, require_closed=False) == custom['acquisition_chain']
+    assert validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True) == custom['acquisition_chain']
     custom['acquisition_chain']['children'] = custom['acquisition_chain']['children'][:1]
     custom['execution_order_snapshots'] = []
-    assert validate_acquisition_chain(config, custom, [], require_closed=False) == custom['acquisition_chain']
+    assert validate_acquisition_chain(config, custom, [], require_closed=False, allow_unacknowledged_tail=True) == custom['acquisition_chain']
 
 
 @pytest.mark.parametrize('mutation, match', [
@@ -173,10 +173,18 @@ def test_in_flight_tolerance_is_limited_to_the_newest_open_child(mutation, match
     config, custom, proofs = in_flight_case()
     mutation(custom, proofs)
     with pytest.raises(ValueError, match=match):
-        validate_acquisition_chain(config, custom, proofs, require_closed=False)
+        validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True)
 
 
 def test_closed_validation_still_requires_every_child_snapshot():
     config, custom, proofs = in_flight_case()
     with pytest.raises(ValueError, match='coverage|successor'):
-        validate_acquisition_chain(config, custom, proofs)
+        validate_acquisition_chain(config, custom, proofs, allow_unacknowledged_tail=True)
+
+
+def test_executor_own_reconciliation_stays_strict_about_the_tail():
+    # down_only_entry_execution._store_entry_reconciliation validates its own open chain
+    # without the projection allowance; an untracked child there is still a contradiction.
+    config, custom, proofs = in_flight_case()
+    with pytest.raises(ValueError, match='coverage'):
+        validate_acquisition_chain(config, custom, proofs, require_closed=False)

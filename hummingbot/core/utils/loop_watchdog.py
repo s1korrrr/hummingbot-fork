@@ -50,6 +50,12 @@ class LoopWatchdog:
             self.loop.call_later(self.interval, self._beat)
 
     def _watch(self):
+        try:
+            self._observe()
+        except Exception:  # The watchdog only observes: its own failure must not reach the process.
+            self.logger.exception("Event loop watchdog stopped")
+
+    def _observe(self):
         while not self.stopped.wait(self.interval):
             if self.loop.is_closed():
                 return

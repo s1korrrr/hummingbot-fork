@@ -45,7 +45,8 @@ def _proofs(value):
     raise ValueError("Acquisition chain terminal proofs are invalid")
 
 
-def validate_acquisition_chain(config, custom_info, proofs, *, require_closed=True) -> dict:
+def validate_acquisition_chain(config, custom_info, proofs, *, require_closed=True,
+                               allow_unacknowledged_tail=False) -> dict:
     """Return the validated V2 chain; reject missing or contradictory evidence.
 
     `require_closed=False` accepts an incomplete, still fully reserved parent.
@@ -126,10 +127,13 @@ def validate_acquisition_chain(config, custom_info, proofs, *, require_closed=Tr
         if order.client_order_id in snapshots:
             raise ValueError("Acquisition chain native snapshot is duplicated")
         snapshots[order.client_order_id] = order
-    # `place_order` returns the client order id before the connector tracks the order,
-    # so an open chain's newest child can exist one loop turn before its snapshot.
-    # It has no fills yet; the parent's whole remaining authorization stays committed.
-    in_flight = [] if require_closed or chain["membership_closed"] else ids[-1:]
+    # A child is recorded when `place_order` returns its client id; its native order
+    # object arrives with the created event after the exchange acknowledges it. Only a
+    # peer's capacity projection (`allow_unacknowledged_tail`) may see that open tail
+    # without a snapshot: it has no fills and the parent's remaining authorization
+    # stays committed. An executor's own reconciliation and release proofs stay strict.
+    in_flight = (ids[-1:] if allow_unacknowledged_tail and not require_closed
+                 and not chain["membership_closed"] else [])
     if set(snapshots) - set(ids) or set(ids) - set(snapshots) - set(in_flight):
         raise ValueError("Acquisition chain native child coverage differs")
     tracked = [child for child in children if child["order_id"] in snapshots]
@@ -212,7 +216,7 @@ def validate_acquisition_chain(config, custom_info, proofs, *, require_closed=Tr
     for index, child in enumerate(children):
         order = snapshots.get(child["order_id"])
         if order is None:
-            continue  # The in-flight newest child: nothing native to bound yet.
+            continue  # The unacknowledged tail: nothing native to bound yet.
         if (order.amount != _amount(child["submitted_base"], "submitted base", positive=True)
                 or order.price != _amount(child["limit_price"], "child price", positive=True)
                 or order.amount > authorized - sum((snapshots[item].executed_amount_base for item in ids[:index]), Decimal("0"))):

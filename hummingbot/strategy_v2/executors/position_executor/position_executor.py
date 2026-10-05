@@ -1457,7 +1457,9 @@ class PositionExecutor(ExecutorBase):
                     self.config.triple_barrier_config.open_order_type):
                 self._end_entry_acquisition("outside_activation_bounds")
             if self._entry_stop_reason is not None:
-                cancel_observed = self._entry_lifecycle.get("cancel_event_timestamp") is not None
+                # Only the current order's own cancellation makes a cancel request unnecessary.
+                # A predecessor's cancel may latch the stop (legacy contract) while this order rests.
+                cancel_observed = self._current_entry_cancel_observed()
                 self._entry_lifecycle["state"] = "reconciliation_required" if cancel_observed else "cancel_pending"
                 now = self._strategy.current_timestamp
                 if (not cancel_observed and
@@ -1509,6 +1511,23 @@ class PositionExecutor(ExecutorBase):
 
     def _entry_cancel_observed(self):
         return self._entry_lifecycle.get("cancel_event_timestamp") is not None
+
+    def _current_entry_cancel_observed(self):
+        """Whether the exchange cancelled the CURRENT entry order (not only a predecessor).
+
+        A replacement (e.g. a post-only repair) keeps one lifecycle across orders, so a cancel
+        stamp is evidence only for the order it names. Lifecycles persisted before the order id
+        was recorded name no order: a stamp older than the current order's creation cannot be
+        its cancellation.
+        """
+        lifecycle = self._entry_lifecycle
+        if self._open_order is None or lifecycle.get("cancel_event_timestamp") is None:
+            return False
+        order_id = lifecycle.get("cancel_event_order_id")
+        if order_id is not None:
+            return order_id == self._open_order.order_id
+        created = lifecycle.get("creation_timestamp")
+        return created is None or lifecycle["cancel_event_timestamp"] >= created
 
     async def _reconcile_expired_entry(self):
         if (self.config.entry_order_policy == "single_attempt" and self._open_order
@@ -2036,6 +2055,7 @@ class PositionExecutor(ExecutorBase):
             if self.config.entry_order_policy == "single_attempt":
                 self._end_entry_acquisition("exchange_canceled")
                 self._entry_lifecycle.update({
+                    "cancel_event_order_id": event.order_id,
                     "cancel_event_timestamp": event.timestamp,
                     "cancel_event_observed_timestamp": self._strategy.current_timestamp,
                     "cancel_event_observed_wall_timestamp": time.time(),

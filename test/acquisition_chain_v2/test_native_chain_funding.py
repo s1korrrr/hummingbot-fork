@@ -104,6 +104,62 @@ async def test_native_replacement_base_fees_shared_reserve_and_next_pair_admissi
         MarketsRecorder._shared_instance = previous
 
 
+@pytest.mark.asyncio
+async def test_peer_child_awaiting_exchange_ack_does_not_refuse_another_pair(tmp_path):
+    """A child is recorded when `place_order` returns its id; its native order object
+    arrives only with the created event after the exchange acknowledges it (seconds on
+    OKX). During that window another pair's admission must still be decided on capacity
+    (2026-10-05 14:36: BTC refused 'native child coverage differs' while SOL/XRP children
+    awaited their acks)."""
+    previous = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    pairs = ('BTC-USDC', 'XRP-USDC')
+    rules = {pair: TradingRule(pair, min_order_size=D('.01'), min_price_increment=D('.01'),
+                               min_base_amount_increment=D('.01'), min_notional_size=D('1')) for pair in pairs}
+    connector = NativePaperTradeExchange(rules, fee_schema=TradeFeeSchema(
+        maker_percent_fee_decimal=D('.001'), taker_percent_fee_decimal=D('.002'),
+        buy_percent_fee_deducted_from_returns=True), trade_participation=D('1'))
+    connector.set_balance('USDC', D('1000'))
+    configs = [get_config_class('ok_rsi')(
+        profile='ok_rsi', id='modular_spot_ack_' + pair[:3].lower(), trading_pair=pair,
+        connector_name='okx_paper_trade', execution_mode='paper', candles_connector='okx',
+        execution_enabled=pair.startswith('BTC'), min_signal_score=1, strict_hmm_mode=False,
+        trend_confirmation_enabled=False, dynamic_position_sizing=False, usd_per_entry=D('40'),
+        entry_acquisition_policy='down_only_maker_v1', entry_activation_bound_pct=D('.01'), entry_reprice_min_ticks=1,
+        entry_reprice_atr_fraction=D('.01'),
+        funding=dict(allocation_quote='100', fee_reserve_fraction='.003', scope='strategy', max_position_quote='70'),
+    ) for pair in pairs]
+    session = NativePaperSession(connector, configs, tmp_path / 'ack.sqlite')
+    try:
+        for index, frame in enumerate(causal_reversal_frames()):
+            now = 600000 + index * 60
+            await session.step(now, books=[dict(trading_pair=p, sequence=2 + index, timestamp=now,
+                                                bids=[(90, 10)], asks=[(90.01, 10)]) for p in pairs],
+                               candles=[dict(connector_name='okx', trading_pair=p, interval='1m',
+                                             frame=frame, available_at=now) for p in pairs])
+        btc = session.executor_orchestrator.active_executors[configs[0].id][0]
+        assert btc.config.entry_chain_contract == 'v2_bounded_acquisition_v1'
+        assert btc._open_order is not None and btc._open_order.order is not None
+        btc._open_order.order = None  # Submitted, id recorded, created event not yet received.
+        # The next strategy tick publishes that state in the controller's executor report.
+        session.controllers[configs[0].id].executors_info = [btc.executor_info]
+        chain = btc.get_custom_info()['acquisition_chain']
+        assert [child['order_id'] for child in chain['children']] == [btc._open_order.order_id]
+        assert not chain['membership_closed']
+
+        xrp = session.controllers[configs[1].id]
+        store = NativeFundingStore(xrp, session.recorder)
+        assert D(store.assess()['pending_quote']) == btc.config.amount * btc.config.entry_price * D('1.003')
+        too_large = xrp.get_executor_config(TradeType.BUY, D('90'), D('.70'))
+        too_large.amount = D('.70')
+        with pytest.raises(ValueError, match='allocation exhausted'):
+            store.admit(too_large)  # The in-flight parent still holds its whole authorization.
+        assert store.admit(xrp.get_executor_config(TradeType.BUY, D('90'), D('.30')))
+    finally:
+        await session.close()
+        MarketsRecorder._shared_instance = previous
+
+
 async def assert_explicit_legacy_transition_keeps_claim_unreleased(session, owner, executor):
     """Construct old-version facts in a disposable DB, never a live migration."""
     from controllers.generic.modular_spot_core.native_funding import _config_identity

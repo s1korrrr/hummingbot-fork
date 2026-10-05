@@ -126,9 +126,14 @@ def validate_acquisition_chain(config, custom_info, proofs, *, require_closed=Tr
         if order.client_order_id in snapshots:
             raise ValueError("Acquisition chain native snapshot is duplicated")
         snapshots[order.client_order_id] = order
-    if set(snapshots) != set(ids):
+    # `place_order` returns the client order id before the connector tracks the order,
+    # so an open chain's newest child can exist one loop turn before its snapshot.
+    # It has no fills yet; the parent's whole remaining authorization stays committed.
+    in_flight = [] if require_closed or chain["membership_closed"] else ids[-1:]
+    if set(snapshots) - set(ids) or set(ids) - set(snapshots) - set(in_flight):
         raise ValueError("Acquisition chain native child coverage differs")
-    for child in children:
+    tracked = [child for child in children if child["order_id"] in snapshots]
+    for child in tracked:
         order = snapshots[child["order_id"]]
         submitted = _amount(child["submitted_base"], "submitted base", positive=True)
         price = _amount(child["limit_price"], "child price", positive=True)
@@ -205,7 +210,9 @@ def validate_acquisition_chain(config, custom_info, proofs, *, require_closed=Tr
             or snapshot_gross > authorized):
         raise ValueError("Acquisition chain gross fill snapshot differs")
     for index, child in enumerate(children):
-        order = snapshots[child["order_id"]]
+        order = snapshots.get(child["order_id"])
+        if order is None:
+            continue  # The in-flight newest child: nothing native to bound yet.
         if (order.amount != _amount(child["submitted_base"], "submitted base", positive=True)
                 or order.price != _amount(child["limit_price"], "child price", positive=True)
                 or order.amount > authorized - sum((snapshots[item].executed_amount_base for item in ids[:index]), Decimal("0"))):

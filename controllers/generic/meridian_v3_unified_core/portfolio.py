@@ -38,6 +38,17 @@ from .migration import IDENTITY_UNVERIFIED, IdentityGuard, epoch, grant_policy, 
 
 ZERO = Decimal('0')
 ERRORS = (ValueError, TypeError, ArithmeticError, KeyError, AttributeError, OSError)
+# InFlightOrder.to_json re-values cumulative fees through the live rate oracle on every
+# read; they are valuations, not receipts. order_fills keeps each fee's token and amount.
+ORDER_SNAPSHOT_VALUATIONS = frozenset({'cumulative_fee_paid_base', 'cumulative_fee_paid_quote'})
+
+
+def receipt_order_snapshots(snapshots):
+    """Order snapshots reduced to native receipts, for comparing two reads of one executor."""
+    if not isinstance(snapshots, list):
+        return snapshots
+    return [{key: value for key, value in item.items() if key not in ORDER_SNAPSHOT_VALUATIONS}
+            if isinstance(item, dict) else item for item in snapshots]
 
 
 class MeridianPortfolio:
@@ -152,7 +163,7 @@ class MeridianPortfolio:
                             'is_active': row.is_active,
                             'receipt': receipt,
                             'order_ids': custom.get('order_ids'),
-                            'orders': custom.get('execution_order_snapshots'),
+                            'orders': receipt_order_snapshots(custom.get('execution_order_snapshots')),
                             'lot': close_quantity,
                             'entry_state': (custom.get('entry_lifecycle') or {}).get('state'),
                         })

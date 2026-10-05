@@ -286,3 +286,67 @@ def test_operator_receipts_and_risk_state_commit_atomically(recorder):
             {**receipt, 'command_id': 'B'}, receipt])
     assert recorder.load_strategy_risk_state() == revised
     assert not recorder.has_operator_command(OWNER, 'B')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['observe', 'persist'])
+async def test_transient_risk_check_failure_refuses_the_action_without_latching_a_stop(recorder, failure):
+    """One failed risk read or write refuses that action only; it must not become a durable stop."""
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize_modular), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            runtime_db_sync_enabled=False, runtime_status_snapshot_enabled=False, chart_snapshots_enabled=False,
+            max_global_drawdown_quote=100, max_controller_drawdown_quote=20))
+        try:
+            action = SimpleNamespace(controller_id=OWNER,
+                                     executor_config=SimpleNamespace(side=TradeType.BUY))
+            assert strategy._risk_reconciliation_error is None and not strategy._is_stop_triggered
+            # A running owner: current reports, no pending resume claim.
+            strategy._controller_reports_valid = True
+            strategy.executor_orchestrator._planned_resume_pending = False
+            permitted = strategy.validate_create_action(action)
+            target = '_observe_daily_entry_risk' if failure == 'observe' else '_persist_risk_state'
+            with patch.object(strategy, target, side_effect=RuntimeError('database is locked')) as failing:
+                assert strategy.validate_create_action(action) is False
+            assert failing.called
+            assert not strategy._is_stop_triggered
+            strategy._persist_risk_state()
+            assert recorder.load_strategy_risk_state()['stopped'] is False
+            assert strategy.validate_create_action(action) == permitted
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_on_tick_rail_failure_status_and_log_clear_once_the_rails_recover(recorder):
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize_modular), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            runtime_db_sync_enabled=False, runtime_status_snapshot_enabled=False, chart_snapshots_enabled=False,
+            max_global_drawdown_quote=100, max_controller_drawdown_quote=20))
+        try:
+            strategy._controller_reports_valid = True
+            strategy.executor_orchestrator._planned_resume_pending = False
+            with patch.object(StrategyV2Base, 'on_tick'), \
+                    patch.object(StrategyV2Base, 'format_status', return_value='status'), \
+                    patch.object(strategy, 'send_performance_report') as report, \
+                    patch.object(strategy, 'logger') as logger:
+                with patch.object(strategy, '_observe_daily_entry_risk', side_effect=RuntimeError('database is locked')):
+                    strategy.on_tick()
+                assert 'NEW EXECUTIONS REFUSED' in strategy.format_status()
+                assert report.called  # reporting continues while a rail fails
+                strategy.on_tick()  # rails healthy again, with no create attempted in between
+                assert 'NEW EXECUTIONS REFUSED' not in strategy.format_status()
+                assert any('recovered' in str(c) for c in logger.return_value.info.call_args_list)
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)

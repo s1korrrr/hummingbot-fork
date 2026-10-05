@@ -47,7 +47,11 @@ class ModularPositionExecutor(PositionExecutor):
     def control_open_order(self):
         controller = self._strategy.controllers.get(self.config.controller_id)
         if controller is None or not controller.entry_permission(self.config, check_funds=not self._entry_submitted):
-            self._end_entry_acquisition('modular_entry_permission_revoked')
+            # The native stop ends an intent that never reached the venue and leaves a
+            # terminal entry untouched; a submitted entry is cancelled and reconciled.
+            self.stop_entry_acquisition('modular_entry_permission_revoked')
+            if self.is_closed:
+                return
         super().control_open_order()
 
     def _min_no_loss_sell_price(self):

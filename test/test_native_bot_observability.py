@@ -399,7 +399,11 @@ def test_runtime_pnl_requires_nonempty_explicit_performance_evidence():
     exec(compile(ast.Module(body=[method], type_ignores=[]), '<actual snapshot>', 'exec'), namespace)
     controller = Obj(config=Obj(connector_name='okx'), get_custom_info=lambda: {})
     entry = {'controller_id': 'c1', 'controller': controller, 'summary': {'pair': 'SUI-USDC', 'price': '1'}, 'executors': [], 'positions': []}
-    for performance, expected in [(None, False), (Obj(), False), (Obj(pnl_available=1), False), (Obj(pnl_available=False), False), (Obj(pnl_available=True), True)]:
+    stated = dict(realized_pnl_quote=Decimal('1'), unrealized_pnl_quote=Decimal('2'), global_pnl_quote=Decimal('3'))
+    for performance, expected in [(None, False), (Obj(), False), (Obj(pnl_available=1), False), (Obj(pnl_available=False), False),
+                                  (Obj(pnl_available=True), False),  # an available flag without values is not evidence
+                                  (Obj(pnl_available=True, **dict(stated, global_pnl_quote=Decimal('NaN'))), False),
+                                  (Obj(pnl_available=True, **stated), True)]:
         entries = [dict(entry, performance=performance)]
         strategy = Obj(_build_controller_status_entries=lambda: entries, _get_balances_snapshot=lambda: [],
                        connectors={'okx': Obj(in_flight_orders={})}, get_active_orders=lambda _: [],
@@ -413,3 +417,45 @@ def test_runtime_pnl_requires_nonempty_explicit_performance_evidence():
             assert snapshot['summary']['net_pnl_quote'] is None
     entries.clear()
     assert namespace['_build_runtime_status_snapshot'](strategy)['summary']['pnl_available'] is False
+
+
+def test_runtime_summary_pnl_is_the_native_controller_report_not_held_bags_only():
+    """Live V3 showed net 0 with 11 filled tranches: the summary summed held bags only."""
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    from hummingbot.strategy_v2.models.executors_info import PerformanceReport
+
+    def executor(net):
+        return Obj(id='tranche', controller_id='owner',
+                   config=Obj(connector_name='okx', trading_pair='BTC-USDC', amount=Decimal('1'),
+                              price=Decimal('100'), side='BUY'),
+                   custom_info={}, side='BUY', type='position_executor', status=Obj(name='RUNNING'),
+                   close_type=None, timestamp=90, net_pnl_quote=net, net_pnl_pct=Decimal('0'),
+                   filled_amount_quote=Decimal('50'), is_active=True, is_done=False)
+
+    held = Obj(trading_pair='BNB-USDC', side='BUY', amount=Decimal('1'), breakeven_price=Decimal('100'),
+               unrealized_pnl_quote=Decimal('5'), realized_pnl_quote=Decimal('10'), cum_fees_quote=Decimal('2'))
+    # Native accounting: closed executors 10 (net of their fees) + held realized 10 - fees 2.
+    report = PerformanceReport(realized_pnl_quote=Decimal('18'), unrealized_pnl_quote=Decimal('4.4'),
+                               global_pnl_quote=Decimal('22.4'))
+    entry = {'controller_id': 'owner', 'controller': Obj(config=Obj(connector_name='okx'), get_custom_info=lambda: {}),
+             'summary': {}, 'executors': [executor(Decimal('-0.6'))], 'positions': [held], 'performance': report}
+    strategy = Obj(
+        _build_controller_status_entries=lambda: [entry], _get_balances_snapshot=lambda: [],
+        connectors={'okx': Obj(in_flight_orders={})}, get_active_orders=lambda _: [],
+        _runtime_status_snapshot_bot_name=lambda: 'test-bot', _build_runtime_operations_snapshot=lambda: {},
+        _compact_side_label=lambda value: value, _compact_executor_type=lambda value: 'position',
+        _compact_enum_label=lambda value: value.name.lower() if value else None,
+        _format_executor_age_short=lambda timestamp: '10s', current_timestamp=100,
+        _controller_reports_valid=True, _unattended_restart_hold=False,
+        _runtime_position_resume_observation=lambda: _position_resume_observation(strategy),
+        _safe_decimal=lambda value: Decimal(str(value or '0')),
+    )
+    summary = StrategyV2Base._build_runtime_status_snapshot(strategy)['summary']
+    assert summary['pnl_available'] is True
+    assert summary['net_pnl_quote'] == 22.4  # the owner's native number, as the daily rail uses
+    assert summary['unrealized_pnl_quote'] == 4.4
+    assert summary['fees_quote'] == 2.0
+    # Consumers derive net realized as realized - fees and net as realized + unrealized - fees.
+    assert round(summary['realized_pnl_quote'] - summary['fees_quote'], 6) == 18.0
+    assert round(summary['realized_pnl_quote'] + summary['unrealized_pnl_quote'] - summary['fees_quote'], 6) == 22.4
+    assert summary['positions_value_quote'] == 100.0  # held-bag value keeps its meaning

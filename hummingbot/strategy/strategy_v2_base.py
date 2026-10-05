@@ -1095,10 +1095,36 @@ class StrategyV2Base(StrategyPyBase):
                         for sale in getattr(entry.get("performance"), "wallet_sales", [])]
         balance_value_quote = round(sum(row["value_quote"] for row in balances), 6)
         positions_value_quote = round(sum(row["value_quote"] for row in positions_held), 6)
-        realized_pnl_quote = round(sum(row["realized_pnl_quote"] for row in positions_held), 6)
-        unrealized_pnl_quote = round(sum(row["unrealized_pnl_quote"] for row in positions_held), 6)
         fees_quote = round(sum(row["fees_quote"] for row in positions_held)
                            + float(sum((Decimal(sale["fees_quote"]) for sale in wallet_sales), Decimal("0"))), 6)
+
+        # PnL is the controllers' native performance report (closed, active and held), the
+        # same accounting the daily loss rail uses. Executor PnL is already net of its fees;
+        # held-position fees are listed in fees_quote, so realized is stated before them and
+        # consumers' realized - fees and realized + unrealized - fees give the native values.
+        def native_total(field):
+            """Sum of one native report field, or None unless every report states a finite value."""
+            total = Decimal("0")
+            for entry in controller_entries:
+                value = getattr(entry.get("performance"), field, None)
+                try:
+                    value = Decimal(str(value)) if value is not None else None
+                except ArithmeticError:
+                    value = None
+                if value is None or not value.is_finite():
+                    return None
+                total += value
+            return total
+
+        realized_pnl_quote = unrealized_pnl_quote = net_pnl_quote = None
+        if pnl_available:
+            totals = [native_total(field) for field in ("realized_pnl_quote", "unrealized_pnl_quote", "global_pnl_quote")]
+            if any(value is None for value in totals):
+                pnl_available = False  # an available flag without finite values is not PnL evidence
+            else:
+                realized_pnl_quote = round(float(totals[0]) + fees_quote, 6)
+                unrealized_pnl_quote = round(float(totals[1]), 6)
+                net_pnl_quote = round(float(totals[2]), 6)
 
         return {
             "schema_version": 1,
@@ -1126,10 +1152,10 @@ class StrategyV2Base(StrategyPyBase):
                 "positions_held_count": len(positions_held),
                 "controller_count": len(controllers),
                 "positions_value_quote": positions_value_quote,
-                "realized_pnl_quote": realized_pnl_quote if pnl_available else None,
-                "unrealized_pnl_quote": unrealized_pnl_quote if pnl_available else None,
+                "realized_pnl_quote": realized_pnl_quote,
+                "unrealized_pnl_quote": unrealized_pnl_quote,
                 "fees_quote": fees_quote,
-                "net_pnl_quote": round(realized_pnl_quote + unrealized_pnl_quote - fees_quote, 6) if pnl_available else None,
+                "net_pnl_quote": net_pnl_quote,
             },
         }
 
@@ -1524,8 +1550,10 @@ class StrategyV2Base(StrategyPyBase):
         Asynchronously listen to actions from the controllers and execute them.
         """
         while True:
+            pending = []
             try:
                 actions = await self.actions_queue.get()
+                pending = list(actions)
                 if self._unattended_restart_hold:
                     continue
                 if getattr(self.executor_orchestrator, "_planned_resume_pending", False) is True:
@@ -1543,6 +1571,7 @@ class StrategyV2Base(StrategyPyBase):
                             self.logger().warning(f"Rejected queued create for stopped or unavailable controller {action.controller_id}")
                             continue
                     self.executor_orchestrator.execute_actions([action])
+                    pending.remove(action)
                     self.update_executors_info()
                 for controller_id in {action.controller_id for action in actions}:
                     controller = self.controllers.get(controller_id)
@@ -1553,6 +1582,26 @@ class StrategyV2Base(StrategyPyBase):
                 raise
             except Exception as e:
                 self.logger().error(f"Error executing action: {e}", exc_info=True)
+            finally:
+                self._report_refused_creates(pending)
+
+    def _report_refused_creates(self, actions):
+        """Tell each owner which of its queued creates never became an executor.
+
+        A controller that reserves decision state when it proposes an entry releases it in
+        its validator, but the creates skipped or failed above never reach that validator.
+        The hook is optional; controllers without it are unaffected.
+        """
+        for action in actions:
+            if not isinstance(action, CreateExecutorAction):
+                continue
+            refused = getattr(self.controllers.get(action.controller_id), "create_action_refused", None)
+            if not callable(refused):
+                continue
+            try:
+                refused(action)
+            except Exception:
+                self.logger().exception(f"Refused create release failed for {action.controller_id}")
 
     def update_executors_info(self):
         """

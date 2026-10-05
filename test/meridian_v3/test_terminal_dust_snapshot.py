@@ -431,3 +431,29 @@ def test_native_terminal_dust_retains_signed_maker_rebates(side, token):
     assert asset.quantity == dust + D('0.000000008552')
     assert abs(asset.basis_quote - expected_basis) < D('1e-24')
     assert asset.sellable_quantity == 0
+
+
+def test_rate_oracle_fee_valuation_is_not_part_of_the_terminal_proof():
+    portfolio, rows, _, _ = snapshot_case()
+    current = copy.deepcopy(rows)
+    for order in current[0].custom_info['execution_order_snapshots']:
+        order['cumulative_fee_paid_base'] = 0.000001234  # re-valued through the live rate oracle
+        order['cumulative_fee_paid_quote'] = 0.1
+    portfolio.owner.executors_info = current
+    portfolio.recorder.return_value.get_all_executors = lambda: rows
+    portfolio._tick = None
+    portfolio.evidence = MeridianPortfolio.evidence.__get__(portfolio, MeridianPortfolio)
+    assert take_snapshot(portfolio).reconciled
+
+
+def test_changed_native_fill_fee_receipt_still_breaks_the_terminal_proof():
+    portfolio, rows, _, _ = snapshot_case()
+    current = copy.deepcopy(rows)
+    [fill] = current[0].custom_info['execution_order_snapshots'][1]['order_fills'].values()
+    fill['fee'] = {'percent': '0', 'flat_fees': [{'token': 'USDC', 'amount': '0.01'}]}
+    portfolio.owner.executors_info = current
+    portfolio.recorder.return_value.get_all_executors = lambda: rows
+    portfolio._tick = None
+    portfolio.evidence = MeridianPortfolio.evidence.__get__(portfolio, MeridianPortfolio)
+    with pytest.raises(PolicyError, match='terminal dust proof'):
+        take_snapshot(portfolio)

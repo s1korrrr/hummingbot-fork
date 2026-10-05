@@ -539,6 +539,18 @@ class NativeComposition:
         self.logger().warning('native executor create refused: %s', reason)
         return False
 
+    def create_action_refused(self, action):
+        """The engine dropped this queued create before calling validate_executor_config.
+
+        Every refusal inside the validator already releases the reserved entry decision;
+        this covers the refusals that never reach it. The release re-arms only when no
+        executor row exists.
+        """
+        if getattr(getattr(action, 'executor_config', None), 'side', None) == TradeType.BUY:
+            release = getattr(self, '_release_entry_decision', None)
+            if callable(release):
+                release()
+
     def validate_executor_config(self, config):
         if (config.side == TradeType.BUY and self.config.funding is not None
                 and self._native_family == 'ok_rsi'

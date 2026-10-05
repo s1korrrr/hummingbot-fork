@@ -108,3 +108,22 @@ def test_funded_entry_above_venue_minimum_is_held_when_minimum_exceeds_cap():
     assert 'per-entry' in controller._funding_hold
     assert controller.validate_executor_config(config) is False
     controller._release_entry_decision.assert_called_once()
+
+
+def test_buy_refused_before_the_validator_releases_the_reserved_entry_decision():
+    """The engine can drop a queued BUY (risk refusal, resume hold, create failure) before this
+    owner's validator runs; the reserved ok_rsi entry decision must not stay held until restart."""
+    from types import SimpleNamespace
+
+    from hummingbot.core.data_type.common import TradeType
+    controller = owner(execution_enabled=True)
+    controller._release_entry_decision = Mock()
+    controller.create_action_refused(SimpleNamespace(executor_config=SimpleNamespace(side=TradeType.SELL)))
+    controller._release_entry_decision.assert_not_called()
+    controller.create_action_refused(SimpleNamespace(executor_config=SimpleNamespace(side=TradeType.BUY)))
+    controller._release_entry_decision.assert_called_once_with()
+
+
+def test_frozen_v1_controller_does_not_adopt_the_refused_create_hook():
+    from controllers.directional_trading.ok_rsi import OKRSIController
+    assert not hasattr(OKRSIController, 'create_action_refused')

@@ -24,7 +24,8 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     # candle_stream and data_reader components changed; crash and V3-only dust
     # modules remain outside it. Historical bindings are not rewritten. The
     # stalled-loop heartbeat drain in candle_stream is recorded there as well.
-    assert source_digest(source_root(), source_files()) == '156119946b518b04a0116a6db993057e1ff96dee59e8fa99c973bab9c7889a7d'  # noqa: documentation
+    # RELEASE_AUDIT_20261005.md records the execution.py and native_composition.py changes.
+    assert source_digest(source_root(), source_files()) == 'b6a9dd1193d42fdb42637b1a8ea1bd7222bddf9bb40b820c54276133cd0c8321'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

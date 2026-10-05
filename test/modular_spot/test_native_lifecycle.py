@@ -257,3 +257,17 @@ def test_per_tranche_quantity_cost_fees_and_tick_floor():
     assert floor is not None
     assert floor == (floor / D('.01')).to_integral_value() * D('.01')
     assert floor >= D('100')
+
+
+def test_permission_revoked_before_submission_ends_the_unsent_entry():
+    """A revoked entry that never reached the venue ends; it must not wait forever for reconciliation."""
+    executor = make_modular_executor()
+    executor._strategy.controllers[executor.config.controller_id] = NS(
+        entry_permission=lambda config, check_funds=True: False)
+    assert executor._open_order is None and executor._entry_submitted is False
+    executor.control_open_order()
+    executor.place_order.assert_not_called()
+    assert executor._entry_stop_reason == 'modular_entry_permission_revoked'
+    assert executor._entry_lifecycle['state'] == 'ended_no_fill'
+    assert executor.close_type == CloseType.EXPIRED
+    assert executor.is_closed

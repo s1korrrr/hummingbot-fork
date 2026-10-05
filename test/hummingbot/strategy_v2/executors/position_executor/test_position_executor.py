@@ -713,8 +713,56 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
             executor.get_net_pnl_pct.return_value = Decimal("0.01")
             executor.control_trailing_stop()
 
-        self.assertIsNotNone(executor._resume_conflicting_fill)
+        # An unpersisted arm never authorizes an exit, and a write failure is not a fill conflict.
+        self.assertIsNone(executor._trailing_stop_trigger_pct)
+        self.assertIsNone(executor._resume_conflicting_fill)
         self.strategy.sell.assert_not_called()
+
+    def test_trailing_checkpoint_failure_keeps_persisted_trigger_and_retries(self):
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        recorder = MagicMock()
+        recorder.store_or_update_executor.side_effect = IOError("database is locked")
+        with patch.object(MarketsRecorder, "get_instance", return_value=recorder):
+            executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.10"))
+            executor.control_trailing_stop()
+            self.assertIsNone(executor._trailing_stop_trigger_pct)
+
+            recorder.store_or_update_executor.side_effect = None
+            executor.control_trailing_stop()
+            self.assertEqual(executor._trailing_stop_trigger_pct, Decimal("0.08"))
+            self.assertEqual(executor._trailing_stop_move_count, 0)
+
+            recorder.store_or_update_executor.side_effect = IOError("database is locked")
+            executor.get_net_pnl_pct.return_value = Decimal("0.13")
+            executor.control_trailing_stop()
+            self.assertEqual(executor._trailing_stop_trigger_pct, Decimal("0.08"))
+            self.assertEqual(executor._trailing_stop_move_count, 0)
+
+            recorder.store_or_update_executor.side_effect = None
+            executor.control_trailing_stop()
+            self.assertEqual(executor._trailing_stop_trigger_pct, Decimal("0.11"))
+            self.assertEqual(executor._trailing_stop_move_count, 1)
+
+        self.assertIsNone(executor._resume_conflicting_fill)
+        self.assertNotEqual(executor._entry_lifecycle.get("state"), "reconciliation_required")
+        self.strategy.sell.assert_not_called()
+
+    def test_persistent_trailing_checkpoint_failure_logs_once_and_logs_recovery(self):
+        executor, order, _ = self.expired_entry_fixture(Decimal("1"))
+        order.current_state = OrderState.FILLED
+        recorder = MagicMock()
+        recorder.store_or_update_executor.side_effect = IOError("database is locked")
+        with patch.object(MarketsRecorder, "get_instance", return_value=recorder), \
+                patch.object(executor, "logger") as logger:
+            executor.get_net_pnl_pct = MagicMock(return_value=Decimal("0.10"))
+            for _ in range(5):
+                executor.control_trailing_stop()
+            self.assertEqual(logger.return_value.error.call_count, 1)
+            recorder.store_or_update_executor.side_effect = None
+            executor.control_trailing_stop()
+        self.assertEqual(executor._trailing_stop_trigger_pct, Decimal("0.08"))
+        self.assertTrue(any("recovered" in str(c) for c in logger.return_value.info.call_args_list))
 
     def test_other_unfinished_owner_never_blocks_direct_position_sell(self):
         executor = self.get_position_executor_running_from_config(
@@ -2022,7 +2070,8 @@ class TestPositionExecutor(IsolatedAsyncioWrapperTestCase):
         pending_task = executor._entry_expiry_reconciliation_task
         order.update_with_trade_update(self.entry_trade(order, Decimal("0.2")))
         connector.get_price_by_type.return_value = Decimal("110")
-        await asyncio.wait_for(executor.control_task(), timeout=0.1)
+        with patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+            await asyncio.wait_for(executor.control_task(), timeout=0.1)
         await asyncio.gather(pending_task, return_exceptions=True)
         self.assertTrue(pending_task.cancelled())
         self.assertIsNotNone(executor._trailing_stop_trigger_pct)

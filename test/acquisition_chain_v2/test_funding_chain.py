@@ -188,3 +188,21 @@ def test_executor_own_reconciliation_stays_strict_about_the_tail():
     config, custom, proofs = in_flight_case()
     with pytest.raises(ValueError, match='coverage'):
         validate_acquisition_chain(config, custom, proofs, require_closed=False)
+
+
+def test_unacknowledged_tail_keeps_its_authorization_and_predecessor_proof_bounds():
+    """Only the native comparison waits for the ack: a tail after a filled predecessor, or
+    beyond the remaining authorization, is refused before its order object exists."""
+    config, custom, proofs = in_flight_case()
+    first = InFlightOrder.from_json(custom['execution_order_snapshots'][0])
+    first.update_with_trade_update(TradeUpdate('old-fill', 'first', 'venue-first', 'BTC-USDC', 3,
+                                               Decimal('100'), Decimal('.4'), Decimal('40'), AddedToCostTradeFee()))
+    first.current_state = OrderState.CANCELED
+    custom['execution_order_snapshots'][0] = first.to_json()
+    custom['acquisition_chain']['gross_filled_base'] = '.4'
+    proofs[0].update(filled_base='.4', trade_ids=['old-fill'])
+    with pytest.raises(ValueError, match='exceeds authorization'):  # 1.0 tail > 0.6 remaining
+        validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True)
+    custom['acquisition_chain']['children'][1]['submitted_base'] = '.6'
+    with pytest.raises(ValueError, match='zero-fill'):  # a filled predecessor never authorizes a successor
+        validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True)

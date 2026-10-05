@@ -214,12 +214,11 @@ def validate_acquisition_chain(config, custom_info, proofs, *, require_closed=Tr
             or snapshot_gross > authorized):
         raise ValueError("Acquisition chain gross fill snapshot differs")
     for index, child in enumerate(children):
-        order = snapshots.get(child["order_id"])
-        if order is None:
-            continue  # The unacknowledged tail: nothing native to bound yet.
-        if (order.amount != _amount(child["submitted_base"], "submitted base", positive=True)
-                or order.price != _amount(child["limit_price"], "child price", positive=True)
-                or order.amount > authorized - sum((snapshots[item].executed_amount_base for item in ids[:index]), Decimal("0"))):
+        submitted = _amount(child["submitted_base"], "submitted base", positive=True)
+        order = snapshots.get(child["order_id"])  # None only for the unacknowledged tail.
+        if (order is not None and (order.amount != submitted
+                                   or order.price != _amount(child["limit_price"], "child price", positive=True))
+                or submitted > authorized - sum((snapshots[item].executed_amount_base for item in ids[:index]), Decimal("0"))):
             raise ValueError("Acquisition chain submitted order exceeds authorization")
         if index:
             previous = proof_by_id.get(ids[index - 1])

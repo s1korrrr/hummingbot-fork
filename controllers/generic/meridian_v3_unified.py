@@ -336,12 +336,17 @@ class MeridianUnifiedController(ControllerBase):
         """The fleet status row: `gate` is 'ready' only when nothing holds new acquisitions."""
         status = self.portfolio.status
         reason, hold = status.get('reason'), status.get('hold')
+        faulted = sorted(pair for pair, context in self.contexts.items() if context.runtime.fault)
         if not self.config.execution_enabled:
             gate = 'execution_disabled'
-        elif self.config.manual_kill_switch:
-            gate = 'kill_switch_entry_hold'
+        elif self.entries_held() is not None:
+            gate = self.entries_held()
+        elif hold is not None:
+            gate = reason
+        elif faulted:
+            gate, hold = 'symbol_fault', ','.join(faulted)
         else:
-            gate = 'ready' if hold is None else reason
+            gate = 'ready'
         return {'gate': gate, 'state': reason, 'note': (hold or '')[:120]}
 
     def to_format_status(self):

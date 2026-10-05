@@ -149,6 +149,34 @@ def test_persistence_failure_suppresses_action_and_restart_retains_prior_peak(re
     assert next(iter(restored._recovery_trails.values())).peak_price == D('102')
 
 
+def test_locked_recorder_holds_one_cycle_then_dispatches_without_restart(recorder):
+    """A busy SQLite recorder is not a contradiction: no latched fault, the next cycle decides again."""
+    from sqlalchemy.exc import OperationalError
+    result = armed_owner(recorder)
+    observe(result, '101.6', reversal=True)
+    store = result._recovery_store
+    healthy, calls = store.recorder, []
+
+    def locked_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OperationalError('UPDATE', {}, Exception('database is locked'))
+        return healthy.sql_manager.get_new_session()
+
+    class LockedOnce:  # The same recorder whose first SQL session reports a held lock.
+        sql_manager = SimpleNamespace(get_new_session=locked_once)
+
+        def __getattr__(self, name):
+            return getattr(healthy, name)
+    store.recorder = LockedOnce()
+    assert result.determine_executor_actions() == []
+    assert result._recovery_fault is None and 'unavailable' in result._recovery_hold
+    assert next(iter(result._recovery_trails.values())).peak_price == D('102')  # Rolled back, not reset.
+    actions = result.determine_executor_actions()
+    assert [a.executor_config.side for a in actions] == [TradeType.SELL]
+    assert result._recovery_fault is None and result._recovery_hold is None
+
+
 def test_restart_inventory_or_configuration_change_requires_explicit_reconciliation(recorder):
     first = armed_owner(recorder)
     persist_position(recorder, first.config.id, amount=D('.5'))

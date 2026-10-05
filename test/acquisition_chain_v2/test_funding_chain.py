@@ -136,3 +136,73 @@ def test_cumulative_quote_must_match_exact_child_fill_receipts():
     custom['execution_order_snapshots'][1]['executed_amount_quote'] = '98'
     with pytest.raises(ValueError, match='native quote total differs'):
         validate_acquisition_chain(config, custom, proofs)
+
+
+def in_flight_case():
+    """A parent whose newest child was submitted but is not yet tracked by the connector.
+
+    `place_order` returns the client order id synchronously; the connector starts
+    tracking it only when its create task first runs, so the chain records the
+    child one loop turn before any native snapshot exists.
+    """
+    config, custom, proofs = chain_case()
+    custom = deepcopy(custom)
+    custom['acquisition_chain']['membership_closed'] = False
+    custom['acquisition_chain']['gross_filled_base'] = '0'
+    custom['execution_order_snapshots'] = custom['execution_order_snapshots'][:1]
+    return config, custom, proofs[:1]
+
+
+def test_open_chain_child_in_submission_keeps_the_chain_open_for_peer_funding():
+    config, custom, proofs = in_flight_case()
+    assert validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True) == custom['acquisition_chain']
+    custom['acquisition_chain']['children'] = custom['acquisition_chain']['children'][:1]
+    custom['execution_order_snapshots'] = []
+    assert validate_acquisition_chain(config, custom, [], require_closed=False, allow_unacknowledged_tail=True) == custom['acquisition_chain']
+
+
+@pytest.mark.parametrize('mutation, match', [
+    # Only the newest child can be in submission; an older one without a snapshot is lost history.
+    (lambda c, p: c['execution_order_snapshots'].__setitem__(slice(None), []), 'coverage'),
+    # A closed chain claims every child terminal, so each needs its native order.
+    (lambda c, p: c['acquisition_chain'].update(membership_closed=True), 'coverage|successor|closed'),
+    # A proof cannot cover an order the connector never tracked.
+    (lambda c, p: p.append({**p[0], 'order_id': 'second', 'exchange_order_id': 'venue-second'}), 'proof'),
+])
+def test_in_flight_tolerance_is_limited_to_the_newest_open_child(mutation, match):
+    config, custom, proofs = in_flight_case()
+    mutation(custom, proofs)
+    with pytest.raises(ValueError, match=match):
+        validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True)
+
+
+def test_closed_validation_still_requires_every_child_snapshot():
+    config, custom, proofs = in_flight_case()
+    with pytest.raises(ValueError, match='coverage|successor'):
+        validate_acquisition_chain(config, custom, proofs, allow_unacknowledged_tail=True)
+
+
+def test_executor_own_reconciliation_stays_strict_about_the_tail():
+    # down_only_entry_execution._store_entry_reconciliation validates its own open chain
+    # without the projection allowance; an untracked child there is still a contradiction.
+    config, custom, proofs = in_flight_case()
+    with pytest.raises(ValueError, match='coverage'):
+        validate_acquisition_chain(config, custom, proofs, require_closed=False)
+
+
+def test_unacknowledged_tail_keeps_its_authorization_and_predecessor_proof_bounds():
+    """Only the native comparison waits for the ack: a tail after a filled predecessor, or
+    beyond the remaining authorization, is refused before its order object exists."""
+    config, custom, proofs = in_flight_case()
+    first = InFlightOrder.from_json(custom['execution_order_snapshots'][0])
+    first.update_with_trade_update(TradeUpdate('old-fill', 'first', 'venue-first', 'BTC-USDC', 3,
+                                               Decimal('100'), Decimal('.4'), Decimal('40'), AddedToCostTradeFee()))
+    first.current_state = OrderState.CANCELED
+    custom['execution_order_snapshots'][0] = first.to_json()
+    custom['acquisition_chain']['gross_filled_base'] = '.4'
+    proofs[0].update(filled_base='.4', trade_ids=['old-fill'])
+    with pytest.raises(ValueError, match='exceeds authorization'):  # 1.0 tail > 0.6 remaining
+        validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True)
+    custom['acquisition_chain']['children'][1]['submitted_base'] = '.6'
+    with pytest.raises(ValueError, match='zero-fill'):  # a filled predecessor never authorizes a successor
+        validate_acquisition_chain(config, custom, proofs, require_closed=False, allow_unacknowledged_tail=True)

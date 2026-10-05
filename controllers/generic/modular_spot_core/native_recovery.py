@@ -208,7 +208,7 @@ class NativeRecoveryStore:
                 self.raw = None if row is None else row.value
             self.previous = None if self.raw is None else decode(self.raw)
         except SQLAlchemyError as exc:
-            raise PolicyError('native recovery checkpoint store unavailable') from exc
+            raise DataUnavailable('native recovery checkpoint store unavailable') from exc
 
     def prepare(self):
         positions = self.inventory()
@@ -314,6 +314,8 @@ class NativeRecoveryStore:
                             Metadata.key == self.key, Metadata.value == self.raw).values(value=payload))
                         if changed.rowcount != 1:
                             raise PolicyError('native held recovery concurrent writer; dispatch refused')
-        except (IntegrityError, SQLAlchemyError) as exc:
-            raise PolicyError('native held recovery persistence failed; dispatch refused') from exc
+        except IntegrityError as exc:  # Another writer created the checkpoint first.
+            raise PolicyError('native held recovery concurrent writer; dispatch refused') from exc
+        except SQLAlchemyError as exc:  # Rolled back: nothing persisted, the next cycle decides again.
+            raise DataUnavailable('native held recovery persistence unavailable; dispatch refused') from exc
         self.previous, self.raw = value, payload

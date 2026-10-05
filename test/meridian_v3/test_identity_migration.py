@@ -130,6 +130,9 @@ class IdentityMigrationTests(OwnerStateCase):
         info = r.controller.get_custom_info()
         self.assertEqual(info['identity_hold'], hold)
         self.assertEqual(info['portfolio']['reason'], IDENTITY_MIGRATION_REQUIRED)
+        summary = r.controller.get_status_summary()  # The fleet runtime status reports this gate.
+        self.assertEqual((summary['gate'], summary['state']), (IDENTITY_MIGRATION_REQUIRED, IDENTITY_MIGRATION_REQUIRED))
+        self.assertEqual(summary['note'], hold[:120])
         self.assertEqual({row['status'] for row in info['symbols'].values()}, {IDENTITY_MIGRATION_REQUIRED})
         self.assertEqual(self.migration_rows(r), self.migration_rows(before))  # nothing rewritten or deleted
         # The paper engine suspends filled tranches into held positions at close; live restart
@@ -169,6 +172,15 @@ class IdentityMigrationTests(OwnerStateCase):
         head = r.controller.portfolio.target_store().head()
         await r.step()
         self.assertIsNone(r.controller.portfolio.identity_hold)
+        self.assertEqual(r.controller.get_status_summary()['gate'], 'ready')
+        r.controller.set_operator_entry_pause(True, reason='test')
+        self.assertEqual(r.controller.get_status_summary()['gate'], 'operator_entry_pause')
+        r.controller.set_operator_entry_pause(False)
+        runtime = r.controller.contexts[SOL].runtime
+        runtime.fault = 'PolicyError:test'
+        self.assertEqual(r.controller.get_status_summary()['gate'], 'symbol_fault')
+        self.assertEqual(r.controller.get_status_summary()['note'], SOL)
+        runtime.fault = None
         self.assertEqual({g.grant_id for g in r.grants()}, {g.grant_id for g in before['grants']})
         self.assertEqual(r.held(BTC), before['held'])
         receipt = await r.step(rsi={SOL: rebound()})

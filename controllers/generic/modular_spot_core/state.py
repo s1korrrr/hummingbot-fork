@@ -8,7 +8,7 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from .config import PolicyModel
-from .domain import PolicyError, identity
+from .domain import DataUnavailable, PolicyError, identity
 
 
 class DecisionState(PolicyModel):
@@ -66,7 +66,7 @@ class DecisionStore:
                 raw = None if row is None else row.value
             return (None, None) if raw is None else (decode(raw), raw)
         except SQLAlchemyError as exc:
-            raise PolicyError('decision store unavailable') from exc
+            raise DataUnavailable('decision store unavailable') from exc
 
     def compare_and_swap(self, expected: str | None, state: DecisionState) -> bool:
         payload = encode(state)
@@ -118,7 +118,7 @@ class DecisionStore:
         except IntegrityError:
             return False
         except SQLAlchemyError as exc:
-            raise PolicyError('decision persistence failed; no dispatch') from exc
+            raise DataUnavailable('decision persistence unavailable; no dispatch') from exc
 
 
 def reconcile_claims(state: DecisionState, inventory, *, bag_empty=None):

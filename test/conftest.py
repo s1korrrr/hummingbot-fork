@@ -31,5 +31,5 @@ def _restore_purged_controller_modules():
     if all(after.get(name) is module for name, module in before.items()):
         return
     for name in after.keys() - before.keys():
-        del sys.modules[name]
+        sys.modules.pop(name, None)
     sys.modules.update(before)

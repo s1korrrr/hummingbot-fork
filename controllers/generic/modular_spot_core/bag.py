@@ -38,7 +38,7 @@ from hummingbot.strategy_v2.components.held_inventory import (
 from hummingbot.strategy_v2.components.program_budget import BAG_RECOVERY_LEVEL
 
 from .config import PolicyModel
-from .domain import PolicyError, decimal, identity
+from .domain import DataUnavailable, PolicyError, decimal, identity
 
 RECOVERY_LEVEL = BAG_RECOVERY_LEVEL  # the program budget recognises member bag sells by this level
 
@@ -642,7 +642,7 @@ class BagTrailStore:
                 row = session.get(self.model, self.key)
                 raw = None if row is None else row.value
         except SQLAlchemyError as exc:
-            raise PolicyError('bag store unavailable') from exc
+            raise DataUnavailable('bag store unavailable') from exc
         return (None, None, None) if raw is None else (*self.decode(raw), raw)
 
     def compare_and_swap(self, expected: Optional[str], trail, evaluated_candle) -> bool:
@@ -662,4 +662,4 @@ class BagTrailStore:
         except IntegrityError:
             return False
         except SQLAlchemyError as exc:
-            raise PolicyError('bag persistence failed; no dispatch') from exc
+            raise DataUnavailable('bag persistence unavailable; no dispatch') from exc

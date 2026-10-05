@@ -14,7 +14,7 @@ from hummingbot.strategy_v2.executors.order_executor.order_executor import Order
 from hummingbot.strategy_v2.models.base import RunnableStatus
 
 from .config import TrailingPolicy
-from .domain import PolicyError, decimal, identity
+from .domain import DataUnavailable, PolicyError, decimal, identity
 from .inventory import inventory_view
 from .trailing import protected_sell_price
 
@@ -411,7 +411,7 @@ class SellOnlyStore:
                 raw = None if row is None else row.value
             return (None, None) if raw is None else (self._decode(raw), raw)
         except SQLAlchemyError as exc:
-            raise PolicyError('sell-only store unavailable') from exc
+            raise DataUnavailable('sell-only store unavailable') from exc
 
     def replace(self, lots: tuple[InventoryHandoff, ...]) -> bool:
         payload = self._encode(lots)
@@ -429,7 +429,7 @@ class SellOnlyStore:
         except IntegrityError:
             return False
         except SQLAlchemyError as exc:
-            raise PolicyError('sell-only persistence failed') from exc
+            raise DataUnavailable('sell-only persistence unavailable') from exc
 
     def _encode(self, lots):
         rows = []

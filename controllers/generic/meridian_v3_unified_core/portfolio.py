@@ -101,6 +101,10 @@ class MeridianPortfolio:
             hold = f'{IDENTITY_UNVERIFIED}:{type(exc).__name__}:{exc}'[:300]
         if hold != self.identity_hold and hold is not None:
             self.owner.logger().error(f'Meridian entries held until identity migration: {hold}')
+        if hold is None and self.identity_hold is not None:
+            # Bound again: the hold no longer describes this owner; the next evaluation reports.
+            self.owner.logger().info('Meridian identity bound; entries evaluated again')
+            self.status = {'reason': 'no_evaluation', 'hold': None}
         self.identity_hold = hold
         if hold is not None:
             self.status = {'reason': hold.split(':', 1)[0], 'hold': hold}

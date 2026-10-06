@@ -180,9 +180,11 @@ class CensusLedger:
     # ------------------------------------------------------------------ tick
     def begin(self, markets, *, fires, payload, now):
         """Census the raw signal population of this tick, before any hold or treatment."""
-        self.touched = set()
         if self.load(now):
             self.flush()
+        # After any history replay: replayed facts are earlier ticks, never this tick's observations,
+        # so the current tick still records its own outcome (hold reason) for each signal.
+        self.touched = set()
         for pair in sorted(markets):  # observed even while the history read fails (logged, replayed later)
             market = markets[pair]
             if market is not None and fires(market):

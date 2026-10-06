@@ -280,6 +280,44 @@ class TidewaterCensusTests(IsolatedAsyncioTestCase):
             finally:
                 await session.close()
 
+    async def hold_then_kill_switch(self, directory, failing):
+        """K4: signals on cut 600000 under an identity hold with the kill switch on; on the same cut the
+        identity hold clears (kill switch still on); then the non-signalling cut 600060. With `failing`,
+        history reads fail until the identity hold clears and recover on that same cut."""
+        session = self.session(Path(directory) / f'k4_{failing}.sqlite', self.config(manual_kill_switch=True))
+        try:
+            portfolio = session.controllers[OWNER].portfolio
+            history = FailingHistory(session.recorder)
+            history.on = failing
+            portfolio.receipts._recorder = history
+
+            def held():
+                portfolio.identity_hold = 'identity_unverified:injected'
+                return portfolio.identity_hold
+
+            def bound():
+                portfolio.identity_hold = None
+                return None
+            portfolio.check_identity = held
+            await self.enter(session)
+            portfolio.check_identity = bound
+            history.on = False
+            await session.step(600061, books=books(2, 600061))
+            _, rebound = frames()
+            await session.step(600120, books=books(3, 600120), candles=all_candles(one_more_candle(rebound), 600120))
+            return (self.transitions(session, 600000),
+                    {p: (r['code'], r['transitions']) for p, r in self.finals(session, 600000).items()})
+        finally:
+            await session.close()
+
+    async def test_replayed_history_does_not_hide_the_recovery_ticks_own_hold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            healthy = await self.hold_then_kill_switch(directory, failing=False)
+            recovered = await self.hold_then_kill_switch(directory, failing=True)
+        self.assertEqual(healthy, ({p: ['identity_held', 'kill_switch_held'] for p in PAIRS},
+                                   {p: ('kill_switch_held', 2) for p in PAIRS}))
+        self.assertEqual(recovered, healthy)
+
     # ------------------------------------------------------------------ inert census-only arm (K2.3)
     async def scenario(self, directory, census):
         """B0 on identical frames: first entries, fills, a refused shallow add, then a deeper one."""

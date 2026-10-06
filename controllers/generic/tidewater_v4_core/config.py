@@ -23,6 +23,8 @@ from controllers.generic.meridian_v3_portfolio import CapitalStage
 from controllers.generic.meridian_v3_unified_core import config as meridian
 from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig, SymbolRuntimeConfig
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
+from controllers.generic.tidewater_v4_core.capitulation import CapitulationOverride
+from controllers.generic.tidewater_v4_core.entry_veto import ENTRY_VETOES
 from controllers.generic.tidewater_v4_core.tide_gate import TideGateConfig
 from hummingbot.strategy_v2.components.recipe_contract import (
     RecipeBinding,
@@ -57,6 +59,9 @@ SINGLE_PAIR_STAGES = MappingProxyType({'tidewater_bnb_1000': 'BNB-USDC'})
 # Frozen priors (operator preference, not fitted). See the design doc, section T1.
 TIDE_GATE_V1 = TideGateConfig(low_occupancy='0.30', high_occupancy='0.90', max_multiplier='4',
                               upward_max_occupancy='0.50')
+# Research candidate fields. At None each is left out of the sealed payload and the recipe digest,
+# so a configuration that does not use them keeps its pre-candidate recipe and configuration digests.
+VARIANT_FIELDS = ('entry_veto', 'capitulation_override')
 
 
 def source_files():
@@ -77,6 +82,11 @@ class TidewaterConfig(MeridianUnifiedConfig):
     # 'strict' re-checks a submitted entry with the full submit-time permission, as V3 does.
     # 'stable' revokes a submitted entry only for hard reasons (design T7).
     resting_entry: Literal['strict', 'stable'] = 'strict'
+    # Research candidates (opt-in, sealed). 'e0' refuses a first-entry BUY when the frozen volatility
+    # model's probability exceeds its threshold (entry_veto.py). CP lifts the native flash pause for a
+    # DCA buy in a deep capitulation (capitulation.py). Neither ever sells, cancels or demotes.
+    entry_veto: Literal['e0'] | None = None
+    capitulation_override: CapitulationOverride | None = None
 
     @model_validator(mode='before')
     @classmethod
@@ -115,7 +125,11 @@ class TidewaterConfig(MeridianUnifiedConfig):
             raise ValueError('observation mode cannot dispatch execution')
         if self.execution_enabled and self.recipe_binding is None:
             raise ValueError('executable Tidewater requires a sealed recipe binding')
-        self.symbol_configs()
+        symbols = self.symbol_configs()
+        cp = self.capitulation_override
+        if cp is not None and any(s.flash_crash is None or s.depth_budget is None
+                                  or s.depth_budget.lookback_minutes != cp.lookback_minutes for s in symbols.values()):
+            raise ValueError('the capitulation override needs the flash pause and a 1,440-minute depth-budget high')
         if self.recipe_binding is not None:
             if self.recipe_binding.recipe_id != RECIPE_ID or self.recipe_binding.recipe_sha256 != self.recipe_digest():
                 raise ValueError('Tidewater recipe binding differs')
@@ -128,6 +142,15 @@ class TidewaterConfig(MeridianUnifiedConfig):
 
     def pair_limit_quote(self):
         return self.stage().per_asset_quote
+
+    def entry_veto_model(self):
+        return None if self.entry_veto is None else ENTRY_VETOES[self.entry_veto]
+
+    def variants(self):
+        """The research candidates this configuration enables, for receipts and reporting."""
+        return {'entry_veto': self.entry_veto,
+                'capitulation_override': None if self.capitulation_override is None
+                else self.capitulation_override.model_dump(mode='json')}
 
     def symbol_configs(self):
         """Meridian's per-symbol native configuration at Tidewater's stage, under Tidewater's
@@ -158,15 +181,27 @@ class TidewaterConfig(MeridianUnifiedConfig):
     def source_manifest(self):
         return source_records(meridian.source_root(), source_files())
 
+    def sealed_payload(self):
+        payload = super().sealed_payload()
+        for name in VARIANT_FIELDS:
+            if payload.get(name, False) is None:
+                del payload[name]
+        return payload
+
     def recipe_digest(self):
-        return digest({'recipe_id': RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,
-                       'result_sha256': recipe.RESULT_SHA256, 'mandate_sha256': self.mandate().identity,
-                       'policy_sha256': self.p0_policy().identity,
-                       'modules': {k: v.model_dump(mode='json') for k, v in self.recipe_modules().items()},
-                       'capital': self.recipe_capital().model_dump(mode='json'),
-                       'pair_limit_quote': str(self.pair_limit_quote()),
-                       'tide_gate': None if self.tide_gate is None else self.tide_gate.model_dump(mode='json'),
-                       'resting_entry': self.resting_entry})
+        values = {'recipe_id': RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,
+                  'result_sha256': recipe.RESULT_SHA256, 'mandate_sha256': self.mandate().identity,
+                  'policy_sha256': self.p0_policy().identity,
+                  'modules': {k: v.model_dump(mode='json') for k, v in self.recipe_modules().items()},
+                  'capital': self.recipe_capital().model_dump(mode='json'),
+                  'pair_limit_quote': str(self.pair_limit_quote()),
+                  'tide_gate': None if self.tide_gate is None else self.tide_gate.model_dump(mode='json'),
+                  'resting_entry': self.resting_entry}
+        if self.entry_veto is not None:  # the frozen model constants are part of the recipe
+            values['entry_veto'] = {'id': self.entry_veto, 'model': self.entry_veto_model().model_dump(mode='json')}
+        if self.capitulation_override is not None:
+            values['capitulation_override'] = self.capitulation_override.model_dump(mode='json')
+        return digest(values)
 
     def seal(self):
         return RecipeBinding(recipe_id=RECIPE_ID, recipe_sha256=self.recipe_digest(),

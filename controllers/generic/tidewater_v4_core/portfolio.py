@@ -15,6 +15,17 @@ each accepted candidate, so one batch cannot cross the gate's limits unnoticed.
 Occupancy is the allocator's own usage (`committed_usage`) over the envelope: no second
 accounting truth. The gap is the pair's live buy gap, the value its runtime applies, so the
 gate is never looser than dispatch.
+
+Research candidates (opt-in; none is active by default):
+
+* With any candidate enabled, each first-entry candidate (no inventory, no pending claim, no open
+  commitment) gets a census receipt before any treatment. The order is then
+  pair_limit -> entry veto -> tide gate.
+* `entry_veto='e0'` refuses a first-entry BUY whose frozen E0 probability exceeds its threshold.
+  Like every pacing refusal it does not consume the cut. A shadow receipt records what the tide
+  gate would have said; it is never read by a decision.
+* `capitulation_override` is applied by the symbol runtime (`runtime.py`) to the market the
+  planner reads; pacing records a receipt for each candidate it let through the flash pause.
 """
 from decimal import Decimal
 
@@ -23,7 +34,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from controllers.generic.meridian_v3_unified_core.migration import IDENTITY_UNVERIFIED, IdentityGuard
 from controllers.generic.meridian_v3_unified_core.portfolio import ERRORS, MeridianPortfolio
 from controllers.generic.modular_spot_core.bag import HeldBag, live_buy_gap
-from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError
+from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError, decimal, identity
 from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, Opportunity
 from hummingbot.strategy_v2.components.recipe_contract import digest
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
@@ -32,8 +43,10 @@ from hummingbot.strategy_v2.portfolio_v3.capital import committed_usage
 from hummingbot.strategy_v2.portfolio_v3.contracts import PortfolioSnapshot
 from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import NATIVE_SNAPSHOT_UNAVAILABLE
 
+from . import entry_veto
+from .capitulation import drawdown
 from .config import PORTFOLIO_ID
-from .receipts import ADMITTED, REFUSED, ReceiptWriter
+from .receipts import ADMITTED, CAPITULATION, CENSUS, REFUSED, SHADOW_TIDE_GATE, ReceiptWriter
 from .recipe import TidewaterPortfolioRecipe, epoch, grant_policy, owner_identity, proposal_writer
 from .tide_gate import multiplier, tide_gate
 
@@ -41,6 +54,8 @@ ZERO = Decimal('0')
 # Pacing one pair reads its decision checkpoint and recorder positions; any failure of those
 # reads (including database errors) refuses that pair only and never faults the portfolio.
 PACING_ERRORS = (DataUnavailable, PolicyError, RuntimeError, SQLAlchemyError, *ERRORS)
+VETO_CODES = frozenset({'entry_veto_e0', 'entry_veto_unavailable'})
+_UNREAD = object()  # the pair's tide-gate reference has not been read this pass
 
 
 class TidewaterPortfolio(MeridianPortfolio):
@@ -125,6 +140,89 @@ class TidewaterPortfolio(MeridianPortfolio):
         held = HeldBag.from_positions(context.positions_held, connector=config.connector_name, pair=pair)
         return held.breakeven_price if held.amount > 0 else None
 
+    def entry_state(self, pair, snapshot=None):
+        """('holds' | 'first' | 'pending', evidence, reference) for one pair.
+
+        'holds': the pair has an acquired active tranche or a held bag (`_reference` is set).
+        'first': no inventory, no unresolved claim (an executor not yet created, or active with
+        nothing filled), nothing pending creation and, when a snapshot is given, no open commitment.
+        'pending': no inventory but an acquisition is under way; it is not a first entry.
+        """
+        runtime = self.owner.contexts[pair].runtime
+        reference = self._reference(pair)
+        state, _ = runtime.ensure_store().load()
+        inventory = runtime.inventory()
+        claims = () if state is None else tuple(state.claims)
+        unresolved = [x for x in claims
+                      if x not in inventory or (not inventory[x].terminal and inventory[x].entry_quote <= 0)]
+        commitments = ZERO if snapshot is None else sum(
+            (c.quote_authority for c in snapshot.commitments if c.symbol == pair), ZERO)
+        evidence = {'reference': None if reference is None else str(reference), 'unresolved_claims': len(unresolved),
+                    'runtime_pending': len(runtime.pending), 'commitments_quote': str(commitments)}
+        if reference is not None:
+            return 'holds', evidence, reference
+        if unresolved or runtime.pending or commitments > 0:
+            return 'pending', evidence, reference
+        return 'first', evidence, reference
+
+    def capitulation(self, pair, market, override):
+        """Whether the capitulation override lifts the native flash pause for this market, or None
+        when the pause is not active. Reads only the market's own closed-candle features and the
+        pair's inventory state; a read failure leaves the pause in force."""
+        pause = getattr(market, 'flash_pause_until', None)
+        now = decimal(self.owner.market_data_provider.time(), 'now')
+        if pause is None or not now < decimal(pause, 'flash pause'):  # the planner's own check
+            return None
+        decision = {'cut': market.candle_open, 'native_flash_pause_until': pause, 'close': str(market.close),
+                    'depth': str(override.depth), 'applied': False}
+        features = getattr(market, 'bag', None)
+        recent_high = None if features is None else features.recent_high
+        if recent_high is None:
+            return {**decision, 'reason': 'recent_high_unavailable'}
+        try:
+            decision.update(recent_high=str(recent_high), drawdown=str(drawdown(close=market.close, recent_high=recent_high)))
+            if not override.holds(close=market.close, recent_high=recent_high):
+                return {**decision, 'reason': 'not_deep_enough'}
+            state, evidence, _ = self.entry_state(pair)
+        except PACING_ERRORS as exc:
+            return {**decision, 'reason': f'unavailable:{type(exc).__name__}:{exc}'[:200]}
+        decision.update(entry_state=state, entry_evidence=evidence)
+        if state == 'pending':
+            return {**decision, 'reason': 'acquisition_pending'}
+        return {**decision, 'applied': True, 'reason': 'capitulation'}
+
+    def _census(self, pair, market, evidence, native_pause, now_ms):
+        """One record per first-entry candidate, before any treatment. Deterministic id and payload."""
+        cut = market.candle_open
+        config = self.owner.config
+        self.receipts.record(CENSUS, pair=pair, cut=cut, code='first_entry', now=now_ms / 1000, payload={
+            'census_id': identity(['tidewater_first_entry_census', config.id, pair, cut]),
+            'close': str(market.close), 'native_flash_pause_until': native_pause, 'evidence': evidence,
+            'variants': config.variants()})
+
+    def _tide(self, pair, market, u, bid, reference):
+        features = getattr(market, 'bag', None)
+        gap = live_buy_gap(self.owner.symbol_config(pair).buy_gap, None if features is None else features.atr_pct)
+        if reference is _UNREAD:
+            reference = self._reference(pair)
+        return gap, reference, tide_gate(self.owner.config.tide_gate, gap=gap, occupancy=u, reference=reference, bid=bid)
+
+    def _shadow_tide_gate(self, pair, market, u, bid, reference, code, now_ms):
+        """What the tide gate would have said about a candidate the entry veto refused. Report only."""
+        if self.owner.config.tide_gate is None:
+            shadow = {'tide_gate': None, 'would_allow': True, 'reason': 'tide_gate_disabled'}
+        else:
+            try:
+                gap, reference, gate = self._tide(pair, market, u, bid, reference)
+            except PACING_ERRORS as exc:
+                shadow = {'would_allow': None, 'reason': 'pacing_unavailable', 'error': f'{type(exc).__name__}:{exc}'[:200]}
+            else:
+                shadow = {'would_allow': gate.allowed, 'reason': gate.reason, 'gap': str(gap),
+                          'multiplier': str(gate.multiplier),
+                          'required_price': None if gate.required_price is None else str(gate.required_price)}
+        self.receipts.record(SHADOW_TIDE_GATE, pair=pair, cut=market.candle_open, code=code, now=now_ms / 1000,
+                             payload={**shadow, 'occupancy': str(u), 'bid': str(bid), 'refused_by': code})
+
     def _pair_usage(self, snapshot, pair):
         asset = next(a for a in snapshot.assets if a.symbol == pair)
         pending = sum((c.quote_authority for c in snapshot.commitments if c.symbol == pair), ZERO)
@@ -135,6 +233,8 @@ class TidewaterPortfolio(MeridianPortfolio):
         config = self.owner.config
         stage = config.stage()
         increment = stage.order_quote * (1 + config.risk.fee_reserve_fraction)
+        veto = config.entry_veto_model()
+        variants = veto is not None or config.capitulation_override is not None
         used = committed_usage(snapshot)
         added = {}
         allowed = []
@@ -146,29 +246,60 @@ class TidewaterPortfolio(MeridianPortfolio):
             decision = {'occupancy': str(u), 'pair_usage': str(pair_usage), 'bid': str(bid),
                         'pair_limit': str(config.pair_limit_quote())}
             code = None
-            if pair_usage + increment > config.pair_limit_quote():
-                code = 'pair_limit'
-            elif config.tide_gate is not None:
+            entry, reference = None, _UNREAD
+            if variants:
                 try:
-                    features = getattr(market, 'bag', None)
-                    gap = live_buy_gap(self.owner.symbol_config(pair).buy_gap,
-                                       None if features is None else features.atr_pct)
-                    reference = self._reference(pair)
-                    gate = tide_gate(config.tide_gate, gap=gap, occupancy=u, reference=reference, bid=bid)
+                    entry, evidence, reference = self.entry_state(pair, snapshot)
                 except PACING_ERRORS as exc:
-                    # This pair cannot be paced now; it waits. Other pairs are paced normally.
                     decision['error'] = f'{type(exc).__name__}:{exc}'[:200]
                     code = 'pacing_unavailable'
                 else:
-                    decision.update(gap=str(gap), multiplier=str(gate.multiplier),
-                                    reference=None if reference is None else str(reference),
-                                    required_price=None if gate.required_price is None else str(gate.required_price))
-                    if not gate.allowed:
-                        code = gate.reason
+                    decision['entry_state'] = entry
+                    lifted = self._lifted(pair, market)
+                    if entry == 'first':
+                        native = market.flash_pause_until if lifted is None else lifted['native_flash_pause_until']
+                        self._census(pair, market, evidence, native, now_ms)
+                    if lifted is not None:
+                        decision['capitulation'] = lifted
+                        self.receipts.record(CAPITULATION, pair=pair, cut=market.candle_open, code='flash_pause_lifted',
+                                             now=now_ms / 1000, payload={
+                                                 **lifted, 'shadow_native_flash_pause': {
+                                                     'would_refuse': True, 'reason': 'flash_crash_pause',
+                                                     'until': lifted['native_flash_pause_until']}})
+            if code is not None:
+                pass
+            elif pair_usage + increment > config.pair_limit_quote():
+                code = 'pair_limit'
+            else:
+                if veto is not None and entry == 'first':
+                    try:
+                        verdict = entry_veto.evaluate(veto, self.owner.contexts[pair].runtime, market)
+                    except PACING_ERRORS as exc:
+                        decision['entry_veto'] = {'error': f'{type(exc).__name__}:{exc}'[:200]}
+                        code = 'entry_veto_unavailable'
+                    else:
+                        decision['entry_veto'] = verdict
+                        if verdict['vetoed']:
+                            code = 'entry_veto_e0'
+                if code is None and config.tide_gate is not None:
+                    try:
+                        gap, reference, gate = self._tide(pair, market, u, bid, reference)
+                    except PACING_ERRORS as exc:
+                        # This pair cannot be paced now; it waits. Other pairs are paced normally.
+                        decision['error'] = f'{type(exc).__name__}:{exc}'[:200]
+                        code = 'pacing_unavailable'
+                    else:
+                        decision.update(gap=str(gap), multiplier=str(gate.multiplier),
+                                        reference=None if reference is None else str(reference),
+                                        required_price=None if gate.required_price is None else str(gate.required_price))
+                        if not gate.allowed:
+                            code = gate.reason
             self.pacing[pair] = {**decision, 'outcome': code or 'paced_ok', 'cut': market.candle_open}
             if code is not None:
                 self.receipts.record(REFUSED, pair=pair, cut=market.candle_open, code=code, payload=decision,
                                      now=now_ms / 1000)
+                if code in VETO_CODES:
+                    self._shadow_tide_gate(pair, market, u, bid, reference, code, now_ms)
                 continue
             allowed.append(pair)
             used += increment
@@ -177,6 +308,14 @@ class TidewaterPortfolio(MeridianPortfolio):
                           'multiplier': None if config.tide_gate is None else str(
                               multiplier(config.tide_gate, committed_usage(snapshot) / stage.envelope_quote))}
         return tuple(p for p in pairs if p in allowed)
+
+    def _lifted(self, pair, market):
+        """The capitulation decision that lifted this market's flash pause, else None."""
+        lifted = getattr(self.owner.contexts[pair].runtime, 'capitulation', None)
+        if (lifted is None or not lifted['applied'] or lifted['cut'] != market.candle_open
+                or market.flash_pause_until is not None):
+            return None
+        return lifted
 
     # ------------------------------------------------------------------ evaluation
     def candidates(self, markets):

@@ -1,0 +1,328 @@
+"""Tidewater research candidates E0 (first-entry volatility veto) and CP (capitulation override).
+
+Synthetic books and candles on the native paper session (the Meridian V3 harness), not economics.
+The frozen parameters come from the root evidence `docs/evidence/2026-10-06-tidewater-candidates/`.
+"""
+import dataclasses
+import math
+import tempfile
+from decimal import Decimal as D
+from pathlib import Path
+from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
+from test.meridian_v3.test_native_paper import frames, paper
+from test.tidewater_v4.test_tidewater_runtime import OWNER, PAIRS, all_candles, books, tidewater
+from unittest import IsolatedAsyncioTestCase
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from controllers.generic.modular_spot_core.domain import DataUnavailable
+from controllers.generic.tidewater_v4_core import entry_veto
+from controllers.generic.tidewater_v4_core.capitulation import CP_FROZEN, CapitulationOverride
+from controllers.generic.tidewater_v4_core.config import TidewaterConfig
+from controllers.generic.tidewater_v4_core.entry_veto import E0_FROZEN, decision_window, e0_features
+from controllers.generic.tidewater_v4_core.receipts import (
+    ADMITTED,
+    CAPITULATION,
+    CENSUS,
+    REFUSED,
+    SHADOW_TIDE_GATE,
+    read_receipts,
+)
+from hummingbot.strategy_v2.paper_session import NativePaperSession
+
+# recipe_digest() and seal().configuration_sha256 at b2bb5e51b (the owner commit this branch is on),
+# computed there before the candidates were applied. seal().source_sha256 binds the Tidewater source
+# files and changes with any source edit by design.
+B2BB5E51B = {
+    'paper_default': ('cbf42b6212887decc93d5e44f17f0028f7dce45a8fe471076a73bd97b36d3f13',  # noqa: documentation
+                      '3b7888ed3d4bfe8aaaa6bad3f8e3b6227bc1f0767746c0e3863059e9ab6c8345'),  # noqa: documentation
+    'paper_bnb_1000': ('19227d8785adffe5489d90587d77820bddc08cd38400e3f5c591198ded2f00ac',  # noqa: documentation
+                       '25f032d0fb19146db5506f782d2684c967ebce53262f083a173f7c0030eb8119'),  # noqa: documentation
+    'observation_default': ('e02ac8e1bc1ebe6e78f2018fe7acd59f5a2399a1837af757942fd50324889bc9',  # noqa: documentation
+                            '8d77d671a482241a2b044a6f1605f750a365d7be29bf65992b690b02a1fbf075'),  # noqa: documentation
+    'paper_no_gate_stable': ('db24a3f4139cebfa9fdb4e9a2990a40e8d4ef3a38e1e1e415cd913e497a58e40',  # noqa: documentation
+                             'f20a7e96e329e5994a7e7a4a7b71e618edaaf7870c1b02f1de810c3b81bddbf1'),  # noqa: documentation
+}
+CONFIGS = {
+    'paper_default': {},
+    'paper_bnb_1000': dict(capital_stage='tidewater_bnb_1000',
+                           symbols=[{'trading_pair': p, 'entry_enabled': p == 'BNB-USDC'} for p in PAIRS]),
+    'observation_default': dict(mode='observation'),
+    'paper_no_gate_stable': dict(tide_gate=None, resting_entry='stable'),
+}
+ALLOW_ALL = E0_FROZEN.model_copy(update={'threshold': D('0.999999999')})
+VETO_ALL = E0_FROZEN.model_copy(update={'threshold': D('0.000000001')})
+
+
+def reference_e0(closes):
+    """Independent pandas definition (the offline freeze script's reference implementation)."""
+    r2 = pd.Series(np.log(np.asarray(closes, dtype=float))).diff() ** 2
+    return math.log(r2.ewm(halflife=60, adjust=False).mean().iloc[-1]), math.log(r2.iloc[-1440:].sum())
+
+
+def crash_frames(drop_to=0.935, crash=0.02):
+    """Flat, a 10-minute `crash` (native flash pause), a slow decline to `drop_to`, then an RSI(17) cross of 29."""
+    flat = 100 + .05 * np.sin(np.arange(1330) / 10)
+    sharp = np.linspace(100, 100 * (1 - crash), 11)[1:]
+    decline = np.linspace(100 * (1 - crash), 100 * drop_to, 160)
+    close = np.r_[flat, sharp, decline]
+    frame = pd.DataFrame(dict(timestamp=np.arange(510000, 600000, 60), open=close, high=close + .05,
+                              low=close - .05, close=close, volume=np.ones(1500) * 10))
+    last = float(close[-1])
+    rebound = dict(timestamp=600000, open=last, high=last + .6, low=last - .05, close=last + .5, volume=10)
+    return frame, pd.concat([frame, pd.DataFrame([rebound])], ignore_index=True), D(str(round(last + .5, 2)))
+
+
+# ---------------------------------------------------------------------- seal and identity
+@pytest.mark.parametrize('name', sorted(CONFIGS))
+def test_default_configurations_keep_their_b2bb5e51b_recipe_and_configuration_digests(name):
+    c = tidewater(**CONFIGS[name])
+    assert (c.entry_veto, c.capitulation_override) == (None, None)
+    seal = c.seal()
+    assert (c.recipe_digest(), seal.configuration_sha256) == B2BB5E51B[name]
+    assert seal.recipe_sha256 == B2BB5E51B[name][0]
+    assert 'entry_veto' not in c.sealed_payload() and 'capitulation_override' not in c.sealed_payload()
+
+
+def test_candidates_enter_the_seal_and_the_recipe_digest():
+    base = tidewater()
+    e0, cp = tidewater(entry_veto='e0'), tidewater(capitulation_override=CP_FROZEN)
+    deeper = tidewater(capitulation_override=CapitulationOverride(depth='0.10'))
+    digests = {c.recipe_digest() for c in (base, e0, cp, deeper)}
+    configurations = {c.seal().configuration_sha256 for c in (base, e0, cp, deeper)}
+    assert len(digests) == len(configurations) == 4
+    sealed = tidewater(execution_enabled=True, entry_veto='e0', capitulation_override=CP_FROZEN)
+    for change in ({'entry_veto': None}, {'capitulation_override': None},
+                   {'capitulation_override': {'depth': '0.10'}}):
+        with pytest.raises(ValueError):
+            TidewaterConfig(**{**sealed.model_dump(mode='json'), **change})
+    TidewaterConfig(**sealed.model_dump(mode='json'))  # the unchanged sealed configuration still validates
+
+
+def test_the_recipe_digest_binds_the_frozen_e0_constants():
+    before = tidewater(entry_veto='e0').recipe_digest()
+    with patch.dict(entry_veto.ENTRY_VETOES, {'e0': E0_FROZEN.model_copy(update={'threshold': D('0.7')})}):
+        assert tidewater(entry_veto='e0').recipe_digest() != before
+    assert tidewater(entry_veto='e0').recipe_digest() == before
+
+
+@pytest.mark.parametrize('change', [{'entry_veto': 'e1'}, {'capitulation_override': {'depth': '0'}},
+                                    {'capitulation_override': {'depth': '1'}},
+                                    {'capitulation_override': {'depth': '0.05', 'lookback_minutes': 720}}])
+def test_invalid_candidate_configurations_are_rejected(change):
+    with pytest.raises(ValueError):
+        tidewater(**change)
+
+
+def test_frozen_values_are_the_evidence_values():
+    assert (str(E0_FROZEN.intercept), str(E0_FROZEN.coef_x1), str(E0_FROZEN.coef_x2), str(E0_FROZEN.threshold)) == (
+        '0.3090052320373231', '-0.09801053710977638', '0.7088562914237231', '0.681859486807908')
+    assert str(CP_FROZEN.depth) == '0.05618828176431856' and CP_FROZEN.lookback_minutes == 1440
+    # At the fit means the model returns sigmoid(intercept).
+    p = E0_FROZEN.probability(float(E0_FROZEN.mean_x1), float(E0_FROZEN.mean_x2))
+    assert abs(p - 1 / (1 + math.exp(-float(E0_FROZEN.intercept)))) < 1e-15
+
+
+# ---------------------------------------------------------------------- E0 features (pure)
+@pytest.mark.parametrize('seed', range(6))
+def test_controller_e0_features_reproduce_the_offline_definition(seed):
+    rng = np.random.default_rng(seed)
+    steps = rng.standard_t(3, 1500) * 10 ** rng.uniform(-4, -2.5)
+    closes = 600 * np.exp(np.cumsum(steps))
+    got, want = e0_features(closes), reference_e0(closes)
+    assert max(abs(a - b) for a, b in zip(got, want)) <= 1e-12
+
+
+def test_e0_features_need_exactly_the_window_of_valid_closes():
+    with pytest.raises(DataUnavailable):
+        e0_features(np.ones(1499) * 100)
+    with pytest.raises(DataUnavailable):
+        e0_features(np.ones(1500) * 100)  # zero realized variance: no fabricated value
+    bad = np.linspace(100, 101, 1500)
+    bad[3] = 0
+    with pytest.raises(Exception):
+        e0_features(bad)
+
+
+def test_e0_reads_only_candles_closed_by_the_decision_candle():
+    frame, rebound = frames()
+    extended = pd.concat([rebound, pd.DataFrame([dict(timestamp=600060 + 60 * k, open=90.0, high=90.1, low=89.9,
+                                                      close=90.0, volume=10) for k in range(5)])], ignore_index=True)
+    closes, digests = decision_window(extended, candle_open=600000, interval=60, now=600060 + 400)
+    assert len(closes) == 1500 and max(digests) == 600000
+    changed = extended.copy()
+    changed.loc[changed.timestamp > 600000, 'close'] = 50.0  # later candles cannot move the decision
+    assert np.array_equal(decision_window(changed, candle_open=600000, interval=60, now=600460)[0], closes)
+    earlier = extended.copy()
+    earlier.loc[earlier.timestamp == 599940, 'close'] = 99.0  # an input candle does
+    assert not np.array_equal(decision_window(earlier, candle_open=600000, interval=60, now=600460)[0], closes)
+    with pytest.raises(DataUnavailable):  # the decision candle has not closed yet
+        decision_window(rebound, candle_open=600000, interval=60, now=600059)
+    with pytest.raises(DataUnavailable):  # fewer than 1,500 closed candles
+        decision_window(frame, candle_open=599940, interval=60, now=600000, size=1501)
+
+
+def test_capitulation_comparison_is_exact_at_the_boundary():
+    cp = CapitulationOverride(depth='0.05')
+    assert cp.holds(close=D('95'), recent_high=D('100'))
+    assert not cp.holds(close=D('95.0000001'), recent_high=D('100'))
+
+
+# ---------------------------------------------------------------------- native paper session
+class TidewaterCandidateTests(IsolatedAsyncioTestCase):
+    setUp = session_tests.NativePaperSessionTests.setUp  # denies all network connections
+
+    def session(self, directory, cash='1000', **overrides):
+        return NativePaperSession(paper(PAIRS, cash), [tidewater(execution_enabled=True, **overrides)],
+                                  Path(directory) / 'tidewater.sqlite')
+
+    async def enter(self, session, pair_frames=None, price=None):
+        before, rebound = frames() if pair_frames is None else pair_frames
+        first = await session.step(600000, books=books(0, 600000, price), candles=all_candles(before, 600000))
+        self.assertEqual(first['actions'], [])
+        return await session.step(600060, books=books(1, 600060, price), candles=all_candles(rebound, 600060))
+
+    def receipts(self, session, kind=None):
+        return [r for r in read_receipts(session.recorder, OWNER) if kind is None or r['kind'] == kind]
+
+    async def test_e0_census_precedes_a_veto_that_does_not_consume_the_cut(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, entry_veto='e0')
+            try:
+                controller = session.controllers[OWNER]
+                with patch.dict(entry_veto.ENTRY_VETOES, {'e0': VETO_ALL}):
+                    vetoed = await self.enter(session)
+                self.assertEqual(vetoed['actions'], [], controller.to_format_status())
+                census, refused = self.receipts(session, CENSUS), self.receipts(session, REFUSED)
+                self.assertEqual({r['pair'] for r in census}, set(PAIRS))
+                self.assertEqual({(r['pair'], r['code']) for r in refused}, {(p, 'entry_veto_e0') for p in PAIRS})
+                for pair in PAIRS:  # the census is written before any treatment of its candidate
+                    c = next(r for r in census if r['pair'] == pair)
+                    self.assertLess(c['sequence'], next(r['sequence'] for r in refused if r['pair'] == pair))
+                    self.assertEqual(c['evidence'], {'reference': None, 'unresolved_claims': 0, 'runtime_pending': 0,
+                                                     'commitments_quote': '0'})
+                self.assertEqual(len({r['census_id'] for r in census}), 5)
+                # The decision read only the 1,500 closed candles ending at the cut.
+                _, rebound = frames()
+                x1, x2 = e0_features(rebound.close.to_numpy()[-1500:])
+                self.assertEqual({(r['entry_veto']['x1'], r['entry_veto']['x2']) for r in refused}, {(repr(x1), repr(x2))})
+                shadow = self.receipts(session, SHADOW_TIDE_GATE)
+                self.assertEqual({(r['pair'], r['would_allow'], r['reason']) for r in shadow},
+                                 {(p, True, 'tide_gate_first_tranche') for p in PAIRS})
+                # Same cut, the veto now allows: the refusal did not consume the cut.
+                with patch.dict(entry_veto.ENTRY_VETOES, {'e0': ALLOW_ALL}):
+                    allowed = await session.step(600061, books=books(2, 600061))
+                self.assertEqual({a.executor_config.trading_pair for a in allowed['actions']}, set(PAIRS))
+                admitted = self.receipts(session, ADMITTED)
+                self.assertEqual({(r['pair'], r['code']) for r in admitted}, {(p, 'admitted') for p in PAIRS})
+                self.assertTrue(all(r['pacing']['entry_veto']['vetoed'] is False for r in admitted))
+                # Each census record ends in exactly one outcome per (pair, cut): refused, then admitted here.
+                for pair in PAIRS:
+                    outcomes = [r['kind'] for r in self.receipts(session) if r['episode'] == f'{pair}:600000'
+                                and r['kind'] in (REFUSED, ADMITTED)]
+                    self.assertEqual(outcomes, [REFUSED, ADMITTED])
+                self.assertEqual(len(self.receipts(session, CENSUS)), 5)  # same candidates, same facts
+                self.assertEqual(controller.get_custom_info()['tidewater']['variants']['entry_veto'], 'e0')
+            finally:
+                await session.close()
+
+    async def test_a_pending_acquisition_is_not_a_first_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, entry_veto='e0')
+            try:
+                controller = session.controllers[OWNER]
+                portfolio = controller.portfolio
+                self.assertEqual({portfolio.entry_state(p)[0] for p in PAIRS}, {'first'})
+                with patch.dict(entry_veto.ENTRY_VETOES, {'e0': ALLOW_ALL}):
+                    receipt = await self.enter(session)
+                self.assertEqual(len(receipt['actions']), 5)
+                # Entries submitted, nothing filled: no inventory, but an acquisition is under way.
+                snapshot = portfolio.snapshot(portfolio.now_ms())
+                for pair in PAIRS:
+                    state, evidence, reference = portfolio.entry_state(pair, snapshot)
+                    self.assertEqual((state, reference), ('pending', None), evidence)
+                    self.assertGreater(evidence['unresolved_claims'] + evidence['runtime_pending'], 0)
+                # Pacing the same candidates again writes no census and runs no veto.
+                portfolio.receipts._seen.clear()
+                markets = {p: c.runtime.market for p, c in controller.contexts.items()}
+                with patch.dict(entry_veto.ENTRY_VETOES, {'e0': VETO_ALL}):
+                    paced = portfolio.pace(tuple(PAIRS), markets, snapshot, portfolio.now_ms())
+                self.assertEqual(set(paced), set(PAIRS))
+                self.assertEqual(len(self.receipts(session, CENSUS)), 5)
+                self.assertEqual({portfolio.pacing[p]['entry_state'] for p in PAIRS}, {'pending'})
+                self.assertFalse(any('entry_veto' in portfolio.pacing[p] for p in PAIRS))
+            finally:
+                await session.close()
+
+    async def test_without_cp_the_native_flash_pause_holds_a_capitulation_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory)
+            try:
+                before, rebound, price = crash_frames()
+                receipt = await self.enter(session, (before, rebound), price)
+                controller = session.controllers[OWNER]
+                self.assertEqual(receipt['actions'], [])
+                self.assertEqual(set(controller.portfolio.status['candidate_holds'].values()), {'flash_crash_pause'})
+                self.assertIsNotNone(controller.contexts['BNB-USDC'].runtime.market.flash_pause_until)
+                self.assertFalse(self.receipts(session, CENSUS))
+            finally:
+                await session.close()
+
+    async def test_cp_lifts_the_flash_pause_for_a_deep_capitulation_with_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, capitulation_override=CP_FROZEN)
+            try:
+                before, rebound, price = crash_frames()
+                receipt = await self.enter(session, (before, rebound), price)
+                controller = session.controllers[OWNER]
+                self.assertEqual({a.executor_config.trading_pair for a in receipt['actions']}, set(PAIRS),
+                                 controller.to_format_status())
+                self.assertTrue(all(a.executor_config.side.name == 'BUY' for a in receipt['actions']))
+                lifted = self.receipts(session, CAPITULATION)
+                self.assertEqual({r['pair'] for r in lifted}, set(PAIRS))
+                for r in lifted:
+                    self.assertTrue(r['applied'])
+                    self.assertGreaterEqual(D(r['drawdown']), CP_FROZEN.depth)
+                    self.assertEqual(r['shadow_native_flash_pause']['would_refuse'], True)
+                    self.assertGreater(r['native_flash_pause_until'], 600060)
+                census = self.receipts(session, CENSUS)  # the census records the native pause, not the override
+                self.assertEqual({r['native_flash_pause_until'] for r in census},
+                                 {r['native_flash_pause_until'] for r in lifted})
+                admitted = self.receipts(session, ADMITTED)
+                self.assertEqual({(r['pair'], r['code']) for r in admitted}, {(p, 'admitted') for p in PAIRS})
+                self.assertTrue(all(r['pacing']['capitulation']['applied'] for r in admitted))
+                # The submitted entry is now a pending acquisition: a new observation keeps the native pause.
+                runtime = controller.contexts['BNB-USDC'].runtime
+                native = runtime._observation[1]
+                self.assertIsNotNone(native.flash_pause_until)
+                runtime.observe()
+                self.assertEqual(runtime.capitulation['reason'], 'acquisition_pending')
+                self.assertIs(runtime.market, native)
+                # When it applies, only the entry pause differs, on a copy; the cached market is untouched.
+                with patch.object(controller.portfolio, 'entry_state', return_value=('holds', {}, D('99'))):
+                    runtime.observe()
+                self.assertEqual(runtime.capitulation['reason'], 'capitulation')
+                self.assertEqual(runtime.market, dataclasses.replace(native, flash_pause_until=None))
+                self.assertIs(runtime._observation[1], native)
+                self.assertIsNotNone(native.flash_pause_until)
+            finally:
+                await session.close()
+
+    async def test_cp_keeps_the_pause_when_the_drop_is_not_deep_enough(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, capitulation_override=CP_FROZEN)
+            try:
+                before, rebound, price = crash_frames(drop_to=0.96)
+                receipt = await self.enter(session, (before, rebound), price)
+                controller = session.controllers[OWNER]
+                self.assertEqual(receipt['actions'], [])
+                runtime = controller.contexts['BNB-USDC'].runtime
+                self.assertEqual(runtime.capitulation['reason'], 'not_deep_enough')
+                self.assertLess(D(runtime.capitulation['drawdown']), CP_FROZEN.depth)
+                self.assertIsNotNone(runtime.market.flash_pause_until)
+                self.assertFalse(self.receipts(session, CAPITULATION))
+            finally:
+                await session.close()

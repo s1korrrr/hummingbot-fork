@@ -22,10 +22,24 @@ from controllers.generic.modular_spot_core.domain import identity
 from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 
 REFUSED, ADMITTED, REVOKED = 'TIDEWATER_GATE_REFUSED', 'TIDEWATER_ADMITTED', 'TIDEWATER_ENTRY_REVOKED'
-KINDS = frozenset({REFUSED, ADMITTED, REVOKED})
+# Research candidates (written only when a candidate is enabled):
+# * CENSUS: one record per first-entry candidate, written before any treatment; its id is a
+#   deterministic function of (controller, pair, cut) and its payload of the candle, so a
+#   re-evaluated cut or a restart rewrites the same fact;
+# * SHADOW_TIDE_GATE: what the tide gate would have said about a candidate the entry veto refused.
+#   Never read by a decision;
+# * CAPITULATION: the capitulation override lifted the native flash pause for this candidate; it
+#   carries what the pause said.
+# A candidate's receipts share the episode `pair:cut`. Its outcome is the existing vocabulary: a
+# REFUSED receipt (an entry-veto refusal uses code `entry_veto_e0` or `entry_veto_unavailable`)
+# or, once the target and grants commit, an ADMITTED receipt with code `admitted`, `not_admitted`
+# or `admission_unresolved`.
+CENSUS, SHADOW_TIDE_GATE = 'TIDEWATER_FIRST_ENTRY_CENSUS', 'TIDEWATER_SHADOW_TIDE_GATE'
+CAPITULATION = 'TIDEWATER_CAPITULATION_OVERRIDE'
+KINDS = frozenset({REFUSED, ADMITTED, REVOKED, CENSUS, SHADOW_TIDE_GATE, CAPITULATION})
 # Closed list of gate refusal codes. A revocation receipt names its failing predicate.
 REFUSAL_CODES = frozenset({'tide_gate_down', 'tide_gate_up_occupancy', 'tide_gate_up_gap', 'pair_limit',
-                           'pacing_unavailable'})
+                           'pacing_unavailable', 'entry_veto_e0', 'entry_veto_unavailable'})
 WRITE_ERRORS = (Exception,)  # any store failure is reported, never raised into a decision
 
 

@@ -25,6 +25,7 @@ from controllers.generic.meridian_v3_unified_core.portfolio import ERRORS, Merid
 from controllers.generic.modular_spot_core.bag import HeldBag, live_buy_gap
 from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError
 from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, Opportunity
+from hummingbot.strategy_v2.components.held_inventory import held_is_dust
 from hummingbot.strategy_v2.components.recipe_contract import digest
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
 from hummingbot.strategy_v2.controllers.portfolio_target_store_v3 import NativeTargetStore
@@ -110,8 +111,12 @@ class TidewaterPortfolio(MeridianPortfolio):
         return PortfolioSnapshot.model_validate({**snapshot.model_dump(mode='json'), 'portfolio_id': PORTFOLIO_ID})
 
     # ------------------------------------------------------------------ pacing
-    def _reference(self, pair):
-        """Last active acquired tranche of the pair, else its held-bag breakeven, else None."""
+    def _reference(self, pair, bid):
+        """Last active acquired tranche of the pair, else its held-bag breakeven, else None.
+
+        A held bag that is venue dust at `bid` is no bag, as in the native planner's `bag_empty`
+        (planner.py): the native runtime applies no bag gap to it, so the gate must not either.
+        """
         context = self.owner.contexts[pair]
         runtime = context.runtime
         config = self.owner.symbol_config(pair)
@@ -123,7 +128,13 @@ class TidewaterPortfolio(MeridianPortfolio):
             if acquired:
                 return acquired[-1].entry_price
         held = HeldBag.from_positions(context.positions_held, connector=config.connector_name, pair=pair)
-        return held.breakeven_price if held.amount > 0 else None
+        if held.amount <= 0:
+            return None
+        rules = runtime.snapshot()
+        if held_is_dust(held.amount, bid, min_amount=max(rules['amount_step'], rules['minimum_amount']),
+                        min_notional=rules['minimum_notional']):
+            return None
+        return held.breakeven_price
 
     def _pair_usage(self, snapshot, pair):
         asset = next(a for a in snapshot.assets if a.symbol == pair)
@@ -154,7 +165,7 @@ class TidewaterPortfolio(MeridianPortfolio):
                     features = getattr(market, 'bag', None)
                     gap = live_buy_gap(self.owner.symbol_config(pair).buy_gap,
                                        None if features is None else features.atr_pct)
-                    reference = self._reference(pair)
+                    reference = self._reference(pair, bid)
                     gate = tide_gate(config.tide_gate, gap=gap, occupancy=u, reference=reference, bid=bid)
                 except PACING_ERRORS as exc:
                     # This pair cannot be paced now; it waits. Other pairs are paced normally.

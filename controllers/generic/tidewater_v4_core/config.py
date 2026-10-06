@@ -83,9 +83,9 @@ class TidewaterConfig(MeridianUnifiedConfig):
     # 'stable' revokes a submitted entry only for hard reasons (design T7).
     resting_entry: Literal['strict', 'stable'] = 'strict'
     # Research candidates (opt-in, sealed). 'e0' refuses a first-entry BUY when the frozen volatility
-    # model's probability exceeds its threshold (entry_veto.py). CP lifts the native flash pause for a
+    # model's probability exceeds its threshold; 'x0' is its seeded-hash placebo (entry_veto.py). CP lifts the native flash pause for a
     # DCA buy in a deep capitulation (capitulation.py). Neither ever sells, cancels or demotes.
-    entry_veto: Literal['e0'] | None = None
+    entry_veto: Literal['e0', 'x0'] | None = None
     capitulation_override: CapitulationOverride | None = None
 
     @model_validator(mode='before')

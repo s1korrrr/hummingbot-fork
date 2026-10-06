@@ -1,9 +1,11 @@
-"""Tidewater research candidates E0 (first-entry volatility veto) and CP (capitulation override).
+"""Tidewater research candidates E0 (first-entry volatility veto), X0 (its exposure-control placebo
+veto) and CP (capitulation override).
 
 Synthetic books and candles on the native paper session (the Meridian V3 harness), not economics.
 The frozen parameters come from the root evidence `docs/evidence/2026-10-06-tidewater-candidates/`.
 """
 import dataclasses
+import hashlib
 import math
 import tempfile
 from decimal import Decimal as D
@@ -22,7 +24,7 @@ from controllers.generic.modular_spot_core.domain import DataUnavailable
 from controllers.generic.tidewater_v4_core import entry_veto
 from controllers.generic.tidewater_v4_core.capitulation import CP_FROZEN, CapitulationOverride
 from controllers.generic.tidewater_v4_core.config import TidewaterConfig
-from controllers.generic.tidewater_v4_core.entry_veto import E0_FROZEN, decision_window, e0_features
+from controllers.generic.tidewater_v4_core.entry_veto import E0_FROZEN, X0_FROZEN, X0Model, decision_window, e0_features
 from controllers.generic.tidewater_v4_core.receipts import (
     ADMITTED,
     CAPITULATION,
@@ -31,6 +33,7 @@ from controllers.generic.tidewater_v4_core.receipts import (
     SHADOW_TIDE_GATE,
     read_receipts,
 )
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
 # recipe_digest() and seal().configuration_sha256 at b2bb5e51b (the owner commit this branch is on),
@@ -55,6 +58,15 @@ CONFIGS = {
 }
 ALLOW_ALL = E0_FROZEN.model_copy(update={'threshold': D('0.999999999')})
 VETO_ALL = E0_FROZEN.model_copy(update={'threshold': D('0.000000001')})
+X0_NONE = X0_FROZEN.model_copy(update={'rate': D('0')})
+X0_ALL = X0_FROZEN.model_copy(update={'rate': D('1')})
+# The frozen X0 verdicts at the harness cut 600000 (seed 0, rate 0.2002), from the formula below.
+X0_VETOED_AT_600000 = {'ETH-USDC', 'BNB-USDC', 'XRP-USDC'}
+
+
+def x0_formula(seed, pair, cut, rate):
+    """The coordinator's specification, written out independently of the controller."""
+    return int(hashlib.sha256(f'x0:{seed}:{pair}:{cut}'.encode()).hexdigest()[:16], 16) / 2 ** 64 < rate
 
 
 def reference_e0(closes):
@@ -89,13 +101,13 @@ def test_default_configurations_keep_their_b2bb5e51b_recipe_and_configuration_di
 
 def test_candidates_enter_the_seal_and_the_recipe_digest():
     base = tidewater()
-    e0, cp = tidewater(entry_veto='e0'), tidewater(capitulation_override=CP_FROZEN)
+    e0, x0, cp = tidewater(entry_veto='e0'), tidewater(entry_veto='x0'), tidewater(capitulation_override=CP_FROZEN)
     deeper = tidewater(capitulation_override=CapitulationOverride(depth='0.10'))
-    digests = {c.recipe_digest() for c in (base, e0, cp, deeper)}
-    configurations = {c.seal().configuration_sha256 for c in (base, e0, cp, deeper)}
-    assert len(digests) == len(configurations) == 4
+    digests = {c.recipe_digest() for c in (base, e0, x0, cp, deeper)}
+    configurations = {c.seal().configuration_sha256 for c in (base, e0, x0, cp, deeper)}
+    assert len(digests) == len(configurations) == 5
     sealed = tidewater(execution_enabled=True, entry_veto='e0', capitulation_override=CP_FROZEN)
-    for change in ({'entry_veto': None}, {'capitulation_override': None},
+    for change in ({'entry_veto': None}, {'entry_veto': 'x0'}, {'capitulation_override': None},
                    {'capitulation_override': {'depth': '0.10'}}):
         with pytest.raises(ValueError):
             TidewaterConfig(**{**sealed.model_dump(mode='json'), **change})
@@ -109,7 +121,41 @@ def test_the_recipe_digest_binds_the_frozen_e0_constants():
     assert tidewater(entry_veto='e0').recipe_digest() == before
 
 
-@pytest.mark.parametrize('change', [{'entry_veto': 'e1'}, {'capitulation_override': {'depth': '0'}},
+@pytest.mark.parametrize('change', [{'rate': D('0.2003')}, {'seed': 1}])
+def test_the_recipe_digest_binds_the_frozen_x0_rate_and_seed(change):
+    before = tidewater(entry_veto='x0').recipe_digest()
+    with patch.dict(entry_veto.ENTRY_VETOES, {'x0': X0_FROZEN.model_copy(update=change)}):
+        assert tidewater(entry_veto='x0').recipe_digest() != before
+    assert tidewater(entry_veto='x0').recipe_digest() == before
+
+
+def test_x0_frozen_values_and_deterministic_verdicts():
+    assert (str(X0_FROZEN.rate), X0_FROZEN.seed) == ('0.2002', 0)
+    again = X0Model.model_validate(X0_FROZEN.model_dump(mode='json'))  # a new instance, as after a restart
+    for k in range(500):
+        for pair in PAIRS:
+            cut = 600000 + 60 * k
+            verdict = X0_FROZEN.vetoes(pair, cut)
+            assert verdict == again.vetoes(pair, cut) == x0_formula(0, pair, cut, 0.2002)
+    assert {p for p in PAIRS if X0_FROZEN.vetoes(p, 600000)} == X0_VETOED_AT_600000
+
+
+@pytest.mark.parametrize('pair', ['BNB-USDC', 'BTC-USDC'])
+def test_x0_empirical_rate_over_ten_thousand_cuts(pair):
+    rate = sum(X0_FROZEN.vetoes(pair, 600000 + 60 * k) for k in range(10000)) / 10000
+    assert abs(rate - 0.2002) <= 0.01
+
+
+def test_x0_reads_no_candles():
+    class Unreadable:
+        def __getattr__(self, name):
+            raise AssertionError(f'X0 read runtime.{name}')
+    market = type('Market', (), {'candle_open': 600000})()
+    verdict = entry_veto.evaluate(X0_FROZEN, Unreadable(), market, pair='BNB-USDC')
+    assert verdict['vetoed'] is True and verdict['model'] == 'x0_hash_placebo_v1'
+
+
+@pytest.mark.parametrize('change', [{'entry_veto': 'e1'}, {'entry_veto': 'x1'}, {'capitulation_override': {'depth': '0'}},
                                     {'capitulation_override': {'depth': '1'}},
                                     {'capitulation_override': {'depth': '0.05', 'lookback_minutes': 720}}])
 def test_invalid_candidate_configurations_are_rejected(change):
@@ -254,6 +300,66 @@ class TidewaterCandidateTests(IsolatedAsyncioTestCase):
                 self.assertEqual(len(self.receipts(session, CENSUS)), 5)
                 self.assertEqual({portfolio.pacing[p]['entry_state'] for p in PAIRS}, {'pending'})
                 self.assertFalse(any('entry_veto' in portfolio.pacing[p] for p in PAIRS))
+            finally:
+                await session.close()
+
+    async def test_x0_refuses_by_hash_with_census_and_shadow_and_never_consumes_the_cut(self):
+        outcomes = []
+        for run in range(2):  # a second, fresh session (a restart) gives the same verdicts
+            with tempfile.TemporaryDirectory() as directory:
+                session = self.session(directory, entry_veto='x0')
+                try:
+                    controller = session.controllers[OWNER]
+                    with patch.object(entry_veto, 'read_frame', side_effect=DataUnavailable('no candles')):
+                        receipt = await self.enter(session)  # X0 never needs candle history
+                    entered = {a.executor_config.trading_pair for a in receipt['actions']}
+                    refused = {r['pair']: r for r in self.receipts(session, REFUSED)}
+                    self.assertEqual(entered, set(PAIRS) - X0_VETOED_AT_600000, controller.to_format_status())
+                    self.assertEqual({p: r['code'] for p, r in refused.items()},
+                                     {p: 'entry_veto_x0' for p in X0_VETOED_AT_600000})
+                    census = {r['pair']: r for r in self.receipts(session, CENSUS)}
+                    self.assertEqual(set(census), set(PAIRS))
+                    for pair, r in refused.items():
+                        self.assertLess(census[pair]['sequence'], r['sequence'])
+                        self.assertEqual(r['entry_veto']['model'], 'x0_hash_placebo_v1')
+                    shadow = self.receipts(session, SHADOW_TIDE_GATE)
+                    self.assertEqual({(r['pair'], r['refused_by'], r['would_allow']) for r in shadow},
+                                     {(p, 'entry_veto_x0', True) for p in X0_VETOED_AT_600000})
+                    outcomes.append((entered, sorted(refused), sorted(r['census_id'] for r in census.values())))
+                    if run == 0:  # same cut with the veto lifted: the refusal did not consume it
+                        with patch.dict(entry_veto.ENTRY_VETOES, {'x0': X0_NONE}):
+                            later = await session.step(600061, books=books(2, 600061))
+                        self.assertEqual({a.executor_config.trading_pair for a in later['actions']},
+                                         X0_VETOED_AT_600000)
+                finally:
+                    await session.close()
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    async def test_x0_never_vetoes_a_pair_that_is_not_a_first_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, entry_veto='x0')
+            try:
+                controller = session.controllers[OWNER]
+                portfolio = controller.portfolio
+                with patch.dict(entry_veto.ENTRY_VETOES, {'x0': X0_NONE}):
+                    receipt = await self.enter(session)
+                self.assertEqual(len(receipt['actions']), 5)
+                markets = {p: c.runtime.market for p, c in controller.contexts.items()}
+                for expected in ('pending', 'holds'):
+                    if expected == 'holds':
+                        trades = [dict(trading_pair=p, sequence=10 + i, timestamp=600061, side=TradeType.SELL,
+                                       price=D('99.49'), amount=D('10')) for i, p in enumerate(PAIRS)]
+                        await session.step(600061, trades=trades)
+                    portfolio.receipts._seen.clear()
+                    snapshot = portfolio.snapshot(portfolio.now_ms())
+                    with patch.dict(entry_veto.ENTRY_VETOES, {'x0': X0_ALL}):
+                        portfolio.pace(tuple(PAIRS), markets, snapshot, portfolio.now_ms())
+                    for pair in PAIRS:
+                        pacing = portfolio.pacing[pair]
+                        self.assertEqual(pacing['entry_state'], expected, pacing)
+                        self.assertNotIn('entry_veto', pacing)
+                        self.assertFalse(pacing['outcome'].startswith('entry_veto'), pacing)
+                self.assertFalse([r for r in self.receipts(session, REFUSED) if r['code'].startswith('entry_veto')])
             finally:
                 await session.close()
 

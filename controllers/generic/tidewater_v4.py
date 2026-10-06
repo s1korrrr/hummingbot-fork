@@ -8,7 +8,7 @@ changes admission only:
 * per-pair limit: one pair holds at most its stage limit (350 of a 1,000 envelope);
 * decision receipts for every refusal, admission and resting-entry revocation;
 * `resting_entry='stable'` (opt-in): a submitted entry is revoked only for hard reasons;
-* research candidates (opt-in, sealed): the E0 first-entry volatility veto (`entry_veto='e0'`)
+* research candidates (opt-in, sealed): the E0 first-entry volatility veto (`entry_veto='e0'`), its X0 placebo (`'x0'`)
   and the CP capitulation override of the flash pause (`capitulation_override`).
 
 None of these cancels an exit, blocks a recovery sell or demotes a position.

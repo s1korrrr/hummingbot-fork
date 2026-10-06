@@ -21,7 +21,8 @@ Research candidates (opt-in; none is active by default):
 * With any candidate enabled, each first-entry candidate (no inventory, no pending claim, no open
   commitment) gets a census receipt before any treatment. The order is then
   pair_limit -> entry veto -> tide gate.
-* `entry_veto='e0'` refuses a first-entry BUY whose frozen E0 probability exceeds its threshold.
+* `entry_veto='e0'` refuses a first-entry BUY whose frozen E0 probability exceeds its threshold;
+  `entry_veto='x0'` (placebo) refuses one whose seeded (pair, cut) hash falls below E0's fit-set rate.
   Like every pacing refusal it does not consume the cut. A shadow receipt records what the tide
   gate would have said; it is never read by a decision.
 * `capitulation_override` is applied by the symbol runtime (`runtime.py`) to the market the
@@ -54,7 +55,7 @@ ZERO = Decimal('0')
 # Pacing one pair reads its decision checkpoint and recorder positions; any failure of those
 # reads (including database errors) refuses that pair only and never faults the portfolio.
 PACING_ERRORS = (DataUnavailable, PolicyError, RuntimeError, SQLAlchemyError, *ERRORS)
-VETO_CODES = frozenset({'entry_veto_e0', 'entry_veto_unavailable'})
+VETO_CODES = frozenset({'entry_veto_e0', 'entry_veto_x0', 'entry_veto_unavailable'})
 _UNREAD = object()  # the pair's tide-gate reference has not been read this pass
 
 
@@ -273,14 +274,14 @@ class TidewaterPortfolio(MeridianPortfolio):
             else:
                 if veto is not None and entry == 'first':
                     try:
-                        verdict = entry_veto.evaluate(veto, self.owner.contexts[pair].runtime, market)
+                        verdict = entry_veto.evaluate(veto, self.owner.contexts[pair].runtime, market, pair=pair)
                     except PACING_ERRORS as exc:
                         decision['entry_veto'] = {'error': f'{type(exc).__name__}:{exc}'[:200]}
                         code = 'entry_veto_unavailable'
                     else:
                         decision['entry_veto'] = verdict
                         if verdict['vetoed']:
-                            code = 'entry_veto_e0'
+                            code = veto.refusal_code
                 if code is None and config.tide_gate is not None:
                     try:
                         gap, reference, gate = self._tide(pair, market, u, bid, reference)

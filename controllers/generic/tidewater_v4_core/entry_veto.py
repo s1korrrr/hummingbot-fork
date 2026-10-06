@@ -15,12 +15,18 @@ population std) and its threshold were fitted OFFLINE on May-Jul 2026 BNB candid
 only; see the root evidence `docs/evidence/2026-10-06-tidewater-candidates/` (`e0_frozen.json`).
 The constants are bound into Tidewater's recipe digest when the veto is enabled.
 
-E0 only refuses a BUY admission. It never cancels an order, blocks an exit or a recovery
-sell, or demotes a position. A refusal does not consume the cut.
+X0 (`entry_veto='x0'`) is E0's exposure-control placebo: the same first-entry predicate, pacing
+order and receipts, but the verdict is a deterministic hash of (seed, pair, cut) compared with
+E0's fit-set veto rate. It reads no candles and keeps no random state, so a restart gives the
+same verdicts.
+
+Both only refuse a BUY admission. Neither cancels an order, blocks an exit or a recovery sell,
+or demotes a position. A refusal does not consume the cut.
 """
+import hashlib
 import math
 from decimal import Decimal
-from typing import Literal
+from typing import ClassVar, Literal
 
 import numpy as np
 import pandas as pd
@@ -56,6 +62,7 @@ def e0_features(closes, *, window=WINDOW, halflife=HALFLIFE, sum_window=SUM_WIND
 
 class E0Model(PolicyModel):
     """Frozen E0 coefficients, scaler and threshold. Decimal strings round-trip to the fitted floats."""
+    refusal_code: ClassVar[str] = 'entry_veto_e0'
     kind: Literal['e0_logistic_vol_v1'] = 'e0_logistic_vol_v1'
     window: Literal[1500] = WINDOW
     halflife_minutes: Literal[60] = HALFLIFE
@@ -88,6 +95,27 @@ class E0Model(PolicyModel):
 
     def vetoes(self, p):
         return float(p) > float(self.threshold)
+
+
+class X0Model(PolicyModel):
+    """Seeded hash placebo: veto when sha256('x0:{seed}:{pair}:{cut}')[:16] / 2**64 < rate.
+
+    `cut` is the decision candle's open time in integer seconds (`MarketFeatures.candle_open`).
+    """
+    refusal_code: ClassVar[str] = 'entry_veto_x0'
+    kind: Literal['x0_hash_placebo_v1'] = 'x0_hash_placebo_v1'
+    rate: Decimal = Field(ge=0, le=1)
+    seed: int = Field(ge=0, strict=True)
+    rate_source: str = Field(min_length=1)  # where the rate was frozen from
+
+    def draw(self, pair, cut):
+        if type(pair) is not str or isinstance(cut, bool) or int(cut) != cut:
+            raise PolicyError('X0 needs a pair name and an integer cut')
+        key = f'x0:{self.seed}:{pair}:{int(cut)}'.encode()
+        return int(hashlib.sha256(key).hexdigest()[:16], 16) / 2 ** 64
+
+    def vetoes(self, pair, cut):
+        return self.draw(pair, cut) < float(self.rate)
 
 
 def decision_window(frame, *, candle_open, interval, now, size=WINDOW):
@@ -126,8 +154,13 @@ def read_frame(runtime):
     return frame, now
 
 
-def evaluate(model: E0Model, runtime, market):
-    """E0 at the decision candle of `market`, on the exact closed rows that decision consumed."""
+def evaluate(model, runtime, market, *, pair):
+    """The veto verdict for one first-entry candidate. X0 reads only (pair, cut); E0 reads the exact
+    closed rows the decision at `market`'s candle consumed."""
+    if isinstance(model, X0Model):
+        draw = model.draw(pair, market.candle_open)
+        return {'model': model.kind, 'draw': repr(draw), 'rate': str(model.rate), 'seed': model.seed,
+                'vetoed': draw < float(model.rate)}
     c = runtime.controller.config
     frame, now = read_frame(runtime)
     closes, digests = decision_window(frame, candle_open=market.candle_open, interval=c.interval_seconds(),
@@ -137,7 +170,7 @@ def evaluate(model: E0Model, runtime, market):
     x1, x2 = e0_features(closes, window=model.window, halflife=model.halflife_minutes,
                          sum_window=model.sum_window_minutes)
     p = model.probability(x1, x2)
-    return {'x1': repr(x1), 'x2': repr(x2), 'p': repr(p), 'threshold': str(model.threshold),
+    return {'model': model.kind, 'x1': repr(x1), 'x2': repr(x2), 'p': repr(p), 'threshold': str(model.threshold),
             'vetoed': model.vetoes(p)}
 
 
@@ -147,4 +180,7 @@ E0_FROZEN = E0Model(intercept='0.3090052320373231', coef_x1='-0.0980105371097763
                     mean_x1='-15.113873748018909', std_x1='0.9104460472587372',
                     mean_x2='-7.84215740675036', std_x2='0.770322432096417', threshold='0.681859486807908',
                     fit_sha256='43618973f9d5b69d946976b7ab6f7d58441c6763543a0255212315fe3ef0fc63')  # noqa: documentation
-ENTRY_VETOES = {'e0': E0_FROZEN}
+# Frozen 2026-10-06 (root evidence x0_frozen.json): E0's fit-set veto rate 179/894 = 0.20022 rounded to
+# 0.2002, seed 0.
+X0_FROZEN = X0Model(rate='0.2002', seed=0, rate_source='e0_frozen.json fit_veto_rate (179/894), rounded to 4 dp')
+ENTRY_VETOES = {'e0': E0_FROZEN, 'x0': X0_FROZEN}

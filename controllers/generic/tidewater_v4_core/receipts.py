@@ -23,24 +23,32 @@ from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 
 REFUSED, ADMITTED, REVOKED = 'TIDEWATER_GATE_REFUSED', 'TIDEWATER_ADMITTED', 'TIDEWATER_ENTRY_REVOKED'
 # Research candidates (written only when a candidate is enabled):
-# * CENSUS: one record per first-entry candidate, written before any treatment; its id is a
-#   deterministic function of (controller, pair, cut) and its payload of the candle, so a
-#   re-evaluated cut or a restart rewrites the same fact;
+# * CENSUS: one record per eligible signal (Meridian's own signal predicate on a new cut of an
+#   entry-enabled pair), written before Meridian's preview, so before the native flash pause, the
+#   capitulation override, the veto and the gates act. It records the native pause and the pair's
+#   entry state (first / holds / pending). Its id is a deterministic function of (controller, pair,
+#   cut), so a re-evaluated cut or a restart names the same signal;
+# * OUTCOME: what happened to a censused signal, from the closed OUTCOME_CODES list. A refused cut
+#   may be re-evaluated, so one signal can gain a later outcome; the last one is the eventual
+#   outcome. `cp_overridden` says whether the capitulation override lifted its native pause;
 # * SHADOW_TIDE_GATE: what the tide gate would have said about a candidate the entry veto refused.
 #   Never read by a decision;
 # * CAPITULATION: the capitulation override lifted the native flash pause for this candidate; it
 #   carries what the pause said.
 # A candidate's receipts share the episode `pair:cut`. Its outcome is the existing vocabulary: a
 # REFUSED receipt (an entry-veto refusal uses code `entry_veto_e0`, `entry_veto_x0` or
-# `entry_veto_unavailable`)
-# or, once the target and grants commit, an ADMITTED receipt with code `admitted`, `not_admitted`
-# or `admission_unresolved`.
-CENSUS, SHADOW_TIDE_GATE = 'TIDEWATER_FIRST_ENTRY_CENSUS', 'TIDEWATER_SHADOW_TIDE_GATE'
-CAPITULATION = 'TIDEWATER_CAPITULATION_OVERRIDE'
-KINDS = frozenset({REFUSED, ADMITTED, REVOKED, CENSUS, SHADOW_TIDE_GATE, CAPITULATION})
+# `entry_veto_unavailable`) or, once the target and grants commit, an ADMITTED receipt with code
+# `admitted`, `not_admitted` or `admission_unresolved`.
+CENSUS, OUTCOME = 'TIDEWATER_SIGNAL_CENSUS', 'TIDEWATER_SIGNAL_OUTCOME'
+SHADOW_TIDE_GATE, CAPITULATION = 'TIDEWATER_SHADOW_TIDE_GATE', 'TIDEWATER_CAPITULATION_OVERRIDE'
+KINDS = frozenset({REFUSED, ADMITTED, REVOKED, CENSUS, OUTCOME, SHADOW_TIDE_GATE, CAPITULATION})
 # Closed list of gate refusal codes. A revocation receipt names its failing predicate.
 REFUSAL_CODES = frozenset({'tide_gate_down', 'tide_gate_up_occupancy', 'tide_gate_up_gap', 'pair_limit',
                            'pacing_unavailable', 'entry_veto_e0', 'entry_veto_x0', 'entry_veto_unavailable'})
+# Signal outcomes: held before pacing (the native pause, another preview hold, or no snapshot to
+# pace against), a pacing refusal, or the admission result.
+OUTCOME_CODES = REFUSAL_CODES | frozenset({'native_paused', 'preview_held', 'admitted', 'not_admitted',
+                                           'admission_unresolved', 'admission_incomplete'})
 WRITE_ERRORS = (Exception,)  # any store failure is reported, never raised into a decision
 
 
@@ -66,6 +74,8 @@ class ReceiptWriter:
             raise ValueError(f'unknown Tidewater receipt kind {kind}')
         if kind == REFUSED and code not in REFUSAL_CODES:
             raise ValueError(f'unknown Tidewater refusal code {code}')
+        if kind == OUTCOME and code not in OUTCOME_CODES:
+            raise ValueError(f'unknown Tidewater signal outcome {code}')
         key = (pair, cut, kind, code, dedupe)
         if key in self._seen:
             return False

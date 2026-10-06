@@ -18,24 +18,29 @@ gate is never looser than dispatch.
 
 Research candidates (opt-in; none is active by default):
 
-* With any candidate enabled, each first-entry candidate (no inventory, no pending claim, no open
-  commitment) gets a census receipt before any treatment. The order is then
-  pair_limit -> entry veto -> tide gate.
+* With any candidate enabled, every eligible signal gets a census receipt before Meridian's preview
+  (so before the native flash pause and every treatment), with its native pause and entry state,
+  and later an outcome receipt (native_paused, preview_held, a pacing refusal, or the admission
+  result). The population therefore does not depend on the treatment. Pacing order:
+  pair_limit -> entry veto (first entries only) -> tide gate.
 * `entry_veto='e0'` refuses a first-entry BUY whose frozen E0 probability exceeds its threshold;
   `entry_veto='x0'` (placebo) refuses one whose seeded (pair, cut) hash falls below E0's fit-set rate.
   Like every pacing refusal it does not consume the cut. A shadow receipt records what the tide
   gate would have said; it is never read by a decision.
 * `capitulation_override` is applied by the symbol runtime (`runtime.py`) to the market the
-  planner reads; pacing records a receipt for each candidate it let through the flash pause.
+  planner reads, for inventory-backed DCA adds only; a first entry keeps the native pause. Pacing
+  records a receipt for each candidate it let through the flash pause.
 """
 from decimal import Decimal
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from controllers.generic import meridian_v3_recipe
 from controllers.generic.meridian_v3_unified_core.migration import IDENTITY_UNVERIFIED, IdentityGuard
 from controllers.generic.meridian_v3_unified_core.portfolio import ERRORS, MeridianPortfolio
 from controllers.generic.modular_spot_core.bag import HeldBag, live_buy_gap
 from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError, decimal, identity
+from controllers.generic.modular_spot_core.signals import signal_decision
 from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, Opportunity
 from hummingbot.strategy_v2.components.recipe_contract import digest
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
@@ -47,7 +52,7 @@ from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import NATIVE_SNAP
 from . import entry_veto
 from .capitulation import drawdown
 from .config import PORTFOLIO_ID
-from .receipts import ADMITTED, CAPITULATION, CENSUS, REFUSED, SHADOW_TIDE_GATE, ReceiptWriter
+from .receipts import ADMITTED, CAPITULATION, CENSUS, OUTCOME, REFUSED, SHADOW_TIDE_GATE, ReceiptWriter
 from .recipe import TidewaterPortfolioRecipe, epoch, grant_policy, owner_identity, proposal_writer
 from .tide_gate import multiplier, tide_gate
 
@@ -85,6 +90,7 @@ class TidewaterPortfolio(MeridianPortfolio):
         self.pacing = {}  # pair -> last pacing decision, for reporting
         self.occupancy = None
         self._paced = ()
+        self._signals = {}  # pair -> this tick's censused signal (cut, census id, override flag)
 
     # ------------------------------------------------------------------ Tidewater identity
     def check_identity(self):
@@ -168,8 +174,9 @@ class TidewaterPortfolio(MeridianPortfolio):
 
     def capitulation(self, pair, market, override):
         """Whether the capitulation override lifts the native flash pause for this market, or None
-        when the pause is not active. Reads only the market's own closed-candle features and the
-        pair's inventory state; a read failure leaves the pause in force."""
+        when the pause is not active. Only an inventory-backed DCA add qualifies: a first entry or a
+        pair with an acquisition pending keeps the native pause. Reads only the market's own
+        closed-candle features and the pair's inventory state; a read failure keeps the pause."""
         pause = getattr(market, 'flash_pause_until', None)
         now = decimal(self.owner.market_data_provider.time(), 'now')
         if pause is None or not now < decimal(pause, 'flash pause'):  # the planner's own check
@@ -188,18 +195,74 @@ class TidewaterPortfolio(MeridianPortfolio):
         except PACING_ERRORS as exc:
             return {**decision, 'reason': f'unavailable:{type(exc).__name__}:{exc}'[:200]}
         decision.update(entry_state=state, entry_evidence=evidence)
-        if state == 'pending':
-            return {**decision, 'reason': 'acquisition_pending'}
+        if state != 'holds':
+            return {**decision, 'reason': 'first_entry_keeps_pause' if state == 'first' else 'acquisition_pending'}
         return {**decision, 'applied': True, 'reason': 'capitulation'}
 
-    def _census(self, pair, market, evidence, native_pause, now_ms):
-        """One record per first-entry candidate, before any treatment. Deterministic id and payload."""
-        cut = market.candle_open
+    # ------------------------------------------------------------------ signal census
+    def _census_enabled(self):
+        """The census and its outcomes run only with a research candidate on; the default path is untouched."""
         config = self.owner.config
-        self.receipts.record(CENSUS, pair=pair, cut=cut, code='first_entry', now=now_ms / 1000, payload={
-            'census_id': identity(['tidewater_first_entry_census', config.id, pair, cut]),
-            'close': str(market.close), 'native_flash_pause_until': native_pause, 'evidence': evidence,
-            'variants': config.variants()})
+        return config.entry_veto is not None or config.capitulation_override is not None
+
+    def _signal_census(self, markets):
+        """Census every eligible signal before Meridian's preview: its native pause and entry state.
+
+        Eligibility is Meridian's own candidate predicate (`MeridianPortfolio.candidates`): a new cut
+        of an entry-enabled pair whose BNB MR signal fires. It reads the market's signal features,
+        which no treatment changes, and the native pause as observed, before any override.
+        """
+        self._signals = {}
+        config = self.owner.config
+        signal = meridian_v3_recipe.strategy_parameters()['signal']
+        entries = {s.trading_pair: s.entry_enabled for s in config.symbols}
+        eligible = []
+        for pair in sorted(markets):
+            market = markets[pair]
+            if market is None:
+                continue
+            cut = market.candle_open
+            first = self._seen.get(pair, cut)
+            if cut <= first or cut <= self._evaluated.get(pair, first) or not entries[pair]:
+                continue
+            if signal_decision(signal, previous_rsi=market.previous_rsi, rsi=market.rsi,
+                               atr_fraction=market.atr_fraction, breakout=False, trend_up=False).enter:
+                eligible.append(pair)
+        if not eligible:
+            return
+        now_ms = self.now_ms()
+        try:
+            snapshot, snapshot_error = self.snapshot(now_ms), None
+        except (DataUnavailable, PolicyError, *ERRORS) as exc:
+            snapshot, snapshot_error = None, f'{type(exc).__name__}:{exc}'[:200]
+        for pair in eligible:
+            market = markets[pair]
+            cut = market.candle_open
+            lifted = self._lifted(pair, market)
+            native = market.flash_pause_until if lifted is None else lifted['native_flash_pause_until']
+            census_id = identity(['tidewater_signal_census', config.id, pair, cut])
+            entry = {'entry_state': 'unavailable', 'error': snapshot_error}
+            if snapshot is not None:
+                try:
+                    state, evidence, _ = self.entry_state(pair, snapshot)
+                except PACING_ERRORS as exc:
+                    entry = {'entry_state': 'unavailable', 'error': f'{type(exc).__name__}:{exc}'[:200]}
+                else:
+                    entry = {'entry_state': state, 'evidence': evidence}
+            self._signals[pair] = {'cut': cut, 'census_id': census_id, 'cp_overridden': lifted is not None}
+            self.receipts.record(CENSUS, pair=pair, cut=cut, code='signal', now=now_ms / 1000, payload={
+                'census_id': census_id, **entry, 'close': str(market.close), 'native_flash_pause_until': native,
+                'signal': {'previous_rsi': str(market.previous_rsi), 'rsi': str(market.rsi),
+                           'atr_fraction': None if market.atr_fraction is None else str(market.atr_fraction)},
+                'variants': config.variants()})
+
+    def _outcome(self, pair, cut, code, reason=None):
+        """Record what happened to this tick's censused signal of `pair` at `cut` (no-op otherwise)."""
+        signal = self._signals.get(pair)
+        if signal is None or signal['cut'] != cut:
+            return
+        self.receipts.record(OUTCOME, pair=pair, cut=cut, code=code, now=self.now_ms() / 1000, payload={
+            'census_id': signal['census_id'], 'cp_overridden': signal['cp_overridden'], 'reason': reason})
 
     def _tide(self, pair, market, u, bid, reference):
         features = getattr(market, 'bag', None)
@@ -257,9 +320,6 @@ class TidewaterPortfolio(MeridianPortfolio):
                 else:
                     decision['entry_state'] = entry
                     lifted = self._lifted(pair, market)
-                    if entry == 'first':
-                        native = market.flash_pause_until if lifted is None else lifted['native_flash_pause_until']
-                        self._census(pair, market, evidence, native, now_ms)
                     if lifted is not None:
                         decision['capitulation'] = lifted
                         self.receipts.record(CAPITULATION, pair=pair, cut=market.candle_open, code='flash_pause_lifted',
@@ -299,6 +359,8 @@ class TidewaterPortfolio(MeridianPortfolio):
             if code is not None:
                 self.receipts.record(REFUSED, pair=pair, cut=market.candle_open, code=code, payload=decision,
                                      now=now_ms / 1000)
+                if variants:
+                    self._outcome(pair, market.candle_open, code)
                 if code in VETO_CODES:
                     self._shadow_tide_gate(pair, market, u, bid, reference, code, now_ms)
                 continue
@@ -328,8 +390,18 @@ class TidewaterPortfolio(MeridianPortfolio):
         only the clock can move, and each read keeps its own consistent time (a reused snapshot
         would carry an earlier cutoff than the observations, and P0 would reject them).
         """
+        census = self._census_enabled()
+        if census:
+            self._signal_census(markets)
         pairs = super().candidates(markets)
         self._paced = ()
+        if census:
+            holds = self.status.get('candidate_holds') or {}
+            for pair, signal in self._signals.items():
+                if pair not in pairs:
+                    reason = holds.get(pair)
+                    self._outcome(pair, signal['cut'],
+                                  'native_paused' if reason == 'flash_crash_pause' else 'preview_held', reason)
         if not pairs:
             return pairs
         now_ms = self.now_ms()
@@ -337,6 +409,8 @@ class TidewaterPortfolio(MeridianPortfolio):
             snapshot = self.snapshot(now_ms)
         except (DataUnavailable, PolicyError, *ERRORS) as exc:
             self.status = {**self.status, 'reason': NATIVE_SNAPSHOT_UNAVAILABLE, 'hold': f'{type(exc).__name__}:{exc}'[:300]}
+            for pair in pairs if census else ():
+                self._outcome(pair, markets[pair].candle_open, 'pacing_unavailable', NATIVE_SNAPSHOT_UNAVAILABLE)
             return ()
         paced = self.pace(pairs, markets, snapshot, now_ms)
         if not paced:
@@ -348,7 +422,10 @@ class TidewaterPortfolio(MeridianPortfolio):
         """Meridian's evaluation; an admission receipt follows each committed target."""
         self._paced = ()
         target = super().evaluate(markets)
+        census = self._census_enabled()
         if target is None or target is not self.last_target or self.last_admission is None:
+            for pair in self._paced if census else ():  # paced, but no admission completed for this cut
+                self._outcome(pair, markets[pair].candle_open, 'admission_incomplete')
             return target
         outcome = self.last_admission
         try:  # admitted grant ids -> their symbols, so each pair's receipt says what it received
@@ -359,8 +436,12 @@ class TidewaterPortfolio(MeridianPortfolio):
             granted = None
         for pair in self._paced:
             if self._evaluated.get(pair) != markets[pair].candle_open:
+                if census:
+                    self._outcome(pair, markets[pair].candle_open, 'admission_incomplete')
                 continue  # admission did not complete for this cut; nothing was committed for it
             code = 'admission_unresolved' if granted is None else ('admitted' if pair in granted else 'not_admitted')
+            if census:
+                self._outcome(pair, markets[pair].candle_open, code)
             self.receipts.record(ADMITTED, pair=pair, cut=markets[pair].candle_open, code=code,
                                  payload={'target_sha256': target.identity, 'target_status': target.status,
                                           'admitted': sorted(str(g) for g in outcome.admitted),

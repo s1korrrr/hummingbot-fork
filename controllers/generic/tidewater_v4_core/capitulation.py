@@ -6,8 +6,8 @@ DCA buy through that pause only in a deep capitulation:
 
     close_t <= (1 - depth) * max(high over the trailing 1,440 closed minutes)
 
-and only when the pair holds inventory or is a first entry (not while an acquisition is
-pending). Everything else (buy gap, depth budget, pair limit, tide gate, P0 admission) still
+and only for an inventory-backed add: the pair holds an acquired tranche or a held bag. A first
+entry, or a pair with an acquisition pending, keeps the native pause. Everything else (buy gap, depth budget, pair limit, tide gate, P0 admission) still
 applies. The 1,440-minute high is the engine's own `BagFeatures.recent_high` (the depth-budget
 lookback), read from the same closed candles as the pause.
 

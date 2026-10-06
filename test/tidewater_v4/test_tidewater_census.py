@@ -35,6 +35,21 @@ class FailingCensusStore:
         return self.inner.get_rsi_v5_runtime_events(controller_id)
 
 
+class FailingHistory:
+    """The real recorder, except that reading the receipt history fails while `on` is set."""
+
+    def __init__(self, inner):
+        self.inner, self.on = inner, True
+
+    def append_rsi_v5_runtime_events(self, events):
+        return self.inner.append_rsi_v5_runtime_events(events)
+
+    def get_rsi_v5_runtime_events(self, controller_id):
+        if self.on:
+            raise RuntimeError('injected history read failure')
+        return self.inner.get_rsi_v5_runtime_events(controller_id)
+
+
 def one_more_candle(frame):
     """The frame plus one flat closed candle: the signal's cut passes."""
     last = frame.iloc[-1]
@@ -200,6 +215,70 @@ class TidewaterCensusTests(IsolatedAsyncioTestCase):
                 self.assertEqual({r['pair']: r['census_id'] for r in census}, census_before)
             finally:
                 await restored.close()
+
+    # ------------------------------------------------------------------ history read failure (K3)
+    async def test_signals_seen_while_the_history_read_fails_are_recorded_once_it_recovers(self):
+        # K3 repro: kill switch on; the signals fire on cut 600000 while the history read fails;
+        # reads recover at the non-signalling cut 600060.
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(Path(directory) / 't.sqlite', self.config(manual_kill_switch=True))
+            try:
+                portfolio = session.controllers[OWNER].portfolio
+                history = FailingHistory(session.recorder)
+                portfolio.receipts._recorder = history
+                receipt = await self.enter(session)
+                self.assertEqual(receipt['actions'], [])
+                self.assertFalse(self.receipts(session, CENSUS))
+                self.assertFalse(portfolio.census.loaded)
+                self.assertIn('injected history read failure', portfolio.census.fault)
+                history.on = False
+                _, rebound = frames()
+                await session.step(600120, books=books(2, 600120), candles=all_candles(one_more_candle(rebound), 600120))
+                self.assertEqual({r['pair'] for r in self.receipts(session, CENSUS) if r['cut'] == 600000}, set(PAIRS))
+                self.assertFalse([r for r in self.receipts(session, CENSUS) if r['cut'] == 600060])  # no signal there
+                self.assertEqual(self.transitions(session, 600000), {p: ['kill_switch_held'] for p in PAIRS})
+                self.assertEqual({p: (r['code'], r['reason']) for p, r in self.finals(session, 600000).items()},
+                                 {p: ('kill_switch_held', 'cut_passed') for p in PAIRS})
+                report = portfolio.census.report()
+                self.assertEqual((report['loaded'], report['queued'], report['pending_history']), (True, 0, 0))
+            finally:
+                await session.close()
+
+    async def test_signals_seen_across_several_failed_history_reads_are_reconciled_completely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            symbols = [{'trading_pair': p, 'entry_enabled': p != 'BTC-USDC'} for p in PAIRS]
+            session = self.session(Path(directory) / 't.sqlite', self.config(symbols=symbols))
+            try:
+                portfolio = session.controllers[OWNER].portfolio
+                history = FailingHistory(session.recorder)
+                portfolio.receipts._recorder = history
+                receipt = await self.enter(session)  # admitted while the history read fails
+                self.assertEqual(len(receipt['actions']), 4)
+                _, rebound = frames()
+                frame = rebound
+                for k in range(3):  # three more cuts pass with the read still failing
+                    frame = one_more_candle(frame)
+                    now = 600120 + 60 * k
+                    await session.step(now, books=books(2 + k, now), candles=all_candles(frame, now))
+                self.assertFalse(self.receipts(session, CENSUS))
+                history.on = False
+                frame = one_more_candle(frame)
+                await session.step(600300, books=books(9, 600300), candles=all_candles(frame, 600300))
+                census = self.receipts(session, CENSUS)
+                self.assertEqual(sorted((r['pair'], r['cut']) for r in census), sorted((p, 600000) for p in PAIRS))
+                self.assertEqual(self.transitions(session, 600000),
+                                 {p: ['entry_disabled' if p == 'BTC-USDC' else 'admitted'] for p in PAIRS})
+                self.assertEqual({p: (r['code'], r['reason'], r['transitions'])
+                                  for p, r in self.finals(session, 600000).items()},
+                                 {p: ('entry_disabled', 'cut_passed', 1) if p == 'BTC-USDC'
+                                  else ('admitted', 'admission_settled', 1) for p in PAIRS})
+                self.assertEqual(sorted(r['seq'] for r in self.receipts(session, OUTCOME)), [1] * 5)
+                await session.step(600301, books=books(10, 600301))  # nothing is written twice
+                self.assertEqual(len(self.receipts(session, CENSUS)), 5)
+                self.assertEqual(len(self.receipts(session, FINAL)), 5)
+                self.assertEqual(portfolio.census.report()['pending_history'], 0)
+            finally:
+                await session.close()
 
     # ------------------------------------------------------------------ inert census-only arm (K2.3)
     async def scenario(self, directory, census):

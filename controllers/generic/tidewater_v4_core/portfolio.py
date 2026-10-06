@@ -42,6 +42,7 @@ from controllers.generic.modular_spot_core.bag import HeldBag, live_buy_gap
 from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError, decimal
 from controllers.generic.modular_spot_core.signals import signal_decision
 from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, Opportunity
+from hummingbot.strategy_v2.components.held_inventory import held_is_dust
 from hummingbot.strategy_v2.components.recipe_contract import digest
 from hummingbot.strategy_v2.controllers.native_portfolio_bridge_v3 import PortfolioGrantStore
 from hummingbot.strategy_v2.controllers.portfolio_target_store_v3 import NativeTargetStore
@@ -133,8 +134,12 @@ class TidewaterPortfolio(MeridianPortfolio):
         return PortfolioSnapshot.model_validate({**snapshot.model_dump(mode='json'), 'portfolio_id': PORTFOLIO_ID})
 
     # ------------------------------------------------------------------ pacing
-    def _reference(self, pair):
-        """Last active acquired tranche of the pair, else its held-bag breakeven, else None."""
+    def _reference(self, pair, bid):
+        """Last active acquired tranche of the pair, else its held-bag breakeven, else None.
+
+        A held bag that is venue dust at `bid` is no bag, as in the native planner's `bag_empty`
+        (planner.py): the native runtime applies no bag gap to it, so the gate must not either.
+        """
         context = self.owner.contexts[pair]
         runtime = context.runtime
         config = self.owner.symbol_config(pair)
@@ -146,18 +151,35 @@ class TidewaterPortfolio(MeridianPortfolio):
             if acquired:
                 return acquired[-1].entry_price
         held = HeldBag.from_positions(context.positions_held, connector=config.connector_name, pair=pair)
-        return held.breakeven_price if held.amount > 0 else None
+        if held.amount <= 0:
+            return None
+        rules = runtime.snapshot()
+        if held_is_dust(held.amount, bid, min_amount=max(rules['amount_step'], rules['minimum_amount']),
+                        min_notional=rules['minimum_notional']):
+            return None
+        return held.breakeven_price
 
-    def entry_state(self, pair, snapshot=None):
+    def entry_state(self, pair, snapshot=None, bid=None):
         """('holds' | 'first' | 'pending', evidence, reference) for one pair.
 
-        'holds': the pair has an acquired active tranche or a held bag (`_reference` is set).
+        'holds': the pair has an acquired active tranche or a held bag that is not venue dust at
+        `bid` (`_reference` is set). A dust bag is no inventory, as in the native planner's
+        `bag_empty`, so a pair holding only dust is a first entry (Astra P5). `bid` defaults to the
+        snapshot's bid for the pair, else the runtime's own book.
         'first': no inventory, no unresolved claim (an executor not yet created, or active with
         nothing filled), nothing pending creation and, when a snapshot is given, no open commitment.
         'pending': no inventory but an acquisition is under way; it is not a first entry.
         """
-        runtime = self.owner.contexts[pair].runtime
-        reference = self._reference(pair)
+        context = self.owner.contexts[pair]
+        runtime = context.runtime
+        if bid is None and snapshot is not None:
+            bid = next(a.bid for a in snapshot.assets if a.symbol == pair)
+        elif bid is None:
+            # `_reference` reads the bid only to judge a held bag as dust; read the book only then.
+            held = HeldBag.from_positions(context.positions_held, connector=self.owner.symbol_config(pair).connector_name,
+                                          pair=pair)
+            bid = runtime.snapshot()['bid'] if held.amount > 0 else None
+        reference = self._reference(pair, bid)
         state, _ = runtime.ensure_store().load()
         inventory = runtime.inventory()
         claims = () if state is None else tuple(state.claims)
@@ -269,7 +291,7 @@ class TidewaterPortfolio(MeridianPortfolio):
         features = getattr(market, 'bag', None)
         gap = live_buy_gap(self.owner.symbol_config(pair).buy_gap, None if features is None else features.atr_pct)
         if reference is _UNREAD:
-            reference = self._reference(pair)
+            reference = self._reference(pair, bid)
         return gap, reference, tide_gate(self.owner.config.tide_gate, gap=gap, occupancy=u, reference=reference, bid=bid)
 
     def _shadow_tide_gate(self, pair, market, u, bid, reference, code, now_ms):
@@ -315,7 +337,7 @@ class TidewaterPortfolio(MeridianPortfolio):
             entry, reference = None, _UNREAD
             if variants:
                 try:
-                    entry, evidence, reference = self.entry_state(pair, snapshot)
+                    entry, evidence, reference = self.entry_state(pair, snapshot, bid=bid)
                 except PACING_ERRORS as exc:
                     decision['error'] = f'{type(exc).__name__}:{exc}'[:200]
                     code = 'pacing_unavailable'

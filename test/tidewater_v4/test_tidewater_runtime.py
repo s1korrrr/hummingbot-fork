@@ -268,10 +268,10 @@ class TidewaterPaperTests(IsolatedAsyncioTestCase):
                     controller = session.controllers[OWNER]
                     original = controller.portfolio._reference
 
-                    def reference(pair, error=error, original=original):
+                    def reference(pair, bid, error=error, original=original):
                         if pair == 'BTC-USDC':
                             raise error
-                        return original(pair)
+                        return original(pair, bid)
                     controller.portfolio._reference = reference
                     receipt = await self.enter(session)
                     pairs = {a.executor_config.trading_pair for a in receipt['actions']}

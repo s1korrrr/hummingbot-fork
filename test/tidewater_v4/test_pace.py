@@ -22,7 +22,7 @@ def portfolio(config, references):
     p = TidewaterPortfolio.__new__(TidewaterPortfolio)
     p.owner, p.pacing, p.occupancy = owner, {}, None
     p.receipts = ReceiptWriter(config.id, recorder=Collecting())
-    p._reference = lambda pair: references.get(pair)
+    p._reference = lambda pair, bid: references.get(pair)
     return p
 
 
@@ -110,3 +110,35 @@ def test_uncapped_stage_allows_entries_on_bnb_only():
     import pytest
     with pytest.raises(ValueError, match='tidewater_bnb_uncapped'):
         tidewater(capital_stage='tidewater_bnb_uncapped')
+
+
+def _held_portfolio(amount, breakeven='100'):
+    """A portfolio whose BNB context has no active tranche and one held position (Astra P5 #1)."""
+    config = tidewater(capital_stage='tidewater_bnb_uncapped', symbols=ONLY_BNB)
+    position = SimpleNamespace(amount=D(amount), side='BUY', connector_name='okx', trading_pair='BNB-USDC',
+                               breakeven_price=D(breakeven), remaining_fees_quote=D('0'))
+    store = SimpleNamespace(load=lambda: (None, None))
+    runtime = SimpleNamespace(ensure_store=lambda: store,
+                              snapshot=lambda: {'amount_step': D('0.001'), 'minimum_amount': D('0.01'),
+                                                'minimum_notional': D('5')})
+    contexts = {'BNB-USDC': SimpleNamespace(runtime=runtime, positions_held=[position])}
+    symbol = SimpleNamespace(connector_name='okx')
+    owner = SimpleNamespace(config=config, contexts=contexts, symbol_config=lambda pair: symbol)
+    p = TidewaterPortfolio.__new__(TidewaterPortfolio)
+    p.owner = owner
+    return p
+
+
+def test_a_dust_held_bag_is_no_pacing_reference_as_in_the_native_planner():
+    # amount 0.001 < minimum amount 0.01: venue dust, which the native planner treats as an empty bag
+    # (planner.py bag_empty) and so applies no bag gap. The gate must not refuse the entry as up_gap.
+    assert _held_portfolio('0.001')._reference('BNB-USDC', D('100')) is None
+
+
+def test_a_held_bag_below_minimum_notional_is_dust_at_the_current_bid():
+    assert _held_portfolio('0.04')._reference('BNB-USDC', D('100')) is None  # 4 quote < 5 notional
+    assert _held_portfolio('0.04')._reference('BNB-USDC', D('200')) == D('100')  # 8 quote: a real bag
+
+
+def test_a_real_held_bag_paces_on_its_breakeven():
+    assert _held_portfolio('1')._reference('BNB-USDC', D('100')) == D('100')

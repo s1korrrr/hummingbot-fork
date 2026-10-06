@@ -13,6 +13,7 @@ from pathlib import Path
 from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
 from test.meridian_v3.test_native_paper import frames, paper
 from test.tidewater_v4.test_tidewater_runtime import OWNER, PAIRS, all_candles, books, tidewater
+from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
@@ -25,6 +26,7 @@ from controllers.generic.tidewater_v4_core import entry_veto
 from controllers.generic.tidewater_v4_core.capitulation import CP_FROZEN, CapitulationOverride
 from controllers.generic.tidewater_v4_core.config import TidewaterConfig
 from controllers.generic.tidewater_v4_core.entry_veto import E0_FROZEN, X0_FROZEN, X0Model, decision_window, e0_features
+from controllers.generic.tidewater_v4_core.portfolio import TidewaterPortfolio
 from controllers.generic.tidewater_v4_core.receipts import (
     ADMITTED,
     CAPITULATION,
@@ -37,10 +39,11 @@ from controllers.generic.tidewater_v4_core.receipts import (
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
-# recipe_digest() and seal().configuration_sha256 at 6ef2bc57e (the owner commit merged into this branch),
-# computed there before the candidates were applied. seal().source_sha256 binds the Tidewater source
-# files and changes with any source edit by design.
-OWNER_6EF2BC57E = {
+# recipe_digest() and seal().configuration_sha256 at the owner's 693fa9fda (merged into this branch).
+# Computed at 6ef2bc57e before the candidates were applied; 693fa9fda changes only portfolio.py and
+# tests, none of the digest inputs, so its values are the same. seal().source_sha256 binds the
+# Tidewater source files and changes with any source edit by design.
+OWNER_693FA9FDA = {
     'paper_default': ('3d4f9624dce28896e7b0d042136b6e3c0da9e5c134ebf0b4c5a497b17fae7c2b',  # noqa: documentation
                       '3b7888ed3d4bfe8aaaa6bad3f8e3b6227bc1f0767746c0e3863059e9ab6c8345'),  # noqa: documentation
     'paper_bnb_1000': ('effbf284895ee040b9b06979f033031f4a5dd45893c8b0efe2082cbbff117afc',  # noqa: documentation
@@ -110,12 +113,12 @@ def crash_continuation(drop_to, crash=0.02):
 
 # ---------------------------------------------------------------------- seal and identity
 @pytest.mark.parametrize('name', sorted(CONFIGS))
-def test_default_configurations_keep_their_6ef2bc57e_recipe_and_configuration_digests(name):
+def test_default_configurations_keep_their_owner_recipe_and_configuration_digests(name):
     c = tidewater(**CONFIGS[name])
     assert (c.entry_veto, c.capitulation_override) == (None, None)
     seal = c.seal()
-    assert (c.recipe_digest(), seal.configuration_sha256) == OWNER_6EF2BC57E[name]
-    assert seal.recipe_sha256 == OWNER_6EF2BC57E[name][0]
+    assert (c.recipe_digest(), seal.configuration_sha256) == OWNER_693FA9FDA[name]
+    assert seal.recipe_sha256 == OWNER_693FA9FDA[name][0]
     assert c.census is False
     assert not {'entry_veto', 'capitulation_override', 'census'} & set(c.sealed_payload())
 
@@ -149,12 +152,12 @@ def test_candidates_and_the_census_seal_on_the_uncapped_stage(candidate):
     uncapped = CONFIGS['paper_bnb_uncapped']
     sealed = tidewater(execution_enabled=True, census=True, **uncapped, **candidate)
     assert sealed.capital_stage == 'tidewater_bnb_uncapped' and sealed.pacing_reference_quote() == 1000
-    assert sealed.seal().recipe_sha256 == sealed.recipe_digest() != OWNER_6EF2BC57E['paper_bnb_uncapped'][0]
+    assert sealed.seal().recipe_sha256 == sealed.recipe_digest() != OWNER_693FA9FDA['paper_bnb_uncapped'][0]
     TidewaterConfig(**sealed.model_dump(mode='json'))  # the sealed configuration validates as written
     with pytest.raises(ValueError):  # and its candidate and census are bound by the seal
         TidewaterConfig(**{**sealed.model_dump(mode='json'), 'census': False})
     census_only = tidewater(execution_enabled=True, census=True, **uncapped)
-    assert census_only.recipe_digest() not in {sealed.recipe_digest(), OWNER_6EF2BC57E['paper_bnb_uncapped'][0]}
+    assert census_only.recipe_digest() not in {sealed.recipe_digest(), OWNER_693FA9FDA['paper_bnb_uncapped'][0]}
 
 
 @pytest.mark.parametrize('change', [{'entry_veto': 'e0'}, {'entry_veto': 'x0'}, {'capitulation_override': CP_FROZEN}])
@@ -213,6 +216,46 @@ def test_frozen_values_are_the_evidence_values():
     # At the fit means the model returns sigmoid(intercept).
     p = E0_FROZEN.probability(float(E0_FROZEN.mean_x1), float(E0_FROZEN.mean_x2))
     assert abs(p - 1 / (1 + math.exp(-float(E0_FROZEN.intercept)))) < 1e-15
+
+
+# ---------------------------------------------------------------------- a dust held bag (Astra P5)
+def held_bag_portfolio(amount, runtime_bid='100'):
+    """BNB with no tranche or claim and one held position; venue rules: step 0.001, minimum 0.01, notional 5."""
+    config = tidewater(census=True, capitulation_override=CP_FROZEN, **CONFIGS['paper_bnb_uncapped'])
+    position = SimpleNamespace(amount=D(amount), side='BUY', connector_name='okx', trading_pair='BNB-USDC',
+                               breakeven_price=D('100'), remaining_fees_quote=D('0'))
+    store = SimpleNamespace(load=lambda: (None, None))
+    runtime = SimpleNamespace(ensure_store=lambda: store, inventory=lambda: {}, pending={},
+                              snapshot=lambda: {'bid': D(runtime_bid), 'amount_step': D('0.001'),
+                                                'minimum_amount': D('0.01'), 'minimum_notional': D('5')})
+    contexts = {'BNB-USDC': SimpleNamespace(runtime=runtime, positions_held=[position])}
+    owner = SimpleNamespace(config=config, contexts=contexts, symbol_config=lambda pair: SimpleNamespace(connector_name='okx'),
+                            market_data_provider=SimpleNamespace(time=lambda: 600060.0))
+    p = TidewaterPortfolio.__new__(TidewaterPortfolio)
+    p.owner = owner
+    return p
+
+
+def test_a_dust_held_bag_is_no_inventory_for_the_first_entry_predicate():
+    # Consistent with the native planner's bag_empty: venue dust is no bag, so the pair is a first entry.
+    state, evidence, reference = held_bag_portfolio('0.001').entry_state('BNB-USDC')  # 0.001 < minimum 0.01
+    assert (state, reference, evidence['reference']) == ('first', None, None)
+    assert held_bag_portfolio('1').entry_state('BNB-USDC')[:3:2] == ('holds', D('100'))
+
+
+def test_dust_is_judged_at_the_bid_the_caller_paces_on_else_the_runtime_book():
+    assert held_bag_portfolio('0.04', runtime_bid='100').entry_state('BNB-USDC')[0] == 'first'  # 4 < 5 quote
+    assert held_bag_portfolio('0.04', runtime_bid='200').entry_state('BNB-USDC')[0] == 'holds'  # 8 quote
+    assert held_bag_portfolio('0.04', runtime_bid='100').entry_state('BNB-USDC', bid=D('200'))[0] == 'holds'
+
+
+def test_cp_treats_a_dust_bag_as_a_first_entry_and_keeps_the_pause():
+    market = SimpleNamespace(flash_pause_until=600999.0, candle_open=600000, close=D('90'),
+                             bag=SimpleNamespace(recent_high=D('100')))
+    dust = held_bag_portfolio('0.001').capitulation('BNB-USDC', market, CP_FROZEN)
+    assert (dust['applied'], dust['reason'], dust['entry_state']) == (False, 'first_entry_keeps_pause', 'first')
+    real = held_bag_portfolio('1').capitulation('BNB-USDC', market, CP_FROZEN)
+    assert (real['applied'], real['reason'], real['entry_state']) == (True, 'capitulation', 'holds')
 
 
 # ---------------------------------------------------------------------- E0 features (pure)

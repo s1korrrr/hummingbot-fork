@@ -37,23 +37,27 @@ from controllers.generic.tidewater_v4_core.receipts import (
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
-# recipe_digest() and seal().configuration_sha256 at b2bb5e51b (the owner commit this branch is on),
+# recipe_digest() and seal().configuration_sha256 at 6ef2bc57e (the owner commit merged into this branch),
 # computed there before the candidates were applied. seal().source_sha256 binds the Tidewater source
 # files and changes with any source edit by design.
-B2BB5E51B = {
-    'paper_default': ('cbf42b6212887decc93d5e44f17f0028f7dce45a8fe471076a73bd97b36d3f13',  # noqa: documentation
+OWNER_6EF2BC57E = {
+    'paper_default': ('3d4f9624dce28896e7b0d042136b6e3c0da9e5c134ebf0b4c5a497b17fae7c2b',  # noqa: documentation
                       '3b7888ed3d4bfe8aaaa6bad3f8e3b6227bc1f0767746c0e3863059e9ab6c8345'),  # noqa: documentation
-    'paper_bnb_1000': ('19227d8785adffe5489d90587d77820bddc08cd38400e3f5c591198ded2f00ac',  # noqa: documentation
+    'paper_bnb_1000': ('effbf284895ee040b9b06979f033031f4a5dd45893c8b0efe2082cbbff117afc',  # noqa: documentation
                        '25f032d0fb19146db5506f782d2684c967ebce53262f083a173f7c0030eb8119'),  # noqa: documentation
-    'observation_default': ('e02ac8e1bc1ebe6e78f2018fe7acd59f5a2399a1837af757942fd50324889bc9',  # noqa: documentation
+    'paper_bnb_uncapped': ('60354719928944ed7f84d1b3bc0401af28862a1e7a97affe8dc634b5d1021d9e',  # noqa: documentation
+                           'c4fb530dc21725479581d6508b2f1d33440388847a65a689d746e22b119efc1e'),  # noqa: documentation
+    'observation_default': ('91de9ebd6de85d008a6fa73d643a76384f1b3c150d6028abc28efc26b6a8d33e',  # noqa: documentation
                             '8d77d671a482241a2b044a6f1605f750a365d7be29bf65992b690b02a1fbf075'),  # noqa: documentation
-    'paper_no_gate_stable': ('db24a3f4139cebfa9fdb4e9a2990a40e8d4ef3a38e1e1e415cd913e497a58e40',  # noqa: documentation
+    'paper_no_gate_stable': ('21f3f68f6d6a4a2f0b998a8ef666dd4b8c57250ffd10a1d6ba6e5536fb03b371',  # noqa: documentation
                              'f20a7e96e329e5994a7e7a4a7b71e618edaaf7870c1b02f1de810c3b81bddbf1'),  # noqa: documentation
 }
 CONFIGS = {
     'paper_default': {},
     'paper_bnb_1000': dict(capital_stage='tidewater_bnb_1000',
                            symbols=[{'trading_pair': p, 'entry_enabled': p == 'BNB-USDC'} for p in PAIRS]),
+    'paper_bnb_uncapped': dict(capital_stage='tidewater_bnb_uncapped',
+                               symbols=[{'trading_pair': p, 'entry_enabled': p == 'BNB-USDC'} for p in PAIRS]),
     'observation_default': dict(mode='observation'),
     'paper_no_gate_stable': dict(tide_gate=None, resting_entry='stable'),
 }
@@ -106,12 +110,12 @@ def crash_continuation(drop_to, crash=0.02):
 
 # ---------------------------------------------------------------------- seal and identity
 @pytest.mark.parametrize('name', sorted(CONFIGS))
-def test_default_configurations_keep_their_b2bb5e51b_recipe_and_configuration_digests(name):
+def test_default_configurations_keep_their_6ef2bc57e_recipe_and_configuration_digests(name):
     c = tidewater(**CONFIGS[name])
     assert (c.entry_veto, c.capitulation_override) == (None, None)
     seal = c.seal()
-    assert (c.recipe_digest(), seal.configuration_sha256) == B2BB5E51B[name]
-    assert seal.recipe_sha256 == B2BB5E51B[name][0]
+    assert (c.recipe_digest(), seal.configuration_sha256) == OWNER_6EF2BC57E[name]
+    assert seal.recipe_sha256 == OWNER_6EF2BC57E[name][0]
     assert c.census is False
     assert not {'entry_veto', 'capitulation_override', 'census'} & set(c.sealed_payload())
 
@@ -138,6 +142,19 @@ def test_the_recipe_digest_binds_the_frozen_e0_constants():
     with patch.dict(entry_veto.ENTRY_VETOES, {'e0': E0_FROZEN.model_copy(update={'threshold': D('0.7')})}):
         assert tidewater(census=True, entry_veto='e0').recipe_digest() != before
     assert tidewater(census=True, entry_veto='e0').recipe_digest() == before
+
+
+@pytest.mark.parametrize('candidate', [{'entry_veto': 'e0'}, {'entry_veto': 'x0'}, {'capitulation_override': CP_FROZEN}])
+def test_candidates_and_the_census_seal_on_the_uncapped_stage(candidate):
+    uncapped = CONFIGS['paper_bnb_uncapped']
+    sealed = tidewater(execution_enabled=True, census=True, **uncapped, **candidate)
+    assert sealed.capital_stage == 'tidewater_bnb_uncapped' and sealed.pacing_reference_quote() == 1000
+    assert sealed.seal().recipe_sha256 == sealed.recipe_digest() != OWNER_6EF2BC57E['paper_bnb_uncapped'][0]
+    TidewaterConfig(**sealed.model_dump(mode='json'))  # the sealed configuration validates as written
+    with pytest.raises(ValueError):  # and its candidate and census are bound by the seal
+        TidewaterConfig(**{**sealed.model_dump(mode='json'), 'census': False})
+    census_only = tidewater(execution_enabled=True, census=True, **uncapped)
+    assert census_only.recipe_digest() not in {sealed.recipe_digest(), OWNER_6EF2BC57E['paper_bnb_uncapped'][0]}
 
 
 @pytest.mark.parametrize('change', [{'entry_veto': 'e0'}, {'entry_veto': 'x0'}, {'capitulation_override': CP_FROZEN}])

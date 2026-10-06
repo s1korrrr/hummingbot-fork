@@ -297,6 +297,7 @@ class TidewaterPortfolio(MeridianPortfolio):
         """Candidates allowed by the per-pair limit and the tide gate, in priority order."""
         config = self.owner.config
         stage = config.stage()
+        pacing_reference = config.pacing_reference_quote()
         increment = stage.order_quote * (1 + config.risk.fee_reserve_fraction)
         veto = config.entry_veto_model()
         variants = veto is not None or config.capitulation_override is not None
@@ -305,7 +306,7 @@ class TidewaterPortfolio(MeridianPortfolio):
         allowed = []
         for pair in (p for p in config.priority if p in pairs):
             market = markets[pair]
-            u = used / stage.envelope_quote
+            u = used / pacing_reference
             pair_usage = self._pair_usage(snapshot, pair) + added.get(pair, ZERO)
             bid = next(a.bid for a in snapshot.assets if a.symbol == pair)
             decision = {'occupancy': str(u), 'pair_usage': str(pair_usage), 'bid': str(bid),
@@ -368,9 +369,10 @@ class TidewaterPortfolio(MeridianPortfolio):
             allowed.append(pair)
             used += increment
             added[pair] = added.get(pair, ZERO) + increment
-        self.occupancy = {'u': str(committed_usage(snapshot) / stage.envelope_quote),
+        self.occupancy = {'u': str(committed_usage(snapshot) / pacing_reference),
+                          'reference_quote': str(pacing_reference),
                           'multiplier': None if config.tide_gate is None else str(
-                              multiplier(config.tide_gate, committed_usage(snapshot) / stage.envelope_quote))}
+                              multiplier(config.tide_gate, committed_usage(snapshot) / pacing_reference))}
         return tuple(p for p in pairs if p in allowed)
 
     def _lifted(self, pair, market):

@@ -46,15 +46,32 @@ ID_PREFIX = 'modular_spot_tidewater_v4_'
 # Each tranche reserves order x (1 + fee reserve) = 50.15, so six fit under 350 and a seventh does
 # not. At zero depth the depth budget (0.75 x 350 = 262.5) allows five; it grows as
 # 262.5 + 500 x depth, so the sixth needs about a 7.5% drop from the 24 h high.
+UNCAPPED_QUOTE = Decimal('1000000')
+# The shared native live-capital model admits at most 64 concurrent active tranches per pair
+# (`LiveCapitalConfig.max_active_tranches`, sealed V3 code). Held bags do not count, so this limits
+# concurrency, not capital; results report how often the slot limit refused an entry.
+UNCAPPED_TRANCHES = 64
+
 CAPITAL_STAGES = MappingProxyType({
     'tidewater_1000': CapitalStage(Decimal('1000'), Decimal('350'), Decimal('50'), 6),
     # Operator 2026-10-06 (via the regime campaign session): one pair uses the whole envelope, so
     # the tide gate is exercised on a single pair. Only that pair may have entries enabled.
     # Nineteen 50.15 tranches fit under 1,000; a twentieth does not.
     'tidewater_bnb_1000': CapitalStage(Decimal('1000'), Decimal('1000'), Decimal('50'), 19),
+    # Operator 2026-10-06: "50 usd per entry, without any cap" (spacing rules such as the flash-crash
+    # pause, the buy gap and the tide gate are a different thing and stay). The envelope, per-pair
+    # limit, depth budget and tranche ceiling are set to values 50-quote entries cannot reach in a
+    # backtest window, so no cap binds; results report the peak usage to prove it.
+    'tidewater_bnb_uncapped': CapitalStage(UNCAPPED_QUOTE, UNCAPPED_QUOTE, Decimal('50'), UNCAPPED_TRANCHES),
 })
 # Single-pair stages: the only pair allowed to acquire. The others stay managed, entries off.
-SINGLE_PAIR_STAGES = MappingProxyType({'tidewater_bnb_1000': 'BNB-USDC'})
+SINGLE_PAIR_STAGES = MappingProxyType({'tidewater_bnb_1000': 'BNB-USDC', 'tidewater_bnb_uncapped': 'BNB-USDC'})
+# Occupancy reference of the tide gate: committed usage / reference. A capped stage paces against
+# its envelope; the uncapped stage paces against 1,000, and usage may exceed it (the gate then
+# uses its maximum spacing; it never stops buying by itself, except upward adds above
+# `upward_max_occupancy` of the reference).
+PACING_REFERENCE = MappingProxyType({'tidewater_1000': Decimal('1000'), 'tidewater_bnb_1000': Decimal('1000'),
+                                     'tidewater_bnb_uncapped': Decimal('1000')})
 
 # Frozen priors (operator preference, not fitted). See the design doc, section T1.
 TIDE_GATE_V1 = TideGateConfig(low_occupancy='0.30', high_occupancy='0.90', max_multiplier='4',
@@ -78,7 +95,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
     controller_name: Literal['tidewater_v4'] = CONTROLLER_NAME
     recipe_version: Literal['tidewater_v4_runtime_v1'] = RECIPE_ID
     id: str = Field(pattern=r'^modular_spot_tidewater_v4_(observation|paper|live)$')
-    capital_stage: Literal['tidewater_1000', 'tidewater_bnb_1000'] = Field(json_schema_extra={'is_updatable': False})
+    capital_stage: Literal['tidewater_1000', 'tidewater_bnb_1000', 'tidewater_bnb_uncapped'] = Field(
+        json_schema_extra={'is_updatable': False})
     # None disables the tide gate (ablation arm); the per-pair limit still applies.
     tide_gate: TideGateConfig | None = TIDE_GATE_V1
     # 'strict' re-checks a submitted entry with the full submit-time permission, as V3 does.
@@ -150,6 +168,10 @@ class TidewaterConfig(MeridianUnifiedConfig):
     def pair_limit_quote(self):
         return self.stage().per_asset_quote
 
+    def pacing_reference_quote(self):
+        """The tide gate's occupancy reference (the envelope for capped stages)."""
+        return PACING_REFERENCE[self.capital_stage]
+
     def entry_veto_model(self):
         return None if self.entry_veto is None else ENTRY_VETOES[self.entry_veto]
 
@@ -205,6 +227,7 @@ class TidewaterConfig(MeridianUnifiedConfig):
                   'modules': {k: v.model_dump(mode='json') for k, v in self.recipe_modules().items()},
                   'capital': self.recipe_capital().model_dump(mode='json'),
                   'pair_limit_quote': str(self.pair_limit_quote()),
+                  'pacing_reference_quote': str(self.pacing_reference_quote()),
                   'tide_gate': None if self.tide_gate is None else self.tide_gate.model_dump(mode='json'),
                   'resting_entry': self.resting_entry}
         if self.entry_veto is not None:  # the frozen model constants are part of the recipe

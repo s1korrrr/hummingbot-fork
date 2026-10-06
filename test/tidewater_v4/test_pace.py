@@ -78,3 +78,35 @@ def test_the_bnb_stage_fits_nineteen_fee_inclusive_tranches():
     p = portfolio(config, {})
     assert 'BNB-USDC' in p.pace(('BNB-USDC',), markets(), snapshot({'BNB-USDC': str(18 * increment)}), 1)
     assert 'BNB-USDC' not in p.pace(('BNB-USDC',), markets(), snapshot({'BNB-USDC': str(19 * increment)}), 1)
+
+
+ONLY_BNB = [{'trading_pair': pair, 'entry_enabled': pair == 'BNB-USDC'} for pair in PAIRS]
+
+
+def test_the_uncapped_bnb_stage_has_no_binding_cap_and_paces_on_a_fixed_reference():
+    # Operator 2026-10-06: "50 usd per entry, without any cap"; spacing rules are a different thing.
+    config = tidewater(capital_stage='tidewater_bnb_uncapped', symbols=ONLY_BNB)
+    stage = config.stage()
+    assert stage.order_quote == 50 and stage.envelope_quote >= 1_000_000 and stage.max_active_tranches == 64  # native maximum of concurrent active tranches
+    bnb = config.symbol_configs()['BNB-USDC']
+    assert bnb.capital.position_cap_quote == bnb.depth_budget.budget_quote == stage.per_asset_quote
+    assert config.pacing_reference_quote() == 1000
+    assert tidewater().pacing_reference_quote() == 1000  # existing stages: the envelope
+
+
+def test_uncapped_buying_continues_far_past_the_reference_with_wider_spacing():
+    config = tidewater(capital_stage='tidewater_bnb_uncapped', symbols=ONLY_BNB)
+    p = portfolio(config, {'BNB-USDC': D('100')})
+    # 5,000 deployed = 5x the pacing reference: no cap, the gate uses its maximum multiplier (4 x 0.8% = 3.2%).
+    used = snapshot({'BNB-USDC': '5000'}, bid=D('96.8'))
+    assert p.pace(('BNB-USDC',), markets(), used, 1) == ('BNB-USDC',)
+    assert D(p.pacing['BNB-USDC']['occupancy']) == 5 and p.pacing['BNB-USDC']['outcome'] == 'paced_ok'
+    shallow = snapshot({'BNB-USDC': '5000'}, bid=D('97'))
+    assert p.pace(('BNB-USDC',), markets(), shallow, 1) == ()
+    assert p.pacing['BNB-USDC']['outcome'] == 'tide_gate_down'
+
+
+def test_uncapped_stage_allows_entries_on_bnb_only():
+    import pytest
+    with pytest.raises(ValueError, match='tidewater_bnb_uncapped'):
+        tidewater(capital_stage='tidewater_bnb_uncapped')

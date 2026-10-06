@@ -236,6 +236,21 @@ class TidewaterController(MeridianUnifiedController):
                 return lifecycle.get('state')
         return None
 
+    # ------------------------------------------------------------------ signal census (census=True)
+    def _determine_executor_actions(self):
+        """Meridian's tick, with the raw signal census taken before its identity and kill-switch holds.
+
+        The census only reads and writes receipts; the decision path inside is Meridian's, unchanged.
+        """
+        if not self.config.census:
+            return super()._determine_executor_actions()
+        markets = {pair: c.runtime.market for pair, c in self.contexts.items()}
+        self.portfolio.census_begin(markets)
+        try:
+            return super()._determine_executor_actions()
+        finally:
+            self.portfolio.census_end(markets)
+
     def _record_denial(self, pair, config, predicate, phase):
         written = self.portfolio.receipts.record(
             REVOKED, pair=pair, cut=config.id, code=phase, dedupe=predicate,
@@ -276,8 +291,9 @@ class TidewaterController(MeridianUnifiedController):
             'inventory': self._inventory_view(),
             'receipts': {'written': self.portfolio.receipts.written, 'fault': self.portfolio.receipts.fault},
             'observed_at': time.time()})
-        if self.config.entry_veto is not None or self.config.capitulation_override is not None:
+        if self.config.census:
             info['tidewater']['variants'] = self.config.variants()
+            info['tidewater']['census'] = self.portfolio.census.report()
         return info
 
     def to_format_status(self):

@@ -62,6 +62,8 @@ TIDE_GATE_V1 = TideGateConfig(low_occupancy='0.30', high_occupancy='0.90', max_m
 # Research candidate fields. At None each is left out of the sealed payload and the recipe digest,
 # so a configuration that does not use them keeps its pre-candidate recipe and configuration digests.
 VARIANT_FIELDS = ('entry_veto', 'capitulation_override')
+# Likewise, `census` is left out of the sealed payload and the recipe digest while False.
+INERT_FALSE_FIELDS = ('census',)
 
 
 def source_files():
@@ -87,6 +89,9 @@ class TidewaterConfig(MeridianUnifiedConfig):
     # DCA buy in a deep capitulation (capitulation.py). Neither ever sells, cancels or demotes.
     entry_veto: Literal['e0', 'x0'] | None = None
     capitulation_override: CapitulationOverride | None = None
+    # Signal census (census.py): records every raw signal and its outcomes, with no decision effect.
+    # Every campaign arm sets it, the baseline included; every candidate requires it.
+    census: bool = False
 
     @model_validator(mode='before')
     @classmethod
@@ -126,6 +131,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
         if self.execution_enabled and self.recipe_binding is None:
             raise ValueError('executable Tidewater requires a sealed recipe binding')
         symbols = self.symbol_configs()
+        if (self.entry_veto is not None or self.capitulation_override is not None) and not self.census:
+            raise ValueError('a research candidate requires census=True (its population must be recorded)')
         cp = self.capitulation_override
         if cp is not None and any(s.flash_crash is None or s.depth_budget is None
                                   or s.depth_budget.lookback_minutes != cp.lookback_minutes for s in symbols.values()):
@@ -148,7 +155,7 @@ class TidewaterConfig(MeridianUnifiedConfig):
 
     def variants(self):
         """The research candidates this configuration enables, for receipts and reporting."""
-        return {'entry_veto': self.entry_veto,
+        return {'census': self.census, 'entry_veto': self.entry_veto,
                 'capitulation_override': None if self.capitulation_override is None
                 else self.capitulation_override.model_dump(mode='json')}
 
@@ -186,6 +193,9 @@ class TidewaterConfig(MeridianUnifiedConfig):
         for name in VARIANT_FIELDS:
             if payload.get(name, False) is None:
                 del payload[name]
+        for name in INERT_FALSE_FIELDS:
+            if payload.get(name) is False:
+                del payload[name]
         return payload
 
     def recipe_digest(self):
@@ -201,6 +211,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
             values['entry_veto'] = {'id': self.entry_veto, 'model': self.entry_veto_model().model_dump(mode='json')}
         if self.capitulation_override is not None:
             values['capitulation_override'] = self.capitulation_override.model_dump(mode='json')
+        if self.census:
+            values['census'] = True
         return digest(values)
 
     def seal(self):

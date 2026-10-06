@@ -112,18 +112,21 @@ def test_default_configurations_keep_their_b2bb5e51b_recipe_and_configuration_di
     seal = c.seal()
     assert (c.recipe_digest(), seal.configuration_sha256) == B2BB5E51B[name]
     assert seal.recipe_sha256 == B2BB5E51B[name][0]
-    assert 'entry_veto' not in c.sealed_payload() and 'capitulation_override' not in c.sealed_payload()
+    assert c.census is False
+    assert not {'entry_veto', 'capitulation_override', 'census'} & set(c.sealed_payload())
 
 
 def test_candidates_enter_the_seal_and_the_recipe_digest():
     base = tidewater()
-    e0, x0, cp = tidewater(entry_veto='e0'), tidewater(entry_veto='x0'), tidewater(capitulation_override=CP_FROZEN)
-    deeper = tidewater(capitulation_override=CapitulationOverride(depth='0.10'))
-    digests = {c.recipe_digest() for c in (base, e0, x0, cp, deeper)}
-    configurations = {c.seal().configuration_sha256 for c in (base, e0, x0, cp, deeper)}
-    assert len(digests) == len(configurations) == 5
-    sealed = tidewater(execution_enabled=True, entry_veto='e0', capitulation_override=CP_FROZEN)
-    for change in ({'entry_veto': None}, {'entry_veto': 'x0'}, {'capitulation_override': None},
+    census = tidewater(census=True)
+    e0, x0 = tidewater(census=True, entry_veto='e0'), tidewater(census=True, entry_veto='x0')
+    cp = tidewater(census=True, capitulation_override=CP_FROZEN)
+    deeper = tidewater(census=True, capitulation_override=CapitulationOverride(depth='0.10'))
+    digests = {c.recipe_digest() for c in (base, census, e0, x0, cp, deeper)}
+    configurations = {c.seal().configuration_sha256 for c in (base, census, e0, x0, cp, deeper)}
+    assert len(digests) == len(configurations) == 6
+    sealed = tidewater(execution_enabled=True, census=True, entry_veto='e0', capitulation_override=CP_FROZEN)
+    for change in ({'entry_veto': None}, {'entry_veto': 'x0'}, {'capitulation_override': None}, {'census': False},
                    {'capitulation_override': {'depth': '0.10'}}):
         with pytest.raises(ValueError):
             TidewaterConfig(**{**sealed.model_dump(mode='json'), **change})
@@ -131,18 +134,25 @@ def test_candidates_enter_the_seal_and_the_recipe_digest():
 
 
 def test_the_recipe_digest_binds_the_frozen_e0_constants():
-    before = tidewater(entry_veto='e0').recipe_digest()
+    before = tidewater(census=True, entry_veto='e0').recipe_digest()
     with patch.dict(entry_veto.ENTRY_VETOES, {'e0': E0_FROZEN.model_copy(update={'threshold': D('0.7')})}):
-        assert tidewater(entry_veto='e0').recipe_digest() != before
-    assert tidewater(entry_veto='e0').recipe_digest() == before
+        assert tidewater(census=True, entry_veto='e0').recipe_digest() != before
+    assert tidewater(census=True, entry_veto='e0').recipe_digest() == before
+
+
+@pytest.mark.parametrize('change', [{'entry_veto': 'e0'}, {'entry_veto': 'x0'}, {'capitulation_override': CP_FROZEN}])
+def test_every_candidate_requires_the_census(change):
+    with pytest.raises(ValueError):
+        tidewater(**change)
+    assert tidewater(census=True, **change).census is True
 
 
 @pytest.mark.parametrize('change', [{'rate': D('0.2003')}, {'seed': 1}])
 def test_the_recipe_digest_binds_the_frozen_x0_rate_and_seed(change):
-    before = tidewater(entry_veto='x0').recipe_digest()
+    before = tidewater(census=True, entry_veto='x0').recipe_digest()
     with patch.dict(entry_veto.ENTRY_VETOES, {'x0': X0_FROZEN.model_copy(update=change)}):
-        assert tidewater(entry_veto='x0').recipe_digest() != before
-    assert tidewater(entry_veto='x0').recipe_digest() == before
+        assert tidewater(census=True, entry_veto='x0').recipe_digest() != before
+    assert tidewater(census=True, entry_veto='x0').recipe_digest() == before
 
 
 def test_x0_frozen_values_and_deterministic_verdicts():
@@ -238,6 +248,7 @@ class TidewaterCandidateTests(IsolatedAsyncioTestCase):
     setUp = session_tests.NativePaperSessionTests.setUp  # denies all network connections
 
     def session(self, directory, cash='1000', **overrides):
+        overrides.setdefault('census', True)  # every campaign arm records the signal census
         return NativePaperSession(paper(PAIRS, cash), [tidewater(execution_enabled=True, **overrides)],
                                   Path(directory) / 'tidewater.sqlite')
 
@@ -251,9 +262,9 @@ class TidewaterCandidateTests(IsolatedAsyncioTestCase):
         return [r for r in read_receipts(session.recorder, OWNER) if kind is None or r['kind'] == kind]
 
     def outcomes(self, session, cut):
-        """Each pair's outcome codes for one signal cut, in sequence order."""
+        """Each pair's outcome transitions for one signal cut, in their recorded order."""
         result = {}
-        for r in self.receipts(session, OUTCOME):
+        for r in sorted(self.receipts(session, OUTCOME), key=lambda r: r['seq']):
             if r['cut'] == cut:
                 result.setdefault(r['pair'], []).append(r['code'])
         return result
@@ -279,7 +290,7 @@ class TidewaterCandidateTests(IsolatedAsyncioTestCase):
                     self.assertLess(c['sequence'], next(r['sequence'] for r in refused if r['pair'] == pair))
                     self.assertEqual((c['entry_state'], c['native_flash_pause_until']), ('first', None))
                     self.assertEqual(c['evidence'], {'reference': None, 'unresolved_claims': 0, 'runtime_pending': 0,
-                                                     'commitments_quote': '0'})
+                                                     'commitments_quote': None})
                 self.assertEqual(len({r['census_id'] for r in census}), 5)
                 # The decision read only the 1,500 closed candles ending at the cut.
                 _, rebound = frames()
@@ -400,7 +411,7 @@ class TidewaterCandidateTests(IsolatedAsyncioTestCase):
 
     async def test_without_cp_the_native_flash_pause_holds_a_capitulation_signal(self):
         with tempfile.TemporaryDirectory() as directory:
-            session = self.session(directory)
+            session = self.session(directory, census=False)
             try:
                 before, rebound, price = crash_frames()
                 receipt = await self.enter(session, (before, rebound), price)

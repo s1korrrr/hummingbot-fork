@@ -20,7 +20,7 @@ from decimal import Decimal
 
 from sqlalchemy.exc import SQLAlchemyError
 
-from controllers.generic.meridian_v3_unified_core.migration import IdentityGuard
+from controllers.generic.meridian_v3_unified_core.migration import IDENTITY_UNVERIFIED, IdentityGuard
 from controllers.generic.meridian_v3_unified_core.portfolio import ERRORS, MeridianPortfolio
 from controllers.generic.modular_spot_core.bag import HeldBag, live_buy_gap
 from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError
@@ -52,8 +52,9 @@ class TidewaterPortfolio(MeridianPortfolio):
         self.recipe = TidewaterPortfolioRecipe(config.mandate(), config.p0_policy())
         self.epoch = epoch(config, self.recipe)
         self.fence = 1
+        # Bound lazily, as Meridian does: an identity that cannot be computed holds entries while
+        # exits and bags keep running, instead of preventing the controller from starting.
         self.identity = IdentityGuard(config)
-        self.identity.current = owner_identity(config, self.recipe)
         self.identity_hold = None
         self.source_sha256 = digest(config.source_manifest())
         self._store = self._targets = None
@@ -70,6 +71,20 @@ class TidewaterPortfolio(MeridianPortfolio):
         self._paced = ()
 
     # ------------------------------------------------------------------ Tidewater identity
+    def check_identity(self):
+        """Meridian's identity hold, bound to Tidewater's owner identity (never Meridian's)."""
+        if self.identity.current is None:
+            try:
+                self.identity.current = owner_identity(self.owner.config, self.recipe)
+            except (PolicyError, *ERRORS) as exc:
+                hold = f'{IDENTITY_UNVERIFIED}:{type(exc).__name__}:{exc}'[:300]
+                if hold != self.identity_hold:
+                    self.owner.logger().error(f'Tidewater entries held: owner identity unavailable: {hold}')
+                self.identity_hold = hold
+                self.status = {'reason': IDENTITY_UNVERIFIED, 'hold': hold}
+                return hold
+        return super().check_identity()
+
     def store(self):
         if self._store is None:
             self._store = PortfolioGrantStore(self.recorder(), grant_policy(self.owner.config, self.recipe))
@@ -196,10 +211,17 @@ class TidewaterPortfolio(MeridianPortfolio):
         if target is None or target is not self.last_target or self.last_admission is None:
             return target
         outcome = self.last_admission
+        try:  # admitted grant ids -> their symbols, so each pair's receipt says what it received
+            wanted = set(outcome.admitted)
+            granted = {g.symbol for g in self.store().grants(now_ms=self.now_ms(), native_executors=self.evidence())
+                       if g.grant_id in wanted} if wanted else set()
+        except PACING_ERRORS:
+            granted = None
         for pair in self._paced:
             if self._evaluated.get(pair) != markets[pair].candle_open:
                 continue  # admission did not complete for this cut; nothing was committed for it
-            self.receipts.record(ADMITTED, pair=pair, cut=markets[pair].candle_open, code='admission',
+            code = 'admission_unresolved' if granted is None else ('admitted' if pair in granted else 'not_admitted')
+            self.receipts.record(ADMITTED, pair=pair, cut=markets[pair].candle_open, code=code,
                                  payload={'target_sha256': target.identity, 'target_status': target.status,
                                           'admitted': sorted(str(g) for g in outcome.admitted),
                                           'pacing': self.pacing.get(pair)},

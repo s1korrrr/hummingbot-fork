@@ -86,7 +86,7 @@ def test_tidewater_binds_its_own_identity_and_paced_stage():
     assert (m.portfolio_id, m.funding_envelope_quote, m.per_asset_quote, m.order_quote) == ('tidewater_v4', 1000, 1000, 50)
     for symbol in c.symbol_configs().values():
         assert (symbol.capital.position_cap_quote, symbol.capital.funded_cap_quote, symbol.capital.max_active_tranches,
-                symbol.depth_budget.budget_quote, symbol.budget.group) == (350, 350, 7, 350, 'tidewater_v4')
+                symbol.depth_budget.budget_quote, symbol.budget.group) == (350, 350, 6, 350, 'tidewater_v4')
     assert c.seal().recipe_id == 'tidewater_v4_runtime_v1'
 
 
@@ -382,6 +382,52 @@ class TidewaterPaperTests(IsolatedAsyncioTestCase):
                     self.assertFalse(controller.entry_permission(executor.config, check_funds=False))
                     predicates.append(controller._last_denial)
                 self.assertTrue(all(p.startswith('strict:data_hold') for p in predicates), predicates)
+            finally:
+                await session.close()
+
+    async def test_an_uncomputable_identity_holds_entries_instead_of_stopping_the_controller(self):
+        from controllers.generic.tidewater_v4_core import portfolio as tidewater_portfolio
+        with tempfile.TemporaryDirectory() as directory:
+            original = tidewater_portfolio.owner_identity
+
+            def broken(config, recipe):
+                raise PolicyError('injected identity drift')
+            tidewater_portfolio.owner_identity = broken
+            try:
+                session = self.session(directory)  # the controller still starts
+                try:
+                    receipt = await self.enter(session)
+                    controller = session.controllers[OWNER]
+                    self.assertEqual(receipt['actions'], [])
+                    self.assertTrue(controller.portfolio.identity_hold.startswith('IDENTITY_UNVERIFIED'))
+                finally:
+                    await session.close()
+            finally:
+                tidewater_portfolio.owner_identity = original
+
+    async def test_admission_receipts_are_per_pair_when_cash_admits_only_some(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, cash='120')  # two 50.15 increments, by priority
+            try:
+                receipt = await self.enter(session)
+                pairs = {a.executor_config.trading_pair for a in receipt['actions']}
+                self.assertEqual(pairs, {'BTC-USDC', 'ETH-USDC'})
+                codes = {r['pair']: r['code'] for r in self.receipts(session) if r['kind'] == ADMITTED}
+                self.assertEqual(codes, {'BTC-USDC': 'admitted', 'ETH-USDC': 'admitted', 'BNB-USDC': 'not_admitted',
+                                         'SOL-USDC': 'not_admitted', 'XRP-USDC': 'not_admitted'})
+            finally:
+                await session.close()
+
+    async def test_a_filled_entry_past_its_window_is_not_recorded_as_revoked(self):
+        # The executor keeps asking permission after a full fill; the denial cancels nothing.
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory)
+            try:
+                await self.enter(session)
+                await self.fill_all(session, 10, 600061)
+                await session.step(600060 + 400, books=books(4, 600060 + 400))
+                self.assertFalse([r for r in self.receipts(session) if r['kind'] == REVOKED])
+                self.assertEqual(sum(e.is_active for e in session.executor_orchestrator.active_executors[OWNER]), 5)
             finally:
                 await session.close()
 

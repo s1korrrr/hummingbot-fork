@@ -30,6 +30,8 @@ CONFIG_CLASS = 'TidewaterConfig'
 __all__ = ['TidewaterConfig', 'TidewaterController']
 ZERO = Decimal('0')
 _ABSENT = object()
+# Entry lifecycle states with no open entry order left: a denial there cancels nothing.
+AFTER_ENTRY = frozenset({'managing_fill', 'ended_no_fill'})
 
 
 class TidewaterController(MeridianUnifiedController):
@@ -214,9 +216,22 @@ class TidewaterController(MeridianUnifiedController):
                     predicate = f'strict:unattributed:{type(exc).__name__}:{exc}'
                 predicate = predicate[:200]
             self._last_denial = predicate
-        if not allowed:
+        if not allowed and self._entry_state(config.id) not in AFTER_ENTRY:
             self._record_denial(context.pair, config, predicate, 'submitted' if submitted else 'pre_submission')
         return allowed
+
+    def _entry_state(self, executor_id):
+        """The executor's own entry lifecycle state, from the in-memory executor reports.
+
+        After a full fill the executor still asks permission each tick; past the entry window
+        the answer is no, and the native stop is a no-op. That is not a revocation, so it gets
+        no receipt (Meridian labels those executors `modular_entry_permission_revoked`).
+        """
+        for info in self.executors_info:
+            if info.id == executor_id:
+                lifecycle = (info.custom_info or {}).get('entry_lifecycle') or {}
+                return lifecycle.get('state')
+        return None
 
     def _record_denial(self, pair, config, predicate, phase):
         written = self.portfolio.receipts.record(

@@ -41,13 +41,15 @@ PAIRS = meridian.PAIRS
 ID_PREFIX = 'modular_spot_tidewater_v4_'
 
 # envelope, per-pair limit (symbol runtimes and Tidewater admission), order, concurrent tranches.
-# At zero depth the depth budget (0.75 x 350) allows about five 50-quote tranches; the sixth
-# needs a 7.5% drop from the 24 h high and the seventh 17.5%.
+# Each tranche reserves order x (1 + fee reserve) = 50.15, so six fit under 350 and a seventh does
+# not. At zero depth the depth budget (0.75 x 350 = 262.5) allows five; it grows as
+# 262.5 + 500 x depth, so the sixth needs about a 7.5% drop from the 24 h high.
 CAPITAL_STAGES = MappingProxyType({
-    'tidewater_1000': CapitalStage(Decimal('1000'), Decimal('350'), Decimal('50'), 7),
+    'tidewater_1000': CapitalStage(Decimal('1000'), Decimal('350'), Decimal('50'), 6),
     # Operator 2026-10-06 (via the regime campaign session): one pair uses the whole envelope, so
     # the tide gate is exercised on a single pair. Only that pair may have entries enabled.
-    'tidewater_bnb_1000': CapitalStage(Decimal('1000'), Decimal('1000'), Decimal('50'), 20),
+    # Nineteen 50.15 tranches fit under 1,000; a twentieth does not.
+    'tidewater_bnb_1000': CapitalStage(Decimal('1000'), Decimal('1000'), Decimal('50'), 19),
 })
 # Single-pair stages: the only pair allowed to acquire. The others stay managed, entries off.
 SINGLE_PAIR_STAGES = MappingProxyType({'tidewater_bnb_1000': 'BNB-USDC'})

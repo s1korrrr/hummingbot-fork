@@ -6,7 +6,9 @@ Receipts go to the recorder's sequenced, append-only controller event store
 replay never reads them.
 
 Timing. A gate refusal has no other effect, so its receipt is written before the refusal
-returns. A revocation receipt is written before `entry_permission` returns False. An
+returns. A revocation receipt is written before `entry_permission` returns False for an entry
+that still has an open order to end (an effective acquisition denial). Post-entry permission
+checks, after a full fill or after the entry already ended, cancel nothing and get no receipt. An
 admission receipt follows the native target and grant commits and carries the target hash
 and grant ids, so a committed target without its receipt is a detectable gap.
 

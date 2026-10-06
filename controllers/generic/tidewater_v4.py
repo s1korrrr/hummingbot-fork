@@ -7,7 +7,9 @@ changes admission only:
 * tide gate: buys of one pair spread out as portfolio occupancy rises;
 * per-pair limit: one pair holds at most its stage limit (350 of a 1,000 envelope);
 * decision receipts for every refusal, admission and resting-entry revocation;
-* `resting_entry='stable'` (opt-in): a submitted entry is revoked only for hard reasons.
+* `resting_entry='stable'` (opt-in): a submitted entry is revoked only for hard reasons;
+* research candidates (opt-in, sealed): the E0 first-entry volatility veto (`entry_veto='e0'`), its X0 placebo (`'x0'`)
+  and the CP capitulation override of the flash pause (`capitulation_override`).
 
 None of these cancels an exit, blocks a recovery sell or demotes a position.
 """
@@ -17,11 +19,12 @@ from decimal import Decimal
 from controllers.generic.meridian_v3_unified import MeridianUnifiedController
 from controllers.generic.meridian_v3_unified_core.config import RECIPE_ID as MERIDIAN_RECIPE_ID
 from controllers.generic.meridian_v3_unified_core.market_context import MarketContextObserver
-from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext, SymbolRuntime
+from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext
 from controllers.generic.modular_spot_core.domain import DataUnavailable, decimal
 from controllers.generic.tidewater_v4_core.config import PAIRS, RECIPE_ID, TidewaterConfig, source_files
 from controllers.generic.tidewater_v4_core.portfolio import TidewaterPortfolio
 from controllers.generic.tidewater_v4_core.receipts import REVOKED
+from controllers.generic.tidewater_v4_core.runtime import TidewaterSymbolRuntime
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.strategy_v2.components.source_identity import component_source_files
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
@@ -57,7 +60,7 @@ class TidewaterController(MeridianUnifiedController):
         self.portfolio = TidewaterPortfolio(self)
         self.contexts = {pair: SymbolContext(self, pair) for pair in PAIRS}
         for context in self.contexts.values():
-            context.runtime = SymbolRuntime(context, self.portfolio, paper=paper)
+            context.runtime = TidewaterSymbolRuntime(context, self.portfolio, paper=paper)
         self.fault = None
         self.market_context = MarketContextObserver(config.market_context, clock_ms=self.portfolio.now_ms,
                                                     logger=self.logger())
@@ -233,6 +236,21 @@ class TidewaterController(MeridianUnifiedController):
                 return lifecycle.get('state')
         return None
 
+    # ------------------------------------------------------------------ signal census (census=True)
+    def _determine_executor_actions(self):
+        """Meridian's tick, with the raw signal census taken before its identity and kill-switch holds.
+
+        The census only reads and writes receipts; the decision path inside is Meridian's, unchanged.
+        """
+        if not self.config.census:
+            return super()._determine_executor_actions()
+        markets = {pair: c.runtime.market for pair, c in self.contexts.items()}
+        self.portfolio.census_begin(markets)
+        try:
+            return super()._determine_executor_actions()
+        finally:
+            self.portfolio.census_end(markets)
+
     def _record_denial(self, pair, config, predicate, phase):
         written = self.portfolio.receipts.record(
             REVOKED, pair=pair, cut=config.id, code=phase, dedupe=predicate,
@@ -273,6 +291,9 @@ class TidewaterController(MeridianUnifiedController):
             'inventory': self._inventory_view(),
             'receipts': {'written': self.portfolio.receipts.written, 'fault': self.portfolio.receipts.fault},
             'observed_at': time.time()})
+        if self.config.census:
+            info['tidewater']['variants'] = self.config.variants()
+            info['tidewater']['census'] = self.portfolio.census.report()
         return info
 
     def to_format_status(self):

@@ -25,7 +25,7 @@ REFUSED, ADMITTED, REVOKED = 'TIDEWATER_GATE_REFUSED', 'TIDEWATER_ADMITTED', 'TI
 KINDS = frozenset({REFUSED, ADMITTED, REVOKED})
 # Closed list of gate refusal codes. A revocation receipt names its failing predicate.
 REFUSAL_CODES = frozenset({'tide_gate_down', 'tide_gate_up_occupancy', 'tide_gate_up_gap', 'pair_limit',
-                           'pacing_unavailable'})
+                           'pacing_unavailable', 'spacing_gap'})
 WRITE_ERRORS = (Exception,)  # any store failure is reported, never raised into a decision
 
 

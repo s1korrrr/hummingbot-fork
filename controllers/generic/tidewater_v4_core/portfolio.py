@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from controllers.generic.meridian_v3_unified_core.migration import IDENTITY_UNVERIFIED, IdentityGuard
 from controllers.generic.meridian_v3_unified_core.portfolio import ERRORS, MeridianPortfolio
 from controllers.generic.modular_spot_core.bag import HeldBag, live_buy_gap
+from controllers.generic.modular_spot_core.data_reader import dataset_for
 from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError
 from hummingbot.strategy_v2.components.decision_protocol import DecisionScope, Opportunity
 from hummingbot.strategy_v2.components.held_inventory import held_is_dust
@@ -36,6 +37,7 @@ from hummingbot.strategy_v2.portfolio_v3.runtime_contracts_v1 import NATIVE_SNAP
 from .config import PORTFOLIO_ID
 from .receipts import ADMITTED, REFUSED, ReceiptWriter
 from .recipe import TidewaterPortfolioRecipe, epoch, grant_policy, owner_identity, proposal_writer
+from .spacing import hourly_atr_fraction, spacing_decision, spacing_zones
 from .tide_gate import multiplier, tide_gate
 
 ZERO = Decimal('0')
@@ -111,22 +113,35 @@ class TidewaterPortfolio(MeridianPortfolio):
         return PortfolioSnapshot.model_validate({**snapshot.model_dump(mode='json'), 'portfolio_id': PORTFOLIO_ID})
 
     # ------------------------------------------------------------------ pacing
+    def _acquired_prices(self, pair):
+        """Entry prices of the pair's active acquired tranches, in claim order (latest last)."""
+        runtime = self.owner.contexts[pair].runtime
+        state, _ = runtime.ensure_store().load()
+        if state is None:
+            return ()
+        inventory = runtime.inventory()
+        active = [inventory[x] for x in state.claims if x in inventory and not inventory[x].terminal]
+        return tuple(v.entry_price for v in active if v.entry_quote > 0)
+
     def _reference(self, pair, bid):
-        """Last active acquired tranche of the pair, else its held-bag breakeven, else None.
+        """Last active acquired tranche of the pair, else its held-bag breakeven, else None."""
+        acquired = self._acquired_prices(pair)
+        return acquired[-1] if acquired else self._held_breakeven(pair, bid)
+
+    def _zones(self, pair, bid):
+        """(active acquired tranche prices in claim order, non-dust held-bag breakeven or None): the open
+        price zones V4.1 spacing keeps its gap from."""
+        return self._acquired_prices(pair), self._held_breakeven(pair, bid)
+
+    def _held_breakeven(self, pair, bid):
+        """The held bag's breakeven, or None when there is no bag.
 
         A held bag that is venue dust at `bid` is no bag, as in the native planner's `bag_empty`
-        (planner.py): the native runtime applies no bag gap to it, so the gate must not either.
+        (planner.py): the native runtime applies no bag gap to it, so Tidewater does not either.
         """
         context = self.owner.contexts[pair]
         runtime = context.runtime
         config = self.owner.symbol_config(pair)
-        state, _ = runtime.ensure_store().load()
-        if state is not None:
-            inventory = runtime.inventory()
-            active = [inventory[x] for x in state.claims if x in inventory and not inventory[x].terminal]
-            acquired = [v for v in active if v.entry_quote > 0]
-            if acquired:
-                return acquired[-1].entry_price
         held = HeldBag.from_positions(context.positions_held, connector=config.connector_name, pair=pair)
         if held.amount <= 0:
             return None
@@ -136,13 +151,35 @@ class TidewaterPortfolio(MeridianPortfolio):
             return None
         return held.breakeven_price
 
+    def _candles(self, pair):
+        """The pair's 1m candle frame from the source the native runtime observes."""
+        runtime = self.owner.contexts[pair].runtime
+        c, provider = runtime.controller.config, runtime.controller.market_data_provider
+        if c.data.mode == 'shared':
+            if runtime.pool is None:
+                raise DataUnavailable('shared candle reader is stopped')
+            now = provider.time()
+            return runtime.pool.snapshot(dataset_for(c), now=now, max_age=c.max_candle_age_seconds).frame(
+                now=now, max_age=c.max_candle_age_seconds)
+        return provider.get_candles_df(getattr(c, 'candles_connector', None) or c.connector_name,
+                                       c.trading_pair, c.interval, c.max_records)
+
+    def _hourly_atr(self, pair, market):
+        """ATR_1h / price from the frame cut at the native decision candle (spacing.hourly_atr_fraction)."""
+        frame = self._candles(pair)
+        if frame is None or not len(frame):
+            raise DataUnavailable('spacing candle frame is empty')
+        return hourly_atr_fraction(frame.timestamp.to_numpy(), frame.high.to_numpy(), frame.low.to_numpy(),
+                                   frame.close.to_numpy(), cutoff_open=int(market.candle_open),
+                                   hours=self.owner.config.spacing.atr_hours)
+
     def _pair_usage(self, snapshot, pair):
         asset = next(a for a in snapshot.assets if a.symbol == pair)
         pending = sum((c.quote_authority for c in snapshot.commitments if c.symbol == pair), ZERO)
         return max(asset.basis_quote, asset.net_cash_consumed_quote, ZERO) + pending
 
     def pace(self, pairs, markets, snapshot, now_ms):
-        """Candidates allowed by the per-pair limit and the tide gate, in priority order."""
+        """Candidates allowed by the per-pair limit, V4.1 spacing and the tide gate, in priority order."""
         config = self.owner.config
         stage = config.stage()
         pacing_reference = config.pacing_reference_quote()
@@ -160,7 +197,24 @@ class TidewaterPortfolio(MeridianPortfolio):
             code = None
             if pair_usage + increment > config.pair_limit_quote():
                 code = 'pair_limit'
-            elif config.tide_gate is not None:
+            if code is None and config.spacing is not None:
+                try:
+                    atr = self._hourly_atr(pair, market)
+                    gap = config.spacing.gap(atr)
+                    tranches, bag = self._zones(pair, bid)
+                    zones = spacing_zones(config.spacing, tranches=tranches, bag=bag)
+                    spaced = spacing_decision(config.spacing, bid=bid, gap=gap, zones=zones)
+                except PACING_ERRORS as exc:
+                    decision['error'] = f'{type(exc).__name__}:{exc}'[:200]
+                    code = 'pacing_unavailable'
+                else:
+                    # Its own block: the tide gate (an ablation that can run alongside) records its own gap.
+                    decision['spacing'] = {'atr_1h': str(atr), 'gap': str(gap), 'zones': [str(z) for z in zones],
+                                           'nearest': None if spaced.nearest is None else str(spaced.nearest),
+                                           'distance': None if spaced.distance is None else str(spaced.distance)}
+                    if not spaced.allowed:
+                        code = spaced.reason
+            if code is None and config.tide_gate is not None:
                 try:
                     features = getattr(market, 'bag', None)
                     gap = live_buy_gap(self.owner.symbol_config(pair).buy_gap,

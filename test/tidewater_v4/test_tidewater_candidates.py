@@ -12,7 +12,7 @@ from decimal import Decimal as D
 from pathlib import Path
 from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
 from test.meridian_v3.test_native_paper import frames, paper
-from test.tidewater_v4.test_tidewater_runtime import OWNER, PAIRS, all_candles, books, tidewater
+from test.tidewater_v4.test_tidewater_runtime import OWNER, PAIRS, all_candles, books, second_rebound, tidewater
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
@@ -24,7 +24,7 @@ import pytest
 from controllers.generic.modular_spot_core.domain import DataUnavailable
 from controllers.generic.tidewater_v4_core import entry_veto
 from controllers.generic.tidewater_v4_core.capitulation import CP_FROZEN, CapitulationOverride
-from controllers.generic.tidewater_v4_core.config import TidewaterConfig
+from controllers.generic.tidewater_v4_core.config import SPACING_V41, TidewaterConfig
 from controllers.generic.tidewater_v4_core.entry_veto import E0_FROZEN, X0_FROZEN, X0Model, decision_window, e0_features
 from controllers.generic.tidewater_v4_core.portfolio import TidewaterPortfolio
 from controllers.generic.tidewater_v4_core.receipts import (
@@ -39,21 +39,22 @@ from controllers.generic.tidewater_v4_core.receipts import (
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
-# recipe_digest() and seal().configuration_sha256 at the owner's 693fa9fda (merged into this branch).
-# Computed at 6ef2bc57e before the candidates were applied; 693fa9fda changes only portfolio.py and
-# tests, none of the digest inputs, so its values are the same. seal().source_sha256 binds the
+# recipe_digest() and seal().configuration_sha256 at the owner's 0e4811f71 (V4.1 options, merged into
+# this branch), computed from a git archive of 0e4811f71 alone. The recipe digests equal 693fa9fda's
+# (the V4.1 digest block is absent at the defaults); the configuration digests moved because the
+# sealed payload now carries the V4.1 fields at their defaults. seal().source_sha256 binds the
 # Tidewater source files and changes with any source edit by design.
-OWNER_693FA9FDA = {
+OWNER_0E4811F71 = {
     'paper_default': ('3d4f9624dce28896e7b0d042136b6e3c0da9e5c134ebf0b4c5a497b17fae7c2b',  # noqa: documentation
-                      '3b7888ed3d4bfe8aaaa6bad3f8e3b6227bc1f0767746c0e3863059e9ab6c8345'),  # noqa: documentation
+                      'a8ebec895f94f4451a20e325be65acc32f099e86874f6fb1ab75f74db2debeca'),  # noqa: documentation
     'paper_bnb_1000': ('effbf284895ee040b9b06979f033031f4a5dd45893c8b0efe2082cbbff117afc',  # noqa: documentation
-                       '25f032d0fb19146db5506f782d2684c967ebce53262f083a173f7c0030eb8119'),  # noqa: documentation
+                       'a3d7e227e5b7287fe1afc702674e8531dbaf9d02c11a00e00ae02b5eb1588317'),  # noqa: documentation
     'paper_bnb_uncapped': ('60354719928944ed7f84d1b3bc0401af28862a1e7a97affe8dc634b5d1021d9e',  # noqa: documentation
-                           'c4fb530dc21725479581d6508b2f1d33440388847a65a689d746e22b119efc1e'),  # noqa: documentation
+                           '5125d6a3d097b9c6da47f3c6890f33426e7874635704945518fa512811f08b2e'),  # noqa: documentation
     'observation_default': ('91de9ebd6de85d008a6fa73d643a76384f1b3c150d6028abc28efc26b6a8d33e',  # noqa: documentation
-                            '8d77d671a482241a2b044a6f1605f750a365d7be29bf65992b690b02a1fbf075'),  # noqa: documentation
+                            '542af6d757a4e5675bd76413ceec2aac52b0e3c967aa9edd291a1d02db9974c1'),  # noqa: documentation
     'paper_no_gate_stable': ('21f3f68f6d6a4a2f0b998a8ef666dd4b8c57250ffd10a1d6ba6e5536fb03b371',  # noqa: documentation
-                             'f20a7e96e329e5994a7e7a4a7b71e618edaaf7870c1b02f1de810c3b81bddbf1'),  # noqa: documentation
+                             'fcd314922dc96250b24ab6b9e43743a6d7bcb401667a5152b8c0de8417e353ab'),  # noqa: documentation
 }
 CONFIGS = {
     'paper_default': {},
@@ -117,8 +118,8 @@ def test_default_configurations_keep_their_owner_recipe_and_configuration_digest
     c = tidewater(**CONFIGS[name])
     assert (c.entry_veto, c.capitulation_override) == (None, None)
     seal = c.seal()
-    assert (c.recipe_digest(), seal.configuration_sha256) == OWNER_693FA9FDA[name]
-    assert seal.recipe_sha256 == OWNER_693FA9FDA[name][0]
+    assert (c.recipe_digest(), seal.configuration_sha256) == OWNER_0E4811F71[name]
+    assert seal.recipe_sha256 == OWNER_0E4811F71[name][0]
     assert c.census is False
     assert not {'entry_veto', 'capitulation_override', 'census'} & set(c.sealed_payload())
 
@@ -152,12 +153,32 @@ def test_candidates_and_the_census_seal_on_the_uncapped_stage(candidate):
     uncapped = CONFIGS['paper_bnb_uncapped']
     sealed = tidewater(execution_enabled=True, census=True, **uncapped, **candidate)
     assert sealed.capital_stage == 'tidewater_bnb_uncapped' and sealed.pacing_reference_quote() == 1000
-    assert sealed.seal().recipe_sha256 == sealed.recipe_digest() != OWNER_693FA9FDA['paper_bnb_uncapped'][0]
+    assert sealed.seal().recipe_sha256 == sealed.recipe_digest() != OWNER_0E4811F71['paper_bnb_uncapped'][0]
     TidewaterConfig(**sealed.model_dump(mode='json'))  # the sealed configuration validates as written
     with pytest.raises(ValueError):  # and its candidate and census are bound by the seal
         TidewaterConfig(**{**sealed.model_dump(mode='json'), 'census': False})
     census_only = tidewater(execution_enabled=True, census=True, **uncapped)
-    assert census_only.recipe_digest() not in {sealed.recipe_digest(), OWNER_693FA9FDA['paper_bnb_uncapped'][0]}
+    assert census_only.recipe_digest() not in {sealed.recipe_digest(), OWNER_0E4811F71['paper_bnb_uncapped'][0]}
+
+
+# The owner's V4.1 options (0e4811f71) on the uncapped BNB stage, as its own test_v41 arms.
+V41 = dict(spacing=SPACING_V41, flash_pause='off', exit_trailing='fixed_v41')
+
+
+def test_v41_options_and_candidates_are_bound_together_by_the_seal():
+    uncapped = CONFIGS['paper_bnb_uncapped']
+    both = tidewater(execution_enabled=True, census=True, entry_veto='e0', **uncapped, **V41)
+    payload = both._digest_payload()
+    assert payload['v41'] == both.v41_options() and payload['entry_veto']['id'] == 'e0' and payload['census'] is True
+    v41_only = tidewater(**uncapped, **V41)
+    candidate_only = tidewater(census=True, entry_veto='e0', **uncapped)
+    assert len({both.recipe_digest(), v41_only.recipe_digest(), candidate_only.recipe_digest()}) == 3
+    assert both.seal().recipe_sha256 == both.recipe_digest()
+    TidewaterConfig(**both.model_dump(mode='json'))  # the sealed configuration reloads
+    for change in ({'spacing': None}, {'flash_pause': 'native'}, {'exit_trailing': 'adaptive'},
+                   {'entry_veto': None}, {'census': False}):
+        with pytest.raises(ValueError):
+            TidewaterConfig(**{**both.model_dump(mode='json'), **change})
 
 
 @pytest.mark.parametrize('change', [{'entry_veto': 'e0'}, {'entry_veto': 'x0'}, {'capitulation_override': CP_FROZEN}])
@@ -589,5 +610,66 @@ class TidewaterCandidateTests(IsolatedAsyncioTestCase):
                 self.assertTrue(all(r['native_flash_pause_until'] is not None for r in census.values()))
                 self.assertEqual(len({r['census_id'] for r in census.values()}), 5)
                 self.assertEqual(self.outcomes(session, 600000), {p: ['native_paused'] for p in PAIRS})
+            finally:
+                await session.close()
+
+    # ------------------------------------------------------------------ with the owner's V4.1 options
+    async def test_with_v41_spacing_the_veto_refuses_first_and_its_refusal_does_not_consume_the_cut(self):
+        # Pacing order pair_limit -> entry veto -> V4.1 spacing -> tide gate. A first entry has no open
+        # zone, so spacing would allow it; the veto is evaluated before spacing reads ATR_1h, so a spacing
+        # data failure cannot replace the veto's refusal code or its shadow receipt.
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, entry_veto='e0', **V41)
+            try:
+                controller = session.controllers[OWNER]
+                unavailable = DataUnavailable('spacing needs 15 completed hours, has 3')
+                with patch.dict(entry_veto.ENTRY_VETOES, {'e0': VETO_ALL}), \
+                        patch.object(TidewaterPortfolio, '_hourly_atr', side_effect=unavailable):
+                    vetoed = await self.enter(session)
+                self.assertEqual(vetoed['actions'], [], controller.to_format_status())
+                refused = self.receipts(session, REFUSED)
+                self.assertEqual({(r['pair'], r['code']) for r in refused}, {(p, 'entry_veto_e0') for p in PAIRS})
+                self.assertFalse([r for r in refused if 'spacing' in r or 'error' in r], refused)
+                shadow = self.receipts(session, SHADOW_TIDE_GATE)
+                self.assertEqual({(r['pair'], r['refused_by'], r['would_allow']) for r in shadow},
+                                 {(p, 'entry_veto_e0', True) for p in PAIRS})
+                # Same cut, the veto now allows: spacing paces the first tranche (no zone) and it is admitted.
+                with patch.dict(entry_veto.ENTRY_VETOES, {'e0': ALLOW_ALL}):
+                    allowed = await session.step(600061, books=books(2, 600061))
+                self.assertEqual({a.executor_config.trading_pair for a in allowed['actions']}, set(PAIRS))
+                admitted = self.receipts(session, ADMITTED)
+                self.assertEqual({(r['pair'], r['code']) for r in admitted}, {(p, 'admitted') for p in PAIRS})
+                for r in admitted:
+                    self.assertEqual(r['pacing']['outcome'], 'paced_ok')
+                    self.assertIsNone(r['pacing']['spacing']['nearest'])
+                    self.assertIs(r['pacing']['entry_veto']['vetoed'], False)
+                self.assertEqual(self.outcomes(session, 600000), {p: ['entry_veto_e0', 'admitted'] for p in PAIRS})
+            finally:
+                await session.close()
+
+    async def test_the_census_records_a_spacing_refusal_and_the_later_admission_of_the_same_signal(self):
+        # The owner's shallow 0.6% second rebound (test_v41): spacing refuses the add; the census row of
+        # that signal records the refusal and, the cut not consumed, the admission on a deeper book.
+        with tempfile.TemporaryDirectory() as directory:
+            session = self.session(directory, tide_gate=None, **V41)
+            try:
+                controller = session.controllers[OWNER]
+                self.assertEqual(len((await self.enter(session))['actions']), 5)
+                await self.fill_all(session, 600061)
+                before, rebound, cut, low = second_rebound(D('.006'))
+                price = D(str(round(low, 2)))
+                await session.step(cut, books=books(20, cut, price), candles=all_candles(before, cut))
+                shallow = await session.step(cut + 60, books=books(21, cut + 60, price),
+                                             candles=all_candles(rebound, cut + 60))
+                self.assertEqual(shallow['actions'], [], controller.to_format_status())
+                refused = [r for r in self.receipts(session, REFUSED) if r['cut'] == cut]
+                self.assertEqual({r['code'] for r in refused}, {'spacing_gap'}, refused)
+                census = {r['pair']: r for r in self.receipts(session, CENSUS) if r['cut'] == cut}
+                self.assertEqual(set(census), {r['pair'] for r in refused})
+                self.assertEqual({r['entry_state'] for r in census.values()}, {'holds'})
+                self.assertEqual(self.outcomes(session, cut), {r['pair']: ['spacing_gap'] for r in refused})
+                deeper = await session.step(cut + 61, books=books(22, cut + 61, price * D('.985')))
+                self.assertEqual({a.executor_config.trading_pair for a in deeper['actions']}, set(census))
+                self.assertEqual(self.outcomes(session, cut), {p: ['spacing_gap', 'admitted'] for p in census})
             finally:
                 await session.close()

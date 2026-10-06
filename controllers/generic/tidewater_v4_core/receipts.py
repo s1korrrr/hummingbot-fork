@@ -45,7 +45,7 @@ SHADOW_TIDE_GATE, CAPITULATION = 'TIDEWATER_SHADOW_TIDE_GATE', 'TIDEWATER_CAPITU
 KINDS = frozenset({REFUSED, ADMITTED, REVOKED, CENSUS, OUTCOME, FINAL, SHADOW_TIDE_GATE, CAPITULATION})
 # Closed list of gate refusal codes. A revocation receipt names its failing predicate.
 REFUSAL_CODES = frozenset({'tide_gate_down', 'tide_gate_up_occupancy', 'tide_gate_up_gap', 'pair_limit',
-                           'pacing_unavailable', 'entry_veto_e0', 'entry_veto_x0', 'entry_veto_unavailable'})
+                           'pacing_unavailable', 'spacing_gap', 'entry_veto_e0', 'entry_veto_x0', 'entry_veto_unavailable'})
 ADMISSION_CODES = frozenset({'admitted', 'not_admitted', 'admission_unresolved'})
 # Signal outcomes: held before evaluation (identity hold, kill switch, portfolio fault, the seed cut
 # after a start, entries disabled, or not evaluated), held in Meridian's preview (the native pause or

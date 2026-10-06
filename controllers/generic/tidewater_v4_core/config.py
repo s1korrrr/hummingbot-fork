@@ -22,9 +22,11 @@ from controllers.generic import meridian_v3_recipe as recipe
 from controllers.generic.meridian_v3_portfolio import CapitalStage
 from controllers.generic.meridian_v3_unified_core import config as meridian
 from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig, SymbolRuntimeConfig
+from controllers.generic.modular_spot_core.config import TrailingPolicy
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
 from controllers.generic.tidewater_v4_core.capitulation import CapitulationOverride
 from controllers.generic.tidewater_v4_core.entry_veto import ENTRY_VETOES
+from controllers.generic.tidewater_v4_core.spacing import SpacingConfig
 from controllers.generic.tidewater_v4_core.tide_gate import TideGateConfig
 from hummingbot.strategy_v2.components.recipe_contract import (
     RecipeBinding,
@@ -82,6 +84,14 @@ VARIANT_FIELDS = ('entry_veto', 'capitulation_override')
 # Likewise, `census` is left out of the sealed payload and the recipe digest while False.
 INERT_FALSE_FIELDS = ('census',)
 
+# V4.1 options, frozen from the BNB May–Aug data study before any economic run
+# (docs/evidence/2026-10-06-bnb-data-deep-dive/SYNTHESIS.md, revision 3). M2 + M4: buys keep
+# 2 x ATR_1h from every open zone. Fixed trailing (M6): run-ups after lows are the same size in every
+# volatility state, so the exit is a fixed percent: 1.2% net of fees (about 1.5% gross at 15 bps per
+# side), 0.5% delta, locked gain 0.7% net.
+SPACING_V41 = SpacingConfig(atr_multiplier='2', zones='all')
+FIXED_TRAILING_V41 = TrailingPolicy(activation='.012', delta='.005')
+
 
 def source_files():
     """Meridian V3's sealed closure plus every Tidewater file. Tidewater code is bound by its
@@ -110,6 +120,13 @@ class TidewaterConfig(MeridianUnifiedConfig):
     # Signal census (census.py): records every raw signal and its outcomes, with no decision effect.
     # Every campaign arm sets it, the baseline included; every candidate requires it.
     census: bool = False
+    # V4.1 options; the defaults keep the V3 modules and the existing recipe digest.
+    # Hourly-ATR spacing and zone memory in pace() (None: off).
+    spacing: SpacingConfig | None = None
+    # 'off' removes the native flash-crash pause (no time pause in V4.1).
+    flash_pause: Literal['native', 'off'] = 'native'
+    # 'fixed_v41' replaces the ATR-adaptive trailing with FIXED_TRAILING_V41.
+    exit_trailing: Literal['adaptive', 'fixed_v41'] = 'adaptive'
 
     @model_validator(mode='before')
     @classmethod
@@ -181,6 +198,26 @@ class TidewaterConfig(MeridianUnifiedConfig):
                 'capitulation_override': None if self.capitulation_override is None
                 else self.capitulation_override.model_dump(mode='json')}
 
+    def v41_options(self):
+        """The V4.1 options that differ from the V3 modules, or {} (then the digest is unchanged)."""
+        options = {}
+        if self.spacing is not None:
+            options['spacing'] = self.spacing.model_dump(mode='json')
+        if self.flash_pause != 'native':
+            options['flash_pause'] = self.flash_pause
+        if self.exit_trailing != 'adaptive':
+            options['exit_trailing'] = self.exit_trailing
+        return options
+
+    def recipe_modules(self):
+        """Meridian's p23 modules with the V4.1 recipe options applied (shared module code unchanged)."""
+        modules = dict(super().recipe_modules())
+        if self.flash_pause == 'off':
+            modules['flash_crash'] = None
+        if self.exit_trailing == 'fixed_v41':
+            modules.update(adaptive_trailing=None, trailing=FIXED_TRAILING_V41)
+        return modules
+
     def symbol_configs(self):
         """Meridian's per-symbol native configuration at Tidewater's stage, under Tidewater's
         budget group and program revision."""
@@ -220,23 +257,32 @@ class TidewaterConfig(MeridianUnifiedConfig):
                 del payload[name]
         return payload
 
-    def recipe_digest(self):
-        values = {'recipe_id': RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,
-                  'result_sha256': recipe.RESULT_SHA256, 'mandate_sha256': self.mandate().identity,
-                  'policy_sha256': self.p0_policy().identity,
-                  'modules': {k: v.model_dump(mode='json') for k, v in self.recipe_modules().items()},
-                  'capital': self.recipe_capital().model_dump(mode='json'),
-                  'pair_limit_quote': str(self.pair_limit_quote()),
-                  'pacing_reference_quote': str(self.pacing_reference_quote()),
-                  'tide_gate': None if self.tide_gate is None else self.tide_gate.model_dump(mode='json'),
-                  'resting_entry': self.resting_entry}
+    def _digest_payload(self):
+        payload = {'recipe_id': RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,
+                   'result_sha256': recipe.RESULT_SHA256, 'mandate_sha256': self.mandate().identity,
+                   'policy_sha256': self.p0_policy().identity,
+                   # A module switched off by a V4.1 option is recorded as None.
+                   'modules': {k: None if v is None else v.model_dump(mode='json')
+                               for k, v in self.recipe_modules().items()},
+                   'capital': self.recipe_capital().model_dump(mode='json'),
+                   'pair_limit_quote': str(self.pair_limit_quote()),
+                   'pacing_reference_quote': str(self.pacing_reference_quote()),
+                   'tide_gate': None if self.tide_gate is None else self.tide_gate.model_dump(mode='json'),
+                   'resting_entry': self.resting_entry}
+        options = self.v41_options()
+        if options:  # absent for configurations without V4.1 options, so their digests do not move
+            payload['v41'] = options
+        # Research candidates, likewise absent unless enabled.
         if self.entry_veto is not None:  # the frozen model constants are part of the recipe
-            values['entry_veto'] = {'id': self.entry_veto, 'model': self.entry_veto_model().model_dump(mode='json')}
+            payload['entry_veto'] = {'id': self.entry_veto, 'model': self.entry_veto_model().model_dump(mode='json')}
         if self.capitulation_override is not None:
-            values['capitulation_override'] = self.capitulation_override.model_dump(mode='json')
+            payload['capitulation_override'] = self.capitulation_override.model_dump(mode='json')
         if self.census:
-            values['census'] = True
-        return digest(values)
+            payload['census'] = True
+        return payload
+
+    def recipe_digest(self):
+        return digest(self._digest_payload())
 
     def seal(self):
         return RecipeBinding(recipe_id=RECIPE_ID, recipe_sha256=self.recipe_digest(),

@@ -18,7 +18,10 @@ class Collecting:
 
 
 def portfolio(config, references):
-    owner = SimpleNamespace(config=config, symbol_config=lambda pair: config.symbol_configs()[pair])
+    symbols = config.symbol_configs()
+    # The symbol contexts present each pair's configuration (the tide gate reads the gap the planner applies).
+    owner = SimpleNamespace(config=config, symbol_config=lambda pair: symbols[pair],
+                            contexts={pair: SimpleNamespace(config=symbols[pair]) for pair in PAIRS})
     p = TidewaterPortfolio.__new__(TidewaterPortfolio)
     p.owner, p.pacing, p.occupancy = owner, {}, None
     p.receipts = ReceiptWriter(config.id, recorder=Collecting())

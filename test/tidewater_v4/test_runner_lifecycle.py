@@ -127,9 +127,9 @@ class RunnerScenario:
     """The Meridian lifecycle harness (lifecycle_harness.Scenario) for Tidewater with the runner on."""
 
     def __init__(self, directory, *, cash='1000', runner=RUNNER_ITER5_B, restore=False, seed_days=14,
-                 base_fee=False):
+                 base_fee=False, **options):
         self.directory = directory
-        self.config = tidewater(execution_enabled=True, exit_runner=runner)
+        self.config = tidewater(execution_enabled=True, exit_runner=runner, **options)
         market = (paper_base_fee if base_fee else paper)(PAIRS, cash)
         self.session = NativePaperSession(market, [self.config], directory / 'tidewater.sqlite', restore=restore)
         self.controller = self.session.controllers[OWNER]
@@ -139,6 +139,7 @@ class RunnerScenario:
         self.trade_sequence = {pair: 0 for pair in PAIRS}
         self.mids = {pair: D('100') for pair in PAIRS}
         self.highs = {}
+        self.atr = D('.002')  # the closed-candle ATR fraction the planner's live buy gap reads
         self._script()
         if seed_days:
             self.seed_days(BTC, seed_days)
@@ -178,7 +179,7 @@ class RunnerScenario:
         mid = self.mids[pair]
         self.features[pair] = MarketFeatures(
             self.now - 60, mid, D(str(prev)), D(str(rsi)), False, False, atr_fraction=D('.005'),
-            bag=BagFeatures(D(str(prev)), mid, D('0'), D('0'), D('.002'), 'range', D('0'), mid))
+            bag=BagFeatures(D(str(prev)), mid, D('0'), D('0'), self.atr, 'range', D('0'), mid))
 
     def book(self, pair, depth=50):
         mid = self.mids[pair]

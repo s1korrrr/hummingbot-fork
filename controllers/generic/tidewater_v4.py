@@ -17,6 +17,10 @@ The protected runner (`exit_runner`, opt-in research option, sealed) changes one
 tranche keeps part of its base in its own executor and sells it later at or above its cost floor
 (tidewater_v4_core/runner_book.py). Its tranche executor is `TidewaterRunnerExecutor`; with the
 option off every executor class, action and digest is unchanged.
+
+R20 (`recovery_min_gap`, opt-in research option, sealed) lowers the minimum buy gap the shared planner
+applies while the pair's recovery regime holds (tidewater_v4_core/recovery_gap.py). With the option off no
+regime is read and every symbol context returns the recipe configuration.
 """
 import time
 from decimal import Decimal
@@ -24,7 +28,6 @@ from decimal import Decimal
 from controllers.generic.meridian_v3_unified import MeridianUnifiedController
 from controllers.generic.meridian_v3_unified_core.config import RECIPE_ID as MERIDIAN_RECIPE_ID
 from controllers.generic.meridian_v3_unified_core.market_context import MarketContextObserver
-from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext
 from controllers.generic.modular_spot_core.domain import DataUnavailable, decimal
 from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
 from controllers.generic.tidewater_v4_core.config import PAIRS, RECIPE_ID, TidewaterConfig, source_files
@@ -32,7 +35,7 @@ from controllers.generic.tidewater_v4_core.portfolio import TidewaterPortfolio
 from controllers.generic.tidewater_v4_core.receipts import REVOKED
 from controllers.generic.tidewater_v4_core.runner_book import RunnerBook
 from controllers.generic.tidewater_v4_core.runner_execution import TidewaterRunnerExecutor
-from controllers.generic.tidewater_v4_core.runtime import TidewaterSymbolRuntime
+from controllers.generic.tidewater_v4_core.runtime import TidewaterSymbolContext, TidewaterSymbolRuntime
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.strategy_v2.components.source_identity import component_source_files
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
@@ -66,7 +69,7 @@ class TidewaterController(MeridianUnifiedController):
         self._operator_state = {'entry_paused': False, 'reason': None, 'scope': None,
                                 'updated_at': None, 'last_command_id': None}
         self.portfolio = TidewaterPortfolio(self)
-        self.contexts = {pair: SymbolContext(self, pair) for pair in PAIRS}
+        self.contexts = {pair: TidewaterSymbolContext(self, pair) for pair in PAIRS}
         for context in self.contexts.values():
             context.runtime = TidewaterSymbolRuntime(context, self.portfolio, paper=paper)
         self.fault = None
@@ -258,7 +261,21 @@ class TidewaterController(MeridianUnifiedController):
 
     # ------------------------------------------------------------------ signal census (census=True)
     def _determine_executor_actions(self):
-        """Tidewater's tick; with `exit_runner`, the runner step first and the runner stop filter last.
+        """Tidewater's tick; with `recovery_min_gap`, each pair's R20 view is read first and presented for
+        this tick only (preview, pacing and dispatch read the same view)."""
+        gap = self.config.recovery_min_gap
+        if gap is None:
+            return self._runner_actions()
+        for context in self.contexts.values():
+            context.view = context.runtime.recovery_view(gap)
+        try:
+            return self._runner_actions()
+        finally:
+            for context in self.contexts.values():
+                context.view = None
+
+    def _runner_actions(self):
+        """With `exit_runner`, the runner step first and the runner stop filter last.
 
         A runner failure is reported and never raised into the decision.
         """
@@ -330,6 +347,10 @@ class TidewaterController(MeridianUnifiedController):
             info['tidewater']['census'] = self.portfolio.census.report()
         if self.runners is not None:
             info['tidewater']['runner'] = self.runners.report()
+        if self.config.recovery_min_gap is not None:
+            info['tidewater']['recovery_min_gap'] = {
+                'min_gap': str(self.config.recovery_min_gap),
+                'regime': {pair: context.runtime.recovery for pair, context in self.contexts.items()}}
         return info
 
     def to_format_status(self):

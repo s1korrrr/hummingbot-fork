@@ -311,7 +311,8 @@ class TidewaterPortfolio(MeridianPortfolio):
 
     def _tide(self, pair, market, u, bid, reference):
         features = getattr(market, 'bag', None)
-        gap = live_buy_gap(self.owner.symbol_config(pair).buy_gap, None if features is None else features.atr_pct)
+        # The symbol context's configuration: the R20 view while its regime holds (the gap the planner applies).
+        gap = live_buy_gap(self.owner.contexts[pair].config.buy_gap, None if features is None else features.atr_pct)
         if reference is _UNREAD:
             reference = self._reference(pair, bid)
         return gap, reference, tide_gate(self.owner.config.tide_gate, gap=gap, occupancy=u, reference=reference, bid=bid)

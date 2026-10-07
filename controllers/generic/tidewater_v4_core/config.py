@@ -26,6 +26,7 @@ from controllers.generic.modular_spot_core.config import TrailingPolicy
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
 from controllers.generic.tidewater_v4_core.capitulation import CapitulationOverride
 from controllers.generic.tidewater_v4_core.entry_veto import ENTRY_VETOES
+from controllers.generic.tidewater_v4_core.recovery_gap import recovery_buy_gap
 from controllers.generic.tidewater_v4_core.runner import RunnerConfig
 from controllers.generic.tidewater_v4_core.spacing import SpacingConfig
 from controllers.generic.tidewater_v4_core.tide_gate import TideGateConfig
@@ -97,7 +98,11 @@ FIXED_TRAILING_V41 = TrailingPolicy(activation='.012', delta='.005')
 # (bnb-20261007-v4-iter5-rally-01, cm5-r20run50): keep half of each harvested tranche, floor margin 1%,
 # trail at 2 x the 14-day daily ATR. Left out of the sealed payload and the recipe digest while None.
 RUNNER_ITER5_B = RunnerConfig(runner_fraction='0.5', floor_margin='0.01', atr_multiplier='2', atr_days=14)
-OPTIONAL_FIELDS = ('exit_runner',)
+# R20 (opt-in research option, recovery_gap.py): V3 with a 0.20% minimum buy gap instead of the recipe's 0.5%
+# floor while the recovery regime holds (the held bag is empty or dust at the bid, or the bid is at or above its
+# breakeven). Left out of the sealed payload and the recipe digest while None.
+R20_RECOVERY_MIN_GAP = Decimal('0.0020')
+OPTIONAL_FIELDS = ('exit_runner', 'recovery_min_gap')
 
 
 def source_files():
@@ -136,6 +141,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
     exit_trailing: Literal['adaptive', 'fixed_v41'] = 'adaptive'
     # Protected runner on harvested tranches (None: off). Research option: paper and replay only.
     exit_runner: RunnerConfig | None = None
+    # R20: the recipe BuyGapConfig's min_gap in the recovery regime (None: off). Research option: paper and replay only.
+    recovery_min_gap: Decimal | None = Field(default=None, ge=0, lt=1)
 
     @model_validator(mode='before')
     @classmethod
@@ -174,9 +181,19 @@ class TidewaterConfig(MeridianUnifiedConfig):
             raise ValueError('observation mode cannot dispatch execution')
         if self.exit_runner is not None and self.execution_mode == 'live':
             raise ValueError('the protected runner is a research option (paper and replay only)')
+        if self.recovery_min_gap is not None and self.execution_mode == 'live':
+            raise ValueError('the recovery minimum gap (R20) is a research option (paper and replay only)')
         if self.execution_enabled and self.recipe_binding is None:
             raise ValueError('executable Tidewater requires a sealed recipe binding')
         symbols = self.symbol_configs()
+        if self.recovery_min_gap is not None:
+            for symbol in symbols.values():
+                if symbol.buy_gap is None:
+                    raise ValueError('the recovery minimum gap replaces the min_gap of a configured live buy gap')
+                try:
+                    recovery_buy_gap(symbol.buy_gap, self.recovery_min_gap)
+                except ValueError as exc:
+                    raise ValueError(f'the recovery minimum gap is not a valid min_gap: {exc}') from None
         if (self.entry_veto is not None or self.capitulation_override is not None) and not self.census:
             raise ValueError('a research candidate requires census=True (its population must be recorded)')
         cp = self.capitulation_override
@@ -295,6 +312,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
             payload['census'] = True
         if self.exit_runner is not None:  # absent unless enabled, so other digests do not move
             payload['exit_runner'] = self.exit_runner.model_dump(mode='json')
+        if self.recovery_min_gap is not None:  # likewise
+            payload['recovery_min_gap'] = str(self.recovery_min_gap)
         return payload
 
     def recipe_digest(self):

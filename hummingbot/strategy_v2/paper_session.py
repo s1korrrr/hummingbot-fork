@@ -314,9 +314,16 @@ class NativePaperSession:
         return self._connector.current_timestamp
 
     def _start_executor(self, executor):
+        # Executors pace venue retries with a wall-clock sleep. The paper clock advances only through step(),
+        # so a pause yields once instead of stalling the replay one real second per shutting-down executor.
+        executor._sleep = self._executor_pause
         executor.register_events()
         executor._status = RunnableStatus.RUNNING
         self._started.append(executor)
+
+    @staticmethod
+    async def _executor_pause(delay):
+        await asyncio.sleep(0)
 
     def buy(self, connector_name, trading_pair, amount, order_type, price, position_action):
         if self._failure is not None:

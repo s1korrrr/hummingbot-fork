@@ -163,6 +163,33 @@ class NativePaperSessionTests(IsolatedAsyncioTestCase):
             finally:
                 await restored.close()
 
+    async def test_executor_pause_follows_the_paper_clock_not_the_wall_clock(self):
+        """A shutting-down executor's 1 s venue pause must not stall a replay step in real time."""
+        import asyncio
+        import time
+
+        from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [reversal_config()], Path(directory) / 'pause.sqlite')
+            try:
+                for index, frame in enumerate(causal_reversal_frames()):
+                    now = 600000 + index * 60
+                    await session.step(now, books=[dict(trading_pair=PAIR, sequence=2 + index, timestamp=now,
+                                                        bids=[(90, 10)], asks=[(90.1, 10)])], candles=[dict(
+                                                            connector_name='okx', trading_pair=PAIR, interval='1m',
+                                                            frame=frame, available_at=now)])
+                executor = session.executor_orchestrator.active_executors['modular_spot_paper_fixture'][0]
+                self.assertIs(type(executor), PositionExecutor)
+                started = time.monotonic()
+                await asyncio.wait_for(executor._sleep(1.0), timeout=0.25)
+                self.assertLess(time.monotonic() - started, 0.25)
+            finally:
+                await session.close()
+        # Outside the paper session the native executor keeps its real venue pause.
+        with patch('asyncio.sleep') as sleep:
+            await PositionExecutor._sleep(object(), 1.0)
+        sleep.assert_awaited_once_with(1.0)
+
     async def test_direct_candle_boundary_rejects_future_gap_geometry_and_volume(self):
         from hummingbot.strategy_v2.paper_session import InjectedPaperMarketData
         market = paper()

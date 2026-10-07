@@ -146,7 +146,11 @@ class TidewaterPortfolio(MeridianPortfolio):
         if state is None:
             return ()
         inventory = runtime.inventory()
-        active = [inventory[x] for x in state.claims if x in inventory and not inventory[x].terminal]
+        # A tranche carrying a protected runner is not an acquisition zone (exit_runner; runner_book.py).
+        runners = getattr(self.owner, 'runners', None)
+        runners = () if runners is None else runners.excluded()
+        active = [inventory[x] for x in state.claims if x in inventory and not inventory[x].terminal
+                  and x not in runners]
         return tuple(v.entry_price for v in active if v.entry_quote > 0)
 
     def _reference(self, pair, bid):
@@ -307,7 +311,8 @@ class TidewaterPortfolio(MeridianPortfolio):
 
     def _tide(self, pair, market, u, bid, reference):
         features = getattr(market, 'bag', None)
-        gap = live_buy_gap(self.owner.symbol_config(pair).buy_gap, None if features is None else features.atr_pct)
+        # The symbol context's configuration: the R20 view while its regime holds (the gap the planner applies).
+        gap = live_buy_gap(self.owner.contexts[pair].config.buy_gap, None if features is None else features.atr_pct)
         if reference is _UNREAD:
             reference = self._reference(pair, bid)
         return gap, reference, tide_gate(self.owner.config.tide_gate, gap=gap, occupancy=u, reference=reference, bid=bid)

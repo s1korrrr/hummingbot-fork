@@ -12,6 +12,15 @@ changes admission only:
   and the CP capitulation override of the flash pause (`capitulation_override`).
 
 None of these cancels an exit, blocks a recovery sell or demotes a position.
+
+The protected runner (`exit_runner`, opt-in research option, sealed) changes one exit: a harvested
+tranche keeps part of its base in its own executor and sells it later at or above its cost floor
+(tidewater_v4_core/runner_book.py). Its tranche executor is `TidewaterRunnerExecutor`; with the
+option off every executor class, action and digest is unchanged.
+
+R20 (`recovery_min_gap`, opt-in research option, sealed) lowers the minimum buy gap the shared planner
+applies while the pair's recovery regime holds (tidewater_v4_core/recovery_gap.py). With the option off no
+regime is read and every symbol context returns the recipe configuration.
 """
 import time
 from decimal import Decimal
@@ -19,12 +28,14 @@ from decimal import Decimal
 from controllers.generic.meridian_v3_unified import MeridianUnifiedController
 from controllers.generic.meridian_v3_unified_core.config import RECIPE_ID as MERIDIAN_RECIPE_ID
 from controllers.generic.meridian_v3_unified_core.market_context import MarketContextObserver
-from controllers.generic.meridian_v3_unified_core.symbols import SymbolContext
 from controllers.generic.modular_spot_core.domain import DataUnavailable, decimal
+from controllers.generic.modular_spot_core.execution import ModularPositionExecutor
 from controllers.generic.tidewater_v4_core.config import PAIRS, RECIPE_ID, TidewaterConfig, source_files
 from controllers.generic.tidewater_v4_core.portfolio import TidewaterPortfolio
 from controllers.generic.tidewater_v4_core.receipts import REVOKED
-from controllers.generic.tidewater_v4_core.runtime import TidewaterSymbolRuntime
+from controllers.generic.tidewater_v4_core.runner_book import RunnerBook
+from controllers.generic.tidewater_v4_core.runner_execution import TidewaterRunnerExecutor
+from controllers.generic.tidewater_v4_core.runtime import TidewaterSymbolContext, TidewaterSymbolRuntime
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.strategy_v2.components.source_identity import component_source_files
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
@@ -58,7 +69,7 @@ class TidewaterController(MeridianUnifiedController):
         self._operator_state = {'entry_paused': False, 'reason': None, 'scope': None,
                                 'updated_at': None, 'last_command_id': None}
         self.portfolio = TidewaterPortfolio(self)
-        self.contexts = {pair: SymbolContext(self, pair) for pair in PAIRS}
+        self.contexts = {pair: TidewaterSymbolContext(self, pair) for pair in PAIRS}
         for context in self.contexts.values():
             context.runtime = TidewaterSymbolRuntime(context, self.portfolio, paper=paper)
         self.fault = None
@@ -67,6 +78,18 @@ class TidewaterController(MeridianUnifiedController):
         self._data_close_tasks = set()
         self._data_close_error = None
         self._last_denial = None  # the latest strict denial predicate, for reporting
+        self.runners = None if config.exit_runner is None else RunnerBook(self, config.exit_runner,
+                                                                          self.portfolio.receipts)
+
+    # ------------------------------------------------------------------ protected runner (exit_runner)
+    def _runner_class(self, selected):
+        return TidewaterRunnerExecutor if self.runners is not None and selected is ModularPositionExecutor else selected
+
+    def get_executor_class_for_config(self, config):
+        return self._runner_class(super().get_executor_class_for_config(config))
+
+    def restart_continuity_executor_class(self, config):
+        return self._runner_class(super().restart_continuity_executor_class(config))
 
     # ------------------------------------------------------------------ resting entries (T7)
     def _stable_hold(self, context, config):
@@ -238,6 +261,34 @@ class TidewaterController(MeridianUnifiedController):
 
     # ------------------------------------------------------------------ signal census (census=True)
     def _determine_executor_actions(self):
+        """Tidewater's tick; with `recovery_min_gap`, each pair's R20 view is read first and presented for
+        this tick only (preview, pacing and dispatch read the same view)."""
+        gap = self.config.recovery_min_gap
+        if gap is None:
+            return self._runner_actions()
+        for context in self.contexts.values():
+            context.view = context.runtime.recovery_view(gap)
+        try:
+            return self._runner_actions()
+        finally:
+            for context in self.contexts.values():
+                context.view = None
+
+    def _runner_actions(self):
+        """With `exit_runner`, the runner step first and the runner stop filter last.
+
+        A runner failure is reported and never raised into the decision.
+        """
+        if self.runners is None:
+            return self._census_actions()
+        try:
+            self.runners.tick()
+        except Exception as exc:
+            self.runners.fault = f'runner_tick:{type(exc).__name__}:{exc}'[:200]
+            self.logger().error(f'Tidewater runner step held: {self.runners.fault}')
+        return self.runners.filter(self._census_actions())
+
+    def _census_actions(self):
         """Meridian's tick, with the raw signal census taken before its identity and kill-switch holds.
 
         The census only reads and writes receipts; the decision path inside is Meridian's, unchanged.
@@ -294,6 +345,12 @@ class TidewaterController(MeridianUnifiedController):
         if self.config.census:
             info['tidewater']['variants'] = self.config.variants()
             info['tidewater']['census'] = self.portfolio.census.report()
+        if self.runners is not None:
+            info['tidewater']['runner'] = self.runners.report()
+        if self.config.recovery_min_gap is not None:
+            info['tidewater']['recovery_min_gap'] = {
+                'min_gap': str(self.config.recovery_min_gap),
+                'regime': {pair: context.runtime.recovery for pair, context in self.contexts.items()}}
         return info
 
     def to_format_status(self):

@@ -42,7 +42,16 @@ REFUSED, ADMITTED, REVOKED = 'TIDEWATER_GATE_REFUSED', 'TIDEWATER_ADMITTED', 'TI
 # `not_admitted` or `admission_unresolved`.
 CENSUS, OUTCOME, FINAL = 'TIDEWATER_SIGNAL_CENSUS', 'TIDEWATER_SIGNAL_OUTCOME', 'TIDEWATER_SIGNAL_FINAL'
 SHADOW_TIDE_GATE, CAPITULATION = 'TIDEWATER_SHADOW_TIDE_GATE', 'TIDEWATER_CAPITULATION_OVERRIDE'
-KINDS = frozenset({REFUSED, ADMITTED, REVOKED, CENSUS, OUTCOME, FINAL, SHADOW_TIDE_GATE, CAPITULATION})
+# Protected runner (written only with `exit_runner`; see runner_book.py). RUNNER records are the runner's
+# durable state under explicit keys `tidewater:runner:<executor_id>:<fact>`: `created` (the split at the
+# harvest), `state:<seq>` checkpoints (floor, high water, phase, last processed minute), `skipped` (no runner
+# kept) and `closed`; `exit_placed` is report only (keyed by its content). RUNNER_DAY records one whole UTC
+# daily bar of a pair (`tidewater:runner_day:<controller>:<pair>:<day>`), the input of the runner's daily ATR.
+# A runner decision reads only stored records, so a restart resumes from them.
+RUNNER, RUNNER_DAY = 'TIDEWATER_RUNNER', 'TIDEWATER_RUNNER_DAY'
+KINDS = frozenset({REFUSED, ADMITTED, REVOKED, CENSUS, OUTCOME, FINAL, SHADOW_TIDE_GATE, CAPITULATION, RUNNER,
+                   RUNNER_DAY})
+RUNNER_CODES = frozenset({'created', 'state', 'skipped', 'exit_placed', 'closed'})
 # Closed list of gate refusal codes. A revocation receipt names its failing predicate.
 REFUSAL_CODES = frozenset({'tide_gate_down', 'tide_gate_up_occupancy', 'tide_gate_up_gap', 'pair_limit',
                            'pacing_unavailable', 'spacing_gap', 'entry_veto_e0', 'entry_veto_x0', 'entry_veto_unavailable'})
@@ -113,6 +122,10 @@ class ReceiptWriter:
             raise ValueError(f'unknown Tidewater signal outcome {code}')
         if kind == FINAL and code not in FINAL_CODES:
             raise ValueError(f'unknown Tidewater final signal outcome {code}')
+        if kind == RUNNER and code not in RUNNER_CODES:
+            raise ValueError(f'unknown Tidewater runner record {code}')
+        if kind == RUNNER_DAY and code != 'day':
+            raise ValueError(f'unknown Tidewater runner day record {code}')
 
     @staticmethod
     def _json(pair, cut, code, payload):

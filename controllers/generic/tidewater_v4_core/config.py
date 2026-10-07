@@ -26,6 +26,7 @@ from controllers.generic.modular_spot_core.config import TrailingPolicy
 from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
 from controllers.generic.tidewater_v4_core.capitulation import CapitulationOverride
 from controllers.generic.tidewater_v4_core.entry_veto import ENTRY_VETOES
+from controllers.generic.tidewater_v4_core.runner import RunnerConfig
 from controllers.generic.tidewater_v4_core.spacing import SpacingConfig
 from controllers.generic.tidewater_v4_core.tide_gate import TideGateConfig
 from hummingbot.strategy_v2.components.recipe_contract import (
@@ -92,6 +93,12 @@ INERT_FALSE_FIELDS = ('census',)
 SPACING_V41 = SpacingConfig(atr_multiplier='2', zones='all')
 FIXED_TRAILING_V41 = TrailingPolicy(activation='.012', delta='.005')
 
+# Protected runner (opt-in research option, runner.py): the V4 iteration-5 lead, candidate B
+# (bnb-20261007-v4-iter5-rally-01, cm5-r20run50): keep half of each harvested tranche, floor margin 1%,
+# trail at 2 x the 14-day daily ATR. Left out of the sealed payload and the recipe digest while None.
+RUNNER_ITER5_B = RunnerConfig(runner_fraction='0.5', floor_margin='0.01', atr_multiplier='2', atr_days=14)
+OPTIONAL_FIELDS = ('exit_runner',)
+
 
 def source_files():
     """Meridian V3's sealed closure plus every Tidewater file. Tidewater code is bound by its
@@ -127,6 +134,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
     flash_pause: Literal['native', 'off'] = 'native'
     # 'fixed_v41' replaces the ATR-adaptive trailing with FIXED_TRAILING_V41.
     exit_trailing: Literal['adaptive', 'fixed_v41'] = 'adaptive'
+    # Protected runner on harvested tranches (None: off). Research option: paper and replay only.
+    exit_runner: RunnerConfig | None = None
 
     @model_validator(mode='before')
     @classmethod
@@ -163,6 +172,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
                 raise ValueError('live capital must bind this live account, connector and the stage envelope')
         if self.execution_mode == 'observation' and self.execution_enabled:
             raise ValueError('observation mode cannot dispatch execution')
+        if self.exit_runner is not None and self.execution_mode == 'live':
+            raise ValueError('the protected runner is a research option (paper and replay only)')
         if self.execution_enabled and self.recipe_binding is None:
             raise ValueError('executable Tidewater requires a sealed recipe binding')
         symbols = self.symbol_configs()
@@ -255,6 +266,9 @@ class TidewaterConfig(MeridianUnifiedConfig):
         for name in INERT_FALSE_FIELDS:
             if payload.get(name) is False:
                 del payload[name]
+        for name in OPTIONAL_FIELDS:
+            if name in payload and payload[name] is None:
+                del payload[name]
         return payload
 
     def _digest_payload(self):
@@ -279,6 +293,8 @@ class TidewaterConfig(MeridianUnifiedConfig):
             payload['capitulation_override'] = self.capitulation_override.model_dump(mode='json')
         if self.census:
             payload['census'] = True
+        if self.exit_runner is not None:  # absent unless enabled, so other digests do not move
+            payload['exit_runner'] = self.exit_runner.model_dump(mode='json')
         return payload
 
     def recipe_digest(self):

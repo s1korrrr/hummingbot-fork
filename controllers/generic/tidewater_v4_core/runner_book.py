@@ -27,7 +27,9 @@ Durability. The split, every floor/high-water/phase change and every daily bar a
 explicit keys before they take effect (receipts.py, RUNNER and RUNNER_DAY), and a restart rebuilds
 from them. A bar that changes nothing is not stored; after a restart the minutes since the last stored
 state are replayed from the frame and give the same result. A failed write keeps the previous state
-and is retried on the next tick. Until the durable state is read no runner decision is taken: a
+in force; the next tick re-sends exactly the same record (same key, same payload) before anything new,
+so a write that committed but lost its acknowledgement is confirmed instead of being refused by the
+event store as a different fact. Until the durable state is read no runner decision is taken: a
 harvest waits (its position is kept) and no runner exit is placed.
 
 Native boundaries. A runner is not demoted to the held bag by the bag line: Tidewater drops the bag
@@ -103,6 +105,7 @@ class RunnerBook:
         self.fault = None
         self.status = {}  # pair -> latest runner step reason, for reporting
         self.kept_stops = 0  # bag-line demotions of runner tranches withheld
+        self._pending = {}  # executor id -> (code, event id, state) whose write is unconfirmed; re-sent unchanged
 
     # ------------------------------------------------------------------ durable state
     def load(self):
@@ -139,6 +142,26 @@ class RunnerBook:
         return self.receipts.persist(RUNNER, pair=pair, cut=eid, code=code, payload=payload, now=now,
                                      event_id=event_id)
 
+    def _commit(self, code, eid, state, now):
+        """Store `state` under its explicit key; True once stored. An unconfirmed write is kept and re-sent
+        unchanged by `_confirm` (it may have committed without its acknowledgement)."""
+        event_id = f'tidewater:runner:{eid}:created' if code == 'created' else (
+            f'tidewater:runner:{eid}:state:{state["seq"]}')
+        self._pending[eid] = (code, event_id, state)
+        return self._confirm(eid, now)
+
+    def _confirm(self, eid, now):
+        """Re-send the unconfirmed write of `eid` (if any); on success its state takes effect. True when
+        nothing is unconfirmed."""
+        if eid not in self._pending:
+            return True
+        code, event_id, state = self._pending[eid]
+        if not self._persist(code, eid, state['pair'], _encode(state), event_id, now):
+            return False
+        del self._pending[eid]
+        self.lots[eid] = state
+        return True
+
     def _now(self):
         return float(self.owner.market_data_provider.time())
 
@@ -163,6 +186,8 @@ class RunnerBook:
         if eid in self.skipped:
             return None
         now = self._now()
+        if eid in self._pending:  # the split was decided and sent; only its confirmation is outstanding
+            return self.lots[eid] if self._confirm(eid, now) else RunnerHold('runner_write_failed')
         split = runner_split(self.cfg, amount=facts['amount'], price=facts['price'], amount_step=facts['amount_step'],
                              minimum_notional=facts['minimum_notional'])
         reason = split.skipped
@@ -186,9 +211,8 @@ class RunnerBook:
                  'sold_base': split.sold_base, 'tranche_base': facts['amount'], 'cost_basis': facts['cost_basis'],
                  'cost_floor': cost_floor, 'harvest_price': facts['price'], 'high_water': facts['price'],
                  'floor': cost_floor, 'fee_fraction': facts['fee_fraction']}
-        if not self._persist('created', eid, pair, _encode(state), f'tidewater:runner:{eid}:created', now):
+        if not self._commit('created', eid, state, now):
             return RunnerHold('runner_write_failed')
-        self.lots[eid] = state
         self.owner.logger().info(f'Tidewater {pair} runner kept executor={eid} runner_base={split.runner_base} '
                                  f'sold_base={split.sold_base} cost_floor={cost_floor} high_water={facts["price"]}')
         return state
@@ -318,6 +342,14 @@ class RunnerBook:
 
     def _advance(self, eid, state, now):
         pair = state['pair']
+        if eid in self._pending:
+            if not self._confirm(eid, now):
+                self.status[pair] = 'runner_write_failed'
+                return  # the stored state stays in force until the unconfirmed one is confirmed
+            state = self.lots[eid]
+            if state['phase'] != OPEN:
+                self._exit_signal(eid, state)
+                return
         market = self._market(pair)
         if market is None:
             self.status[pair] = 'runner_market_unavailable'
@@ -354,14 +386,16 @@ class RunnerBook:
             self.lots[eid] = updated  # nothing new to store; a restart replays these minutes to the same state
             return
         updated['seq'] = int(state['seq']) + 1
-        if not self._persist('state', eid, pair, _encode(updated), f'tidewater:runner:{eid}:state:{updated["seq"]}',
-                             now):
+        if not self._commit('state', eid, updated, now):
             self.status[pair] = 'runner_write_failed'
-            return  # the previous state stays in force; the same minutes are replayed next tick
-        self.lots[eid] = updated
+            return  # the previous state stays in force; this exact record is re-sent next tick
         if phase == EXIT:
-            self.owner.logger().info(f'Tidewater {pair} runner exit signal executor={eid} close={c[rows[-1]]} '
-                                     f'floor={lot.floor} cost_floor={state["cost_floor"]}')
+            self._exit_signal(eid, updated)
+
+    def _exit_signal(self, eid, state):
+        self.owner.logger().info(f'Tidewater {state["pair"]} runner exit signal executor={eid} '
+                                 f'minute={state["last_minute"]} floor={state["floor"]} '
+                                 f'cost_floor={state["cost_floor"]}')
 
     # ------------------------------------------------------------------ reporting
     def report(self):

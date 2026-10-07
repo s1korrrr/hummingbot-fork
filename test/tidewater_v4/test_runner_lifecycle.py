@@ -6,8 +6,9 @@ frame is scripted the same way (one closed bar per minute at the scripted mid un
 high). Daily bars older than the frame are stored as RUNNER_DAY records before the first tick, exactly as
 an earlier run of the runner would have stored them. Economics are not claimed.
 """
+import logging
 import tempfile
-from decimal import Decimal as D
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal as D
 from pathlib import Path
 from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
 from test.meridian_v3.lifecycle_harness import LINEAGE, START, creates, rebound
@@ -15,6 +16,7 @@ from test.meridian_v3.test_native_paper import paper
 from test.tidewater_v4.test_tidewater_candidates import CONFIGS, OWNER_0E4811F71
 from test.tidewater_v4.test_tidewater_runtime import tidewater
 from unittest import IsolatedAsyncioTestCase
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -27,8 +29,15 @@ from controllers.generic.tidewater_v4_core.config import RUNNER_ITER5_B, Tidewat
 from controllers.generic.tidewater_v4_core.receipts import RUNNER, RUNNER_DAY, ReceiptWriter, read_receipts
 from controllers.generic.tidewater_v4_core.runner import DAY_SECONDS, RunnerConfig
 from controllers.generic.tidewater_v4_core.runner_book import EXIT, OPEN, RunnerBook
-from controllers.generic.tidewater_v4_core.runner_execution import TidewaterRunnerExecutor
+from controllers.generic.tidewater_v4_core.runner_execution import (
+    RUNNER_CANCEL_MAX_REQUESTS,
+    RUNNER_CANCEL_RETRY_SECONDS,
+    TidewaterRunnerExecutor,
+)
+from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import NativePaperTradeExchange
+from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 from hummingbot.strategy_v2.executors.restart_continuity import continuity_plan
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
@@ -38,6 +47,32 @@ from hummingbot.strategy_v2.paper_session import NativePaperSession
 BTC = 'BTC-USDC'
 OWNER = 'modular_spot_tidewater_v4_paper'
 ATR = D('0.02')  # the seeded daily bars: true range 2 on a close of 100 every day
+LOT, TICK = D('.001'), D('.01')
+
+
+def paper_base_fee(pairs, cash):
+    """The native paper exchange of `paper` with base-denominated buy fees: owned inventory is not a lot
+    multiple (fee dust), as on a venue that takes the buy fee from the bought asset."""
+    rules = {pair: TradingRule(pair, min_order_size=LOT, min_price_increment=TICK, min_base_amount_increment=LOT,
+                               min_notional_size=D('1')) for pair in pairs}
+    market = NativePaperTradeExchange(rules, fee_schema=TradeFeeSchema(
+        maker_percent_fee_decimal=D('.001'), taker_percent_fee_decimal=D('.002'),
+        buy_percent_fee_deducted_from_returns=True), trade_participation=D('1'))
+    for pair in pairs:
+        market.set_balance(pair.split('-')[0], D('0'))
+    market.set_balance('USDC', D(cash))
+    market.tick(1000)
+    for pair in pairs:
+        market.set_order_book(pair, 1, 1000, [(99.5, 10)], [(99.51, 10)])
+    return market
+
+
+def lot(amount):
+    return (amount / LOT).to_integral_value(rounding=ROUND_FLOOR) * LOT
+
+
+def up_to_tick(price):
+    return (price / TICK).to_integral_value(rounding=ROUND_CEILING) * TICK
 
 
 # ---------------------------------------------------------------------- configuration and identity
@@ -91,11 +126,12 @@ def test_invalid_runner_settings_are_rejected(bad):
 class RunnerScenario:
     """The Meridian lifecycle harness (lifecycle_harness.Scenario) for Tidewater with the runner on."""
 
-    def __init__(self, directory, *, cash='1000', runner=RUNNER_ITER5_B, restore=False, seed_days=14):
+    def __init__(self, directory, *, cash='1000', runner=RUNNER_ITER5_B, restore=False, seed_days=14,
+                 base_fee=False):
         self.directory = directory
         self.config = tidewater(execution_enabled=True, exit_runner=runner)
-        self.session = NativePaperSession(paper(PAIRS, cash), [self.config], directory / 'tidewater.sqlite',
-                                          restore=restore)
+        market = (paper_base_fee if base_fee else paper)(PAIRS, cash)
+        self.session = NativePaperSession(market, [self.config], directory / 'tidewater.sqlite', restore=restore)
         self.controller = self.session.controllers[OWNER]
         self.features, self.bars = {}, {pair: [] for pair in PAIRS}
         self.minute = 0
@@ -386,6 +422,106 @@ class RunnerLifecycle(IsolatedAsyncioTestCase):
         await s.step()
         self.assertTrue(executor.is_closed)
         self.assertEqual(s.balance('BTC'), D('0'))
+
+    # ------------------------------------------------------------------ base-denominated buy fees (fee dust)
+    async def test_with_fee_dust_the_runner_exit_rests_at_the_cost_floor_without_churn(self):
+        s = self.scenario(base_fee=True)
+        executor, owned = await self.harvested(s)
+        self.assertNotEqual(owned, lot(owned))  # the buy fee left sub-lot dust in the owned base
+        protected = executor._min_no_loss_sell_price()  # the harvest part's native protected floor
+        await s.step()  # the harvest sale filled: runner phase
+        runner = self.runner(s, executor)
+        self.assertEqual(executor.status, RunnableStatus.RUNNING)
+        self.assertEqual(lot(executor.amount_to_close), runner['runner_base'])
+        self.assertLess(runner['runner_base'], executor.amount_to_close)  # dust, not an unsold harvest part
+        await s.step(mids={BTC: '100'})  # exit signal, bid below the cost floor: a resting limit at the cost floor
+        self.assertEqual(self.runner(s, executor)['phase'], EXIT)
+        resting = executor._close_order.order
+        cost_floor = self.runner(s, executor)['cost_floor']
+        self.assertEqual((resting.amount, resting.price), (lot(executor.amount_to_close), up_to_tick(cost_floor)))
+        self.assertLess(resting.price, protected)  # the harvest part's floor does not apply to the runner
+        for _ in range(6):
+            await s.step(minutes=0, seconds=1)
+            self.assertIs(executor._close_order.order, resting)
+            self.assertEqual(resting.current_state.name, 'OPEN')
+        await s.step(mids={BTC: '100.5'})
+        self.assertIs(executor._close_order.order, resting)
+        [_, exit_order] = executor._exit_orders()  # the harvest sale and one runner exit: no cancel and re-place
+        self.assertIs(exit_order.order, resting)
+        [placed] = s.records('exit_placed')
+        self.assertEqual(placed['order_floor'], str(cost_floor))
+        await s.step(mids={BTC: '101.3'})
+        await s.lift_at(BTC, '101.40')
+        await s.step()
+        self.assertTrue(executor.is_closed)
+        self.assertEqual(executor.close_type, CloseType.TRAILING_STOP)
+        self.assertEqual(resting.executed_amount_base, resting.amount)
+        self.assertLess(executor.amount_to_close, LOT)  # only the native sub-lot residue remains
+        self.assertEqual(s.balance('BTC'), executor.amount_to_close)
+
+    async def test_with_fee_dust_a_runner_exit_while_the_harvest_rests_sells_the_owned_lot_above_both_floors(self):
+        s = self.scenario(base_fee=True)
+        executor, owned = await self.harvested(s, depth='0.05')
+        harvest = executor._close_order.order
+        self.assertEqual(harvest.executed_amount_base, D('0.05'))
+        protected = executor._min_no_loss_sell_price()
+        await s.step(mids={BTC: '100'})
+        self.assertEqual(self.runner(s, executor)['phase'], EXIT)
+        self.assertEqual(harvest.current_state.name, 'CANCELED')
+        await s.step()
+        merged = executor._close_order.order
+        self.assertEqual(merged.amount, lot(owned - D('0.05')))  # the largest owned lot, harvest part included
+        cost_floor = self.runner(s, executor)['cost_floor']
+        self.assertGreater(protected, cost_floor)
+        self.assertEqual(merged.price, up_to_tick(protected))  # the unsold harvest part keeps its protected floor
+        for _ in range(3):
+            await s.step(minutes=0, seconds=1)
+            self.assertIs(executor._close_order.order, merged)
+        await s.step(mids={BTC: '104'})
+        await s.lift_at(BTC, merged.price + D('0.05'))
+        await s.step()
+        self.assertTrue(executor.is_closed)
+        self.assertLess(s.balance('BTC'), LOT)
+
+    async def test_a_lost_cancel_of_the_resting_harvest_is_requested_again_within_a_bound(self):
+        s = self.scenario()
+        executor, owned = await self.harvested(s, depth='0.05')
+        harvest = executor._close_order.order
+        requests = []
+
+        def lost(**kwargs):
+            requests.append(kwargs['order_id'])  # the request never reaches the venue
+
+        with patch.object(executor._strategy, 'cancel', side_effect=lost):
+            await s.step(mids={BTC: '100'})  # runner exit: the resting harvest sale must be cancelled
+            self.assertEqual(requests, [harvest.client_order_id])
+            await s.step(minutes=0, seconds=int(RUNNER_CANCEL_RETRY_SECONDS) - 2)
+            self.assertEqual(len(requests), 1)  # not before the retry interval
+            with self.assertLogs(level=logging.WARNING) as logs:
+                for k in range(2, RUNNER_CANCEL_MAX_REQUESTS + 3):
+                    await s.step(minutes=0, seconds=k * int(RUNNER_CANCEL_RETRY_SECONDS))
+            self.assertEqual(requests, [harvest.client_order_id] * RUNNER_CANCEL_MAX_REQUESTS)  # bounded
+            self.assertTrue(any('cancel requested again' in line for line in logs.output))
+            self.assertTrue(any('cancel unconfirmed' in line for line in logs.output))
+            self.assertEqual(s.controller.runners.status[BTC], f'runner_cancel_unconfirmed:{harvest.client_order_id}')
+            self.assertTrue(harvest.is_open)  # still resting at its protected floor
+            await s.step(minutes=0, seconds=(RUNNER_CANCEL_MAX_REQUESTS + 6) * int(RUNNER_CANCEL_RETRY_SECONDS))
+            self.assertEqual(len(requests), RUNNER_CANCEL_MAX_REQUESTS)  # no request after the bound
+        self.assertFalse(executor.is_closed)
+
+    async def test_a_re_requested_cancel_lets_the_runner_exit_sell_everything(self):
+        s = self.scenario()
+        executor, owned = await self.harvested(s, depth='0.05')
+        harvest = executor._close_order.order
+        with patch.object(executor._strategy, 'cancel', side_effect=lambda **kwargs: None):
+            await s.step(mids={BTC: '100'})  # the first cancel request is lost
+        self.assertTrue(harvest.is_open)
+        await s.step(minutes=0, seconds=int(RUNNER_CANCEL_RETRY_SECONDS))  # requested again: the venue cancels
+        self.assertEqual(harvest.current_state.name, 'CANCELED')
+        await s.step()
+        merged = executor._close_order.order
+        self.assertEqual(merged.amount, owned - D('0.05'))
+        self.assertGreaterEqual(merged.price, self.runner(s, executor)['cost_floor'])
 
     async def test_a_split_below_the_minimum_keeps_no_runner_and_the_native_exit_runs(self):
         s = self.scenario(runner=RUNNER_ITER5_B.model_copy(update={'runner_fraction': D('0.001')}))

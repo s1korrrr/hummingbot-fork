@@ -17,6 +17,12 @@ Never below the floor: every runner-path order is a LIMIT at or above the native
 (harvest part, as the native trailing close) or the runner's cost floor (exit), checked immediately
 before submission. The runner path never
 demotes the position to the held bag; untradeable residue follows the native held-inventory rule.
+
+Fee dust. Owned inventory need not be a lot multiple (base-denominated buy fees). The native spot close
+sells the largest owned lot (`_single_attempt_spot_close_amount`) and the sub-lot rest is closed residue
+(`_closed_residual_dust`). The runner path therefore reads owned base in lots: an exit order for the
+owned lot already sells everything, and the harvest part is unsold only when a tradeable lot of it
+remains above the runner base.
 """
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
@@ -29,6 +35,11 @@ from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
 from .runner_book import EXIT, RunnerHold
 
 RUNNER_EXIT_REASON = 'RUNNER_FLOOR'
+# A resting harvest sale that must yield to the runner exit is cancelled by request; a request the venue
+# never confirms is sent again every RUNNER_CANCEL_RETRY_SECONDS, at most RUNNER_CANCEL_MAX_REQUESTS times.
+# After that the order is kept resting (a LIMIT at or above its floor), logged and reported.
+RUNNER_CANCEL_RETRY_SECONDS = 30
+RUNNER_CANCEL_MAX_REQUESTS = 5
 
 
 class TidewaterRunnerExecutor(ModularPositionExecutor):
@@ -87,22 +98,48 @@ class TidewaterRunnerExecutor(ModularPositionExecutor):
             # stop holds in place_close_order_and_cancel_open_orders, so nothing sells.
             return super().control_barriers()
         if self.status == RunnableStatus.RUNNING and (runner['phase'] == EXIT
-                                                      or self.amount_to_close > runner['runner_base']):
+                                                      or self._harvest_unsold(runner, self.current_market_price)):
             self.place_close_order_and_cancel_open_orders(CloseType.TRAILING_STOP)
 
     async def control_close_order(self):
         runner = self._runner_state()
         order = None if self._close_order is None else self._close_order.order
         if (isinstance(runner, dict) and runner['phase'] == EXIT and order is not None and order.is_open
-                and (order.amount - order.executed_amount_base < self.amount_to_close
+                and (order.amount - order.executed_amount_base < self._lot(self.amount_to_close)
                      or order.price < runner['cost_floor'])):
-            # The resting harvest sale yields to the runner exit of everything still owned.
-            if getattr(self, '_runner_cancel_requested', None) != order.client_order_id:
-                self._runner_cancel_requested = order.client_order_id
-                self._strategy.cancel(connector_name=self.config.connector_name,
-                                      trading_pair=self.config.trading_pair, order_id=order.client_order_id)
+            # The resting harvest sale yields to the runner exit of everything still owned (the owned lot;
+            # the native close never sells the sub-lot residue, so the runner's own exit is never cancelled).
+            self._runner_request_cancel(order)
             return
         await super().control_close_order()
+
+    def _runner_request_cancel(self, order):
+        """Request the cancel; re-request one the venue never confirms, within RUNNER_CANCEL_MAX_REQUESTS."""
+        now = self._strategy.current_timestamp
+        state = getattr(self, '_runner_cancel', None)
+        if state is None or state['order_id'] != order.client_order_id:
+            state = self._runner_cancel = {'order_id': order.client_order_id, 'requests': 0, 'last_at': None,
+                                           'reported': False}
+        if state['last_at'] is not None and now - state['last_at'] < RUNNER_CANCEL_RETRY_SECONDS:
+            return
+        if state['requests'] >= RUNNER_CANCEL_MAX_REQUESTS:
+            if not state['reported']:
+                state['reported'] = True
+                book = self._runner_book()
+                if book is not None:
+                    book.status[self.config.trading_pair] = f'runner_cancel_unconfirmed:{order.client_order_id}'
+                self.logger().error(self._log_message(
+                    f'Runner exit blocked: cancel unconfirmed after {state["requests"]} requests '
+                    f'order_id={order.client_order_id}; the order keeps resting at price={order.price}'))
+            return
+        if state['requests']:
+            self.logger().warning(self._log_message(
+                f'Runner exit: cancel requested again order_id={order.client_order_id} '
+                f'request={state["requests"] + 1}/{RUNNER_CANCEL_MAX_REQUESTS}'))
+        state['requests'] += 1
+        state['last_at'] = now
+        self._strategy.cancel(connector_name=self.config.connector_name, trading_pair=self.config.trading_pair,
+                              order_id=order.client_order_id)
 
     # ------------------------------------------------------------------ runner path
     def _runner_hold(self, hold):
@@ -118,6 +155,10 @@ class TidewaterRunnerExecutor(ModularPositionExecutor):
         rules = self.trading_rules
         return amount > 0 and amount >= rules.min_order_size and amount * price >= rules.min_notional_size
 
+    def _harvest_unsold(self, runner, price):
+        """A tradeable lot of the harvest part is still owned (sub-lot fee dust is not an unsold part)."""
+        return self._tradeable(self._lot(self.amount_to_close - runner['runner_base']), price)
+
     def _runner_close(self, runner, price):
         if self._resume_conflicting_fill is not None:
             return
@@ -125,7 +166,7 @@ class TidewaterRunnerExecutor(ModularPositionExecutor):
         bid = self._current_trailing_reference_price()
         if runner['phase'] == EXIT:
             floor = runner['cost_floor']
-            if self.amount_to_close > runner['runner_base']:
+            if self._harvest_unsold(runner, bid if bid is not None else self.current_market_price):
                 # Part of the harvest sale is unsold: the one exit order also keeps its protected floor.
                 protected = self._min_no_loss_sell_price()
                 if protected is None:

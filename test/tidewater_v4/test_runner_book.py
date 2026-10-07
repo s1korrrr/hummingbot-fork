@@ -39,6 +39,7 @@ class Recorder:
 
     def __init__(self):
         self.rows, self.fail, self.fail_reads = [], False, False
+        self.lost_acks = 0  # the next N appends commit, then the acknowledgement is lost (the call raises)
 
     def append_rsi_v5_runtime_events(self, events):
         if self.fail:
@@ -50,6 +51,9 @@ class Recorder:
                     raise RuntimeError('event id already records a different fact')
                 continue
             self.rows.append(NS(sequence=len(self.rows) + 1, **event))
+        if self.lost_acks:
+            self.lost_acks -= 1
+            raise RuntimeError('acknowledgement lost after commit')
 
     def get_rsi_v5_runtime_events(self, controller_id):
         if self.fail_reads:
@@ -225,6 +229,55 @@ def test_a_failed_write_keeps_the_stored_state_and_the_retry_gives_the_same_resu
     expected, exited = research_reference(frame, start, int(minutes[-1]), price, book.lots['e1']['cost_floor'])
     assert (book.lots['e1']['floor'], book.lots['e1']['high_water'], book.lots['e1']['last_minute']) == (
         expected.floor, expected.high_water, exited)
+
+
+def test_a_state_write_committed_without_its_acknowledgement_is_confirmed_by_the_identical_retry():
+    frame = tape()
+    minutes = frame.timestamp.to_numpy()
+    start = int(minutes[2 * 1440 + 30])
+    price = D(str(float(frame.close[frame.timestamp == start].iloc[0])))
+    recorder = Recorder()
+    owner = Owner(frame, recorder)
+    book = owner.book()
+    run(owner, book, minutes[:2 * 1440 + 30])
+    harvest_at(owner, book, start, price)
+    run(owner, book, minutes[2 * 1440 + 31:2 * 1440 + 200])
+    seq = book.lots['e1']['seq']
+    before = len(recorder.rows)
+    k = 2 * 1440 + 200
+    while len(recorder.rows) == before:  # the next state change commits; its acknowledgement is lost
+        recorder.lost_acks = 1
+        run(owner, book, minutes[k:k + 1])
+        k += 1
+    recorder.lost_acks = 0
+    assert book.lots['e1']['seq'] == seq  # unconfirmed: the stored state is not yet in force
+    committed = json.loads(recorder.rows[-1].payload_json)
+    assert committed['seq'] == seq + 1
+    run(owner, book, minutes[k:k + 120])  # later minutes change nothing about the stored fact
+    assert owner.receipts.fault['count'] == 1  # the retry re-sends the same fact: never refused
+    assert book.lots['e1']['seq'] > seq + 1
+    run(owner, book, minutes[k + 120:])
+    states = [json.loads(r.payload_json) for r in recorder.rows if r.event_id.startswith('tidewater:runner:e1:state:')]
+    assert [st['seq'] for st in states] == list(range(1, len(states) + 1))
+    expected, exited = research_reference(frame, start, int(minutes[-1]), price, book.lots['e1']['cost_floor'])
+    assert (book.lots['e1']['floor'], book.lots['e1']['high_water'], book.lots['e1']['last_minute']) == (
+        expected.floor, expected.high_water, exited)
+
+
+def test_a_split_committed_without_its_acknowledgement_is_confirmed_unchanged():
+    recorder = Recorder()
+    owner = Owner(tape(days=1), recorder)
+    book = owner.book()
+    owner.at(DAY0 + 600)
+    recorder.lost_acks = 1
+    assert isinstance(book.harvest({**FACTS, 'price': D('98')}), RunnerHold)
+    assert book.lots == {}
+    owner.at(DAY0 + 660)  # a later trigger price and clock: the stored split is the fact, not a new one
+    state = book.harvest({**FACTS, 'price': D('98.5')})
+    assert (state['harvest_price'], state['harvested_at']) == (D('98'), DAY0 + 660)
+    assert owner.receipts.fault['count'] == 1
+    [row] = recorder.rows
+    assert book.lots['e1'] == state and json.loads(row.payload_json)['harvest_price'] == '98'
 
 
 def test_no_runner_decision_before_the_store_is_read_or_when_the_split_cannot_be_stored():

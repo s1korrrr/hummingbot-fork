@@ -168,3 +168,20 @@ def test_legacy_mode_still_holds_on_held_inventory():
     state = DecisionState(fingerprint='a' * 64, candle=1080, claims=('held',), committed_quote=D('50'))
     view = {'held': _view('.5', '50', '100', True, held=True)}
     assert plan(state, view, **inputs())[2] == 'held_inventory_requires_reconciliation'
+
+
+def test_wide_spread_does_not_consume_the_candle():
+    # A wide book at one tick is transient: the same closed candle is evaluated again on the next tick.
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    revised, proposal, reason = plan(state, {}, **inputs(ask=D('101')))
+    assert (reason, proposal, revised.candle) == ('spread_limit', None, 1080)
+    retried, retried_proposal, retried_reason = plan(revised, {}, **inputs())
+    assert retried_reason == 'entry_proposed' and retried_proposal is not None and retried.candle == 1140
+
+
+def test_flash_pause_still_consumes_the_candle():
+    state = DecisionState(fingerprint='a' * 64, candle=1080)
+    paused = inputs(market=replace(inputs()['market'], flash_pause_until=D('1300')))
+    revised, proposal, reason = plan(state, {}, **paused)
+    assert (reason, proposal, revised.candle) == ('flash_crash_pause', None, 1140)
+    assert plan(revised, {}, **inputs())[2] == 'same_candle'

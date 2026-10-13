@@ -441,3 +441,31 @@ async def test_kill_switch_stop_is_durable_before_any_tick_even_during_a_shutdow
         finally:
             restarted.listen_to_executor_actions_task.cancel()
             await asyncio.gather(restarted.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.parametrize('persist_fails', [False, True])
+def test_global_drawdown_stop_persists_at_once_and_stops_even_if_persistence_fails(persist_fails):
+    from unittest.mock import Mock
+
+    strategy = SimpleNamespace(max_global_pnl=D('100'), drawdown_exited_controllers=[], controllers={'a': object()},
+                               config=SimpleNamespace(max_global_drawdown_quote=10), _is_stop_triggered=False,
+                               _drawdown_pnl=lambda cid: D('50'), logger=Mock())
+    persisted = []
+
+    def persist():
+        persisted.append(strategy._is_stop_triggered)
+        if persist_fails:
+            raise RuntimeError('disk error')
+    strategy._persist_risk_state = persist
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    strategy.latch_risk_stop = lambda: StrategyV2Base.latch_risk_stop(strategy)
+    app = Mock()
+    with patch('scripts.v2_with_controllers.HummingbotApplication.main_application', return_value=app):
+        if persist_fails:
+            with pytest.raises(RuntimeError, match='disk error'):
+                V2WithControllers.check_max_global_drawdown(strategy)
+        else:
+            V2WithControllers.check_max_global_drawdown(strategy)
+    assert persisted == [True] and strategy._is_stop_triggered is True
+    assert strategy.drawdown_exited_controllers == ['a']
+    app.stop.assert_called_once_with()

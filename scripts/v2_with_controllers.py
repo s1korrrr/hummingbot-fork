@@ -553,8 +553,11 @@ class V2WithControllers(StrategyV2Base):
             if current_global_drawdown > self.config.max_global_drawdown_quote:
                 self.drawdown_exited_controllers.extend(list(self.controllers.keys()))
                 self.logger().info("Global drawdown reached. Stopping the strategy.")
-                self.latch_risk_stop()
-                HummingbotApplication.main_application().stop()
+                try:
+                    self.latch_risk_stop()
+                finally:
+                    # A persistence failure surfaces to the caller; the stop still happens.
+                    HummingbotApplication.main_application().stop()
 
     def get_controller_report(self, controller_id: str) -> dict:
         """

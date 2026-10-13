@@ -149,6 +149,17 @@ class V2WithControllers(StrategyV2Base):
                 self._risk_reconciliation_error = str(error) or type(error).__name__
                 self.logger().exception('Risk state unavailable; execution blocked pending reconciliation')
 
+    def latch_risk_stop(self):
+        super().latch_risk_stop()
+        if getattr(self, '_risk_persistence_enabled', False) and getattr(self, '_risk_reconciliation_error', None):
+            # _persist_risk_state keeps unreconciled evidence untouched, but the risk stop must
+            # still survive a restart: set only `stopped` on a readable row. A missing or
+            # malformed row already blocks the next boot for reconciliation.
+            recorder = MarketsRecorder.get_instance()
+            state = recorder.load_strategy_risk_state()
+            if isinstance(state, dict) and state.get('stopped') is False:
+                recorder.store_strategy_risk_state({**state, 'stopped': True})
+
     def _persist_risk_state(self, *, operator_receipts=()):
         if not getattr(self, '_risk_persistence_enabled', False):
             return

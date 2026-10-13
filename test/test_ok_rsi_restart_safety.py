@@ -469,3 +469,46 @@ def test_global_drawdown_stop_persists_at_once_and_stops_even_if_persistence_fai
     assert persisted == [True] and strategy._is_stop_triggered is True
     assert strategy.drawdown_exited_controllers == ['a']
     app.stop.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_risk_stop_is_durable_during_reconciliation_without_rewriting_its_evidence(recorder):
+    """Round 3: with a reconciliation error, _persist_risk_state writes nothing, so a kill
+    switch or drawdown stop must set only `stopped` on the readable row. A reconciliation
+    latch by itself stays non-durable (the next boot re-evaluates it)."""
+    import asyncio
+    from collections import deque
+
+    from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+    from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    from scripts.v2_with_controllers import V2WithControllersConfig
+
+    state = {'version': 1, 'controllers': ['controller'], 'max_global_pnl': '100',
+             'max_pnl_by_controller': {'controller': '75'}, 'drawdown_exited_controllers': [],
+             'stopped': False, 'operator_paused': {'controller': False}}
+    recorder.store_strategy_risk_state(state)
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+
+    def initialize(strategy):
+        config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT')
+        strategy.controllers = {'controller': OKRSIController(config, strategy.market_data_provider, strategy.actions_queue)}
+
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig())
+        try:
+            # A transient receipt-store failure latches in memory only.
+            strategy._is_stop_triggered = True
+            strategy._risk_reconciliation_error = 'Operator receipt store unavailable'
+            strategy.max_global_pnl = D('999')  # unreconciled in-memory value must not be written
+            strategy._persist_risk_state()
+            assert recorder.load_strategy_risk_state() == state
+            strategy.latch_risk_stop()
+            assert recorder.load_strategy_risk_state() == {**state, 'stopped': True}
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)

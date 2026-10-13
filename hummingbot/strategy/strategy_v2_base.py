@@ -430,6 +430,9 @@ class StrategyV2Base(StrategyPyBase):
         """
         Called when the strategy is stopped. Shuts down controllers, executors, and market data provider.
         """
+        if not hasattr(self, '_native_shutdown_initial_stop_latch'):
+            # Kept across failed shutdown retries; see durable_stop_latch.
+            self._native_shutdown_initial_stop_latch = self._is_stop_triggered
         self._is_stop_triggered = True
         self._controllers_started = False
         self._controller_start_requested = False
@@ -462,6 +465,28 @@ class StrategyV2Base(StrategyPyBase):
             self._pub = None
         if strict:
             return result
+
+    def durable_stop_latch(self) -> bool:
+        """The strategy stop a restart must restore: the latch as it was before any shutdown.
+
+        on_stop latches every shutdown so no action starts while executors suspend, and
+        the clock keeps ticking (and persisting) until the stop completes. A process
+        killed before then must not turn that administrative latch into a durable stop.
+        """
+        return getattr(self, '_native_shutdown_initial_stop_latch', self._is_stop_triggered)
+
+    def latch_risk_stop(self) -> None:
+        """Latch a risk stop durably now, before any shutdown can remove the clock that persists it.
+
+        Overrides a shutdown already in progress: its administrative latch must not hide a
+        risk stop that fires while executors suspend.
+        """
+        self._is_stop_triggered = True
+        if hasattr(self, '_native_shutdown_initial_stop_latch'):
+            self._native_shutdown_initial_stop_latch = True
+        persist = getattr(self, '_persist_risk_state', None)
+        if callable(persist):
+            persist()
 
     def _shutdown_keep_position_preferences(self) -> Dict[str, bool]:
         preferences: Dict[str, bool] = {}

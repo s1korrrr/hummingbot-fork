@@ -456,7 +456,7 @@ def test_transition_refuses_drift_and_rolls_back_every_write(mutation):
 
 def release_request(**updates):
     return {'command_id': 'approved-latch-release', 'requested_at': 1000, 'controllers': [OWNER],
-            'owner_stopped': True, **updates}
+            'owner_stopped': True, 'kill_switch_disabled': True, **updates}
 
 
 def test_interrupted_shutdown_latch_release_changes_only_the_latch_and_archives_it():
@@ -491,6 +491,7 @@ def test_interrupted_shutdown_latch_release_changes_only_the_latch_and_archives_
     ('missing_state', 'No durable risk state'),
     ('other_controllers', 'scope mismatch'),
     ('owner_running', 'Stopped owner proof'),
+    ('kill_switch_enabled', 'kill-switch stop is a risk stop'),
 ])
 def test_latch_release_refuses_a_risk_stop_or_unproven_scope_without_writing(case, message):
     from hummingbot.strategy_v2.migrations.entry_risk import plan_interrupted_shutdown_latch_release
@@ -501,6 +502,8 @@ def test_latch_release_refuses_a_risk_stop_or_unproven_scope_without_writing(cas
     updates = {'controllers': ['other-owner']} if case == 'other_controllers' else {}
     if case == 'owner_running':
         updates = {'owner_stopped': False}
+    if case == 'kill_switch_enabled':
+        updates = {'kill_switch_disabled': False}
     connection = database(None if case == 'missing_state' else state)
     try:
         before = list(connection.iterdump())

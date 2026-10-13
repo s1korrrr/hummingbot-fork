@@ -382,14 +382,18 @@ def plan_interrupted_shutdown_latch_release(connection, script_config, request):
     Before StrategyV2Base.durable_stop_latch, every shutdown latched the strategy and the
     still-ticking clock could persist that latch before the process died. The one durable
     risk stop, the global drawdown rail, records every controller as drawdown-exited before
-    it latches, so a stopped row with no exited controller is not a risk stop. The caller
-    proves the owner stopped and its stop interrupted; the planner changes no record.
+    it latches, so a stopped row with no exited controller is not a drawdown stop. The native
+    kill switch latches without recording exits, so the caller must also attest that the
+    owner runs with the kill switch disabled. The caller proves the owner stopped and its
+    stop interrupted; the planner changes no record.
     """
     _require(isinstance(script_config, str) and re.fullmatch(r'[A-Za-z0-9_.-]+\.yml', script_config),
              'One native script owner is required')
-    _require(isinstance(request, dict) and set(request) == {'command_id', 'requested_at', 'controllers', 'owner_stopped'},
-             'Explicit bounded latch release request is required')
+    _require(isinstance(request, dict) and set(request) == {
+        'command_id', 'requested_at', 'controllers', 'owner_stopped', 'kill_switch_disabled'},
+        'Explicit bounded latch release request is required')
     _require(request['owner_stopped'] is True, 'Stopped owner proof is required')
+    _require(request['kill_switch_disabled'] is True, 'A kill-switch stop is a risk stop; disabled kill switch proof is required')
     _require(isinstance(request['command_id'], str) and 1 <= len(request['command_id']) <= 128
              and type(request['requested_at']) in (float, int) and math.isfinite(request['requested_at'])
              and request['requested_at'] >= 0, 'Approved latch release command identity is required')

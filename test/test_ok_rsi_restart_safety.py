@@ -376,3 +376,67 @@ async def test_pending_resume_tick_preserves_operator_pause_without_uninitialize
         finally:
             strategy.listen_to_executor_actions_task.cancel()
             await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_stop_stays_durable_when_its_shutdown_is_killed(recorder):
+    """The native kill switch is a risk stop: unlike the shutdown's own latch it must
+    survive a restart, even when the process dies while executors suspend."""
+    import asyncio
+    from collections import deque
+    from unittest.mock import AsyncMock, Mock
+
+    from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+    from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+    from hummingbot.core.utils.kill_switch import ActiveKillSwitch
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    from scripts.v2_with_controllers import V2WithControllersConfig
+
+    recorder.store_strategy_risk_state({
+        'version': 1, 'controllers': ['controller'], 'max_global_pnl': '100',
+        'max_pnl_by_controller': {'controller': '75'}, 'drawdown_exited_controllers': [],
+        'stopped': False, 'operator_paused': {'controller': False}})
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+
+    def initialize(strategy):
+        config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT')
+        strategy.controllers = {'controller': OKRSIController(config, strategy.market_data_provider, strategy.actions_queue)}
+
+    async def suspend_until_killed(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig())
+        suspending = asyncio.Event()
+
+        async def shutdown():
+            stop = asyncio.ensure_future(strategy.on_stop())
+            await asyncio.sleep(0)
+            suspending.set()
+            await stop
+
+        core = SimpleNamespace(strategy=strategy, notify=Mock(), shutdown=AsyncMock(side_effect=shutdown),
+                               calculate_profitability=AsyncMock(return_value=D('-0.5')))
+        try:
+            with patch.object(StrategyV2Base, 'on_tick'), \
+                    patch.object(strategy.executor_orchestrator, 'stop', suspend_until_killed):
+                switch = asyncio.ensure_future(ActiveKillSwitch(D('-10'), core).check_profitability_loop())
+                await suspending.wait()
+                strategy.on_tick()  # the clock persists while executors suspend
+                switch.cancel()  # the process dies before the stop completes
+                await asyncio.gather(switch, return_exceptions=True)
+            assert recorder.load_strategy_risk_state()['stopped'] is True
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+        restarted = V2WithControllers({'okx': connector}, V2WithControllersConfig())
+        try:
+            assert restarted._is_stop_triggered is True
+        finally:
+            restarted.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(restarted.listen_to_executor_actions_task, return_exceptions=True)

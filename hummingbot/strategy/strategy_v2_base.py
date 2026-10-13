@@ -475,6 +475,19 @@ class StrategyV2Base(StrategyPyBase):
         """
         return getattr(self, '_native_shutdown_initial_stop_latch', self._is_stop_triggered)
 
+    def latch_risk_stop(self) -> None:
+        """Latch a risk stop durably now, before any shutdown can remove the clock that persists it.
+
+        Overrides a shutdown already in progress: its administrative latch must not hide a
+        risk stop that fires while executors suspend.
+        """
+        self._is_stop_triggered = True
+        if hasattr(self, '_native_shutdown_initial_stop_latch'):
+            self._native_shutdown_initial_stop_latch = True
+        persist = getattr(self, '_persist_risk_state', None)
+        if callable(persist):
+            persist()
+
     def _shutdown_keep_position_preferences(self) -> Dict[str, bool]:
         preferences: Dict[str, bool] = {}
         for controller_id, controller in self.controllers.items():

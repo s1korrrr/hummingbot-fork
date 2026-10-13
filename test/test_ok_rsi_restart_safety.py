@@ -379,9 +379,10 @@ async def test_pending_resume_tick_preserves_operator_pause_without_uninitialize
 
 
 @pytest.mark.asyncio
-async def test_kill_switch_stop_stays_durable_when_its_shutdown_is_killed(recorder):
-    """The native kill switch is a risk stop: unlike the shutdown's own latch it must
-    survive a restart, even when the process dies while executors suspend."""
+@pytest.mark.parametrize('during_shutdown', [False, True])
+async def test_kill_switch_stop_is_durable_before_any_tick_even_during_a_shutdown(recorder, during_shutdown):
+    """The native kill switch is a risk stop: it must survive a restart with no later clock
+    tick, and override the latch of an administrative shutdown already in progress."""
     import asyncio
     from collections import deque
     from unittest.mock import AsyncMock, Mock
@@ -402,7 +403,10 @@ async def test_kill_switch_stop_stays_durable_when_its_shutdown_is_killed(record
         config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT')
         strategy.controllers = {'controller': OKRSIController(config, strategy.market_data_provider, strategy.actions_queue)}
 
+    suspending = asyncio.Event()
+
     async def suspend_until_killed(*args, **kwargs):
+        suspending.set()
         await asyncio.Event().wait()
 
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
@@ -411,24 +415,21 @@ async def test_kill_switch_stop_stays_durable_when_its_shutdown_is_killed(record
             patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
             patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
         strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig())
-        suspending = asyncio.Event()
-
-        async def shutdown():
-            stop = asyncio.ensure_future(strategy.on_stop())
-            await asyncio.sleep(0)
-            suspending.set()
-            await stop
-
-        core = SimpleNamespace(strategy=strategy, notify=Mock(), shutdown=AsyncMock(side_effect=shutdown),
+        pending = []
+        core = SimpleNamespace(strategy=strategy, notify=Mock(),
+                               shutdown=AsyncMock(side_effect=lambda: pending.append(asyncio.ensure_future(strategy.on_stop()))),
                                calculate_profitability=AsyncMock(return_value=D('-0.5')))
         try:
-            with patch.object(StrategyV2Base, 'on_tick'), \
-                    patch.object(strategy.executor_orchestrator, 'stop', suspend_until_killed):
-                switch = asyncio.ensure_future(ActiveKillSwitch(D('-10'), core).check_profitability_loop())
-                await suspending.wait()
-                strategy.on_tick()  # the clock persists while executors suspend
-                switch.cancel()  # the process dies before the stop completes
-                await asyncio.gather(switch, return_exceptions=True)
+            with patch.object(strategy.executor_orchestrator, 'stop', suspend_until_killed):
+                if during_shutdown:  # an operator/restart stop is already suspending executors
+                    pending.append(asyncio.ensure_future(strategy.on_stop(strict=True)))
+                    await suspending.wait()
+                    assert recorder.load_strategy_risk_state()['stopped'] is False
+                await ActiveKillSwitch(D('-10'), core).check_profitability_loop()
+                # No clock tick: the process dies before the stop completes.
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
             assert recorder.load_strategy_risk_state()['stopped'] is True
         finally:
             strategy.listen_to_executor_actions_task.cancel()

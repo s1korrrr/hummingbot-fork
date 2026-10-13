@@ -376,8 +376,56 @@ def plan_entry_risk_transition(connection, script_config, request):
     return {**proposal, 'transition_id': _digest(proposal)}
 
 
+def plan_interrupted_shutdown_latch_release(connection, script_config, request):
+    """Propose releasing a strategy stop that an interrupted shutdown persisted; nothing else changes.
+
+    Before StrategyV2Base.durable_stop_latch, every shutdown latched the strategy and the
+    still-ticking clock could persist that latch before the process died. The one durable
+    risk stop, the global drawdown rail, records every controller as drawdown-exited before
+    it latches, so a stopped row with no exited controller is not a risk stop. The caller
+    proves the owner stopped and its stop interrupted; the planner changes no record.
+    """
+    _require(isinstance(script_config, str) and re.fullmatch(r'[A-Za-z0-9_.-]+\.yml', script_config),
+             'One native script owner is required')
+    _require(isinstance(request, dict) and set(request) == {'command_id', 'requested_at', 'controllers', 'owner_stopped'},
+             'Explicit bounded latch release request is required')
+    _require(request['owner_stopped'] is True, 'Stopped owner proof is required')
+    _require(isinstance(request['command_id'], str) and 1 <= len(request['command_id']) <= 128
+             and type(request['requested_at']) in (float, int) and math.isfinite(request['requested_at'])
+             and request['requested_at'] >= 0, 'Approved latch release command identity is required')
+    controllers = request['controllers']
+    _require(isinstance(controllers, list) and controllers
+             and all(isinstance(cid, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,180}', cid) for cid in controllers)
+             and controllers == sorted(set(controllers)),
+             'Exact sorted native controller scope is required')
+    row = connection.execute('SELECT value FROM Metadata WHERE key=?', ('strategy-risk:' + script_config,)).fetchone()
+    _require(row is not None, 'No durable risk state to release')
+    before = json.loads(row[0])
+    _validate_state(before, controllers)
+    _require(before['stopped'] is True, 'Durable strategy stop is not latched')
+    _require(before['drawdown_exited_controllers'] == [], 'A drawdown exit latched this stop; it is a risk stop')
+    after = copy.deepcopy(before)
+    after['stopped'] = False
+    archive_key = 'strategy-risk-transition:' + _digest([script_config, request['command_id']])
+    _require(connection.execute('SELECT 1 FROM Metadata WHERE key=?', (archive_key,)).fetchone() is None,
+             'Risk transition command was already applied')
+    proposal = {'schema_version': 1, 'script_config': script_config, 'request': copy.deepcopy(request),
+                'kind': 'interrupted_shutdown_latch_release', 'before': before, 'after': after,
+                'archive_key': archive_key, 'native_state_sha256': financial_state_digest(connection)}
+    return {**proposal, 'transition_id': _digest(proposal)}
+
+
 def apply_entry_risk_transition(connection, proposal, *, now):
     """Atomically apply an exact reviewed proposal; a changed row or replay refuses."""
+    return _apply_planned_transition(connection, proposal, plan_entry_risk_transition, now=now)
+
+
+def apply_interrupted_shutdown_latch_release(connection, proposal, *, now):
+    """Atomically apply an exact reviewed latch release; a changed row or replay refuses."""
+    return _apply_planned_transition(connection, proposal, plan_interrupted_shutdown_latch_release, now=now)
+
+
+def _apply_planned_transition(connection, proposal, planner, *, now):
     _require(not connection.in_transaction, 'Risk transition owns its SQLite transaction')
     _require(type(now) in (float, int) and math.isfinite(now), 'Finite transition clock is required')
     _require(isinstance(proposal, dict), 'Reviewed transition proposal is required')
@@ -385,7 +433,7 @@ def apply_entry_risk_transition(connection, proposal, *, now):
     _require(type(stamp) in (float, int) and 0 <= now - stamp < 300, 'Fresh approved risk transition is required')
     connection.execute('BEGIN IMMEDIATE')
     try:
-        actual = plan_entry_risk_transition(connection, proposal['script_config'], proposal['request'])
+        actual = planner(connection, proposal['script_config'], proposal['request'])
         _require(actual == proposal, 'Native state or reviewed risk transition changed')
         key = 'strategy-risk:' + actual['script_config']
         connection.execute('INSERT INTO Metadata (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',

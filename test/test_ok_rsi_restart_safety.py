@@ -157,6 +157,67 @@ async def test_real_strategy_constructor_restores_pauses_and_drawdown_peaks(reco
             await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('risk_stopped', [False, True])
+async def test_shutdown_killed_while_executors_suspend_keeps_the_durable_risk_latch(recorder, risk_stopped):
+    """2026-10-13: the host shut down while V3 suspended its executor. The clock kept
+    ticking during the awaited stop and persisted on_stop's administrative latch, so
+    the next boot was a durable strategy stop. Only a risk stop may survive a restart."""
+    import asyncio
+    from collections import deque
+
+    from controllers.directional_trading.ok_rsi import OKRSIController, OKRSIControllerConfig
+    from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+    from scripts.v2_with_controllers import V2WithControllersConfig
+
+    # A global drawdown stop records every controller as exited before it latches.
+    recorder.store_strategy_risk_state({
+        'version': 1, 'controllers': ['controller'], 'max_global_pnl': '100',
+        'max_pnl_by_controller': {'controller': '75'},
+        'drawdown_exited_controllers': ['controller'] if risk_stopped else [],
+        'stopped': risk_stopped, 'operator_paused': {'controller': False}})
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDT'])
+
+    def initialize(strategy):
+        config = OKRSIControllerConfig(id='controller', connector_name='okx', trading_pair='ETH-USDT')
+        strategy.controllers = {'controller': OKRSIController(config, strategy.market_data_provider, strategy.actions_queue)}
+
+    suspending = asyncio.Event()
+
+    async def suspend_until_killed(*args, **kwargs):
+        suspending.set()
+        await asyncio.Event().wait()
+
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig())
+        try:
+            assert strategy._is_stop_triggered is risk_stopped
+            with patch.object(StrategyV2Base, 'on_tick'), \
+                    patch.object(strategy.executor_orchestrator, 'stop', suspend_until_killed):
+                shutdown = asyncio.ensure_future(strategy.on_stop(strict=True))
+                await suspending.wait()
+                assert strategy._is_stop_triggered  # no new action while executors suspend
+                strategy.on_tick()  # the clock still ticks and persists during the awaited stop
+                shutdown.cancel()  # the process dies before reconciliation completes
+                await asyncio.gather(shutdown, return_exceptions=True)
+            assert recorder.load_strategy_risk_state()['stopped'] is risk_stopped
+        finally:
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+        restarted = V2WithControllers({'okx': connector}, V2WithControllersConfig())
+        try:
+            assert restarted._is_stop_triggered is risk_stopped
+            assert ('EXECUTION BLOCKED' in restarted.format_status()) is risk_stopped
+        finally:
+            restarted.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(restarted.listen_to_executor_actions_task, return_exceptions=True)
+
+
 def test_recovery_diagnostic_includes_shutting_down_and_excludes_terminated(recorder):
     from pathlib import Path
 

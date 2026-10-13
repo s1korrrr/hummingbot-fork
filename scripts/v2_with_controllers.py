@@ -161,7 +161,7 @@ class V2WithControllers(StrategyV2Base):
                  'max_pnl_by_controller': {cid: (None if self.max_pnl_by_controller.get(cid, Decimal('0')) is None else
                                                  str(self.max_pnl_by_controller.get(cid, Decimal('0')))) for cid in self.controllers},
                  'drawdown_exited_controllers': sorted(set(self.drawdown_exited_controllers)),
-                 'stopped': self._is_stop_triggered,
+                 'stopped': self.durable_stop_latch(),
                  'operator_paused': {cid: self._operator_paused(c) for cid, c in self.controllers.items()}}
         if getattr(self, '_operator_watermarks', {}):
             state['operator_watermarks'] = self._operator_watermarks.copy()

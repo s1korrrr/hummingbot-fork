@@ -167,7 +167,7 @@ class MeridianV4Controller(ModularSpotController):
         if config.execution_mode == 'paper':
             connector = market_data_provider.connectors.get(config.connector_name)
             if not is_native_paper_connector(connector):
-                raise ValueError('V4 requires the exact native paper connector')
+                raise ValueError(f'{self.STRATEGY_NAME} requires the exact native paper connector')
         super().__init__(config, market_data_provider, actions_queue, **kwargs)
 
     def _runtime_bindings(self):

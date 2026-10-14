@@ -871,12 +871,61 @@ async def test_v4_runtime_hosts_five_sealed_owners_and_reports_them(tmp_path, pr
             assert status["simulation_assumptions"]["quote"] == "200000"
             assert {r["custom_info"]["strategy_name"] for r in status["controllers"]} == {
                 "V4" if program == "meridian_v4" else "V4 D2h"}
+            assert status["decision_journal"] == {"failures": 0, "last_error": None}
             journal = tmp_path / f"{program}_paper.decisions.jsonl"
-            first = [json.loads(line) for line in journal.read_text().splitlines()]
-            assert sorted(e["controller"] for e in first) == sorted(c.id for c in references)
-            assert all(e["actions"] == [] and e["status"] and e["detail"].startswith(e["status"]) for e in first)
-            await runtime.step(now + 1)  # unchanged decision state appends nothing
-            assert len(journal.read_text().splitlines()) == len(first)
+            assert not journal.exists() or journal.read_text() == ""  # no closed candle yet
+            # One line per controller per closed candle with step counts per status; same_candle is not counted.
+            script = iter([("c1", "acquisition_not_eligible"), ("c1", "same_candle"),
+                           ("c1", "data_hold:native market/account provider not ready"), ("c2", "acquisition_not_eligible")])
+            for candle, reason in script:
+                for controller in runtime.session.controllers.values():
+                    controller.get_custom_info = (lambda c=candle, r=reason: {
+                        "modular_status": r.split(":", 1)[0], "candle_open": c, "bag": {"held_amount": "0"}})
+                    controller.runtime.reason = reason
+                runtime.journal(now, {"actions": []})
+            lines = [json.loads(line) for line in journal.read_text().splitlines()]
+            assert all(e["kind"] == "candle" for e in lines)  # the real first candle closes too
+            lines = [e for e in lines if e["candle_open"] == "c1"]
+            assert sorted(e["controller"] for e in lines) == sorted(c.id for c in references)
+            assert all(e["kind"] == "candle" and e["candle_open"] == "c1" and e["final"] == "data_hold"
+                       and e["statuses"] == {"acquisition_not_eligible": 1, "data_hold": 1}
+                       and e["detail"] == "data_hold:native market/account provider not ready" and "bag" in e
+                       for e in lines)
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        MarketsRecorder._shared_instance = prior
+
+
+@pytest.mark.asyncio
+async def test_v4_journal_failure_is_reported_not_a_session_failure(tmp_path):
+    paths, _ = v4_files(tmp_path)
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    runtime = None
+    try:
+        with patch("socket.getaddrinfo", side_effect=AssertionError("no networking")):
+            runtime = PaperRuntime(PaperConfig(
+                bot_name="meridian_v4_paper", pairs=list(MERIDIAN_PAIRS), state_path=tmp_path / "paper.sqlite",
+                status_path=tmp_path / "status.json", candle_origin="http://127.0.0.1:8092",
+                controller_kind="meridian_v4", controller_files=[str(p) for p in paths], simulated_quote="200000"),
+                rules(MERIDIAN_PAIRS))
+            runtime.journal_path = tmp_path  # a directory: every append fails
+            runtime.journal = lambda now, result: open(runtime.journal_path, "a")
+            now = 600000
+            await ack(runtime.liquidity)
+            runtime.candles.clock = lambda: now
+            runtime.candles.begin_session()
+            for pair in MERIDIAN_PAIRS:
+                runtime.candles.apply(dict(v=1, type="snapshot", epoch="fixture", published_at=now, received_at=now,
+                                           pair=pair, sequence=1, rows=[row(t) for t in range(now - 60 * 1500, now, 60)]))
+                await runtime.liquidity.accept(book(now, pair), now)
+            await runtime.step(now)
+            await runtime.step(now + 1)  # a failed journal never holds the session
+            assert runtime.failure is None and runtime.journal_failures == 2
+            assert runtime.journal_error.startswith("IsADirectoryError")
+            status = json.loads((tmp_path / "status.json").read_text())
+            assert status["decision_journal"]["failures"] == 1 and status["failure"] is None  # reported next step
     finally:
         if runtime is not None:
             await runtime.close()

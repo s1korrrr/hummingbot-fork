@@ -18,6 +18,7 @@ import json
 import math
 import os
 import signal
+import sys
 import tempfile
 import time
 from collections import deque
@@ -622,6 +623,8 @@ class PaperRuntime:
         self._applied_books = dict(connector.tracking_states["book_sequence"])
         self.journal_path = config.status_path.with_name(config.bot_name + ".decisions.jsonl")
         self._journal_state = {}
+        self.journal_failures = 0
+        self.journal_error = None
 
     def status(self, now, reasons):
         reports = (self.last_result['reports'] if self.last_result and self.failure is None
@@ -639,6 +642,7 @@ class PaperRuntime:
             "process_pid": os.getpid(),
             "source_sha256": self.source_sha256,
             "restored": self.restored,
+            "decision_journal": {"failures": self.journal_failures, "last_error": self.journal_error},
             "ready": not reasons and self.failure is None,
             "reasons": reasons,
             "failure": self.failure,
@@ -691,10 +695,11 @@ class PaperRuntime:
         return row
 
     def journal(self, now, result):
-        """Append one line per controller whose decision state changed, and one per action.
+        """Append the decision trail the status file overwrites every step (bounded growth).
 
-        The decision trail (refusal causes, entries, exits) the status file overwrites every step.
-        Lines are written only on a change, so the file grows with decisions, not with steps."""
+        One line per controller per closed candle: step counts per decision status, the final
+        decision and its full reason (e.g. data_hold:<cause>), and the bag only when it changed.
+        One line per executor action, immediately. `same_candle` re-checks are not counted."""
         lines = []
         acted = {}
         for action in result["actions"]:
@@ -708,20 +713,50 @@ class PaperRuntime:
             })
         for controller_id, controller in self.session.controllers.items():
             info = controller.get_custom_info()
-            bag = json.dumps(info.get("bag"), sort_keys=True, default=json_value)
-            state = (info.get("modular_status"), info.get("execution_enabled"), bag)
-            if controller_id in acted or self._journal_state.get(controller_id) != state:
-                self._journal_state[controller_id] = state
-                runtime = getattr(controller, "runtime", None)
-                detail = getattr(runtime, "reason", None)  # the full reason, e.g. data_hold:<cause>
-                lines.append(json.dumps({"t": now, "controller": controller_id, "status": info.get("modular_status"),
-                                         "detail": None if detail is None else str(detail)[:240],
-                                         "candle_open": info.get("candle_open"), "bag": info.get("bag"),
-                                         "actions": acted.get(controller_id, [])},
+            detail = getattr(getattr(controller, "runtime", None), "reason", None)
+            detail = None if detail is None else str(detail)[:240]
+            status, candle = info.get("modular_status"), info.get("candle_open")
+            stats = self._journal_state.get(controller_id)
+            if stats is not None and stats["candle_open"] != candle and stats["statuses"]:
+                lines.append(self._candle_line(controller_id, stats))
+            if stats is None or stats["candle_open"] != candle:
+                previous_bag = None if stats is None else stats["logged_bag"]
+                stats = {"candle_open": candle, "statuses": {}, "final": None, "detail": None,
+                         "bag": None, "logged_bag": previous_bag}
+                self._journal_state[controller_id] = stats
+            if status != "same_candle":
+                stats["statuses"][status] = stats["statuses"].get(status, 0) + 1
+                stats["final"], stats["detail"] = status, detail
+            stats["bag"] = info.get("bag")
+            if controller_id in acted:
+                lines.append(json.dumps({"t": now, "controller": controller_id, "kind": "action",
+                                         "candle_open": candle, "status": status, "detail": detail,
+                                         "bag": info.get("bag"), "actions": acted[controller_id]},
                                         sort_keys=True, default=json_value, allow_nan=False))
         if lines:
             with open(self.journal_path, "a") as output:
                 output.write("\n".join(lines) + "\n")
+
+    def _candle_line(self, controller_id, stats):
+        bag = json.dumps(stats["bag"], sort_keys=True, default=json_value)
+        changed = bag != stats["logged_bag"]
+        stats["logged_bag"] = bag
+        return json.dumps({"t": time.time(), "controller": controller_id, "kind": "candle",
+                           "candle_open": stats["candle_open"], "statuses": stats["statuses"],
+                           "final": stats["final"], "detail": stats["detail"],
+                           **({"bag": stats["bag"]} if changed else {})},
+                          sort_keys=True, default=json_value, allow_nan=False)
+
+    def write_journal(self, now, result):
+        """The journal is evidence, not session state: its failure is counted, reported and logged,
+        never turned into a native session failure (the step has already been persisted)."""
+        try:
+            self.journal(now, result)
+        except Exception as error:
+            self.journal_failures += 1
+            self.journal_error = f"{type(error).__name__}: {str(error)[:200]}"
+            print(f"ERROR decision journal write failed ({self.journal_failures}): {self.journal_error}",
+                  file=sys.stderr, flush=True)
 
     async def step(self, now):
         if self.failure:
@@ -814,8 +849,6 @@ class PaperRuntime:
                     reason = owner + ': public_book_unavailable'
                 reasons.append(reason)
             atomic_json(self.config.status_path, self.status(now, reasons))
-            self.journal(now, result)
-            return result
         except BaseException as error:
             self.failure = type(error).__name__
             atomic_json(
@@ -823,6 +856,8 @@ class PaperRuntime:
                 self.status(now, ["native_session_failure_requires_reconciliation"]),
             )
             raise
+        self.write_journal(now, result)
+        return result
 
     async def run(self, stop):
         self.candles.start()

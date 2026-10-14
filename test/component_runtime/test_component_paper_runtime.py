@@ -874,7 +874,7 @@ async def test_v4_runtime_hosts_five_sealed_owners_and_reports_them(tmp_path, pr
             journal = tmp_path / f"{program}_paper.decisions.jsonl"
             first = [json.loads(line) for line in journal.read_text().splitlines()]
             assert sorted(e["controller"] for e in first) == sorted(c.id for c in references)
-            assert all(e["actions"] == [] and e["status"] for e in first)
+            assert all(e["actions"] == [] and e["status"] and e["detail"].startswith(e["status"]) for e in first)
             await runtime.step(now + 1)  # unchanged decision state appends nothing
             assert len(journal.read_text().splitlines()) == len(first)
     finally:

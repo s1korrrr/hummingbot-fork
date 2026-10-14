@@ -712,7 +712,10 @@ class PaperRuntime:
             state = (info.get("modular_status"), info.get("execution_enabled"), bag)
             if controller_id in acted or self._journal_state.get(controller_id) != state:
                 self._journal_state[controller_id] = state
+                runtime = getattr(controller, "runtime", None)
+                detail = getattr(runtime, "reason", None)  # the full reason, e.g. data_hold:<cause>
                 lines.append(json.dumps({"t": now, "controller": controller_id, "status": info.get("modular_status"),
+                                         "detail": None if detail is None else str(detail)[:240],
                                          "candle_open": info.get("candle_open"), "bag": info.get("bag"),
                                          "actions": acted.get(controller_id, [])},
                                         sort_keys=True, default=json_value, allow_nan=False))

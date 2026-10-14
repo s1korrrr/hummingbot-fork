@@ -117,3 +117,50 @@ class MeridianV4NativePaperTests(IsolatedAsyncioTestCase):
                     self.assertEqual((executor.config.controller_id, executor.config.trading_pair), (c.id, c.trading_pair))
             finally:
                 await session.close()
+
+
+class MeridianV4RestingEntryTests(IsolatedAsyncioTestCase):
+    """A submitted entry rests until it fills or times out, as in the backtests (paper A/B, 2026-10-14).
+
+    Live paper evidence: D2h's ETH entry was cancelled after 28 s with `modular_entry_permission_revoked`
+    because a quiet BNB book made the shared paper connector not ready (`data_hold`) for one tick."""
+    setUp = session_tests.NativePaperSessionTests.setUp
+
+    async def rest_entry(self, session):
+        before, rebound = frames(.05)
+        books = [dict(**{**BOOK, 'trading_pair': p}, sequence=2, timestamp=600000) for p in ('BNB-USDC', 'ETH-USDC')]
+        await session.step(600000, books=books, candles=[candles(before, 600000)])
+        books = [dict(**{**BOOK, 'trading_pair': p}, sequence=3, timestamp=600060) for p in ('BNB-USDC', 'ETH-USDC')]
+        receipt = await session.step(600060, books=books, candles=[candles(rebound, 600060)])
+        self.assertEqual(len(receipt['actions']), 1, session.controllers[OWNER].runtime.reason)
+        return session.executor_orchestrator.active_executors[OWNER][0]
+
+    async def test_transient_data_hold_and_wide_spread_never_cancel_a_resting_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(('BNB-USDC', 'ETH-USDC')), [config(execution_enabled=True)],
+                                         Path(directory) / 'v4.sqlite')
+            try:
+                executor = await self.rest_entry(session)
+                session._connector.invalidate_order_book('ETH-USDC')  # another pair's book goes quiet
+                await session.step(600062, books=[dict(**BOOK, sequence=4, timestamp=600062)])
+                self.assertTrue(session.controllers[OWNER].runtime.reason.startswith('data_hold'))
+                self.assertFalse(executor.is_closed)
+                self.assertIsNotNone(executor._open_order)
+                wide = dict(trading_pair=PAIR, bids=[(98.0, 10)], asks=[(99.51, 10)])  # spread > 0.3%
+                await session.step(600064, books=[dict(**wide, sequence=5, timestamp=600064)])
+                self.assertFalse(executor.is_closed)
+                self.assertIsNotNone(executor._open_order)
+            finally:
+                await session.close()
+
+    async def test_definitive_revocations_still_end_a_resting_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(('BNB-USDC', 'ETH-USDC')), [config(execution_enabled=True)],
+                                         Path(directory) / 'v4.sqlite')
+            try:
+                executor = await self.rest_entry(session)
+                session.controllers[OWNER].config.manual_kill_switch = True
+                await session.step(600062, books=[dict(**BOOK, sequence=4, timestamp=600062)])
+                self.assertEqual(executor._entry_lifecycle['stop_reason'], 'modular_entry_permission_revoked')
+            finally:
+                await session.close()

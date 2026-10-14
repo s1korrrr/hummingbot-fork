@@ -195,8 +195,22 @@ class MeridianV4Controller(ModularSpotController):
                 and super().validate_executor_config(config))
 
     def entry_permission(self, config, *, check_funds=True):
-        return (self.config.execution_mode == 'paper' and self.config.recipe_binding is not None
-                and super().entry_permission(config, check_funds=check_funds))
+        if self.config.execution_mode != 'paper' or self.config.recipe_binding is None:
+            return False
+        if super().entry_permission(config, check_funds=check_funds):
+            return True
+        # A submitted entry (the executor re-checks with check_funds=False) rests until it fills or reaches
+        # its entry timeout, as in the backtested recipe. Transient market holds (a stale book on any pair of
+        # the shared paper connector, a momentarily wide spread) must not cancel it; definitive revocations do.
+        return not check_funds and self._resting_entry_retained(config)
+
+    def _resting_entry_retained(self, config):
+        c, runtime = self.config, self.runtime
+        if (not c.execution_enabled or c.manual_kill_switch or not c.acquisition_enabled or runtime.fault
+                or config is None or runtime.pending.get(config.id) != config):
+            return False
+        now = self.market_data_provider.time()
+        return 0 <= now - config.timestamp <= c.acquisition.entry_timeout_seconds
 
     def get_executor_class_for_config(self, config):
         if self.config.execution_mode != 'paper' or self.config.recipe_binding is None:

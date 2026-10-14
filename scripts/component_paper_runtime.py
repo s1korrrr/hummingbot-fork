@@ -34,6 +34,7 @@ from hummingbot.connector.exchange.okx.okx_api_order_book_data_source import Okx
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import NativePaperTradeExchange
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest, WSPlainTextRequest
 from hummingbot.strategy_v2.components.candle_data import Dataset
@@ -57,7 +58,7 @@ class PaperConfig(BaseModel):
     trade_participation: Decimal = Field(default=Decimal(".1"), gt=0, le=1)
     book_max_age_seconds: float = Field(default=5, gt=0, le=5)
     controller_kind: Literal["component_breakout", "rsi_modular", "modular_spot_research",
-                             "meridian_v3_unified"] = "component_breakout"
+                             "meridian_v3_unified", "meridian_v4"] = "component_breakout"
     controller_files: tuple[Path, ...] = ()
 
     @field_validator("pairs")
@@ -239,8 +240,25 @@ class PublicSymbols:
         return await self.trading_pair_associated_to_exchange_symbol(trading_pair)
 
 
+def books5_snapshot(payload, pair):
+    """One OKX books5 frame as one native snapshot message.
+
+    books5 pushes a complete five-level book in every frame (no `action`, no `prevSeqId`), so
+    no stream continuity applies. The OKX data source's book parser serves the incremental
+    `books` channel and refuses frames without that continuity, so it is not used here. Book
+    contents are validated afterwards by the native paper connector's book validator.
+    """
+    (data,) = payload["data"]
+    update_id = int(data["ts"])
+    return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
+        "trading_pair": pair, "update_id": update_id,
+        "bids": [(row[0], row[1]) for row in data["bids"]],
+        "asks": [(row[0], row[1]) for row in data["asks"]],
+    }, update_id * 1e-3)
+
+
 class PublicLiquidity:
-    """Bounded public snapshots/trades, parsed by Hummingbot's OKX datasource."""
+    """Bounded public snapshots/trades: books5 frames as native snapshots, trades by Hummingbot's OKX datasource."""
     ACK_TIMEOUT_SECONDS = 15.0
 
     def __init__(self, pairs, max_age=5, *, book_validator=None):
@@ -336,7 +354,7 @@ class PublicLiquidity:
                 raise ValueError("Five-level snapshot required")
             if len(payload['data']) != 1 or payload['data'][0].get('instId', pair) != pair:
                 raise ValueError('Snapshot instrument differs from acknowledged channel')
-            await self.parser._parse_order_book_snapshot_message(payload, queue)
+            queue.put_nowait(books5_snapshot(payload, pair))
         else:
             await self.parser._parse_trade_message(payload, queue)
         while not queue.empty():
@@ -470,6 +488,34 @@ class PublicLiquidity:
         await self.factory._connections_factory.close()
 
 
+def meridian_v4_paper_configs(paths, pairs):
+    """Sealed per-pair V4 or V4 D2h paper controllers (one program per runtime, injected 1m candles)."""
+    import yaml
+
+    from controllers.generic.meridian_v4 import MeridianV4Config
+    from controllers.generic.meridian_v4_d2h import MeridianV4D2hConfig
+
+    classes = {"meridian_v4": MeridianV4Config, "meridian_v4_d2h": MeridianV4D2hConfig}
+    configs = []
+    for path in paths:
+        values = yaml.safe_load(Path(path).read_text())
+        cls = classes.get(values.get("controller_name")) if isinstance(values, dict) else None
+        if cls is None:
+            raise ValueError(f"V4 paper requires a meridian_v4 or meridian_v4_d2h controller file: {path}")
+        config = cls.model_validate(values)
+        if (config.execution_mode != "paper" or config.connector_name != "okx_paper_trade"
+                or config.data.mode != "native" or not config.execution_enabled or config.recipe_binding is None):
+            raise ValueError("V4 paper needs a sealed, enabled okx_paper_trade controller with injected native 1m candles")
+        configs.append(config)
+    if len({type(c) for c in configs}) != 1 or len({c.budget.group for c in configs}) != 1:
+        raise ValueError("One V4 program per paper runtime; run each A/B arm in its own runtime")
+    if sum(c.total_amount_quote for c in configs) > configs[0].budget.max_quote:
+        raise ValueError("Per-pair budgets exceed the program budget")
+    if sorted(c.trading_pair for c in configs) != sorted(pairs):
+        raise ValueError("Paper controller pairs must equal the configured pairs")
+    return configs
+
+
 def meridian_unified_paper_configs(paths, pairs):
     """The one Meridian portfolio controller (native paper wallet, injected 1m candles)."""
     import yaml
@@ -500,6 +546,11 @@ class PaperRuntime:
         elif config.controller_kind == "modular_spot_research":
             configs = modular_spot_research_paper_configs(config.controller_files, config.pairs)
             history = {c.trading_pair: c.max_records for c in configs}  # the binding reads max_records closed candles
+        elif config.controller_kind == "meridian_v4":
+            configs = meridian_v4_paper_configs(config.controller_files, config.pairs)
+            if sum(c.total_amount_quote for c in configs) > config.simulated_quote:
+                raise ValueError("Per-pair budgets exceed the simulated paper wallet")
+            history = {c.trading_pair: c.max_records for c in configs}
         elif config.controller_kind == "meridian_v3_unified":
             configs = meridian_unified_paper_configs(config.controller_files, config.pairs)
             history = {p: 1500 for p in config.pairs}  # every symbol context reads the p23 1500-candle window

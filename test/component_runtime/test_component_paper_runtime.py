@@ -771,3 +771,105 @@ async def test_meridian_unified_runtime_hosts_one_owner_for_five_pairs(tmp_path)
         if runtime is not None:
             await runtime.close()
         MarketsRecorder._shared_instance = prior
+
+
+# ---------------------------------------------------------------- V4 / V4 D2h paper (forward A/B arms)
+def v4_files(tmp_path, program="meridian_v4", pair_quote="40000", pairs=MERIDIAN_PAIRS):
+    import yaml
+
+    from controllers.generic.meridian_v4 import MeridianV4Config
+    from controllers.generic.meridian_v4_d2h import MeridianV4D2hConfig
+
+    cls = {"meridian_v4": MeridianV4Config, "meridian_v4_d2h": MeridianV4D2hConfig}[program]
+    paths, configs = [], []
+    for pair in pairs:
+        values = dict(id=f"modular_spot_{program}_paper_{pair.split('-')[0].lower()}", trading_pair=pair,
+                      execution_mode="paper", connector_name="okx_paper_trade", account=f"{program}_paper",
+                      risk=dict(max_drawdown_fraction=".10", max_daily_loss_fraction=".05", max_spread_fraction=".003",
+                                fee_reserve_fraction=".003", cash_reserve_quote="0"),
+                      budget=dict(group=program, max_quote=str(5 * int(pair_quote)), max_assets=5),
+                      total_amount_quote=pair_quote)
+        unsealed = cls(**values)
+        config = cls(**values, execution_enabled=True, recipe_binding=unsealed.seal())
+        path = tmp_path / f"{program}_{pair.split('-')[0].lower()}.yml"
+        path.write_text(yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False))
+        paths.append(path)
+        configs.append(config)
+    return paths, configs
+
+
+@pytest.mark.parametrize("program", ["meridian_v4", "meridian_v4_d2h"])
+def test_v4_paper_files_load_strictly_one_program_per_runtime(tmp_path, program):
+    import yaml
+
+    from scripts.component_paper_runtime import meridian_v4_paper_configs
+    paths, references = v4_files(tmp_path, program)
+    loaded = meridian_v4_paper_configs(paths, MERIDIAN_PAIRS)
+    assert [c.model_dump(mode="json") for c in loaded] == [c.model_dump(mode="json") for c in references]
+    with pytest.raises(ValueError, match="pairs"):
+        meridian_v4_paper_configs(paths[:4], MERIDIAN_PAIRS)
+    other = "meridian_v4_d2h" if program == "meridian_v4" else "meridian_v4"
+    (tmp_path / "other").mkdir()
+    other_paths, _ = v4_files(tmp_path / "other", other)
+    with pytest.raises(ValueError, match="One V4 program"):
+        meridian_v4_paper_configs([*paths[:4], other_paths[4]], MERIDIAN_PAIRS)
+    unsealed = yaml.safe_load(paths[0].read_text())
+    unsealed.update(execution_enabled=False, recipe_binding=None)
+    paths[0].write_text(yaml.safe_dump(unsealed, sort_keys=False))
+    with pytest.raises(ValueError, match="sealed, enabled"):
+        meridian_v4_paper_configs(paths, MERIDIAN_PAIRS)
+
+
+def test_v4_paper_budgets_must_fit_the_simulated_wallet(tmp_path):
+    paths, _ = v4_files(tmp_path)
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    try:
+        with pytest.raises(ValueError, match="simulated paper wallet"):
+            PaperRuntime(PaperConfig(
+                bot_name="meridian_v4_paper", pairs=list(MERIDIAN_PAIRS), state_path=tmp_path / "paper.sqlite",
+                status_path=tmp_path / "status.json", candle_origin="http://127.0.0.1:8092",
+                controller_kind="meridian_v4", controller_files=[str(p) for p in paths], simulated_quote="199999"),
+                rules(MERIDIAN_PAIRS))
+    finally:
+        MarketsRecorder._shared_instance = prior
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("program", ["meridian_v4", "meridian_v4_d2h"])
+async def test_v4_runtime_hosts_five_sealed_owners_and_reports_them(tmp_path, program):
+    paths, references = v4_files(tmp_path, program)
+    prior = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    runtime = None
+    try:
+        with patch("socket.getaddrinfo", side_effect=AssertionError("no networking")):
+            runtime = PaperRuntime(PaperConfig(
+                bot_name=f"{program}_paper", pairs=list(MERIDIAN_PAIRS), state_path=tmp_path / "paper.sqlite",
+                status_path=tmp_path / "status.json", candle_origin="http://127.0.0.1:8092",
+                controller_kind="meridian_v4", controller_files=[str(p) for p in paths], simulated_quote="200000"),
+                rules(MERIDIAN_PAIRS))
+            assert {d.trading_pair: d.history for d in runtime.datasets} == {p: 1500 for p in MERIDIAN_PAIRS}
+            assert runtime.controller_ids == {c.trading_pair: c.id for c in references}
+            now = 600000
+            await ack(runtime.liquidity)
+            runtime.candles.clock = lambda: now
+            runtime.candles.begin_session()
+            for pair in MERIDIAN_PAIRS:
+                runtime.candles.apply(dict(v=1, type="snapshot", epoch="fixture", published_at=now, received_at=now,
+                                           pair=pair, sequence=1,
+                                           rows=[row(t) for t in range(now - 60 * 1500, now, 60)]))
+                await runtime.liquidity.accept(book(now, pair), now)
+            result = await runtime.step(now)
+            assert result["actions"] == []  # the first observed cut only seeds each owner
+            status = json.loads((tmp_path / "status.json").read_text())
+            assert status["controller_kind"] == "meridian_v4"
+            assert sorted(r["id"] for r in status["controllers"]) == sorted(c.id for c in references)
+            assert status["failure"] is None
+            assert status["unavailable_controller_ids"] == []  # every owner reports natively
+            assert status["public_liquidity"]["fresh_book_pairs"] == 5
+            assert status["simulation_assumptions"]["quote"] == "200000"
+    finally:
+        if runtime is not None:
+            await runtime.close()
+        MarketsRecorder._shared_instance = prior

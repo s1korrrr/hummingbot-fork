@@ -33,6 +33,7 @@ ORDER_QUOTE = Decimal('100')
 # The native live-capital model's tranche ceiling (`LiveCapitalConfig.max_active_tranches`), as in
 # the backtests; the per-pair budget (position and funded cap) is the binding limit.
 MAX_ACTIVE_TRANCHES = 64
+ECONOMIC_VALIDATION = 'CANDLE_MODEL_SEP25_SEP26_BNB_IN_SAMPLE_UNCAPPED'
 
 
 def strategy_parameters():

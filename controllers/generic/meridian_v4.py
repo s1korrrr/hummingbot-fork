@@ -7,7 +7,7 @@ only. Live activation needs a separately admitted ownership path.
 """
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import Field, model_validator
 
@@ -25,7 +25,13 @@ from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.components.program_budget import BudgetPolicy
-from hummingbot.strategy_v2.components.recipe_contract import digest, source_records, verify_binding
+from hummingbot.strategy_v2.components.recipe_contract import (
+    RecipeBinding,
+    configuration_digest,
+    digest,
+    source_records,
+    verify_binding,
+)
 from hummingbot.strategy_v2.components.source_identity import component_source_files
 
 CONFIG_CLASS = 'MeridianV4Config'
@@ -62,25 +68,39 @@ class MeridianV4Config(ModularSpotControllerConfig):
     program_revision: Literal['meridian_v4'] = PROGRAM
     policy_revision: Literal['meridian_v4_v3c_v1'] = recipe.RECIPE_ID
 
+    # The versioned recipe this class binds and its program identity; a variant (meridian_v4_d2h)
+    # rebinds these together with its Literal identity fields, never V4's values.
+    RECIPE: ClassVar = recipe
+    PROGRAM: ClassVar[str] = PROGRAM
+
+    def expected_depth_budget(self):
+        return None
+
     @model_validator(mode='after')
     def validate_composition(self):
         # Reuse the generic host's full validation without modifying its source,
         # defaults, binding scope or legacy consumers. Validate our own binding below.
-        expected_capital = recipe.capital_policy(self.risk.fee_reserve_fraction, self.total_amount_quote)
+        r, program = self.RECIPE, self.PROGRAM
+        expected_capital = r.capital_policy(self.risk.fee_reserve_fraction, self.total_amount_quote)
         if self.capital is None:
             self.capital = expected_capital
         if self.capital != expected_capital:
-            raise ValueError('V4 requires the versioned 100-quote capital recipe at its per-pair budget')
-        for name, expected in recipe.strategy_parameters().items():
+            raise ValueError(f'{program} requires the versioned {r.ORDER_QUOTE}-quote capital recipe at its per-pair budget')
+        for name, expected in r.strategy_parameters().items():
             if getattr(self, name) != expected:
-                raise ValueError(f'V4 {name} differs from the versioned recipe; new version required')
-        if self.budget.group != PROGRAM or self.budget.max_assets != len(recipe.PAIRS):
-            raise ValueError('V4 requires its dedicated five-asset meridian_v4 program budget')
+                raise ValueError(f'{program} {name} differs from the versioned recipe; new version required')
+        expected_depth = self.expected_depth_budget()
+        if self.depth_budget is None and expected_depth is not None:
+            self.depth_budget = expected_depth
+        if self.depth_budget != expected_depth:
+            raise ValueError(f'{program} depth_budget differs from the versioned recipe at its per-pair budget')
+        if self.budget.group != program or self.budget.max_assets != len(r.PAIRS):
+            raise ValueError(f'{program} requires its dedicated five-asset {program} program budget')
         if self.universe.mode != 'fixed' or self.universe.symbols or self.universe.benchmarks:
-            raise ValueError('V4 keeps a fixed pair per controller')
-        expected_id = f'modular_spot_meridian_v4_{self.execution_mode}_{self.trading_pair.split("-")[0].lower()}'
-        if self.id != expected_id or self.account != f'meridian_v4_{self.execution_mode}':
-            raise ValueError('V4 requires distinct mode, pair and account identities')
+            raise ValueError(f'{program} keeps a fixed pair per controller')
+        expected_id = f'modular_spot_{program}_{self.execution_mode}_{self.trading_pair.split("-")[0].lower()}'
+        if self.id != expected_id or self.account != f'{program}_{self.execution_mode}':
+            raise ValueError(f'{program} requires distinct mode, pair and account identities')
         if self.execution_mode == 'paper':
             if self.connector_name != 'okx_paper_trade' or self.data.mode != 'native':
                 raise ValueError('V4 paper requires the isolated native paper connector and injected candles')
@@ -92,7 +112,7 @@ class MeridianV4Config(ModularSpotControllerConfig):
         base.update(controller_name='modular_spot', recipe_binding=None)
         ModularSpotControllerConfig.model_validate(base)
         if self.recipe_binding is not None:
-            if (self.recipe_binding.recipe_id != recipe.RECIPE_ID
+            if (self.recipe_binding.recipe_id != r.RECIPE_ID
                     or self.recipe_binding.recipe_sha256 != self.recipe_digest()):
                 raise ValueError('V4 recipe binding differs')
             verify_binding(self.recipe_binding, self.model_dump(mode='json'),
@@ -102,10 +122,19 @@ class MeridianV4Config(ModularSpotControllerConfig):
     def source_manifest(self):
         return source_records(Path(__file__).parent, source_files())
 
+    def seal(self):
+        """The recipe binding of this exact configuration and source; it grants no execution authority."""
+        return RecipeBinding(recipe_id=self.RECIPE.RECIPE_ID, recipe_sha256=self.recipe_digest(),
+                             source_sha256=digest(self.source_manifest()),
+                             configuration_sha256=configuration_digest(self.model_dump(mode='json')))
+
     def recipe_digest(self):
-        return digest({'recipe_id': recipe.RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,
-                       'prepared_sha256': recipe.PREPARED_SHA256,
-                       'modules': {k: v.model_dump(mode='json') for k, v in recipe.strategy_parameters().items()},
+        r = self.RECIPE
+        modules = {k: v.model_dump(mode='json') for k, v in r.strategy_parameters().items()}
+        if self.depth_budget is not None:  # absent for V4, so V4's digest is unchanged
+            modules['depth_budget'] = self.depth_budget.model_dump(mode='json')
+        return digest({'recipe_id': r.RECIPE_ID, 'candidate_sha256': r.CANDIDATE_SHA256,
+                       'prepared_sha256': r.PREPARED_SHA256, 'modules': modules,
                        'capital': self.capital.model_dump(mode='json'), 'exit_floor': self.exit_floor})
 
     def get_controller_class(self):
@@ -123,16 +152,18 @@ class _V4PaperBindings(NativeBindings):
 
 class MeridianV4Controller(ModularSpotController):
     allow_implementation_hot_reload = False
+    CONFIG = MeridianV4Config
+    STRATEGY_NAME = 'V4'
 
     @classmethod
     def implementation_source_files(cls):
         return [*source_files(), *component_source_files()]
 
     def __init__(self, config, market_data_provider, actions_queue, **kwargs):
-        if type(config) is not MeridianV4Config:
-            raise ValueError('Exact V4 configuration required')
+        if type(config) is not self.CONFIG:
+            raise ValueError(f'Exact {self.STRATEGY_NAME} configuration required')
         # Revalidate even model_copy/model_construct input before creating runtime state.
-        config = MeridianV4Config.model_validate(config.model_dump(mode='json'))
+        config = self.CONFIG.model_validate(config.model_dump(mode='json'))
         if config.execution_mode == 'paper':
             connector = market_data_provider.connectors.get(config.connector_name)
             if not is_native_paper_connector(connector):
@@ -152,10 +183,10 @@ class MeridianV4Controller(ModularSpotController):
         # Execution is an ordinary mutable operator flag on the generic host.
         # It must never turn a V4 shadow instance into a live controller.
         if self.config.execution_mode != 'paper':
-            self.runtime.reason = 'meridian_v4_shadow_execution_not_supported'
+            self.runtime.reason = f'{self.config.PROGRAM}_shadow_execution_not_supported'
             return []
         if self.config.recipe_binding is None:
-            self.runtime.reason = 'meridian_v4_recipe_binding_required'
+            self.runtime.reason = f'{self.config.PROGRAM}_recipe_binding_required'
             return []
         return super().determine_executor_actions()
 
@@ -169,18 +200,20 @@ class MeridianV4Controller(ModularSpotController):
 
     def get_executor_class_for_config(self, config):
         if self.config.execution_mode != 'paper' or self.config.recipe_binding is None:
-            raise ValueError('Only sealed V4 paper may dispatch execution')
+            raise ValueError(f'Only sealed {self.STRATEGY_NAME} paper may dispatch execution')
         return super().get_executor_class_for_config(config)
 
     def get_custom_info(self):
-        return {**super().get_custom_info(), 'strategy_name': 'V4',
-                'execution_mode': self.config.execution_mode, 'recipe_version': recipe.RECIPE_ID,
+        r = self.config.RECIPE
+        return {**super().get_custom_info(), 'strategy_name': self.STRATEGY_NAME,
+                'execution_mode': self.config.execution_mode, 'recipe_version': r.RECIPE_ID,
                 'recipe_sha256': self.config.recipe_digest(),
-                'evidence_candidate_sha256': recipe.CANDIDATE_SHA256,
-                'economic_validation': 'CANDLE_MODEL_SEP25_SEP26_BNB_IN_SAMPLE_UNCAPPED',
+                'evidence_candidate_sha256': r.CANDIDATE_SHA256,
+                'economic_validation': r.ECONOMIC_VALIDATION,
                 'capital_scope': 'RECORDER_SCOPED',
-                'limits': {'entry_quote': str(recipe.ORDER_QUOTE), 'pair_quote': str(self.config.total_amount_quote),
+                'limits': {'entry_quote': str(r.ORDER_QUOTE), 'pair_quote': str(self.config.total_amount_quote),
                            'program_quote': str(self.config.budget.max_quote)}}
 
     def to_format_status(self):
-        return [f'V4 | {recipe.RECIPE_ID} | {self.config.execution_mode}', *super().to_format_status()]
+        return [f'{self.STRATEGY_NAME} | {self.config.RECIPE.RECIPE_ID} | {self.config.execution_mode}',
+                *super().to_format_status()]

@@ -1354,6 +1354,26 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.orchestrator.active_executors["test"] = [position_executor]
         self.orchestrator.stop_executor(StopExecutorAction(executor_id="123", controller_id="test"))
 
+    def test_stopping_an_open_order_executor_logs_its_executed_amount_without_raising(self):
+        # Meridian's bag-recovery executor is an OrderExecutor: it has no open_filled_amount. Stopping it while open
+        # raised AttributeError after the stop was applied (a native replay failed on it, 2026-10-14).
+        from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
+        order_executor = MagicMock(spec=OrderExecutor)
+        order_executor.is_closed = False
+        order_executor.status = RunnableStatus.RUNNING
+        order_executor.early_stop = MagicMock(return_value=None)
+        order_executor.config = MagicMock()
+        order_executor.config.id = "456"
+        order_executor._all_orders = MagicMock(return_value=[MagicMock(executed_amount_base=Decimal("0.4")),
+                                                             MagicMock(executed_amount_base=Decimal("0.1"))])
+        self.assertFalse(hasattr(order_executor, "open_filled_amount"))
+        self.orchestrator.active_executors["test"] = [order_executor]
+        with self.assertLogs(level="WARNING") as logs:
+            self.orchestrator.stop_executor(StopExecutorAction(executor_id="456", controller_id="test",
+                                                               keep_position=True))
+        order_executor.early_stop.assert_called_once_with(True)
+        self.assertIn("filled_base=0.5", "\n".join(logs.output))
+
     @patch("hummingbot.strategy_v2.executors.executor_orchestrator.MarketsRecorder.get_instance")
     def test_generate_performance_report_with_loaded_positions(self, mock_get_instance: MagicMock):
         # Create mock markets recorder

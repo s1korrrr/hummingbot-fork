@@ -620,6 +620,8 @@ class PaperRuntime:
         self.failure = None
         self._seen_candles = {}
         self._applied_books = dict(connector.tracking_states["book_sequence"])
+        self.journal_path = config.status_path.with_name(config.bot_name + ".decisions.jsonl")
+        self._journal_state = {}
 
     def status(self, now, reasons):
         reports = (self.last_result['reports'] if self.last_result and self.failure is None
@@ -684,7 +686,39 @@ class PaperRuntime:
         pairs = owned_pairs(controller.config)
         row.setdefault("pair", pairs[0] if len(pairs) == 1 else list(pairs))
         row.setdefault("execution_mode", controller.config.execution_mode)
+        # The bounded native custom info (decision reason, candle, bag) the live publisher sends.
+        row.setdefault("custom_info", controller.get_custom_info())
         return row
+
+    def journal(self, now, result):
+        """Append one line per controller whose decision state changed, and one per action.
+
+        The decision trail (refusal causes, entries, exits) the status file overwrites every step.
+        Lines are written only on a change, so the file grows with decisions, not with steps."""
+        lines = []
+        acted = {}
+        for action in result["actions"]:
+            config = getattr(action, "executor_config", None)
+            acted.setdefault(action.controller_id, []).append({
+                "type": type(action).__name__, "executor_id": getattr(action, "executor_id", None)
+                or getattr(config, "id", None),
+                "side": None if getattr(config, "side", None) is None else str(getattr(config.side, "name", config.side)),
+                "amount": None if getattr(config, "amount", None) is None else str(config.amount),
+                "price": None if getattr(config, "entry_price", None) is None else str(config.entry_price),
+            })
+        for controller_id, controller in self.session.controllers.items():
+            info = controller.get_custom_info()
+            bag = json.dumps(info.get("bag"), sort_keys=True, default=json_value)
+            state = (info.get("modular_status"), info.get("execution_enabled"), bag)
+            if controller_id in acted or self._journal_state.get(controller_id) != state:
+                self._journal_state[controller_id] = state
+                lines.append(json.dumps({"t": now, "controller": controller_id, "status": info.get("modular_status"),
+                                         "candle_open": info.get("candle_open"), "bag": info.get("bag"),
+                                         "actions": acted.get(controller_id, [])},
+                                        sort_keys=True, default=json_value, allow_nan=False))
+        if lines:
+            with open(self.journal_path, "a") as output:
+                output.write("\n".join(lines) + "\n")
 
     async def step(self, now):
         if self.failure:
@@ -777,6 +811,7 @@ class PaperRuntime:
                     reason = owner + ': public_book_unavailable'
                 reasons.append(reason)
             atomic_json(self.config.status_path, self.status(now, reasons))
+            self.journal(now, result)
             return result
         except BaseException as error:
             self.failure = type(error).__name__

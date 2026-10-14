@@ -869,6 +869,14 @@ async def test_v4_runtime_hosts_five_sealed_owners_and_reports_them(tmp_path, pr
             assert status["unavailable_controller_ids"] == []  # every owner reports natively
             assert status["public_liquidity"]["fresh_book_pairs"] == 5
             assert status["simulation_assumptions"]["quote"] == "200000"
+            assert {r["custom_info"]["strategy_name"] for r in status["controllers"]} == {
+                "V4" if program == "meridian_v4" else "V4 D2h"}
+            journal = tmp_path / f"{program}_paper.decisions.jsonl"
+            first = [json.loads(line) for line in journal.read_text().splitlines()]
+            assert sorted(e["controller"] for e in first) == sorted(c.id for c in references)
+            assert all(e["actions"] == [] and e["status"] for e in first)
+            await runtime.step(now + 1)  # unchanged decision state appends nothing
+            assert len(journal.read_text().splitlines()) == len(first)
     finally:
         if runtime is not None:
             await runtime.close()

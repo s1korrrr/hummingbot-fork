@@ -5,7 +5,7 @@ target, tide gate or runner, and no Meridian V3 or Tidewater code (`meridian_v4_
 Same pattern as the per-pair `meridian_v3.py`: native paper and disabled shared-data shadow
 only. Live activation needs a separately admitted ownership path.
 """
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import ClassVar, Literal
 
@@ -21,6 +21,7 @@ from controllers.generic.modular_spot_core.bag import (
     LiveCapitalConfig,
 )
 from controllers.generic.modular_spot_core.config import AcquisitionPolicy, RiskPolicy, SignalPolicy, TrailingPolicy
+from controllers.generic.modular_spot_core.domain import DataUnavailable, PolicyError, decimal
 from controllers.generic.modular_spot_core.native_bindings import NativeBindings
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import is_native_paper_connector
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -33,7 +34,6 @@ from hummingbot.strategy_v2.components.recipe_contract import (
     verify_binding,
 )
 from hummingbot.strategy_v2.components.source_identity import component_source_files
-from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
 
 CONFIG_CLASS = 'MeridianV4Config'
 PROGRAM = 'meridian_v4'
@@ -150,6 +150,39 @@ class _V4PaperBindings(NativeBindings):
             raise ValueError('V4 requires the exact native paper connector')
         return connector
 
+    @classmethod
+    def snapshot(cls, controller):
+        """The native snapshot with readiness scoped to this controller's own pair.
+
+        The native paper connector's aggregate ``ready`` (and the injected provider's, which is the same) is true only
+        while every configured pair's book is fresh, so in a five-owner paper runtime one quiet book (BNB-USDC) put
+        every other owner on a data hold and revoked their resting entries (live paper, 2026-10-14). Each V4
+        controller trades one pair; it requires its own book to be fresh. Every other line is NativeBindings.snapshot
+        unchanged (test_meridian_v4_snapshot pins the equivalence and the native source digest)."""
+        from hummingbot.core.data_type.common import PriceType
+        c, p = controller.config, controller.market_data_provider
+        connector = cls.spot_connector(controller)
+        if connector.pair_ready(c.trading_pair) is not True:
+            raise DataUnavailable('native paper book for this pair is not fresh')
+        if getattr(connector, 'supports_terminal_fill_reconciliation', False) is not True:
+            raise PolicyError('authoritative terminal fill reconciliation is required')
+        report = controller.performance_report
+        if report is None or report.pnl_available is not True or report.global_pnl_quote is None:
+            raise DataUnavailable('native marked performance unavailable')
+        if controller.native_report_age() > c.max_native_report_age_seconds:
+            raise DataUnavailable('native controller report is stale')
+        pnl = decimal(report.global_pnl_quote, 'native marked pnl', minimum=None)
+        bid = decimal(p.get_price_by_type(c.connector_name, c.trading_pair, PriceType.BestBid), 'bid', positive=True)
+        ask = decimal(p.get_price_by_type(c.connector_name, c.trading_pair, PriceType.BestAsk), 'ask', positive=True)
+        available = decimal(connector.get_available_balance(c.trading_pair.split('-')[1]), 'available quote')
+        rules = connector.trading_rules[c.trading_pair]
+        tick = decimal(rules.min_price_increment, 'price increment', positive=True)
+        # A buy limit must not round above the price used to reserve quote capital.
+        bid = (bid / tick).to_integral_value(rounding=ROUND_FLOOR) * tick
+        return dict(bid=bid, ask=ask, available_quote=available, pnl=pnl,
+                    amount_step=rules.min_base_amount_increment, minimum_amount=rules.min_order_size,
+                    minimum_notional=rules.min_notional_size)
+
 
 class MeridianV4Controller(ModularSpotController):
     allow_implementation_hot_reload = False
@@ -196,41 +229,8 @@ class MeridianV4Controller(ModularSpotController):
                 and super().validate_executor_config(config))
 
     def entry_permission(self, config, *, check_funds=True):
-        if self.config.execution_mode != 'paper' or self.config.recipe_binding is None:
-            return False
-        runtime = self.runtime
-        previous = runtime.reason
-        runtime.reason = None  # observe the reason this check sets, if any
-        allowed = super().entry_permission(config, check_funds=check_funds)
-        denial = runtime.reason
-        if denial is None:
-            runtime.reason = previous
-        if allowed or check_funds:
-            return allowed
-        # A submitted entry (the executor re-checks with check_funds=False) rests until it fills or reaches its
-        # entry timeout, as in the backtested recipe. Only one denial is transient and overridden: a data hold
-        # (stale public data on any pair of the shared paper connector). Every other native denial revokes,
-        # including those that set no fault (latched risk rails, revised inputs, fees, spread, a removed claim).
-        return (isinstance(denial, str) and denial.startswith('data_hold:')
-                and self._resting_entry_retained(config))
-
-    def _resting_entry_retained(self, config):
-        """Conditions a data-held resting entry must still meet: the controller runs without a kill switch (the
-        base execution check), no operator entry pause or sell-only universe, execution and acquisition enabled,
-        no runtime fault, the pending claim unchanged and still owned, no latched risk rail, inside the timeout."""
-        c, runtime = self.config, self.runtime
-        if (not ControllerBase.validate_executor_config(self, config)
-                or getattr(self, '_operator_entry_paused', False) or c.universe.mode == 'sell_only'
-                or not c.execution_enabled or c.manual_kill_switch or not c.acquisition_enabled or runtime.fault
-                or config is None or runtime.pending.get(config.id) != config):
-            return False
-        state, _ = runtime.ensure_store().load()
-        # The data hold short-circuits native permission before its risk check; a rail already latched in the
-        # persisted decision state still revokes, and the claim must still be owned.
-        if state is None or state.risk_paused or config.id not in state.claims:
-            return False
-        now = self.market_data_provider.time()
-        return 0 <= now - config.timestamp <= c.acquisition.entry_timeout_seconds
+        return (self.config.execution_mode == 'paper' and self.config.recipe_binding is not None
+                and super().entry_permission(config, check_funds=check_funds))
 
     def get_executor_class_for_config(self, config):
         if self.config.execution_mode != 'paper' or self.config.recipe_binding is None:

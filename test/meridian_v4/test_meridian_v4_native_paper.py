@@ -135,7 +135,8 @@ class MeridianV4RestingEntryTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(receipt['actions']), 1, session.controllers[OWNER].runtime.reason)
         return session.executor_orchestrator.active_executors[OWNER][0]
 
-    async def test_a_transient_data_hold_never_cancels_a_resting_entry(self):
+    async def test_another_pairs_quiet_book_never_holds_or_cancels_a_resting_entry(self):
+        """Root cause of the 2026-10-14 revocation: aggregate connector readiness. Readiness is now per pair."""
         with tempfile.TemporaryDirectory() as directory:
             session = NativePaperSession(paper(('BNB-USDC', 'ETH-USDC')), [config(execution_enabled=True)],
                                          Path(directory) / 'v4.sqlite')
@@ -143,15 +144,33 @@ class MeridianV4RestingEntryTests(IsolatedAsyncioTestCase):
                 executor = await self.rest_entry(session)
                 session._connector.invalidate_order_book('ETH-USDC')  # another pair's book goes quiet
                 await session.step(600062, books=[dict(**BOOK, sequence=4, timestamp=600062)])
-                self.assertTrue(session.controllers[OWNER].runtime.reason.startswith('data_hold'))
+                self.assertFalse(str(session.controllers[OWNER].runtime.reason).startswith('data_hold'))
                 self.assertFalse(executor.is_closed)
                 self.assertIsNotNone(executor._open_order)
             finally:
                 await session.close()
 
-    async def test_only_a_data_hold_is_retained_every_other_native_denial_revokes(self):
-        """Review round 2 (GPT-6.1-Sol): a blocklist missed native denials without a fault (latched drawdown or
-        daily-loss rail, revised inputs, fees above the reserve); retention is an allowlist of the data hold."""
+    async def test_own_pair_stale_book_pauses_the_owner_then_native_checks_resume(self):
+        """The session steps an owner only while its own book is fresh (native per-owner freshness): a stale own book
+        neither drives nor revokes the entry; once the book is fresh every native check applies again."""
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(('BNB-USDC', 'ETH-USDC')), [config(execution_enabled=True)],
+                                         Path(directory) / 'v4.sqlite')
+            try:
+                executor = await self.rest_entry(session)
+                session._connector.invalidate_order_book(PAIR)
+                await session.step(600062, books=[dict(**{**BOOK, 'trading_pair': 'ETH-USDC'}, sequence=4,
+                                                       timestamp=600062)])
+                self.assertIsNone(executor._entry_lifecycle.get('stop_reason'))
+                self.assertIsNotNone(executor._open_order)
+                session.controllers[OWNER].config.manual_kill_switch = True
+                await session.step(600064, books=[dict(**BOOK, sequence=5, timestamp=600064)])
+                self.assertEqual(executor._entry_lifecycle.get('stop_reason'), 'modular_entry_permission_revoked')
+            finally:
+                await session.close()
+
+    async def test_native_denials_revoke_a_resting_entry(self):
+        """Reviews (GPT-6.1-Sol rounds 2-3): every native denial revokes, also while another pair's book is quiet."""
         cases = ('wide_spread', 'risk_latched', 'risk_latched_during_hold', 'claim_removed')
         for case in cases:
             with self.subTest(case), tempfile.TemporaryDirectory() as directory:

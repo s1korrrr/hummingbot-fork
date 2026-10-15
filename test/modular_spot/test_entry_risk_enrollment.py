@@ -454,6 +454,93 @@ def test_transition_refuses_drift_and_rolls_back_every_write(mutation):
         connection.close()
 
 
+def release_request(**updates):
+    return {'command_id': 'approved-latch-release', 'requested_at': 1000, 'controllers': [OWNER],
+            'owner_stopped': True, 'kill_switch_disabled': True, **updates}
+
+
+def test_interrupted_shutdown_latch_release_changes_only_the_latch_and_archives_it():
+    from hummingbot.strategy_v2.migrations.entry_risk import (
+        apply_interrupted_shutdown_latch_release,
+        plan_interrupted_shutdown_latch_release,
+    )
+    state = legacy_state()
+    state['stopped'] = True
+    connection = database(state)
+    try:
+        planned = plan_interrupted_shutdown_latch_release(connection, 'owner.yml', release_request())
+        assert planned['kind'] == 'interrupted_shutdown_latch_release'
+        assert planned['after'] == {**state, 'stopped': False}
+        before_fills = connection.execute('SELECT * FROM TradeFill').fetchall()
+        apply_interrupted_shutdown_latch_release(connection, planned, now=1001)
+        saved = json.loads(connection.execute("SELECT value FROM Metadata WHERE key='strategy-risk:owner.yml'").fetchone()[0])
+        assert saved == {**state, 'stopped': False}
+        assert connection.execute('SELECT * FROM TradeFill').fetchall() == before_fills
+        assert connection.execute("SELECT value FROM Metadata WHERE key='strategy-operator:preserved'").fetchone()[0] == '{"old":"receipt"}'
+        archive = json.loads(connection.execute('SELECT value FROM Metadata WHERE key=?', (planned['archive_key'],)).fetchone()[0])
+        assert archive['before'] == state and archive['after'] == saved
+        with pytest.raises(ValueError, match='not latched|already applied'):
+            apply_interrupted_shutdown_latch_release(connection, planned, now=1002)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('case, message', [
+    ('drawdown_exit', 'risk stop'),
+    ('not_stopped', 'not latched'),
+    ('missing_state', 'No durable risk state'),
+    ('other_controllers', 'scope mismatch'),
+    ('owner_running', 'Stopped owner proof'),
+    ('kill_switch_enabled', 'kill-switch stop is a risk stop'),
+])
+def test_latch_release_refuses_a_risk_stop_or_unproven_scope_without_writing(case, message):
+    from hummingbot.strategy_v2.migrations.entry_risk import plan_interrupted_shutdown_latch_release
+    state = legacy_state()
+    state['stopped'] = case != 'not_stopped'
+    if case == 'drawdown_exit':
+        state['drawdown_exited_controllers'] = [OWNER]
+    updates = {'controllers': ['other-owner']} if case == 'other_controllers' else {}
+    if case == 'owner_running':
+        updates = {'owner_stopped': False}
+    if case == 'kill_switch_enabled':
+        updates = {'kill_switch_disabled': False}
+    connection = database(None if case == 'missing_state' else state)
+    try:
+        before = list(connection.iterdump())
+        with pytest.raises(ValueError, match=message):
+            plan_interrupted_shutdown_latch_release(connection, 'owner.yml', release_request(**updates))
+        assert list(connection.iterdump()) == before
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize('mutation', ['changed_fill', 'changed_state', 'expired'])
+def test_latch_release_refuses_drift_after_review_and_rolls_back(mutation):
+    from hummingbot.strategy_v2.migrations.entry_risk import (
+        apply_interrupted_shutdown_latch_release,
+        plan_interrupted_shutdown_latch_release,
+    )
+    state = legacy_state()
+    state['stopped'] = True
+    connection = database(state)
+    try:
+        planned = plan_interrupted_shutdown_latch_release(connection, 'owner.yml', release_request())
+        now = 1001
+        if mutation == 'changed_fill':
+            connection.execute("UPDATE TradeFill SET amount='2'")
+        elif mutation == 'changed_state':
+            connection.execute("UPDATE Metadata SET value='{}' WHERE key='strategy-operator:preserved'")
+        else:
+            now = 1300
+        connection.commit()
+        before = list(connection.iterdump())
+        with pytest.raises(ValueError, match='changed|Fresh approved'):
+            apply_interrupted_shutdown_latch_release(connection, planned, now=now)
+        assert list(connection.iterdump()) == before
+    finally:
+        connection.close()
+
+
 def test_missing_state_requires_explicit_new_scope_and_never_invents_a_peak_or_pnl():
     from hummingbot.strategy_v2.migrations.entry_risk import plan_entry_risk_transition
     connection = database(None)
@@ -599,7 +686,7 @@ class NativePaperEnrollmentTests(IsolatedAsyncioTestCase):
                     drawdown_exited_controllers=[], _is_stop_triggered=False,
                     get_performance_report=lambda cid: session.controllers[cid].performance_report,
                     _operator_paused=V2WithControllers._operator_paused)
-                for name in ('_drawdown_pnl', '_persist_risk_state', '_apply_daily_entry_pause'):
+                for name in ('_drawdown_pnl', '_persist_risk_state', '_apply_daily_entry_pause', 'durable_stop_latch'):
                     setattr(runner, name, MethodType(getattr(V2WithControllers, name), runner))
                 with patch('scripts.v2_with_controllers.time.time', return_value=600062):
                     V2WithControllers._observe_daily_entry_risk(runner)

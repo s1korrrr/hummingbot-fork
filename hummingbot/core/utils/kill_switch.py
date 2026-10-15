@@ -52,6 +52,14 @@ class ActiveKillSwitch(KillSwitch):
                     self.logger().info("Kill switch threshold reached. Stopping the bot...")
                     self._trading_core.notify(f"\n[Kill switch triggered]\nCurrent profitability is "
                                               f"{self._profitability}. Stopping the bot...")
+                    # A risk stop, unlike the shutdown's own latch: make it durable before shutdown.
+                    strategy = getattr(self._trading_core, "strategy", None)
+                    try:
+                        if callable(getattr(strategy, "latch_risk_stop", None)):
+                            strategy.latch_risk_stop()
+                    except Exception:
+                        # Stopping still beats trading on: shut down, and leave the failure visible.
+                        self.logger().exception("Kill switch could not persist its risk stop")
                     await self._trading_core.shutdown()
                     break
 

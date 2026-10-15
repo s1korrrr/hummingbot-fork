@@ -477,11 +477,14 @@ class OkxExchange(ExchangePyBase):
             path_url=self.trading_rules_request_path,
             params={"instType": "SPOT"},
         )
+        # Refresh the symbol map from this payload first: the rules are formatted from the same payload and
+        # resolve each instrument through the map, so a pair that went live since the last refresh must be in it
+        # (otherwise every new listing logged "Error parsing the trading pair rule" with a KeyError once).
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
         trading_rules_list = await self._format_trading_rules(exchange_info)
         self._trading_rules.clear()
         for trading_rule in trading_rules_list:
             self._trading_rules[trading_rule.trading_pair] = trading_rule
-        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
 
     async def _format_trading_rules(self, raw_trading_pair_info: List[Dict[str, Any]]) -> List[TradingRule]:
         trading_rules = []

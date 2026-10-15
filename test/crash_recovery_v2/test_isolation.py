@@ -25,7 +25,9 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     # modules remain outside it. Historical bindings are not rewritten. The
     # stalled-loop heartbeat drain in candle_stream is recorded there as well.
     # RELEASE_AUDIT_20261005.md records the execution.py and native_composition.py changes.
-    assert source_digest(source_root(), source_files()) == 'b6a9dd1193d42fdb42637b1a8ea1bd7222bddf9bb40b820c54276133cd0c8321'  # noqa: documentation
+    # RELEASE_AUDIT_20261015.md records the PR #128 store-unavailability and
+    # funding unacknowledged-tail changes.
+    assert source_digest(source_root(), source_files()) == '92a3ed2e644a6b671a24fe1f6907acda917c203878325e103021429ad9a66aa7'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

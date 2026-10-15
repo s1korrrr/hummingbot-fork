@@ -385,7 +385,9 @@ class MeridianPortfolio:
             pair_fills = [f for f in fills if f.symbol == pair]
             projection = funding_projection(pair_fills, config.connector_name, pair)
             consumed += projection['cash_used']
-            loose = {key: v for key, v in views.items() if not v.held}
+            # A held view moves into `positions_held` only once its executor is done; until
+            # then (e.g. a just-stopped `held_residual` entry) the executor still owns it.
+            loose = {key: v for key, v in views.items() if not (v.held and v.terminal)}
             dust, dust_basis = self.terminal_dust(loose, evidence, fills, pair, book['amount_step'])
             quantity = held.amount + sum((v.remaining_base for v in loose.values()), ZERO) + dust
             difference = abs(filled_base(pair_fills, pair) - quantity)

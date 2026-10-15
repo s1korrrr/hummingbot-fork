@@ -1,0 +1,445 @@
+{
+  "bars": 349920,
+  "candidate": {
+    "bytes": 1493,
+    "path": "/Users/rsikora/rsibot-runs/edge-20261014/trials/D2h_bnb_janaug25/candidate.json",
+    "sha256": "77270fb6da0e9b1fb1cd1f31082a33c0d3195c0086ac2019a1a11f9ba2ffb530"
+  },
+  "configuration": {
+    "bytes": 1834,
+    "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/backtests/meridian_v3/laptop2/inputs/packets/BNB-USDC.json",
+    "sha256": "fa11359a2ee9b73c945580e47a4d9119bb1c72d8f6e500166618d60d4b2b32a1"
+  },
+  "economics": "NOT_RUN",
+  "effective_config": {
+    "acquisition": {
+      "cooldown_seconds": 1,
+      "entry_timeout_seconds": 300,
+      "fractions": [
+        "0.200000",
+        "0.200000",
+        "0.200000",
+        "0.200000",
+        "0.200000"
+      ],
+      "minimum_drop": "0.008"
+    },
+    "research": {
+      "adaptive_trailing": {
+        "activation_exponent": "0.70",
+        "activation_max": "0.05",
+        "activation_min": "0.003",
+        "baseline_atr_pct": "0.002",
+        "delta_exponent": "0.35",
+        "delta_max": "0.02",
+        "delta_min": "0.001",
+        "max_multiplier": "2.5",
+        "min_locked_profit": "0.010",
+        "min_multiplier": "0.5"
+      },
+      "bag": {
+        "chaser_distance_pct": "0.002",
+        "chaser_refresh_threshold_pct": "0.003",
+        "early_stop_drawdown_pct": "0.03",
+        "maker_fee_rate": "0.0008",
+        "min_profit_pct_for_sell": "0.02",
+        "price_tick": "0.1",
+        "recovery_arm_rsi": "65.0",
+        "recovery_rsi_rollover_delta": "2",
+        "recovery_target_pct": "0.02",
+        "recovery_trail_pullback_pct": "0.009000000000000001",
+        "remainder_sweep_quote": "2.5",
+        "sell_price_gap_pct": "0.01",
+        "sell_rsi_rollover_delta": "0.5",
+        "sell_trend_hold_min_confidence": "0.2",
+        "slice_quote": "100",
+        "stale_cancel_pct": "0.005",
+        "trend_adx_threshold": "18.0",
+        "trend_higher_records": "85",
+        "trend_sell_threshold_boost": "4.0",
+        "trend_short_records": "500"
+      },
+      "buy_gap": {
+        "atr_multiplier": "2.5",
+        "base_gap": "0.008",
+        "max_gap": "0.03",
+        "min_gap": "0.005"
+      },
+      "capital": {
+        "max_active_tranches": "64",
+        "slice_quote": "50"
+      },
+      "depth_budget": {
+        "base_fraction": "1",
+        "full_depth": "0.25",
+        "lookback_minutes": "1440",
+        "max_slice_multiplier": "5"
+      },
+      "flash_crash": {
+        "cooldown_seconds": "300",
+        "drop_pct": "0.04",
+        "lookback": "5"
+      },
+      "max_hold_seconds": null,
+      "reuse_vacant_stages": false,
+      "stop_loss": null,
+      "wallet_quote": "1000000"
+    },
+    "signal": {
+      "breakout_lookback": 20,
+      "kind": "rsi_rebound",
+      "max_atr_fraction": "0.0012",
+      "min_atr_fraction": "0.0002",
+      "oversold": "29.0",
+      "require_uptrend": true,
+      "rsi_length": 17
+    },
+    "trailing": {
+      "activation": "0.025",
+      "delta": "0.005"
+    }
+  },
+  "minute_bundle": {
+    "bytes": 6348,
+    "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/backtests/meridian_v3/laptop2/bundles/bnb_janaug25_okx/bundle.json",
+    "sha256": "13927b8f62b460c2731613d94d7a8e4536b96adeb70f87cbf4237a571d5e7e1d"
+  },
+  "minute_sources": [
+    {
+      "bytes": 4083733,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2024-11.jsonl",
+      "sha256": "5b61238328c2d371b0eab0bc5b80b7994b8346d043e146fbc1af0ebee790312b"
+    },
+    {
+      "bytes": 4242020,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2024-12.jsonl",
+      "sha256": "2132933120b2bd2a9ae67b160e1c35f71cf8ca012713ae68e5fd7989ad914c79"
+    },
+    {
+      "bytes": 4175478,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-01.jsonl",
+      "sha256": "1d0dde1a789a1bcdc39289e000da50d93d2b091c7be962898141caee7afce9e7"
+    },
+    {
+      "bytes": 3830241,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-02.jsonl",
+      "sha256": "d4d488e506d41d8b7d2ff5d9fa36c33deaedc9d4b189178c09a56c0f5d8488d4"
+    },
+    {
+      "bytes": 4234005,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-03.jsonl",
+      "sha256": "34a44cfb8afe72dec84ff3934505d178054f2f71f50be36d0a38d4b6ba5f798a"
+    },
+    {
+      "bytes": 4033905,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-04.jsonl",
+      "sha256": "fe2db6242b451717f39da8c116e4eb52fdc62c2e3699636b7b59067124ecb633"
+    },
+    {
+      "bytes": 4184589,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-05.jsonl",
+      "sha256": "e6505a578e1dd65bca1424e14ad8397b293dd73bbbebe5ddf90637e1ba223b69"
+    },
+    {
+      "bytes": 4026801,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-06.jsonl",
+      "sha256": "8edfa9b3e666dba99fe4a9a255aa421493cabc371e4895e76494d314116eedb7"
+    },
+    {
+      "bytes": 4173604,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-07.jsonl",
+      "sha256": "62e75582ca3ada31d9d9e82ffa295bc807282efa9a65eaa24191088248bfa9ca"
+    },
+    {
+      "bytes": 4211760,
+      "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/data_backfills/spot_corpus_okx_usdt_2024_11_2025_08_preperiod/bnbusdc/1m/raw/BNB-USDT-1m-2025-08.jsonl",
+      "sha256": "4c2bb58b110664442842a1cbfbd5aa7b1bcadc38eaddfa367bd77965f066564d"
+    }
+  ],
+  "minutes": {
+    "bytes": 32028142,
+    "path": "/Users/rsikora/dev/andrzej/rsibot/quants-lab/output/backtests/meridian_v3/laptop2/bundles/bnb_janaug25_okx/minutes.npz",
+    "sha256": "7f841966ba70a147b5ecf4c22e46aefc6c09932cf30d109582249b23b2df9ad4"
+  },
+  "model": {
+    "accounting": "SPOT_BUY_1X_SINGLE_PAIR_SIMULATOR",
+    "acquisition": {
+      "cooldown_seconds": 1,
+      "entry_timeout_seconds": 300,
+      "fractions": [
+        "0.200000",
+        "0.200000",
+        "0.200000",
+        "0.200000",
+        "0.200000"
+      ],
+      "minimum_drop": "0.008"
+    },
+    "candidate": {
+      "bytes": 1493,
+      "path": "/Users/rsikora/rsibot-runs/edge-20261014/trials/D2h_bnb_janaug25/candidate.json",
+      "sha256": "77270fb6da0e9b1fb1cd1f31082a33c0d3195c0086ac2019a1a11f9ba2ffb530"
+    },
+    "capital": "Live OK RSI capital model (controllers.generic.modular_spot_core.bag.live_capital_exposure/decision, shared with the controller and recomputed by the verifier for every capital decision), in the live gate order: fewer than max_active_tranches active buys; the slice_quote plan, first resized (live V2 funding, when funded_cap_quote is set) to (funded_cap_quote - max(0, net cash spent, inventory cost)) / (1 + funding_fee_reserve), at cost; then held bag (non-dust) plus active buys marked at the bar close plus the buy must stay within position_cap_quote when one is set (absent: no position cap). Without funding (V1) a buy the wallet cannot pay for is refused (live balance_low), wallet cash being equity minus inventory at mark (realized PnL is reinvested). With funding (V2) the buy never exceeds wallet cash net of the round-trip cost reserve (the research wallet, research.wallet_quote or the pair allocation, stays 1x cash); the live V2 strategy-wide allocation (2500 across pairs) is not modelled for this single pair, and funding cost is per lot where live blends one running average. The verifier re-derives every decision's active tranches, held bag, exposure, cash and funded used from the ledgers. Not modelled: dynamic signal-strength sizing (live dynamic_position_sizing, V2 0.5-1.0x, V1 0.5-1.25x; every buy plans the full slice_quote); the live buy-threshold shifts by HMM regime (+-3) and by trend confirmation (down trend: -0.4 x boost x confidence, floor 20); the adaptive (ATR-scaled 45-90 s) and consecutive-loss cooldowns (the sealed acquisition.cooldown_seconds applies instead) and the flash-crash pause unless research.flash_crash. The live scout/runner split is disabled in live (buy_confirmation_mode none). Replaces the fixed-allocation-at-cost entry capital of plain bag mode. research.depth_budget (a research setting, not live OK RSI) then refuses a buy when the bag at cost plus active buys at their quote plus the buy would exceed wallet x min(1, base_fraction + (1 - base_fraction) x depth / full_depth), depth being the price's drawdown below the higher of the highest closed-candle high over lookback_minutes and the held (non-dust) bag's breakeven; the verifier recomputes the recent high from the bars, the breakeven and deployed quote from the ledgers and the decision with the native function. With depth_budget.max_slice_multiplier m != 1 each buy first plans slice_quote x (1 + (m - 1) x min(1, depth / full_depth)) and that sized slice goes through the live capital gates (refused, never shrunk, when unaffordable or capped) and then the depth budget.",
+    "decision": "completed candle t enters no earlier than candle t+1 close",
+    "differences": [
+      "No native paper order, partial fill, cancel, spread, liquidity, or persistence lifecycle",
+      "Hummingbot simulator deducts combined round-trip fee and displacement as one trade_cost",
+      "Global Wilder RSI seed approximates native bounded-window reseeding",
+      "Native 90-second cooldown and five-stage dip condition rounded to 1m decisions",
+      "Native daily-loss/drawdown admission rails are not simulated",
+      "Cash admission reserves each active notional plus modeled round-trip cost; completed PnL restores cash"
+    ],
+    "displacement_bps_per_side": 7,
+    "entry": "market close fill on next bar; exported entry timestamp is close availability time, amount floored to BNB step",
+    "exit": "Native modular_spot bag decisions (controllers.generic.modular_spot_core.bag.decide, shared with the controller) replayed on a fixed intrabar candle path (open-low-high-close for up bars, open-high-low-close for down bars; the opposite ordering is not run). Tranches that never become bags exit on the Hummingbot simulator's close-based trailing stop; a tranche whose trailing exit lands on a bar cannot be moved into a bag by that bar's low. Active tranches down early_stop_drawdown_pct from fill are held with keep_position (no sale, slot freed); held inventory sells only via the recovery trail (net target, RSI-overbought arm, pullback or RSI rollover below EMA9, or the live sell signal at the first tick after a close unless trend-held) through a resting LIMIT_CHASER maker sell at market*(1+distance), floored at breakeven*(1+min_profit)+fees/amount grossed up by the maker fee, re-quoted on the chaser threshold, cancelled when stale under trend hold, filled on touch; the trail is frozen while a sell is live; remaining held inventory is marked at the final close. Per path point: fill on touch, then the live tick order (stale cancel, recovery, early stops), then the chaser requote. Entry capital in bag mode is the native fixed allocation minus active tranches and bag cost (no compounding; live OK RSI compounds via the wallet). Fee convention: the candle model charges the full round-trip cost at entry, so held fees (and therefore the 4% arm/delete line, the 2% sell-signal gate and the floor) are about 0.22 percentage points stricter than live, which carries only the entry fee. Not modelled: HMM regime threshold shift (regime treated as absent), queue position and partial fills, spread (ask = path price), shared-wallet balance caps, restarts. The 1% sell-gap reference is the newest filled bag sell among the 20 most recent stored executors (live orchestrator window; closed tranches, held tranches and finished bag sells). Market entries always fill here, so expired or unfilled live entries never take window slots, and partial fills are not modelled. Indicators: Wilder RSI, EMA span 9 (adjust=False), MACD 14/22/9, Wilder ATR 14; trend from the live analyze_rsi_trend_confirmation on 499 closed 1m candles and 5m/15m derived from 1274.",
+    "fee_per_side": ".0008",
+    "initial_cash": "1000000",
+    "pair_quote_cap": "1000000",
+    "promotion": "NONE",
+    "research": {
+      "adaptive_trailing": {
+        "activation_exponent": "0.70",
+        "activation_max": "0.05",
+        "activation_min": "0.003",
+        "baseline_atr_pct": "0.002",
+        "delta_exponent": "0.35",
+        "delta_max": "0.02",
+        "delta_min": "0.001",
+        "max_multiplier": "2.5",
+        "min_locked_profit": "0.010",
+        "min_multiplier": "0.5"
+      },
+      "bag": {
+        "chaser_distance_pct": "0.002",
+        "chaser_refresh_threshold_pct": "0.003",
+        "early_stop_drawdown_pct": "0.03",
+        "maker_fee_rate": "0.0008",
+        "min_profit_pct_for_sell": "0.02",
+        "price_tick": "0.1",
+        "recovery_arm_rsi": "65.0",
+        "recovery_rsi_rollover_delta": "2",
+        "recovery_target_pct": "0.02",
+        "recovery_trail_pullback_pct": "0.009000000000000001",
+        "remainder_sweep_quote": "2.5",
+        "sell_price_gap_pct": "0.01",
+        "sell_rsi_rollover_delta": "0.5",
+        "sell_trend_hold_min_confidence": "0.2",
+        "slice_quote": "100",
+        "stale_cancel_pct": "0.005",
+        "trend_adx_threshold": "18.0",
+        "trend_higher_records": "85",
+        "trend_sell_threshold_boost": "4.0",
+        "trend_short_records": "500"
+      },
+      "buy_gap": {
+        "atr_multiplier": "2.5",
+        "base_gap": "0.008",
+        "max_gap": "0.03",
+        "min_gap": "0.005"
+      },
+      "capital": {
+        "max_active_tranches": "64",
+        "slice_quote": "50"
+      },
+      "depth_budget": {
+        "base_fraction": "1",
+        "full_depth": "0.25",
+        "lookback_minutes": "1440",
+        "max_slice_multiplier": "5"
+      },
+      "flash_crash": {
+        "cooldown_seconds": "300",
+        "drop_pct": "0.04",
+        "lookback": "5"
+      },
+      "max_hold_seconds": null,
+      "reuse_vacant_stages": false,
+      "stop_loss": null,
+      "wallet_quote": "1000000"
+    },
+    "round_trip_cost_fraction": "0.003",
+    "signal": {
+      "breakout_lookback": 20,
+      "kind": "rsi_rebound",
+      "max_atr_fraction": "0.0012",
+      "min_atr_fraction": "0.0002",
+      "oversold": "29.0",
+      "require_uptrend": true,
+      "rsi_length": 17
+    },
+    "trailing": {
+      "activation": "0.025",
+      "delta": "0.005"
+    }
+  },
+  "native_root": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2",
+  "pair": "BNB-USDC",
+  "parent_prepared": {
+    "bytes": 331,
+    "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/inputs/recipe/prepared.json",
+    "sha256": "d2f21ce4f41d752b6d069eca4143a7077193c42c65b40919f4f0178f91b50364"
+  },
+  "profile": "bnb_janaug25_okx",
+  "recipe": {
+    "bytes": 566,
+    "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/inputs/recipe/recipe.json",
+    "sha256": "78cd8ccc01c80e49f9b7bb3c4dad33ae5c5a9c9253dd2e7e917194e4651a9198"
+  },
+  "resolution": "1m",
+  "runtime_identity": {
+    "kind": "LOCAL_CANDLE_BACKTEST",
+    "network": "FORBIDDEN_SOCKET_GUARD",
+    "python_executable": "/opt/anaconda3/envs/hummingbot/bin/python3.13",
+    "python_sha256": "5e457f6eac1bfb1cf1b56c62c65f8de34f108206babe4b790ed6af9c7ca7cb78",
+    "python_version": "3.13.15"
+  },
+  "schema": "spot_modular.minute_prepared.v1",
+  "source_files": [
+    {
+      "bytes": 212190,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/ql-72c71564/scripts/research/spot_modular_minute.py",
+      "sha256": "ba2919b97482f0f13e45e1539c4dca23bae6b4e87257abbd53750a2f85a9e60b"
+    },
+    {
+      "bytes": 113958,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/ql-72c71564/core/backtesting/spot_modular_minute.py",
+      "sha256": "92ed996be4e3dc6c5bd9da76c59aaf3e22f2c5853ea3f16a904c96c29d418b3f"
+    },
+    {
+      "bytes": 13049,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/ql-72c71564/core/backtesting/engine.py",
+      "sha256": "2f8fad4e0143aaab6da3511d576d024c82765f6f70a33cabdb5652500f1ff131"
+    },
+    {
+      "bytes": 203,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/generic/modular_spot_core/acquisition.py",
+      "sha256": "db1ff2012c37c50fd4b003063d6823957a930fe6e0e01905f2279f2d7d9c17fb"
+    },
+    {
+      "bytes": 3153,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/generic/modular_spot_core/config.py",
+      "sha256": "3d0fc2d08124ed85a9b32322f5881cc8a1c57bac5943c3dbb0489791777fcf9b"
+    },
+    {
+      "bytes": 198,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/generic/modular_spot_core/domain.py",
+      "sha256": "8baa19a62ce4e002eb398eeead526465cc859b419d3857c90d1170757eeaaa8d"
+    },
+    {
+      "bytes": 1656,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/generic/modular_spot_core/signals.py",
+      "sha256": "b906eb3a99bcf8cb1ec62874cf3459406fb89a0cbce73c381181e16a31abca62"
+    },
+    {
+      "bytes": 7236,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/generic/modular_spot_core/market.py",
+      "sha256": "6b64859aff0f2fb00e13f89de6825b749bf4653462f030991af74527d12a8043"
+    },
+    {
+      "bytes": 13603,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/generic/component_breakout.py",
+      "sha256": "b724b97b1ffd406b0645ace04f199d773d5ffaafb5cddf4fafe8c8be224b20d0"
+    },
+    {
+      "bytes": 3020,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/shared/trailing.py",
+      "sha256": "b16d7bcd226851014f6409aac1571b51ce32c5b2f948290920af048ee7326b0c"
+    },
+    {
+      "bytes": 36574,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/generic/modular_spot_core/bag.py",
+      "sha256": "a03ce7675f007c697e573517c790e85efe8713367e3eff0abd91ce0f8377dd2b"
+    },
+    {
+      "bytes": 8135,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/controllers/directional_trading/rsi_signals.py",
+      "sha256": "ffbed24745dea67bb5dfe0290b3115af210296641ed617b93bae8b33dc3eebc3"
+    },
+    {
+      "bytes": 4996,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/components/candle_aggregation.py",
+      "sha256": "b5b67496af99cb9562014190fa12cb7d64f75c7d7e194ee47e36b2222c6756e1"
+    },
+    {
+      "bytes": 53466,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/utils/market_analysis.py",
+      "sha256": "491c447f0f87da06b8a7cec65215c9ba1f79d99e0c8a79052aa6ad52ea842bae"
+    },
+    {
+      "bytes": 22751,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/data_feed/candles_feed/candles_base.py",
+      "sha256": "301258166e4d8ccfe3d2b0b6070051ba128b62d8371c98c6719a1809693bcd59"
+    },
+    {
+      "bytes": 18104,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/components/held_inventory.py",
+      "sha256": "780045cfb7480793a07bebacb388df35d80654bb7ae0c6dcef0c3cb75f2cc214"
+    },
+    {
+      "bytes": 864,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/components/acquisition.py",
+      "sha256": "c0786dd85c3ea69f5efb01b6f2b6a6b48a5545bf17d3266cdb89c65011a0cb80"
+    },
+    {
+      "bytes": 1828,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/components/config.py",
+      "sha256": "9b86f6745166b8c7f866459af1ffd5912e5fda7db4b76925ffc9b997e3480a18"
+    },
+    {
+      "bytes": 1192,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/components/domain.py",
+      "sha256": "6aee8f6e832535a2baadacdfaf64e5487d58a75c7c5e251aa23d5b46ad316407"
+    },
+    {
+      "bytes": 21111,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/backtesting/backtesting_engine_base.py",
+      "sha256": "0984377ce23675aacc58285f0fe98ab1cc0279c30aa1f1e7ca4aa016c38152a1"
+    },
+    {
+      "bytes": 8493,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/backtesting/backtesting_data_provider.py",
+      "sha256": "edef84f20616e1f163355cc567a2aedff612b824b678090a6383264ad2cfcf19"
+    },
+    {
+      "bytes": 3746,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/backtesting/executor_simulator_base.py",
+      "sha256": "019977a67fe17cafefd644323fefa39c42ca61445522eda140ac2fcc7bd6b9e0"
+    },
+    {
+      "bytes": 5015,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/backtesting/executors_simulator/position_executor_simulator.py",
+      "sha256": "a6a39cc2b103503878ffa92976e3b4219d5cb50e3b208529b086a2004d8703ab"
+    },
+    {
+      "bytes": 40288,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/controllers/controller_base.py",
+      "sha256": "0a571a9a9af65ac5c092d813bd4a6aa766cd442deedf2ebb778a6aa13df7c3c8"
+    },
+    {
+      "bytes": 950,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/models/executor_actions.py",
+      "sha256": "9158a732c6878c8d1cc2a00937b8b3960ef7c41395f7ed7abe278c85d94fab93"
+    },
+    {
+      "bytes": 2834,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/models/executors.py",
+      "sha256": "b58ed634bb09294199f9e2e42d09f67fee18349f5e707c30912a7c83a58d6dd2"
+    },
+    {
+      "bytes": 3413,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/models/executors_info.py",
+      "sha256": "e3d0192055934244026a324a4e051b14b0e66d09fada2c4bede2ca9176c51710"
+    },
+    {
+      "bytes": 3925,
+      "path": "/Users/rsikora/rsibot-runs/bnb-v1v4-20261013/candle/src/native-2854f07b2/hummingbot/strategy_v2/executors/position_executor/data_types.py",
+      "sha256": "41e7c2feb29a3a0df1b646b7ab2b28a0e30f0ea6638b6e45805b684ce9cbbd08"
+    }
+  ],
+  "warmup_bars": 50400,
+  "window": [
+    1735689600,
+    1756684800
+  ]
+}

@@ -2100,6 +2100,17 @@ class ExecutorOrchestrator:
                 return override
         return self._executor_mapping.get(executor_config.type)
 
+    @staticmethod
+    def _filled_base_for_log(executor):
+        """Filled base of an executor for the stop log. Order executors (e.g. Meridian's bag-recovery executor) have
+        no open_filled_amount; their fill is the executed amount of their orders, as in the reservation check."""
+        if hasattr(executor, "open_filled_amount"):
+            return executor.open_filled_amount
+        orders = getattr(executor, "_all_orders", None)
+        if callable(orders):
+            return sum((item.executed_amount_base for item in orders()), Decimal("0"))
+        return "UNAVAILABLE"
+
     def stop_executor(self, action: StopExecutorAction):
         """
         Stop an executor based on the action details.
@@ -2123,7 +2134,7 @@ class ExecutorOrchestrator:
             # Logged after the stop so a bad fill or fee record can never abort it. The executor
             # may override keep_position, and a hold without held orders can still end as EARLY_STOP.
             try:
-                filled = executor.open_filled_amount
+                filled = self._filled_base_for_log(executor)
             except (ValueError, ArithmeticError):
                 filled = "UNAVAILABLE"
             close_type = getattr(executor, "close_type", None)

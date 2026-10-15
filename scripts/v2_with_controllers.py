@@ -149,6 +149,17 @@ class V2WithControllers(StrategyV2Base):
                 self._risk_reconciliation_error = str(error) or type(error).__name__
                 self.logger().exception('Risk state unavailable; execution blocked pending reconciliation')
 
+    def latch_risk_stop(self):
+        super().latch_risk_stop()
+        if getattr(self, '_risk_persistence_enabled', False) and getattr(self, '_risk_reconciliation_error', None):
+            # _persist_risk_state keeps unreconciled evidence untouched, but the risk stop must
+            # still survive a restart: set only `stopped` on a readable row. A missing or
+            # malformed row already blocks the next boot for reconciliation.
+            recorder = MarketsRecorder.get_instance()
+            state = recorder.load_strategy_risk_state()
+            if isinstance(state, dict) and state.get('stopped') is False:
+                recorder.store_strategy_risk_state({**state, 'stopped': True})
+
     def _persist_risk_state(self, *, operator_receipts=()):
         if not getattr(self, '_risk_persistence_enabled', False):
             return
@@ -161,7 +172,7 @@ class V2WithControllers(StrategyV2Base):
                  'max_pnl_by_controller': {cid: (None if self.max_pnl_by_controller.get(cid, Decimal('0')) is None else
                                                  str(self.max_pnl_by_controller.get(cid, Decimal('0')))) for cid in self.controllers},
                  'drawdown_exited_controllers': sorted(set(self.drawdown_exited_controllers)),
-                 'stopped': self._is_stop_triggered,
+                 'stopped': self.durable_stop_latch(),
                  'operator_paused': {cid: self._operator_paused(c) for cid, c in self.controllers.items()}}
         if getattr(self, '_operator_watermarks', {}):
             state['operator_watermarks'] = self._operator_watermarks.copy()
@@ -553,8 +564,11 @@ class V2WithControllers(StrategyV2Base):
             if current_global_drawdown > self.config.max_global_drawdown_quote:
                 self.drawdown_exited_controllers.extend(list(self.controllers.keys()))
                 self.logger().info("Global drawdown reached. Stopping the strategy.")
-                self._is_stop_triggered = True
-                HummingbotApplication.main_application().stop()
+                try:
+                    self.latch_risk_stop()
+                finally:
+                    # A persistence failure surfaces to the caller; the stop still happens.
+                    HummingbotApplication.main_application().stop()
 
     def get_controller_report(self, controller_id: str) -> dict:
         """

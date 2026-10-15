@@ -18,6 +18,7 @@ import json
 import math
 import os
 import signal
+import sys
 import tempfile
 import time
 from collections import deque
@@ -34,6 +35,7 @@ from hummingbot.connector.exchange.okx.okx_api_order_book_data_source import Okx
 from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import NativePaperTradeExchange
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import TradeType
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest, WSPlainTextRequest
 from hummingbot.strategy_v2.components.candle_data import Dataset
@@ -57,7 +59,7 @@ class PaperConfig(BaseModel):
     trade_participation: Decimal = Field(default=Decimal(".1"), gt=0, le=1)
     book_max_age_seconds: float = Field(default=5, gt=0, le=5)
     controller_kind: Literal["component_breakout", "rsi_modular", "modular_spot_research",
-                             "meridian_v3_unified"] = "component_breakout"
+                             "meridian_v3_unified", "meridian_v4"] = "component_breakout"
     controller_files: tuple[Path, ...] = ()
 
     @field_validator("pairs")
@@ -239,8 +241,25 @@ class PublicSymbols:
         return await self.trading_pair_associated_to_exchange_symbol(trading_pair)
 
 
+def books5_snapshot(payload, pair):
+    """One OKX books5 frame as one native snapshot message.
+
+    books5 pushes a complete five-level book in every frame (no `action`, no `prevSeqId`), so
+    no stream continuity applies. The OKX data source's book parser serves the incremental
+    `books` channel and refuses frames without that continuity, so it is not used here. Book
+    contents are validated afterwards by the native paper connector's book validator.
+    """
+    (data,) = payload["data"]
+    update_id = int(data["ts"])
+    return OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
+        "trading_pair": pair, "update_id": update_id,
+        "bids": [(row[0], row[1]) for row in data["bids"]],
+        "asks": [(row[0], row[1]) for row in data["asks"]],
+    }, update_id * 1e-3)
+
+
 class PublicLiquidity:
-    """Bounded public snapshots/trades, parsed by Hummingbot's OKX datasource."""
+    """Bounded public snapshots/trades: books5 frames as native snapshots, trades by Hummingbot's OKX datasource."""
     ACK_TIMEOUT_SECONDS = 15.0
 
     def __init__(self, pairs, max_age=5, *, book_validator=None):
@@ -336,7 +355,7 @@ class PublicLiquidity:
                 raise ValueError("Five-level snapshot required")
             if len(payload['data']) != 1 or payload['data'][0].get('instId', pair) != pair:
                 raise ValueError('Snapshot instrument differs from acknowledged channel')
-            await self.parser._parse_order_book_snapshot_message(payload, queue)
+            queue.put_nowait(books5_snapshot(payload, pair))
         else:
             await self.parser._parse_trade_message(payload, queue)
         while not queue.empty():
@@ -470,6 +489,34 @@ class PublicLiquidity:
         await self.factory._connections_factory.close()
 
 
+def meridian_v4_paper_configs(paths, pairs):
+    """Sealed per-pair V4 or V4 D2h paper controllers (one program per runtime, injected 1m candles)."""
+    import yaml
+
+    from controllers.generic.meridian_v4 import MeridianV4Config
+    from controllers.generic.meridian_v4_d2h import MeridianV4D2hConfig
+
+    classes = {"meridian_v4": MeridianV4Config, "meridian_v4_d2h": MeridianV4D2hConfig}
+    configs = []
+    for path in paths:
+        values = yaml.safe_load(Path(path).read_text())
+        cls = classes.get(values.get("controller_name")) if isinstance(values, dict) else None
+        if cls is None:
+            raise ValueError(f"V4 paper requires a meridian_v4 or meridian_v4_d2h controller file: {path}")
+        config = cls.model_validate(values)
+        if (config.execution_mode != "paper" or config.connector_name != "okx_paper_trade"
+                or config.data.mode != "native" or not config.execution_enabled or config.recipe_binding is None):
+            raise ValueError("V4 paper needs a sealed, enabled okx_paper_trade controller with injected native 1m candles")
+        configs.append(config)
+    if len({type(c) for c in configs}) != 1 or len({c.budget.group for c in configs}) != 1:
+        raise ValueError("One V4 program per paper runtime; run each A/B arm in its own runtime")
+    if sum(c.total_amount_quote for c in configs) > configs[0].budget.max_quote:
+        raise ValueError("Per-pair budgets exceed the program budget")
+    if sorted(c.trading_pair for c in configs) != sorted(pairs):
+        raise ValueError("Paper controller pairs must equal the configured pairs")
+    return configs
+
+
 def meridian_unified_paper_configs(paths, pairs):
     """The one Meridian portfolio controller (native paper wallet, injected 1m candles)."""
     import yaml
@@ -500,6 +547,11 @@ class PaperRuntime:
         elif config.controller_kind == "modular_spot_research":
             configs = modular_spot_research_paper_configs(config.controller_files, config.pairs)
             history = {c.trading_pair: c.max_records for c in configs}  # the binding reads max_records closed candles
+        elif config.controller_kind == "meridian_v4":
+            configs = meridian_v4_paper_configs(config.controller_files, config.pairs)
+            if sum(c.total_amount_quote for c in configs) > config.simulated_quote:
+                raise ValueError("Per-pair budgets exceed the simulated paper wallet")
+            history = {c.trading_pair: c.max_records for c in configs}
         elif config.controller_kind == "meridian_v3_unified":
             configs = meridian_unified_paper_configs(config.controller_files, config.pairs)
             history = {p: 1500 for p in config.pairs}  # every symbol context reads the p23 1500-candle window
@@ -569,6 +621,10 @@ class PaperRuntime:
         self.failure = None
         self._seen_candles = {}
         self._applied_books = dict(connector.tracking_states["book_sequence"])
+        self.journal_path = config.status_path.with_name(config.bot_name + ".decisions.jsonl")
+        self._journal_state = {}
+        self.journal_failures = 0
+        self.journal_error = None
 
     def status(self, now, reasons):
         reports = (self.last_result['reports'] if self.last_result and self.failure is None
@@ -586,6 +642,7 @@ class PaperRuntime:
             "process_pid": os.getpid(),
             "source_sha256": self.source_sha256,
             "restored": self.restored,
+            "decision_journal": {"failures": self.journal_failures, "last_error": self.journal_error},
             "ready": not reasons and self.failure is None,
             "reasons": reasons,
             "failure": self.failure,
@@ -633,7 +690,87 @@ class PaperRuntime:
         pairs = owned_pairs(controller.config)
         row.setdefault("pair", pairs[0] if len(pairs) == 1 else list(pairs))
         row.setdefault("execution_mode", controller.config.execution_mode)
+        # The bounded native custom info (decision reason, candle, bag) the live publisher sends.
+        row.setdefault("custom_info", controller.get_custom_info())
         return row
+
+    def journal(self, now, result):
+        """Append the decision trail the status file overwrites every step (bounded growth).
+
+        One line per controller per closed candle: step counts per decision status (`same_candle` counts
+        steps after the decision), the final decision and its full reason (e.g. data_hold:<cause>),
+        `decided` from the owner's persisted checkpoint, and the bag only when it changed.
+        One line per executor action, immediately."""
+        lines = []
+        acted = {}
+        for action in result["actions"]:
+            config = getattr(action, "executor_config", None)
+            acted.setdefault(action.controller_id, []).append({
+                "type": type(action).__name__, "executor_id": getattr(action, "executor_id", None)
+                or getattr(config, "id", None),
+                "side": None if getattr(config, "side", None) is None else str(getattr(config.side, "name", config.side)),
+                "amount": None if getattr(config, "amount", None) is None else str(config.amount),
+                "price": None if getattr(config, "entry_price", None) is None else str(config.entry_price),
+            })
+        for controller_id, controller in self.session.controllers.items():
+            info = controller.get_custom_info()
+            detail = getattr(getattr(controller, "runtime", None), "reason", None)
+            detail = None if detail is None else str(detail)[:240]
+            status, candle = info.get("modular_status"), info.get("candle_open")
+            stats = self._journal_state.get(controller_id)
+            if stats is not None and stats["candle_open"] != candle and stats["statuses"]:
+                lines.append(self._candle_line(controller_id, stats))
+            if stats is None or stats["candle_open"] != candle:
+                previous_bag = None if stats is None else stats["logged_bag"]
+                stats = {"candle_open": candle, "statuses": {}, "final": None, "detail": None,
+                         "bag": None, "logged_bag": previous_bag}
+                self._journal_state[controller_id] = stats
+            stats["statuses"][status] = stats["statuses"].get(status, 0) + 1
+            if status != "same_candle":
+                stats["final"], stats["detail"] = status, detail
+            stats["controller"] = controller
+            stats["bag"] = info.get("bag")
+            if controller_id in acted:
+                lines.append(json.dumps({"t": now, "controller": controller_id, "kind": "action",
+                                         "candle_open": candle, "status": status, "detail": detail,
+                                         "bag": info.get("bag"), "actions": acted[controller_id]},
+                                        sort_keys=True, default=json_value, allow_nan=False))
+        if lines:
+            with open(self.journal_path, "a") as output:
+                output.write("\n".join(lines) + "\n")
+
+    def _candle_line(self, controller_id, stats):
+        bag = json.dumps(stats["bag"], sort_keys=True, default=json_value)
+        changed = bag != stats["logged_bag"]
+        stats["logged_bag"] = bag
+        return json.dumps({"t": time.time(), "controller": controller_id, "kind": "candle",
+                           "candle_open": stats["candle_open"], "statuses": stats["statuses"],
+                           "final": stats["final"], "detail": stats["detail"],
+                           "decided": self._decided(stats.get("controller"), stats["candle_open"]),
+                           **({"bag": stats["bag"]} if changed else {})},
+                          sort_keys=True, default=json_value, allow_nan=False)
+
+    @staticmethod
+    def _decided(controller, candle_open):
+        """Whether the owner's persisted decision checkpoint reached this candle (True/False), or None when the
+        owner has no modular decision store. A status line alone cannot prove it: a later snapshot in the same
+        step can overwrite the decision reason with a data hold."""
+        store = getattr(getattr(controller, "runtime", None), "store", None)
+        if store is None or candle_open is None:
+            return None
+        state, _ = store.load()
+        return state is not None and state.candle is not None and state.candle >= candle_open
+
+    def write_journal(self, now, result):
+        """The journal is evidence, not session state: its failure is counted, reported and logged,
+        never turned into a native session failure (the step has already been persisted)."""
+        try:
+            self.journal(now, result)
+        except Exception as error:
+            self.journal_failures += 1
+            self.journal_error = f"{type(error).__name__}: {str(error)[:200]}"
+            print(f"ERROR decision journal write failed ({self.journal_failures}): {self.journal_error}",
+                  file=sys.stderr, flush=True)
 
     async def step(self, now):
         if self.failure:
@@ -726,7 +863,6 @@ class PaperRuntime:
                     reason = owner + ': public_book_unavailable'
                 reasons.append(reason)
             atomic_json(self.config.status_path, self.status(now, reasons))
-            return result
         except BaseException as error:
             self.failure = type(error).__name__
             atomic_json(
@@ -734,6 +870,8 @@ class PaperRuntime:
                 self.status(now, ["native_session_failure_requires_reconciliation"]),
             )
             raise
+        self.write_journal(now, result)
+        return result
 
     async def run(self, stop):
         self.candles.start()

@@ -212,13 +212,15 @@ class NativePaperSession:
         from controllers.generic.component_breakout import ComponentBreakoutConfig
         from controllers.generic.meridian_v3 import MeridianV3Config
         from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig
+        from controllers.generic.meridian_v4 import MeridianV4Config
+        from controllers.generic.meridian_v4_d2h import MeridianV4D2hConfig
         from controllers.generic.modular_spot_research import ModularSpotResearchConfig
         from controllers.generic.momentum_fusion_v2 import MomentumFusionV2Config
         from controllers.generic.rsi_modular import CONFIG_PROFILES
         from controllers.generic.tidewater_v4_core.config import TidewaterConfig
         allowed = (ModularOKRSIControllerConfig, ModularRSIV5ControllerConfig, *CONFIG_PROFILES.values(),
                    ComponentBreakoutConfig, MomentumFusionV2Config, ModularSpotResearchConfig, MeridianV3Config,
-                   MeridianUnifiedConfig, TidewaterConfig)
+                   MeridianUnifiedConfig, TidewaterConfig, MeridianV4Config, MeridianV4D2hConfig)
         if not configs or len({c.id for c in configs}) != len(configs):
             raise ValueError('Distinct native paper controller identities required')
         for config in configs:

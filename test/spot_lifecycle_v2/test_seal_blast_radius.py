@@ -20,7 +20,9 @@ def test_isolated_component_stays_outside_the_frozen_consumer_closure():
 
 def test_frozen_consumer_seal_matches_current_master_baseline():
     records = modular_spot_records()
-    assert digest(records) == '14e76708f297834597beaa7b7eb38b89aa00e5ce1f781b01a406a8264c625224'  # noqa: documentation
+    # Same closure as the crash_recovery_v2 isolation pin; reseal both together
+    # (docs/controllers/modular_spot/RELEASE_AUDIT_20261015.md).
+    assert digest(records) == '92a3ed2e644a6b671a24fe1f6907acda917c203878325e103021429ad9a66aa7'  # noqa: documentation
 
 
 def test_only_the_component_namespace_is_shared_with_the_frozen_consumer():

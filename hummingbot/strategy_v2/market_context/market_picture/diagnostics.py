@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import MAX_EMAX, MIN_EMIN, ROUND_HALF_EVEN, Context, Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from typing import Mapping
 
@@ -243,7 +243,8 @@ def capped_weights(
         raise ValueError("expected cohort identities must be sorted, unique and non-empty")
     if not cap.is_finite() or cap <= 0 or cap > 1:
         raise ValueError("weight cap must be in (0, 1]")
-    if set(prior_liquidity) != set(expected_ids) or Decimal(len(expected_ids)) * cap < 1:
+    cap_fraction = Fraction(cap)
+    if set(prior_liquidity) != set(expected_ids) or len(expected_ids) * cap_fraction < 1:
         return None
     raw = {}
     for identity in expected_ids:
@@ -253,30 +254,95 @@ def capped_weights(
             raise ValueError("prior liquidity weights must be finite positive numbers") from exc
         if not value.is_finite() or value <= 0:
             return None
-        raw[identity] = value
-    remaining = set(expected_ids)
+        raw[identity] = Fraction(value)
+    remaining = list(expected_ids)
     result: dict[str, Decimal] = {}
-    remaining_weight = Decimal(1)
+    remaining_weight = Fraction(1)
     while remaining:
-        available_total = sum((raw[key] for key in remaining), Decimal(0))
+        available_total = sum((raw[key] for key in remaining), Fraction(0))
         if available_total <= 0:
             return None
-        newly_capped = {key for key in remaining if remaining_weight * raw[key] / available_total > cap}
+        newly_capped = [
+            key for key in remaining if remaining_weight * raw[key] / available_total > cap_fraction
+        ]
         if not newly_capped:
             for key in remaining:
-                result[key] = remaining_weight * raw[key] / available_total
+                share = remaining_weight * raw[key] / available_total
+                rounded = _fraction_to_decimal(share)
+                # Rounding a value immediately below a high-precision cap can
+                # land one ulp above it. Keep the exact cap and reconcile the
+                # resulting mass difference across a member with available
+                # room below.
+                result[key] = cap if Fraction(rounded) > cap_fraction else rounded
             break
         for key in newly_capped:
             result[key] = cap
-            remaining_weight -= cap
-        remaining -= newly_capped
-    if set(result) != set(expected_ids) or sum(result.values(), Decimal(0)) != Decimal(1):
-        # Decimal division may leave a final ulp; assign it deterministically to
-        # the last uncapped identity, without changing any capped member.
-        last = next((key for key in reversed(expected_ids) if result[key] < cap), None)
-        if last is None:
-            return None
-        result[last] += Decimal(1) - sum(result.values(), Decimal(0))
-    if any(value > cap for value in result.values()) or sum(result.values(), Decimal(0)) != Decimal(1):
+        remaining_weight -= len(newly_capped) * cap_fraction
+        capped = set(newly_capped)
+        remaining = [key for key in remaining if key not in capped]
+    if set(result) != set(expected_ids):
         return None
-    return result
+
+    residual = Fraction(1) - sum((Fraction(value) for value in result.values()), Fraction(0))
+    if residual:
+        direction = 1 if residual > 0 else -1
+        adjustment_order = sorted(
+            remaining,
+            key=lambda key: (
+                cap_fraction - Fraction(result[key])
+                if direction > 0
+                else Fraction(result[key])
+            ),
+            reverse=True,
+        )
+        for key in adjustment_order:
+            current = Fraction(result[key])
+            available = cap_fraction - current if direction > 0 else current
+            adjustment = min(abs(residual), available)
+            if adjustment:
+                result[key] = _terminating_fraction_decimal(current + direction * adjustment)
+                residual -= direction * adjustment
+            if not residual:
+                break
+        if residual:
+            return None
+    if any(Fraction(value) <= 0 or Fraction(value) > cap_fraction for value in result.values()):
+        return None
+    if sum((Fraction(value) for value in result.values()), Fraction(0)) != 1:
+        return None
+    return {identity: result[identity] for identity in expected_ids}
+
+
+def _terminating_fraction_decimal(value: Fraction) -> Decimal:
+    """Convert an exact finite base-10 fraction to Decimal without context rounding."""
+    denominator = value.denominator
+    twos = fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        raise ValueError("weight residual must have a finite decimal representation")
+    scale = max(twos, fives)
+    coefficient = value.numerator * (2 ** (scale - twos)) * (5 ** (scale - fives))
+    sign = 1 if coefficient < 0 else 0
+    digits = tuple(int(digit) for digit in str(abs(coefficient))) or (0,)
+    return Decimal((sign, digits, -scale))
+
+
+def _fraction_to_decimal(value: Fraction, *, precision: int = 28) -> Decimal:
+    """Round a positive rational with fixed precision, range and rounding mode."""
+    if value <= 0 or precision < 1:
+        raise ValueError("weight share and precision must be positive")
+    # An isolated context fixes precision, rounding, exponent range and traps;
+    # caller-local Decimal settings cannot alter the normalized vector.
+    context = Context(
+        prec=precision,
+        rounding=ROUND_HALF_EVEN,
+        Emin=MIN_EMIN,
+        Emax=MAX_EMAX,
+    )
+    with localcontext(context):
+        return Decimal(value.numerator) / Decimal(value.denominator)

@@ -1,4 +1,10 @@
+import os
+import subprocess
+import sys
 from decimal import Decimal
+from fractions import Fraction
+
+import pytest
 
 from hummingbot.strategy_v2.market_context.market_picture.diagnostics import (
     capped_weights,
@@ -148,3 +154,50 @@ def test_t40_capped_liquidity_weights_require_a_feasible_complete_prior_cohort()
     assert weights["a0"] == Decimal("0.10")
     assert max(weights.values()) <= Decimal("0.10")
     assert sum(weights.values()) == Decimal(1)
+    assert capped_weights({key: 1 for key in ids[:-1]}, expected_ids=ids) is None
+    assert capped_weights({key: (0 if key == "a0" else 1) for key in ids}, expected_ids=ids) is None
+    assert capped_weights({key: ("NaN" if key == "a0" else 1) for key in ids}, expected_ids=ids) is None
+    with pytest.raises(ValueError, match="finite positive numbers"):
+        capped_weights({key: ("not-a-number" if key == "a0" else 1) for key in ids}, expected_ids=ids)
+    thirds = capped_weights(
+        {key: 1 for key in ("a", "b", "c")},
+        expected_ids=("a", "b", "c"),
+        cap=Decimal("0.33333333333333333333333333334"),
+    )
+    assert thirds is not None
+    assert sum((Fraction(value) for value in thirds.values()), Fraction(0)) == 1
+    assert max(thirds.values()) <= Decimal("0.33333333333333333333333333334")
+    assert sum(value == Decimal("0.33333333333333333333333333334") for value in thirds.values()) == 2
+
+
+def test_capped_weights_are_hashseed_stable_for_300_positive_members():
+    script = """
+import json
+from decimal import Decimal, localcontext
+from hummingbot.strategy_v2.market_context.market_picture.diagnostics import capped_weights
+
+ids = tuple(f"asset-{index:03d}" for index in range(300))
+raw = {identity: Decimal(index + 1) for index, identity in enumerate(ids)}
+weights = capped_weights(raw, expected_ids=ids)
+with localcontext() as context:
+    context.prec = 9
+    reversed_weights = capped_weights(dict(reversed(tuple(raw.items()))), expected_ids=ids)
+assert weights is not None
+assert reversed_weights == weights
+assert tuple(weights) == ids
+assert all(Decimal(0) < weight <= Decimal("0.10") for weight in weights.values())
+assert sum(weights.values(), Decimal(0)) == Decimal(1)
+print(json.dumps([str(weights[identity]) for identity in ids]))
+"""
+    outputs = []
+    for seed in ("20", "56", "59"):
+        environment = dict(os.environ, PYTHONHASHSEED=seed)
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        outputs.append(completed.stdout)
+    assert outputs[0] == outputs[1] == outputs[2]

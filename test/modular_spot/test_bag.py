@@ -849,3 +849,27 @@ def test_shared_feature_cache_key_separates_flash_crash_configurations():
     one = observed_spec(FlashCrashConfig(lookback=5, drop_pct=D('0.03'), cooldown_seconds=300))
     other = observed_spec(FlashCrashConfig(lookback=5, drop_pct=D('0.05'), cooldown_seconds=300))
     assert len({repr(plain), repr(one), repr(other)}) == 3
+
+
+def test_runtime_keeps_the_last_entry_decision_visible_across_same_candle_ticks(bag_recorder):
+    from dataclasses import replace
+
+    runtime = _runtime(bag_recorder, positions=[])
+    clock = {'now': 1_800_000_030.0}
+    runtime.controller.market_data_provider.time = lambda: clock['now']
+    runtime.reason, runtime.pending_inputs, runtime.last_decision = 'execution_disabled', {}, None
+    runtime.observe = lambda: runtime.market
+    runtime.acquisition_permitted = lambda: True
+    runtime.snapshot = lambda: {**_snapshot(D('106')), 'available_quote': D('500'), 'pnl': D('0')}
+
+    runtime.actions()                                   # fresh owner: seeds the decision state
+    assert runtime.reason == 'seeded'
+    runtime.market = replace(runtime.market, candle_open=1_800_000_060, flash_pause_until=1_800_030_000.0)
+    clock['now'] = 1_800_000_121.0
+    runtime.actions()
+    assert runtime.reason == 'flash_crash_pause'
+    assert runtime.last_decision == {'reason': 'flash_crash_pause', 'candle': 1_800_000_060, 'at': 1_800_000_121.0}
+    clock['now'] = 1_800_000_150.0
+    runtime.actions()                                   # same closed candle: the reason is hidden, the decision is not
+    assert runtime.reason == 'same_candle'
+    assert runtime.last_decision['reason'] == 'flash_crash_pause'

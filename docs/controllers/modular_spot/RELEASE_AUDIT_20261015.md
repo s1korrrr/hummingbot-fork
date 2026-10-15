@@ -39,3 +39,15 @@ same digest here.
 
 Historical receipts, checkpoints and deployed bindings keep their actual
 identities and are not rewritten. Nothing is deployed by this record.
+
+## Addendum: hummingbot #133 (same-candle spread retry) merged to master
+
+`707d9ac5b` ("a transient wide spread no longer consumes the decision candle; keep the last entry decision visible")
+changes `modular_spot_core/planner.py` and `modular_spot_core/runtime.py` (plus `meridian_v3_unified.py`, outside
+this closure). Its patch is identical (`git patch-id` 8a32066bb3a1) to the commit live V3 has run since 2026-10-07 on
+its deploy line (`158989140`, now `404f785cb`), so this merge aligns master with live V3. V2 (rsi_modular_v2) adopts it
+only at its next engine deploy.
+
+Closure digest: `92a3ed2e…6aa7` → `8bb97f3b26eee24c7ea235bd9ac681b8ca2010e1724b2d8d46bd044c57b01feb`. Both pins
+(`test/crash_recovery_v2/test_isolation.py`, `test/spot_lifecycle_v2/test_seal_blast_radius.py`) updated together.
+Historical bindings are not rewritten.

@@ -27,7 +27,7 @@ def test_crash_additions_preserve_frozen_modular_spot_source_identity():
     # RELEASE_AUDIT_20261005.md records the execution.py and native_composition.py changes.
     # RELEASE_AUDIT_20261015.md records the PR #128 store-unavailability and
     # funding unacknowledged-tail changes.
-    assert source_digest(source_root(), source_files()) == '92a3ed2e644a6b671a24fe1f6907acda917c203878325e103021429ad9a66aa7'  # noqa: documentation
+    assert source_digest(source_root(), source_files()) == '8bb97f3b26eee24c7ea235bd9ac681b8ca2010e1724b2d8d46bd044c57b01feb'  # noqa: documentation
 
 
 def test_neutral_components_never_import_a_controller_family():

@@ -875,8 +875,9 @@ async def test_v4_runtime_hosts_five_sealed_owners_and_reports_them(tmp_path, pr
             journal = tmp_path / f"{program}_paper.decisions.jsonl"
             assert not journal.exists() or journal.read_text() == ""  # no closed candle yet
             # One line per controller per closed candle with step counts per status; same_candle is not counted.
-            script = iter([("c1", "acquisition_not_eligible"), ("c1", "same_candle"),
-                           ("c1", "data_hold:native market/account provider not ready"), ("c2", "acquisition_not_eligible")])
+            c1, c2 = 10 ** 10, 10 ** 10 + 60  # far after the real checkpoint, so not decided
+            script = iter([(c1, "acquisition_not_eligible"), (c1, "same_candle"),
+                           (c1, "data_hold:native market/account provider not ready"), (c2, "acquisition_not_eligible")])
             for candle, reason in script:
                 for controller in runtime.session.controllers.values():
                     controller.get_custom_info = (lambda c=candle, r=reason: {
@@ -885,10 +886,11 @@ async def test_v4_runtime_hosts_five_sealed_owners_and_reports_them(tmp_path, pr
                 runtime.journal(now, {"actions": []})
             lines = [json.loads(line) for line in journal.read_text().splitlines()]
             assert all(e["kind"] == "candle" for e in lines)  # the real first candle closes too
-            lines = [e for e in lines if e["candle_open"] == "c1"]
+            lines = [e for e in lines if e["candle_open"] == c1]
             assert sorted(e["controller"] for e in lines) == sorted(c.id for c in references)
-            assert all(e["kind"] == "candle" and e["candle_open"] == "c1" and e["final"] == "data_hold"
-                       and e["statuses"] == {"acquisition_not_eligible": 1, "data_hold": 1}
+            assert all(e["kind"] == "candle" and e["candle_open"] == c1 and e["final"] == "data_hold"
+                       and e["statuses"] == {"acquisition_not_eligible": 1, "same_candle": 1, "data_hold": 1}
+                       and e["decided"] is False  # the scripted candle never reached the real checkpoint
                        and e["detail"] == "data_hold:native market/account provider not ready" and "bag" in e
                        for e in lines)
     finally:
@@ -930,3 +932,15 @@ async def test_v4_journal_failure_is_reported_not_a_session_failure(tmp_path):
         if runtime is not None:
             await runtime.close()
         MarketsRecorder._shared_instance = prior
+
+
+def test_decided_reads_the_owner_checkpoint():
+    from types import SimpleNamespace
+
+    def owner(candle):
+        state = None if candle is None else SimpleNamespace(candle=candle)
+        return SimpleNamespace(runtime=SimpleNamespace(store=SimpleNamespace(load=lambda: (state, "raw"))))
+    assert PaperRuntime._decided(owner(120), 120) is True
+    assert PaperRuntime._decided(owner(60), 120) is False
+    assert PaperRuntime._decided(owner(None), 120) is False
+    assert PaperRuntime._decided(SimpleNamespace(), 120) is None  # no modular decision store

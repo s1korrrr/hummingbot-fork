@@ -697,9 +697,10 @@ class PaperRuntime:
     def journal(self, now, result):
         """Append the decision trail the status file overwrites every step (bounded growth).
 
-        One line per controller per closed candle: step counts per decision status, the final
-        decision and its full reason (e.g. data_hold:<cause>), and the bag only when it changed.
-        One line per executor action, immediately. `same_candle` re-checks are not counted."""
+        One line per controller per closed candle: step counts per decision status (`same_candle` counts
+        steps after the decision), the final decision and its full reason (e.g. data_hold:<cause>),
+        `decided` from the owner's persisted checkpoint, and the bag only when it changed.
+        One line per executor action, immediately."""
         lines = []
         acted = {}
         for action in result["actions"]:
@@ -724,9 +725,10 @@ class PaperRuntime:
                 stats = {"candle_open": candle, "statuses": {}, "final": None, "detail": None,
                          "bag": None, "logged_bag": previous_bag}
                 self._journal_state[controller_id] = stats
+            stats["statuses"][status] = stats["statuses"].get(status, 0) + 1
             if status != "same_candle":
-                stats["statuses"][status] = stats["statuses"].get(status, 0) + 1
                 stats["final"], stats["detail"] = status, detail
+            stats["controller"] = controller
             stats["bag"] = info.get("bag")
             if controller_id in acted:
                 lines.append(json.dumps({"t": now, "controller": controller_id, "kind": "action",
@@ -744,8 +746,20 @@ class PaperRuntime:
         return json.dumps({"t": time.time(), "controller": controller_id, "kind": "candle",
                            "candle_open": stats["candle_open"], "statuses": stats["statuses"],
                            "final": stats["final"], "detail": stats["detail"],
+                           "decided": self._decided(stats.get("controller"), stats["candle_open"]),
                            **({"bag": stats["bag"]} if changed else {})},
                           sort_keys=True, default=json_value, allow_nan=False)
+
+    @staticmethod
+    def _decided(controller, candle_open):
+        """Whether the owner's persisted decision checkpoint reached this candle (True/False), or None when the
+        owner has no modular decision store. A status line alone cannot prove it: a later snapshot in the same
+        step can overwrite the decision reason with a data hold."""
+        store = getattr(getattr(controller, "runtime", None), "store", None)
+        if store is None or candle_open is None:
+            return None
+        state, _ = store.load()
+        return state is not None and state.candle is not None and state.candle >= candle_open
 
     def write_journal(self, now, result):
         """The journal is evidence, not session state: its failure is counted, reported and logged,

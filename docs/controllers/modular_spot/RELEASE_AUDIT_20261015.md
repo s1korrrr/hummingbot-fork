@@ -1,6 +1,6 @@
 # Modular spot closure reseal for PR #128 — 15 October 2026
 
-The modular spot closure (`controllers.generic.modular_spot`, 39 files) changed
+The modular spot closure (`controllers.generic.modular_spot`: 39 controller files plus 28 shared components, 67 hashed) changed
 on master on 5 October 2026 in
 [PR #128](https://github.com/s1korrrr/hummingbot/pull/128) (merge `f3e602162`),
 but its two pinned digests were not resealed. Both tests failed on master
@@ -31,7 +31,7 @@ The closure changes from `b6a9dd11…8321` to `92a3ed2e…6aa7`. Only the five
 files above change; no path is added or removed. Crash and V3-only dust modules
 remain outside the closure.
 
-`test/spot_lifecycle_v2/test_seal_blast_radius.py` hashes the same 39 files
+`test/spot_lifecycle_v2/test_seal_blast_radius.py` hashes the same closure (67 files: 39 controller files plus 28 shared components)
 path-only. Its pin `14e76708f297834597beaa7b7eb38b89aa00e5ce1f781b01a406a8264c625224`
 was stale since `0a3b7538b` (RELEASE_AUDIT_20260930.md), which resealed only the
 isolation test; it was missed at every later reseal too. It is resealed to the

@@ -164,3 +164,38 @@ class MeridianV4RestingEntryTests(IsolatedAsyncioTestCase):
                 self.assertEqual(executor._entry_lifecycle['stop_reason'], 'modular_entry_permission_revoked')
             finally:
                 await session.close()
+
+
+class MeridianV4RestingEntryRevocationTests(IsolatedAsyncioTestCase):
+    """Review (GPT-6.1-Sol, 2026-10-15): the resting-entry fallback must never outlive a definitive revocation.
+    Before the fix a stopped controller (NOT_STARTED / SHUTTING_DOWN / TERMINATED) or an operator entry pause
+    kept an unfilled buy alive."""
+    setUp = session_tests.NativePaperSessionTests.setUp
+
+    async def resting(self, directory):
+        session = NativePaperSession(paper(('BNB-USDC', 'ETH-USDC')), [config(execution_enabled=True)],
+                                     Path(directory) / 'v4.sqlite')
+        executor = await MeridianV4RestingEntryTests.rest_entry(self, session)
+        return session, executor, session.controllers[OWNER]
+
+    async def test_operator_entry_pause_ends_a_resting_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session, executor, controller = await self.resting(directory)
+            try:
+                controller._operator_entry_paused = True
+                self.assertFalse(controller.entry_permission(executor.config, check_funds=False))
+                await session.step(600062, books=[dict(**BOOK, sequence=4, timestamp=600062)])
+                self.assertEqual(executor._entry_lifecycle['stop_reason'], 'modular_entry_permission_revoked')
+            finally:
+                await session.close()
+
+    async def test_a_controller_that_is_not_running_never_retains_a_resting_entry(self):
+        from hummingbot.strategy_v2.models.base import RunnableStatus
+        with tempfile.TemporaryDirectory() as directory:
+            session, executor, controller = await self.resting(directory)
+            try:
+                for status in (RunnableStatus.NOT_STARTED, RunnableStatus.SHUTTING_DOWN, RunnableStatus.TERMINATED):
+                    controller._status = status
+                    self.assertFalse(controller.entry_permission(executor.config, check_funds=False), status)
+            finally:
+                await session.close()

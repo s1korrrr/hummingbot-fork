@@ -33,6 +33,7 @@ from hummingbot.strategy_v2.components.recipe_contract import (
     verify_binding,
 )
 from hummingbot.strategy_v2.components.source_identity import component_source_files
+from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
 
 CONFIG_CLASS = 'MeridianV4Config'
 PROGRAM = 'meridian_v4'
@@ -205,8 +206,14 @@ class MeridianV4Controller(ModularSpotController):
         return not check_funds and self._resting_entry_retained(config)
 
     def _resting_entry_retained(self, config):
+        """Only transient market holds are overridden. Every definitive revocation the native permission applies
+        still ends the entry: the controller is not running or its kill switch is on (the base execution check),
+        an operator entry pause or a sell-only universe, disabled execution or acquisition, a runtime fault, a
+        replaced pending claim, or the entry timeout."""
         c, runtime = self.config, self.runtime
-        if (not c.execution_enabled or c.manual_kill_switch or not c.acquisition_enabled or runtime.fault
+        if (not ControllerBase.validate_executor_config(self, config)
+                or getattr(self, '_operator_entry_paused', False) or c.universe.mode == 'sell_only'
+                or not c.execution_enabled or c.manual_kill_switch or not c.acquisition_enabled or runtime.fault
                 or config is None or runtime.pending.get(config.id) != config):
             return False
         now = self.market_data_provider.time()

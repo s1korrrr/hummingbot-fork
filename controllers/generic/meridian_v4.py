@@ -198,23 +198,36 @@ class MeridianV4Controller(ModularSpotController):
     def entry_permission(self, config, *, check_funds=True):
         if self.config.execution_mode != 'paper' or self.config.recipe_binding is None:
             return False
-        if super().entry_permission(config, check_funds=check_funds):
-            return True
-        # A submitted entry (the executor re-checks with check_funds=False) rests until it fills or reaches
-        # its entry timeout, as in the backtested recipe. Transient market holds (a stale book on any pair of
-        # the shared paper connector, a momentarily wide spread) must not cancel it; definitive revocations do.
-        return not check_funds and self._resting_entry_retained(config)
+        runtime = self.runtime
+        previous = runtime.reason
+        runtime.reason = None  # observe the reason this check sets, if any
+        allowed = super().entry_permission(config, check_funds=check_funds)
+        denial = runtime.reason
+        if denial is None:
+            runtime.reason = previous
+        if allowed or check_funds:
+            return allowed
+        # A submitted entry (the executor re-checks with check_funds=False) rests until it fills or reaches its
+        # entry timeout, as in the backtested recipe. Only one denial is transient and overridden: a data hold
+        # (stale public data on any pair of the shared paper connector). Every other native denial revokes,
+        # including those that set no fault (latched risk rails, revised inputs, fees, spread, a removed claim).
+        return (isinstance(denial, str) and denial.startswith('data_hold:')
+                and self._resting_entry_retained(config))
 
     def _resting_entry_retained(self, config):
-        """Only transient market holds are overridden. Every definitive revocation the native permission applies
-        still ends the entry: the controller is not running or its kill switch is on (the base execution check),
-        an operator entry pause or a sell-only universe, disabled execution or acquisition, a runtime fault, a
-        replaced pending claim, or the entry timeout."""
+        """Conditions a data-held resting entry must still meet: the controller runs without a kill switch (the
+        base execution check), no operator entry pause or sell-only universe, execution and acquisition enabled,
+        no runtime fault, the pending claim unchanged and still owned, no latched risk rail, inside the timeout."""
         c, runtime = self.config, self.runtime
         if (not ControllerBase.validate_executor_config(self, config)
                 or getattr(self, '_operator_entry_paused', False) or c.universe.mode == 'sell_only'
                 or not c.execution_enabled or c.manual_kill_switch or not c.acquisition_enabled or runtime.fault
                 or config is None or runtime.pending.get(config.id) != config):
+            return False
+        state, _ = runtime.ensure_store().load()
+        # The data hold short-circuits native permission before its risk check; a rail already latched in the
+        # persisted decision state still revokes, and the claim must still be owned.
+        if state is None or state.risk_paused or config.id not in state.claims:
             return False
         now = self.market_data_provider.time()
         return 0 <= now - config.timestamp <= c.acquisition.entry_timeout_seconds

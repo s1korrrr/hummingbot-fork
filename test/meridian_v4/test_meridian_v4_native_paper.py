@@ -135,7 +135,7 @@ class MeridianV4RestingEntryTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(receipt['actions']), 1, session.controllers[OWNER].runtime.reason)
         return session.executor_orchestrator.active_executors[OWNER][0]
 
-    async def test_transient_data_hold_and_wide_spread_never_cancel_a_resting_entry(self):
+    async def test_a_transient_data_hold_never_cancels_a_resting_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             session = NativePaperSession(paper(('BNB-USDC', 'ETH-USDC')), [config(execution_enabled=True)],
                                          Path(directory) / 'v4.sqlite')
@@ -146,12 +146,39 @@ class MeridianV4RestingEntryTests(IsolatedAsyncioTestCase):
                 self.assertTrue(session.controllers[OWNER].runtime.reason.startswith('data_hold'))
                 self.assertFalse(executor.is_closed)
                 self.assertIsNotNone(executor._open_order)
-                wide = dict(trading_pair=PAIR, bids=[(98.0, 10)], asks=[(99.51, 10)])  # spread > 0.3%
-                await session.step(600064, books=[dict(**wide, sequence=5, timestamp=600064)])
-                self.assertFalse(executor.is_closed)
-                self.assertIsNotNone(executor._open_order)
             finally:
                 await session.close()
+
+    async def test_only_a_data_hold_is_retained_every_other_native_denial_revokes(self):
+        """Review round 2 (GPT-6.1-Sol): a blocklist missed native denials without a fault (latched drawdown or
+        daily-loss rail, revised inputs, fees above the reserve); retention is an allowlist of the data hold."""
+        cases = ('wide_spread', 'risk_latched', 'risk_latched_during_hold', 'claim_removed')
+        for case in cases:
+            with self.subTest(case), tempfile.TemporaryDirectory() as directory:
+                session = NativePaperSession(paper(('BNB-USDC', 'ETH-USDC')), [config(execution_enabled=True)],
+                                             Path(directory) / 'v4.sqlite')
+                try:
+                    executor = await self.rest_entry(session)
+                    controller = session.controllers[OWNER]
+                    store = controller.runtime.ensure_store()
+                    state, raw = store.load()
+                    book = dict(**BOOK, sequence=4, timestamp=600062)
+                    if case == 'wide_spread':
+                        book = dict(trading_pair=PAIR, bids=[(98.0, 10)], asks=[(99.51, 10)], sequence=4,
+                                    timestamp=600062)  # spread > 0.3%
+                    elif case.startswith('risk_latched'):
+                        self.assertTrue(store.compare_and_swap(raw, state.model_copy(update={'risk_paused': True})))
+                        if case == 'risk_latched_during_hold':
+                            session._connector.invalidate_order_book('ETH-USDC')
+                    else:
+                        controller.runtime.pending.pop(executor.config.id)
+                    if case != 'wide_spread':  # the wide book only exists once the step applies it
+                        self.assertFalse(controller.entry_permission(executor.config, check_funds=False), case)
+                    await session.step(600062, books=[book])
+                    self.assertEqual(executor._entry_lifecycle.get('stop_reason'), 'modular_entry_permission_revoked',
+                                     case)
+                finally:
+                    await session.close()
 
     async def test_definitive_revocations_still_end_a_resting_entry(self):
         with tempfile.TemporaryDirectory() as directory:

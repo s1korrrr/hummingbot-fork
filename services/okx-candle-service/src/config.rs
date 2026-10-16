@@ -40,6 +40,10 @@ pub struct Args {
     /// Enable the separately versioned, bounded Market Picture history projection.
     #[arg(long, default_value_t = false)]
     pub market_picture: bool,
+    /// Explicit JSON configuration for opt-in trades-all and bbo-tbt capture.
+    /// When absent, the observation extension creates no tasks or files.
+    #[arg(long)]
+    pub observations_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]

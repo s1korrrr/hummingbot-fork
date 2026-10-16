@@ -161,6 +161,111 @@ DEFINITIONS = {
         {"formula": "current_pressure-previous_pressure", "range": [-6, 6], "matched_cohort": True},
         "Matched-cohort breadth pressure change in index points.",
     ),
+    "breadth_pressure_1bp": _definition(
+        "breadth_pressure_1bp",
+        "index_minus1_to1",
+        {
+            "formula": "(advances-declines)/valid_count",
+            "advance_if_return_gt": "0.0001",
+            "decline_if_return_lt": "-0.0001",
+            "otherwise": "unchanged",
+            "missing": "excluded_from_valid_count",
+            "range": [-1, 1],
+            "return_unit": "fraction",
+        },
+        "Normalized breadth pressure using a distinct one-basis-point neutral band.",
+    ),
+    "breadth_pressure_change": _definition(
+        "breadth_pressure_change",
+        "index_points",
+        {"formula": "pressure_t-pressure_t_minus_tau", "matched_cohort": True},
+        "Matched-cohort normalized breadth pressure change.",
+    ),
+    "breadth_pressure_velocity": _definition(
+        "breadth_pressure_velocity",
+        "index_points_per_minute",
+        {"formula": "(pressure_t-pressure_t_minus_tau)/tau_minutes", "matched_cohort": True},
+        "Matched-cohort normalized breadth pressure change per minute.",
+    ),
+    "breadth_pressure_acceleration": _definition(
+        "breadth_pressure_acceleration",
+        "index_points_per_minute_squared",
+        {
+            "formula": "(pressure_t-2*pressure_t_minus_tau+pressure_t_minus_2tau)/tau_minutes^2",
+            "matched_cohort": True,
+            "requires_contiguous_endpoints": True,
+        },
+        "Matched-cohort normalized breadth pressure acceleration.",
+    ),
+    "breadth_price_divergence": _definition(
+        "breadth_price_divergence",
+        "count",
+        {
+            "rule": "new_confirmed_24h_close_high_and_pressure_change_negative_or_new_low_and_pressure_change_positive",
+            "prior_range_minutes": 1440,
+            "future_data": False,
+            "descriptive_only": True,
+        },
+        "Causal price and matched breadth disagreement flag; not a pivot or forecast.",
+    ),
+    "contribution_top5_abs": _definition(
+        "contribution_top5_abs",
+        "share_fraction",
+        {
+            "formula": "sum(top5(abs(weight_i*return_i)))/sum(abs(weight_i*return_i))",
+            "weight_source": "frozen_prior_interval_weights",
+            "missing_positive_weight_member": "unavailable",
+            "zero_gross_threshold": "1e-12",
+        },
+        "Top-five absolute return contribution share using frozen prior weights.",
+    ),
+    "cohort_equal_weight_return": _definition(
+        "cohort_equal_weight_return",
+        "return_percent",
+        {
+            "formula": "sum(r_i)/N_start",
+            "weights": "equal_at_interval_start",
+            "missing_positive_weight_member": "unavailable",
+        },
+        "Full frozen-cohort equal-weight return.",
+    ),
+    "cohort_capped_liquidity_return": _definition(
+        "cohort_capped_liquidity_return",
+        "return_percent",
+        {
+            "formula": "sum(w_i*r_i)",
+            "weights": "previous_completed_utc_day_quote_turnover",
+            "cap": "0.10",
+            "redistribution": "iterative_proportional_uncapped",
+            "minimum_positive_members": 10,
+            "missing_positive_weight_member": "unavailable",
+        },
+        "Full frozen-cohort return with capped prior-day liquidity weights.",
+    ),
+    "return_concentration_abs_top5_equal": _definition(
+        "return_concentration_abs_top5_equal",
+        "share_fraction",
+        {
+            "formula": "sum(top5(abs(r_i/N)))/sum(abs(r_i/N))",
+            "weights": "equal_at_interval_start",
+            "zero_gross_threshold": "1e-12",
+            "missing_positive_weight_member": "unavailable",
+        },
+        "Top-five absolute contribution share under equal start weights.",
+    ),
+    "return_concentration_abs_top5_capped_liquidity": _definition(
+        "return_concentration_abs_top5_capped_liquidity",
+        "share_fraction",
+        {
+            "formula": "sum(top5(abs(w_i*r_i)))/sum(abs(w_i*r_i))",
+            "weights": "previous_completed_utc_day_quote_turnover",
+            "cap": "0.10",
+            "redistribution": "iterative_proportional_uncapped",
+            "zero_gross_threshold": "1e-12",
+            "missing_positive_weight_member": "unavailable",
+        },
+        "Top-five absolute contribution share under capped prior-day liquidity weights.",
+    ),
     "rvol_delta": _definition(
         "rvol_delta",
         "ratio_points",
@@ -172,6 +277,17 @@ DEFINITIONS = {
         "percentage_points",
         {"formula": "100*(current_share-previous_share)", "matched_cohort": True, "comparison_horizon": "1h"},
         "Matched-cohort one-hour change in participation share, in percentage points.",
+    ),
+    "breadth_advancing_share_change": _definition(
+        "breadth_advancing_share_change",
+        "percentage_points",
+        {
+            "formula": "100*(share_now-share_prior)",
+            "matched_cohort": True,
+            "comparison_window": "metric-specific tau encoded in metric_id",
+            "advancing_threshold": "strictly-greater-than-1bp simple return",
+        },
+        "Matched-cohort change in advancing share over the declared trajectory interval, in percentage points.",
     ),
     "volatility_delta": _definition(
         "volatility_delta",
@@ -252,6 +368,186 @@ DEFINITIONS = {
         {"length": 21, "seed": "first-close", "adjust": False},
         "Causal EMA21 of confirmed closes.",
     ),
+    "daily_high_break_20d": _definition(
+        "daily_high_break_20d",
+        "count",
+        {
+            "current": "confirmed-daily-high",
+            "prior_days": 20,
+            "comparison": "strict-greater-than",
+            "interval": "1d-utc",
+        },
+        "Current confirmed UTC daily high above the prior 20 completed UTC daily highs.",
+    ),
+    "daily_low_break_20d": _definition(
+        "daily_low_break_20d",
+        "count",
+        {"current": "confirmed-daily-low", "prior_days": 20, "comparison": "strict-less-than", "interval": "1d-utc"},
+        "Current confirmed UTC daily low below the prior 20 completed UTC daily lows.",
+    ),
+    "daily_close_break_high_20d": _definition(
+        "daily_close_break_high_20d",
+        "count",
+        {
+            "current": "confirmed-daily-close",
+            "prior_days": 20,
+            "range": "prior-daily-highs",
+            "comparison": "strict-greater-than",
+            "interval": "1d-utc",
+        },
+        "Current confirmed UTC daily close above the prior 20 completed daily highs.",
+    ),
+    "daily_close_break_low_20d": _definition(
+        "daily_close_break_low_20d",
+        "count",
+        {
+            "current": "confirmed-daily-close",
+            "prior_days": 20,
+            "range": "prior-daily-lows",
+            "comparison": "strict-less-than",
+            "interval": "1d-utc",
+        },
+        "Current confirmed UTC daily close below the prior 20 completed daily lows.",
+    ),
+    **{
+        key: _definition(
+            key,
+            unit,
+            parameters,
+            description,
+        )
+        for key, unit, parameters, description in (
+            (
+                f"daily_sma_{window}",
+                "price_quote",
+                {
+                    "window_days": window,
+                    "formula": f"mean(last_{window}_confirmed_utc_daily_closes)",
+                    "interval": "1d-utc",
+                    "decimal_precision": 28,
+                    "rounding": "ROUND_HALF_EVEN",
+                    "serialization": "fixed-strip-trailing-zero",
+                },
+                f"Simple moving average of the latest {window} confirmed UTC daily closes.",
+            )
+            for window in (20, 50, 200)
+        )
+    },
+    **{
+        metric_id: _definition(metric_id, unit, parameters, description)
+        for window in (20, 50, 200)
+        for metric_id, unit, parameters, description in (
+            (
+                f"above_sma{window}_share",
+                "share_fraction",
+                {"interval": "1h", "window_bars": window, "formula": "close_t>sma_t", "strict": True},
+                f"Share of valid assets whose latest confirmed hourly close is above SMA{window}.",
+            ),
+            (
+                f"sma{window}_slope_pct_per_hour_median",
+                "return_percent",
+                {
+                    "interval": "1h",
+                    "window_bars": window,
+                    "formula": "100*(sma_t/sma_t_minus_1-1)",
+                    "aggregation": "median",
+                },
+                f"Median one-hour percentage change in confirmed hourly SMA{window}.",
+            ),
+            (
+                f"sma{window}_cross_up_count",
+                "instruments",
+                {
+                    "interval": "1h",
+                    "window_bars": window,
+                    "formula": "close_prev<=sma_prev and close_t>sma_t",
+                    "missing_comparison": "unavailable",
+                },
+                f"Valid assets crossing above confirmed hourly SMA{window}.",
+            ),
+            (
+                f"sma{window}_cross_down_count",
+                "instruments",
+                {
+                    "interval": "1h",
+                    "window_bars": window,
+                    "formula": "close_prev>=sma_prev and close_t<sma_t",
+                    "missing_comparison": "unavailable",
+                },
+                f"Valid assets crossing below confirmed hourly SMA{window}.",
+            ),
+        )
+    },
+    **{
+        f"trend_class_{label}_count": _definition(
+            f"trend_class_{label}_count",
+            "instruments",
+            {
+                "interval": "1h",
+                "bullish": "close>SMA20>SMA50 and SMA20_t>SMA20_t_minus_3h",
+                "bearish": "close<SMA20<SMA50 and SMA20_t<SMA20_t_minus_3h",
+                "otherwise": "neutral",
+                "minimum_bars": 53,
+                "valid_population_only": True,
+            },
+            f"Valid hourly trend-classified assets counted as {label}.",
+        )
+        for label in ("bullish", "bearish", "neutral")
+    },
+    "efficiency_ratio_20_median": _definition(
+        "efficiency_ratio_20_median",
+        "ratio",
+        {
+            "interval": "1h",
+            "window_bars": 20,
+            "formula": "abs(close_t-close_t_minus_20)/sum(abs(delta_close))",
+            "flat_complete_path": "0",
+            "minimum_bars": 21,
+            "aggregation": "median",
+        },
+        "Median 20-hour close-path efficiency over complete confirmed hourly bars.",
+    ),
+    **{
+        key: _definition(
+            key,
+            unit,
+            parameters,
+            description,
+        )
+        for window in (20, 50, 200)
+        for key, unit, parameters, description in (
+            (
+                f"daily_sma_{window}_above_close",
+                "share_fraction",
+                {"window_days": window, "formula": "close_t>sma_t", "interval": "1d-utc"},
+                f"Whether the latest confirmed daily close is above daily SMA{window}.",
+            ),
+            (
+                f"daily_sma_{window}_slope_pct_per_day",
+                "return_percent",
+                {
+                    "window_days": window,
+                    "formula": "100*(sma_t/sma_t_minus_1-1)",
+                    "step": "one-utc-day",
+                    "decimal_precision": 28,
+                    "rounding": "ROUND_HALF_EVEN",
+                    "serialization": "fixed-strip-trailing-zero",
+                },
+                f"One-UTC-day percent change in daily SMA{window}.",
+            ),
+            (
+                f"daily_sma_{window}_cross",
+                "index_points",
+                {
+                    "window_days": window,
+                    "formula": "cross-up=1,cross-down=-1,otherwise=0",
+                    "requires": "previous-and-current-confirmed-close-and-sma",
+                    "interval": "1d-utc",
+                },
+                f"Close crossing daily SMA{window}: +1 up, -1 down, 0 no cross.",
+            ),
+        )
+    },
     "rsi14_wilder": _definition(
         "rsi14_wilder",
         "rsi_0_100",
@@ -391,6 +687,69 @@ DEFINITIONS = {
         {"formula": "asset_return_pct-benchmark_return_pct", "matched_horizon": True},
         "Same-horizon arithmetic relative return in percentage points.",
     ),
+    "relative_return_delta": _definition(
+        "relative_return_delta",
+        "percentage_points",
+        {
+            "formula": "median(current_asset_minus_benchmark_24h)-median(previous_asset_minus_benchmark_24h)",
+            "comparison_interval_minutes": 60,
+            "matched_cohort": True,
+            "source_metric": "RANK03_simple_relative_24h",
+        },
+        "One-hour change in median existing 24-hour benchmark-relative return.",
+    ),
+    "dictionary_rvol_1h": _definition(
+        "dictionary_rvol_1h",
+        "ratio",
+        {
+            "interval": "1h",
+            "current": "latest-completed-hour-quote-turnover",
+            "baseline": "median-previous-20-complete-nonoverlapping-hour-turnovers",
+            "exclude_current": True,
+            "zero_baseline": "unavailable",
+        },
+        "Completed-hour quote turnover divided by the median of the preceding 20 complete hourly turnovers.",
+    ),
+    "dictionary_rvol_1h_high": _definition(
+        "dictionary_rvol_1h_high",
+        "count",
+        {"source_definition_id": "dictionary_rvol_1h", "threshold": ">=2", "strict": False},
+        "Per-instrument high-RVOL candidate under the separate dictionary hourly definition.",
+    ),
+    "bollinger_inside_ema_atr_compression_1h": _definition(
+        "bollinger_inside_ema_atr_compression_1h",
+        "count",
+        {
+            "interval": "1h",
+            "bollinger": "SMA20+/-2*population_std(last_20_closes)",
+            "envelope": "EMA20+/-1.5*WilderATR20",
+            "ema": {"seed": "first-close", "adjust": False, "warmup_bars": 60},
+            "atr": {"true_range": True, "length": 20, "smoothing": "Wilder", "seed": "mean-first-20"},
+            "inside": "lower_bollinger>lower_envelope and upper_bollinger<upper_envelope",
+            "strict": True,
+        },
+        "Compression candidate when the confirmed hourly Bollinger band lies strictly inside the EMA/ATR envelope.",
+    ),
+    "realized_volatility_24h_hourly_annualized": _definition(
+        "realized_volatility_24h_hourly_annualized",
+        "volatility_fraction_annualized",
+        {"interval": "1h", "returns": 24, "log": True, "ddof": 1, "periods_per_year": 8760},
+        "Annualized sample volatility of the latest 24 confirmed hourly log returns.",
+    ),
+    "extreme_realized_volatility_1h_95p": _definition(
+        "extreme_realized_volatility_1h_95p",
+        "count",
+        {
+            "source_definition_id": "realized_volatility_24h_hourly_annualized",
+            "reference_observations": 720,
+            "percentile": 95,
+            "interpolation": "linear",
+            "exclude_current": True,
+            "comparison": "current>prior_percentile",
+            "minimum_hourly_closes": 745,
+        },
+        "Extreme-volatility candidate above the trailing 95th percentile of 720 prior 24-hour hourly volatility observations.",
+    ),
     "leaders_laggards": _definition(
         "leaders_laggards",
         "return_percent",
@@ -446,6 +805,18 @@ EVENT_PARAMETERS = {
         "interval_ms": 60000,
         "missing": "break-consecutive-chain",
     },
+    "breadth_thrust_event": {
+        "source": "normalized_15m_advance_share",
+        "matched_cohort": "full-frozen-universe-throughout",
+        "expansion_change_pp": ">=15 over 15m",
+        "expansion_persistence": ">=0.60 for final three consecutive 1m endpoints",
+        "contraction_change_pp": "<=-15 over 15m",
+        "contraction_persistence": "<=0.40 for final three consecutive 1m endpoints",
+        "minimum_coverage": "1.0",
+        "definition_registry_stable": True,
+        "missing_or_gap": "break-chain",
+        "restart_identity": "stable-occurrence-key",
+    },
     "trend_continuation_event": {
         "source": "adx14_wilder",
         "adx_above": "25",
@@ -496,6 +867,62 @@ for _event_id, _event_parameters in EVENT_PARAMETERS.items():
         _event_parameters,
         "Descriptive persisted event occurrence; never an order or trading permission.",
     )
+
+for _micro_id, _micro_unit, _micro_parameters, _micro_description in (
+    (
+        "spot_executed_flow_1m",
+        "volume_quote",
+        {
+            "window_ms": 60000,
+            "window": "half-open",
+            "side": "verified-aggressor",
+            "aggregate_quantity": "already-summed-count-not-multiplier",
+            "unknown": "separate-notional-no-confirmation",
+            "duplicate": "channel-instrument-trade-id-with-overlap-rejection",
+            "cumulative": "explicit-reset-no-gap-bridge",
+        },
+        "Executed spot buy/sell/unknown notional; never derived from candle direction.",
+    ),
+    (
+        "spot_visible_book_cost",
+        "basis_points",
+        {
+            "reference": "mid",
+            "size": "explicit-base-or-quote",
+            "max_age_ms": 5000,
+            "partial": "covered-vwap-only-full-size-null",
+            "fees": "separate-provenance-required",
+            "access": "non-rpi-or-explicit-rpi",
+            "band_bps": "explicit",
+            "replay": "snapshot-only",
+        },
+        "Visible-book walk at an explicit size and access basis, without a fill promise.",
+    ),
+    (
+        "spot_visible_band_depth",
+        "volume_quote",
+        {
+            "band_bps": "explicit",
+            "coverage": "both-observed-sides-reach-boundary",
+            "rpi": "total-includes-organic-subset",
+            "max_age_ms": 5000,
+        },
+        "Covered visible notional; full-band imbalance requires full boundary coverage.",
+    ),
+    (
+        "spot_liquidity_percentile_7d",
+        "share_fraction",
+        {
+            "completed_minutes": 10080,
+            "minimum_coverage": 0.9,
+            "ties": "midrank",
+            "current_excluded": True,
+            "comparison": "same-instrument-definition-side-size-unit-size-access",
+        },
+        "Comparable past-minute liquidity percentile with seven-day coverage.",
+    ),
+):
+    DEFINITIONS[_micro_id] = _definition(_micro_id, _micro_unit, _micro_parameters, _micro_description)
 
 REGISTRY_HASH = sha256(
     canonical_json({key: value.definition_hash for key, value in sorted(DEFINITIONS.items())}).encode()

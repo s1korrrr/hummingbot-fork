@@ -309,6 +309,7 @@ class MeridianUnifiedController(ControllerBase):
             if target is not None:
                 change = next(str(q.change) for q in target.quantities if q.symbol == pair)
             rows[pair] = {'entry_enabled': entries[pair], 'status': context.runtime.reason.split(':', 1)[0][:80],
+                          'last_decision': context.runtime.last_decision,
                           'bag': context.runtime.bag_status, 'target_change': change,
                           'priority': self.config.priority.index(pair) + 1}
         return {
@@ -354,5 +355,7 @@ class MeridianUnifiedController(ControllerBase):
                  f'execution={self.config.execution_enabled} | portfolio={self.portfolio.status.get("reason")}',
                  f'  {self.market_context.status_line()}']
         for pair, context in self.contexts.items():
-            lines.append(f'  {pair}: {context.runtime.reason} | bag={context.runtime.bag_status}')
+            last = context.runtime.last_decision
+            decided = '' if last is None else f' (last decision: {last["reason"]} @ candle {last["candle"]})'
+            lines.append(f'  {pair}: {context.runtime.reason}{decided} | bag={context.runtime.bag_status}')
         return lines

@@ -44,6 +44,8 @@ class ModularRuntime:
         self.reason = 'execution_disabled'
         self.coverage = None
         self.bag_status = None  # last bag tick: reason, trail, held amount/breakeven, release state
+        # Last entry decision that evaluated a candle; later ticks of that candle report `same_candle`.
+        self.last_decision = None
         self.bindings.guard_resume(controller, self.bindings.recorder())
         self.pool = attach_pool(controller.market_data_provider, controller.config)
 
@@ -384,6 +386,9 @@ class ModularRuntime:
             if revised != state and not store.compare_and_swap(raw, revised):
                 raise PolicyError('decision CAS conflict; no dispatch')
             self.reason = permission_reason if reason == 'acquisition_disabled' else reason
+            if reason != 'same_candle':
+                self.last_decision = {'reason': self.reason[:200], 'candle': market.candle_open,
+                                      'at': self.controller.market_data_provider.time()}
             recovery = self._pending_recovery_ids()
             self.pending = {key: value for key, value in self.pending.items()
                             if key in revised.claims or key in recovery}

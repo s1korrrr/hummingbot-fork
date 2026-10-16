@@ -79,6 +79,7 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
         return revised, None, 'seeded'
     if market.candle_open == state.candle:
         return revised, None, 'same_candle'
+    unconsumed = revised
     revised = revised.model_copy(update={'candle': market.candle_open})
     if now - revised.last_entry_time < acquisition.cooldown_seconds:
         return revised, None, 'cooldown'
@@ -86,7 +87,9 @@ def plan(state, inventory, *, fingerprint, budget, now, market, bid, ask, availa
     if pause is not None and now < decimal(pause, 'flash pause'):  # research order: cooldown, flash pause, gaps
         return revised, None, 'flash_crash_pause'
     if (ask - bid) / bid > risk.max_spread_fraction:
-        return revised, None, 'spread_limit'
+        # The book is a per-tick observation, not a property of the closed candle: a momentarily wide spread
+        # must not consume the candle, so the next tick re-evaluates it (one evaluation per candle is unchanged).
+        return unconsumed, None, 'spread_limit'
     signal_result = signal_decision(signal, previous_rsi=market.previous_rsi, rsi=market.rsi,
                                     breakout=market.breakout, trend_up=market.trend_up,
                                     turn=getattr(market, 'turn', False), score=getattr(market, 'score', 0),

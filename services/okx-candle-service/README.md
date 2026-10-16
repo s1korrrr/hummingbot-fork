@@ -111,7 +111,8 @@ Market Picture cache recovery verifies the original digest and every row before 
 
 ## Bounded collection and recovery
 
-The collector uses fixed `wss://ws.okx.com:8443/ws/v5/business` (`candle1m`) and
+The collector uses fixed `wss://ws.okx.com/ws/v5/business` (`candle1m`) on the
+default secure WebSocket port and
 `https://www.okx.com/api/v5/market/candles` for the latest page, followed by
 `https://www.okx.com/api/v5/market/history-candles` for older pages. Both REST
 paths fix `bar=1m`; each page has at most 300 rows and older pages use
@@ -119,7 +120,10 @@ paths fix `bar=1m`; each page has at most 300 rows and older pages use
 forming bar. Pagination must move strictly backward and uses at most
 `ceil(history/300)+2` requests per attempt. All connections use verified TLS; REST environmental proxies and redirects are disabled and the
 WebSocket connector connects directly without redirect following. No endpoint
-can be overridden. See [OKX API documentation](https://www.okx.com/docs-v5/en/).
+can be overridden. OKX announced that WebSocket port 8443 will stop accepting
+connections on 2026-10-31; this collector uses port 443. See the
+[port discontinuation notice](https://www.okx.com/en-eu/help/okx-websocket-port-8443-discontinuation-announcement)
+and [OKX API documentation](https://www.okx.com/docs-v5/en/).
 
 Each upstream socket owns at most 100 pairs. Attempts are paced at least 1050ms
 apart across this process, including retries, with 1–30 second reconnect backoff.

@@ -356,41 +356,12 @@ fn derived_bar_content_hash(payload: &Value) -> Result<String> {
 fn validate_raw_frame_dispositions(
     entries: &[crate::observation_journal::JournalEntry],
 ) -> Result<()> {
-    let mut processed = BTreeSet::new();
-    let mut raw = BTreeSet::new();
+    let mut pending = BTreeMap::new();
     for entry in entries {
-        let Some(channel) = entry.payload.get("channel").and_then(Value::as_str) else {
-            continue;
-        };
-        if entry.payload.get("event").and_then(Value::as_str) == Some("raw_frame") {
-            if let Some(sequence) = entry
-                .payload
-                .get("receive_sequence")
-                .and_then(Value::as_u64)
-            {
-                raw.insert((channel.to_owned(), sequence));
-            }
-            continue;
-        }
-        if !is_terminal_raw_disposition(&entry.payload) {
-            continue;
-        }
-        let sequence = entry
-            .payload
-            .get("receive_sequence")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                entry
-                    .payload
-                    .get("raw_frame_sequence")
-                    .and_then(Value::as_u64)
-            });
-        if let Some(sequence) = sequence {
-            processed.insert((channel.to_owned(), sequence));
-        }
+        account_raw_frame_disposition(&mut pending, &entry.payload, usize::MAX)?;
     }
     ensure!(
-        raw.iter().all(|frame| processed.contains(frame)),
+        pending.is_empty(),
         "journal contains raw frames without a durable normalized or rejection disposition; operator recovery is required"
     );
     Ok(())
@@ -408,6 +379,93 @@ fn is_terminal_raw_disposition(payload: &Value) -> bool {
     )
 }
 
+type RawFrameKey = (String, String, u64);
+
+fn expected_raw_frame_dispositions(payload: &Value) -> usize {
+    payload
+        .get("raw_text")
+        .and_then(Value::as_str)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|frame| {
+            // An event or ACK is handled as one complete source frame even if
+            // it carries a `data` field. Only data frames have per-item exits.
+            if frame.get("event").is_some() {
+                Some(1)
+            } else {
+                frame.get("data").and_then(Value::as_array).map(Vec::len)
+            }
+        })
+        .filter(|count| (1..=1000).contains(count))
+        .unwrap_or(1)
+}
+
+fn account_raw_frame_disposition(
+    pending: &mut BTreeMap<RawFrameKey, usize>,
+    payload: &Value,
+    max_pending: usize,
+) -> Result<()> {
+    let Some(channel) = payload.get("channel").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let epoch = payload
+        .get("source_epoch")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let event = payload.get("event").and_then(Value::as_str).unwrap_or("");
+    if event == "raw_frame" {
+        let sequence = payload
+            .get("receive_sequence")
+            .and_then(Value::as_u64)
+            .context("raw frame has no receive sequence")?;
+        ensure!(
+            pending.len() < max_pending,
+            "unresolved raw-frame dispositions exceed configured bound"
+        );
+        ensure!(
+            pending
+                .insert(
+                    (channel.to_owned(), epoch.to_owned(), sequence),
+                    expected_raw_frame_dispositions(payload),
+                )
+                .is_none(),
+            "duplicate raw frame sequence in one source epoch"
+        );
+        return Ok(());
+    }
+    if !is_terminal_raw_disposition(payload) {
+        return Ok(());
+    }
+    let sequence = payload
+        .get("raw_frame_sequence")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            (event == "subscription_ack")
+                .then(|| payload.get("receive_sequence").and_then(Value::as_u64))
+                .flatten()
+        });
+    if let Some(sequence) = sequence {
+        let key = (channel.to_owned(), epoch.to_owned(), sequence);
+        let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("");
+        if matches!(
+            reason,
+            "INVALID_BATCH_SIZE"
+                | "DATA_NOT_ARRAY"
+                | "CHANNEL_MISSING"
+                | "INSTRUMENT_MISSING"
+                | "INSTRUMENT_OUTSIDE_CATALOGUE"
+                | "UNREQUESTED_CHANNEL"
+        ) {
+            pending.remove(&key);
+        } else if let Some(remaining) = pending.get_mut(&key) {
+            *remaining -= 1;
+            if *remaining == 0 {
+                pending.remove(&key);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct ChannelReplayInventory {
     earliest_trade_event_ms: Option<u64>,
@@ -422,92 +480,9 @@ fn validate_raw_frame_dispositions_stream(
     root: &std::path::Path,
     max_pending: usize,
 ) -> Result<()> {
-    type Key = (String, String, u64);
-    let mut pending = BTreeMap::<Key, usize>::new();
+    let mut pending = BTreeMap::new();
     crate::observation_journal::visit_verified_records(root, |entry| {
-        let Some(channel) = entry.payload.get("channel").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let epoch = entry
-            .payload
-            .get("source_epoch")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if entry.payload.get("event").and_then(Value::as_str) == Some("raw_frame") {
-            let Some(sequence) = entry
-                .payload
-                .get("receive_sequence")
-                .and_then(Value::as_u64)
-            else {
-                bail!("raw frame has no receive sequence")
-            };
-            let expected = entry
-                .payload
-                .get("raw_text")
-                .and_then(Value::as_str)
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                .and_then(|frame| frame.get("data").and_then(Value::as_array).map(Vec::len))
-                .filter(|count| (1..=1000).contains(count))
-                .unwrap_or(1);
-            ensure!(
-                pending.len() < max_pending,
-                "unresolved raw-frame dispositions exceed configured bound"
-            );
-            ensure!(
-                pending
-                    .insert((channel.to_owned(), epoch.to_owned(), sequence), expected)
-                    .is_none(),
-                "duplicate raw frame sequence in one source epoch"
-            );
-            return Ok(());
-        }
-        let event = entry
-            .payload
-            .get("event")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !is_terminal_raw_disposition(&entry.payload) {
-            return Ok(());
-        }
-        let sequence = entry
-            .payload
-            .get("raw_frame_sequence")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                (event == "subscription_ack")
-                    .then(|| {
-                        entry
-                            .payload
-                            .get("receive_sequence")
-                            .and_then(Value::as_u64)
-                    })
-                    .flatten()
-            });
-        if let Some(sequence) = sequence {
-            let key = (channel.to_owned(), epoch.to_owned(), sequence);
-            let reason = entry
-                .payload
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if matches!(
-                reason,
-                "INVALID_BATCH_SIZE"
-                    | "DATA_NOT_ARRAY"
-                    | "CHANNEL_MISSING"
-                    | "INSTRUMENT_MISSING"
-                    | "INSTRUMENT_OUTSIDE_CATALOGUE"
-                    | "UNREQUESTED_CHANNEL"
-            ) {
-                pending.remove(&key);
-            } else if let Some(remaining) = pending.get_mut(&key) {
-                *remaining -= 1;
-                if *remaining == 0 {
-                    pending.remove(&key);
-                }
-            }
-        }
-        Ok(())
+        account_raw_frame_disposition(&mut pending, &entry.payload, max_pending)
     })?;
     ensure!(
         pending.is_empty(),
@@ -734,6 +709,39 @@ pub fn websocket_endpoint(settings: &ObservationSettings, channel: &str) -> Resu
     }
 }
 
+async fn drain_capture_tasks(
+    tasks: &mut JoinSet<Result<()>>,
+    first: &mut Result<()>,
+    max_wait: Duration,
+) -> Result<()> {
+    if timeout(max_wait, async {
+        while let Some(result) = tasks.join_next().await {
+            if first.is_ok() {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => *first = Err(error),
+                    Err(error) => {
+                        *first = Err(anyhow::anyhow!(
+                            "observation channel task panicked: {error}"
+                        ))
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        bail!(
+            "observation shutdown drain exceeded {} seconds; operator must verify raw-frame dispositions before restart",
+            max_wait.as_secs()
+        );
+    }
+    Ok(())
+}
+
 pub async fn run_with_state(
     settings: ObservationSettings,
     state: Arc<CaptureState>,
@@ -947,8 +955,14 @@ pub async fn run_with_state(
         }
     };
     stop.cancel();
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    // A raw frame is journaled before its item dispositions. Let an in-flight
+    // source branch finish that durable unit before closing the journal.
+    // Stalled I/O remains bounded and is reported as an incomplete shutdown.
+    let mut first = first;
+    if let Err(error) = drain_capture_tasks(&mut tasks, &mut first, Duration::from_secs(120)).await
+    {
+        first = Err(error);
+    }
     journal.shutdown().await?;
     let mut health = state.health_snapshot()?;
     health.running = false;
@@ -1004,10 +1018,21 @@ async fn run_channel(
                 .source_epochs
                 .insert(channel.clone(), source_epoch.clone());
         }
-        let result = tokio::select! {
-            _ = stop.cancelled() => break,
-            result = connect_and_capture(&settings, &journal, &stop, &channel, &source_epoch, &connection_id, &mut dedup, &mut time_bars, &mut notional_bars, &state) => result,
-        };
+        // Session checks cancellation only between complete durable frame or
+        // timer branches. Cancelling this future here could orphan a raw frame.
+        let result = connect_and_capture(
+            &settings,
+            &journal,
+            &stop,
+            &channel,
+            &source_epoch,
+            &connection_id,
+            &mut dedup,
+            &mut time_bars,
+            &mut notional_bars,
+            &state,
+        )
+        .await;
         let reason = match result {
             Ok(()) => "source_closed",
             Err(error) => {
@@ -1295,7 +1320,7 @@ where
                         submit_record(journal, state, rejection_payload(channel, source_epoch, raw_frame_sequence, &raw_sha256, receive_at_ms, "UNEXPECTED_SOURCE_EVENT")).await?;
                         bail!("unexpected observation source event");
                     }
-                    let Some(channel) = frame.get("arg").and_then(|arg| arg.get("channel")).and_then(Value::as_str) else {
+                    let Some(frame_channel) = frame.get("arg").and_then(|arg| arg.get("channel")).and_then(Value::as_str) else {
                         submit_record(journal, state, rejection_payload(channel, source_epoch, raw_frame_sequence, &raw_sha256, receive_at_ms, "ACK_CHANNEL_MISSING")).await?;
                         bail!("subscription ack channel missing");
                     };
@@ -1303,7 +1328,7 @@ where
                         submit_record(journal, state, rejection_payload(channel, source_epoch, raw_frame_sequence, &raw_sha256, receive_at_ms, "ACK_INSTRUMENT_MISSING")).await?;
                         bail!("subscription ack instrument missing");
                     };
-                    if channel != requested[0]["channel"].as_str().unwrap_or_default() || !metadata.contains_key(inst_id) {
+                    if frame_channel != channel || !metadata.contains_key(inst_id) {
                         submit_record(journal, state, rejection_payload(channel, source_epoch, raw_frame_sequence, &raw_sha256, receive_at_ms, "UNREQUESTED_ACK")).await?;
                         bail!("acknowledged unrequested subscription");
                     }
@@ -1315,7 +1340,7 @@ where
                         "receive_sequence":receive_sequence,"raw_sha256":raw_sha256,"raw_payload":frame})).await?;
                     continue;
                 }
-                let Some(channel) = frame.get("arg").and_then(|arg| arg.get("channel")).and_then(Value::as_str) else {
+                let Some(frame_channel) = frame.get("arg").and_then(|arg| arg.get("channel")).and_then(Value::as_str) else {
                     submit_record(journal, state, rejection_payload(channel, source_epoch, raw_frame_sequence, &raw_sha256, receive_at_ms, "CHANNEL_MISSING")).await?;
                     bail!("observation channel missing");
                 };
@@ -1327,7 +1352,7 @@ where
                     submit_record(journal, state, rejection_payload(channel, source_epoch, raw_frame_sequence, &raw_sha256, receive_at_ms, "INSTRUMENT_OUTSIDE_CATALOGUE")).await?;
                     bail!("observation instrument outside configured catalogue");
                 };
-                if channel != requested[0]["channel"].as_str().unwrap_or_default() {
+                if frame_channel != channel {
                     submit_record(journal, state, rejection_payload(channel, source_epoch, raw_frame_sequence, &raw_sha256, receive_at_ms, "UNREQUESTED_CHANNEL")).await?;
                     bail!("received unrequested observation channel");
                 }
@@ -1400,6 +1425,10 @@ where
                                     "event":"trade_conflict","instrument_id":instrument.instrument_id,"channel":channel,
                                     "trade_id":trade.trade_id,"source_epoch":source_epoch,"raw_frame_sequence":raw_frame_sequence,
                                     "available_at_ms":receive_at_ms})).await?;
+                                reject_remaining_batch(journal, state, RejectBatch {
+                                    channel, source_epoch, raw_frame_sequence, raw_sha256: &raw_sha256,
+                                    available_at_ms: receive_at_ms,
+                                }, data.len().saturating_sub(payload_index + 1)).await?;
                                 state.fail(format!("conflicting duplicate trade: {error:#}"));
                                 return Err(error);
                             }
@@ -2024,6 +2053,186 @@ mod tests {
             json!({"event":"late_for_finalized_bar","channel":"trades-all","raw_frame_sequence":7}),
         );
         assert!(validate_raw_frame_dispositions(&[raw, late]).is_err());
+    }
+
+    #[test]
+    fn in_memory_validator_counts_source_event_once_even_with_data() {
+        let entry = |payload| crate::observation_journal::JournalEntry {
+            cursor: JournalCursor {
+                segment: 0,
+                sequence: 1,
+                hash: "a".repeat(64),
+            },
+            payload,
+        };
+        let raw = entry(json!({"event":"raw_frame","channel":"bbo-tbt",
+            "source_epoch":"fixture","receive_sequence":9,
+            "raw_text":"{\"event\":\"subscribe\",\"data\":[{},{}]}"}));
+        let ack = entry(json!({"event":"subscription_ack","channel":"bbo-tbt",
+            "source_epoch":"fixture","receive_sequence":9}));
+        assert!(validate_raw_frame_dispositions(&[raw, ack]).is_ok());
+    }
+
+    async fn rejected_source_frame_keeps_replayable_journal(channel: &str, frames: Vec<Value>) {
+        let root = std::env::temp_dir().join(format!("observation-rejection-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut settings = settings(root.to_string_lossy().into_owned());
+        settings.channels = vec![channel.into()];
+        let state = CaptureState::new(&settings).unwrap();
+        let journal = JournalWorker::start(&root, 16 * 1024, 16).unwrap();
+        let stop = CancellationToken::new();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await.unwrap().unwrap();
+            for frame in frames {
+                socket
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let (client, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let mut dedup = TradeDeduplicator::new(64).unwrap();
+        let mut time_bars = BTreeMap::from([(
+            "okx:spot:BTC-USDC".to_string(),
+            FixedTimeBars::new_at(60_000, 0).unwrap(),
+        )]);
+        let mut notional_bars = BTreeMap::new();
+        assert!(
+            session(
+                &settings,
+                &journal,
+                &stop,
+                client,
+                channel,
+                "fixture-epoch",
+                "fixture-connection",
+                &mut dedup,
+                &mut time_bars,
+                &mut notional_bars,
+                &state,
+            )
+            .await
+            .is_err()
+        );
+        server.await.unwrap();
+        journal.shutdown().await.unwrap();
+        let entries = read_verified_records(&root).unwrap();
+        if channel == "trades-all" {
+            assert!(
+                entries
+                    .iter()
+                    .any(|entry| entry.payload["event"] == "trade_conflict")
+            );
+        }
+        assert!(
+            validate_raw_frame_dispositions_stream(&root, 100).is_ok(),
+            "a rejected raw frame must have a complete durable disposition"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unexpected_frame_channel_rejection_preserves_raw_lineage() {
+        rejected_source_frame_keeps_replayable_journal(
+            "bbo-tbt",
+            vec![json!({"event":"subscribe","arg":{"channel":"books","instId":"BTC-USDC"}})],
+        )
+        .await;
+        rejected_source_frame_keeps_replayable_journal(
+            "bbo-tbt",
+            vec![json!({"arg":{"channel":"books","instId":"BTC-USDC"},"data":[{}]})],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn trade_conflict_disposes_remaining_frame_items_before_stop() {
+        let ts = wall_ms().unwrap().saturating_sub(1).to_string();
+        rejected_source_frame_keeps_replayable_journal(
+            "trades-all",
+            vec![
+                json!({"arg":{"channel":"trades-all","instId":"BTC-USDC"},"data":[
+                    {"instId":"BTC-USDC","tradeId":"777","px":"100","sz":"1","side":"buy","ts":ts},
+                    {"instId":"BTC-USDC","tradeId":"777","px":"101","sz":"1","side":"buy","ts":ts},
+                    {"instId":"BTC-USDC","tradeId":"778","px":"100","sz":"1","side":"buy","ts":ts}
+                ]}),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn source_event_data_array_is_one_frame_disposition() {
+        rejected_source_frame_keeps_replayable_journal(
+            "bbo-tbt",
+            vec![
+                json!({"event":"subscribe","arg":{"channel":"books","instId":"BTC-USDC"},
+                "data":[{},{}]}),
+            ],
+        )
+        .await;
+        rejected_source_frame_keeps_replayable_journal(
+            "bbo-tbt",
+            vec![json!({"event":"error","data":[{},{}]})],
+        )
+        .await;
+        rejected_source_frame_keeps_replayable_journal(
+            "bbo-tbt",
+            vec![
+                json!({"event":"subscribe","arg":{"channel":"bbo-tbt","instId":"BTC-USDC"},
+                    "data":[{},{}]}),
+                json!({"event":"error","data":[{},{}]}),
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn graceful_stop_drains_an_in_flight_raw_frame_disposition() {
+        let root = std::env::temp_dir().join(format!("observation-stop-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let journal = JournalWorker::start(&root, 16 * 1024, 16).unwrap();
+        journal
+            .submit(json!({"event":"raw_frame","channel":"trades-all",
+                "source_epoch":"fixture-epoch","receive_sequence":1,"raw_text":"bad JSON"}))
+            .unwrap()
+            .durable()
+            .await
+            .unwrap();
+        let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        let worker = journal.clone();
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            wait_for_release.await?;
+            worker
+                .submit(json!({"event":"parse_rejection","channel":"trades-all",
+                    "source_epoch":"fixture-epoch","raw_frame_sequence":1,
+                    "reason":"INVALID_JSON"}))?
+                .durable()
+                .await?;
+            Ok(())
+        });
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let drain = tokio::spawn(async move {
+            let mut first = Ok(());
+            drain_capture_tasks(&mut tasks, &mut first, Duration::from_secs(1)).await?;
+            first
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !drain.is_finished(),
+            "shutdown must await the durable disposition"
+        );
+        release.send(()).unwrap();
+        drain.await.unwrap().unwrap();
+        journal.shutdown().await.unwrap();
+        validate_raw_frame_dispositions_stream(&root, 100).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

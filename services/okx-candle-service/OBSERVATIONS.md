@@ -90,6 +90,14 @@ are synced. Streaming updates are emitted only after the durable cursor
 `{segment, sequence, hash}` is acknowledged. Consumers must use the durable cursor for persisted
 identity. Segment sequence numbers are local to each segment.
 
+On a normal stop, capture finishes the in-flight frame or timer branch and its durable
+dispositions before closing the journal. The task drain is bounded to 120 seconds; a timeout
+is reported as an incomplete shutdown. Before a restart after that error, the owner must verify
+the raw-frame dispositions from the preserved journal. Rejected frames retain the configured
+socket channel as their journal lineage even when the exchange frame names another channel.
+ACK and error frames have one durable disposition, including when their payload contains a
+`data` array; market-data frames require a disposition for each array item.
+
 The bounded live update also reports local `accepted_at_ms`, `durable_acknowledged_at_ms`, and
 `published_at_ms`; these do not replace source `available_at_ms`. The sealed tape declares
 `availability_semantics: source_receipt_only_publication_unavailable` because publication timing

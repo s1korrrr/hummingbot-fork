@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 const REST: &str = "https://www.okx.com/api/v5/market/candles";
 const HISTORY_REST: &str = "https://www.okx.com/api/v5/market/history-candles";
-const WS: &str = "wss://ws.okx.com:8443/ws/v5/business";
+const WS: &str = "wss://ws.okx.com/ws/v5/business";
 
 /// Shared across every request/connection task in this process. No burst credit.
 #[derive(Clone)]
@@ -159,6 +159,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     session_lane(state, pairs, socket, timing, 0).await
+}
+
+#[cfg(test)]
+#[test]
+fn candle_collector_uses_okx_default_websocket_port() {
+    assert_eq!(WS, "wss://ws.okx.com/ws/v5/business");
 }
 
 async fn session_lane<S>(

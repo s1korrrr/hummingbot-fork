@@ -37,6 +37,9 @@ pub struct App {
     pub stop: CancellationToken,
     pub market_picture: Option<crate::market_picture::SharedProjection>,
     pub market_picture_clients: Arc<Semaphore>,
+    pub observations: Option<Arc<crate::observation_capture::CaptureState>>,
+    pub observation_clients: Arc<Semaphore>,
+    pub observation_scopes: Arc<BTreeMap<String, Arc<Semaphore>>>,
 }
 /// Single-token router: one consumer with the whole catalog and history.
 pub fn router(
@@ -58,17 +61,49 @@ pub fn router_with_auth(
     stop: CancellationToken,
     market_picture: Option<crate::market_picture::SharedProjection>,
 ) -> Router {
+    router_with_observations(state, auth, stop, market_picture, None)
+}
+
+pub fn router_with_observations(
+    state: Shared,
+    auth: Auth,
+    stop: CancellationToken,
+    market_picture: Option<crate::market_picture::SharedProjection>,
+    observations: Option<Arc<crate::observation_capture::CaptureState>>,
+) -> Router {
     let total: usize = auth
         .consumers()
         .iter()
         .map(|c| c.streams.available_permits())
         .sum();
+    let observation_scopes = auth
+        .consumers()
+        .iter()
+        .map(|consumer| {
+            (
+                consumer.id.clone(),
+                Arc::new(Semaphore::new(consumer.streams.available_permits().min(16))),
+            )
+        })
+        .collect();
     Router::new()
         .route("/health", get(health))
         .route("/v1/metrics", get(metrics))
         .route("/v2/market-picture/history", get(market_picture_history))
         .route("/v2/market-picture/updates", get(market_picture_updates))
         .route("/v1/stream", get(upgrade))
+        .route(
+            "/v2/observations/capabilities",
+            get(crate::observation_server::capabilities),
+        )
+        .route(
+            "/v2/observations/health",
+            get(crate::observation_server::health),
+        )
+        .route(
+            "/v2/observations/stream",
+            get(crate::observation_server::upgrade),
+        )
         .with_state(App {
             state,
             auth: Arc::new(auth),
@@ -76,6 +111,9 @@ pub fn router_with_auth(
             stop,
             market_picture,
             market_picture_clients: Arc::new(Semaphore::new(16)),
+            observations,
+            observation_clients: Arc::new(Semaphore::new(16)),
+            observation_scopes: Arc::new(observation_scopes),
         })
 }
 async fn health(State(app): State<App>, headers: HeaderMap) -> Response {

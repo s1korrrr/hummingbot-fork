@@ -2,6 +2,7 @@
 import ast
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -191,7 +192,7 @@ def _imports(path):
     return names
 
 
-def test_import_has_no_io_or_controller_dependency():
+def test_import_has_no_io_or_controller_dependency(tmp_path):
     forbidden = ('controllers', 'hummingbot.connector', 'hummingbot.strategy_v2.controllers', 'hummingbot.data_feed',
                  'hummingbot.client', 'hummingbot.core', 'aiohttp', 'asyncio', 'socket', 'sqlite3', 'requests',
                  'os', 'time', 'datetime', 'random', 'uuid', 'subprocess', 'threading')
@@ -223,6 +224,9 @@ def test_import_has_no_io_or_controller_dependency():
         '    "hummingbot.strategy_v2.controllers", "hummingbot.data_feed", "sqlite3", "asyncio")))\n'
         'files = [e for e in events if e[0] == "open" and not e[1].startswith(tuple(sys.path[1:]))]\n'
         'print(repr((bad, [e for e in events if e[0] != "open"], files)))\n')
-    output = subprocess.run([sys.executable, '-c', probe], check=True, capture_output=True, text=True,
+    # Audit package effects, excluding the interpreter's own bytecode-cache writes.
+    # A cold cache keeps this boundary independent of earlier test/import order.
+    output = subprocess.run([sys.executable, '-B', '-c', probe], check=True, capture_output=True, text=True,
+                            env={**os.environ, 'PYTHONPYCACHEPREFIX': str(tmp_path / 'bytecode')},
                             cwd=str(PACKAGE.parents[2])).stdout.strip().splitlines()[-1]
     assert output == '([], [], [])'

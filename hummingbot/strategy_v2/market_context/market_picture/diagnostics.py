@@ -227,6 +227,50 @@ def weighted_cohort_return(
         return sum((parsed_weights[key] * parsed_returns[key] for key in expected_ids), Decimal(0)) / total_weight
 
 
+def complete_cohort_median_return(
+    returns: Mapping[str, Decimal | str | int | float | None],
+    *,
+    expected_ids: tuple[str, ...],
+) -> Decimal | None:
+    """Return the exact median only when every frozen cohort member is valid.
+
+    ``None`` means the original cohort cannot be represented completely. It is
+    deliberately distinct from a known median of zero. The expected identity
+    sequence is canonical so callers cannot silently change the cohort order.
+    """
+    if tuple(sorted(set(expected_ids))) != expected_ids or not expected_ids:
+        raise ValueError("expected cohort identities must be sorted, unique and non-empty")
+    if set(returns) != set(expected_ids):
+        return None
+    parsed: list[Decimal] = []
+    for identity in expected_ids:
+        value = returns[identity]
+        if value is None:
+            return None
+        try:
+            number = value if isinstance(value, Decimal) else Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError("cohort returns must be finite numbers") from exc
+        if not number.is_finite():
+            raise ValueError("cohort returns must be finite numbers")
+        parsed.append(number)
+    parsed.sort()
+    middle = len(parsed) // 2
+    if len(parsed) % 2:
+        return parsed[middle]
+    # Decimal division obeys ambient precision. Preserve the rational result
+    # and choose precision from its integer numerator/denominator, including
+    # large decimal exponents, before converting the terminating midpoint.
+    left, right = parsed[middle - 1], parsed[middle]
+    midpoint = (Fraction(left) + Fraction(right)) / 2
+    with localcontext() as context:
+        context.prec = max(
+            28,
+            len(str(abs(midpoint.numerator))) + len(str(midpoint.denominator)) + 4,
+        )
+        return Decimal(midpoint.numerator) / Decimal(midpoint.denominator)
+
+
 def capped_weights(
     prior_liquidity: Mapping[str, Decimal | str | int | float],
     *,

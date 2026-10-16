@@ -8,6 +8,7 @@ import pytest
 
 from hummingbot.strategy_v2.market_context.market_picture.diagnostics import (
     capped_weights,
+    complete_cohort_median_return,
     matched_pressure_trajectory,
     normalized_breadth,
     price_breadth_divergence,
@@ -144,6 +145,48 @@ def test_t34_divergence_is_causal_and_requires_prior_range_and_matched_change():
     assert price_breadth_divergence(current_close=101, prior_closes=(99, 100), pressure_change="0.1") is False
     assert price_breadth_divergence(current_close=99, prior_closes=(100, 101), pressure_change="0.1") is True
     assert price_breadth_divergence(current_close=101, prior_closes=(99, 100), pressure_change=None) is None
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ({"a": "-0.03", "b": "0.01", "c": "0.04"}, Decimal("0.01")),
+        ({"a": "-0.03", "b": "0.04"}, Decimal("0.005")),
+    ],
+)
+def test_frozen_cohort_median_uses_exact_odd_and_even_order_statistics(values, expected):
+    ids = tuple(sorted(values))
+    assert complete_cohort_median_return(values, expected_ids=ids) == expected
+
+
+def test_frozen_cohort_even_midpoint_preserves_extreme_decimal_scale():
+    assert complete_cohort_median_return(
+        {"a": "0", "b": "1e-1000"}, expected_ids=("a", "b")
+    ) == Decimal("5e-1001")
+
+
+def test_frozen_cohort_median_is_unavailable_for_missing_members_or_start_cohort():
+    assert complete_cohort_median_return(
+        {"a": "-0.03", "b": None}, expected_ids=("a", "b")
+    ) is None
+    assert complete_cohort_median_return(
+        {"a": "-0.03"}, expected_ids=("a", "b")
+    ) is None
+    assert complete_cohort_median_return(
+        {"a": "0", "b": "0"}, expected_ids=("a", "b")
+    ) == Decimal(0)
+
+
+def test_frozen_cohort_median_rejects_noncanonical_expected_identity_order():
+    with pytest.raises(ValueError, match="sorted, unique and non-empty"):
+        complete_cohort_median_return({"b": "0.1", "a": "0.2"}, expected_ids=("b", "a"))
+    with pytest.raises(ValueError, match="sorted, unique and non-empty"):
+        complete_cohort_median_return({"a": "0.1"}, expected_ids=("a", "a"))
+    assert complete_cohort_median_return(
+        {"a": "0.1", "unexpected": "0.2"}, expected_ids=("a", "b")
+    ) is None
+    with pytest.raises(ValueError, match="finite numbers"):
+        complete_cohort_median_return({"a": "NaN"}, expected_ids=("a",))
 
 
 def test_t40_capped_liquidity_weights_require_a_feasible_complete_prior_cohort():

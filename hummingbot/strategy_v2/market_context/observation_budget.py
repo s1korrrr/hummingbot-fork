@@ -9,9 +9,6 @@ from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from typing import Callable
 
-from sqlalchemy import update
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-
 from .observation_entry import EntryObservation
 
 
@@ -55,6 +52,8 @@ class ObservationGateStore:
         self.key = native_key + ":observations-v1"
 
     def load(self):
+        from sqlalchemy.exc import SQLAlchemyError
+
         try:
             with self.recorder.sql_manager.get_new_session() as session:
                 row = session.get(self.model, self.key)
@@ -86,6 +85,9 @@ class ObservationGateStore:
             raise RuntimeError("invalid observation checkpoint") from exc
 
     def compare_and_swap(self, expected, states: dict[str, NativeGateState], max_clock_ms: int) -> bool:
+        from sqlalchemy import update
+        from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
         payload = json.dumps(
             {
                 "schema_version": 1,

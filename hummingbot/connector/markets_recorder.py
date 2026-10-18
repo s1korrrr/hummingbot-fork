@@ -20,7 +20,8 @@ from hummingbot import data_path
 from hummingbot.client.config.client_config_map import MarketDataCollectionConfigMap
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.utils import TradeFillOrderDetails
-from hummingbot.core.data_type.common import PriceType
+from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -1284,6 +1285,31 @@ class MarketsRecorder:
                           event_tag: int,
                           market: ConnectorBase,
                           evt: OrderCancelledEvent):
+        if threading.current_thread() != threading.main_thread():
+            self._ev_loop.call_soon_threadsafe(self._did_cancel_order, event_tag, market, evt)
+            return
+        with self._sql_manager.get_new_session() as session:
+            missing = session.get(Order, evt.order_id) is None
+        if missing:
+            # A post-only cancel may arrive before creation, including through
+            # PENDING_CANCEL or with a late exchange ID. Recover the receipt
+            # from the genuine tracked order; never infer acceptance from the
+            # cancellation's client ID alone or emit another connector event.
+            tracker = getattr(market, '_order_tracker', None)
+            tracked = tracker.fetch_order(evt.order_id) if tracker is not None else None
+            if (isinstance(tracked, InFlightOrder) and tracked.is_cancelled
+                    and tracked.exchange_order_id and tracked.exchange_order_id == evt.exchange_order_id):
+                buy = tracked.trade_type == TradeType.BUY
+                created_event = BuyOrderCreatedEvent if buy else SellOrderCreatedEvent
+                created_tag = MarketEvent.BuyOrderCreated if buy else MarketEvent.SellOrderCreated
+                self._did_create_order(created_tag.value, market, created_event(
+                    evt.timestamp, tracked.order_type, tracked.trading_pair, tracked.amount,
+                    tracked.price, tracked.client_order_id, tracked.creation_timestamp,
+                    exchange_order_id=tracked.exchange_order_id, leverage=tracked.leverage,
+                    position=tracked.position.value))
+            else:
+                self.logger().warning(f'Cannot persist cancellation before creation without a matching '
+                                      f'native terminal order receipt: {evt.order_id}')
         self._update_order_status(event_tag, market, evt)
 
     def _did_fail_order(self,

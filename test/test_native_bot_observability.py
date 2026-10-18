@@ -313,7 +313,9 @@ def test_actual_snapshot_uses_each_native_instrument_for_multisymbol_rows():
         ],
         'positions': [Obj(trading_pair='XRP-USDC', side='BUY', amount=Decimal('2'),
                           breakeven_price=Decimal('1'), unrealized_pnl_quote=Decimal('0'),
-                          realized_pnl_quote=Decimal('0'), cum_fees_quote=Decimal('0'))],
+                          realized_pnl_quote=Decimal('0'), cum_fees_quote=Decimal('0'),
+                          mark_price_quote=None, mark_observed_at=None,
+                          mark_timestamp_semantics=None, mark_availability='unavailable')],
         'performance': None,
     }
     strategy = Obj(
@@ -433,7 +435,9 @@ def test_runtime_summary_pnl_is_the_native_controller_report_not_held_bags_only(
                    filled_amount_quote=Decimal('50'), is_active=True, is_done=False)
 
     held = Obj(trading_pair='BNB-USDC', side='BUY', amount=Decimal('1'), breakeven_price=Decimal('100'),
-               unrealized_pnl_quote=Decimal('5'), realized_pnl_quote=Decimal('10'), cum_fees_quote=Decimal('2'))
+               unrealized_pnl_quote=Decimal('5'), realized_pnl_quote=Decimal('10'), cum_fees_quote=Decimal('2'),
+               mark_price_quote=None, mark_observed_at=None,
+               mark_timestamp_semantics=None, mark_availability='unavailable')
     # Native accounting: closed executors 10 (net of their fees) + held realized 10 - fees 2.
     report = PerformanceReport(realized_pnl_quote=Decimal('18'), unrealized_pnl_quote=Decimal('4.4'),
                                global_pnl_quote=Decimal('22.4'))

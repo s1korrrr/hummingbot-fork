@@ -524,6 +524,33 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             snapshot = json.loads((Path(tmp) / 'rsi_modular_v2.status.json').read_text())
         self.assertTrue(snapshot['unattended_restart_hold'])
 
+    def test_runtime_status_snapshot_preserves_native_position_mark_provenance(self):
+        position = SimpleNamespace(
+            trading_pair="ETH-USDC", side=TradeType.BUY, amount=Decimal("0.25"),
+            breakeven_price=Decimal("3900"), unrealized_pnl_quote=Decimal("25"),
+            realized_pnl_quote=Decimal("0"), cum_fees_quote=Decimal("0.1"),
+            mark_price_quote=Decimal("4000"), mark_observed_at="2026-10-18T08:00:00+00:00",
+            mark_timestamp_semantics="sampled_at", mark_availability="available",
+        )
+        entry = {"controller_id": "meridian-v3", "summary": {"pair": None}, "positions": [position],
+                 "executors": [], "performance": None}
+        with patch.object(self.strategy, "_build_controller_status_entries", return_value=[entry]), \
+                patch.object(self.strategy, "_get_balances_snapshot", return_value=[]), \
+                patch.object(self.strategy, "_build_runtime_operations_snapshot", return_value={}), \
+                patch.object(self.strategy, "get_active_orders", return_value=[]), \
+                patch("hummingbot.strategy.native_observability.controller_observation", return_value={}), \
+                patch("hummingbot.strategy.native_observability.active_order_observations",
+                      return_value=([], "available")), \
+                patch.object(type(self.strategy), "current_timestamp", new_callable=PropertyMock, return_value=1792310400.0):
+            snapshot = self.strategy._build_runtime_status_snapshot()
+
+        held = snapshot["positions_held"][0]
+        self.assertEqual(held["value_quote"], 975.0)  # Breakeven cost remains separate from the current mark.
+        self.assertEqual(held["mark_price_quote"], "4000")
+        self.assertEqual(held["mark_observed_at"], "2026-10-18T08:00:00+00:00")
+        self.assertEqual(held["mark_timestamp_semantics"], "sampled_at")
+        self.assertEqual(held["mark_availability"], "available")
+
     async def test_unattended_v2_restart_hold_discards_queued_actions(self):
         action = CreateExecutorAction(controller_id="controller_1",
                                       executor_config=self.get_position_config_market_short())

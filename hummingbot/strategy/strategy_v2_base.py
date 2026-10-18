@@ -1104,6 +1104,11 @@ class StrategyV2Base(StrategyPyBase):
                         "amount_base": float(self._safe_decimal(position.amount)),
                         "value_quote": float(self._safe_decimal(position.amount) * self._safe_decimal(position.breakeven_price)),
                         "breakeven_price": float(self._safe_decimal(position.breakeven_price)),
+                        "mark_price_quote": (str(position.mark_price_quote)
+                                             if position.mark_availability == "available" else None),
+                        "mark_observed_at": position.mark_observed_at,
+                        "mark_timestamp_semantics": position.mark_timestamp_semantics,
+                        "mark_availability": position.mark_availability,
                         "unrealized_pnl_quote": float(self._safe_decimal(position.unrealized_pnl_quote)),
                         "realized_pnl_quote": float(self._safe_decimal(position.realized_pnl_quote)),
                         "fees_quote": float(self._safe_decimal(position.cum_fees_quote)),

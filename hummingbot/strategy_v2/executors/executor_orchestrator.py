@@ -4,6 +4,7 @@ import uuid
 from collections import deque
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
@@ -137,7 +138,7 @@ class PositionHold:
         for order in held_position_orders:
             self.add_order_record(order)
 
-    def get_position_summary(self, mid_price: Decimal):
+    def get_position_summary(self, mid_price: Decimal, *, observed_at: Optional[float] = None):
         # Handle NaN quote amounts by calculating them lazily
         if self.buy_amount_quote.is_nan() and self.buy_amount_base > 0:
             self.buy_amount_quote = self.buy_amount_base * mid_price
@@ -213,6 +214,16 @@ class PositionHold:
             is_net_long = net_amount_base >= 0
             unrealized_pnl_quote = (mid_price - breakeven_price) * net_amount_base
 
+        mark_available = mid_price.is_finite() and mid_price > Decimal("0")
+        mark_observed_at = None
+        if mark_available and observed_at is not None:
+            try:
+                timestamp = float(observed_at)
+                if timestamp > 0:
+                    mark_observed_at = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+            except (OverflowError, OSError, TypeError, ValueError):
+                mark_observed_at = None
+
         return PositionSummary(
             connector_name=self.connector_name,
             trading_pair=self.trading_pair,
@@ -222,7 +233,11 @@ class PositionHold:
             breakeven_price=breakeven_price,
             unrealized_pnl_quote=unrealized_pnl_quote,
             realized_pnl_quote=realized_pnl_quote,
-            cum_fees_quote=self.cum_fees_quote, remaining_fees_quote=remaining_fees_quote)
+            cum_fees_quote=self.cum_fees_quote, remaining_fees_quote=remaining_fees_quote,
+            mark_price_quote=mid_price if mark_available else None,
+            mark_observed_at=mark_observed_at,
+            mark_timestamp_semantics="sampled_at" if mark_observed_at is not None else None,
+            mark_availability="available" if mark_available and mark_observed_at is not None else "unavailable")
 
 
 def controller_market_pairs(controller) -> Tuple[Tuple[str, str], ...]:
@@ -2300,7 +2315,7 @@ class ExecutorOrchestrator:
             for position in positions_list:
                 mid_price = self.strategy.market_data_provider.get_price_by_type(
                     position.connector_name, position.trading_pair, PriceType.MidPrice)
-                summary = position.get_position_summary(mid_price)
+                summary = position.get_position_summary(mid_price, observed_at=self.strategy.current_timestamp)
                 if summary.amount > Decimal("0"):
                     positions_summary.append(summary)
             report[controller_id] = positions_summary

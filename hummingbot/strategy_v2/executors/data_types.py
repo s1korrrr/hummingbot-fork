@@ -73,6 +73,10 @@ class PositionSummary(BaseModel):
     realized_pnl_quote: Decimal
     cum_fees_quote: Decimal
     remaining_fees_quote: Optional[Decimal] = None
+    mark_price_quote: Optional[Decimal] = None
+    mark_observed_at: Optional[str] = None
+    mark_timestamp_semantics: Optional[str] = None
+    mark_availability: str = "unavailable"
 
     @property
     def amount_quote(self) -> Decimal:

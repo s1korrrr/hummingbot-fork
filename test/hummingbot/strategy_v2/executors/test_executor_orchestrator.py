@@ -1202,6 +1202,7 @@ class TestExecutorOrchestrator(unittest.TestCase):
         self.assertEqual(len(self.orchestrator.positions_held), 0)
 
     def test_get_positions_report(self):
+        self.mock_strategy.current_timestamp = 1792310400.0
         position_held = PositionHold("binance", "SOL-USDT", side=TradeType.BUY)
         executor_info = ExecutorInfo(
             id="123", timestamp=1234, type="position_executor",
@@ -1223,6 +1224,15 @@ class TestExecutorOrchestrator(unittest.TestCase):
         report = self.orchestrator.get_positions_report()
         self.assertEqual(len(report), 1)
         self.assertEqual(report["main"][0].amount, Decimal(10))
+        self.assertEqual(report["main"][0].mark_price_quote, Decimal("230"))
+        self.assertEqual(report["main"][0].mark_availability, "available")
+        self.assertEqual(report["main"][0].mark_observed_at, "2026-10-18T08:00:00+00:00")
+        self.assertEqual(report["main"][0].mark_timestamp_semantics, "sampled_at")
+        self.mock_strategy.market_data_provider.get_price_by_type.return_value = Decimal("0")
+        unavailable = self.orchestrator.get_positions_report()["main"][0]
+        self.assertIsNone(unavailable.mark_price_quote)
+        self.assertEqual(unavailable.mark_availability, "unavailable")
+        self.assertIsNone(unavailable.mark_observed_at)
 
     @patch.object(MarketsRecorder, "get_instance")
     def test_store_all_executors(self, markets_recorder_mock):

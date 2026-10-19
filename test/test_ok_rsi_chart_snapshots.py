@@ -563,6 +563,162 @@ def test_ok_rsi_successor_preserves_same_candle_decision_during_blocked_commit()
     asyncio.run(scenario())
 
 
+def test_ok_rsi_outstanding_successors_deduplicate_adjacent_payloads_only():
+    import asyncio
+    import copy
+    import threading
+    from unittest.mock import patch
+
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+
+    async def scenario():
+        controller = chart_owner([120, 180])
+        controller.market_data_provider.time = lambda: 245
+        controller.processed_data.update({
+            'timestamp': 245,
+            'candle_timestamp': 180,
+            'data_health': {'ready': True},
+            'signal': 1,
+            'indicators': {'cost_basis': 1},
+            'signal_state': {'buy_decision': 'hold'},
+        })
+        first_started = threading.Event()
+        release_first = threading.Event()
+        first_failure_reported = asyncio.Event()
+        attempt_rows = []
+        committed = []
+        acknowledgements = []
+        final_acknowledged = asyncio.Event()
+
+        logger = SimpleNamespace(
+            error=lambda *_args: first_failure_reported.set(),
+            exception=lambda *_args: None,
+            info=lambda *_args: None,
+            warning=lambda *_args: None,
+        )
+
+        def ack(rows):
+            acknowledgements.append(copy.deepcopy(rows))
+            if len(acknowledgements) == 3:
+                final_acknowledged.set()
+
+        controller.chart_snapshot_rows_persisted = ack
+        strategy = SimpleNamespace(
+            _chart_snapshots_enabled=lambda: True, ready_to_trade=True, _is_stop_triggered=False,
+            _runtime_status_snapshot_bot_name=lambda: 'main', current_timestamp=245,
+            _last_chart_snapshot_prune_ts=1000, _chart_snapshot_prune_interval=lambda: 3600,
+            controllers={'ok-rsi': controller}, logger=lambda: logger,
+        )
+        bind_chart_snapshot_methods(strategy)
+
+        def write(rows):
+            attempt_rows.append(copy.deepcopy(rows))
+            if len(attempt_rows) == 1:
+                first_started.set()
+                if not release_first.wait(timeout=3):
+                    raise TimeoutError('test did not release first chart commit')
+                raise RuntimeError('injected first chart write failure')
+            committed.append(copy.deepcopy(rows))
+
+        recorder = SimpleNamespace(store_or_update_chart_snapshots=write,
+                                   prune_chart_snapshots=lambda **_kwargs: None)
+        with patch('hummingbot.strategy.strategy_v2_base.MarketsRecorder.get_instance', return_value=recorder):
+            try:
+                StrategyV2Base._write_chart_snapshots_if_due(strategy)
+                assert await asyncio.to_thread(first_started.wait, 2)
+                first = copy.deepcopy(attempt_rows[0])
+
+                # The native builder reports the same still-unacknowledged state on
+                # repeated ticks. Repeated payloads must not consume successor slots.
+                StrategyV2Base._write_chart_snapshots_if_due(strategy)
+                StrategyV2Base._write_chart_snapshots_if_due(strategy)
+
+                controller.processed_data['signal_state']['buy_decision'] = 'buy'
+                StrategyV2Base._write_chart_snapshots_if_due(strategy)
+                controller.processed_data['signal_state']['buy_decision'] = 'hold'
+                StrategyV2Base._write_chart_snapshots_if_due(strategy)
+                StrategyV2Base._write_chart_snapshots_if_due(strategy)
+
+                release_first.set()
+                await asyncio.wait_for(first_failure_reported.wait(), timeout=2)
+                assert not acknowledgements, 'failed write must not acknowledge a controller batch'
+
+                async def pump_until_final_ack():
+                    while not final_acknowledged.is_set():
+                        StrategyV2Base._write_chart_snapshots_if_due(strategy)
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(pump_until_final_ack(), timeout=3)
+            finally:
+                release_first.set()
+                await strategy._shutdown_chart_snapshot_writer()
+
+        assert committed == acknowledgements
+        assert attempt_rows[0] == committed[0], 'retry must preserve the exact failed batch'
+        assert len(committed) == 3
+        assert committed[0] == first
+        assert committed[0] != committed[1]
+        assert committed[1] != committed[2]
+        assert next(row for row in committed[0] if row['candle_timestamp'] == 180000)['buy_decision'] == 'hold'
+        assert next(row for row in committed[1] if row['candle_timestamp'] == 180000)['buy_decision'] == 'buy'
+        assert next(row for row in committed[2] if row['candle_timestamp'] == 180000)['buy_decision'] == 'hold'
+
+    asyncio.run(scenario())
+
+
+def test_same_payload_can_be_built_again_after_prior_batch_is_acknowledged():
+    import asyncio
+    import copy
+    from unittest.mock import patch
+
+    from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+
+    async def scenario():
+        rows = [{'controller_id': 'a', 'timestamp': 1}]
+        committed = []
+        acknowledged = []
+        acknowledgements_seen = asyncio.Event()
+
+        def ack(persisted_rows):
+            acknowledged.append(copy.deepcopy(persisted_rows))
+            if len(acknowledged) == 2:
+                acknowledgements_seen.set()
+
+        controller = SimpleNamespace(
+            build_chart_snapshot_rows=lambda **_kwargs: copy.deepcopy(rows),
+            chart_snapshot_rows_persisted=ack,
+        )
+        owner = SimpleNamespace(
+            _chart_snapshots_enabled=lambda: True, ready_to_trade=True, _is_stop_triggered=False,
+            _runtime_status_snapshot_bot_name=lambda: 'main', current_timestamp=100,
+            _last_chart_snapshot_prune_ts=100, _chart_snapshot_prune_interval=lambda: 3600,
+            controllers={'a': controller},
+        )
+        bind_chart_snapshot_methods(owner)
+        recorder = SimpleNamespace(
+            store_or_update_chart_snapshots=lambda batch: committed.append(copy.deepcopy(batch)),
+            prune_chart_snapshots=lambda **_kwargs: None,
+        )
+        with patch('hummingbot.strategy.strategy_v2_base.MarketsRecorder.get_instance', return_value=recorder):
+            try:
+                StrategyV2Base._write_chart_snapshots_if_due(owner)
+
+                async def wait_for_first_ack():
+                    while len(acknowledged) < 1:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_for_first_ack(), timeout=2)
+                StrategyV2Base._write_chart_snapshots_if_due(owner)
+                await asyncio.wait_for(acknowledgements_seen.wait(), timeout=2)
+            finally:
+                await owner._shutdown_chart_snapshot_writer()
+
+        assert committed == [rows, rows]
+        assert acknowledged == committed
+
+    asyncio.run(scenario())
+
+
 def test_prune_failure_retries_prune_without_rewriting_or_reacknowledging_rows():
     import asyncio
     from unittest.mock import Mock, patch

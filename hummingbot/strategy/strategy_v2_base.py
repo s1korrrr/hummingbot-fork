@@ -1032,7 +1032,9 @@ class StrategyV2Base(StrategyPyBase):
             )
             return
         if rows:
-            job.successor_batches.append(rows)
+            previous_batch = job.successor_batches[-1] if job.successor_batches else job.rows
+            if rows != previous_batch:
+                job.successor_batches.append(rows)
         job.successor_reserved = False
         if rows and job.prune_cycle is not None:
             job.prune_cycle["wrote_rows"] = True

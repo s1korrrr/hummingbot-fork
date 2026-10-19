@@ -27,9 +27,9 @@ LEGACY_NEVER_STARTED = {'schema': 1, 'source': 'never_started_intent_v1'}
 
 
 class CandidateFundingPolicy(PolicyModel):
-    allocation_quote: Decimal = Field(gt=0, le=2500)
+    allocation_quote: Decimal | None = Field(..., gt=0, le=2500)
     fee_reserve_fraction: Decimal = Field(gt=0, le=Decimal('.1'))
-    max_position_quote: Decimal = Field(default=50, gt=0, le=505)
+    max_position_quote: Decimal | None = Field(default=50, gt=0, le=505)
     scope: Literal['controller', 'strategy'] = 'controller'
     resize_to_available_quote: bool = False
 
@@ -140,6 +140,19 @@ class NativeFundingStore:
         self.binding = self._binding_for_source(None)
         self._code_upgrade_checked = False
         self.status = {}
+
+    def _available_quote(self, projection, pending):
+        """Quote still admissible after native unresolved commitments.
+
+        The bounded envelope uses its historical fill-derived allocation. Wallet
+        mode uses the connector's current free USDC, with unresolved native
+        claims reserved before another owner may submit a buy.
+        """
+        if self.policy.allocation_quote is not None:
+            return max(ZERO, self.policy.allocation_quote - projection['used'] - pending)
+        connector = self.owner.market_data_provider.connectors[self.owner.config.connector_name]
+        free = decimal(connector.get_available_balance('USDC'), 'native available USDC')
+        return max(ZERO, free - pending)
 
     def _binding_for_source(self, source_sha256):
         """The binding formula; ``source_sha256`` overrides every owner's native source hash."""
@@ -744,10 +757,12 @@ class NativeFundingStore:
                                     or tracked.exchange_order_id != receipt['exchange_order_id']):
             raise PolicyError('Native tracker conflicts with terminal funding release')
 
-    def plan_binding_transition(self, expected_binding, *, legacy_evidence=None):
+    def plan_binding_transition(self, expected_binding, *, legacy_evidence=None,
+                                allocation_only_previous_configs=None):
         """Read-only proposal; never called by automatic entry admission."""
         from .native_funding_transition import plan_transition
-        return plan_transition(self, expected_binding, legacy_evidence=legacy_evidence)
+        return plan_transition(self, expected_binding, legacy_evidence=legacy_evidence,
+                               allocation_only_previous_configs=allocation_only_previous_configs)
 
     def prepare_runtime_binding(self):
         """Run the existing source-only upgrade policy once for a live owner.
@@ -778,7 +793,7 @@ class NativeFundingStore:
             state['fills'] = projection['fills']
             if previous == self._audit_hash(state) or self._write(raw, state):
                 self.status = {'released_intents': sum(receipt != LEGACY_NEVER_STARTED for receipt in state['releases'].values()), 'pending_quote': str(pending), 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
-                               'available_quote': str(max(ZERO, self.policy.allocation_quote - projection['used'] - pending)),
+                               'available_quote': str(self._available_quote(projection, pending)),
                                'unused_intent_release': 'native_terminal_reconciliation'}
                 return dict(self.status)
         raise PolicyError('Funding reconciliation contention; no release')
@@ -790,9 +805,10 @@ class NativeFundingStore:
         raw, state = self._load(allow_code_upgrade=False)
         projection, pending, _ = self._evidence(state, raw, reconcile=True)
         pair = self.owner.config.trading_pair
-        available = min(self.policy.allocation_quote - projection['used'] - pending,
-                        self.policy.max_position_quote - projection['used_by_pair'][pair]
-                        - projection['pending_by_pair'][pair])
+        available = self._available_quote(projection, pending)
+        if self.policy.max_position_quote is not None:
+            available = min(available, self.policy.max_position_quote - projection['used_by_pair'][pair]
+                            - projection['pending_by_pair'][pair])
         return max(ZERO, available / (1 + self.policy.fee_reserve_fraction))
 
     def assess(self):
@@ -811,7 +827,7 @@ class NativeFundingStore:
                 'revision': state['revision'], 'pending_quote': str(pending),
                 'inventory_cost': str(projection['inventory_cost']),
                 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
-                'available_quote': str(max(ZERO, self.policy.allocation_quote - projection['used'] - pending))}
+                'available_quote': str(self._available_quote(projection, pending))}
 
     def admit(self, executor_config):
         config = self.owner.config
@@ -847,17 +863,19 @@ class NativeFundingStore:
                     raise PolicyError('Duplicate or mutated funded native executor')
                 raise PolicyError('Unresolved funded intent requires explicit reconciliation')
             required = amount * price * (1 + self.policy.fee_reserve_fraction)
-            if (required + projection['used_by_pair'][config.trading_pair]
+            if (self.policy.max_position_quote is not None
+                    and required + projection['used_by_pair'][config.trading_pair]
                     + projection['pending_by_pair'][config.trading_pair] > self.policy.max_position_quote):
                 raise PolicyError('Candidate per-position funding allocation exhausted')
-            self.status = {'allocation_quote': str(self.policy.allocation_quote),
+            available = self._available_quote(projection, pending)
+            self.status = {'allocation_quote': None if self.policy.allocation_quote is None else str(self.policy.allocation_quote),
                            'native_cash_used': str(projection['cash_used']),
                            'native_inventory_cost': str(projection['inventory_cost']),
                            'pending_quote': str(pending), 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']), 'new_quote': str(required),
-                           'available_quote': str(max(ZERO, self.policy.allocation_quote - projection['used'] - pending)),
+                           'available_quote': str(available),
                            'released_intents': sum(receipt != LEGACY_NEVER_STARTED for receipt in state['releases'].values()),
                            'unused_intent_release': 'native_terminal_reconciliation'}
-            if projection['used'] + pending + required > self.policy.allocation_quote:
+            if required > available:
                 raise PolicyError('Candidate funding allocation exhausted')
             state['claims'][executor_config.id] = claim
             state['fills'] = projection['fills']

@@ -27,7 +27,7 @@ from types import SimpleNamespace
 from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
-from pydantic import Field as PydanticField, field_validator, model_validator
+from pydantic import Field as PydanticField, field_validator, model_serializer, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
 from hummingbot.client.config.config_data_types import ClientFieldData
@@ -273,6 +273,25 @@ class HLRSIControllerConfig(DirectionalTradingControllerConfigBase):
             is_updatable=False,
         ),
     )
+    # The default retains the historical per-position and executor-count ceilings.
+    # Wallet-funded mode keeps finite per-entry sizing but lets exchange-available
+    # quote balance, rather than an accumulated-position ceiling, govern new buys.
+    allocation_mode: Literal["bounded", "wallet_funded"] = Field(
+        default="bounded",
+        client_data=ClientFieldData(
+            prompt=lambda mi: "Allocation mode (bounded/wallet_funded):",
+            prompt_on_new=False,
+            is_updatable=True,
+        ),
+    )
+
+    @model_serializer(mode="wrap")
+    def omit_default_allocation_mode(self, serializer):
+        payload = serializer(self)
+        if self.allocation_mode == "bounded":
+            payload.pop("allocation_mode", None)
+        return payload
+
     leverage: int = 1
     position_mode: PositionMode = PositionMode.ONEWAY
 
@@ -491,7 +510,7 @@ class HLRSIControllerConfig(DirectionalTradingControllerConfigBase):
 
         if float(self.rsi_buy_threshold) >= float(self.sell_rsi_overbought):
             raise ValueError("rsi_buy_threshold must be below the effective RSI sell threshold")
-        if self.usd_per_entry > self.max_total_position_usd:
+        if self.allocation_mode == "bounded" and self.usd_per_entry > self.max_total_position_usd:
             raise ValueError("usd_per_entry must be less than or equal to max_total_position_usd")
         if float(self.min_position_size_multiplier) > float(self.max_position_size_multiplier):
             raise ValueError("min_position_size_multiplier must be less than or equal to max_position_size_multiplier")
@@ -1527,7 +1546,8 @@ class HLRSIController(DirectionalTradingControllerBase):
         mid_price = self._get_mid_price()
         avg_entry = self._get_position_cost_basis()
         context_parts = [
-            f"pos_util={self._get_position_utilization():.0%}",
+            ("allocation=wallet-funded" if self.config.allocation_mode == "wallet_funded"
+             else f"pos_util={self._get_position_utilization():.0%}"),
             f"active_buy_execs={len(self._filter_same_side(TradeType.BUY, active_only=True))}",
             f"held_bags={self._held_bag_count()}",
         ]
@@ -2329,6 +2349,8 @@ class HLRSIController(DirectionalTradingControllerBase):
             return Decimal("Infinity")
 
     def _get_position_utilization(self) -> float:
+        if self.config.allocation_mode == "wallet_funded":
+            return 0.0
         max_pos = getattr(self.config, "max_total_position_usd", Decimal("0"))
         if max_pos <= 0:
             return 0.0
@@ -2615,8 +2637,11 @@ class HLRSIController(DirectionalTradingControllerBase):
 
         relevant_gate = ("exposure-unavailable" if exposure_unavailable else
                          sell_gate if (pos_usd > 0 or current_signal < 0 or len(active_sells) > 0) else buy_gate)
-        exposure_text = ("unavailable" if exposure_unavailable else
-                         f"${float(pos_usd):.0f}/${float(self.config.max_total_position_usd):.0f} ({util:.0%})")
+        exposure_text = (
+            "unavailable" if exposure_unavailable else
+            f"${float(pos_usd):.0f} wallet-funded" if self.config.allocation_mode == "wallet_funded" else
+            f"${float(pos_usd):.0f}/${float(self.config.max_total_position_usd):.0f} ({util:.0%})"
+        )
 
         rsi_value = indicators.get("rsi")
         rsi_buy_threshold = float(self.config.rsi_buy_threshold)
@@ -2665,6 +2690,7 @@ class HLRSIController(DirectionalTradingControllerBase):
             "trend": self._processed_trend_confirmation().get("direction", "unavailable"),
             "avg_buy": self._summary_price(cost_basis),
             "exposure": exposure_text,
+            "allocation_mode": self.config.allocation_mode,
             "execs": f"B{len(active_buys)} S{len(active_sells)} H{len(held_bags)}",
             "u_pnl": self._summary_pct(unrealized_pnl_pct),
             "u_pnl_pct": self._summary_pct(unrealized_pnl_pct),
@@ -5199,7 +5225,11 @@ class HLRSIController(DirectionalTradingControllerBase):
             if entry is None or entry <= 0:
                 self._record_gate_reason(TradeType.BUY, "invalid_entry_price")
                 return False
-            if self._get_total_position_value_usd() + amount * max(entry, mid_price) > self.config.max_total_position_usd:
+            if (
+                self.config.allocation_mode == "bounded"
+                and self._get_total_position_value_usd() + amount * max(entry, mid_price)
+                > self.config.max_total_position_usd
+            ):
                 self._record_gate_reason(TradeType.BUY, "max_position")
                 return False
         else:
@@ -5261,7 +5291,10 @@ class HLRSIController(DirectionalTradingControllerBase):
         if signal < 0 and active_same_side:
             self._record_gate_reason(target_side, "sell_active")
             return False
-        if len(active_same_side) >= self.config.max_executors_per_side:
+        if (
+            len(active_same_side) >= self.config.max_executors_per_side
+            and not (signal > 0 and self.config.allocation_mode == "wallet_funded")
+        ):
             self._record_gate_reason(target_side, "capacity")
             return False
 
@@ -5328,7 +5361,10 @@ class HLRSIController(DirectionalTradingControllerBase):
                 self._record_gate_reason(target_side, "avg_entry_gap")
                 return False
             current_pos = self._get_total_position_value_usd()
-            if current_pos + entry_usd > self.config.max_total_position_usd:
+            if (
+                self.config.allocation_mode == "bounded"
+                and current_pos + entry_usd > self.config.max_total_position_usd
+            ):
                 self._record_gate_reason(target_side, "max_position")
                 return False
 
@@ -5914,7 +5950,8 @@ class HLRSIController(DirectionalTradingControllerBase):
             f"bags={inventory.bag_count}",
             f"base={self._fmt(base_balance, 8)}",
             f"cost={self._fmt(inventory.cost_basis, 4)}",
-            f"exp=${float(position_value):.0f}/${float(max_position):.0f} ({utilization:.0%})",
+            (f"exp=${float(position_value):.0f} wallet-funded" if self.config.allocation_mode == "wallet_funded"
+             else f"exp=${float(position_value):.0f}/${float(max_position):.0f} ({utilization:.0%})"),
         ])
         return self._status_row("position", *parts)
 

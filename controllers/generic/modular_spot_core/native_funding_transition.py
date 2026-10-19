@@ -9,13 +9,14 @@ import json
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-from hummingbot.core.data_type.common import OrderType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder
 from hummingbot.model.market_state import MarketState
 from hummingbot.model.metadata import Metadata
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 
-from .domain import PolicyError, identity
+from .domain import PolicyError, decimal, identity
+from .recipe_contract import configuration_digest
 
 NATIVE_TABLES = ('Executors', 'Order', 'OrderStatus', 'OrderExact', 'TradeFill',
                  'TradeFillExact', 'Position', 'PositionHoldLedger', 'MarketState',
@@ -171,7 +172,61 @@ def _legacy_evidence(view, session, evidence, infos, orders):
             'acquisition_chain_sha256': identity(chain), 'terminal_proofs_sha256': identity(receipt)}
 
 
-def _proposal(store, session, expected_binding, legacy_evidence=None):
+def _allocation_only_source(store, session, expected_binding, previous_configs):
+    """Prove that the old binding differs only by explicitly named allocation fields."""
+    if not isinstance(previous_configs, dict) or set(previous_configs) != set(store.owners):
+        raise PolicyError('Allocation-only transition requires exact prior owner configurations')
+    previous = {}
+    for owner_id, peer in store.owners.items():
+        old = type(peer.config).model_validate(previous_configs[owner_id])
+        if old.id != owner_id or old.funding is None or old.allocation_mode == peer.config.allocation_mode:
+            raise PolicyError('Allocation-only transition prior owner or mode differs')
+        if old.allocation_mode == 'bounded':
+            if (old.funding.allocation_quote is None or old.funding.max_position_quote is None
+                    or peer.config.allocation_mode != 'wallet_funded'
+                    or peer.config.funding.allocation_quote is not None
+                    or peer.config.funding.max_position_quote is not None):
+                raise PolicyError('Allocation-only transition bounded-to-wallet policy differs')
+        elif (old.allocation_mode != 'wallet_funded' or old.funding.allocation_quote is not None
+              or old.funding.max_position_quote is not None or peer.config.allocation_mode != 'bounded'
+              or peer.config.funding.allocation_quote is None or peer.config.funding.max_position_quote is None):
+            raise PolicyError('Allocation-only transition wallet-to-bounded policy differs')
+        expected = old.model_dump(mode='json')
+        if peer.config.allocation_mode == 'wallet_funded':
+            expected['allocation_mode'] = 'wallet_funded'
+        else:
+            expected.pop('allocation_mode', None)
+        expected['funding']['allocation_quote'] = (None if peer.config.funding.allocation_quote is None
+                                                   else str(peer.config.funding.allocation_quote))
+        expected['funding']['max_position_quote'] = (None if peer.config.funding.max_position_quote is None
+                                                     else str(peer.config.funding.max_position_quote))
+        if expected != peer.config.model_dump(mode='json'):
+            raise PolicyError('Allocation-only transition changes strategy, execution, sizing, or risk')
+        previous[owner_id] = old
+    policies = {identity(old.funding.model_dump(mode='json')) for old in previous.values()}
+    if len(policies) != 1:
+        raise PolicyError('Allocation-only transition prior funding policies differ')
+    old_policy = next(iter(previous.values())).funding
+    peers = store._binding_peers
+    for source_hash in store._previous_source_hashes(session):
+        if old_policy.scope == 'strategy':
+            candidate = identity(['strategy', old_policy.model_dump(mode='json'),
+                                  [[peer.config.id, peer.config.connector_name, peer.config.trading_pair,
+                                    configuration_digest(previous[peer.config.id].model_dump(mode='json')),
+                                    source_hash] for peer in peers]])
+        else:
+            peer = peers[0]
+            candidate = identity([peer.config.id, peer.config.connector_name, peer.config.trading_pair,
+                                  configuration_digest(previous[peer.config.id].model_dump(mode='json')),
+                                  source_hash])
+        if candidate == expected_binding:
+            return {'source_sha256': source_hash,
+                    'previous_config_sha256': {key: configuration_digest(value.model_dump(mode='json'))
+                                               for key, value in previous.items()}}
+    raise PolicyError('Allocation-only transition prior binding lacks source and configuration proof')
+
+
+def _proposal(store, session, expected_binding, legacy_evidence=None, allocation_only_previous_configs=None):
     if not isinstance(expected_binding, str) or expected_binding == store.binding:
         raise PolicyError('Funding transition requires the exact previous binding')
     from .native_funding import NativeFundingStore
@@ -182,10 +237,16 @@ def _proposal(store, session, expected_binding, legacy_evidence=None):
     raw, state = view._load(expected_binding=expected_binding)
     if raw is None:
         raise PolicyError('Funding transition requires an existing checkpoint')
+    allocation_proof = None
+    if allocation_only_previous_configs is not None:
+        if legacy_evidence is not None:
+            raise PolicyError('Allocation-only transition does not combine with a legacy repair')
+        allocation_proof = _allocation_only_source(store, session, expected_binding,
+                                                   allocation_only_previous_configs)
     infos = view.recorder.get_all_executors()
     current = [info for owner in store.owners.values() for info in owner.executors_info]
     connector = store.owner.market_data_provider.connectors[store.owner.config.connector_name]
-    if any(info.is_active or info.is_trading for info in [*infos, *current]):
+    if allocation_proof is None and any(info.is_active or info.is_trading for info in [*infos, *current]):
         raise PolicyError('Funding transition requires quiescent native executors')
     if any(not order.is_done for order in connector._order_tracker.all_orders.values()):
         raise PolicyError('Funding transition refuses active native orders')
@@ -198,6 +259,20 @@ def _proposal(store, session, expected_binding, legacy_evidence=None):
               if legacy_evidence is not None else None)
     projection, pending, _ = view._evidence(
         state, raw, reconcile=legacy is None, allow_quiescent_legacy=legacy is not None)
+    if allocation_proof is not None:
+        if pending != 0 or projection['legacy_uncertain_quote'] != 0:
+            raise PolicyError('Allocation-only transition requires fully reconciled acquisition commitments')
+        owned = {order_id: info.id for info in infos for _, _, order_id in ExecutorOrchestrator._owned_order_keys(info)}
+        for info in [*infos, *current]:
+            if not (info.is_active or info.is_trading):
+                continue
+            claim = state['claims'].get(info.id)
+            if info.config.side != TradeType.BUY or claim is None:
+                raise PolicyError('Allocation-only transition requires fully filled native BUY ownership')
+            acquired = sum((amount for order_id, amount in projection['bought_by_order'].items()
+                            if owned.get(order_id) == info.id), 0)
+            if acquired != decimal(claim['amount'], 'funded amount', positive=True):
+                raise PolicyError('Allocation-only transition requires complete native acquisition fill')
     if legacy is not None:
         unresolved = [info.id for info in infos if info.config.side.name == 'BUY'
                       and isinstance((info.custom_info or {}).get('entry_reconciliation'), dict)
@@ -208,31 +283,40 @@ def _proposal(store, session, expected_binding, legacy_evidence=None):
             raise PolicyError('Funding legacy transition has other unresolved acquisition chains')
     if pending != projection['legacy_uncertain_quote']:
         raise PolicyError('Funding transition retains unresolved commitments; reconcile terminal evidence first')
-    if (projection['used'] + pending > store.policy.allocation_quote
-            or any(value + projection['pending_by_pair'][pair] > store.policy.max_position_quote
-                   for pair, value in projection['used_by_pair'].items())):
+    if ((store.policy.allocation_quote is not None and projection['used'] + pending > store.policy.allocation_quote)
+            or (store.policy.max_position_quote is not None and any(
+                value + projection['pending_by_pair'][pair] > store.policy.max_position_quote
+                for pair, value in projection['used_by_pair'].items()))):
         raise PolicyError('Funding transition target cannot contain existing native exposure')
     state['fills'] = projection['fills']
     before = {row.key: row.value for row in session.query(Metadata).all()
               if row.key == store.key or row.key.startswith(store.key + ':')}
+    available_quote = (None if store.policy.allocation_quote is None
+                       and not callable(getattr(connector, 'get_available_balance', None))
+                       else str(store._available_quote(projection, pending)))
     proposal = {'schema': 1, 'from_binding': expected_binding, 'to_binding': store.binding,
                 'previous_revision': state['revision'], 'before': before,
                 'native_sha256': _native_digest(session), 'state': state,
                 'inventory_cost': str(projection['inventory_cost']), 'cash_used': str(projection['cash_used']),
                 'pending_quote': str(pending), 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
-                'available_quote': str(store.policy.allocation_quote - projection['used'] - pending)}
+                'available_quote': available_quote}
+    if allocation_proof is not None:
+        proposal['allocation_only'] = allocation_proof
+        source_row = session.get(Metadata, store._source_key)
+        proposal['source_before'] = None if source_row is None else source_row.value
     if legacy is not None:
         proposal['legacy_retained_unreleased'] = legacy
     proposal['transition_id'] = identity(proposal)
     return proposal
 
 
-def plan_transition(store, expected_binding, *, legacy_evidence=None):
+def plan_transition(store, expected_binding, *, legacy_evidence=None, allocation_only_previous_configs=None):
     with store.recorder.sql_manager.get_new_session() as session:
         session.connection().exec_driver_sql('BEGIN')
-        proposal = _proposal(store, session, expected_binding, legacy_evidence)
+        proposal = _proposal(store, session, expected_binding, legacy_evidence,
+                             allocation_only_previous_configs)
     plans = getattr(store, '_binding_transition_plans', {})
-    plans[proposal['transition_id']] = (expected_binding, legacy_evidence)
+    plans[proposal['transition_id']] = (expected_binding, legacy_evidence, allocation_only_previous_configs)
     store._binding_transition_plans = plans
     return proposal
 
@@ -253,8 +337,10 @@ def apply_transition(store, transition_id):
         planned = getattr(store, '_binding_transition_plans', {}).get(transition_id)
         if planned is None:
             raise PolicyError('Funding transition plan unavailable; prepare and review again')
-        expected, legacy_evidence = planned if isinstance(planned, tuple) else (planned, None)
-        proposal = _proposal(store, session, expected, legacy_evidence)
+        expected, legacy_evidence, previous_configs = (planned if isinstance(planned, tuple) and len(planned) == 3
+                                                       else (*planned, None) if isinstance(planned, tuple)
+                                                       else (planned, None, None))
+        proposal = _proposal(store, session, expected, legacy_evidence, previous_configs)
         if proposal['transition_id'] != transition_id:
             raise PolicyError('Funding transition plan is stale; native evidence or audit changed')
         state = proposal['state']
@@ -282,6 +368,12 @@ def apply_transition(store, transition_id):
                 session.add(Metadata(key=row_key, value=value))
             elif row.value != value:
                 raise PolicyError('Funding transition changed an immutable release')
+        if proposal.get('allocation_only') is not None:
+            source_row = session.get(Metadata, store._source_key)
+            if source_row is None:
+                session.add(Metadata(key=store._source_key, value=store._source_record()))
+            else:
+                source_row.value = store._source_record()
         header = {'schema': 1, 'binding': store.binding, 'revision': state['revision'] + 1,
                   'audit_sha256': store._audit_hash(state)}
         session.get(Metadata, store.key).value = _json(header)

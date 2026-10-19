@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import ClassVar, Literal
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_serializer, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from hummingbot.core.data_type.common import PositionMode, TradeType
@@ -160,11 +160,19 @@ class NativeCompositionFields(BaseModel):
 
     execution_mode: Literal['live', 'paper'] = 'live'
     execution_enabled: StrictBool = Field(default=False, json_schema_extra={'is_updatable': True})
+    allocation_mode: Literal['bounded', 'wallet_funded'] = 'bounded'
     data: DataPolicy = Field(default_factory=DataPolicy)
     shared_history: int | None = Field(default=None, ge=500, le=10000, strict=True)
     recipe_binding: RecipeBinding | None = None
     funding: CandidateFundingPolicy | None = None
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False, validate_default=True)
+
+    @model_serializer(mode='wrap')
+    def preserve_bounded_identity(self, serialize):
+        payload = serialize(self)
+        if self.allocation_mode == 'bounded':
+            payload.pop('allocation_mode', None)
+        return payload
 
     @model_validator(mode='after')
     def validate_native_composition(self):
@@ -179,6 +187,14 @@ class NativeCompositionFields(BaseModel):
         if self.funding is not None:
             if self.trading_pair.split('-')[0] == 'SUI' or getattr(self, 'trade_mode', 'buy_sell') != 'buy_sell':
                 raise ValueError('Initial funded candidate excludes wallet-wide seller assets and sell-only adoption')
+            unbounded = self.funding.allocation_quote is None and self.funding.max_position_quote is None
+            if self.allocation_mode == 'wallet_funded' and not unbounded:
+                raise ValueError('wallet_funded requires null accumulated funding allocations')
+            if self.allocation_mode == 'bounded' and (self.funding.allocation_quote is None
+                                                      or self.funding.max_position_quote is None):
+                raise ValueError('bounded funding requires explicit accumulated allocation limits')
+        elif self.allocation_mode == 'wallet_funded':
+            raise ValueError('wallet_funded native composition requires durable funding policy')
         controls = {'mode', 'transport', 'origin', 'token_file'}
         if self.data.model_dump(exclude=controls) != DataPolicy().model_dump(exclude=controls):
             raise ValueError('native composition does not consume generic screening or source-profile settings')

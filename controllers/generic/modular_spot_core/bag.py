@@ -9,11 +9,11 @@ controller's orchestrator PositionHold built from its own keep_position stops.
 import json
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from pydantic import Field, model_validator
+from pydantic import Field, model_serializer, model_validator
 from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
@@ -126,14 +126,28 @@ class LiveCapitalConfig(PolicyModel):
     sizing are entry-side behaviour, not modelled here.
     """
     slice_quote: Decimal = Field(default=Decimal('100'), gt=0)
+    allocation_mode: Literal['bounded', 'wallet_funded'] = 'bounded'
     # Required so no config loses its cap by omission: a quote, or None for no position cap (live V2 BNB: 500).
     position_cap_quote: Optional[Decimal] = Field(..., gt=0)
-    max_active_tranches: int = Field(default=8, ge=1, le=64, strict=True)
+    max_active_tranches: Optional[int] = Field(default=8, ge=1, le=64, strict=True)
     funded_cap_quote: Optional[Decimal] = Field(default=None, gt=0)
     funding_fee_reserve: Decimal = Field(default=Decimal('0.003'), ge=0, lt=1)
 
+    @model_serializer(mode='wrap')
+    def preserve_bounded_identity(self, serialize):
+        payload = serialize(self)
+        if self.allocation_mode == 'bounded':
+            payload.pop('allocation_mode', None)
+        return payload
+
     @model_validator(mode='after')
     def slice_within_cap(self):
+        if self.allocation_mode == 'wallet_funded':
+            if any(value is not None for value in (self.position_cap_quote, self.funded_cap_quote,
+                                                   self.max_active_tranches)):
+                raise ValueError('wallet_funded requires null accumulated position, funding, and tranche caps')
+        elif self.max_active_tranches is None:
+            raise ValueError('bounded capital requires max_active_tranches')
         if self.position_cap_quote is not None and self.slice_quote > self.position_cap_quote:
             raise ValueError('slice_quote must not exceed position_cap_quote (live usd_per_entry <= max_total_position_usd)')
         return self
@@ -345,7 +359,7 @@ def live_capital_decision(cap: LiveCapitalConfig, *, active_count: int, exposure
                           funded_used_quote: Optional[Decimal] = None):
     """Quote for the next buy, or ``(None, reason)``, in the live gate order. Pure, so the
     research verifier can recompute every recorded capital decision."""
-    if active_count >= cap.max_active_tranches:
+    if cap.max_active_tranches is not None and active_count >= cap.max_active_tranches:
         return None, 'max_executors'
     quote = cap.slice_quote
     if cap.funded_cap_quote is not None:

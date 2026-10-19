@@ -2,7 +2,9 @@ import asyncio
 import json
 import sqlite3
 import tempfile
+import threading
 import time
+from collections import Counter
 from decimal import Decimal
 from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -11,7 +13,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
 from sqlalchemy import create_engine, event, update
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -27,6 +29,7 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model.chart_snapshot import ChartSnapshot
 from hummingbot.model.controller_candle_watermark import (
     ControllerCandleWatermarkNamespace,
     ControllerCandleWatermarkOutcome,
@@ -1338,6 +1341,396 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         recorder = MarketsRecorder.__new__(MarketsRecorder)
         recorder._sql_manager = manager
         return recorder
+
+    def test_chart_batch_does_not_hold_sqlite_writer_during_remaining_identity_reads(self):
+        """A slow chart lookup must not consume the native fill callback's lock budget."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()),
+                SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(temp_dir) / "chart-financial.sqlite"),
+            )
+            recorder = MarketsRecorder(
+                sql=manager,
+                markets=[self],
+                config_file_path=self.config_file_path,
+                strategy_name=self.strategy_name,
+                market_data_collection=MarketDataCollectionConfigMap(
+                    market_data_collection_enabled=False,
+                    market_data_collection_interval=60,
+                    market_data_collection_depth=20,
+                ),
+            )
+            with manager.engine.connect() as connection:
+                self.assertEqual(2000, connection.exec_driver_sql("PRAGMA busy_timeout").scalar())
+
+            rows = [
+                {
+                    "bot_name": "offline-chart-test",
+                    "controller_id": "offline-controller",
+                    "pair": self.trading_pair,
+                    "interval": "1m",
+                    "candle_timestamp": 1_700_000_000_000 + index * 60_000,
+                    "open_price": 100.0,
+                    "high_price": 101.0,
+                    "low_price": 99.0,
+                    "close_price": 100.0 + index / 1000,
+                    "volume": 1.0,
+                    "rsi": 45.0,
+                }
+                for index in range(500)
+            ]
+            recorder.store_or_update_chart_snapshots(rows[:250])
+            batch = [{**row, "rsi": 46.0} for row in rows[:250]] + rows[250:]
+            first_update = threading.Event()
+            chart_done = threading.Event()
+            chart_errors = []
+            counts = Counter()
+
+            def before_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if threading.current_thread().name != "chart-financial-probe":
+                    return
+                kind = statement.lstrip().split(None, 1)[0].upper()
+                counts[kind] += 1
+                if first_update.is_set() and kind == "SELECT" and '"ChartSnapshot"' in statement:
+                    time.sleep(0.006)
+
+            def after_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if threading.current_thread().name == "chart-financial-probe" and statement.lstrip().upper().startswith("UPDATE"):
+                    first_update.set()
+
+            event.listen(manager.engine, "before_cursor_execute", before_execute)
+            event.listen(manager.engine, "after_cursor_execute", after_execute)
+
+            def write_chart():
+                try:
+                    recorder.store_or_update_chart_snapshots(batch)
+                except Exception as exc:
+                    chart_errors.append(exc)
+                finally:
+                    chart_done.set()
+
+            worker = threading.Thread(target=write_chart, name="chart-financial-probe")
+            worker.start()
+            try:
+                self.assertTrue(first_update.wait(10), "chart batch never reached its first update")
+                fill = OrderFilledEvent(
+                    timestamp=1_700_000_000,
+                    order_id="offline-chart-fill",
+                    trading_pair=self.trading_pair,
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("100"),
+                    amount=Decimal("1"),
+                    trade_fee=AddedToCostTradeFee(),
+                    exchange_trade_id="offline-chart-fill-id",
+                )
+                recorder._did_fill_order(MarketEvent.OrderFilled.value, self, fill)
+            finally:
+                worker.join(timeout=10)
+                event.remove(manager.engine, "before_cursor_execute", before_execute)
+                event.remove(manager.engine, "after_cursor_execute", after_execute)
+
+            self.assertTrue(chart_done.is_set(), "chart worker did not finish")
+            self.assertEqual([], chart_errors)
+            self.assertLessEqual(counts["SELECT"], 3)
+            with manager.get_new_session() as session:
+                self.assertEqual(500, session.query(ChartSnapshot).count())
+                self.assertEqual(1, session.query(TradeFill).count())
+                self.assertEqual(
+                    46.0,
+                    session.query(ChartSnapshot.rsi).filter(
+                        ChartSnapshot.candle_timestamp == rows[0]["candle_timestamp"]
+                    ).scalar(),
+                )
+
+    def test_chart_batch_prefetch_keeps_legacy_merge_duplicate_and_identity_semantics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = self._file_recorder(Path(temp_dir) / "chart-merge.sqlite")
+            base = {
+                "bot_name": "offline-chart-test",
+                "controller_id": "offline-controller",
+                "pair": self.trading_pair,
+                "interval": "1m",
+                "candle_timestamp": 1_700_000_000_000,
+                "open_price": 100.0,
+                "high_price": 101.0,
+                "low_price": 99.0,
+                "close_price": 100.0,
+                "volume": 1.0,
+                "rsi": 45.0,
+            }
+            recorder.store_or_update_chart_snapshots([{**base, "buy_decision": "observed"}])
+            with recorder.sql_manager.get_new_session() as session:
+                existing_id = session.query(ChartSnapshot.id).scalar()
+
+            new = {**base, "candle_timestamp": base["candle_timestamp"] + 60_000, "id": existing_id + 100}
+            recorder.store_or_update_chart_snapshots([
+                {**base, "id": existing_id + 200, "rsi": None, "signal": 0},
+                {**new, "rsi": 46.0, "buy_decision": "first"},
+                {**new, "id": existing_id + 300, "rsi": 47.0, "buy_decision": None},
+            ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).order_by(ChartSnapshot.candle_timestamp).all()
+                self.assertEqual(2, len(rows))
+                self.assertEqual(existing_id, rows[0].id)
+                self.assertIsNone(rows[0].rsi)
+                self.assertEqual(0, rows[0].signal)
+                self.assertEqual("observed", rows[0].buy_decision)
+                self.assertEqual(existing_id + 100, rows[1].id)
+                self.assertEqual(47.0, rows[1].rsi)
+                self.assertIsNone(rows[1].buy_decision)
+
+            # SQLite integer affinity accepted this caller input before the
+            # prefetch optimization; the fallback must retain that matching.
+            recorder.store_or_update_chart_snapshots([
+                {**base, "candle_timestamp": str(base["candle_timestamp"]), "rsi": 48.0}
+            ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(2, len(rows))
+                self.assertEqual(48.0, next(row.rsi for row in rows if row.id == existing_id))
+
+            with self.assertRaises(TypeError):
+                recorder.store_or_update_chart_snapshots([
+                    {**base, "rsi": 49.0},
+                    {**base, "candle_timestamp": base["candle_timestamp"] + 120_000,
+                     "unexpected_column": 1},
+                ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(2, len(rows))
+                self.assertEqual(48.0, next(row.rsi for row in rows if row.id == existing_id))
+
+    def test_duplicate_chart_identity_preserves_intermediate_constraint_and_batch_rollback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = self._file_recorder(Path(temp_dir) / "chart-intermediate-constraint.sqlite")
+            base = {
+                "bot_name": "offline-chart-test",
+                "controller_id": "offline-controller",
+                "pair": self.trading_pair,
+                "interval": "1m",
+                "candle_timestamp": 1_700_000_000_000,
+                "open_price": 100.0,
+                "high_price": 101.0,
+                "low_price": 99.0,
+                "close_price": 100.0,
+            }
+            recorder.store_or_update_chart_snapshots([base])
+
+            # The original per-row SELECT autoflushes the invalid first
+            # update before the later correction can mask the constraint.
+            with self.assertRaises(IntegrityError):
+                recorder.store_or_update_chart_snapshots([
+                    {**base, "open_price": None},
+                    {**base, "open_price": 101.0},
+                ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(1, len(rows))
+                self.assertEqual(100.0, rows[0].open_price)
+
+            new = {**base, "candle_timestamp": base["candle_timestamp"] + 60_000}
+            with self.assertRaises(IntegrityError):
+                recorder.store_or_update_chart_snapshots([
+                    {**new, "open_price": None},
+                    {**new, "open_price": 101.0},
+                ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(1, len(rows))
+                self.assertEqual(100.0, rows[0].open_price)
+
+    def test_financial_commit_between_chart_prefetch_and_flush_does_not_invalidate_chart_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()),
+                SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(temp_dir) / "chart-prefetch-interleave.sqlite"),
+            )
+            recorder = MarketsRecorder(
+                sql=manager,
+                markets=[self],
+                config_file_path=self.config_file_path,
+                strategy_name=self.strategy_name,
+                market_data_collection=MarketDataCollectionConfigMap(
+                    market_data_collection_enabled=False,
+                    market_data_collection_interval=60,
+                    market_data_collection_depth=20,
+                ),
+            )
+            row = {
+                "bot_name": "offline-chart-test",
+                "controller_id": "offline-controller",
+                "pair": self.trading_pair,
+                "interval": "1m",
+                "candle_timestamp": 1_700_000_000_000,
+                "open_price": 100.0,
+                "high_price": 101.0,
+                "low_price": 99.0,
+                "close_price": 100.0,
+                "rsi": 45.0,
+            }
+            recorder.store_or_update_chart_snapshots([row])
+            read_completed = threading.Event()
+            release_read = threading.Event()
+            chart_done = threading.Event()
+            chart_errors = []
+
+            def after_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if (threading.current_thread().name == "chart-prefetch-interleave"
+                        and statement.lstrip().upper().startswith("SELECT")
+                        and '"ChartSnapshot"' in statement
+                        and not read_completed.is_set()):
+                    read_completed.set()
+                    if not release_read.wait(5):
+                        raise TimeoutError("financial commit did not release chart prefetch")
+
+            event.listen(manager.engine, "after_cursor_execute", after_execute)
+
+            def write_chart():
+                try:
+                    recorder.store_or_update_chart_snapshots([{**row, "rsi": 46.0}])
+                except Exception as exc:
+                    chart_errors.append(exc)
+                finally:
+                    chart_done.set()
+
+            worker = threading.Thread(target=write_chart, name="chart-prefetch-interleave")
+            worker.start()
+            try:
+                self.assertTrue(read_completed.wait(5), "chart identity prefetch did not run")
+                fill = OrderFilledEvent(
+                    timestamp=1_700_000_000,
+                    order_id="offline-prefetch-fill",
+                    trading_pair=self.trading_pair,
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("100"),
+                    amount=Decimal("1"),
+                    trade_fee=AddedToCostTradeFee(),
+                    exchange_trade_id="offline-prefetch-fill-id",
+                )
+                recorder._did_fill_order(MarketEvent.OrderFilled.value, self, fill)
+            finally:
+                release_read.set()
+                worker.join(timeout=10)
+                event.remove(manager.engine, "after_cursor_execute", after_execute)
+
+            self.assertTrue(chart_done.is_set())
+            self.assertEqual([], chart_errors)
+            with manager.get_new_session() as session:
+                self.assertEqual(1, session.query(TradeFill).count())
+                self.assertEqual(46.0, session.query(ChartSnapshot.rsi).scalar())
+
+    def test_chart_prune_and_actual_fill_commit_concurrently_without_losing_either_receipt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()),
+                SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(temp_dir) / "chart-prune-financial.sqlite"),
+            )
+            recorder = MarketsRecorder(
+                sql=manager,
+                markets=[self],
+                config_file_path=self.config_file_path,
+                strategy_name=self.strategy_name,
+                market_data_collection=MarketDataCollectionConfigMap(
+                    market_data_collection_enabled=False,
+                    market_data_collection_interval=60,
+                    market_data_collection_depth=20,
+                ),
+            )
+            with manager.engine.connect() as connection:
+                self.assertEqual("wal", connection.exec_driver_sql("PRAGMA journal_mode").scalar())
+                self.assertEqual(2000, connection.exec_driver_sql("PRAGMA busy_timeout").scalar())
+
+            base_timestamp = 1_700_000_000_000
+            rows = [
+                {
+                    "bot_name": "offline-chart-test",
+                    "controller_id": "offline-controller",
+                    "pair": self.trading_pair,
+                    "interval": "1m",
+                    "candle_timestamp": base_timestamp + index * 60_000,
+                    "open_price": 100.0,
+                    "high_price": 101.0,
+                    "low_price": 99.0,
+                    "close_price": 100.0,
+                }
+                for index in range(4096)
+            ]
+            for offset in range(0, len(rows), 500):
+                recorder.store_or_update_chart_snapshots(rows[offset:offset + 500])
+
+            delete_executed = threading.Event()
+            fill_insert_attempt = threading.Event()
+            prune_done = threading.Event()
+            prune_errors = []
+
+            def before_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if (threading.current_thread() is threading.main_thread()
+                        and statement.lstrip().startswith('INSERT INTO "TradeFillExact"')):
+                    fill_insert_attempt.set()
+
+            def after_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if (threading.current_thread().name == "chart-prune-probe"
+                        and statement.lstrip().startswith('DELETE FROM "ChartSnapshot"')):
+                    delete_executed.set()
+                    if not fill_insert_attempt.wait(5):
+                        raise TimeoutError("fill callback did not reach its native insert")
+
+            event.listen(manager.engine, "before_cursor_execute", before_execute)
+            event.listen(manager.engine, "after_cursor_execute", after_execute)
+
+            def prune():
+                try:
+                    recorder.prune_chart_snapshots(
+                        controller_id="offline-controller",
+                        pair=self.trading_pair,
+                        interval="1m",
+                        keep_after_timestamp=rows[2048]["candle_timestamp"],
+                    )
+                except Exception as exc:
+                    prune_errors.append(exc)
+                finally:
+                    prune_done.set()
+
+            worker = threading.Thread(target=prune, name="chart-prune-probe")
+            worker.start()
+            try:
+                self.assertTrue(delete_executed.wait(5), "prune never executed its indexed delete")
+                fill = OrderFilledEvent(
+                    timestamp=1_700_000_000,
+                    order_id="offline-prune-fill",
+                    trading_pair=self.trading_pair,
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("100"),
+                    amount=Decimal("1"),
+                    trade_fee=AddedToCostTradeFee(),
+                    exchange_trade_id="offline-prune-fill-id",
+                )
+                recorder._did_fill_order(MarketEvent.OrderFilled.value, self, fill)
+            finally:
+                fill_insert_attempt.set()
+                worker.join(timeout=10)
+                event.remove(manager.engine, "before_cursor_execute", before_execute)
+                event.remove(manager.engine, "after_cursor_execute", after_execute)
+
+            self.assertTrue(prune_done.is_set())
+            self.assertEqual([], prune_errors)
+            with manager.get_new_session() as session:
+                self.assertEqual(2048, session.query(ChartSnapshot).count())
+                self.assertEqual(
+                    rows[2048]["candle_timestamp"],
+                    session.query(ChartSnapshot.candle_timestamp).order_by(ChartSnapshot.candle_timestamp).first()[0],
+                )
+                self.assertEqual(
+                    rows[-1]["candle_timestamp"],
+                    session.query(ChartSnapshot.candle_timestamp).order_by(ChartSnapshot.candle_timestamp.desc()).first()[0],
+                )
+                self.assertEqual(1, session.query(TradeFill).count())
 
     def test_watermark_explicit_seed_reopen_and_missing_row_are_typed(self):
         with tempfile.TemporaryDirectory() as temp_dir:

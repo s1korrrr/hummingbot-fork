@@ -12,9 +12,10 @@ from shutil import move
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
-from sqlalchemy import event as sql_event, func, inspect, update
+from sqlalchemy import event as sql_event, func, inspect, tuple_, update
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Query, Session
+from sqlalchemy.orm.exc import MultipleResultsFound
 
 from hummingbot import data_path
 from hummingbot.client.config.client_config_map import MarketDataCollectionConfigMap
@@ -672,21 +673,51 @@ class MarketsRecorder:
         """Commit a bounded chart batch atomically; omitted fields retain their values."""
         if not snapshots:
             return
+        identity_columns = ("controller_id", "pair", "interval", "candle_timestamp")
+        identities = [tuple(snapshot[column] for column in identity_columns) for snapshot in snapshots]
+        # Coercible identities and duplicate keys need the original per-row
+        # lookup/autoflush behavior, including intermediate constraint checks.
+        canonical_identities = all(
+            all(type(value) is str for value in identity[:3]) and type(identity[3]) is int
+            for identity in identities
+        ) and len(set(identities)) == len(identities)
         with self._sql_manager.get_new_session() as session:
-            for snapshot in snapshots:
-                identity = {
-                    "controller_id": snapshot["controller_id"],
-                    "pair": snapshot["pair"],
-                    "interval": snapshot["interval"],
-                    "candle_timestamp": snapshot["candle_timestamp"],
-                }
-                existing_snapshot = session.query(ChartSnapshot).filter_by(**identity).one_or_none()
+            existing_by_identity = {}
+            if canonical_identities:
+                unique_identities = list(dict.fromkeys(identities))
+                chart_identity = tuple_(
+                    ChartSnapshot.controller_id,
+                    ChartSnapshot.pair,
+                    ChartSnapshot.interval,
+                    ChartSnapshot.candle_timestamp,
+                )
+                # Four bound parameters per identity; 200 remains below the
+                # older SQLite default variable limit of 999 while bounding read work.
+                for offset in range(0, len(unique_identities), 200):
+                    chunk = unique_identities[offset:offset + 200]
+                    for row in session.query(ChartSnapshot).filter(chart_identity.in_(chunk)).all():
+                        row_identity = (row.controller_id, row.pair, row.interval, row.candle_timestamp)
+                        if row_identity in existing_by_identity:
+                            # The previous per-key one_or_none() failed closed
+                            # if an old database lacked the unique constraint.
+                            raise MultipleResultsFound("Duplicate chart snapshot identity")
+                        existing_by_identity[row_identity] = row
+
+            for snapshot, identity_values in zip(snapshots, identities):
+                if canonical_identities:
+                    existing_snapshot = existing_by_identity.get(identity_values)
+                else:
+                    identity = dict(zip(identity_columns, identity_values))
+                    existing_snapshot = session.query(ChartSnapshot).filter_by(**identity).one_or_none()
                 if existing_snapshot:
                     for attr, value in snapshot.items():
                         if attr != "id":
                             setattr(existing_snapshot, attr, value)
                 else:
-                    session.add(ChartSnapshot(**snapshot))
+                    new_snapshot = ChartSnapshot(**snapshot)
+                    session.add(new_snapshot)
+                    if canonical_identities:
+                        existing_by_identity[identity_values] = new_snapshot
             session.commit()
 
     def prune_chart_snapshots(self, *, controller_id: str, pair: str, interval: str, keep_after_timestamp: int):

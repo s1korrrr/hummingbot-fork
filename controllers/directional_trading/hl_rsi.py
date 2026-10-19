@@ -281,7 +281,7 @@ class HLRSIControllerConfig(DirectionalTradingControllerConfigBase):
         client_data=ClientFieldData(
             prompt=lambda mi: "Allocation mode (bounded/wallet_funded):",
             prompt_on_new=False,
-            is_updatable=True,
+            is_updatable=False,
         ),
     )
 

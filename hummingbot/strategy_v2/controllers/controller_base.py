@@ -277,17 +277,20 @@ class ControllerBase(RunnableBase):
         Update the controller configuration. With the variables that in the client_data have the is_updatable flag set
         to True. This will be only available for those variables that don't interrupt the bot operation.
         """
-        current = self.config.model_dump()
         requested = new_config.model_dump()
+        # Some controllers intentionally omit a default from their canonical
+        # serialization to preserve a pre-upgrade identity hash. Compare the
+        # actual validated fields so an unchanged reload remains well-defined.
+        validated = type(self.config).model_validate(requested)
         restart_fields = []
         for name, field_info in type(self.config).model_fields.items():
-            if current[name] != requested[name] and not (field_info.json_schema_extra or {}).get("is_updatable", False):
+            if (getattr(self.config, name) != getattr(validated, name)
+                    and not (field_info.json_schema_extra or {}).get("is_updatable", False)):
                 restart_fields.append(name)
         if restart_fields:
             raise ValueError("restart required for config fields: " + ", ".join(restart_fields))
         # Validate a complete snapshot, then swap it. Assignment validation on individual fields can mutate
         # the original object before a coupled-field validator raises.
-        validated = type(self.config).model_validate(requested)
         self.config = validated
 
     def build_chart_snapshot_rows(self, bot_name: str) -> List[Dict[str, object]]:

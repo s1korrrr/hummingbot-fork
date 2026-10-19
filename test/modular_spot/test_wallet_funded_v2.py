@@ -69,6 +69,27 @@ def test_legacy_hl_rsi_reload_accepts_unchanged_allocation_mode(mode):
     assert bot.config.allocation_mode == mode
 
 
+@pytest.mark.parametrize(('before_mode', 'after_mode'), [
+    ('bounded', 'wallet_funded'), ('wallet_funded', 'bounded'),
+])
+def test_legacy_allocation_mode_change_requires_guarded_restart(before_mode, after_mode):
+    import asyncio
+
+    from test_native_composition import provider
+
+    from controllers.directional_trading.hl_rsi import HLRSIController, HLRSIControllerConfig
+
+    config = HLRSIControllerConfig(id='hl_rsi_restart_mode', allocation_mode=before_mode,
+                                   candles_connector='hyperliquid', candles_trading_pair='HYPE-USDC')
+    bot = HLRSIController(config, provider(), asyncio.Queue())
+    before = bot.config.model_dump(mode='json')
+    target = type(config).model_validate({**before, 'allocation_mode': after_mode})
+    with pytest.raises(ValueError, match='restart required.*allocation_mode'):
+        bot.update_config(target)
+    assert bot.config is config
+    assert bot.config.model_dump(mode='json') == before
+
+
 def test_wallet_funded_capital_allows_existing_exposure_and_tranches_but_requires_cash():
     cap = LiveCapitalConfig(slice_quote=D('100'), allocation_mode='wallet_funded', position_cap_quote=None,
                             max_active_tranches=None, funded_cap_quote=None)

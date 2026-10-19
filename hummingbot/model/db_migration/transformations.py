@@ -199,3 +199,30 @@ class AddExactTradeFillReceipts(DatabaseTransformation):
     @property
     def to_version(self):
         return 20260910
+
+
+class AddTradeFillExecutionTimestamp(DatabaseTransformation):
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        with db_handle.engine.begin() as connection:
+            self.apply_sqlite_transaction(connection)
+        return db_handle
+
+    def apply_sqlite_transaction(self, connection):
+        # Fresh create_all may already have supplied these columns on an old metadata-only DB.
+        columns = {column["name"] for column in inspect(connection).get_columns("TradeFill")}
+        if "execution_timestamp_ms" not in columns:
+            connection.exec_driver_sql(
+                'ALTER TABLE "TradeFill" ADD COLUMN "execution_timestamp_ms" BIGINT NULL'
+            )
+        if "execution_timestamp_source" not in columns:
+            connection.exec_driver_sql(
+                'ALTER TABLE "TradeFill" ADD COLUMN "execution_timestamp_source" TEXT NULL'
+            )
+
+    @property
+    def name(self):
+        return "AddTradeFillExecutionTimestamp"
+
+    @property
+    def to_version(self):
+        return 20261019

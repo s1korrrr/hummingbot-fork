@@ -13,7 +13,7 @@ from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import get_new_client_order_id
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderCancelledEvent, OrderType, TradeType
 
@@ -36,6 +36,73 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertTrue(taker[0].is_taker)
         self.assertTrue(self.exchange._is_taker_fill({"tradeId": "unknown"}))
 
+    async def test_rest_fill_time_is_attested_without_replacing_record_timestamp(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+        fill["ts"] = "1781855999000"
+        # Exactly at the +5s observation bound, while the REST record clock is 8s earlier.
+        fill["fillTime"] = "1781856007000"
+        self.exchange._set_current_timestamp(1781856002)
+        with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+            request.return_value = {"code": "0", "data": [fill]}
+            update = (await self.exchange._all_trade_updates_for_order(order))[0]
+        self.assertEqual(update.fill_timestamp, 1781855999)
+        self.assertEqual(update.execution_timestamp_ms, 1781856007000)
+        self.assertEqual(update.execution_timestamp_source, "okx.fillTime")
+        self.assertEqual(update.execution_timestamp_observed_at_ms, 1781856002000)
+
+        self.assertTrue(order.update_with_trade_update(update))
+        restored = InFlightOrder.from_json(json.loads(json.dumps(order.to_json())))
+        restored_update = restored.order_fills[update.trade_id]
+        self.assertEqual(restored_update.execution_timestamp_ms, 1781856007000)
+        self.assertEqual(restored_update.execution_timestamp_source, "okx.fillTime")
+        self.assertEqual(restored_update.execution_timestamp_observed_at_ms, 1781856002000)
+
+        old_payload = update.to_json()
+        old_payload.pop("execution_timestamp_observed_at_ms")
+        old_payload["fill_timestamp"] = 1781855990
+        old_without_basis = TradeUpdate.from_json(old_payload)
+        self.assertIsNone(old_without_basis.execution_timestamp_ms)
+        self.assertIsNone(old_without_basis.execution_timestamp_source)
+
+    async def test_rest_oversized_fill_time_keeps_financial_receipt(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+        fill["fillTime"] = "9" * 4301
+        self.exchange._set_current_timestamp(1781856002)
+        with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+            request.return_value = {"code": "0", "data": [fill]}
+            update = (await self.exchange._all_trade_updates_for_order(order))[0]
+        self.assertEqual(update.fill_price, Decimal(fill["fillPx"]))
+        self.assertEqual(update.fill_base_amount, Decimal(fill["fillSz"]))
+        self.assertEqual(update.fill_quote_amount, Decimal(fill["fillSz"]) * Decimal(fill["fillPx"]))
+        self.assertIsNone(update.execution_timestamp_ms)
+        self.assertIsNone(update.execution_timestamp_source)
+
+    async def test_invalid_or_far_future_rest_fill_time_keeps_fill_unknown(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        self.exchange._set_current_timestamp(1781856000)
+        for invalid in ("0", "bad", "1781856006001"):
+            fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+            fill["fillTime"] = invalid
+            with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+                request.return_value = {"code": "0", "data": [fill]}
+                update = (await self.exchange._all_trade_updates_for_order(order))[0]
+            self.assertIsNone(update.execution_timestamp_ms)
+            self.assertIsNone(update.execution_timestamp_source)
+
     async def test_websocket_maker_fill_role_is_preserved(self):
         order = InFlightOrder(
             client_order_id="maker-entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
@@ -56,6 +123,63 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 patch.object(self.exchange, "_order_tracker", tracker):
             await self.exchange._user_stream_event_listener()
         self.assertFalse(tracker.process_trade_update.call_args.args[0].is_taker)
+
+    async def test_websocket_fill_time_is_attested_separately_from_update_time(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        event = self.trade_event_for_full_fill_websocket_update(order)
+        event["data"][0].update({"uTime": "1781856002000", "fillTime": "1781856001000"})
+
+        async def one_event():
+            yield event
+
+        tracker = MagicMock()
+        self.exchange._set_current_timestamp(1781856002)
+        tracker.all_fillable_orders = {order.client_order_id: order}
+        tracker.all_updatable_orders = {}
+        with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
+                patch.object(self.exchange, "_order_tracker", tracker):
+            await self.exchange._user_stream_event_listener()
+        update = tracker.process_trade_update.call_args.args[0]
+        self.assertEqual(update.fill_timestamp, 1781856002)
+        self.assertEqual(update.execution_timestamp_ms, 1781856001000)
+        self.assertEqual(update.execution_timestamp_source, "okx.fillTime")
+
+    async def test_websocket_oversized_fill_time_keeps_fill_and_order_status(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        event = self.trade_event_for_full_fill_websocket_update(order)
+        event["data"][0].update({
+            "state": "partially_filled",
+            "uTime": "1781856002000",
+            "fillTime": "9" * 4301,
+        })
+
+        async def one_event():
+            yield event
+
+        tracker = MagicMock()
+        tracker.all_fillable_orders = {order.client_order_id: order}
+        tracker.all_updatable_orders = {order.client_order_id: order}
+        self.exchange._set_current_timestamp(1781856002)
+        with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
+                patch.object(self.exchange, "_order_tracker", tracker):
+            await self.exchange._user_stream_event_listener()
+
+        update = tracker.process_trade_update.call_args.args[0]
+        self.assertEqual(update.fill_price, Decimal(event["data"][0]["fillPx"]))
+        self.assertEqual(update.fill_base_amount, Decimal(event["data"][0]["fillSz"]))
+        self.assertEqual(update.fill_quote_amount, update.fill_base_amount * update.fill_price)
+        self.assertIsNone(update.execution_timestamp_ms)
+        self.assertIsNone(update.execution_timestamp_source)
+        order_update = tracker.process_order_update.call_args.kwargs["order_update"]
+        self.assertEqual(order_update.new_state, OrderState.PARTIALLY_FILLED)
 
     async def test_preopen_instrument_is_not_mapped_as_live_rule(self):
         info = {"instType": "SPOT", "instId": "LAT-USDC", "baseCcy": "LAT", "quoteCcy": "USDC",

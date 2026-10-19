@@ -21,7 +21,11 @@ from hummingbot.client.config.client_config_map import MarketDataCollectionConfi
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.utils import TradeFillOrderDetails
 from hummingbot.core.data_type.common import PriceType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.in_flight_order import (
+    OKX_FILL_TIME_SOURCE,
+    InFlightOrder,
+    normalize_execution_timestamp_ms,
+)
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -80,6 +84,23 @@ class MarketsRecorder:
         if cls._logger is None:
             cls._logger = logging.getLogger(__name__)
         return cls._logger
+
+    @classmethod
+    def _execution_timestamp_attestation(cls, evt: OrderFilledEvent) -> Tuple[Optional[int], Optional[str]]:
+        timestamp_ms = evt.execution_timestamp_ms
+        source = evt.execution_timestamp_source
+        if timestamp_ms is None and source is None:
+            return None, None
+        if type(timestamp_ms) is not int or source != OKX_FILL_TIME_SOURCE:
+            cls.logger().error("Invalid fill execution-time attestation for %s/%s; storing it as unknown",
+                               evt.order_id, evt.exchange_trade_id)
+            return None, None
+        normalized = normalize_execution_timestamp_ms(timestamp_ms, evt.timestamp)
+        if normalized is None:
+            cls.logger().error("Out-of-range or future fill execution time for %s/%s; storing it as unknown",
+                               evt.order_id, evt.exchange_trade_id)
+            return None, None
+        return normalized, source
 
     @classmethod
     def get_instance(cls, *args, **kwargs) -> "MarketsRecorder":
@@ -1116,6 +1137,7 @@ class MarketsRecorder:
 
         base_asset, quote_asset = evt.trading_pair.split("-")
         timestamp: int = int(evt.timestamp * 1e3) if evt.timestamp is not None else self.db_timestamp
+        execution_timestamp_ms, execution_timestamp_source = self._execution_timestamp_attestation(evt)
         event_type: MarketEvent = self.market_event_tag_map[event_tag]
         order_id: str = evt.order_id
 
@@ -1139,6 +1161,31 @@ class MarketsRecorder:
                             or existing_fill.symbol != evt.trading_pair or existing_fill.trade_type != evt.trade_type.name
                             or existing_fill.trade_fee != evt.trade_fee.to_json()):
                         raise ValueError(f"Conflicting duplicate fill receipt for {order_id}/{evt.exchange_trade_id}")
+                    existing_execution_time = normalize_execution_timestamp_ms(
+                        existing_fill.execution_timestamp_ms,
+                        existing_fill.timestamp / 1e3,
+                    ) if type(existing_fill.execution_timestamp_ms) is int else None
+                    existing_execution_source = existing_fill.execution_timestamp_source
+                    if (existing_execution_time is not None
+                            and existing_execution_source == OKX_FILL_TIME_SOURCE):
+                        if (execution_timestamp_ms is not None
+                                and (existing_execution_time != execution_timestamp_ms
+                                     or existing_execution_source != execution_timestamp_source)):
+                            self.logger().error(
+                                "Conflicting duplicate fill execution-time attestation for %s/%s; "
+                                "preserving the first attestation",
+                                order_id, evt.exchange_trade_id,
+                            )
+                    elif (existing_fill.execution_timestamp_ms is None
+                          and existing_fill.execution_timestamp_source is None
+                          and execution_timestamp_ms is not None):
+                        # A financially identical receipt can add missing venue evidence, but never overwrite known data.
+                        existing_fill.execution_timestamp_ms = execution_timestamp_ms
+                        existing_fill.execution_timestamp_source = execution_timestamp_source
+                        self.logger().info(
+                            "Enriched duplicate fill execution-time attestation for %s/%s",
+                            order_id, evt.exchange_trade_id,
+                        )
                     return  # Stable venue/order/fill identity: redelivery must not duplicate receipts or status.
                 # Try to find the order record, and update it if necessary.
                 order_record: Optional[Order] = session.query(Order).filter(Order.id == order_id).one_or_none()
@@ -1185,6 +1232,8 @@ class MarketsRecorder:
                     exact_price=TradeFill.decimal_text(evt.price),
                     exact_trade_fee_in_quote=exact_fee_in_quote,
                     exact_receipt_source="order_filled_event_v1",
+                    execution_timestamp_ms=execution_timestamp_ms,
+                    execution_timestamp_source=execution_timestamp_source,
                     exchange_trade_id=evt.exchange_trade_id,
                     position=evt.position if evt.position else PositionAction.NIL.value,
                 )

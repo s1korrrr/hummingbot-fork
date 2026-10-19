@@ -20,6 +20,34 @@ if typing.TYPE_CHECKING:  # avoid circular import problems
 s_decimal_0 = Decimal("0")
 
 GET_EX_ORDER_ID_TIMEOUT = 10  # seconds
+EXECUTION_TIMESTAMP_FUTURE_TOLERANCE_MS = 5_000
+MAX_UNIX_TIMESTAMP_MS = 253_402_300_799_999
+OKX_FILL_TIME_SOURCE = "okx.fillTime"
+
+
+def _normalize_execution_timestamp_ms_at_observation_ms(value: Any, observed_at_ms: Any) -> Optional[int]:
+    if isinstance(value, str):
+        if not value or len(value) > 15 or not value.isascii() or not value.isdigit():
+            return None
+        value = int(value)
+    if (type(value) is not int or value <= 0 or value > MAX_UNIX_TIMESTAMP_MS
+            or type(observed_at_ms) is not int or observed_at_ms <= 0
+            or observed_at_ms > MAX_UNIX_TIMESTAMP_MS):
+        return None
+    if value > observed_at_ms + EXECUTION_TIMESTAMP_FUTURE_TOLERANCE_MS:
+        return None
+    return value
+
+
+def normalize_execution_timestamp_ms(value: Any, observed_at_seconds: Any) -> Optional[int]:
+    """Return a positive millisecond timestamp no more than 5 seconds after observation."""
+    if type(observed_at_seconds) not in (int, float):
+        return None
+    try:
+        observed_at_ms = int(observed_at_seconds * 1000)
+    except (OverflowError, ValueError):
+        return None
+    return _normalize_execution_timestamp_ms_at_observation_ms(value, observed_at_ms)
 
 
 class OrderState(Enum):
@@ -56,6 +84,9 @@ class TradeUpdate(NamedTuple):
     fill_quote_amount: Decimal
     fee: TradeFeeBase
     is_taker: bool = True  # CEXs deliver trade events from the taker's perspective
+    execution_timestamp_ms: Optional[int] = None
+    execution_timestamp_source: Optional[str] = None
+    execution_timestamp_observed_at_ms: Optional[int] = None
 
     @property
     def fee_asset(self):
@@ -66,6 +97,27 @@ class TradeUpdate(NamedTuple):
         is_taker = data.get("is_taker", True)
         if type(is_taker) is not bool:
             raise ValueError("TradeUpdate is_taker must be a boolean")
+        raw_execution_timestamp_ms = data.get("execution_timestamp_ms")
+        if "execution_timestamp_observed_at_ms" in data:
+            raw_observed_at_ms = data.get("execution_timestamp_observed_at_ms")
+            execution_timestamp_ms = _normalize_execution_timestamp_ms_at_observation_ms(
+                raw_execution_timestamp_ms if type(raw_execution_timestamp_ms) is int else None,
+                raw_observed_at_ms,
+            ) if type(raw_observed_at_ms) is int else None
+            execution_timestamp_observed_at_ms = raw_observed_at_ms if execution_timestamp_ms is not None else None
+        else:
+            execution_timestamp_ms = normalize_execution_timestamp_ms(
+                raw_execution_timestamp_ms if type(raw_execution_timestamp_ms) is int else None,
+                data.get("fill_timestamp"),
+            )
+            execution_timestamp_observed_at_ms = None
+        execution_timestamp_source = (
+            data.get("execution_timestamp_source") if execution_timestamp_ms is not None else None
+        )
+        if execution_timestamp_source != "okx.fillTime":
+            execution_timestamp_ms = None
+            execution_timestamp_source = None
+            execution_timestamp_observed_at_ms = None
         instance = TradeUpdate(
             trade_id=data["trade_id"],
             client_order_id=data["client_order_id"],
@@ -77,12 +129,17 @@ class TradeUpdate(NamedTuple):
             fill_quote_amount=Decimal(data["fill_quote_amount"]),
             fee=TradeFeeBase.from_json(data["fee"]),
             is_taker=is_taker,
+            execution_timestamp_ms=execution_timestamp_ms,
+            execution_timestamp_source=execution_timestamp_source,
+            execution_timestamp_observed_at_ms=execution_timestamp_observed_at_ms,
         )
 
         return instance
 
     def to_json(self) -> Dict[str, Any]:
         json_dict = self._asdict()
+        if self.execution_timestamp_observed_at_ms is None:
+            json_dict.pop("execution_timestamp_observed_at_ms")
         json_dict.update({
             "fill_price": str(self.fill_price),
             "fill_base_amount": str(self.fill_base_amount),

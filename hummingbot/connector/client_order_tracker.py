@@ -8,7 +8,14 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional
 from cachetools import TTLCache
 
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import (
+    OKX_FILL_TIME_SOURCE,
+    InFlightOrder,
+    OrderState,
+    OrderUpdate,
+    TradeUpdate,
+    normalize_execution_timestamp_ms,
+)
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -210,6 +217,22 @@ class ClientOrderTracker:
 
             updated: bool = tracked_order.update_with_trade_update(trade_update)
             if updated:
+                execution_timestamp_ms = None
+                execution_timestamp_source = None
+                if (trade_update.execution_timestamp_source == OKX_FILL_TIME_SOURCE
+                        and type(trade_update.execution_timestamp_ms) is int):
+                    execution_timestamp_ms = normalize_execution_timestamp_ms(
+                        trade_update.execution_timestamp_ms, self.current_timestamp
+                    )
+                    if execution_timestamp_ms is not None:
+                        execution_timestamp_source = OKX_FILL_TIME_SOURCE
+                if ((trade_update.execution_timestamp_ms is not None
+                     or trade_update.execution_timestamp_source is not None)
+                        and execution_timestamp_ms is None):
+                    self.logger().warning(
+                        "Invalid fill execution-time attestation for %s/%s; fill remains recorded without it",
+                        trade_update.client_order_id, trade_update.trade_id,
+                    )
                 self._trigger_order_fills(
                     tracked_order=tracked_order,
                     prev_executed_amount_base=previous_executed_amount_base,
@@ -219,6 +242,8 @@ class ClientOrderTracker:
                     trade_id=trade_update.trade_id,
                     exchange_order_id=trade_update.exchange_order_id,
                     is_taker=trade_update.is_taker,
+                    execution_timestamp_ms=execution_timestamp_ms,
+                    execution_timestamp_source=execution_timestamp_source,
                 )
 
     async def process_order_not_found(self, client_order_id: str):
@@ -342,6 +367,8 @@ class ClientOrderTracker:
         fill_fee: TradeFeeBase,
         trade_id: str,
         exchange_order_id: str,
+        execution_timestamp_ms: Optional[int] = None,
+        execution_timestamp_source: Optional[str] = None,
     ):
         self._connector.trigger_event(
             MarketEvent.OrderFilled,
@@ -358,6 +385,8 @@ class ClientOrderTracker:
                 leverage=int(order.leverage),
                 position=order.position.value,
                 exchange_order_id=exchange_order_id,
+                execution_timestamp_ms=execution_timestamp_ms,
+                execution_timestamp_source=execution_timestamp_source,
             ),
         )
 
@@ -408,7 +437,9 @@ class ClientOrderTracker:
                              fill_fee: TradeFeeBase,
                              trade_id: str,
                              exchange_order_id: str,
-                             is_taker: bool = True):
+                             is_taker: bool = True,
+                             execution_timestamp_ms: Optional[int] = None,
+                             execution_timestamp_source: Optional[str] = None):
         if prev_executed_amount_base < tracked_order.executed_amount_base:
             self.logger().info(
                 tracked_order.build_order_filled_message(fill_price, fill_fee, is_taker)
@@ -420,6 +451,8 @@ class ClientOrderTracker:
                 fill_fee=fill_fee,
                 trade_id=trade_id,
                 exchange_order_id=exchange_order_id,
+                execution_timestamp_ms=execution_timestamp_ms,
+                execution_timestamp_source=execution_timestamp_source,
             )
 
     def _trigger_order_completion(self, tracked_order: InFlightOrder, order_update: Optional[OrderUpdate] = None):

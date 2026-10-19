@@ -27,7 +27,7 @@ class SQLConnectionManager(TransactionBase):
     _scm_trade_fills_instance: Optional["SQLConnectionManager"] = None
 
     LOCAL_DB_VERSION_KEY = "local_db_version"
-    LOCAL_DB_VERSION_VALUE = "20260910"
+    LOCAL_DB_VERSION_VALUE = "20261019"
     SQLITE_BUSY_TIMEOUT_MS = 2_000
 
     @classmethod

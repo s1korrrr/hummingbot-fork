@@ -257,6 +257,47 @@ class InFlightOrderPyUnitTests(unittest.TestCase):
         del payload["is_taker"]
         self.assertTrue(TradeUpdate.from_json(payload).is_taker)
 
+    def test_trade_update_execution_time_is_optional_and_round_trips(self):
+        update = TradeUpdate(
+            trade_id="fill", client_order_id="order", exchange_order_id="venue",
+            trading_pair=self.trading_pair, fill_timestamp=1640001112,
+            fill_price=Decimal("100"), fill_base_amount=Decimal("2"),
+            fill_quote_amount=Decimal("200"), fee=AddedToCostTradeFee(),
+            execution_timestamp_ms=1640001112345, execution_timestamp_source="okx.fillTime",
+        )
+        restored = TradeUpdate.from_json(json.loads(json.dumps(update.to_json())))
+        self.assertEqual(update, restored)
+
+        legacy_payload = update.to_json()
+        legacy_payload.pop("execution_timestamp_ms")
+        legacy_payload.pop("execution_timestamp_source")
+        legacy = TradeUpdate.from_json(legacy_payload)
+        self.assertIsNone(legacy.execution_timestamp_ms)
+        self.assertIsNone(legacy.execution_timestamp_source)
+
+        boundary_payload = dict(update.to_json())
+        boundary_payload["execution_timestamp_ms"] = 1640001117000
+        boundary_payload["execution_timestamp_observed_at_ms"] = 1640001112000
+        boundary = TradeUpdate.from_json(boundary_payload)
+        self.assertEqual(1640001117000, boundary.execution_timestamp_ms)
+        self.assertEqual("okx.fillTime", boundary.execution_timestamp_source)
+        self.assertEqual(1640001112000, boundary.execution_timestamp_observed_at_ms)
+
+        for malformed_observation in (True, "1640001112000", 0, 253402300800000):
+            invalid_basis_payload = dict(boundary_payload)
+            invalid_basis_payload["execution_timestamp_observed_at_ms"] = malformed_observation
+            invalid_basis = TradeUpdate.from_json(invalid_basis_payload)
+            self.assertIsNone(invalid_basis.execution_timestamp_ms)
+            self.assertIsNone(invalid_basis.execution_timestamp_source)
+            self.assertIsNone(invalid_basis.execution_timestamp_observed_at_ms)
+
+        for invalid_time in (True, 0, "1640001112345", 1640001117001, 253402300800000):
+            invalid_payload = dict(update.to_json())
+            invalid_payload["execution_timestamp_ms"] = invalid_time
+            invalid = TradeUpdate.from_json(invalid_payload)
+            self.assertIsNone(invalid.execution_timestamp_ms)
+            self.assertIsNone(invalid.execution_timestamp_source)
+
     def test_from_json(self):
         fee = AddedToCostTradeFee(
             percent=Decimal("0.5"),
@@ -272,6 +313,8 @@ class InFlightOrderPyUnitTests(unittest.TestCase):
             fill_base_amount=Decimal("2"),
             fill_quote_amount=Decimal("2000.22"),
             fee=fee,
+            execution_timestamp_ms=1640001112000,
+            execution_timestamp_source="okx.fillTime",
         )
 
         order_json = {
@@ -434,6 +477,8 @@ class InFlightOrderPyUnitTests(unittest.TestCase):
         self.assertEqual(order_json["last_update_timestamp"], order.last_update_timestamp)
         self.assertIsNone(order_json["cancel_source"])
         self.assertEqual(order_json["order_fills"], {"1": trade_update.to_json()})
+        restored_order = InFlightOrder.from_json(json.loads(json.dumps(order_json)))
+        self.assertEqual(restored_order.order_fills["1"], trade_update)
 
     def test_to_limit_order(self):
         order: InFlightOrder = InFlightOrder(

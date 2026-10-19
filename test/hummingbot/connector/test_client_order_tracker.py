@@ -632,6 +632,8 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
             fill_quote_amount=trade_filled_price * trade_filled_amount,
             fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token=self.quote_asset, amount=fee_paid)]),
             fill_timestamp=1,
+            execution_timestamp_ms=1639999999999,
+            execution_timestamp_source="okx.fillTime",
         )
 
         self.tracker.process_trade_update(trade_update)
@@ -653,14 +655,35 @@ class ClientOrderTrackerUnitTest(unittest.TestCase):
         self.assertNotIn("PnL", fill_log)
 
         self.assertEqual(1, len(self.order_filled_logger.event_log))
+        self.assertEqual(1639999999999, self.order_filled_logger.event_log[0].execution_timestamp_ms)
+        self.assertEqual("okx.fillTime", self.order_filled_logger.event_log[0].execution_timestamp_source)
         order_filled_event: OrderFilledEvent = self.order_filled_logger.event_log[0]
-
         self.assertEqual(order_filled_event.order_id, order.client_order_id)
         self.assertEqual(order_filled_event.price, trade_update.fill_price)
         self.assertEqual(order_filled_event.amount, trade_update.fill_base_amount)
         self.assertEqual(
             order_filled_event.trade_fee, AddedToCostTradeFee(flat_fees=[TokenAmount(self.quote_asset, fee_paid)])
         )
+
+    def test_invalid_future_execution_attestation_does_not_drop_financial_fill(self):
+        order = InFlightOrder(
+            client_order_id="future-fill-order", exchange_order_id="venue-order",
+            trading_pair=self.trading_pair, order_type=OrderType.LIMIT, trade_type=TradeType.BUY,
+            amount=Decimal("2"), creation_timestamp=1640000000, price=Decimal("1"),
+            initial_state=OrderState.OPEN,
+        )
+        self.tracker.start_tracking_order(order)
+        self.tracker.process_trade_update(TradeUpdate(
+            trade_id="future-fill", client_order_id=order.client_order_id,
+            exchange_order_id=order.exchange_order_id, trading_pair=order.trading_pair,
+            fill_price=Decimal("0.5"), fill_base_amount=Decimal("1"), fill_quote_amount=Decimal("0.5"),
+            fee=AddedToCostTradeFee(), fill_timestamp=1640000000,
+            execution_timestamp_ms=1640000006001, execution_timestamp_source="okx.fillTime",
+        ))
+        event = self.order_filled_logger.event_log[0]
+        self.assertEqual(Decimal("1"), order.executed_amount_base)
+        self.assertIsNone(event.execution_timestamp_ms)
+        self.assertIsNone(event.execution_timestamp_source)
 
     def test_process_trade_update_logs_maker_sell_without_guessed_pnl(self):
         order: InFlightOrder = InFlightOrder(

@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import ExitStack
 from decimal import Decimal as D
 from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_lifecycle import make_executor, tracked
 from types import SimpleNamespace
@@ -463,6 +464,68 @@ def test_invalid_inventory_cannot_be_valued_as_zero_exposure():
                                                amount='bad', breakeven_price=D('100'), cum_fees_quote=D('0'))]
     assert not instance._get_total_position_value_usd().is_finite()
     assert not instance.can_create_executor(1)
+
+
+def test_wallet_funded_mode_bypasses_accumulated_buy_caps_but_keeps_wallet_cash_check():
+    def funded_controller(available_quote):
+        instance = controller()
+        instance.config.allocation_mode = 'wallet_funded'
+        instance.config.max_total_position_usd = D('100')
+        instance.config.max_executors_per_side = 1
+        instance.config.executor_price_gap_threshold = D('0')
+        instance.market_data_provider.get_available_balance.return_value = available_quote
+        instance._get_total_position_value_usd = lambda: D('30000')
+        active_buy = SimpleNamespace(timestamp=1000)
+        gates = (
+            patch.object(instance, '_filter_same_side', return_value=[active_buy]),
+            patch.object(instance, '_executor_owned_base', return_value=D('0')),
+            patch.object(instance, '_has_active_buy_leg', return_value=False),
+            patch.object(instance, '_has_sufficient_avg_entry_gap_for_buy', return_value=True),
+            patch.object(instance, '_effective_cooldown_time', return_value=0),
+            patch.object(instance, '_has_sufficient_price_gap', return_value=True),
+            patch.object(instance, '_is_flash_crash_cooldown', return_value=False),
+        )
+        return instance, gates
+
+    funded, funded_gates = funded_controller(D('25'))
+    with ExitStack() as stack:
+        for gate in funded_gates:
+            stack.enter_context(gate)
+        assert funded.can_create_executor(1)
+        assert funded._last_gate_reason[TradeType.BUY] == 'ready'
+        assert funded._get_position_utilization() == 0
+        assert 'allocation=wallet-funded' in funded._position_log_context()
+        buy_config = funded.get_executor_config(TradeType.BUY, D('100'), D('.25'))
+        decision_gate = SimpleNamespace(dispatch=lambda *args: True, release=lambda: None)
+        with patch.object(funded, '_get_entry_decision_gate', return_value=decision_gate):
+            assert funded.validate_executor_config(buy_config)
+
+    short_cash, short_cash_gates = funded_controller(D('24.99'))
+    with ExitStack() as stack:
+        for gate in short_cash_gates:
+            stack.enter_context(gate)
+        assert not short_cash.can_create_executor(1)
+        assert short_cash._last_gate_reason[TradeType.BUY] == 'balance_low'
+
+
+def test_bounded_allocation_remains_default_and_rejects_entry_over_position_cap():
+    with pytest.raises(ValueError, match='usd_per_entry must be less than or equal'):
+        OKRSIControllerConfig(
+            id='bounded-invalid', connector_name='okx', trading_pair='ETH-USDT',
+            usd_per_entry=D('25'), max_total_position_usd=D('24'),
+        )
+    wallet_funded = OKRSIControllerConfig(
+        id='wallet-funded', connector_name='okx', trading_pair='ETH-USDT',
+        allocation_mode='wallet_funded', usd_per_entry=D('25'), max_total_position_usd=D('24'),
+    )
+    default_bounded = OKRSIControllerConfig(
+        id='default-bounded', connector_name='okx', trading_pair='ETH-USDT',
+        usd_per_entry=D('25'), max_total_position_usd=D('25'),
+    )
+    assert wallet_funded.allocation_mode == 'wallet_funded'
+    assert default_bounded.allocation_mode == 'bounded'
+    assert 'allocation_mode' not in default_bounded.model_dump()
+    assert wallet_funded.model_dump()['allocation_mode'] == 'wallet_funded'
 
 
 def test_completed_loss_is_counted_before_any_entry_proposal():

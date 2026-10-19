@@ -90,9 +90,14 @@ def funding_projection(fills, connector, pair):
         if fill.trade_type == 'BUY':
             by_order[fill.order_id] = by_order.get(fill.order_id, ZERO) + amount
         position.add_order_record(record)
-        summary = position.get_position_summary(price)
-        if summary.side != TradeType.BUY and summary.amount > 0:
-            raise ValueError('Funding history sells unowned inventory')
+        # A validated BUY adds nonnegative native base and cannot create a
+        # short position. Replaying every BUY prefix is quadratic in retained
+        # history. Keep the native prefix check at every SELL so a later BUY
+        # cannot conceal an earlier sale of unowned inventory.
+        if fill.trade_type == 'SELL':
+            summary = position.get_position_summary(price)
+            if summary.side != TradeType.BUY and summary.amount > 0:
+                raise ValueError('Funding history sells unowned inventory')
     summary = position.get_position_summary(Decimal('1'))
     # Reuse native remaining fee attribution; do not invent another cost ledger.
     cost = summary.amount * summary.breakeven_price + summary.remaining_fees_quote

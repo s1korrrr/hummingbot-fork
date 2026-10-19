@@ -27,6 +27,48 @@ def test_wallet_funded_composition_requires_explicit_unbounded_funding_policy():
         ModularOKRSIControllerConfig(**(common | {'allocation_mode': 'bounded'}), funding=funding)
 
 
+def test_bounded_and_wallet_reload_compare_validated_fields_without_changing_identity():
+    import asyncio
+
+    from test_native_composition import provider
+
+    from controllers.generic.modular_ok_rsi import ModularOKRSIController
+
+    bounded = ModularOKRSIControllerConfig(id='modular_spot_reload', trading_pair='BTC-USDC')
+    assert 'allocation_mode' not in bounded.model_dump(mode='json')
+    bot = ModularOKRSIController(bounded, provider(), asyncio.Queue())
+    bot.update_config(type(bounded).model_validate(bounded.model_dump(mode='json')))
+    assert bot.config.allocation_mode == 'bounded'
+    payload = bounded.model_dump(mode='json')
+    payload['allocation_mode'] = 'wallet_funded'
+    payload['funding'] = {'allocation_quote': None, 'max_position_quote': None,
+                          'fee_reserve_fraction': '.003', 'scope': 'controller'}
+    wallet = type(bounded).model_validate(payload)
+    with pytest.raises(ValueError, match='restart required.*allocation_mode'):
+        bot.update_config(wallet)
+    assert bot.config.allocation_mode == 'bounded'
+    wallet_bot = ModularOKRSIController(wallet, provider(), asyncio.Queue())
+    wallet_bot.update_config(type(wallet).model_validate(wallet.model_dump(mode='json')))
+    assert wallet_bot.config.allocation_mode == 'wallet_funded'
+
+
+@pytest.mark.parametrize('mode', ['bounded', 'wallet_funded'])
+def test_legacy_hl_rsi_reload_accepts_unchanged_allocation_mode(mode):
+    import asyncio
+
+    from test_native_composition import provider
+
+    from controllers.directional_trading.hl_rsi import HLRSIController, HLRSIControllerConfig
+
+    config = HLRSIControllerConfig(id='hl_rsi_reload', allocation_mode=mode,
+                                   candles_connector='hyperliquid', candles_trading_pair='HYPE-USDC')
+    if mode == 'bounded':
+        assert 'allocation_mode' not in config.model_dump(mode='json')
+    bot = HLRSIController(config, provider(), asyncio.Queue())
+    bot.update_config(type(config).model_validate(config.model_dump(mode='json')))
+    assert bot.config.allocation_mode == mode
+
+
 def test_wallet_funded_capital_allows_existing_exposure_and_tranches_but_requires_cash():
     cap = LiveCapitalConfig(slice_quote=D('100'), allocation_mode='wallet_funded', position_cap_quote=None,
                             max_active_tranches=None, funded_cap_quote=None)
@@ -117,14 +159,35 @@ async def test_wallet_transition_keeps_filled_active_buy_and_refuses_partial_or_
             prior = {owner.config.id: prior_config}
             with pytest.raises(ValueError, match='active native orders'):
                 wallet.plan_binding_transition(old_binding, allocation_only_previous_configs=prior)
+            # A stopped mode transition cannot run controller ticks under the
+            # target configuration before native fills finish under the old one.
+            owner.config = type(owner.config).model_validate(prior_config)
+            owner._composition_digest = configuration_digest(owner.config.model_dump(mode='json'))
             amount = active.config.amount
             await session.step(600061, trades=[dict(trading_pair='BTC-USDC', sequence=1, timestamp=600061,
                                                     side=TradeType.SELL, price=active.config.entry_price - D('.01'),
                                                     amount=amount)])
             await session.step(600062, books=[dict(trading_pair='BTC-USDC', sequence=4, timestamp=600062,
                                                    bids=[(90, 10)], asks=[(90.1, 10)])])
+            owner.config = type(owner.config).model_validate(target)
+            owner._composition_digest = configuration_digest(owner.config.model_dump(mode='json'))
+            wallet = NativeFundingStore(owner, session.recorder)
             plan = wallet.plan_binding_transition(old_binding, allocation_only_previous_configs=prior)
             assert plan['allocation_only']['previous_config_sha256'][owner.config.id]
+            held = plan['allocation_only']['held_recovery'][owner.config.id]
+            assert held['previous_configuration_sha256'] == plan['allocation_only']['previous_config_sha256'][owner.config.id]
+            assert held['target_configuration_sha256'] == owner._composition_digest
+            if held['before_raw'] is not None:
+                from controllers.generic.modular_spot_core.native_recovery import decode, encode
+                original = held['before_raw']
+                with session.recorder.sql_manager.get_new_session() as sql, sql.begin():
+                    sql.get(Metadata, held['key']).value = encode(decode(original).model_copy(
+                        update={'source_sha256': 'd' * 64}))
+                with pytest.raises(ValueError, match='held recovery prior'):
+                    wallet.apply_binding_transition(plan['transition_id'])
+                with session.recorder.sql_manager.get_new_session() as sql, sql.begin():
+                    assert old_binding in sql.get(Metadata, wallet.key).value
+                    sql.get(Metadata, held['key']).value = original
             assert D(plan['pending_quote']) == 0
             before = session.recorder.get_trades_for_config(session.recorder.config_file_path)
             wallet.apply_binding_transition(plan['transition_id'])
@@ -152,6 +215,52 @@ async def test_wallet_transition_keeps_filled_active_buy_and_refuses_partial_or_
         finally:
             await session.close()
             MarketsRecorder._shared_instance = previous_recorder
+
+
+@pytest.mark.asyncio
+async def test_wallet_transition_refuses_foreign_held_ledger_scope(tmp_path):
+    from test.hummingbot.strategy_v2.paper.test_paper_funding import funded_config, paper
+
+    from controllers.generic.modular_spot_core.recipe_contract import configuration_digest
+    from hummingbot.connector.markets_recorder import MarketsRecorder
+    from hummingbot.model.position_hold_ledger import PositionHoldLedger
+    from hummingbot.strategy_v2.paper_session import NativePaperSession
+
+    previous_recorder = MarketsRecorder._shared_instance
+    MarketsRecorder._shared_instance = None
+    session = NativePaperSession(paper(), [funded_config()], tmp_path / 'foreign-held.sqlite')
+    try:
+        owner = next(iter(session.controllers.values()))
+        old = NativeFundingStore(owner, session.recorder)
+        raw, state = old._load()
+        assert old._write(raw, state)
+        old_binding = old.binding
+        previous_config = owner.config.model_dump(mode='json')
+        target = owner.config.model_dump(mode='json')
+        target['allocation_mode'] = 'wallet_funded'
+        target['funding']['allocation_quote'] = None
+        target['funding']['max_position_quote'] = None
+        owner.config = type(owner.config).model_validate(target)
+        owner._composition_digest = configuration_digest(owner.config.model_dump(mode='json'))
+        wallet = NativeFundingStore(owner, session.recorder)
+        with session.recorder.sql_manager.get_new_session() as sql, sql.begin():
+            sql.add(PositionHoldLedger(id='foreign-held-ledger', controller_id='unbound-controller',
+                                       executor_id='unbound-executor', connector_name='okx_paper_trade',
+                                       trading_pair='BTC-USDC', position_side=None, order_side='BUY',
+                                       timestamp=1, client_order_id='foreign-order', exchange_order_id=None,
+                                       price=D('1'), amount=D('1'), executed_amount_base=D('1'),
+                                       executed_amount_quote=D('1'), cumulative_fee_paid_quote=D('0'),
+                                       order_payload={}))
+        with pytest.raises(ValueError, match='foreign native owner or scope'):
+            wallet.plan_binding_transition(old_binding,
+                                           allocation_only_previous_configs={owner.config.id: previous_config})
+    finally:
+        with session.recorder.sql_manager.get_new_session() as sql, sql.begin():
+            foreign = sql.get(PositionHoldLedger, 'foreign-held-ledger')
+            if foreign is not None:
+                sql.delete(foreign)
+        await session.close()
+        MarketsRecorder._shared_instance = previous_recorder
 
 
 @pytest.mark.asyncio

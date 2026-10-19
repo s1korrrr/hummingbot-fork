@@ -13,12 +13,16 @@ from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.model.market_state import MarketState
 from hummingbot.model.metadata import Metadata
+from hummingbot.model.position import Position
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 
 from .domain import PolicyError, decimal, identity
 from .recipe_contract import configuration_digest
+
+ALLOCATION_HELD_RECOVERY_CONTRACT_VERSION = 1
 
 NATIVE_TABLES = ('Executors', 'Order', 'OrderStatus', 'OrderExact', 'TradeFill',
                  'TradeFillExact', 'Position', 'PositionHoldLedger', 'MarketState',
@@ -336,6 +340,22 @@ def _proposal(store, session, expected_binding, legacy_evidence=None, allocation
                 'pending_quote': str(pending), 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
                 'available_quote': available_quote}
     if allocation_proof is not None:
+        from .native_recovery import allocation_transition_held
+        if any((entry.controller_id not in store.owners
+                or entry.connector_name != store.owners[entry.controller_id].config.connector_name
+                or entry.trading_pair != store.owners[entry.controller_id].config.trading_pair)
+               for entry in session.query(PositionHoldLedger).all()):
+            raise PolicyError('Allocation-only held ledger has a foreign native owner or scope')
+        if any((entry.controller_id not in store.owners
+                or entry.connector_name != store.owners[entry.controller_id].config.connector_name
+                or entry.trading_pair != store.owners[entry.controller_id].config.trading_pair)
+               for entry in session.query(Position).all()):
+            raise PolicyError('Allocation-only held position has a foreign native owner or scope')
+        allocation_proof['held_recovery'] = {
+            owner_id: allocation_transition_held(
+                session, owner, store.recorder,
+                allocation_proof['previous_config_sha256'][owner_id], allocation_proof['source_sha256'])
+            for owner_id, owner in sorted(store.owners.items())}
         proposal['allocation_only'] = allocation_proof
         source_row = session.get(Metadata, store._source_key)
         proposal['source_before'] = None if source_row is None else source_row.value
@@ -368,6 +388,10 @@ def apply_transition(store, transition_id):
                     or receipt.get('transition_id') != transition_id or receipt.get('to_binding') != store.binding
                     or header is None or json.loads(header.value).get('binding') != store.binding):
                 raise PolicyError('Funding transition receipt conflicts with current identity')
+            held = (receipt.get('allocation_only') or {}).get('held_recovery', {})
+            if any((row.value if (row := session.get(Metadata, evidence['key'])) is not None else None)
+                   != evidence['after_raw'] for evidence in held.values()):
+                raise PolicyError('Funding transition held recovery changed after receipt')
             return receipt
         planned = getattr(store, '_binding_transition_plans', {}).get(transition_id)
         if planned is None:
@@ -404,6 +428,13 @@ def apply_transition(store, transition_id):
             elif row.value != value:
                 raise PolicyError('Funding transition changed an immutable release')
         if proposal.get('allocation_only') is not None:
+            for evidence in proposal['allocation_only']['held_recovery'].values():
+                held = session.get(Metadata, evidence['key'])
+                before = None if held is None else held.value
+                if before != evidence['before_raw']:
+                    raise PolicyError('Allocation-only held recovery changed during transition')
+                if held is not None:
+                    held.value = evidence['after_raw']
             source_row = session.get(Metadata, store._source_key)
             if source_row is None:
                 session.add(Metadata(key=store._source_key, value=store._source_record()))

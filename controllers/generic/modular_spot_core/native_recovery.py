@@ -1,4 +1,5 @@
 """Persist native held-recovery policy state; native recorder remains inventory truth."""
+import hashlib
 import json
 from dataclasses import asdict
 from decimal import ROUND_DOWN, Decimal
@@ -11,6 +12,9 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.model.metadata import Metadata
+from hummingbot.model.position import Position
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
+from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator, PositionHold
 
 from .config import PolicyModel
 from .domain import DataUnavailable, PolicyError, decimal, identity
@@ -85,6 +89,104 @@ def decode(raw):
         return RecoveryCheckpoint.model_validate(data)
     except (ValueError, TypeError) as exc:
         raise PolicyError('native held recovery checkpoint is corrupt') from exc
+
+
+def verify_pending_reductions(checkpoint, recorder, controller_id):
+    """Keep a proposed held reduction bound to its actual native SELL intent."""
+    if checkpoint is None or not checkpoint.pending_reductions:
+        return
+    executors = {info.id: info for info in recorder.get_executors_by_controller(controller_id)}
+    for pending in checkpoint.pending_reductions:
+        info = executors.get(pending.executor_id)
+        if info is None:
+            raise DataUnavailable('native recovery reduction receipt pending; peak reset is not reusable')
+        fingerprint = identity(info.config.model_dump(mode='json', exclude={'controller_id'}))
+        if fingerprint != pending.configuration_sha256:
+            raise PolicyError('native recovery reduction receipt differs from the checkpoint intent')
+
+
+def allocation_transition_held(session, owner, recorder, previous_config_sha256, previous_source_sha256):
+    """Prove and carry one held checkpoint during a stopped, allocation-only rebind.
+
+    Funding has already proved exact fill/order ownership in this transaction.
+    Reconstruct held inventory with its native exact-fill accounting, and check
+    the recorder's lossy six-decimal Position report just as runtime recovery
+    does. Only the checkpoint's top-level owner identity may change.
+    """
+    config = owner.config
+    key = 'modular-native-held:v1:' + identity([
+        recorder.config_file_path, config.id, config.connector_name, config.trading_pair])
+    row = session.get(Metadata, key)
+    raw = None if row is None else row.value
+    checkpoint = None if raw is None else decode(raw)
+    family = config._native_family
+    if checkpoint is not None and (checkpoint.family != family
+                                   or checkpoint.configuration_sha256 != previous_config_sha256
+                                   or checkpoint.source_sha256 != previous_source_sha256):
+        raise PolicyError('Allocation-only held recovery prior source, configuration, or family differs')
+    verify_pending_reductions(checkpoint, recorder, config.id)
+
+    fills = recorder.get_trades_for_config(recorder.config_file_path)
+    ledger = session.query(PositionHoldLedger).filter(PositionHoldLedger.controller_id == config.id).all()
+    held_position = PositionHold(config.connector_name, config.trading_pair, TradeType.BUY)
+    ledger_orders = set()
+    try:
+        for entry in sorted(ledger, key=lambda item: (item.timestamp, item.client_order_id)):
+            if (entry.connector_name != config.connector_name or entry.trading_pair != config.trading_pair
+                    or entry.position_side not in (None, '', 'None')
+                    or entry.client_order_id in ledger_orders):
+                raise ValueError('Foreign or duplicate native held ledger order')
+            ledger_orders.add(entry.client_order_id)
+            order_fills = [fill for fill in fills if fill.order_id == entry.client_order_id]
+            record = ExecutorOrchestrator._corroborated_ledger_order(entry, order_fills)
+            held_position.add_order_record(record)
+        native = held_position.get_position_summary(Decimal('1'))
+    except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
+        raise PolicyError('Allocation-only held recovery native ledger differs from exact fills') from exc
+    if native.side != TradeType.BUY and native.amount > 0:
+        raise PolicyError('Allocation-only held recovery has unowned native inventory')
+    recorded = session.query(Position).filter(Position.controller_id == config.id).all()
+    scale = NativeRecoveryStore.POSITION_REPORT_SCALE
+    actual = []
+    for item in recorded:
+        if (item.connector_name != config.connector_name or item.trading_pair != config.trading_pair
+                or item.side != 'BUY' or item.amount < 0):
+            raise PolicyError('Allocation-only held recovery recorder scope differs')
+        if item.amount > 0:
+            actual.append((item.amount, item.breakeven_price))
+    # A native PositionHold has one aggregate BUY bag for this controller/pair.
+    # Historical zero recorder rows are harmless, but extra positive bags are
+    # ambiguous and require explicit reconciliation.
+    if len(actual) > 1 or checkpoint is not None and len(checkpoint.positions) > 1:
+        raise PolicyError('Allocation-only held recovery has ambiguous inventory')
+    positions = () if checkpoint is None else checkpoint.positions
+    if positions:
+        held = positions[0]
+        position_key = config.get_controller_class()._recovery_position_key(SimpleNamespace(
+            connector_name=config.connector_name, trading_pair=config.trading_pair,
+            side=TradeType.BUY, breakeven_price=held.breakeven_price))
+        if (held.position_key != position_key or held.amount != native.amount
+                or held.breakeven_price != native.breakeven_price):
+            raise PolicyError('Allocation-only held recovery differs from native exact-fill inventory')
+        projected = (held.amount.quantize(scale, rounding=ROUND_DOWN),
+                     held.breakeven_price.quantize(scale, rounding=ROUND_DOWN))
+        if actual != [projected]:
+            raise PolicyError('Allocation-only held recovery differs from recorder inventory')
+    elif actual or (native.amount != 0 if checkpoint is None
+                    else native.amount.quantize(scale, rounding=ROUND_DOWN) != 0):
+        raise PolicyError('Allocation-only held recovery has uncheckpointed native inventory')
+    # A missing checkpoint is acceptable only for a proven empty scope. An
+    # existing empty checkpoint retains its sequence and raw policy state.
+    target_config = owner._composition_digest
+    target_source = owner._native_source_hash
+    updated = (None if checkpoint is None else encode(checkpoint.model_copy(update={
+        'configuration_sha256': target_config, 'source_sha256': target_source})))
+    return {'key': key, 'before_raw': raw, 'after_raw': updated,
+            'before_sha256': None if raw is None else hashlib.sha256(raw.encode()).hexdigest(),
+            'after_sha256': None if updated is None else hashlib.sha256(updated.encode()).hexdigest(),
+            'previous_configuration_sha256': previous_config_sha256,
+            'target_configuration_sha256': target_config,
+            'previous_source_sha256': previous_source_sha256, 'target_source_sha256': target_source}
 
 
 class NativeRecoveryStore:
@@ -252,16 +354,7 @@ class NativeRecoveryStore:
         return positions
 
     def _verify_pending(self):
-        if self.previous is None or not self.previous.pending_reductions:
-            return
-        executors = {info.id: info for info in self.recorder.get_executors_by_controller(self.owner.config.id)}
-        for pending in self.previous.pending_reductions:
-            info = executors.get(pending.executor_id)
-            if info is None:
-                raise DataUnavailable('native recovery reduction receipt pending; peak reset is not reusable')
-            fingerprint = identity(info.config.model_dump(mode='json', exclude={'controller_id'}))
-            if fingerprint != pending.configuration_sha256:
-                raise PolicyError('native recovery reduction receipt differs from the checkpoint intent')
+        verify_pending_reductions(self.previous, self.recorder, self.owner.config.id)
 
     def persist(self, positions, actions=()):
         if self.inventory() != positions:

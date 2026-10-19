@@ -214,6 +214,8 @@ class OKRSIControllerConfig(hl_rsi.HLRSIControllerConfig):
 
     @model_validator(mode="after")
     def validate_okx_spot_contract(self):
+        if self.allocation_mode == 'wallet_funded' and self.episode_enabled:
+            raise ValueError('wallet_funded allocation is unsupported for episode mode')
         down_only_active = self.entry_acquisition_policy == "down_only_maker_v1"
         down_only_shadow = self.entry_acquisition_shadow_policy == "down_only_maker_v1"
         if down_only_active and down_only_shadow:

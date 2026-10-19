@@ -22,6 +22,7 @@ CONTROL_FIELDS = frozenset({'recipe_binding', 'execution_enabled', 'manual_kill_
 # upgrade needs explicit reconciliation.
 IDENTITY_NEUTRAL_DEFAULTS = MappingProxyType({
     'recovery_keep_trail_after_target': False,
+    'allocation_mode': 'bounded',
 })
 
 

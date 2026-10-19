@@ -14,6 +14,7 @@ def controller(*, mid=Decimal("100"), ready=True, regime_error=False, same_side=
     instance = object.__new__(HLRSIController)
     instance._status = status
     instance.config = SimpleNamespace(connector_name="okx", trading_pair="BTC-USDC", strict_hmm_mode=True,
+                                      allocation_mode="bounded",
                                       max_total_position_usd=Decimal("1000"), manual_kill_switch=kill)
     instance.market_data_provider = SimpleNamespace(time=lambda: 1000.0)
     instance.update_interval = 1.0

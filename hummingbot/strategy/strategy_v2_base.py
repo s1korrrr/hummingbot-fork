@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import importlib
 import inspect
@@ -31,6 +32,7 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.logger import HummingbotLogger
 from hummingbot.remote_iface.mqtt import ETopicPublisher
+from hummingbot.strategy.chart_snapshot_writer import BoundedChartSnapshotWriter
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_py_base import StrategyPyBase
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
@@ -47,6 +49,11 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 lsb_logger = None
 s_decimal_nan = Decimal("NaN")
 USD_STABLE_TOKENS = {"USD", "USDT", "USDC", "FDUSD", "BUSD", "DAI", "TUSD", "USDE"}
+# Five native controllers can each retain one active batch and two successors.
+# Additional controllers are deferred before their stateful builder is called.
+CHART_SNAPSHOT_WRITER_MAX_PENDING = 15
+CHART_SNAPSHOT_WRITER_MAX_PENDING_PER_CONTROLLER = 3
+CHART_SNAPSHOT_WRITER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 # Lazy-loaded to avoid circular import (strategy_v2_base -> executor_orchestrator -> executors -> strategy_v2_base)
 ExecutorOrchestrator = None
@@ -64,6 +71,38 @@ class ControllerImplementationChanged(RuntimeError):
     def __init__(self, module_path: str):
         self.module_path = module_path
         super().__init__(f"Controller source changed or is unreadable: {module_path}; process restart with ownership reconciliation is required")
+
+
+class _ChartSnapshotJob:
+    def __init__(self, *, controller_id, controller, recorder, rows, prune_requests, prune_cycle):
+        self.controller_id = controller_id
+        self.controller = controller
+        self.recorder = recorder
+        self.rows = rows
+        self.prune_requests = prune_requests
+        self.prune_request_pending = False
+        self.prune_cycle = prune_cycle
+        self.phase = "write" if rows else "ack"
+        self.in_flight = False
+        self.last_error = None
+        self.successor_batches = []
+        self.successor_reserved = False
+
+
+class _ChartSnapshotPruneRetry:
+    def __init__(self, *, controller_id, controller, recorder, requests, cycle, request_pending=False):
+        self.controller_id = controller_id
+        self.controller = controller
+        self.recorder = recorder
+        self.requests = requests
+        self.cycle = cycle
+        self.request_pending = request_pending
+        self.index = 0
+        self.in_flight = False
+        self.last_error = None
+
+
+_CHART_SNAPSHOT_RESERVED = object()
 
 
 class StrategyV2ConfigBase(BaseClientModel):
@@ -356,6 +395,16 @@ class StrategyV2Base(StrategyPyBase):
         self._last_runtime_db_sync_ts: float = 0
         self._last_runtime_status_snapshot_ts: float = 0
         self._last_chart_snapshot_prune_ts: float = 0
+        self._chart_snapshot_jobs = {}
+        self._chart_snapshot_prune_retries = {}
+        self._chart_snapshot_active_job = None
+        self._chart_snapshot_writer = None
+        self._chart_snapshot_writer_loop = None
+        self._chart_snapshot_activity = None
+        self._chart_snapshot_writer_draining = False
+        self._chart_snapshot_scheduler_cursor = 0
+        self._chart_snapshot_prune_cycle = None
+        self._chart_snapshot_saturation_reported = False
         self.mqtt_enabled = False
         self._pub: Optional[ETopicPublisher] = None
         self._controller_start_requested = False
@@ -444,19 +493,24 @@ class StrategyV2Base(StrategyPyBase):
         if self.listen_to_executor_actions_task:
             self.listen_to_executor_actions_task.cancel()
         keep_position_by_controller = self._shutdown_keep_position_preferences()
-        if strict:
-            result = await self.executor_orchestrator.stop(
-                self.max_executors_close_attempts,
-                keep_position_by_controller=keep_position_by_controller,
-                strict=True,
-            )
-            if not result.reconciliation_complete:
-                return result
-        else:
-            await self.executor_orchestrator.stop(
-                self.max_executors_close_attempts,
-                keep_position_by_controller=keep_position_by_controller,
-            )
+        try:
+            if strict:
+                result = await self.executor_orchestrator.stop(
+                    self.max_executors_close_attempts,
+                    keep_position_by_controller=keep_position_by_controller,
+                    strict=True,
+                )
+            else:
+                await self.executor_orchestrator.stop(
+                    self.max_executors_close_attempts,
+                    keep_position_by_controller=keep_position_by_controller,
+                )
+        finally:
+            # Executor/order cleanup gets priority; chart drain is bounded and
+            # still runs when strict reconciliation fails or raises.
+            await self._shutdown_chart_snapshot_writer()
+        if strict and not result.reconciliation_complete:
+            return result
         self.market_data_provider.stop()
         if not strict:
             self.executor_orchestrator.store_all_executors()
@@ -761,33 +815,440 @@ class StrategyV2Base(StrategyPyBase):
             self.logger().warning(f"Failed to sync runtime state to db: {e}")
 
     def _write_chart_snapshots_if_due(self):
-        if not self._chart_snapshots_enabled() or not self.ready_to_trade:
+        if (not self._chart_snapshots_enabled() or not self.ready_to_trade or self._is_stop_triggered):
             return
         try:
             recorder = MarketsRecorder.get_instance()
         except Exception:
             return
-        bot_name = self._runtime_status_snapshot_bot_name()
-        prune_enabled = self.current_timestamp - self._last_chart_snapshot_prune_ts >= self._chart_snapshot_prune_interval()
-        wrote_rows = False
-        for controller in self.controllers.values():
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.logger().error("Chart snapshot persistence requires the strategy event loop")
+            return
+
+        writer = self._chart_snapshot_writer
+        if writer is None:
+            writer = BoundedChartSnapshotWriter(
+                loop=loop,
+                logger=self.logger(),
+                on_complete=self._chart_snapshot_write_completed,
+            )
+            self._chart_snapshot_writer = writer
+            self._chart_snapshot_writer_loop = loop
+            self._chart_snapshot_activity = asyncio.Event()
+        elif self._chart_snapshot_writer_loop is not loop:
+            self.logger().error("Chart snapshot writer cannot change owner event loops")
+            return
+
+        self._schedule_chart_snapshot_jobs(recorder)
+
+    def _schedule_chart_snapshot_jobs(self, recorder):
+        if self._is_stop_triggered:
+            return
+
+        controller_items = list(self.controllers.items())
+        if not controller_items:
+            controller_items = []
+
+        now = self.current_timestamp
+        pending_jobs = [job for job in self._chart_snapshot_jobs.values()
+                        if job is not _CHART_SNAPSHOT_RESERVED]
+        per_controller_room = all(
+            1 + len(job.successor_batches) < CHART_SNAPSHOT_WRITER_MAX_PENDING_PER_CONTROLLER
+            for job in pending_jobs
+        )
+        if (self._pending_chart_snapshot_batch_count() < CHART_SNAPSHOT_WRITER_MAX_PENDING
+                and per_controller_room):
+            self._chart_snapshot_saturation_reported = False
+        prune_enabled = now - self._last_chart_snapshot_prune_ts >= self._chart_snapshot_prune_interval()
+        cycle = self._chart_snapshot_prune_cycle
+        if prune_enabled and cycle is None:
+            cycle_items = list(controller_items)
+            cycle = {
+                "timestamp": now,
+                "controller_items": cycle_items,
+                "built": set(),
+                "pending": {controller_id for controller_id, _ in cycle_items},
+                "wrote_rows": False,
+            }
+            self._chart_snapshot_prune_cycle = cycle
+
+        # Retry retained failures first. The rotating cursor makes newly available
+        # slots fair across controllers, including when the global bound is full.
+        current_ids = {controller_id for controller_id, _ in controller_items}
+        for controller_id, job in self._chart_snapshot_jobs.items():
+            if controller_id not in current_ids and job is not _CHART_SNAPSHOT_RESERVED:
+                controller_items.append((controller_id, job.controller))
+        if cycle is not None:
+            for controller_id in tuple(cycle["pending"]):
+                if controller_id not in current_ids and controller_id not in self._chart_snapshot_jobs:
+                    cycle["built"].add(controller_id)
+                    cycle["pending"].discard(controller_id)
+
+        roster_items = controller_items
+        if roster_items:
+            offset = self._chart_snapshot_scheduler_cursor % len(roster_items)
+            controller_items = roster_items[offset:] + roster_items[:offset]
+
+        for index, (controller_id, _controller) in enumerate(controller_items):
+            job = self._chart_snapshot_jobs.get(controller_id)
+            if job is None or job is _CHART_SNAPSHOT_RESERVED:
+                continue
+            if (job.phase == "write" and not job.successor_reserved and job.last_error is None
+                    and self.controllers.get(controller_id) is job.controller):
+                controller_batches = 1 + len(job.successor_batches)
+                global_batches = self._pending_chart_snapshot_batch_count()
+                if (controller_batches < CHART_SNAPSHOT_WRITER_MAX_PENDING_PER_CONTROLLER
+                        and global_batches < CHART_SNAPSHOT_WRITER_MAX_PENDING):
+                    self._capture_chart_snapshot_successor(job)
+                else:
+                    self._report_chart_snapshot_backpressure(controller_id)
+            if job.in_flight:
+                continue
+            if self._enqueue_chart_snapshot_job(job):
+                roster_index = next(
+                    (position for position, item in enumerate(roster_items) if item[0] == controller_id),
+                    index,
+                )
+                self._chart_snapshot_scheduler_cursor = (roster_index + 1) % len(roster_items)
+
+        # Existing row batches take the first writer turn. Then retry retained
+        # pruning before invoking new stateful builders, so repeated ready rows
+        # cannot starve cleanup after a transient prune failure.
+        for retry in tuple(self._chart_snapshot_prune_retries.values()):
+            if retry.in_flight or self._chart_snapshot_active_job is not None:
+                continue
+            if retry.request_pending:
+                try:
+                    requests = retry.controller.chart_snapshot_prune_requests()
+                    retry.requests = copy.deepcopy(requests or [])
+                    retry.request_pending = False
+                except Exception as exc:
+                    retry.last_error = exc
+                    self.logger().exception(
+                        "Chart snapshot prune request retry failed for controller %s",
+                        retry.controller_id,
+                    )
+                    continue
+            if not retry.requests:
+                self._complete_chart_snapshot_prune_retry(retry)
+                continue
+            self._enqueue_chart_snapshot_prune_retry(retry)
+
+        for controller_id, _controller in controller_items:
+            job = self._chart_snapshot_jobs.get(controller_id)
+            if job is not None:
+                continue
+
+            if self._pending_chart_snapshot_batch_count() >= CHART_SNAPSHOT_WRITER_MAX_PENDING:
+                self._report_chart_snapshot_backpressure(controller_id)
+                continue
+
+            cycle_controller = None
+            if cycle is not None and controller_id in cycle["pending"] and controller_id not in cycle["built"]:
+                cycle_controller = next(
+                    (item for item in cycle["controller_items"] if item[0] == controller_id), None
+                )
+            if cycle_controller is not None:
+                controller = self.controllers.get(controller_id)
+                if controller is None:
+                    cycle["built"].add(controller_id)
+                    cycle["pending"].discard(controller_id)
+                    continue
+                prune_cycle = cycle
+                prune_enabled_for_job = True
+            else:
+                controller = self.controllers.get(controller_id)
+                if controller is None:
+                    continue
+                prune_cycle = None
+                prune_enabled_for_job = False
+
             build_fn = getattr(controller, "build_chart_snapshot_rows", None)
             if not callable(build_fn):
+                if prune_cycle is not None:
+                    prune_cycle["built"].add(controller_id)
+                    prune_cycle["pending"].discard(controller_id)
                 continue
-            rows = build_fn(bot_name=bot_name)
-            if rows:
-                recorder.store_or_update_chart_snapshots(rows)
-                wrote_rows = True
-            acknowledge = getattr(controller, "chart_snapshot_rows_persisted", None)
-            if callable(acknowledge):
-                acknowledge(rows)
-            if prune_enabled:
-                prune_fn = getattr(controller, "chart_snapshot_prune_requests", None)
-                if callable(prune_fn):
-                    for request in prune_fn():
-                        recorder.prune_chart_snapshots(**request)
-        if prune_enabled and wrote_rows:
-            self._last_chart_snapshot_prune_ts = self.current_timestamp
+
+            # Reserve the per-controller/global slot before build: some native
+            # builders advance their guards while constructing the returned rows.
+            reservation = _CHART_SNAPSHOT_RESERVED
+            self._chart_snapshot_jobs[controller_id] = reservation
+            try:
+                rows = copy.deepcopy(build_fn(bot_name=self._runtime_status_snapshot_bot_name()) or [])
+            except Exception:
+                if self._chart_snapshot_jobs.get(controller_id) is reservation:
+                    del self._chart_snapshot_jobs[controller_id]
+                raise
+            if prune_cycle is not None:
+                prune_cycle["built"].add(controller_id)
+                prune_cycle["wrote_rows"] = prune_cycle["wrote_rows"] or bool(rows)
+            if not rows and not prune_enabled_for_job:
+                if self._chart_snapshot_jobs.get(controller_id) is reservation:
+                    del self._chart_snapshot_jobs[controller_id]
+                if prune_cycle is not None:
+                    prune_cycle["pending"].discard(controller_id)
+                continue
+
+            job = _ChartSnapshotJob(
+                controller_id=controller_id,
+                controller=controller,
+                recorder=recorder,
+                rows=rows,
+                prune_requests=[],
+                prune_cycle=prune_cycle,
+            )
+            if prune_enabled_for_job:
+                try:
+                    self._refresh_chart_snapshot_prune_requests(job)
+                except Exception as exc:
+                    job.prune_request_pending = True
+                    job.last_error = exc
+                    self.logger().exception(
+                        "Chart snapshot prune request failed for controller %s; retaining rows",
+                        controller_id,
+                    )
+            self._chart_snapshot_jobs[controller_id] = job
+            if not self._enqueue_chart_snapshot_job(job):
+                # Keep the exact built batch; do not call a stateful builder again.
+                job.in_flight = False
+        self._finish_chart_snapshot_prune_cycle_if_ready()
+
+    def _capture_chart_snapshot_successor(self, job):
+        controller = job.controller
+        build_fn = getattr(controller, "build_chart_snapshot_rows", None)
+        if not callable(build_fn):
+            return
+        job.successor_reserved = True
+        try:
+            rows = copy.deepcopy(build_fn(bot_name=self._runtime_status_snapshot_bot_name()) or [])
+        except Exception:
+            job.successor_reserved = False
+            self.logger().exception(
+                "Chart snapshot successor build failed for controller %s; primary batch remains retained",
+                job.controller_id,
+            )
+            return
+        if rows:
+            job.successor_batches.append(rows)
+        job.successor_reserved = False
+        if rows and job.prune_cycle is not None:
+            job.prune_cycle["wrote_rows"] = True
+
+    def _pending_chart_snapshot_batch_count(self):
+        return len(self._chart_snapshot_jobs) + sum(
+            len(job.successor_batches) + int(job.successor_reserved)
+            for job in self._chart_snapshot_jobs.values()
+            if job is not _CHART_SNAPSHOT_RESERVED
+        )
+
+    def _report_chart_snapshot_backpressure(self, controller_id):
+        if not self._chart_snapshot_saturation_reported:
+            self.logger().warning(
+                "Chart snapshot writer is saturated; deferring controller %s before building another batch",
+                controller_id,
+            )
+            self._chart_snapshot_saturation_reported = True
+
+    def _enqueue_chart_snapshot_job(self, job):
+        if job.in_flight:
+            return False
+        active_job = self._chart_snapshot_active_job
+        if active_job is not None and active_job is not job:
+            return False
+        stopping = self._is_stop_triggered
+        if stopping and not self._chart_snapshot_writer_draining:
+            return False
+        if job.phase == "write":
+            payload = job.rows
+        elif job.phase == "ack":
+            # A commit succeeded; a transient owner callback failure retries only
+            # the idempotent acknowledgement, never the database upsert.
+            try:
+                acknowledge = getattr(job.controller, "chart_snapshot_rows_persisted", None)
+                if callable(acknowledge):
+                    acknowledge(copy.deepcopy(job.rows))
+                job.last_error = None
+            except Exception as exc:
+                job.last_error = exc
+                self.logger().exception("Chart snapshot acknowledgement failed for controller %s", job.controller_id)
+                return False
+            if job.successor_batches:
+                job.rows = job.successor_batches.pop(0)
+                job.phase = "write"
+                job.last_error = None
+                # Return the promoted batch to the scheduler. Immediate recursive
+                # submission lets one controller drain every retained successor
+                # before another ready controller gets a writer turn.
+                return False
+            self._complete_chart_snapshot_job(job)
+            return True
+        else:
+            raise ValueError("Unknown chart snapshot job phase")
+
+        if self._chart_snapshot_writer.submit(job, job.phase, payload):
+            job.in_flight = True
+            self._chart_snapshot_active_job = job
+            return True
+        return False
+
+    def _enqueue_chart_snapshot_prune_retry(self, retry):
+        if retry.in_flight or self._chart_snapshot_active_job is not None:
+            return False
+        if self._is_stop_triggered and not self._chart_snapshot_writer_draining:
+            return False
+        payload = retry.requests[retry.index]
+        if self._chart_snapshot_writer.submit(retry, "prune", payload):
+            retry.in_flight = True
+            self._chart_snapshot_active_job = retry
+            return True
+        return False
+
+    def _chart_snapshot_write_completed(self, job, phase, error):
+        job.in_flight = False
+        if self._chart_snapshot_active_job is job:
+            self._chart_snapshot_active_job = None
+        self._chart_snapshot_activity.set()
+        if error is not None:
+            job.last_error = error
+            self.logger().error(
+                "Chart snapshot %s failed for controller %s; retaining batch for retry: %s",
+                phase, job.controller_id, error,
+            )
+            return
+
+        job.last_error = None
+        if phase == "write":
+            job.phase = "ack"
+            self._enqueue_chart_snapshot_job(job)
+        elif phase == "prune":
+            if isinstance(job, _ChartSnapshotPruneRetry):
+                job.index += 1
+                if job.index < len(job.requests):
+                    self._enqueue_chart_snapshot_prune_retry(job)
+                else:
+                    self._complete_chart_snapshot_prune_retry(job)
+            else:
+                raise RuntimeError("Prune completion was returned for a chart row job")
+
+    def _complete_chart_snapshot_job(self, job):
+        if self._chart_snapshot_jobs.get(job.controller_id) is job:
+            del self._chart_snapshot_jobs[job.controller_id]
+        if job.prune_cycle is not None:
+            if job.prune_request_pending or job.prune_requests:
+                retry = _ChartSnapshotPruneRetry(
+                    controller_id=job.controller_id,
+                    controller=job.controller,
+                    recorder=job.recorder,
+                    requests=job.prune_requests,
+                    cycle=job.prune_cycle,
+                    request_pending=job.prune_request_pending,
+                )
+                self._chart_snapshot_prune_retries[job.controller_id] = retry
+                if retry.requests:
+                    self._enqueue_chart_snapshot_prune_retry(retry)
+            else:
+                job.prune_cycle["pending"].discard(job.controller_id)
+            self._finish_chart_snapshot_prune_cycle_if_ready()
+
+    def _complete_chart_snapshot_prune_retry(self, retry):
+        if self._chart_snapshot_prune_retries.get(retry.controller_id) is retry:
+            del self._chart_snapshot_prune_retries[retry.controller_id]
+        if retry.cycle is not None:
+            retry.cycle["pending"].discard(retry.controller_id)
+            self._finish_chart_snapshot_prune_cycle_if_ready()
+
+    def _refresh_chart_snapshot_prune_requests(self, job):
+        prune_fn = getattr(job.controller, "chart_snapshot_prune_requests", None)
+        job.prune_requests = copy.deepcopy(prune_fn() or []) if callable(prune_fn) else []
+        job.prune_request_pending = False
+        job.last_error = None
+
+    def _finish_chart_snapshot_prune_cycle_if_ready(self):
+        cycle = self._chart_snapshot_prune_cycle
+        if cycle is not None and not cycle["pending"] and len(cycle["built"]) == len(cycle["controller_items"]):
+            if cycle["wrote_rows"]:
+                self._last_chart_snapshot_prune_ts = cycle["timestamp"]
+            self._chart_snapshot_prune_cycle = None
+
+    async def _shutdown_chart_snapshot_writer(self):
+        writer = self._chart_snapshot_writer
+        if writer is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CHART_SNAPSHOT_WRITER_SHUTDOWN_TIMEOUT_SECONDS
+        self._chart_snapshot_writer_draining = True
+        activity = self._chart_snapshot_activity
+        stopped = False
+        try:
+            while (self._chart_snapshot_jobs or self._chart_snapshot_prune_retries) and loop.time() < deadline:
+                activity.clear()
+                for job in tuple(self._chart_snapshot_jobs.values()):
+                    if job is not _CHART_SNAPSHOT_RESERVED and not job.in_flight and job.last_error is None:
+                        try:
+                            self._enqueue_chart_snapshot_job(job)
+                        except Exception as exc:
+                            job.last_error = exc
+                            self.logger().exception(
+                                "Chart snapshot shutdown drain failed for controller %s",
+                                job.controller_id,
+                            )
+                for retry in tuple(self._chart_snapshot_prune_retries.values()):
+                    if retry.in_flight or retry.last_error is not None:
+                        continue
+                    try:
+                        if retry.request_pending:
+                            retry.requests = copy.deepcopy(retry.controller.chart_snapshot_prune_requests() or [])
+                            retry.request_pending = False
+                        if retry.requests:
+                            self._enqueue_chart_snapshot_prune_retry(retry)
+                        else:
+                            self._complete_chart_snapshot_prune_retry(retry)
+                    except Exception as exc:
+                        retry.last_error = exc
+                        self.logger().exception(
+                            "Chart snapshot shutdown prune retry failed for controller %s",
+                            retry.controller_id,
+                        )
+                active = any(
+                    job is not _CHART_SNAPSHOT_RESERVED and job.in_flight
+                    for job in self._chart_snapshot_jobs.values()
+                ) or any(retry.in_flight for retry in self._chart_snapshot_prune_retries.values())
+                if not active:
+                    break
+                try:
+                    await asyncio.wait_for(activity.wait(), timeout=max(0.0, deadline - loop.time()))
+                except asyncio.TimeoutError:
+                    break
+        finally:
+            writer.close()
+            try:
+                async def wait_for_writer_stop():
+                    while loop.time() < deadline:
+                        if writer.join(0):
+                            return True
+                        await asyncio.sleep(min(0.01, deadline - loop.time()))
+                    return writer.join(0)
+
+                cleanup_task = loop.create_task(wait_for_writer_stop())
+                try:
+                    stopped = await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    try:
+                        stopped = await cleanup_task
+                    finally:
+                        raise
+            finally:
+                self._chart_snapshot_writer_draining = False
+        if not stopped or self._chart_snapshot_jobs or self._chart_snapshot_prune_retries:
+            self.logger().error(
+                "Chart snapshot writer shutdown incomplete: stopped=%s pending_jobs=%s pending_prunes=%s",
+                stopped, len(self._chart_snapshot_jobs), len(self._chart_snapshot_prune_retries),
+            )
+        else:
+            self.logger().info("Chart snapshot writer stopped cleanly")
 
     def _runtime_status_snapshot_interval(self) -> int:
         try:

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import types
 import unittest
 from decimal import Decimal
@@ -803,6 +804,102 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                             )
 
         mock_reload.assert_called_once_with(mock_module)
+
+    def test_protected_controller_source_is_checked_once_per_load_batch(self):
+        from hummingbot.strategy.strategy_v2_base import ControllerImplementationChanged
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            module_file = Path(temp_dir) / "shared_controller.py"
+            implementation_file = Path(temp_dir) / "implementation.py"
+            module_file.write_text("module source", encoding="utf-8")
+            implementation_file.write_text("implementation v1", encoding="utf-8")
+            module_path = f"{strategy_v2_base_module.settings.CONTROLLERS_MODULE}.fixture.shared_controller"
+            protected_module = types.ModuleType(module_path)
+            protected_module.__file__ = str(module_file)
+            protected_module.ProtectedController = type(
+                "ProtectedController",
+                (ControllerBase,),
+                {
+                    "allow_implementation_hot_reload": False,
+                    "implementation_source_files": classmethod(lambda cls: [str(implementation_file)]),
+                },
+            )
+            self.strategy_config.controllers_config = [f"controller_{i}.yml" for i in range(5)]
+            source_paths = {module_file.resolve(), implementation_file.resolve()}
+            read_counts = {path: 0 for path in source_paths}
+            config_reads = []
+            original_read_bytes = Path.read_bytes
+
+            def delayed_source_read(path):
+                if path.resolve() in source_paths:
+                    read_counts[path.resolve()] += 1
+                    time.sleep(0.002)
+                return original_read_bytes(path)
+
+            def read_config(_path):
+                config_reads.append(_path)
+                config_name = Path(_path).name
+                return (
+                    "controller_type: fixture\n"
+                    "controller_name: shared_controller\n"
+                    f"fixture_id: {config_name}\n"
+                )
+
+            def load_config(data, _root, _module):
+                return data
+
+            with patch("hummingbot.strategy_v2.controllers.controller_loader.load_controller_config", side_effect=load_config), \
+                    patch("hummingbot.client.native_sources.read_config_text", side_effect=read_config, create=True), \
+                    patch.object(strategy_v2_base_module.importlib, "import_module", return_value=protected_module) as importer, \
+                    patch.object(strategy_v2_base_module.inspect, "getsourcefile", return_value=str(module_file)), \
+                    patch.object(Path, "read_bytes", delayed_source_read):
+                started = time.perf_counter()
+                first = self.strategy_config.load_controller_configs()
+                first_elapsed = time.perf_counter() - started
+                self.assertEqual(len(first), 5)
+                self.assertEqual(
+                    read_counts,
+                    {path: 1 for path in source_paths},
+                    f"five-config first batch performed repeated source reads ({first_elapsed:.6f}s)",
+                )
+                self.assertEqual([item["fixture_id"] for item in first], [f"controller_{i}.yml" for i in range(5)])
+                self.assertEqual(importer.call_count, 1)
+
+                importer.reset_mock()
+                second = self.strategy_config.load_controller_configs(reload_changed_modules=True)
+                self.assertEqual(len(second), 5)
+                self.assertEqual(read_counts, {path: 2 for path in source_paths})
+                self.assertEqual([item["fixture_id"] for item in second], [f"controller_{i}.yml" for i in range(5)])
+                self.assertEqual(importer.call_count, 1)
+
+                config_read_count = len(config_reads)
+                implementation_file.write_text("implementation v2", encoding="utf-8")
+                with self.assertRaises(ControllerImplementationChanged):
+                    self.strategy_config.load_controller_configs(reload_changed_modules=True)
+                self.assertEqual(len(config_reads), config_read_count)
+                self.assertEqual(read_counts, {path: 3 for path in source_paths})
+
+    def test_unprotected_controller_modules_keep_per_config_reload_behavior(self):
+        module_path = f"{strategy_v2_base_module.settings.CONTROLLERS_MODULE}.fixture.legacy_controller"
+        module = types.ModuleType(module_path)
+        module.__file__ = "/tmp/legacy_controller.py"
+        self.strategy_config.controllers_config = ["legacy_a.yml", "legacy_b.yml"]
+
+        def read_config(path):
+            return f"controller_type: fixture\ncontroller_name: legacy_controller\nname: {path}\n"
+
+        with patch("hummingbot.strategy_v2.controllers.controller_loader.load_controller_config", side_effect=lambda data, _root, _module: data), \
+                patch("hummingbot.client.native_sources.read_config_text", side_effect=read_config, create=True), \
+                patch.object(strategy_v2_base_module.importlib, "import_module", return_value=module) as importer, \
+                patch.object(strategy_v2_base_module.importlib, "reload", return_value=module) as reload_module, \
+                patch.object(strategy_v2_base_module.inspect, "getsourcefile", return_value=module.__file__), \
+                patch.object(strategy_v2_base_module.os.path, "exists", return_value=True), \
+                patch.object(strategy_v2_base_module.os.path, "getmtime", side_effect=[10, 20]):
+            loaded = self.strategy_config.load_controller_configs(reload_changed_modules=True)
+
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(importer.call_count, 2)
+        reload_module.assert_called_once_with(module)
 
     def test_update_controllers_configs_contains_reload_errors(self):
         mock_logger = MagicMock()

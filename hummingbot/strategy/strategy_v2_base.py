@@ -144,7 +144,12 @@ class StrategyV2ConfigBase(BaseClientModel):
             return []
         return v
 
-    def _load_controller_module(self, module_path: str, reload_changed_modules: bool = False):
+    def _load_controller_module(
+        self, module_path: str, reload_changed_modules: bool = False,
+        _protected_module_batch_cache: Optional[Dict[str, Any]] = None,
+    ):
+        if _protected_module_batch_cache is not None and module_path in _protected_module_batch_cache:
+            return _protected_module_batch_cache[module_path]
         module = importlib.import_module(module_path)
         try:
             module_file = inspect.getsourcefile(module)
@@ -178,6 +183,8 @@ class StrategyV2ConfigBase(BaseClientModel):
             # A new strategy config in the same interpreter must not bless old loaded code.
             module.__dict__.setdefault("__hummingbot_protected_source_fingerprint__", fingerprint)
             self._controller_source_fingerprints.setdefault(module_path, fingerprint)
+            if _protected_module_batch_cache is not None:
+                _protected_module_batch_cache[module_path] = module
             return module
 
         current_mtime = None
@@ -197,11 +204,15 @@ class StrategyV2ConfigBase(BaseClientModel):
         return module
 
     def load_controller_configs(self, reload_changed_modules: bool = False):
+        protected_module_batch_cache: Dict[str, Any] = {}
         if reload_changed_modules:
             # A shared helper may also be used by a reload-enabled controller later in this batch.
             # Preflight protected sources before any module in the batch can be reloaded.
             for module_path in self._controller_source_fingerprints:
-                self._load_controller_module(module_path)
+                self._load_controller_module(
+                    module_path,
+                    _protected_module_batch_cache=protected_module_batch_cache,
+                )
         loaded_configs = []
         for config_path in self.controllers_config:
             full_path = os.path.join(settings.CONTROLLERS_CONF_DIR_PATH, config_path)
@@ -219,6 +230,7 @@ class StrategyV2ConfigBase(BaseClientModel):
             module = self._load_controller_module(
                 module_path=module_path,
                 reload_changed_modules=reload_changed_modules,
+                _protected_module_batch_cache=protected_module_batch_cache,
             )
 
             from hummingbot.strategy_v2.controllers.controller_loader import load_controller_config

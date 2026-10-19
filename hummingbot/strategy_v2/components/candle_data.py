@@ -140,7 +140,16 @@ class CandleSnapshot(PolicyModel):
 
     @property
     def digest(self) -> str:
-        return identity([self.dataset.key, [row.model_dump(mode='json') for row in self.rows]])
+        # The snapshot and its nested rows/dataset are frozen. Cache by object
+        # identity, as for the feature frame: model_copy(update=...) must compute
+        # a fresh digest rather than inherit a cached value from its source.
+        key = id(self)
+        cached = _SNAPSHOT_DIGESTS.get(key)
+        if cached is None:
+            cached = identity([self.dataset.key, [row.model_dump(mode='json') for row in self.rows]])
+            _SNAPSHOT_DIGESTS[key] = cached
+            weakref.finalize(self, _SNAPSHOT_DIGESTS.pop, key, None)
+        return cached
 
     def check(self, *, now: float, max_age: float) -> None:
         """Every ``frame`` admission check, without copying the frame."""
@@ -158,6 +167,7 @@ class CandleSnapshot(PolicyModel):
 
 
 _SNAPSHOT_FRAMES: dict[int, pd.DataFrame] = {}
+_SNAPSHOT_DIGESTS: dict[int, str] = {}
 
 
 def _snapshot_frame(snapshot: 'CandleSnapshot') -> pd.DataFrame:

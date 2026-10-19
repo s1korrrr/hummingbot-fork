@@ -539,3 +539,9 @@ def test_completed_loss_is_counted_before_any_entry_proposal():
     instance.create_actions_proposal = MagicMock(side_effect=lambda: ['unsafe'] if not instance._check_consecutive_loss_pause() else [])
     instance.stop_actions_proposal = MagicMock(return_value=[])
     assert instance.determine_executor_actions() == []
+
+
+def test_wallet_funding_cannot_silently_leave_an_episode_allocation_ceiling_active():
+    with pytest.raises(ValueError, match='wallet_funded.*episode'):
+        OKRSIControllerConfig(id='episode-wallet', connector_name='okx', trading_pair='ETH-USDT',
+                              allocation_mode='wallet_funded', episode_enabled=True)

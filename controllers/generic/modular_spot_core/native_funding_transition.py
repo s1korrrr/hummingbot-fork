@@ -10,10 +10,12 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.model.market_state import MarketState
 from hummingbot.model.metadata import Metadata
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executors import CloseType
 
 from .domain import PolicyError, decimal, identity
 from .recipe_contract import configuration_digest
@@ -80,11 +82,11 @@ def _check_persisted_submissions(store, session, infos, orders, connector):
             if value.get('owner') != store.recorder.config_file_path:
                 raise PolicyError('Funding transition found foreign durable submission')
             if row.key.startswith('v2-submitted-order:'):
-                snapshots.append(value['order'])
+                snapshots.append((value['order'], True))
                 if row.key != 'v2-submitted-order:' + value['order']['client_order_id']:
                     raise PolicyError('Funding transition durable submission identity differs')
             else:
-                snapshots.extend(value['orders'])
+                snapshots.extend((raw, False) for raw in value['orders'])
     for row in session.query(MarketState).all():
         if row.config_file_path != store.recorder.config_file_path or row.market != connector.display_name:
             raise PolicyError('Funding transition found foreign native tracker')
@@ -93,11 +95,13 @@ def _check_persisted_submissions(store, session, infos, orders, connector):
             if tracker.get('schema') != 'native_spot_paper_v1':
                 raise PolicyError('Funding transition paper tracker schema differs')
             tracker = tracker['orders']
-        snapshots.extend(tracker.values())
+        snapshots.extend((raw, False) for raw in tracker.values())
     fills = store.recorder.get_trades_for_config(store.recorder.config_file_path)
-    for raw in snapshots:
+    for raw, submitted in snapshots:
         order = InFlightOrder.from_json(raw)
         saved = recorded.get(order.client_order_id)
+        if submitted and saved is None and _proven_unrecorded_rejection(store, infos, native, fills, orders, order):
+            continue
         if order.client_order_id not in owned or saved is None:
             raise PolicyError('Funding transition has unresolved durable submission without native ownership')
         if (saved.symbol != order.trading_pair
@@ -123,6 +127,36 @@ def _check_persisted_submissions(store, session, infos, orders, connector):
             if (record['executed_amount_base'] != trade.fill_base_amount
                     or record['price'] != trade.fill_price or fill.trade_fee != trade.fee.to_json()):
                 raise PolicyError('Funding transition terminal fill or fee differs from native recorder')
+
+
+def _proven_unrecorded_rejection(store, infos, native, fills, orders, submitted):
+    """Accept only the native terminal rejection that legitimately has no Order row."""
+    key = (store.owner.config.connector_name, submitted.trading_pair, submitted.client_order_id)
+    owners = [info for info in infos if key in ExecutorOrchestrator._owned_order_keys(info)]
+    if len(owners) != 1:
+        return False
+    info = owners[0]
+    terminal = native.get(submitted.client_order_id)
+    if (info.status != RunnableStatus.TERMINATED or info.is_active or info.is_trading
+            or info.close_type != CloseType.FAILED or terminal is None
+            or submitted.current_state != OrderState.PENDING_CREATE
+            or terminal.current_state != OrderState.FAILED
+            or submitted.trade_type != TradeType.BUY or terminal.trade_type != TradeType.BUY
+            or submitted.exchange_order_id is not None or terminal.exchange_order_id is not None
+            or submitted.trading_pair != terminal.trading_pair or submitted.order_type != terminal.order_type
+            or submitted.amount != terminal.amount
+            or (submitted.order_type != OrderType.MARKET and submitted.price != terminal.price)
+            or any(order.executed_amount_base != 0 or order.executed_amount_quote != 0 or order.order_fills
+                   for order in (submitted, terminal))
+            or any(fill.order_id == submitted.client_order_id for fill in fills)):
+        return False
+    receipt = (info.custom_info or {}).get('entry_reconciliation')
+    if not isinstance(receipt, dict) or receipt.get('source') != 'okx_submission_rejected_v1':
+        return False
+    # The native release validator binds the exact owner, entry snapshot, receipt,
+    # venue scope, empty trade set and (if present) tracker. Keep one authority.
+    store._validate_release(info, receipt, 0, fills, orders)
+    return True
 
 
 def _legacy_evidence(view, session, evidence, infos, orders):
@@ -260,8 +294,9 @@ def _proposal(store, session, expected_binding, legacy_evidence=None, allocation
     projection, pending, _ = view._evidence(
         state, raw, reconcile=legacy is None, allow_quiescent_legacy=legacy is not None)
     if allocation_proof is not None:
-        if pending != 0 or projection['legacy_uncertain_quote'] != 0:
-            raise PolicyError('Allocation-only transition requires fully reconciled acquisition commitments')
+        # Keep unresolved claims and historical uncertainty reserved across a
+        # mode-only rebind. Wallet admission subtracts this same pending total
+        # from actual free quote; the transition must never release it by age.
         owned = {order_id: info.id for info in infos for _, _, order_id in ExecutorOrchestrator._owned_order_keys(info)}
         for info in [*infos, *current]:
             if not (info.is_active or info.is_trading):
@@ -281,7 +316,7 @@ def _proposal(store, session, expected_binding, legacy_evidence=None, allocation
                       and info.id not in state['releases']]
         if unresolved != [legacy['executor_id']]:
             raise PolicyError('Funding legacy transition has other unresolved acquisition chains')
-    if pending != projection['legacy_uncertain_quote']:
+    if allocation_proof is None and pending != projection['legacy_uncertain_quote']:
         raise PolicyError('Funding transition retains unresolved commitments; reconcile terminal evidence first')
     if ((store.policy.allocation_quote is not None and projection['used'] + pending > store.policy.allocation_quote)
             or (store.policy.max_position_quote is not None and any(

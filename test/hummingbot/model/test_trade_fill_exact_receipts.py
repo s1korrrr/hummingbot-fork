@@ -7,8 +7,10 @@ import pytest
 
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
+from hummingbot.connector.client_order_tracker import ClientOrderTracker
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
 from hummingbot.core.event.events import MarketEvent, OrderFilledEvent
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
@@ -52,9 +54,13 @@ def event():
                             exchange_trade_id='fill')
 
 
+def attested_event(timestamp_ms=1789021245123, source='okx.fillTime'):
+    return event()._replace(execution_timestamp_ms=timestamp_ms, execution_timestamp_source=source)
+
+
 def test_recorder_preserves_exact_decimals_after_reopen_and_deduplicates(manager):
     writer, market = recorder(manager)
-    fill = event()
+    fill = attested_event()
     writer._did_fill_order(MarketEvent.OrderFilled.value, market, fill)
     writer._did_fill_order(MarketEvent.OrderFilled.value, market, fill)
     manager.engine.dispose()
@@ -157,6 +163,123 @@ def test_conflicting_duplicate_preserves_first_receipt_and_reports_error(manager
         assert session.query(TradeFill).one().amount_decimal == fill.amount
 
 
+def test_recorder_persists_execution_time_without_changing_lifecycle_timestamp(manager):
+    writer, market = recorder(manager)
+    fill = attested_event()
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, fill)
+    with manager.get_new_session() as session:
+        result = session.query(TradeFill).one()
+        assert result.timestamp == int(fill.timestamp * 1e3)
+        assert result.execution_timestamp_ms == fill.execution_timestamp_ms
+        assert result.execution_timestamp_source == 'okx.fillTime'
+
+
+def test_tracker_to_recorder_keeps_lifecycle_and_attested_execution_clocks_separate(manager):
+    writer, market = recorder(manager)
+    connector = MagicMock(current_timestamp=1789021246)
+    tracker = ClientOrderTracker(connector)
+    order = InFlightOrder(
+        client_order_id='order', exchange_order_id='venue-order', trading_pair='BTC-USDC',
+        order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=D('1'),
+        creation_timestamp=1789021240, initial_state=OrderState.OPEN,
+    )
+    tracker.start_tracking_order(order)
+    update = TradeUpdate(
+        trade_id='fill', client_order_id='order', exchange_order_id='venue-order', trading_pair='BTC-USDC',
+        fill_timestamp=1789021245.9, fill_price=D('100'), fill_base_amount=D('0.1'),
+        fill_quote_amount=D('10'), fee=AddedToCostTradeFee(),
+        execution_timestamp_ms=1789021245123, execution_timestamp_source='okx.fillTime',
+    )
+    tracker.process_trade_update(update)
+    filled_event = connector.trigger_event.call_args.args[1]
+    assert filled_event.timestamp == 1789021246
+    assert filled_event.execution_timestamp_ms == update.execution_timestamp_ms
+    assert filled_event.execution_timestamp_source == 'okx.fillTime'
+
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, filled_event)
+    with manager.get_new_session() as session:
+        result = session.query(TradeFill).one()
+        assert result.timestamp == 1789021246000
+        assert result.execution_timestamp_ms == 1789021245123
+        assert result.execution_timestamp_source == 'okx.fillTime'
+
+
+def test_delayed_partial_fills_keep_execution_times_across_utc_midnight(manager):
+    writer, market = recorder(manager)
+    midnight_ms = 1789084800000  # 2026-09-11T00:00:00Z
+    before = event()._replace(
+        timestamp=(midnight_ms + 250) / 1000,
+        exchange_trade_id='before-midnight',
+        execution_timestamp_ms=midnight_ms - 250,
+        execution_timestamp_source='okx.fillTime',
+    )
+    after = event()._replace(
+        timestamp=(midnight_ms + 3000) / 1000,
+        exchange_trade_id='after-midnight',
+        execution_timestamp_ms=midnight_ms + 1250,
+        execution_timestamp_source='okx.fillTime',
+    )
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, before)
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, after)
+    with manager.get_new_session() as session:
+        rows = {row.exchange_trade_id: row for row in session.query(TradeFill).all()}
+        assert rows['before-midnight'].timestamp == midnight_ms + 250
+        assert rows['before-midnight'].execution_timestamp_ms == midnight_ms - 250
+        assert rows['after-midnight'].timestamp == midnight_ms + 3000
+        assert rows['after-midnight'].execution_timestamp_ms == midnight_ms + 1250
+
+
+def test_conflicting_duplicate_execution_attestation_keeps_first_and_does_not_raise(manager, caplog):
+    writer, market = recorder(manager)
+    fill = attested_event()
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, fill)
+    changed_attestation = fill._replace(execution_timestamp_ms=fill.execution_timestamp_ms + 1)
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, changed_attestation)
+    with manager.get_new_session() as session:
+        rows = session.query(TradeFill).all()
+        assert len(rows) == 1
+        assert rows[0].execution_timestamp_ms == fill.execution_timestamp_ms
+        assert rows[0].amount_decimal == fill.amount
+    assert 'Conflicting duplicate fill execution-time attestation' in caplog.text
+
+
+def test_recorder_only_enriches_unknown_execution_attestation_and_never_downgrades(manager, caplog):
+    caplog.set_level('INFO')
+    writer, market = recorder(manager)
+    fill = event()
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, fill)
+    known = attested_event()
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, known)
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, event())
+    with manager.get_new_session() as session:
+        result = session.query(TradeFill).one()
+        assert result.execution_timestamp_ms == known.execution_timestamp_ms
+        assert result.execution_timestamp_source == known.execution_timestamp_source
+        assert result.amount_decimal == fill.amount
+        assert session.query(TradeFill).count() == 1
+    assert "Enriched duplicate fill execution-time attestation" in caplog.text
+
+
+@pytest.mark.parametrize("timestamp_ms,source", [
+    (1789021245123, None),
+    (None, "okx.fillTime"),
+    (True, "okx.fillTime"),
+    (0, "okx.fillTime"),
+    (253402300800000, "okx.fillTime"),
+    (1789021252001, "okx.fillTime"),
+])
+def test_invalid_execution_attestation_is_dropped_without_dropping_fill(manager, timestamp_ms, source):
+    writer, market = recorder(manager)
+    fill = event()._replace(execution_timestamp_ms=timestamp_ms, execution_timestamp_source=source)
+    writer._did_fill_order(MarketEvent.OrderFilled.value, market, fill)
+    with manager.get_new_session() as session:
+        result = session.query(TradeFill).one()
+        assert result.execution_timestamp_ms is None
+        assert result.execution_timestamp_source is None
+        assert result.amount_decimal == fill.amount
+        assert session.query(TradeFill).count() == 1
+
+
 def test_nonfinite_fee_conversion_is_unavailable_without_losing_fill(manager):
     writer, market = recorder(manager)
     fill = event()
@@ -175,7 +298,7 @@ def test_csv_uses_exact_values_and_retains_precision_metadata(manager, tmp_path,
     import hummingbot.connector.markets_recorder as recorder_module
 
     writer, market = recorder(manager)
-    fill = event()
+    fill = attested_event()
     writer._did_fill_order(MarketEvent.OrderFilled.value, market, fill)
     monkeypatch.setattr(recorder_module, 'data_path', lambda: str(tmp_path))
     with manager.get_new_session() as session:
@@ -185,6 +308,8 @@ def test_csv_uses_exact_values_and_retains_precision_metadata(manager, tmp_path,
     assert D(rows[0]['amount']) == fill.amount
     assert json.loads(rows[0]['receipt_precision'])['amount'] == 'exact_decimal'
     assert rows[0]['exact_receipt_source'] == 'order_filled_event_v1'
+    assert rows[0]['execution_timestamp_ms'] == str(fill.execution_timestamp_ms)
+    assert rows[0]['execution_timestamp_source'] == 'okx.fillTime'
 
 
 def test_wal_reader_keeps_its_snapshot_during_in_place_migration(manager):

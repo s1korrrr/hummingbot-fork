@@ -137,7 +137,7 @@ class ControllerCandleWatermarkModelTests(TestCase):
                 sentinel = connection.exec_driver_sql("SELECT value FROM sentinel WHERE id = 1").scalar_one()
             self.assertEqual(sentinel, "preserved")
 
-    def test_prior_version_migration_keeps_sentinel_and_additive_table_without_version_bump(self):
+    def test_prior_version_migration_keeps_sentinel_and_advances_schema_version(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "prior.sqlite"
             raw = sqlite3.connect(db_path)
@@ -157,7 +157,9 @@ class ControllerCandleWatermarkModelTests(TestCase):
                 db_path=str(db_path),
             )
 
-            self.assertEqual(SQLConnectionManager.LOCAL_DB_VERSION_VALUE, "20260327")
+            with manager.get_new_session() as session:
+                self.assertEqual(SQLConnectionManager.LOCAL_DB_VERSION_VALUE,
+                                 manager.get_local_db_version(session).value)
             inspector = inspect(manager.engine)
             self.assertIn(ControllerCandleWatermark.__tablename__, inspector.get_table_names())
             with manager.engine.connect() as connection:

@@ -16,7 +16,14 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import (
+    OKX_FILL_TIME_SOURCE,
+    InFlightOrder,
+    OrderState,
+    OrderUpdate,
+    TradeUpdate,
+    normalize_execution_timestamp_ms,
+)
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.terminal_reconciliation import terminal_reconciliation
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
@@ -53,6 +60,23 @@ class OkxExchange(ExchangePyBase):
     supports_terminal_fill_reconciliation = True
 
     web_utils = web_utils
+
+    def _execution_timestamp_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        observed_at_seconds = self.current_timestamp
+        execution_timestamp_ms = normalize_execution_timestamp_ms(
+            data.get("fillTime"), observed_at_seconds
+        )
+        if execution_timestamp_ms is None:
+            return {
+                "execution_timestamp_ms": None,
+                "execution_timestamp_source": None,
+                "execution_timestamp_observed_at_ms": None,
+            }
+        return {
+            "execution_timestamp_ms": execution_timestamp_ms,
+            "execution_timestamp_source": OKX_FILL_TIME_SOURCE,
+            "execution_timestamp_observed_at_ms": int(observed_at_seconds * 1000),
+        }
 
     def __init__(self,
                  okx_api_key: str,
@@ -554,6 +578,7 @@ class OkxExchange(ExchangePyBase):
                     fill_price=Decimal(fill_data["fillPx"]),
                     fill_timestamp=int(fill_data["ts"]) * 1e-3,
                     is_taker=self._is_taker_fill(fill_data),
+                    **self._execution_timestamp_fields(fill_data),
                 )
                 trade_updates.append(trade_update)
 
@@ -662,6 +687,7 @@ class OkxExchange(ExchangePyBase):
                                 fill_price=Decimal(data["fillPx"]),
                                 fill_timestamp=int(data["uTime"]) * 1e-3,
                                 is_taker=self._is_taker_fill(data),
+                                **self._execution_timestamp_fields(data),
                             )
                             self._order_tracker.process_trade_update(trade_update)
 

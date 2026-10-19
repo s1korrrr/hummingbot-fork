@@ -168,6 +168,8 @@ class OrderFilledEvent(NamedTuple):
     exchange_order_id: str = ""
     leverage: Optional[int] = 1
     position: Optional[str] = PositionAction.NIL.value
+    execution_timestamp_ms: Optional[int] = None
+    execution_timestamp_source: Optional[str] = None
 
     @classmethod
     def order_filled_events_from_order_book_rows(

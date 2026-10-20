@@ -438,7 +438,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertTrue(self._is_logged(
             "INFO",
-            "Subscribed to public order book and trade channels..."
+            "Sent public order book and trade subscription requests; awaiting snapshots."
         ))
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
@@ -865,7 +865,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn(new_pair, self.data_source._trading_pairs)
 
         self.assertTrue(
-            self._is_logged("INFO", f"Subscribed to {new_pair} order book and trade channels")
+            self._is_logged("INFO", f"Sent {new_pair} order book and trade subscription requests; awaiting snapshot.")
         )
 
     async def test_subscribe_to_trading_pair_websocket_not_connected(self):

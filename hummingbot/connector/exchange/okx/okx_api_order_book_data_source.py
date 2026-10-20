@@ -1,5 +1,6 @@
 import asyncio
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.okx import okx_constants as CONSTANTS, okx_web_utils as web_utils
@@ -309,7 +310,7 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     await ws.send(subscribe_orderbook_request)
                 self._require_snapshot_before_deadline(trading_pair, ws)
 
-            self.logger().info("Subscribed to public order book and trade channels...")
+            self.logger().info("Sent public order book and trade subscription requests; awaiting snapshots.")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -328,6 +329,15 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 channel = self._diff_messages_queue_key
 
         return channel
+
+    async def _process_message_for_unknown_channel(
+        self, event_message: Dict[str, Any], websocket_assistant: WSAssistant
+    ):
+        if isinstance(event_message, Mapping) and event_message.get("event") == "error":
+            # Control errors may omit arg. Exit through native invalidation and reconnect;
+            # never include the server's echoed request or raw payload in the exception.
+            raise ConnectionError("OKX public subscription rejected")
+        await super()._process_message_for_unknown_channel(event_message, websocket_assistant)
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
         try:
@@ -357,7 +367,8 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
         on the existing WebSocket connection.
 
         :param trading_pair: the trading pair to subscribe to
-        :return: True if subscription was successful, False otherwise
+        :return: True if subscription requests were sent, False otherwise.
+                 Readiness still requires a fresh WebSocket snapshot.
         """
         if self._ws_assistant is None:
             self.logger().warning(
@@ -389,7 +400,7 @@ class OkxAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
             self.add_trading_pair(trading_pair)
             self._require_snapshot_before_deadline(trading_pair, self._ws_assistant)
-            self.logger().info(f"Subscribed to {trading_pair} order book and trade channels")
+            self.logger().info(f"Sent {trading_pair} order book and trade subscription requests; awaiting snapshot.")
             return True
 
         except asyncio.CancelledError:

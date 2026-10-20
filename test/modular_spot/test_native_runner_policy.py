@@ -30,11 +30,16 @@ OWNER = 'modular_spot_runner'
 def test_async_operator_unknown_controller_is_consumed_without_busy_loop():
     code = r'''
 import asyncio
+import os
+import signal
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from scripts.v2_with_controllers import V2WithControllers
+
+def drain_deadline(_signum, _frame):
+    os._exit(124)
 
 async def main():
     strategy = V2WithControllers.__new__(V2WithControllers)
@@ -46,17 +51,53 @@ async def main():
     strategy.controllers = {}
     strategy._risk_persistence_enabled = True
     strategy._risk_write_task = None
+    previous_handler = signal.signal(signal.SIGALRM, drain_deadline)
+    signal.setitimer(signal.ITIMER_REAL, 3.0)
     with patch.object(MarketsRecorder, "get_existing_instance", return_value=object()):
-        await strategy.process_operator_events_async()
+        try:
+            await strategy.process_operator_events_async()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
     assert not strategy._operator_event_queue
 
 asyncio.run(main())
 '''
     result = subprocess.run(
         [sys.executable, '-B', '-c', code], cwd=Path(__file__).resolve().parents[2],
-        capture_output=True, text=True, timeout=3,
+        capture_output=True, text=True, timeout=15,
     )
     assert result.returncode == 0, f"operator child failed: {result.stderr[-1000:]}"
+
+
+def test_unknown_operator_non_consuming_head_is_interrupted_by_drain_deadline():
+    code = r'''
+import os
+import signal
+from collections import deque
+
+queue = deque([{"controller_id": "missing-owner"}])
+def drain_deadline(_signum, _frame):
+    os._exit(124)
+
+signal.signal(signal.SIGALRM, drain_deadline)
+signal.setitimer(signal.ITIMER_REAL, 3.0)
+try:
+    # This is the former unknown-controller branch: reject but fail to remove
+    # the head item, so the synchronous drain spins on the same event forever.
+    while queue:
+        event = queue[0]
+        targets = []
+        if event.get("controller_id") is not None and not targets:
+            continue
+finally:
+    signal.setitimer(signal.ITIMER_REAL, 0)
+'''
+    result = subprocess.run(
+        [sys.executable, '-B', '-c', code], cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 124
 
 
 def risk_state():

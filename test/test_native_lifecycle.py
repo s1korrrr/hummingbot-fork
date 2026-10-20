@@ -206,7 +206,9 @@ async def test_stop_start_uses_owner_hooks_and_same_request_never_executes_twice
     owner.stop_strategy = AsyncMock(side_effect=stop_strategy)
     owner.remove_connector = Mock(side_effect=lambda name: connectors.pop(name))
     owner._is_running = False
-    owner.markets_recorder = Mock()
+    markets_recorder = Mock()
+    markets_recorder.stop_async = AsyncMock()
+    owner.markets_recorder = markets_recorder
     app = SimpleNamespace(trading_core=owner, native_lifecycle=NativeLifecycle('ok-rsi-main'),
                           stop_market_event_notifiers=Mock(), _mqtt=Mock(), logger=Mock(),
                           _peek_config=Mock(return_value={'script_file_name': 'v2_with_controllers.py'}))
@@ -224,6 +226,7 @@ async def test_stop_start_uses_owner_hooks_and_same_request_never_executes_twice
     assert result['execution_completed'] is True
     assert result['state'] == 'stopped'
     assert result['reconciliation_complete'] is True
+    markets_recorder.stop_async.assert_awaited_once()
     assert await commands.execute(request) == result
     strategy.on_stop.assert_awaited_once_with(strict=True)
     app._mqtt._remove_market_event_listeners.assert_called_once()

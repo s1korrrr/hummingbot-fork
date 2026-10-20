@@ -510,6 +510,36 @@ async def test_transient_risk_check_failure_refuses_the_action_without_latching_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('async_mode', [False, True])
+async def test_on_tick_uses_async_operator_drain_only_for_acknowledged_recorder(async_mode):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    strategy = V2WithControllers.__new__(V2WithControllers)
+    strategy._risk_persistence_enabled = True
+    strategy._operator_drain_task = None
+    strategy._risk_latch_task = None
+    strategy._ownership_recovery_complete = Mock(return_value=False)
+    strategy.process_operator_events = Mock()
+    strategy.process_operator_events_async = AsyncMock()
+    strategy._report_operator_drain_result = Mock()
+    recorder_instance = SimpleNamespace(_async_financial_events=async_mode)
+
+    with patch.object(StrategyV2Base, 'on_tick'), \
+            patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder_instance):
+        strategy.on_tick()
+        if async_mode:
+            assert strategy._operator_drain_task is not None
+            await strategy._operator_drain_task
+            strategy.process_operator_events.assert_not_called()
+            strategy.process_operator_events_async.assert_awaited_once()
+        else:
+            assert strategy._operator_drain_task is None
+            strategy.process_operator_events.assert_called_once()
+            strategy.process_operator_events_async.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_on_tick_rail_failure_status_and_log_clear_once_the_rails_recover(recorder):
     connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
     with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \

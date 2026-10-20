@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import inspect
 import logging
 import math
 from abc import ABC, abstractmethod
@@ -32,6 +33,10 @@ from hummingbot.core.web_assistant.auth import AuthBase
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.logger import HummingbotLogger
+
+
+class NativeOrderPersistencePending(RuntimeError):
+    """Venue accepted an order, but its native receipt has not yet been acknowledged."""
 
 
 class ExchangePyBase(ExchangeBase, ABC):
@@ -189,9 +194,15 @@ class ExchangePyBase(ExchangeBase, ABC):
     @property
     def tracking_states(self) -> Dict[str, any]:
         """
-        Returns a dictionary associating current active orders client id to their JSON representation
+        Returns active orders and recent cached fill receipts needed for native
+        recorder replay if a process stops before the receipt is acknowledged.
         """
-        return {key: value.to_json() for key, value in self._order_tracker.all_updatable_orders.items()}
+        updatable = self._order_tracker.all_updatable_orders
+        cached_receipts = {
+            key: value for key, value in self._order_tracker.cached_orders.items()
+            if value.order_fills or value.recorder_pending_events
+        }
+        return {key: value.to_json() for key, value in {**updatable, **cached_receipts}.items()}
 
     @abstractmethod
     def supported_order_types(self) -> List[OrderType]:
@@ -434,20 +445,20 @@ class ExchangePyBase(ExchangeBase, ABC):
 
         if order_type not in self.supported_order_types():
             self.logger().error(f"{order_type} is not in the list of supported order types")
-            self._update_order_after_failure(
+            await self._update_order_after_failure_and_wait(
                 order_id=order_id, trading_pair=trading_pair,
                 exception=ValueError(f"{order_type} is not in the list of supported order types"))
             return
 
         elif quantized_amount < trading_rule.min_order_size:
-            self._update_order_after_failure(
+            await self._update_order_after_failure_and_wait(
                 order_id=order_id, trading_pair=trading_pair,
                 exception=ValueError(f"Order amount {amount} is lower than minimum order size {trading_rule.min_order_size} "
                                      f"for the pair {trading_pair}. The order will not be created."))
             return
 
         elif notional_size < trading_rule.min_notional_size:
-            self._update_order_after_failure(
+            await self._update_order_after_failure_and_wait(
                 order_id=order_id, trading_pair=trading_pair,
                 exception=ValueError(f"Order notional {notional_size} is lower than minimum notional size {trading_rule.min_notional_size}"
                                      f" for the pair {trading_pair}. The order will not be created."))
@@ -457,8 +468,13 @@ class ExchangePyBase(ExchangeBase, ABC):
 
         except asyncio.CancelledError:
             raise
+        except NativeOrderPersistencePending as ex:
+            self.logger().error(
+                "Exchange accepted order %s, but native persistence is pending; retaining it for reconciliation (%s)",
+                order_id, type(ex).__name__,
+            )
         except Exception as ex:
-            self._on_order_failure(
+            pending_update = self._on_order_failure(
                 order_id=order_id,
                 trading_pair=trading_pair,
                 amount=quantized_amount,
@@ -468,6 +484,8 @@ class ExchangePyBase(ExchangeBase, ABC):
                 exception=ex,
                 **kwargs,
             )
+            if inspect.isawaitable(pending_update):
+                await pending_update
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
         exchange_order_id, update_timestamp = await self._place_order(
@@ -487,7 +505,18 @@ class ExchangePyBase(ExchangeBase, ABC):
             update_timestamp=update_timestamp,
             new_state=OrderState.OPEN,
         )
-        self._order_tracker.process_order_update(order_update)
+        # The exchange has already accepted the order. Preserve its exchange ID
+        # before recorder I/O so an ACK failure cannot turn it into a synthetic
+        # placement failure or erase the reconciliation identity.
+        order.update_exchange_order_id(str(exchange_order_id))
+        try:
+            await self._order_tracker.process_order_update_and_wait(order_update)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise NativeOrderPersistencePending(
+                f"accepted order {order.client_order_id} awaits native receipt ACK"
+            ) from error
 
         return exchange_order_id
 
@@ -508,7 +537,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             exc_info=True,
             app_warning_msg=f"Failed to submit {trade_type.name.upper()} order to {self.name_cap}. Check API key and network connection."
         )
-        self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
+        return self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
 
     def _update_order_after_failure(self, order_id: str, trading_pair: str, exception: Optional[Exception] = None):
         misc_updates = {}
@@ -523,7 +552,22 @@ class ExchangePyBase(ExchangeBase, ABC):
             new_state=OrderState.FAILED,
             misc_updates=misc_updates
         )
-        self._order_tracker.process_order_update(order_update)
+        return self._order_tracker.process_order_update(order_update)
+
+    async def _update_order_after_failure_and_wait(self, order_id: str, trading_pair: str,
+                                                   exception: Optional[Exception] = None):
+        misc_updates = {}
+        if exception:
+            misc_updates['error_message'] = str(exception)
+            misc_updates['error_type'] = exception.__class__.__name__
+        order_update = OrderUpdate(
+            client_order_id=order_id,
+            trading_pair=trading_pair,
+            update_timestamp=self.current_timestamp,
+            new_state=OrderState.FAILED,
+            misc_updates=misc_updates,
+        )
+        await self._order_tracker.process_order_update_and_wait(order_update)
 
     async def _execute_order_cancel(self, order: InFlightOrder) -> Optional[str]:
         try:
@@ -558,7 +602,7 @@ class ExchangePyBase(ExchangeBase, ABC):
                            if self.is_cancel_request_in_exchange_synchronous
                            else OrderState.PENDING_CANCEL),
             )
-            self._order_tracker.process_order_update(order_update)
+            await self._order_tracker.process_order_update_and_wait(order_update)
         return cancelled
 
     async def _execute_cancel(self, trading_pair: str, order_id: str) -> str:
@@ -985,7 +1029,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             try:
                 trade_updates = await self._all_trade_updates_for_order(order=order)
                 for trade_update in trade_updates:
-                    self._order_tracker.process_trade_update(trade_update)
+                    await self._order_tracker.process_trade_update_and_wait(trade_update)
             except asyncio.CancelledError:
                 raise
             except Exception as request_error:
@@ -1009,7 +1053,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         is_not_found = self._is_order_not_found_during_status_update_error(status_update_exception=error)
         self.logger().debug(f"Order update error for lost order {order.client_order_id}\n{order}\nIs order not found: {is_not_found} ({error})")
         if is_not_found:
-            self._update_order_after_failure(order.client_order_id, order.trading_pair, exception=error)
+            await self._update_order_after_failure_and_wait(order.client_order_id, order.trading_pair, exception=error)
         else:
             self.logger().warning(f"Error fetching status update for the lost order {order.client_order_id}: {error}.")
 
@@ -1017,7 +1061,7 @@ class ExchangePyBase(ExchangeBase, ABC):
         for order in orders:
             try:
                 order_update = await self._request_order_status(tracked_order=order)
-                self._order_tracker.process_order_update(order_update)
+                await self._order_tracker.process_order_update_and_wait(order_update)
             except asyncio.CancelledError:
                 raise
             except Exception as request_error:

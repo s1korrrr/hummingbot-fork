@@ -117,18 +117,10 @@ class OkxExchange(ExchangePyBase):
                 raise ValueError('A matching durable V2 or Meridian V3 native recorder is required before submission')
             # The existing MarketState is the native order-tracker checkpoint,
             # including PENDING_CREATE. Commit its client ID before venue I/O.
-            with recorder._sql_manager.get_new_session() as session:
-                with session.begin():
-                    recorder.save_market_states(recorder.config_file_path, self, session)
-                    from hummingbot.model.metadata import Metadata
-
-                    # Keep the historical namespace for existing recovery readers;
-                    # the immutable receipt binds the actual runner owner below.
-                    key = 'v2-submitted-order:' + order.client_order_id
-                    if session.get(Metadata, key) is not None:
-                        raise ValueError('Durable native client order ID was already submitted')
-                    session.add(Metadata(key=key, value=json.dumps({
-                        'owner': recorder.config_file_path, 'order': order.to_json()}, sort_keys=True)))
+            # Keep the historical namespace for existing recovery readers; the
+            # immutable receipt and MarketState checkpoint commit together.
+            await recorder.store_submitted_order_checkpoint_async(
+                recorder.config_file_path, self, order.to_json(), order.client_order_id)
         return await super()._place_order_and_process_update(order, **kwargs)
 
     @property
@@ -649,7 +641,7 @@ class OkxExchange(ExchangePyBase):
         order.update_exchange_order_id(exchange_id)
         if order.executed_amount_base < expected:
             for trade_update in await self._all_trade_updates_for_order(order):
-                self._order_tracker.process_trade_update(trade_update)
+                await self._order_tracker.process_trade_update_and_wait(trade_update)
         if order.executed_amount_base != expected:
             raise IOError(f"Terminal fill reconciliation pending: expected={expected}, observed={order.executed_amount_base}")
 
@@ -689,7 +681,7 @@ class OkxExchange(ExchangePyBase):
                                 is_taker=self._is_taker_fill(data),
                                 **self._execution_timestamp_fields(data),
                             )
-                            self._order_tracker.process_trade_update(trade_update)
+                            await self._order_tracker.process_trade_update_and_wait(trade_update)
 
                         if updatable_order is not None:
                             if order_status in {OrderState.CANCELED, OrderState.FILLED}:
@@ -702,7 +694,7 @@ class OkxExchange(ExchangePyBase):
                                 exchange_order_id=str(data["ordId"]),
                                 misc_updates=self._okx_order_misc_updates(data),
                             )
-                            self._order_tracker.process_order_update(order_update=order_update)
+                            await self._order_tracker.process_order_update_and_wait(order_update=order_update)
 
                 elif channel == CONSTANTS.OKX_WS_ACCOUNT_CHANNEL:
                     for data in stream_message.get("data", []):

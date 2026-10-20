@@ -90,7 +90,7 @@ async def strict_stop(app):
     if core._is_running and not await core.stop_clock():
         return ShutdownResult(False, 'Clock stop did not complete')
     if core.markets_recorder:
-        core.markets_recorder.stop()
+        await core.markets_recorder.stop_async()
         core.markets_recorder = None
     core.strategy_name = None
     core.strategy_config_map = None

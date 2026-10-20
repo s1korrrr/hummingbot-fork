@@ -55,6 +55,20 @@ def make_runner(recorder, **config):
 async def close(strategy):
     strategy.listen_to_executor_actions_task.cancel()
     await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+    task = getattr(strategy, '_risk_write_task', None)
+    if task is not None:
+        await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+
+
+async def tick_and_ack(strategy):
+    strategy.on_tick()
+    operator_task = getattr(strategy, '_operator_drain_task', None)
+    if operator_task is not None:
+        await asyncio.shield(operator_task)
+    strategy._schedule_risk_state_persistence()
+    task = getattr(strategy, '_risk_write_task', None)
+    if task is not None:
+        await asyncio.shield(task)
 
 
 @pytest.mark.asyncio
@@ -67,7 +81,7 @@ async def test_pending_enrollment_tick_waits_for_report_initialization_without_r
         with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
                 patch.object(StrategyV2Base, 'on_tick'), \
                 patch.object(strategy, 'check_manual_kill_switch'):
-            strategy.on_tick()
+            await tick_and_ack(strategy)
         assert strategy._daily_entry_risk is None
         assert strategy._entry_risk_enrollment.pending
         assert strategy.controllers[OWNER].paused
@@ -90,7 +104,7 @@ async def test_pending_ownership_does_not_initialize_daily_risk(recorder):
 
         with patch.object(StrategyV2Base, 'on_tick'), \
                 patch('scripts.v2_with_controllers.time.time', return_value=1002):
-            strategy.on_tick()
+            await tick_and_ack(strategy)
             assert not strategy.validate_create_action(SimpleNamespace(
                 controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.BUY)))
 
@@ -98,6 +112,62 @@ async def test_pending_ownership_does_not_initialize_daily_risk(recorder):
         assert strategy._entry_risk_enrollment.pending
         assert strategy.max_global_pnl is None
         assert recorder.load_strategy_risk_state() == before
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
+async def test_create_validation_waits_for_durable_enrollment_before_admission(recorder):
+    recorder.store_strategy_risk_state(pending_state())
+    strategy = make_runner(recorder)
+    try:
+        strategy._controller_reports_valid = True
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('-12.5'))}}
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = recorder.store_strategy_risk_state_async
+
+        async def delayed_store(state, *, operator_receipts=()):
+            started.set()
+            await release.wait()
+            await original(state, operator_receipts=operator_receipts)
+
+        with patch.object(recorder, 'store_strategy_risk_state_async', delayed_store):
+            action = SimpleNamespace(controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.BUY))
+            validation = asyncio.create_task(strategy.validate_create_action_async(action))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            assert not validation.done()
+            assert strategy._entry_risk_enrollment.pending is False
+            assert recorder.load_strategy_risk_state()['entry_risk_enrollment']['initialized_at'] is None
+            release.set()
+            # The durable entry fence remains in force until a separate
+            # operator resume, even though the baseline is now complete.
+            assert not await asyncio.wait_for(validation, timeout=2)
+        saved = recorder.load_strategy_risk_state()
+        assert saved['entry_risk_enrollment']['initial_pnl_quote'] == '-12.5'
+        assert saved['daily_entry_risk']['baseline_quote'] == '-12.5'
+    finally:
+        await close(strategy)
+
+
+@pytest.mark.asyncio
+async def test_create_validation_refuses_when_durable_enrollment_write_fails(recorder):
+    recorder.store_strategy_risk_state(pending_state())
+    strategy = make_runner(recorder)
+    try:
+        strategy._controller_reports_valid = True
+        strategy.controller_reports = {OWNER: {'performance': SimpleNamespace(
+            pnl_available=True, global_pnl_quote=D('-12.5'))}}
+
+        async def failed_store(*_args, **_kwargs):
+            raise OSError('fixture commit failure')
+
+        with patch.object(recorder, 'store_strategy_risk_state_async', failed_store):
+            action = SimpleNamespace(controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.BUY))
+            assert not await strategy.validate_create_action_async(action)
+        assert recorder.load_strategy_risk_state() == pending_state()
+        assert strategy._risk_check_failure is not None
     finally:
         await close(strategy)
 
@@ -122,7 +192,7 @@ async def test_failed_or_unresolved_ownership_keeps_risk_rails_and_creation(reco
 
         with patch.object(StrategyV2Base, 'on_tick'), \
                 patch('scripts.v2_with_controllers.time.time', return_value=1002):
-            strategy.on_tick()
+            await tick_and_ack(strategy)
             # The first fresh native mark enrolls the daily rail; SELLs are never refused by it.
             assert strategy.validate_create_action(SimpleNamespace(
                 controller_id=OWNER, executor_config=SimpleNamespace(side=TradeType.SELL)))
@@ -143,9 +213,9 @@ async def test_successful_ownership_claim_initializes_daily_risk_once(recorder):
             pnl_available=True, global_pnl_quote=D('-12.5'))}}
         with patch.object(StrategyV2Base, 'on_tick'), \
                 patch('scripts.v2_with_controllers.time.time', side_effect=[1002, 1003]):
-            strategy.on_tick()
+            await tick_and_ack(strategy)
             first = recorder.load_strategy_risk_state()
-            strategy.on_tick()
+            await tick_and_ack(strategy)
             second = recorder.load_strategy_risk_state()
 
         assert first['daily_entry_risk']['baseline_quote'] == '-12.5'
@@ -214,9 +284,9 @@ async def test_operator_pause_remains_durable_but_resume_waits_for_claim(recorde
                 patch.object(HummingbotApplication, 'main_application',
                              return_value=SimpleNamespace(instance_id='candidate')):
             strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=pause)))
-            strategy.on_tick()
+            await tick_and_ack(strategy)
             strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=resume)))
-            strategy.on_tick()
+            await tick_and_ack(strategy)
 
         assert strategy.controllers[OWNER].paused
         assert recorder.load_strategy_risk_state()['daily_entry_risk'] == before_daily
@@ -686,10 +756,15 @@ class NativePaperEnrollmentTests(IsolatedAsyncioTestCase):
                     drawdown_exited_controllers=[], _is_stop_triggered=False,
                     get_performance_report=lambda cid: session.controllers[cid].performance_report,
                     _operator_paused=V2WithControllers._operator_paused)
-                for name in ('_drawdown_pnl', '_persist_risk_state', '_apply_daily_entry_pause', 'durable_stop_latch'):
+                for name in ('_drawdown_pnl', '_persist_risk_state', '_risk_state_snapshot',
+                             '_apply_daily_entry_pause', 'durable_stop_latch'):
                     setattr(runner, name, MethodType(getattr(V2WithControllers, name), runner))
                 with patch('scripts.v2_with_controllers.time.time', return_value=600062):
                     V2WithControllers._observe_daily_entry_risk(runner)
+                    # Risk state is acknowledged asynchronously by the runner
+                    # before Create admission; the pure observer only updates
+                    # the in-memory baseline and must not block the event loop.
+                    await V2WithControllers._persist_risk_state_async(runner)
                 saved = MarketsRecorder.get_instance().load_strategy_risk_state()
                 self.assertEqual(D(saved['daily_entry_risk']['baseline_quote']), expected)
                 self.assertEqual(saved['operator_paused'], {PAPER_OWNER: True})
@@ -735,7 +810,7 @@ async def test_operator_resume_waits_only_for_a_pending_claim(recorder, claim):
                 patch.object(HummingbotApplication, 'main_application',
                              return_value=SimpleNamespace(instance_id='candidate')):
             strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=resume)))
-            strategy.on_tick()
+            await tick_and_ack(strategy)
         assert strategy.controllers[OWNER].paused is (claim == 'pending')
         assert not strategy._is_stop_triggered
     finally:

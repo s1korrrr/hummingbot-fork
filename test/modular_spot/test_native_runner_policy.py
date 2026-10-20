@@ -1,7 +1,10 @@
 """Actual native runner and orchestrator gates for the opt-in OK RSI composition."""
 import asyncio
+import subprocess
+import sys
 from collections import deque
 from decimal import Decimal as D
+from pathlib import Path
 from test.hummingbot.strategy_v2.executors.position_executor.test_partial_fill_lifecycle import make_executor
 from test.hummingbot.strategy_v2.executors.test_wallet_sale_accounting import wallet_sale
 from types import SimpleNamespace
@@ -22,6 +25,38 @@ from scripts.v2_with_controllers import V2WithControllers, V2WithControllersConf
 
 recorder = _recorder_fixture
 OWNER = 'modular_spot_runner'
+
+
+def test_async_operator_unknown_controller_is_consumed_without_busy_loop():
+    code = r'''
+import asyncio
+from collections import deque
+from types import SimpleNamespace
+from unittest.mock import patch
+from hummingbot.connector.markets_recorder import MarketsRecorder
+from scripts.v2_with_controllers import V2WithControllers
+
+async def main():
+    strategy = V2WithControllers.__new__(V2WithControllers)
+    strategy._operator_drain_lock = asyncio.Lock()
+    strategy._operator_event_queue = deque([("rsibot.operator", SimpleNamespace(data={
+        "action": "bot_pause_entries", "controller_id": "missing-owner",
+        "command_id": "unknown-owner", "requested_at": 100.0,
+    }))])
+    strategy.controllers = {}
+    strategy._risk_persistence_enabled = True
+    strategy._risk_write_task = None
+    with patch.object(MarketsRecorder, "get_existing_instance", return_value=object()):
+        await strategy.process_operator_events_async()
+    assert not strategy._operator_event_queue
+
+asyncio.run(main())
+'''
+    result = subprocess.run(
+        [sys.executable, '-B', '-c', code], cwd=Path(__file__).resolve().parents[2],
+        capture_output=True, text=True, timeout=3,
+    )
+    assert result.returncode == 0, f"operator child failed: {result.stderr[-1000:]}"
 
 
 def risk_state():
@@ -108,6 +143,158 @@ async def test_real_modular_runner_restores_or_holds_durable_risk_state(recorder
                 strategy._persist_risk_state()
                 assert recorder.load_strategy_risk_state() == state
             assert not connector.in_flight_orders
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_native_operator_async_path_commits_receipt_and_pause_through_writer(recorder):
+    state = risk_state()
+    recorder.store_strategy_risk_state(state)
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', lambda strategy: initialize_modular(strategy)), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            runtime_db_sync_enabled=False, runtime_status_snapshot_enabled=False, chart_snapshots_enabled=False,
+            max_global_drawdown_quote=100, max_controller_drawdown_quote=20))
+        try:
+            strategy._operator_started_at = 1000
+            command = {'action': 'bot_pause_entries', 'bot_name': 'candidate', 'controller_id': OWNER,
+                       'requested_at': 1000.25, 'command_id': 'pause-through-writer'}
+            with patch('scripts.v2_with_controllers.time.time', return_value=1000.5), \
+                    patch('scripts.v2_with_controllers.HummingbotApplication.main_application',
+                          return_value=SimpleNamespace(instance_id='candidate')), \
+                    patch.object(recorder, 'store_strategy_risk_state', side_effect=AssertionError('sync SQL path')):
+                strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=command)))
+                await strategy.process_operator_events_async()
+            assert strategy.controllers[OWNER]._operator_entry_paused
+            saved = recorder.load_strategy_risk_state()
+            assert saved['operator_paused'][OWNER] is True
+            assert recorder.has_operator_command(OWNER, 'pause-through-writer')
+        finally:
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cancel_phase', ['freshness', 'risk_commit'])
+async def test_native_operator_event_survives_precommit_cancellation(recorder, cancel_phase):
+    from hummingbot.client.hummingbot_application import HummingbotApplication
+
+    recorder.store_strategy_risk_state(risk_state())
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', lambda strategy: initialize_modular(strategy)), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            runtime_db_sync_enabled=False, runtime_status_snapshot_enabled=False, chart_snapshots_enabled=False,
+            max_global_drawdown_quote=100, max_controller_drawdown_quote=20))
+        started = asyncio.Event()
+        command = {'action': 'bot_pause_entries', 'bot_name': 'candidate', 'controller_id': OWNER,
+                   'requested_at': 1000.25, 'command_id': f'cancel-{cancel_phase}'}
+        event = SimpleNamespace(data=command)
+        strategy._operator_started_at = 1000
+        strategy._operator_event_queue.append(('rsibot.operator', event))
+        has_command = recorder.has_operator_command_async
+        write = recorder._sql_manager.write_queue.write
+        try:
+            with patch('scripts.v2_with_controllers.time.time', return_value=1000.5), \
+                    patch.object(HummingbotApplication, 'main_application',
+                                 return_value=SimpleNamespace(instance_id='candidate')):
+                if cancel_phase == 'freshness':
+                    async def blocked_freshness(*args, **kwargs):
+                        started.set()
+                        await asyncio.Event().wait()
+                    recorder.has_operator_command_async = blocked_freshness
+                else:
+                    async def blocked_write(operation):
+                        started.set()
+                        await asyncio.Event().wait()
+                    recorder._sql_manager.write_queue.write = blocked_write
+                task = asyncio.create_task(strategy.process_operator_events_async())
+                await asyncio.wait_for(started.wait(), timeout=2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert strategy._operator_event_queue[0][1] is event
+                assert strategy._operator_watermarks[OWNER] == {
+                    'requested_at': 100.0, 'command_id': 'old-command'}
+                assert not recorder.has_operator_command(OWNER, command['command_id'])
+                recorder.has_operator_command_async = has_command
+                recorder._sql_manager.write_queue.write = write
+                await strategy.process_operator_events_async()
+            assert not strategy._operator_event_queue
+            assert recorder.has_operator_command(OWNER, command['command_id'])
+        finally:
+            recorder.has_operator_command_async = has_command
+            recorder._sql_manager.write_queue.write = write
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_native_operator_commit_cancellation_consumes_known_durable_event(recorder):
+    from hummingbot.model.sql_connection_manager import SQLWriteCancelledAfterCommit
+
+    recorder.store_strategy_risk_state(risk_state())
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', lambda strategy: initialize_modular(strategy)), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            runtime_db_sync_enabled=False, runtime_status_snapshot_enabled=False, chart_snapshots_enabled=False,
+            max_global_drawdown_quote=100, max_controller_drawdown_quote=20))
+        command = {'action': 'bot_pause_entries', 'bot_name': 'candidate', 'controller_id': OWNER,
+                   'requested_at': 1000.25, 'command_id': 'cancel-after-commit'}
+        strategy._operator_started_at = 1000
+        strategy._operator_event_queue.append(('rsibot.operator', SimpleNamespace(data=command)))
+        persist = recorder.store_strategy_risk_state_async
+
+        async def commit_then_cancel(*args, **kwargs):
+            result = await persist(*args, **kwargs)
+            raise SQLWriteCancelledAfterCommit(result)
+
+        try:
+            with patch('scripts.v2_with_controllers.time.time', return_value=1000.5), \
+                    patch('scripts.v2_with_controllers.HummingbotApplication.main_application',
+                          return_value=SimpleNamespace(instance_id='candidate')):
+                recorder.store_strategy_risk_state_async = commit_then_cancel
+                with pytest.raises(SQLWriteCancelledAfterCommit):
+                    await strategy.process_operator_events_async()
+            assert not strategy._operator_event_queue
+            assert strategy._operator_watermarks[OWNER]['command_id'] == command['command_id']
+            assert recorder.has_operator_command(OWNER, command['command_id'])
+        finally:
+            recorder.store_strategy_risk_state_async = persist
+            strategy.listen_to_executor_actions_task.cancel()
+            await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_native_risk_stop_async_acknowledges_before_return(recorder):
+    recorder.store_strategy_risk_state(risk_state())
+    connector = OkxExchange(okx_api_key='', okx_secret_key='', okx_passphrase='', trading_pairs=['ETH-USDC'])
+    with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+            patch.object(StrategyV2Base, 'initialize_controllers', initialize_modular), \
+            patch.object(StrategyV2Base, 'initialize_candles'), \
+            patch('hummingbot.data_feed.market_data_provider.MarketDataProvider.initialize_rate_sources'), \
+            patch('scripts.v2_with_controllers.ExternalEventFactory.create_queue', return_value=deque()):
+        strategy = V2WithControllers({'okx': connector}, V2WithControllersConfig(
+            runtime_db_sync_enabled=False, runtime_status_snapshot_enabled=False, chart_snapshots_enabled=False,
+            max_global_drawdown_quote=100, max_controller_drawdown_quote=20))
+        try:
+            with patch.object(recorder, 'store_strategy_risk_state', side_effect=AssertionError('sync SQL path')):
+                await strategy.latch_risk_stop_async()
+            assert strategy._is_stop_triggered
+            assert recorder.load_strategy_risk_state()['stopped'] is True
         finally:
             strategy.listen_to_executor_actions_task.cancel()
             await asyncio.gather(strategy.listen_to_executor_actions_task, return_exceptions=True)
@@ -344,7 +531,13 @@ async def test_on_tick_rail_failure_status_and_log_clear_once_the_rails_recover(
                     strategy.on_tick()
                 assert 'NEW EXECUTIONS REFUSED' in strategy.format_status()
                 assert report.called  # reporting continues while a rail fails
+                drain = strategy._operator_drain_task
+                if drain is not None:
+                    await drain
                 strategy.on_tick()  # rails healthy again, with no create attempted in between
+                write = strategy._risk_write_task
+                if write is not None:
+                    await write
                 assert 'NEW EXECUTIONS REFUSED' not in strategy.format_status()
                 assert any('recovered' in str(c) for c in logger.return_value.info.call_args_list)
         finally:

@@ -66,7 +66,7 @@ from hummingbot.model.position import Position
 from hummingbot.model.position_hold_ledger import PositionHoldLedger
 from hummingbot.model.range_position_update import RangePositionUpdate
 from hummingbot.model.rsi_v5_runtime_event import RSIV5RuntimeEvent
-from hummingbot.model.sql_connection_manager import SQLConnectionManager
+from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLWriteCancelledAfterCommit
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.controller_base import ControllerConfigBase
 from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
@@ -133,6 +133,16 @@ class MarketsRecorder:
         self._executor_reads: Optional[Dict[str, Any]] = None
         self._executor_scope: Optional[Dict[str, Any]] = None
         self._executor_scope_watched = False
+        self._async_financial_events = False
+        self._native_recorder_sequence = 0
+        self._financial_event_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._financial_event_worker: Optional[asyncio.Task] = None
+        self._financial_event_pending: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._financial_event_failed: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._financial_event_replay: Dict[Any, Any] = {}
+        self._financial_event_reconciliation_needed = False
+        self._financial_event_error: Optional[BaseException] = None
+        self._financial_event_current_job: Optional[Dict[str, Any]] = None
         # Internal collection of trade fills in connector will be used for remote/local history reconciliation
         for market in self._markets:
             trade_fills = self.get_trades_for_config(self._config_file_path, 2000)
@@ -514,6 +524,27 @@ class MarketsRecorder:
         if self._market_data_collection_config.market_data_collection_enabled:
             self._start_market_data_recording()
 
+    def enable_async_financial_events(self):
+        """Opt a qualified native runtime into acknowledged off-loop writes."""
+        prefix = f"native-recorder-sequence:{self._config_file_path}:"
+        with self._sql_manager.get_new_session() as session:
+            values = session.query(Metadata.key, Metadata.value).all()
+        sequences = []
+        for key, value in values:
+            if not key.startswith(prefix):
+                continue
+            try:
+                sequence = int(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Invalid persisted native recorder sequence") from error
+            if sequence < 0:
+                raise ValueError("Invalid persisted native recorder sequence")
+            sequences.append(sequence)
+        self._native_recorder_sequence = max(sequences, default=0)
+        self._async_financial_events = True
+        for market in self._markets:
+            self._restore_order_event_replays(market)
+
     def add_market(self, market: ConnectorBase):
         """Add a new market/connector dynamically."""
         if market not in self._markets:
@@ -551,6 +582,19 @@ class MarketsRecorder:
         if self._market_data_collection_task is not None:
             self._market_data_collection_task.cancel()
 
+    async def stop_async(self):
+        """Detach callbacks and durably drain native financial writes before release."""
+        self.stop()
+        await self.flush_financial_events()
+        worker = self._financial_event_worker
+        if worker is not None and not worker.done():
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+        self._financial_event_worker = None
+
     def store_or_update_executor(self, executor, executor_info: Optional[ExecutorInfo] = None):
         """`executor_info` may carry the info the caller already built for `executor` in the same pass.
 
@@ -584,6 +628,63 @@ class MarketsRecorder:
             finally:
                 reads["own"] = False
             reads["written"][info.id] = serialized_config
+
+    def store_executor_info_snapshot(self, serialized_info: str):
+        """Upsert an immutable ExecutorInfo serialization from the SQL writer lane."""
+        executor_dict = json.loads(serialized_info)
+        executor_id = executor_dict.get('id')
+        if not isinstance(executor_id, str) or not executor_id:
+            raise ValueError('Executor snapshot has no stable identity')
+        with self._sql_manager.get_new_session() as session:
+            existing = session.query(Executors).filter(Executors.id == executor_id).one_or_none()
+            if existing is None:
+                session.add(Executors(**executor_dict))
+            else:
+                for attr, value in executor_dict.items():
+                    setattr(existing, attr, value)
+            session.commit()
+
+    async def store_executor_info_snapshot_async(self, serialized_info: str):
+        """Persist a loop-captured executor projection on the bounded SQL lane."""
+        if not isinstance(serialized_info, str):
+            raise TypeError("executor snapshot must be serialized before SQL submission")
+        payload = self.capture_executor_info_payload(serialized_info)
+        await self._sql_manager.write_queue.write(
+            lambda payload=payload: self._store_executor_info_payload(payload)
+        )
+
+    def capture_executor_info_payload(self, serialized_info: str):
+        info = json.loads(serialized_info)
+        executor_id = info.get('id')
+        if not isinstance(executor_id, str) or not executor_id:
+            raise ValueError('Executor snapshot has no stable identity')
+        sequence = None
+        if self._async_financial_events:
+            self._native_recorder_sequence += 1
+            sequence = self._native_recorder_sequence
+        return {'executor_id': executor_id, 'executor_info_json': serialized_info,
+                'recorder_sequence': sequence}
+
+    def _store_executor_info_payload(self, payload):
+        info = json.loads(payload['executor_info_json'])
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                if not self._claim_recorder_sequence(session, payload, 'executor', payload['executor_id']):
+                    return False
+                existing = session.query(Executors).filter(Executors.id == payload['executor_id']).one_or_none()
+                if existing is None:
+                    session.add(Executors(**info))
+                else:
+                    for attr, value in info.items():
+                        setattr(existing, attr, value)
+        return True
+
+    async def store_position_hold_ledger_entries_async(self, **payload):
+        """Persist loop-captured hold-ledger rows on the bounded SQL lane."""
+        frozen = json.loads(json.dumps(payload, allow_nan=False, sort_keys=True))
+        await self._sql_manager.write_queue.write(
+            lambda frozen=frozen: self.store_or_update_position_hold_ledger_entries(**frozen)
+        )
 
     @staticmethod
     def _same_rsi_v5_runtime_fact(row: RSIV5RuntimeEvent, event: Dict[str, Any]) -> bool:
@@ -770,6 +871,69 @@ class MarketsRecorder:
 
             session.commit()
 
+    def store_live_position_snapshot(self, positions, controller_ids, timestamp, recorder_sequences=None):
+        """Commit a loop-captured live-position projection as one bounded transaction."""
+        controller_ids = tuple(controller_ids)
+        position_rows = tuple(dict(row) for row in positions)
+        sequences = dict(recorder_sequences or {})
+        with self._sql_manager.get_new_session() as session:
+            accepted_ids = []
+            for controller_id in controller_ids:
+                sequence = sequences.get(controller_id)
+                if self._claim_recorder_sequence(
+                        session, {'recorder_sequence': sequence}, 'position', controller_id):
+                    accepted_ids.append(controller_id)
+            controller_ids = tuple(accepted_ids)
+            position_rows = tuple(row for row in position_rows if row['controller_id'] in controller_ids)
+            live_keys = {(row['controller_id'], row['connector_name'], row['trading_pair'], row['side'])
+                         for row in position_rows if Decimal(str(row['amount'])) > 0}
+            existing = session.query(Position).filter(Position.controller_id.in_(controller_ids)).all() if controller_ids else []
+            by_key = {(row.controller_id, row.connector_name, row.trading_pair, row.side): row for row in existing}
+            for values in position_rows:
+                key = (values['controller_id'], values['connector_name'], values['trading_pair'], values['side'])
+                row = by_key.get(key)
+                if Decimal(str(values['amount'])) <= 0:
+                    if row is not None:
+                        session.delete(row)
+                    continue
+                if row is None:
+                    session.add(Position(**values))
+                    continue
+                for field in ('timestamp', 'volume_traded_quote', 'amount', 'breakeven_price',
+                              'unrealized_pnl_quote', 'realized_pnl_quote', 'cum_fees_quote'):
+                    setattr(row, field, values[field])
+            for key, row in by_key.items():
+                if key in live_keys:
+                    continue
+                row.timestamp = timestamp
+                row.volume_traded_quote = Decimal('0')
+                row.amount = Decimal('0')
+                row.breakeven_price = Decimal('0')
+                row.unrealized_pnl_quote = Decimal('0')
+                row.realized_pnl_quote = Decimal('0')
+                # Preserve cumulative fees, matching the existing stale-position path.
+            session.commit()
+
+    async def store_live_position_snapshot_async(self, positions, controller_ids, timestamp, recorder_sequences=None):
+        immutable_rows = tuple(dict(row) for row in positions)
+        immutable_ids = tuple(controller_ids)
+        immutable_sequences = dict(recorder_sequences or {})
+        await self._sql_manager.write_queue.write(
+            lambda: self.store_live_position_snapshot(
+                immutable_rows, immutable_ids, timestamp, immutable_sequences)
+        )
+
+    def capture_live_position_snapshot_sequences(self, controller_ids):
+        if not self._async_financial_events:
+            return {}
+        sequences = {}
+        for controller_id in sorted(set(controller_ids)):
+            if not isinstance(controller_id, str) or not controller_id:
+                raise ValueError('Invalid native position snapshot owner')
+            self._native_recorder_sequence += 1
+            sequences[controller_id] = self._native_recorder_sequence
+        return sequences
+
     @classmethod
     def _safe_decimal(cls, value: Any) -> Decimal:
         try:
@@ -898,15 +1062,24 @@ class MarketsRecorder:
         return self.get_position_hold_ledger_entries_by_controller(controller_id=None)
 
     def store_controller_config(self, controller_config: ControllerConfigBase):
+        self._store_controller_config_payloads((controller_config.json(),))
+
+    def _store_controller_config_payloads(self, serialized_configs):
+        configs = tuple(json.loads(value) for value in serialized_configs)
         with self._sql_manager.get_new_session() as session:
-            config = json.loads(controller_config.json())
-            base_columns = ["id", "timestamp", "type"]
-            controller = Controllers(id=config["id"],
-                                     timestamp=time.time(),
-                                     type=config["controller_type"],
-                                     config={k: v for k, v in config.items() if k not in base_columns})
-            session.add(controller)
-            session.commit()
+            with session.begin():
+                for config in configs:
+                    base_columns = ["id", "timestamp", "type"]
+                    controller = Controllers(id=config["id"], timestamp=time.time(), type=config["controller_type"],
+                                             config={k: v for k, v in config.items() if k not in base_columns})
+                    session.add(controller)
+
+    async def store_controller_configs_async(self, serialized_configs):
+        if not isinstance(serialized_configs, tuple) or any(not isinstance(value, str) for value in serialized_configs):
+            raise TypeError("controller config snapshots must be serialized before SQL submission")
+        await self._sql_manager.write_queue.write(
+            lambda serialized_configs=serialized_configs: self._store_controller_config_payloads(serialized_configs)
+        )
 
     def get_executors_by_ids(self, executor_ids: List[str]):
         with self._sql_manager.get_new_session() as session:
@@ -1057,19 +1230,65 @@ class MarketsRecorder:
         with self._sql_manager.get_new_session() as session:
             return session.get(Metadata, self._operator_command_key(controller_id, command_id)) is not None
 
+    async def has_operator_command_async(self, controller_id: str, command_id: str) -> bool:
+        key = self._operator_command_key(controller_id, command_id)
+        return await self._sql_manager.write_queue.write(
+            lambda key=key: self._has_operator_command_key(key)
+        )
+
+    def _has_operator_command_key(self, key: str) -> bool:
+        with self._sql_manager.get_new_session() as session:
+            return session.get(Metadata, key) is not None
+
     def store_strategy_risk_state(self, state: dict, *, operator_receipts=()):
         payload = json.dumps(state, allow_nan=False, sort_keys=True)
+        serialized_receipts = self._serialize_operator_receipts(operator_receipts)
+        self._store_strategy_risk_state_payload(payload, serialized_receipts)
+
+    async def store_strategy_risk_state_async(self, state: dict, *, operator_receipts=()):
+        """Persist a risk snapshot off-loop and return only after its transaction commits."""
+        payload = json.dumps(state, allow_nan=False, sort_keys=True)
+        serialized_receipts = self._serialize_operator_receipts(operator_receipts)
+        await self._sql_manager.write_queue.write(
+            lambda: self._store_strategy_risk_state_payload(payload, serialized_receipts)
+        )
+
+    async def latch_strategy_risk_stop_async(self):
+        """Set only the stop bit on an existing row, preserving unreconciled evidence."""
+        await self._sql_manager.write_queue.write(self._latch_strategy_risk_stop)
+
+    def _latch_strategy_risk_stop(self):
+        key = f"strategy-risk:{self._config_file_path}"
         with self._sql_manager.get_new_session() as session:
             with session.begin():
-                for receipt in operator_receipts:
-                    if (not isinstance(receipt, dict) or set(receipt) != {'controller_id', 'command_id', 'requested_at'}
-                            or type(receipt['requested_at']) not in (int, float)
-                            or not Decimal(str(receipt['requested_at'])).is_finite() or receipt['requested_at'] < 0):
-                        raise ValueError('Invalid native operator receipt')
-                    receipt_key = self._operator_command_key(receipt['controller_id'], receipt['command_id'])
+                row = session.get(Metadata, key)
+                if row is None:
+                    return False
+                state = json.loads(row.value)
+                if not isinstance(state, dict) or type(state.get('stopped')) is not bool:
+                    raise ValueError('Cannot latch an unreconciled malformed risk state')
+                state['stopped'] = True
+                row.value = json.dumps(state, allow_nan=False, sort_keys=True)
+                return True
+
+    def _serialize_operator_receipts(self, operator_receipts):
+        serialized = []
+        for receipt in operator_receipts:
+            if (not isinstance(receipt, dict) or set(receipt) != {'controller_id', 'command_id', 'requested_at'}
+                    or type(receipt['requested_at']) not in (int, float)
+                    or not Decimal(str(receipt['requested_at'])).is_finite() or receipt['requested_at'] < 0):
+                raise ValueError('Invalid native operator receipt')
+            key = self._operator_command_key(receipt['controller_id'], receipt['command_id'])
+            serialized.append((key, json.dumps(receipt, allow_nan=False, sort_keys=True)))
+        return tuple(serialized)
+
+    def _store_strategy_risk_state_payload(self, payload, serialized_receipts):
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                for receipt_key, receipt_json in serialized_receipts:
                     if session.get(Metadata, receipt_key) is not None:
                         raise ValueError('Native operator command already applied')
-                    session.add(Metadata(key=receipt_key, value=json.dumps(receipt, allow_nan=False, sort_keys=True)))
+                    session.add(Metadata(key=receipt_key, value=receipt_json))
                 key = f"strategy-risk:{self._config_file_path}"
                 row = session.get(Metadata, key)
                 if row is None:
@@ -1091,12 +1310,40 @@ class MarketsRecorder:
                                         saved_state=market.tracking_states)
             session.add(market_states)
 
+    async def store_submitted_order_checkpoint_async(self, config_file_path: str, market: ConnectorBase,
+                                                     order_json: dict, client_order_id: str):
+        """Commit the immutable pre-submit tracker checkpoint and identity off-loop."""
+        market_state = {**self._capture_market_state_payload(market), 'market': market.display_name}
+        payload = json.dumps(order_json, sort_keys=True)
+        market_state.update({'config_file_path': config_file_path})
+        key = 'v2-submitted-order:' + client_order_id
+        await self._sql_manager.write_queue.write(
+            lambda: self._store_submitted_order_checkpoint(
+                config_file_path, market_state, key, payload))
+
+    def _store_submitted_order_checkpoint(self, config_file_path, market_state, receipt_key, order_payload):
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                self._store_market_state_payload(session, market_state)
+                if session.get(Metadata, receipt_key) is not None:
+                    raise ValueError('Durable native client order ID was already submitted')
+                session.add(Metadata(key=receipt_key, value=json.dumps({
+                    'owner': config_file_path, 'order': json.loads(order_payload)}, sort_keys=True)))
+
     def restore_market_states(self, config_file_path: str, market: ConnectorBase):
         with self._sql_manager.get_new_session() as session:
             market_states: Optional[MarketState] = self.get_market_states(config_file_path, market, session=session)
 
             if market_states is not None:
                 market.restore_tracking_states(market_states.saved_state)
+                replay_pending = getattr(self, "_restore_order_event_replays", None)
+                if callable(replay_pending):
+                    replay_pending(market)
+                tracker = getattr(market, "_order_tracker", None)
+                if tracker is not None and any(
+                        order.order_fills or order.recorder_pending_events
+                        for order in tracker.all_fillable_orders.values()):
+                    self._financial_event_reconciliation_needed = True
 
     def get_market_states(self,
                           config_file_path: str,
@@ -1109,54 +1356,214 @@ class MarketsRecorder:
         market_states: Optional[MarketState] = query.one_or_none()
         return market_states
 
-    def _did_create_order(self,
-                          event_tag: int,
-                          market: ConnectorBase,
+    def _capture_market_state_payload(self, market):
+        sequence = None
+        if self._async_financial_events:
+            self._native_recorder_sequence += 1
+            sequence = self._native_recorder_sequence
+        return {
+            # Connector tracker state uses NaN for a MARKET order's unknown
+            # limit price; the historical SQL JSON column preserves that token.
+            'market_state_json': json.dumps(market.tracking_states, sort_keys=True),
+            'market_state_timestamp': self.db_timestamp,
+            'recorder_sequence': sequence,
+        }
+
+    def _claim_recorder_sequence(self, session, payload, scope, identity):
+        sequence = payload.get('recorder_sequence')
+        if sequence is None:
+            return True  # Legacy synchronous callers retain their existing contract.
+        if type(sequence) is not int or sequence <= 0:
+            raise ValueError('Invalid native recorder capture sequence')
+        key = f"native-recorder-sequence:{self._config_file_path}:{scope}:{identity}"
+        marker = session.get(Metadata, key)
+        if marker is not None:
+            previous = int(marker.value)
+            if previous < 0:
+                raise ValueError('Invalid persisted native recorder sequence')
+            if sequence <= previous:
+                return False
+            marker.value = str(sequence)
+        else:
+            session.add(Metadata(key=key, value=str(sequence)))
+        return True
+
+    def _apply_order_status_payload(self, session, order, payload):
+        if self._claim_recorder_sequence(session, payload, 'order', payload['order_id']):
+            order.last_status = payload['event_status']
+            order.last_update_timestamp = payload['timestamp']
+        duplicate = (payload.get('recorder_sequence') is not None and session.query(OrderStatus).filter_by(
+            order_id=payload['order_id'], timestamp=payload['timestamp'], status=payload['event_status'],
+        ).first() is not None)
+        if not duplicate:
+            session.add(OrderStatus(order_id=payload['order_id'], timestamp=payload['timestamp'],
+                                    status=payload['event_status']))
+
+    def _store_market_state_payload(self, session, payload):
+        if not self._claim_recorder_sequence(session, payload, 'market', payload['market']):
+            return
+        saved = json.loads(payload['market_state_json'])
+        # A newer captured projection can still contain an earlier event's
+        # pending marker. Remove only markers whose canonical SQL receipt is
+        # committed in this same transaction; never infer ACK from admission.
+        for order_state in saved.values():
+            if not isinstance(order_state, dict):
+                continue
+            pending = order_state.get('recorder_pending_events')
+            if not isinstance(pending, dict):
+                continue
+            for key, event in tuple(pending.items()):
+                source = event.get('payload', {}) if isinstance(event, dict) else {}
+                order_id = source.get('order_id')
+                if event.get('kind') == 'order-create':
+                    acknowledged = order_id is not None and session.get(OrderExact, order_id) is not None
+                else:
+                    acknowledged = (event.get('kind') == 'order-status' and session.query(OrderStatus).filter_by(
+                        order_id=order_id, timestamp=source.get('timestamp'), status=source.get('event_status'),
+                    ).first() is not None)
+                if acknowledged:
+                    pending.pop(key)
+        state = session.query(MarketState).filter_by(
+            config_file_path=payload['config_file_path'], market=payload['market'],
+        ).one_or_none()
+        if state is None:
+            session.add(MarketState(config_file_path=payload['config_file_path'], market=payload['market'],
+                                    timestamp=payload['market_state_timestamp'], saved_state=saved))
+        else:
+            state.timestamp = payload['market_state_timestamp']
+            state.saved_state = saved
+
+    def _capture_order_creation(self, event_tag, market, evt):
+        base_asset, quote_asset = evt.trading_pair.split('-')
+        price = evt.price if evt.price == evt.price else Decimal('0')
+        return {
+            'order_id': evt.order_id, 'config_file_path': self._config_file_path,
+            'strategy': self._strategy_name, 'market': market.display_name, 'symbol': evt.trading_pair,
+            'base_asset': base_asset, 'quote_asset': quote_asset, 'timestamp': int(evt.creation_timestamp * 1e3),
+            'order_type': evt.type.name, 'amount': decimal_text(evt.amount), 'price': decimal_text(price),
+            'leverage': evt.leverage if evt.leverage else 1,
+            'position': evt.position if evt.position else PositionAction.NIL.value,
+            'event_status': self.market_event_tag_map[event_tag].name, 'exchange_order_id': evt.exchange_order_id,
+        }
+
+    def _create_order_from_payload(self, session, payload, *, sequence=True):
+        existing = session.get(Order, payload['order_id'])
+        if existing is not None:
+            exact = session.get(OrderExact, payload['order_id'])
+            if (existing.market != payload['market'] or existing.symbol != payload['symbol']
+                    or (exact is not None and (Decimal(exact.amount) != Decimal(payload['amount'])
+                                               or Decimal(exact.price) != Decimal(payload['price'])))):
+                raise ValueError(f"Conflicting order creation event: {payload['order_id']}")
+            if exact is None and payload.get('recorder_sequence') is not None:
+                # A genuine re-delivered native creation receipt can enrich a
+                # legacy six-decimal row only after matching its stored values.
+                amount = Decimal(int(Decimal(payload['amount']) * 10**6)) / 10**6
+                price = Decimal(int(Decimal(payload['price']) * 10**6)) / 10**6
+                if existing.amount != amount or existing.price != price:
+                    raise ValueError(f"Conflicting legacy order creation receipt: {payload['order_id']}")
+                session.add(OrderExact(order_id=payload['order_id'], amount=payload['amount'], price=payload['price']))
+            return False
+        session.add(OrderExact(order_id=payload['order_id'], amount=payload['amount'], price=payload['price']))
+        order = Order(id=payload['order_id'], config_file_path=payload['config_file_path'], strategy=payload['strategy'],
+                      market=payload['market'], symbol=payload['symbol'], base_asset=payload['base_asset'],
+                      quote_asset=payload['quote_asset'], creation_timestamp=payload['timestamp'],
+                      order_type=payload['order_type'], amount=Decimal(payload['amount']), leverage=payload['leverage'],
+                      price=Decimal(payload['price']), position=payload['position'], last_status=payload['event_status'],
+                      last_update_timestamp=payload['timestamp'], exchange_order_id=payload['exchange_order_id'])
+        session.add(order)
+        if sequence:
+            self._apply_order_status_payload(session, order, payload)
+        else:
+            session.add(OrderStatus(order_id=payload['order_id'], timestamp=payload['timestamp'],
+                                    status=payload['event_status']))
+        return True
+
+    def _persist_order_creation_payload(self, payload):
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                created = self._create_order_from_payload(session, payload)
+                if created or payload.get('recorder_sequence') is not None:
+                    self._store_market_state_payload(session, payload)
+        return {'created': created}
+
+    def _persist_order_status_payload(self, payload):
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                order = session.get(Order, payload['order_id'])
+                recovered = False
+                if order is None and payload.get('creation_if_missing') is not None:
+                    recovered = self._create_order_from_payload(session, payload['creation_if_missing'], sequence=False)
+                    session.flush()
+                    order = session.get(Order, payload['order_id'])
+                if order is not None:
+                    self._apply_order_status_payload(session, order, payload)
+                if order is not None or payload.get('recorder_sequence') is not None:
+                    self._store_market_state_payload(session, payload)
+        return {'found': order is not None, 'created': recovered}
+
+    def _enqueue_order_event(self, market, payload, kind):
+        event_key = f"{kind}:{payload['event_status']}:{payload['timestamp']}"
+        identity = (payload['market'], payload['order_id'], event_key)
+        tracker = getattr(market, '_order_tracker', None)
+        tracked = tracker.fetch_order(payload['order_id']) if tracker is not None else None
+        pending = tracked.recorder_pending_events if isinstance(tracked, InFlightOrder) else None
+        source = {'identity': list(identity), 'kind': kind, 'payload': json.loads(json.dumps(payload, allow_nan=False))}
+        if pending is not None:
+            previous = pending.get(event_key)
+            if previous is not None and previous != source:
+                error = ValueError('Conflicting pending native order event')
+                self._financial_event_error = error
+                raise error
+            pending.setdefault(event_key, source)
+        captured = {**payload, **self._capture_market_state_payload(market)}
+        frozen = json.dumps(captured, allow_nan=False, sort_keys=True)
+        operation = self._persist_order_creation_payload if kind == 'order-create' else self._persist_order_status_payload
+
+        def after_commit(result):
+            if pending is not None:
+                pending.pop(event_key, None)
+            self.unregister_financial_replay(identity)
+            if result['created']:
+                creation = payload if kind == 'order-create' else payload['creation_if_missing']
+                market.add_exchange_order_ids_from_market_recorder({creation['exchange_order_id']: payload['order_id']})
+            if kind == 'order-status' and not result['found'] and payload.get('cancel_event'):
+                self.logger().warning('Cannot persist cancellation before creation without a matching '
+                                      'native terminal order receipt: %s', payload['order_id'])
+
+        def replay():
+            return self.enqueue_financial_write(identity, lambda: operation(json.loads(frozen)), after_commit,
+                                                kind=kind, source=source)
+
+        self.register_financial_replay(identity, replay)
+        if not replay():
+            self._financial_event_reconciliation_needed = True
+            self.logger().error('Financial order-event queue full; exact native receipt retained for reconciliation')
+
+    def _restore_order_event_replays(self, market):
+        if not self._async_financial_events:
+            # Legacy/bootstrap restore retains the native source metadata; only
+            # an explicitly enabled runtime may admit asynchronous work.
+            return
+        tracker = getattr(market, '_order_tracker', None)
+        if tracker is None:
+            return
+        for order in tracker.all_fillable_orders.values():
+            for event in tuple(order.recorder_pending_events.values()):
+                self._enqueue_order_event(market, event['payload'], event['kind'])
+
+    def _did_create_order(self, event_tag: int, market: ConnectorBase,
                           evt: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         if threading.current_thread() != threading.main_thread():
             self._ev_loop.call_soon_threadsafe(self._did_create_order, event_tag, market, evt)
             return
-
-        base_asset, quote_asset = evt.trading_pair.split("-")
-        timestamp = int(evt.creation_timestamp * 1e3)
-        event_type: MarketEvent = self.market_event_tag_map[event_tag]
-
-        with self._sql_manager.get_new_session() as session:
-            with session.begin():
-                existing_order = session.get(Order, evt.order_id)
-                if existing_order is not None:
-                    exact_order = session.get(OrderExact, evt.order_id)
-                    if (existing_order.market != market.display_name or existing_order.symbol != evt.trading_pair
-                            or (exact_order is not None and (
-                                Decimal(exact_order.amount) != evt.amount
-                                or Decimal(exact_order.price) != (evt.price if evt.price == evt.price else 0)))):
-                        raise ValueError(f"Conflicting order creation event: {evt.order_id}")
-                    return  # Replayed creation event; preserve the original receipt and latest status.
-                session.add(OrderExact(order_id=evt.order_id, amount=decimal_text(evt.amount),
-                                       price=decimal_text(evt.price if evt.price == evt.price else 0)))
-                order_record: Order = Order(id=evt.order_id,
-                                            config_file_path=self._config_file_path,
-                                            strategy=self._strategy_name,
-                                            market=market.display_name,
-                                            symbol=evt.trading_pair,
-                                            base_asset=base_asset,
-                                            quote_asset=quote_asset,
-                                            creation_timestamp=timestamp,
-                                            order_type=evt.type.name,
-                                            amount=Decimal(evt.amount),
-                                            leverage=evt.leverage if evt.leverage else 1,
-                                            price=Decimal(evt.price) if evt.price == evt.price else Decimal(0),
-                                            position=evt.position if evt.position else PositionAction.NIL.value,
-                                            last_status=event_type.name,
-                                            last_update_timestamp=timestamp,
-                                            exchange_order_id=evt.exchange_order_id)
-                order_status: OrderStatus = OrderStatus(order=order_record,
-                                                        timestamp=timestamp,
-                                                        status=event_type.name)
-                session.add(order_record)
-                session.add(order_status)
-                market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
-                self.save_market_states(self._config_file_path, market, session=session)
+        payload = self._capture_order_creation(event_tag, market, evt)
+        if self._async_financial_events:
+            self._enqueue_order_event(market, payload, 'order-create')
+            return
+        payload.update(self._capture_market_state_payload(market))
+        result = self._persist_order_creation_payload(payload)
+        if result['created']:
+            market.add_exchange_order_ids_from_market_recorder({evt.exchange_order_id: evt.order_id})
 
     def _did_fill_order(self,
                         event_tag: int,
@@ -1164,6 +1571,10 @@ class MarketsRecorder:
                         evt: OrderFilledEvent):
         if threading.current_thread() != threading.main_thread():
             self._ev_loop.call_soon_threadsafe(self._did_fill_order, event_tag, market, evt)
+            return
+
+        if self._async_financial_events:
+            self._enqueue_financial_fill(event_tag, market, evt)
             return
 
         base_asset, quote_asset = evt.trading_pair.split("-")
@@ -1280,6 +1691,343 @@ class MarketsRecorder:
                                                                                    trade_fill_record.exchange_trade_id,
                                                                                    trade_fill_record.symbol)})
 
+    def _capture_financial_fill(self, event_tag: int, market: ConnectorBase, evt: OrderFilledEvent):
+        base_asset, quote_asset = evt.trading_pair.split("-")
+        execution_timestamp_ms, execution_timestamp_source = self._execution_timestamp_attestation(evt)
+        fee_in_quote = None
+        try:
+            fee_in_quote = evt.trade_fee.fee_amount_in_token(
+                trading_pair=evt.trading_pair, price=evt.price, order_amount=evt.amount,
+                token=quote_asset, exchange=market,
+            )
+        except Exception as error:
+            self.logger().error("Error calculating fee in quote: %s; fee remains unavailable.", error)
+        payload = {
+            "config_file_path": self._config_file_path,
+            "strategy": self._strategy_name,
+            "market": market.display_name,
+            "symbol": evt.trading_pair,
+            "base_asset": base_asset,
+            "quote_asset": quote_asset,
+            "timestamp": int(evt.timestamp * 1e3) if evt.timestamp is not None else self.db_timestamp,
+            "order_id": evt.order_id,
+            "trade_type": evt.trade_type.name,
+            "order_type": evt.order_type.name,
+            "price": decimal_text(evt.price),
+            "amount": decimal_text(evt.amount),
+            "leverage": evt.leverage if evt.leverage else 1,
+            "trade_fee_json": json.dumps(evt.trade_fee.to_json(), allow_nan=False, sort_keys=True),
+            "trade_fee_in_quote": None if fee_in_quote is None else str(fee_in_quote),
+            "exact_trade_fee_in_quote": None if fee_in_quote is None else TradeFill.decimal_text(fee_in_quote),
+            "execution_timestamp_ms": execution_timestamp_ms,
+            "execution_timestamp_source": execution_timestamp_source,
+            "exchange_trade_id": evt.exchange_trade_id,
+            "position": evt.position if evt.position else PositionAction.NIL.value,
+            "event_status": self.market_event_tag_map[event_tag].name,
+            "event_receipt_timestamp": evt.timestamp,
+        }
+        payload.update(self._capture_market_state_payload(market))
+        payload["config_file_path"] = self._config_file_path
+        identity = (market.display_name, evt.order_id, evt.exchange_trade_id)
+        return identity, {"identity": identity, "market_object": market, "payload": payload}
+
+    def _enqueue_financial_fill(self, event_tag: int, market: ConnectorBase, evt: OrderFilledEvent):
+        identity, job = self._capture_financial_fill(event_tag, market, evt)
+        payload = job["payload"]
+        accepted = self.enqueue_financial_write(
+            identity,
+            lambda payload=payload: self._persist_financial_fill(payload),
+            lambda _result, market=market, payload=payload: market.add_trade_fills_from_market_recorder(
+                {TradeFillOrderDetails(payload["market"], payload["exchange_trade_id"], payload["symbol"])}
+            ),
+            kind="fill",
+            source=job,
+        )
+        if not accepted:
+            # The tracker has already recorded this exact TradeUpdate. A later
+            # ACK barrier replays it from tracker state before terminal cleanup.
+            self._financial_event_reconciliation_needed = True
+            self.logger().error("Financial fill queue full; exact tracker receipt requires reconciliation")
+
+    def enqueue_financial_write(self, identity, operation, after_commit=None, *, kind, source=None):
+        """Admit one immutable, idempotent DB write and optional owner-loop effect.
+
+        `operation` must use only captured immutable data. `after_commit` runs on
+        the owner loop after the DB operation returned (which means commit for
+        recorder transactions). A False result means capacity rejected the job;
+        callers must retain or reconcile the exact source receipt.
+        """
+        existing = self._financial_event_pending.get(identity) or self._financial_event_failed.get(identity)
+        if existing is not None:
+            if self._financial_event_source_signature(existing.get("source")) != self._financial_event_source_signature(source):
+                self._financial_event_error = ValueError("Conflicting duplicate native financial receipt")
+                self._financial_event_reconciliation_needed = True
+                self.logger().error("Conflicting duplicate native financial receipt identity; reconciliation required")
+                return False
+            return True
+        if self._financial_event_worker is None or self._financial_event_worker.done():
+            self._financial_event_worker = asyncio.get_running_loop().create_task(self._run_financial_event_writer())
+        job = {
+            "identity": identity,
+            "kind": kind,
+            "operation": operation,
+            "after_commit": after_commit,
+            "source": source,
+        }
+        try:
+            self._financial_event_queue.put_nowait(job)
+        except asyncio.QueueFull:
+            return False
+        self._financial_event_pending[identity] = job
+        return True
+
+    @staticmethod
+    def _financial_event_source_signature(source):
+        """Compare immutable receipt facts while excluding replaceable projections."""
+        if not isinstance(source, dict):
+            return json.dumps(source, allow_nan=False, sort_keys=True, default=str)
+        payload = source.get("payload")
+        if not isinstance(payload, dict):
+            return json.dumps(source, allow_nan=False, sort_keys=True, default=str)
+        projection_fields = {"market_state_json", "market_state_timestamp", "recorder_sequence"}
+        canonical = {key: value for key, value in source.items() if key not in {"payload", "market_object"}}
+        canonical["payload"] = {key: value for key, value in payload.items() if key not in projection_fields}
+        return json.dumps(canonical, allow_nan=False, sort_keys=True, default=str)
+
+    def register_financial_replay(self, identity, replay):
+        """Register a source-owned exact DTO replay for capacity rejection recovery."""
+        if not callable(replay):
+            raise TypeError("financial replay must be callable")
+        self._financial_event_replay[identity] = replay
+
+    def unregister_financial_replay(self, identity):
+        self._financial_event_replay.pop(identity, None)
+
+    def financial_persistence_status(self):
+        replay_only_count = len(set(self._financial_event_replay) - set(self._financial_event_pending)
+                                - set(self._financial_event_failed))
+        pending = bool(self._financial_event_pending or self._financial_event_replay
+                       or not self._financial_event_queue.empty()
+                       or self._financial_event_current_job is not None
+                       or self._financial_event_reconciliation_needed)
+        failed = bool(self._financial_event_failed or self._financial_event_error is not None)
+        return {
+            "mode": "acknowledged_async" if self._async_financial_events else "legacy_sync",
+            "pending_count": len(self._financial_event_pending) + replay_only_count,
+            "failed_count": len(self._financial_event_failed),
+            "reconciliation_needed": self._financial_event_reconciliation_needed,
+            "acknowledged": (not pending and not failed) if self._async_financial_events else None,
+            "error_type": type(self._financial_event_error).__name__ if self._financial_event_error else None,
+        }
+
+    async def _run_financial_event_writer(self):
+        while True:
+            job = await self._financial_event_queue.get()
+            self._financial_event_current_job = job
+            try:
+                result = await self._sql_manager.write_queue.write(job["operation"])
+                if job["after_commit"] is not None:
+                    job["after_commit"](result)
+            except SQLWriteCancelledAfterCommit as cancelled:
+                try:
+                    if job["after_commit"] is not None:
+                        job["after_commit"](cancelled.result)
+                except Exception as error:
+                    identity = job["identity"]
+                    self._financial_event_failed[identity] = job
+                    self._financial_event_error = error
+                    self.logger().error("Committed native financial write requires reconciliation | kind=%s error=%s",
+                                        job["kind"], type(error).__name__)
+                else:
+                    identity = job["identity"]
+                    self._financial_event_pending.pop(identity, None)
+                    self._financial_event_failed.pop(identity, None)
+                    self._financial_event_replay.pop(identity, None)
+                    if not self._financial_event_failed:
+                        self._financial_event_error = None
+                    self.logger().info("Acknowledged committed native financial write after cancellation | kind=%s",
+                                       job["kind"])
+                raise asyncio.CancelledError
+            except asyncio.CancelledError:
+                identity = job["identity"]
+                self._financial_event_failed[identity] = job
+                self._financial_event_error = asyncio.CancelledError()
+                self.logger().error("Native financial write worker cancelled before acknowledged completion | kind=%s",
+                                    job["kind"])
+                raise
+            except Exception as error:
+                identity = job["identity"]
+                self._financial_event_failed[identity] = job
+                self._financial_event_error = error
+                self.logger().error("Native financial write failed; exact receipt remains pending | kind=%s error=%s",
+                                    job["kind"], type(error).__name__)
+            else:
+                identity = job["identity"]
+                self._financial_event_pending.pop(identity, None)
+                self._financial_event_replay.pop(identity, None)
+                if job.get("retrying"):
+                    self.logger().info("Recovered native financial write | kind=%s", job["kind"])
+                self._financial_event_failed.pop(identity, None)
+                if not self._financial_event_failed:
+                    self._financial_event_error = None
+            finally:
+                self._financial_event_current_job = None
+                self._financial_event_queue.task_done()
+
+    def _persist_financial_fill(self, payload: Dict[str, Any]):
+        fee_json = json.loads(payload["trade_fee_json"])
+        exact_fee = payload["exact_trade_fee_in_quote"]
+        timestamp = payload["timestamp"]
+        with self._sql_manager.get_new_session() as session:
+            with session.begin():
+                existing = session.query(TradeFill).filter_by(
+                    market=payload["market"], order_id=payload["order_id"],
+                    exchange_trade_id=payload["exchange_trade_id"],
+                ).one_or_none()
+                if existing is not None:
+                    exact = session.get(TradeFillExact, (
+                        payload["market"], payload["order_id"], payload["exchange_trade_id"]
+                    ))
+                    if exact is not None and (
+                            Decimal(exact.amount) != Decimal(payload["amount"])
+                            or Decimal(exact.price) != Decimal(payload["price"])):
+                        raise ValueError("Conflicting exact duplicate fill receipt")
+                    amount = Decimal(TradeFill.decimal_text(Decimal(payload["amount"])))
+                    price = Decimal(TradeFill.decimal_text(Decimal(payload["price"])))
+                    if existing.exact_amount is None:
+                        amount = Decimal(int(amount * 10 ** 6)) / 10 ** 6
+                    if existing.exact_price is None:
+                        price = Decimal(int(price * 10 ** 6)) / 10 ** 6
+                    if (existing.amount_decimal != amount or existing.price_decimal != price
+                            or existing.symbol != payload["symbol"]
+                            or existing.trade_type != payload["trade_type"]
+                            or existing.trade_fee != fee_json):
+                        raise ValueError("Conflicting duplicate fill receipt")
+                    existing_time = normalize_execution_timestamp_ms(
+                        existing.execution_timestamp_ms, existing.timestamp / 1e3
+                    ) if type(existing.execution_timestamp_ms) is int else None
+                    if (existing_time is None and existing.execution_timestamp_ms is None
+                            and existing.execution_timestamp_source is None
+                            and payload["execution_timestamp_ms"] is not None):
+                        existing.execution_timestamp_ms = payload["execution_timestamp_ms"]
+                        existing.execution_timestamp_source = payload["execution_timestamp_source"]
+                    order = session.get(Order, payload["order_id"])
+                    if order is not None:
+                        self._apply_order_status_payload(session, order, payload)
+                    elif payload.get("recorder_sequence") is not None and session.query(OrderStatus).filter_by(
+                            order_id=payload["order_id"], timestamp=timestamp,
+                            status=payload["event_status"]).first() is None:
+                        session.add(OrderStatus(order_id=payload["order_id"], timestamp=timestamp,
+                                                status=payload["event_status"]))
+                    self._store_market_state_payload(session, payload)
+                    return
+
+                order = session.query(Order).filter(Order.id == payload["order_id"]).one_or_none()
+                if order is not None:
+                    self._apply_order_status_payload(session, order, payload)
+                elif payload.get("recorder_sequence") is None or session.query(OrderStatus).filter_by(
+                        order_id=payload["order_id"], timestamp=timestamp,
+                        status=payload["event_status"]).first() is None:
+                    session.add(OrderStatus(order_id=payload["order_id"], timestamp=timestamp,
+                                            status=payload["event_status"]))
+                session.add(TradeFill(
+                    config_file_path=payload["config_file_path"], strategy=payload["strategy"],
+                    market=payload["market"], symbol=payload["symbol"],
+                    base_asset=payload["base_asset"], quote_asset=payload["quote_asset"],
+                    timestamp=timestamp, order_id=payload["order_id"],
+                    trade_type=payload["trade_type"], order_type=payload["order_type"],
+                    price=Decimal(payload["price"]), amount=Decimal(payload["amount"]),
+                    leverage=payload["leverage"], trade_fee=fee_json,
+                    trade_fee_in_quote=(None if payload["trade_fee_in_quote"] is None
+                                        else Decimal(payload["trade_fee_in_quote"])),
+                    exact_amount=payload["amount"], exact_price=payload["price"],
+                    exact_trade_fee_in_quote=exact_fee, exact_receipt_source="order_filled_event_v1",
+                    execution_timestamp_ms=payload["execution_timestamp_ms"],
+                    execution_timestamp_source=payload["execution_timestamp_source"],
+                    exchange_trade_id=payload["exchange_trade_id"], position=payload["position"],
+                ))
+                session.add(TradeFillExact(
+                    market=payload["market"], order_id=payload["order_id"],
+                    exchange_trade_id=payload["exchange_trade_id"],
+                    amount=payload["amount"], price=payload["price"], fee_in_quote=exact_fee,
+                ))
+                self._store_market_state_payload(session, payload)
+
+    async def flush_financial_events(self):
+        """Wait for admitted fills, replay tracker-held receipts, and return only after commit."""
+        if not self._async_financial_events:
+            return
+        needs_writer = (not self._financial_event_queue.empty() or bool(self._financial_event_pending)
+                        or bool(self._financial_event_failed) or self._financial_event_reconciliation_needed)
+        if needs_writer and (self._financial_event_worker is None or self._financial_event_worker.done()):
+            self._financial_event_worker = asyncio.get_running_loop().create_task(self._run_financial_event_writer())
+        for identity, job in list(self._financial_event_failed.items()):
+            job["retrying"] = True
+            await self._financial_event_queue.put(job)
+            self._financial_event_failed.pop(identity, None)
+            self._financial_event_pending[identity] = job
+        queued = {job["identity"] for job in tuple(self._financial_event_queue._queue)}
+        active = (self._financial_event_current_job["identity"]
+                  if self._financial_event_current_job is not None else None)
+        for identity, job in list(self._financial_event_pending.items()):
+            if identity not in queued and identity != active and identity not in self._financial_event_failed:
+                await self._financial_event_queue.put(job)
+                queued.add(identity)
+        reconciled_this_flush = set()
+        while True:
+            for replay in tuple(self._financial_event_replay.values()):
+                if not replay():
+                    self._financial_event_reconciliation_needed = True
+            if self._financial_event_reconciliation_needed:
+                self._financial_event_reconciliation_needed = False
+                for market in self._markets:
+                    tracker = getattr(market, "_order_tracker", None)
+                    if tracker is None:
+                        continue
+                    for order in tracker.all_fillable_orders.values():
+                        for fill_update in order.order_fills.values():
+                            identity = (market.display_name, order.client_order_id, fill_update.trade_id)
+                            if (identity in self._financial_event_pending or identity in self._financial_event_failed
+                                    or identity in reconciled_this_flush):
+                                continue
+                            event_tag = MarketEvent.OrderFilled
+                            evt = OrderFilledEvent(
+                                timestamp=(fill_update.receipt_timestamp if fill_update.receipt_timestamp is not None
+                                           else fill_update.fill_timestamp),
+                                order_id=order.client_order_id, trading_pair=order.trading_pair,
+                                trade_type=order.trade_type, order_type=order.order_type,
+                                price=fill_update.fill_price, amount=fill_update.fill_base_amount, trade_fee=fill_update.fee,
+                                exchange_trade_id=fill_update.trade_id, exchange_order_id=fill_update.exchange_order_id,
+                                leverage=int(order.leverage), position=order.position.value,
+                                execution_timestamp_ms=fill_update.execution_timestamp_ms,
+                                execution_timestamp_source=fill_update.execution_timestamp_source,
+                            )
+                            _, job = self._capture_financial_fill(event_tag.value, market, evt)
+                            payload = job["payload"]
+                            accepted = self.enqueue_financial_write(
+                                job["identity"],
+                                lambda payload=payload: self._persist_financial_fill(payload),
+                                lambda _result, market=market, payload=payload:
+                                    market.add_trade_fills_from_market_recorder({TradeFillOrderDetails(
+                                        payload["market"], payload["exchange_trade_id"], payload["symbol"]
+                                    )}),
+                                kind="fill",
+                                source=job,
+                            )
+                            if not accepted:
+                                # Capacity may clear as the current queue drains;
+                                # keep the tracker receipt visible for another pass.
+                                self._financial_event_reconciliation_needed = True
+                            else:
+                                reconciled_this_flush.add(identity)
+            await self._financial_event_queue.join()
+            if self._financial_event_error is not None or not self._financial_event_reconciliation_needed:
+                break
+        if self._financial_event_error is not None:
+            error = self._financial_event_error
+            self._financial_event_error = None
+            raise RuntimeError("Financial fill persistence has not been durably acknowledged") from error
+
     def _did_complete_funding_payment(self,
                                       event_tag: int,
                                       market: ConnectorBase,
@@ -1332,49 +2080,19 @@ class MarketsRecorder:
         df = pd.DataFrame([field_data])
         df.to_csv(csv_path, mode='a', header=False, index=False)
 
-    def _update_order_status(self,
-                             event_tag: int,
-                             market: ConnectorBase,
-                             evt: Union[OrderCancelledEvent,
-                                        MarketOrderFailureEvent,
-                                        BuyOrderCompletedEvent,
-                                        SellOrderCompletedEvent,
-                                        OrderExpiredEvent]):
+    def _update_order_status(self, event_tag: int, market: ConnectorBase,
+                             evt: Union[OrderCancelledEvent, MarketOrderFailureEvent, BuyOrderCompletedEvent,
+                                        SellOrderCompletedEvent, OrderExpiredEvent]):
         if threading.current_thread() != threading.main_thread():
             self._ev_loop.call_soon_threadsafe(self._update_order_status, event_tag, market, evt)
             return
-
-        timestamp: int = self.db_timestamp
-        event_type: MarketEvent = self.market_event_tag_map[event_tag]
-        order_id: str = evt.order_id
-
-        with self._sql_manager.get_new_session() as session:
-            with session.begin():
-                order_record: Optional[Order] = session.query(Order).filter(Order.id == order_id).one_or_none()
-
-                if order_record is not None:
-                    order_record.last_status = event_type.name
-                    order_record.last_update_timestamp = timestamp
-                    order_status: OrderStatus = OrderStatus(order_id=order_id,
-                                                            timestamp=timestamp,
-                                                            status=event_type.name)
-                    session.add(order_status)
-                    self.save_market_states(self._config_file_path, market, session=session)
-
-    def _did_cancel_order(self,
-                          event_tag: int,
-                          market: ConnectorBase,
-                          evt: OrderCancelledEvent):
-        if threading.current_thread() != threading.main_thread():
-            self._ev_loop.call_soon_threadsafe(self._did_cancel_order, event_tag, market, evt)
-            return
-        with self._sql_manager.get_new_session() as session:
-            missing = session.get(Order, evt.order_id) is None
-        if missing:
-            # A post-only cancel may arrive before creation, including through
-            # PENDING_CANCEL or with a late exchange ID. Recover the receipt
-            # from the genuine tracked order; never infer acceptance from the
-            # cancellation's client ID alone or emit another connector event.
+        payload = {
+            'order_id': evt.order_id, 'config_file_path': self._config_file_path,
+            'market': market.display_name, 'timestamp': self.db_timestamp,
+            'event_status': self.market_event_tag_map[event_tag].name,
+            'cancel_event': isinstance(evt, OrderCancelledEvent), 'creation_if_missing': None,
+        }
+        if payload['cancel_event']:
             tracker = getattr(market, '_order_tracker', None)
             tracked = tracker.fetch_order(evt.order_id) if tracker is not None else None
             if (isinstance(tracked, InFlightOrder) and tracked.is_cancelled
@@ -1382,14 +2100,24 @@ class MarketsRecorder:
                 buy = tracked.trade_type == TradeType.BUY
                 created_event = BuyOrderCreatedEvent if buy else SellOrderCreatedEvent
                 created_tag = MarketEvent.BuyOrderCreated if buy else MarketEvent.SellOrderCreated
-                self._did_create_order(created_tag.value, market, created_event(
+                payload['creation_if_missing'] = self._capture_order_creation(created_tag.value, market, created_event(
                     evt.timestamp, tracked.order_type, tracked.trading_pair, tracked.amount,
                     tracked.price, tracked.client_order_id, tracked.creation_timestamp,
                     exchange_order_id=tracked.exchange_order_id, leverage=tracked.leverage,
                     position=tracked.position.value))
-            else:
-                self.logger().warning(f'Cannot persist cancellation before creation without a matching '
-                                      f'native terminal order receipt: {evt.order_id}')
+        if self._async_financial_events:
+            self._enqueue_order_event(market, payload, 'order-status')
+            return
+        payload.update(self._capture_market_state_payload(market))
+        result = self._persist_order_status_payload(payload)
+        if result['created']:
+            creation = payload['creation_if_missing']
+            market.add_exchange_order_ids_from_market_recorder({creation['exchange_order_id']: evt.order_id})
+        if not result['found'] and payload['cancel_event']:
+            self.logger().warning('Cannot persist cancellation before creation without a matching '
+                                  'native terminal order receipt: %s', evt.order_id)
+
+    def _did_cancel_order(self, event_tag: int, market: ConnectorBase, evt: OrderCancelledEvent):
         self._update_order_status(event_tag, market, evt)
 
     def _did_fail_order(self,

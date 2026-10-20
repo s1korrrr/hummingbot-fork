@@ -102,6 +102,34 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             status,
         )
 
+    def test_async_persistence_opt_in_is_limited_to_exact_native_okx_owners(self):
+        connector = SimpleNamespace(name="okx")
+        base = SimpleNamespace(
+            config_file_path="rsi_modular_v2.yml", strategy_name="v2_with_controllers",
+            _markets=[connector],
+        )
+        self.assertTrue(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"okx": connector},
+        ))
+
+        for config_path in ("generic.yml", "paper.yml", "ok_rsi_bak.yml"):
+            base.config_file_path = config_path
+            self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+                base, {"okx": connector},
+            ))
+        base.config_file_path = "meridian_v3.yml"
+        base.strategy_name = "legacy_strategy"
+        self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"okx": connector},
+        ))
+        base.strategy_name = "v2_with_controllers"
+        self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"mock_paper_exchange": SimpleNamespace(name="mock_paper_exchange")},
+        ))
+        self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"okx": SimpleNamespace(name="okx")},
+        ))
+
     def test_direct_strategy_orders_are_never_fenced_by_reported_unfinished_executor(self):
         self.strategy.executor_orchestrator.recovery_required = {"removed-owner": ["entry-1"]}
         self.strategy.executor_orchestrator._planned_resume_pending = False
@@ -120,11 +148,14 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                 self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
         sell.assert_not_called()
 
-    def test_controller_config_persistence_waits_for_successful_startup_resume(self):
+    async def test_controller_config_persistence_waits_for_successful_startup_resume(self):
         controller_config = MagicMock(id='controller-1')
         recorder = MagicMock()
         events = []
-        recorder.store_controller_config.side_effect = lambda config: events.append('store')
+
+        async def store(configs):
+            events.append('store')
+        recorder.store_controller_configs_async = AsyncMock(side_effect=store)
         self.strategy.executor_orchestrator._planned_resume_pending = True
         self.strategy.executor_orchestrator._resume_preflight_failed = False
         self.strategy.executor_orchestrator._planned_resume_failure = None
@@ -149,8 +180,9 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             self.strategy.determine_executor_actions = MagicMock(return_value=[])
 
             self.strategy.on_tick()
+            await self.strategy.await_controller_config_persistence()
 
-        recorder.store_controller_config.assert_called_once_with(controller_config)
+        recorder.store_controller_configs_async.assert_awaited_once()
         self.assertEqual(events, ['claim', 'store'])
         self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
 
@@ -383,9 +415,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.controllers["direct"].update_config.assert_not_called()
         self.assertIn("direct OK RSI candle policy", self.strategy._last_controller_reload_error)
 
-    def test_controller_config_persistence_is_immediate_without_pending_resume(self):
+    async def test_controller_config_persistence_is_immediate_without_pending_resume(self):
         controller_config = MagicMock(id='controller-1')
         recorder = MagicMock()
+        recorder.store_controller_configs_async = AsyncMock()
         self.strategy.executor_orchestrator._planned_resume_pending = False
         self.strategy.executor_orchestrator._resume_preflight_failed = False
         self.strategy.executor_orchestrator._planned_resume_failure = None
@@ -393,8 +426,9 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                 patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[controller_config]), \
                 patch.object(self.strategy, 'add_controller'):
             self.strategy.initialize_controllers()
+            await self.strategy.await_controller_config_persistence()
 
-        recorder.store_controller_config.assert_called_once_with(controller_config)
+        recorder.store_controller_configs_async.assert_awaited_once()
         self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
 
     def test_controller_config_persistence_stays_deferred_after_resume_failure(self):
@@ -478,6 +512,31 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         observation = self.strategy._runtime_position_resume_observation()
         self.assertTrue(observation['preflight_failed'])
         self.assertIsNone(self.strategy._runtime_reconciliation_observation()['pending_count'])
+
+    def test_native_admission_readiness_requires_explicit_financial_ack(self):
+        self.strategy.ready_to_trade = True
+        self.strategy._controller_reports_valid = True
+        self.strategy._is_stop_triggered = False
+        self.strategy._unattended_restart_hold = False
+        recorder = MagicMock(_async_financial_events=True)
+        with patch.object(self.strategy, '_build_controller_status_entries', return_value=[]), \
+                patch.object(self.strategy, '_get_balances_snapshot', return_value=[]), \
+                patch.object(self.strategy, '_runtime_status_snapshot_bot_name', return_value='candidate'), \
+                patch.object(self.strategy, '_build_runtime_operations_snapshot', return_value={}), \
+                patch.object(self.strategy, 'get_active_orders', return_value=[]), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock,
+                             return_value=1792310400.0), \
+                patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+            recorder.financial_persistence_status.return_value = {
+                'mode': 'acknowledged_async', 'pending_count': 0, 'failed_count': 0,
+                'reconciliation_needed': False, 'acknowledged': None, 'error_type': None,
+            }
+            self.assertFalse(self.strategy._build_runtime_status_snapshot()['trading_admission_ready'])
+            recorder.financial_persistence_status.return_value['acknowledged'] = True
+            self.assertTrue(self.strategy._build_runtime_status_snapshot()['trading_admission_ready'])
+            recorder.financial_persistence_status.return_value['acknowledged'] = None
+            with patch.object(MarketsRecorder, 'get_existing_instance', return_value=None):
+                self.assertIsNone(self.strategy._build_runtime_status_snapshot()['trading_admission_ready'])
 
     def test_unattended_v2_restart_hold_blocks_direct_buy_and_sell(self):
         self.strategy._unattended_restart_hold = True
@@ -1003,6 +1062,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy._controller_restart_required = {'controller_1': 'source changed'}
         self.strategy.actions_queue = MagicMock()
         self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
         try:
             await self.strategy.listen_to_executor_actions()
         except asyncio.CancelledError:
@@ -1022,6 +1085,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.strategy.controllers['controller_1'].config.manual_kill_switch = False
         self.strategy.actions_queue = MagicMock()
         self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
         try:
             await self.strategy.listen_to_executor_actions()
         except asyncio.CancelledError:
@@ -1658,6 +1725,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
     async def _listen_once(self, actions):
         self.strategy.actions_queue = MagicMock()
         self.strategy.actions_queue.get = AsyncMock(side_effect=[actions, asyncio.CancelledError])
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
         try:
             await self.strategy.listen_to_executor_actions()
         except asyncio.CancelledError:
@@ -1727,6 +1798,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             asyncio.CancelledError,
         ])
         self.strategy.executor_orchestrator.execute_actions = MagicMock()
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
         controller_mock = MagicMock()
         controller_mock.status = RunnableStatus.RUNNING
         controller_mock.config.manual_kill_switch = False

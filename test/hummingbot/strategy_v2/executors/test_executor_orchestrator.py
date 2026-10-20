@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from decimal import Decimal
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -82,6 +83,155 @@ class TestExecutorOrchestrator(unittest.TestCase):
         controller.config.connector_name = connector_name
         controller.config.trading_pair = trading_pair
         return controller
+
+    def test_create_async_rechecks_gate_after_intent_commit_and_terminalizes_refusal(self):
+        async def scenario(changed):
+            controller = MagicMock(status=RunnableStatus.RUNNING)
+            controller.config.manual_kill_switch = False
+            controller.validate_executor_config = MagicMock(return_value=changed != 'controller-permission')
+            replacement = MagicMock(status=RunnableStatus.RUNNING)
+            replacement.config.manual_kill_switch = False
+            strategy = MagicMock()
+            strategy.controllers = {'controller-1': controller}
+            strategy._unattended_restart_hold = False
+            strategy._is_stop_triggered = False
+            strategy._controller_restart_required = {}
+            strategy._controller_reports_valid = True
+
+            async def validate(_action):
+                if changed == 'cancel':
+                    raise asyncio.CancelledError()
+                if changed == 'validator-error':
+                    raise RuntimeError('injected admission validation failure')
+                return True
+            strategy.validate_create_action_async = validate
+
+            config = PositionExecutorConfig(
+                id='intent-1', timestamp=1234, controller_id='controller-1', connector_name='binance',
+                trading_pair='BTC-USDT', side=TradeType.BUY, entry_price=Decimal('100'), amount=Decimal('1'),
+                triple_barrier_config=TripleBarrierConfig())
+            action = CreateExecutorAction(controller_id='controller-1', executor_config=config)
+            started = []
+            executor = MagicMock()
+            executor.config = config
+            executor.executor_info.model_dump_json.return_value = json.dumps({
+                'id': 'intent-1', 'timestamp': 1234.0, 'type': 'position_executor', 'status': 1,
+                'config': {}, 'net_pnl_pct': None, 'net_pnl_quote': None, 'cum_fees_quote': 0,
+                'filled_amount_quote': 0, 'is_active': True, 'is_trading': False, 'custom_info': {},
+                'close_timestamp': None, 'close_type': None, 'controller_id': 'controller-1',
+            })
+            executor.start.side_effect = lambda: started.append(True)
+
+            orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)
+            orchestrator.strategy = strategy
+            orchestrator._planned_resume_pending = False
+            orchestrator.active_executors = {'controller-1': []}
+            orchestrator.stored_executors = {'controller-1': []}
+            orchestrator.executors_update_interval = 1
+            orchestrator.executors_max_retries = 1
+            orchestrator._executor_start = None
+            orchestrator._prepare_executor_for_action = MagicMock(return_value=(executor, controller))
+
+            recorder = MagicMock()
+            intent_started, allow_commit = asyncio.Event(), asyncio.Event()
+            persisted = []
+
+            async def persist(serialized):
+                persisted.append(json.loads(serialized))
+                if len(persisted) == 1:
+                    intent_started.set()
+                    await allow_commit.wait()
+            recorder.store_executor_info_snapshot_async = persist
+            with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+                task = asyncio.create_task(orchestrator.create_executor_async(action))
+                await asyncio.wait_for(intent_started.wait(), timeout=2)
+                if changed == 'stop':
+                    strategy._is_stop_triggered = True
+                elif changed == 'topology':
+                    strategy.controllers['controller-1'] = replacement
+                allow_commit.set()
+                if changed == 'cancel':
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(task, timeout=2)
+                elif changed == 'validator-error':
+                    with self.assertRaisesRegex(RuntimeError, 'injected admission validation failure'):
+                        await asyncio.wait_for(task, timeout=2)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'admission changed after intent commit'):
+                        await asyncio.wait_for(task, timeout=2)
+                if changed == 'controller-permission':
+                    controller.validate_executor_config.assert_called_once_with(config)
+                else:
+                    controller.validate_executor_config.assert_not_called()
+
+            self.assertEqual(started, [])
+            self.assertEqual(orchestrator.active_executors['controller-1'], [])
+            self.assertEqual(len(persisted), 2)
+            refused = persisted[1]
+            self.assertEqual(refused['status'], RunnableStatus.TERMINATED.value)
+            self.assertEqual(refused['close_type'], CloseType.FAILED.value)
+            self.assertFalse(refused['is_active'])
+            self.assertFalse(refused['is_trading'])
+            self.assertFalse(refused['custom_info']['execution_started'])
+
+        for gate in ('stop', 'topology', 'cancel', 'validator-error', 'controller-permission'):
+            with self.subTest(gate=gate):
+                asyncio.run(scenario(gate))
+
+    def test_create_async_terminalizes_intent_cancelled_after_commit(self):
+        async def scenario():
+            from hummingbot.model.sql_connection_manager import SQLWriteCancelledAfterCommit
+            controller = MagicMock(status=RunnableStatus.RUNNING)
+            controller.config.manual_kill_switch = False
+            strategy = MagicMock()
+            strategy.controllers = {'controller-1': controller}
+            strategy._unattended_restart_hold = False
+            strategy._is_stop_triggered = False
+            strategy._controller_restart_required = {}
+            strategy._controller_reports_valid = True
+            strategy.validate_create_action_async = AsyncMock(return_value=True)
+            config = PositionExecutorConfig(
+                id='cancelled-intent', timestamp=1234, controller_id='controller-1', connector_name='binance',
+                trading_pair='BTC-USDT', side=TradeType.BUY, entry_price=Decimal('100'), amount=Decimal('1'),
+                triple_barrier_config=TripleBarrierConfig())
+            action = CreateExecutorAction(controller_id='controller-1', executor_config=config)
+            executor = MagicMock()
+            executor.config = config
+            executor.executor_info.model_dump_json.return_value = json.dumps({
+                'id': 'cancelled-intent', 'timestamp': 1234.0, 'type': 'position_executor', 'status': 1,
+                'config': {}, 'net_pnl_pct': None, 'net_pnl_quote': None, 'cum_fees_quote': 0,
+                'filled_amount_quote': 0, 'is_active': True, 'is_trading': False, 'custom_info': {},
+                'close_timestamp': None, 'close_type': None, 'controller_id': 'controller-1',
+            })
+            executor.start = MagicMock()
+            orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)
+            orchestrator.strategy = strategy
+            orchestrator._planned_resume_pending = False
+            orchestrator.active_executors = {'controller-1': []}
+            orchestrator.executors_update_interval = 1
+            orchestrator.executors_max_retries = 1
+            orchestrator._executor_start = None
+            orchestrator._prepare_executor_for_action = MagicMock(return_value=(executor, controller))
+            persisted = []
+
+            async def write(serialized):
+                persisted.append(json.loads(serialized))
+                if len(persisted) == 1:
+                    raise SQLWriteCancelledAfterCommit(None)
+
+            recorder = MagicMock()
+            recorder.store_executor_info_snapshot_async = write
+            with patch.object(MarketsRecorder, 'get_instance', return_value=recorder):
+                with self.assertRaises(SQLWriteCancelledAfterCommit):
+                    await orchestrator.create_executor_async(action)
+            self.assertEqual(len(persisted), 2)
+            self.assertFalse(persisted[1]['is_active'])
+            self.assertEqual(persisted[1]['status'], RunnableStatus.TERMINATED.value)
+            self.assertFalse(persisted[1]['custom_info']['execution_started'])
+            executor.start.assert_not_called()
+
+        from unittest.mock import AsyncMock
+        asyncio.run(scenario())
 
     def test_executor_class_override_is_scoped_to_owning_controller(self):
         config = RSIPositionExecutorConfig(
@@ -294,7 +444,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
             "BTC-USDT": TradingRule(trading_pair="BTC-USDT"),
         })
         recorder = MarketsRecorder.get_instance()
-        self.orchestrator._resolve_executor_class = MagicMock(return_value=MagicMock())
+        executor = MagicMock()
+        executor.config = config
+        executor.executor_info.controller_id = config.controller_id
+        self.orchestrator._resolve_executor_class = MagicMock(return_value=MagicMock(return_value=executor))
 
         self.orchestrator.create_executor(CreateExecutorAction(
             controller_id=config.controller_id, executor_config=config))
@@ -323,7 +476,10 @@ class TestExecutorOrchestrator(unittest.TestCase):
             entry_price=Decimal("100"), amount=Decimal("1"))
 
         self.assertEqual(restarted.recovery_required, {"removed-eth": ["old-entry"]})
-        restarted._resolve_executor_class = MagicMock(return_value=MagicMock())
+        executor = MagicMock()
+        executor.config = new_config
+        executor.executor_info.controller_id = new_config.controller_id
+        restarted._resolve_executor_class = MagicMock(return_value=MagicMock(return_value=executor))
         restarted.active_executors["new-btc"] = []
         restarted.create_executor(CreateExecutorAction(controller_id="new-btc", executor_config=new_config))
         recorder.store_or_update_executor.assert_called_once()

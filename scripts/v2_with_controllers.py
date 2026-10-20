@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from decimal import Decimal
@@ -10,6 +11,7 @@ from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
+from hummingbot.model.sql_connection_manager import SQLWriteCancelledAfterCommit
 from hummingbot.remote_iface.mqtt import ExternalEventFactory
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 from hummingbot.strategy_v2.controllers.native_policy_identity import (
@@ -76,6 +78,10 @@ class V2WithControllers(StrategyV2Base):
         self._operator_started_at = time.time()
         self._operator_watermarks = {}
         self._last_risk_state = None
+        self._risk_write_task = None
+        self._operator_drain_task = None
+        self._operator_drain_lock = asyncio.Lock()
+        self._risk_latch_task = None
         self._risk_reconciliation_error: Optional[str] = None
         self._daily_entry_risk = None
         self._entry_risk_enrollment = None
@@ -160,12 +166,34 @@ class V2WithControllers(StrategyV2Base):
             if isinstance(state, dict) and state.get('stopped') is False:
                 recorder.store_strategy_risk_state({**state, 'stopped': True})
 
+    async def latch_risk_stop_async(self):
+        self._is_stop_triggered = True
+        if hasattr(self, '_native_shutdown_initial_stop_latch'):
+            self._native_shutdown_initial_stop_latch = True
+        if not getattr(self, '_risk_persistence_enabled', False):
+            return
+        recorder = MarketsRecorder.get_instance()
+        if getattr(self, '_risk_reconciliation_error', None) is not None:
+            await recorder.latch_strategy_risk_stop_async()
+            return
+        await self._persist_risk_state_async()
+
     def _persist_risk_state(self, *, operator_receipts=()):
         if not getattr(self, '_risk_persistence_enabled', False):
             return
         if getattr(self, '_risk_reconciliation_error', None) is not None:
             # Preserve missing/malformed evidence; defaults cannot reconstruct account peaks.
             return
+        state = self._risk_state_snapshot()
+        if state != self._last_risk_state or operator_receipts:
+            recorder = MarketsRecorder.get_instance()
+            if operator_receipts:
+                recorder.store_strategy_risk_state(state, operator_receipts=operator_receipts)
+            else:
+                recorder.store_strategy_risk_state(state)
+            self._last_risk_state = state
+
+    def _risk_state_snapshot(self):
         enrollment = getattr(self, '_entry_risk_enrollment', None)
         state = {'version': 2 if enrollment is not None else 1, 'controllers': sorted(self.controllers),
                  'max_global_pnl': None if self.max_global_pnl is None else str(self.max_global_pnl),
@@ -180,13 +208,47 @@ class V2WithControllers(StrategyV2Base):
             state['daily_entry_risk'] = self._daily_entry_risk.snapshot()
         if enrollment is not None:
             state['entry_risk_enrollment'] = enrollment.snapshot()
-        if state != self._last_risk_state or operator_receipts:
-            recorder = MarketsRecorder.get_instance()
-            if operator_receipts:
-                recorder.store_strategy_risk_state(state, operator_receipts=operator_receipts)
-            else:
-                recorder.store_strategy_risk_state(state)
+        return state
+
+    async def _persist_risk_state_async(self, *, operator_receipts=()):
+        if (not getattr(self, '_risk_persistence_enabled', False)
+                or getattr(self, '_risk_reconciliation_error', None) is not None):
+            return
+        state = self._risk_state_snapshot()
+        if state == self._last_risk_state and not operator_receipts:
+            return
+        recorder = MarketsRecorder.get_instance()
+        from hummingbot.model.sql_connection_manager import SQLWriteCancelledAfterCommit
+        try:
+            await recorder.store_strategy_risk_state_async(state, operator_receipts=operator_receipts)
+        except SQLWriteCancelledAfterCommit:
+            # Cancellation is reported to the caller, but this exact snapshot is
+            # durable and must not be replayed as a different state.
             self._last_risk_state = state
+            raise
+        else:
+            self._last_risk_state = state
+
+    def _schedule_risk_state_persistence(self):
+        if not getattr(self, '_risk_persistence_enabled', False):
+            return
+        task = self._risk_write_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._risk_write_task = loop.create_task(self._persist_risk_state_async())
+
+        def report_failure(completed):
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                self._risk_check_failed('Unable to persist risk state; retrying next tick', error)
+
+        self._risk_write_task.add_done_callback(report_failure)
 
     @staticmethod
     def _durable_operator_policy(config):
@@ -204,12 +266,12 @@ class V2WithControllers(StrategyV2Base):
         return bool(getattr(controller, '_operator_entry_paused', False))
 
     def validate_create_action(self, action):
-        # Called after fresh reports and immediately before executor creation.
+        """Synchronous compatibility gate for existing native callers/tests."""
         if getattr(self, '_risk_reconciliation_error', None) is not None:
             self._is_stop_triggered = True
             return False
         if getattr(self, '_controller_reports_valid', True) is False:
-            return False  # ported from live V1: never size a new entry from an invalid report
+            return False
         try:
             if self._funding_scope_owners and (
                     set(self.controllers) != {owner.config.id for owner in self._funding_scope_owners}
@@ -222,6 +284,61 @@ class V2WithControllers(StrategyV2Base):
             self.control_max_drawdown()
             self._observe_daily_entry_risk()
             self._persist_risk_state()
+            buying = getattr(getattr(action, 'executor_config', None), 'side', TradeType.BUY) == TradeType.BUY
+            daily_block = self._daily_entry_risk is not None and self._daily_entry_risk.paused and buying
+            controller = self.controllers.get(action.controller_id)
+            operator_block = (buying and controller is not None
+                              and self._durable_operator_policy(controller.config)
+                              and self._operator_paused(controller))
+            self._risk_check_recovered()
+            return (not daily_block and not operator_block and not self._is_stop_triggered
+                    and action.controller_id not in self.drawdown_exited_controllers)
+        except Exception as error:
+            self._risk_check_failed('Risk check or persistence failed; this action is refused', error)
+            return False
+
+    async def validate_create_action_async(self, action):
+        # Called after fresh reports and immediately before executor creation.
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is not None:
+            await recorder.flush_financial_events()
+        await self.await_controller_config_persistence()
+        pending_latch = getattr(self, '_risk_latch_task', None)
+        if pending_latch is not None:
+            await asyncio.shield(pending_latch)
+        if getattr(self, '_risk_reconciliation_error', None) is not None:
+            self._is_stop_triggered = True
+            return False
+        if getattr(self, '_controller_reports_valid', True) is False:
+            return False  # ported from live V1: never size a new entry from an invalid report
+        try:
+            if self._funding_scope_owners and (
+                    set(self.controllers) != {owner.config.id for owner in self._funding_scope_owners}
+                    or any(self.controllers.get(owner.config.id) is not owner for owner in self._funding_scope_owners)):
+                raise ValueError('Funded controller topology changed; restart and reconcile explicitly')
+            await self.process_operator_events_async()
+            if not self._ownership_recovery_complete():
+                return False
+            self.check_manual_kill_switch()
+            self.control_max_drawdown()
+            self._observe_daily_entry_risk()
+            for _ in range(2):
+                pending_risk_write = getattr(self, '_risk_write_task', None)
+                if pending_risk_write is not None and not pending_risk_write.done():
+                    await asyncio.shield(pending_risk_write)
+                await self._persist_risk_state_async()
+                if self._last_risk_state == self._risk_state_snapshot():
+                    break
+            else:
+                # A continuously changing risk snapshot cannot be certified for
+                # this create; the next fresh controller action may retry.
+                return False
+            # State can change while waiting for the durable write. Recheck all
+            # entry gates against the current loop-owned state before admission.
+            if getattr(self, '_risk_reconciliation_error', None) is not None:
+                return False
+            if getattr(self, '_controller_reports_valid', True) is False:
+                return False
             buying = getattr(getattr(action, 'executor_config', None), 'side', TradeType.BUY) == TradeType.BUY
             daily_block = self._daily_entry_risk is not None and self._daily_entry_risk.paused and buying
             controller = self.controllers.get(action.controller_id)
@@ -265,7 +382,14 @@ class V2WithControllers(StrategyV2Base):
 
     def on_tick(self):
         super().on_tick()
-        self.process_operator_events()
+        task = getattr(self, '_operator_drain_task', None)
+        if task is None or task.done():
+            try:
+                self._operator_drain_task = asyncio.get_running_loop().create_task(
+                    self.process_operator_events_async())
+                self._operator_drain_task.add_done_callback(self._report_operator_drain_result)
+            except RuntimeError:
+                self.process_operator_events()
         # Risk marks and their durable projection must not advance against an
         # unclaimed startup snapshot. The entry fence and operator events remain
         # observable while the claim is pending.
@@ -281,15 +405,19 @@ class V2WithControllers(StrategyV2Base):
                     # Creation re-runs these rails and refuses while they fail; reporting continues.
                     self._risk_check_failed('Risk rails unavailable; new executions are refused', error)
                 self.send_performance_report()
-            try:
-                self._persist_risk_state()
-            except Exception as error:
-                # Every create re-runs the risk check and persistence, so a failing store
-                # refuses new executions until it recovers; it does not latch a stop.
-                self._risk_check_failed('Unable to persist risk state; retrying next tick', error)
-            else:
-                if rails_ok:
-                    self._risk_check_recovered()
+            if ((self._operator_drain_task is None or self._operator_drain_task.done())
+                    and (self._risk_latch_task is None or self._risk_latch_task.done())):
+                self._schedule_risk_state_persistence()
+            if rails_ok:
+                self._risk_check_recovered()
+
+    def _report_operator_drain_result(self, task):
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._is_stop_triggered = True
+            self._risk_check_failed('Native operator command could not be durably processed', error)
 
     def _ownership_recovery_complete(self):
         # Only a pending claim defers risk rails and creation. A failed or
@@ -329,8 +457,8 @@ class V2WithControllers(StrategyV2Base):
                 self.max_global_pnl = pnl
                 self.max_pnl_by_controller = values.copy()
             self._daily_entry_risk, self._entry_risk_enrollment = risk, completed
-            # Establish the native baseline durably before any new create action.
-            self._persist_risk_state()
+            # The async create gate acknowledges this baseline before it admits
+            # an executor. The tick path schedules the same immutable snapshot.
         else:
             self._daily_entry_risk.observe(time.time(), pnl)
         self._apply_daily_entry_pause()
@@ -473,6 +601,163 @@ class V2WithControllers(StrategyV2Base):
                     self.logger().exception(self._risk_reconciliation_error)
                     raise RuntimeError(self._risk_reconciliation_error) from error
 
+    async def process_operator_events_async(self):
+        """Drain native operator receipts through the ordered SQL writer lane."""
+        async with self._operator_drain_lock:
+            return await self._process_operator_events_async_locked()
+
+    async def _process_operator_events_async_locked(self):
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is None or not getattr(self, '_risk_persistence_enabled', False):
+            return self.process_operator_events()
+        pending_risk = getattr(self, '_risk_write_task', None)
+        if pending_risk is not None and not pending_risk.done():
+            await asyncio.shield(pending_risk)
+        while len(self._operator_event_queue) > 0:
+            event_name, event = self._operator_event_queue[0]
+            payload = getattr(event, 'data', {}) or {}
+            if not isinstance(payload, dict):
+                self.logger().warning('Rejected non-mapping operator event')
+                self._operator_event_queue.popleft()
+                continue
+            action = str(payload.get('action') or '').strip()
+            controller_id = payload.get('controller_id')
+            command_id, requested_at = payload.get('command_id'), payload.get('requested_at')
+            targets = ([self.controllers.get(controller_id)] if controller_id
+                       else list(self.controllers.values()))
+            targets = [controller for controller in targets if controller is not None]
+            if controller_id is not None and not targets:
+                self.logger().warning('Rejected native operator command for unknown controller')
+                self._operator_event_queue.popleft()
+                continue
+            allowed = {'global_pause_entries', 'bot_pause_entries', 'global_resume_entries',
+                       'bot_resume_entries', 'bot_cancel_pending_entries'}
+            if action not in allowed or not await self._native_operator_command_is_fresh_async(payload, targets):
+                self.logger().warning('Rejected stale, duplicate or incorrectly addressed native operator command')
+                self._operator_event_queue.popleft()
+                continue
+            if action in {'global_resume_entries', 'bot_resume_entries'} and not self._ownership_recovery_complete():
+                self.logger().warning('Entry resume rejected until native ownership recovery is complete')
+                self._operator_event_queue.popleft()
+                continue
+            if action in {'global_resume_entries', 'bot_resume_entries'} and self._daily_entry_risk is not None:
+                self._observe_daily_entry_risk()
+                if self._daily_entry_risk.paused:
+                    if (action != 'global_resume_entries' or controller_id is not None
+                            or not self._daily_entry_risk.acknowledge(time.time(), self._daily_entry_risk.last_pnl_quote)):
+                        await self._persist_risk_state_async()
+                        self.logger().warning('Daily loss entry pause requires global acknowledgement after UTC rollover')
+                        self._operator_event_queue.popleft()
+                        continue
+            old_pauses = {c.config.id: self._operator_paused(c) for c in targets}
+            old_watermarks = {c.config.id: self._operator_watermarks.get(c.config.id) for c in targets}
+            if action in {'global_pause_entries', 'bot_pause_entries',
+                          'global_resume_entries', 'bot_resume_entries'}:
+                paused = action.endswith('pause_entries')
+                scope = 'global' if action.startswith('global_') else 'bot'
+                for controller in targets:
+                    setter = getattr(controller, 'set_operator_entry_pause', None)
+                    if callable(setter):
+                        setter(paused, reason='mobile-operator', scope=scope,
+                               command_id=command_id, updated_at=requested_at)
+            elif action == 'bot_cancel_pending_entries':
+                ids = {c.config.id for c in targets}
+                actions = [StopExecutorAction(executor_id=e.id, controller_id=e.controller_id,
+                                              keep_position=True, acquisition_only=True)
+                           for e in self.get_all_executors()
+                           if e.controller_id in ids and e.side == TradeType.BUY and e.is_active and not e.is_trading]
+                if actions:
+                    await self.executor_orchestrator.execute_actions_async(actions)
+            native_targets = [c for c in targets if self._durable_operator_policy(c.config)]
+            if not native_targets:
+                # A valid command for a non-native controller has no durable native
+                # receipt to write. Consume it after the local action so it cannot
+                # pin the queue head and spin on every subsequent tick.
+                if (self._operator_event_queue and self._operator_event_queue[0][0] == event_name
+                        and self._operator_event_queue[0][1] is event):
+                    self._operator_event_queue.popleft()
+                continue
+            for controller in native_targets:
+                self._operator_watermarks[controller.config.id] = {
+                    'requested_at': requested_at, 'command_id': command_id}
+            receipts = tuple({'controller_id': c.config.id, 'command_id': command_id,
+                              'requested_at': requested_at} for c in native_targets)
+            try:
+                await self._persist_risk_state_async(operator_receipts=receipts)
+            except SQLWriteCancelledAfterCommit:
+                # The commit is known durable: consume this queue item before
+                # propagating cancellation so a retry cannot duplicate its receipt.
+                if (self._operator_event_queue and self._operator_event_queue[0][0] == event_name
+                        and self._operator_event_queue[0][1] is event):
+                    self._operator_event_queue.popleft()
+                raise
+            except Exception:
+                # Pause is conservative; resume must be withdrawn unless its receipt
+                # and resulting risk state committed atomically.
+                if action in {'global_resume_entries', 'bot_resume_entries'}:
+                    for controller in targets:
+                        setter = getattr(controller, 'set_operator_entry_pause', None)
+                        if callable(setter):
+                            setter(old_pauses[controller.config.id], reason='persistence-failure', scope='bot')
+                for controller in native_targets:
+                    previous = old_watermarks.get(controller.config.id)
+                    if previous is None:
+                        self._operator_watermarks.pop(controller.config.id, None)
+                    else:
+                        self._operator_watermarks[controller.config.id] = previous
+                self._is_stop_triggered = True
+                self._risk_reconciliation_error = 'Operator command persistence failed'
+                raise
+            except asyncio.CancelledError:
+                if action in {'global_resume_entries', 'bot_resume_entries'}:
+                    for controller in targets:
+                        setter = getattr(controller, 'set_operator_entry_pause', None)
+                        if callable(setter):
+                            setter(old_pauses[controller.config.id], reason='persistence-cancelled', scope='bot')
+                for controller in native_targets:
+                    previous = old_watermarks.get(controller.config.id)
+                    if previous is None:
+                        self._operator_watermarks.pop(controller.config.id, None)
+                    else:
+                        self._operator_watermarks[controller.config.id] = previous
+                raise
+            if (self._operator_event_queue and self._operator_event_queue[0][0] == event_name
+                    and self._operator_event_queue[0][1] is event):
+                self._operator_event_queue.popleft()
+            if action in {'global_resume_entries', 'bot_resume_entries'}:
+                self._risk_check_recovered()
+
+    async def _native_operator_command_is_fresh_async(self, payload, targets):
+        native = [c for c in targets if self._durable_operator_policy(c.config)]
+        if not native:
+            return True
+        if getattr(self, '_risk_reconciliation_error', None):
+            return False
+        enrollment = getattr(self, '_entry_risk_enrollment', None)
+        if (enrollment is not None and enrollment.pending
+                and payload.get('action') in ('global_resume_entries', 'bot_resume_entries')):
+            return False
+        timestamp, command_id = payload.get('requested_at'), payload.get('command_id')
+        bot_id, now = HummingbotApplication.main_application().instance_id, time.time()
+        if (not isinstance(bot_id, str) or not bot_id or payload.get('bot_name') != bot_id
+                or type(timestamp) not in (float, int) or not Decimal(str(timestamp)).is_finite()
+                or not self._operator_started_at <= timestamp <= now + 5 or now - timestamp > 60
+                or not isinstance(command_id, str) or not 1 <= len(command_id) <= 128):
+            return False
+        try:
+            for controller in native:
+                previous = self._operator_watermarks.get(controller.config.id)
+                if previous and (timestamp <= previous['requested_at'] or command_id == previous['command_id']):
+                    return False
+                if await MarketsRecorder.get_instance().has_operator_command_async(controller.config.id, command_id):
+                    return False
+        except Exception as error:
+            self._is_stop_triggered = True
+            self._risk_reconciliation_error = 'Operator receipt store unavailable'
+            self.logger().exception(self._risk_reconciliation_error)
+            raise RuntimeError(self._risk_reconciliation_error) from error
+        return True
+
     def _validate_modular_loss_limits(self):
         enrollment = getattr(self, '_entry_risk_enrollment', None)
         if (enrollment is not None and not enrollment.historical_peaks_available
@@ -564,7 +849,13 @@ class V2WithControllers(StrategyV2Base):
             if current_global_drawdown > self.config.max_global_drawdown_quote:
                 self.drawdown_exited_controllers.extend(list(self.controllers.keys()))
                 self.logger().info("Global drawdown reached. Stopping the strategy.")
+                self._is_stop_triggered = True
+                if hasattr(self, '_native_shutdown_initial_stop_latch'):
+                    self._native_shutdown_initial_stop_latch = True
                 try:
+                    loop = asyncio.get_running_loop()
+                    self._risk_latch_task = loop.create_task(self.latch_risk_stop_async())
+                except RuntimeError:
                     self.latch_risk_stop()
                 finally:
                     # A persistence failure surfaces to the caller; the stop still happens.

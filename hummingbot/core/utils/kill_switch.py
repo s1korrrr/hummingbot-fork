@@ -55,7 +55,10 @@ class ActiveKillSwitch(KillSwitch):
                     # A risk stop, unlike the shutdown's own latch: make it durable before shutdown.
                     strategy = getattr(self._trading_core, "strategy", None)
                     try:
-                        if callable(getattr(strategy, "latch_risk_stop", None)):
+                        latch = getattr(strategy, "latch_risk_stop_async", None)
+                        if callable(latch):
+                            await latch()
+                        elif callable(getattr(strategy, "latch_risk_stop", None)):
                             strategy.latch_risk_stop()
                     except Exception:
                         # Stopping still beats trading on: shut down, and leave the failure visible.

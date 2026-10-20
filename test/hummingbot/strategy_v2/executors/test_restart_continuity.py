@@ -265,12 +265,14 @@ def test_contradictory_row_is_reported_and_never_blocks_new_execution(recorder):
     fresh = make_executor()
     fresh.config.controller_id = 'controller'
     fresh.config.id = 'fresh'
-    created = MagicMock()
+    created = MagicMock(config=fresh.config)
     orchestrator._validate_okx_wallet_reservation = MagicMock()
     orchestrator._resolve_executor_class = MagicMock(return_value=MagicMock(return_value=created))
     with patch.object(MarketsRecorder, 'get_instance', return_value=MagicMock()):
         orchestrator.create_executor(CreateExecutorAction(controller_id='controller', executor_config=fresh.config))
     created.start.assert_called_once()
+    assert orchestrator.active_executors['controller'] == [created]
+    assert orchestrator.active_executors['controller'][0].config is fresh.config
 
 
 def test_plan_rejects_exits_larger_than_entries():

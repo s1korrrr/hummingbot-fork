@@ -382,14 +382,24 @@ class V2WithControllers(StrategyV2Base):
 
     def on_tick(self):
         super().on_tick()
-        task = getattr(self, '_operator_drain_task', None)
-        if task is None or task.done():
-            try:
-                self._operator_drain_task = asyncio.get_running_loop().create_task(
-                    self.process_operator_events_async())
-                self._operator_drain_task.add_done_callback(self._report_operator_drain_result)
-            except RuntimeError:
-                self.process_operator_events()
+        recorder = MarketsRecorder.get_existing_instance()
+        async_persistence = (getattr(self, '_risk_persistence_enabled', False)
+                             and recorder is not None
+                             and getattr(recorder, '_async_financial_events', None) is True)
+        if async_persistence:
+            task = getattr(self, '_operator_drain_task', None)
+            if task is None or task.done():
+                try:
+                    self._operator_drain_task = asyncio.get_running_loop().create_task(
+                        self.process_operator_events_async())
+                    self._operator_drain_task.add_done_callback(self._report_operator_drain_result)
+                except RuntimeError:
+                    self.process_operator_events()
+        else:
+            # Preserve synchronous event ordering for legacy and non-native
+            # recorder users. Their caller may rely on the command taking
+            # effect before on_tick returns.
+            self.process_operator_events()
         # Risk marks and their durable projection must not advance against an
         # unclaimed startup snapshot. The entry fence and operator events remain
         # observable while the claim is pending.
@@ -405,11 +415,20 @@ class V2WithControllers(StrategyV2Base):
                     # Creation re-runs these rails and refuses while they fail; reporting continues.
                     self._risk_check_failed('Risk rails unavailable; new executions are refused', error)
                 self.send_performance_report()
-            if ((self._operator_drain_task is None or self._operator_drain_task.done())
-                    and (self._risk_latch_task is None or self._risk_latch_task.done())):
-                self._schedule_risk_state_persistence()
-            if rails_ok:
-                self._risk_check_recovered()
+            if async_persistence:
+                if ((self._operator_drain_task is None or self._operator_drain_task.done())
+                        and (self._risk_latch_task is None or self._risk_latch_task.done())):
+                    self._schedule_risk_state_persistence()
+                if rails_ok:
+                    self._risk_check_recovered()
+            else:
+                try:
+                    self._persist_risk_state()
+                except Exception as error:
+                    self._risk_check_failed('Unable to persist risk state; retrying next tick', error)
+                else:
+                    if rails_ok:
+                        self._risk_check_recovered()
 
     def _report_operator_drain_result(self, task):
         if task.cancelled():

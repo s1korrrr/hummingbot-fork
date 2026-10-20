@@ -164,6 +164,118 @@ class OkxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         ))
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
+    async def test_private_updates_before_final_ack_are_queued_in_receive_order(self, ws_connect_mock):
+        ws = self.mocking_assistant.create_websocket_mock()
+        ws_connect_mock.return_value = ws
+        messages = [
+            {"event": "login", "code": "0", "msg": ""},
+            {"event": "subscribe", "arg": {"channel": "account"}},
+            {"arg": {"channel": "account"}, "data": [{"seqId": 1}]},
+            {"event": "subscribe", "arg": {"channel": "orders", "instType": "SPOT"}},
+            {"arg": {"channel": "orders", "instType": "SPOT"}, "data": [{"ordId": "x"}]},
+        ]
+        for message in messages:
+            self.mocking_assistant.add_websocket_aiohttp_message(ws, json.dumps(message))
+
+        output_queue = asyncio.Queue()
+        self.listening_task = self.local_event_loop.create_task(self.data_source.listen_for_user_stream(output_queue))
+        await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws)
+
+        self.assertEqual([
+            {"arg": {"channel": "account"}, "data": [{"seqId": 1}]},
+            {"arg": {"channel": "orders", "instType": "SPOT"}, "data": [{"ordId": "x"}]},
+        ], [output_queue.get_nowait(), output_queue.get_nowait()])
+        self.assertGreater(self.data_source.last_recv_time, 0)
+
+    @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
+    async def test_orders_fill_survives_missing_account_ack_and_listener_reconnects(self, ws_connect_mock):
+        ws = self.mocking_assistant.create_websocket_mock()
+        second_connect_started = asyncio.Event()
+        connect_calls = 0
+
+        def connect_side_effect(*args, **kwargs):
+            nonlocal connect_calls
+            connect_calls += 1
+            if connect_calls == 1:
+                return ws
+            second_connect_started.set()
+            raise asyncio.CancelledError
+
+        ws_connect_mock.side_effect = connect_side_effect
+
+        async def fast_retry_sleep(delay):
+            await asyncio.sleep(0)
+
+        self.data_source._sleep = fast_retry_sleep
+        fill = {"arg": {"channel": "orders", "instType": "SPOT"}, "data": [{"ordId": "before-account-ack"}]}
+        for message in (
+            {"event": "login", "code": "0", "msg": ""},
+            {"event": "subscribe", "arg": {"channel": "orders", "instType": "SPOT"}},
+            fill,
+        ):
+            self.mocking_assistant.add_websocket_aiohttp_message(ws, json.dumps(message))
+
+        output_queue = asyncio.Queue()
+        with patch(
+            "hummingbot.connector.exchange.okx.okx_api_user_stream_data_source.CONSTANTS.SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE",
+            0.2,
+        ):
+            self.listening_task = self.local_event_loop.create_task(self.data_source.listen_for_user_stream(output_queue))
+            await self.mocking_assistant.run_until_all_aiohttp_messages_delivered(ws)
+            await asyncio.wait_for(second_connect_started.wait(), timeout=3)
+            with self.assertRaises(asyncio.CancelledError):
+                await self.listening_task
+
+        self.assertEqual(fill, output_queue.get_nowait())
+        self.assertTrue(output_queue.empty())
+        self.assertEqual(2, ws_connect_mock.await_count)
+        self.assertEqual(0, self.data_source.last_recv_time)
+
+    @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
+    async def test_repeated_transport_pongs_without_login_ack_reconnect_within_deadline(self, ws_connect_mock):
+        ws = self.mocking_assistant.create_websocket_mock()
+        second_connect_started = asyncio.Event()
+        connect_calls = 0
+
+        def connect_side_effect(*args, **kwargs):
+            nonlocal connect_calls
+            connect_calls += 1
+            if connect_calls == 1:
+                return ws
+            second_connect_started.set()
+            raise asyncio.CancelledError
+
+        ws_connect_mock.side_effect = connect_side_effect
+
+        async def fast_retry_sleep(delay):
+            await asyncio.sleep(0)
+
+        async def send_transport_pongs():
+            for _ in range(3):
+                await asyncio.sleep(0.07)
+                self.mocking_assistant.add_websocket_aiohttp_message(
+                    ws, message="", message_type=WSMsgType.PONG
+                )
+
+        self.data_source._sleep = fast_retry_sleep
+        pongs_task = self.local_event_loop.create_task(send_transport_pongs())
+        output_queue = asyncio.Queue()
+        with patch(
+            "hummingbot.connector.exchange.okx.okx_api_user_stream_data_source.CONSTANTS.SECONDS_TO_WAIT_TO_RECEIVE_MESSAGE",
+            0.3,
+        ):
+            self.listening_task = self.local_event_loop.create_task(self.data_source.listen_for_user_stream(output_queue))
+            await asyncio.wait_for(second_connect_started.wait(), timeout=0.44)
+            with self.assertRaises(asyncio.CancelledError):
+                await self.listening_task
+        await pongs_task
+
+        self.assertEqual(2, ws_connect_mock.await_count)
+        self.assertFalse(self.data_source._private_channels_ready)
+        self.assertEqual(0, self.data_source.last_recv_time)
+        self.assertTrue(output_queue.empty())
+
+    @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
     async def test_listen_for_user_stream_authentication_failure(self, ws_connect_mock):
         ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
 
@@ -198,6 +310,12 @@ class OkxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.mocking_assistant.add_websocket_aiohttp_message(
             mock_ws.return_value,
             json.dumps(successful_login_response))
+        self.mocking_assistant.add_websocket_aiohttp_message(
+            mock_ws.return_value,
+            json.dumps({"event": "subscribe", "arg": {"channel": "account"}}))
+        self.mocking_assistant.add_websocket_aiohttp_message(
+            mock_ws.return_value,
+            json.dumps({"event": "subscribe", "arg": {"channel": "orders", "instType": "SPOT"}}))
         self.mocking_assistant.add_websocket_aiohttp_message(mock_ws.return_value, "")
 
         msg_queue = asyncio.Queue()
@@ -239,6 +357,8 @@ class OkxUserStreamDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         ws_connect_mock.return_value = self.mocking_assistant.create_websocket_mock()
         ws_connect_mock.return_value.receive.side_effect = [
             WSMessage(type=WSMsgType.TEXT, data=json.dumps(successful_login_response), extra=None),
+            WSMessage(type=WSMsgType.TEXT, data=json.dumps({"event": "subscribe", "arg": {"channel": "account"}}), extra=None),
+            WSMessage(type=WSMsgType.TEXT, data=json.dumps({"event": "subscribe", "arg": {"channel": "orders", "instType": "SPOT"}}), extra=None),
             asyncio.TimeoutError("Test timeout"),
             asyncio.CancelledError]
 

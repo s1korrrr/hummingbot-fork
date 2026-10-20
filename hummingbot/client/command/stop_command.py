@@ -56,7 +56,7 @@ class StopCommand:
 
         # Stop markets recorder
         if self.trading_core.markets_recorder:
-            self.trading_core.markets_recorder.stop()
+            await self.trading_core.markets_recorder.stop_async()
             self.trading_core.markets_recorder = None
 
         # Clear strategy references

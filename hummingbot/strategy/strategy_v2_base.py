@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 from hummingbot.client import settings
 from hummingbot.client.config.config_data_types import BaseClientModel
+from hummingbot.client.native_lifecycle import ShutdownResult
 from hummingbot.client.ui.interface_utils import format_df_for_printout
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.derivative_base import DerivativeBase
@@ -54,6 +55,22 @@ USD_STABLE_TOKENS = {"USD", "USDT", "USDC", "FDUSD", "BUSD", "DAI", "TUSD", "USD
 CHART_SNAPSHOT_WRITER_MAX_PENDING = 15
 CHART_SNAPSHOT_WRITER_MAX_PENDING_PER_CONTROLLER = 3
 CHART_SNAPSHOT_WRITER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+NATIVE_ASYNC_RECORDER_CONFIGS = frozenset({"ok_rsi.yml", "rsi_modular_v2.yml", "meridian_v3.yml"})
+
+
+def _qualified_native_async_recorder(recorder, connectors):
+    """Identify only the deployed native OKX controller owners for async persistence."""
+    if recorder is None or recorder.config_file_path not in NATIVE_ASYNC_RECORDER_CONFIGS:
+        return False
+    if recorder.strategy_name != "v2_with_controllers" or not connectors:
+        return False
+    markets = tuple(recorder._markets)
+    return (
+        len(markets) == len(connectors)
+        and all(getattr(connector, "name", None) == "okx" for connector in connectors.values())
+        and all(any(market is connector for market in markets) for connector in connectors.values())
+    )
+
 
 # Lazy-loaded to avoid circular import (strategy_v2_base -> executor_orchestrator -> executors -> strategy_v2_base)
 ExecutorOrchestrator = None
@@ -384,6 +401,9 @@ class StrategyV2Base(StrategyPyBase):
         :param config: Optional configuration. If StrategyV2ConfigBase, enables controller orchestration.
         """
         super().__init__()
+        recorder = MarketsRecorder.get_existing_instance()
+        if _qualified_native_async_recorder(recorder, connectors):
+            recorder.enable_async_financial_events()
         self.connectors: Dict[str, ConnectorBase] = connectors
         self.ready_to_trade: bool = False
         self.add_markets(list(connectors.values()))
@@ -404,7 +424,9 @@ class StrategyV2Base(StrategyPyBase):
         self._last_controller_reload_error: Optional[str] = None
         self._controller_restart_required: Dict[str, str] = {}
         self._controller_configs_pending_persistence: List[ControllerConfigBase] = []
+        self._controller_config_persistence_task: Optional[asyncio.Task] = None
         self._last_runtime_db_sync_ts: float = 0
+        self._runtime_db_sync_task: Optional[asyncio.Task] = None
         self._last_runtime_status_snapshot_ts: float = 0
         self._last_chart_snapshot_prune_ts: float = 0
         self._chart_snapshot_jobs = {}
@@ -422,6 +444,7 @@ class StrategyV2Base(StrategyPyBase):
         self._controller_start_requested = False
 
         self.actions_queue = asyncio.Queue()
+        self._pending_store_action_ids = set()
         self.listen_to_executor_actions_task: asyncio.Task = asyncio.create_task(self.listen_to_executor_actions())
 
         # Initialize controllers from config if available
@@ -485,7 +508,15 @@ class StrategyV2Base(StrategyPyBase):
                 for action in executor_actions:
                     if isinstance(action, CreateExecutorAction) and action.controller_id in self._controller_restart_required:
                         continue
-                    self.executor_orchestrator.execute_action(action)
+                    if isinstance(action, CreateExecutorAction):
+                        self.actions_queue.put_nowait([action])
+                    elif isinstance(action, StoreExecutorAction):
+                        key = (action.controller_id, action.executor_id)
+                        if key not in self._pending_store_action_ids:
+                            self._pending_store_action_ids.add(key)
+                            self.actions_queue.put_nowait([action])
+                    else:
+                        self.executor_orchestrator.execute_action(action)
 
     async def on_stop(self, strict: bool = False):
         """
@@ -497,6 +528,53 @@ class StrategyV2Base(StrategyPyBase):
         self._is_stop_triggered = True
         self._controllers_started = False
         self._controller_start_requested = False
+        recorder = MarketsRecorder.get_existing_instance()
+        persistence_error = None
+        if recorder is not None:
+            try:
+                await recorder.flush_financial_events()
+            except Exception as error:
+                persistence_error = type(error).__name__
+                self.logger().error("Financial receipts did not acknowledge before shutdown: %s", error)
+
+        # Preserve acknowledgment of accepted off-loop projections before the
+        # recorder/chart writer is drained or runtime state is stopped.
+        persistence_tasks = [task for task in (
+            getattr(self, '_runtime_db_sync_task', None),
+            getattr(self, '_risk_write_task', None),
+            getattr(self, '_risk_latch_task', None),
+            getattr(self, '_controller_config_persistence_task', None),
+            getattr(self, '_operator_drain_task', None),
+        ) if task is not None]
+        pending_persistence = [task for task in persistence_tasks if not task.done()]
+        for task in persistence_tasks:
+            if not task.done():
+                continue
+            if task.cancelled():
+                risk_acknowledged = (
+                    task in (getattr(self, '_risk_write_task', None), getattr(self, '_risk_latch_task', None))
+                    and getattr(self, '_last_risk_state', None) == getattr(self, '_risk_state_snapshot', lambda: None)()
+                )
+                config_acknowledged = (
+                    task is getattr(self, '_controller_config_persistence_task', None)
+                    and not getattr(self, '_controller_configs_pending_persistence', ())
+                )
+                if not (risk_acknowledged or config_acknowledged):
+                    persistence_error = persistence_error or 'CancelledPersistenceTask'
+                    self.logger().error('Native persistence task was cancelled without an acknowledged state')
+            else:
+                error = task.exception()
+                if error is not None:
+                    persistence_error = type(error).__name__
+                    self.logger().error('Native persistence task failed before shutdown: %s', error)
+        if pending_persistence:
+            results = await asyncio.gather(
+                *(asyncio.shield(task) for task in pending_persistence), return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                    persistence_error = type(result).__name__
+                    self.logger().error('Native persistence did not acknowledge before shutdown: %s', result)
 
         # Stop controllers FIRST to prevent new executor actions
         for controller in self.controllers.values():
@@ -520,9 +598,17 @@ class StrategyV2Base(StrategyPyBase):
         finally:
             # Executor/order cleanup gets priority; chart drain is bounded and
             # still runs when strict reconciliation fails or raises.
+            if recorder is not None:
+                try:
+                    await recorder.flush_financial_events()
+                except Exception as error:
+                    persistence_error = type(error).__name__
+                    self.logger().error("Financial receipts did not acknowledge during shutdown: %s", error)
             await self._shutdown_chart_snapshot_writer()
         if strict and not result.reconciliation_complete:
             return result
+        if strict and persistence_error is not None:
+            return ShutdownResult(False, f'Native persistence did not acknowledge before shutdown ({persistence_error})')
         self.market_data_provider.stop()
         if not strict:
             self.executor_orchestrator.store_all_executors()
@@ -553,6 +639,15 @@ class StrategyV2Base(StrategyPyBase):
         persist = getattr(self, '_persist_risk_state', None)
         if callable(persist):
             persist()
+
+    async def latch_risk_stop_async(self) -> None:
+        """Fence new actions immediately and await the native risk-state commit."""
+        self._is_stop_triggered = True
+        if hasattr(self, '_native_shutdown_initial_stop_latch'):
+            self._native_shutdown_initial_stop_latch = True
+        persist = getattr(self, '_persist_risk_state_async', None)
+        if callable(persist):
+            await persist()
 
     def _shutdown_keep_position_preferences(self) -> Dict[str, bool]:
         preferences: Dict[str, bool] = {}
@@ -820,11 +915,31 @@ class StrategyV2Base(StrategyPyBase):
             return
         if self.current_timestamp - self._last_runtime_db_sync_ts < self._runtime_db_sync_interval():
             return
+        task = self._runtime_db_sync_task
+        if task is not None and not task.done():
+            return
         try:
-            self.executor_orchestrator.sync_live_state_to_db()
-            self._last_runtime_db_sync_ts = self.current_timestamp
+            snapshot = self.executor_orchestrator.snapshot_live_positions_for_db()
+            snapshot_timestamp = self.current_timestamp
+            loop = asyncio.get_running_loop()
         except Exception as e:
             self.logger().warning(f"Failed to sync runtime state to db: {e}")
+            return
+
+        async def persist_snapshot():
+            await self.executor_orchestrator.persist_live_position_snapshot(snapshot)
+            self._last_runtime_db_sync_ts = snapshot_timestamp
+
+        self._runtime_db_sync_task = loop.create_task(persist_snapshot())
+
+        def report_failure(completed):
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                self.logger().warning(f"Failed to sync runtime state to db: {error}")
+
+        self._runtime_db_sync_task.add_done_callback(report_failure)
 
     def _write_chart_snapshots_if_due(self):
         if (not self._chart_snapshots_enabled() or not self.ready_to_trade or self._is_stop_triggered):
@@ -1632,11 +1747,28 @@ class StrategyV2Base(StrategyPyBase):
                 unrealized_pnl_quote = round(float(totals[1]), 6)
                 net_pnl_quote = round(float(totals[2]), 6)
 
+        recorder = MarketsRecorder.get_existing_instance()
+        native_persistence = (recorder.financial_persistence_status() if recorder is not None else {
+            "mode": "unavailable", "pending_count": None, "failed_count": None,
+            "reconciliation_needed": None, "acknowledged": None, "error_type": None,
+        })
+        native_async_mode = (recorder is not None
+                             and getattr(recorder, "_async_financial_events", False) is True)
+        admission_ready = None
+        if native_async_mode:
+            admission_ready = bool(
+                self.ready_to_trade and self._controller_reports_valid
+                and native_persistence.get("acknowledged") is True
+                and not self._is_stop_triggered and not self._unattended_restart_hold
+            )
         return {
             "schema_version": 1,
             "bot_name": self._runtime_status_snapshot_bot_name(),
             "unattended_restart_hold": self._unattended_restart_hold,
             "controller_reports_valid": self._controller_reports_valid,
+            "ready_to_trade": self.ready_to_trade,
+            "native_persistence": native_persistence,
+            "trading_admission_ready": admission_ready,
             "position_resume_recovery": self._runtime_position_resume_observation(),
             "updated_at": pd.Timestamp(float(self.current_timestamp), unit="s", tz="UTC").isoformat(),
             "operations": self._build_runtime_operations_snapshot(),
@@ -1936,10 +2068,49 @@ class StrategyV2Base(StrategyPyBase):
         if (getattr(orchestrator, "_resume_preflight_failed", False) is True
                 or getattr(orchestrator, "_planned_resume_failure", None)):
             return
+        task = self._controller_config_persistence_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        captured = tuple(self._controller_configs_pending_persistence)
+        serialized = tuple(config.json() for config in captured)
+        self._controller_config_persistence_task = loop.create_task(
+            self._persist_controller_config_snapshots(captured, serialized)
+        )
+
+    async def _persist_controller_config_snapshots(self, captured, serialized):
         recorder = MarketsRecorder.get_instance()
-        for controller_config in self._controller_configs_pending_persistence:
-            recorder.store_controller_config(controller_config)
-        self._controller_configs_pending_persistence.clear()
+        from hummingbot.model.sql_connection_manager import SQLWriteCancelledAfterCommit
+        try:
+            await recorder.store_controller_configs_async(serialized)
+        except SQLWriteCancelledAfterCommit:
+            self._ack_controller_config_snapshots(captured)
+            raise
+        except Exception as error:
+            self.logger().error("Controller config persistence failed; startup fence remains: %s",
+                                type(error).__name__)
+            raise
+        self._ack_controller_config_snapshots(captured)
+
+    def _ack_controller_config_snapshots(self, captured):
+        captured_ids = {id(config) for config in captured}
+        self._controller_configs_pending_persistence = [
+            config for config in self._controller_configs_pending_persistence if id(config) not in captured_ids
+        ]
+
+    async def await_controller_config_persistence(self):
+        """Wait for initial durable controller rows before accepting new execution."""
+        task = self._controller_config_persistence_task
+        if task is None or task.done():
+            self._persist_controller_configs_if_safe()
+            task = self._controller_config_persistence_task
+        if task is not None:
+            await asyncio.shield(task)
+        if self._controller_configs_pending_persistence:
+            raise RuntimeError("Initial controller config rows remain unacknowledged")
 
     def _start_controllers_if_safe(self):
         """Start controller loops once a prepared owner claim has been attempted.
@@ -2074,14 +2245,21 @@ class StrategyV2Base(StrategyPyBase):
                     if isinstance(action, CreateExecutorAction):
                         if action.controller_id in self._controller_restart_required:
                             continue
-                        if not self.validate_create_action(action):
+                        async_validator = getattr(self, 'validate_create_action_async', None)
+                        validation = (async_validator(action) if callable(async_validator)
+                                      else self.validate_create_action(action))
+                        if inspect.isawaitable(validation):
+                            validation = await validation
+                        if not validation:
                             continue
                         if (self._is_stop_triggered or not self._controller_reports_valid or controller is None
                                 or controller.status != RunnableStatus.RUNNING or controller.config.manual_kill_switch):
                             self.logger().warning(f"Rejected queued create for stopped or unavailable controller {action.controller_id}")
                             continue
-                    self.executor_orchestrator.execute_actions([action])
+                    await self.executor_orchestrator.execute_action_async(action)
                     pending.remove(action)
+                    if isinstance(action, StoreExecutorAction):
+                        self._pending_store_action_ids.discard((action.controller_id, action.executor_id))
                     self.update_executors_info()
                 for controller_id in {action.controller_id for action in actions}:
                     controller = self.controllers.get(controller_id)
@@ -2094,6 +2272,9 @@ class StrategyV2Base(StrategyPyBase):
                 self.logger().error(f"Error executing action: {e}", exc_info=True)
             finally:
                 self._report_refused_creates(pending)
+                for action in pending:
+                    if isinstance(action, StoreExecutorAction):
+                        self._pending_store_action_ids.discard((action.controller_id, action.executor_id))
 
     def _report_refused_creates(self, actions):
         """Tell each owner which of its queued creates never became an executor.

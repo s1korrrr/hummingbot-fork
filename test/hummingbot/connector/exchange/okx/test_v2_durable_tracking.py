@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -171,7 +172,7 @@ async def test_failed_durable_commit_blocks_venue_submission(tmp_path, monkeypat
     market.start_tracking_order('owned-client', None, 'ETH-USDC', TradeType.BUY, Decimal('100'),
                                 Decimal('.09'), OrderType.LIMIT_MAKER)
     try:
-        with patch.object(recorder, 'save_market_states', side_effect=IOError('durable storage unavailable')), \
+        with patch.object(recorder, '_store_submitted_order_checkpoint', side_effect=IOError('durable storage unavailable')), \
                 patch.object(market, '_place_order', new_callable=AsyncMock) as place:
             with pytest.raises(IOError, match='storage unavailable'):
                 await market._place_order_and_process_update(market.in_flight_orders['owned-client'])
@@ -181,4 +182,43 @@ async def test_failed_durable_commit_blocks_venue_submission(tmp_path, monkeypat
             assert recorder.get_market_states(owner, market, session) is None
     finally:
         MarketsRecorder._shared_instance = prior
+        sql.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_checkpoint_waits_off_loop_for_writer_ack(tmp_path, monkeypatch):
+    monkeypatch.setenv('RSIBOT_V2_DURABLE_ORDER_TRACKING', '1')
+    market = OkxExchange('fixture', 'fixture', 'fixture', trading_pairs=['ETH-USDC'])
+    sql = SQLConnectionManager(ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                               db_path=str(tmp_path / 'held-writer.sqlite'))
+    prior = MarketsRecorder._shared_instance
+    recorder = MarketsRecorder(sql, [market], 'rsi_modular_v2.yml', 'v2_with_controllers',
+                               MarketDataCollectionConfigMap(market_data_collection_enabled=False))
+    market.start_tracking_order('held-client', None, 'ETH-USDC', TradeType.BUY, Decimal('100'),
+                                Decimal('.09'), OrderType.LIMIT_MAKER)
+    entered, release = threading.Event(), threading.Event()
+    place = AsyncMock(return_value=('exchange-held-client', 1.0))
+    try:
+        blocker = asyncio.create_task(sql.write_queue.write(
+            lambda: (entered.set(), release.wait(3))))
+        assert await asyncio.to_thread(entered.wait, 1)
+        submission = asyncio.create_task(
+            market._place_order_and_process_update(market.in_flight_orders['held-client']))
+        # The event loop remains responsive while the owner writer is blocked,
+        # and venue I/O cannot begin before the checkpoint ACK.
+        await asyncio.sleep(.03)
+        assert not submission.done()
+        with patch.object(market, '_place_order', place):
+            release.set()
+            await blocker
+            await submission
+        place.assert_awaited_once()
+        with sql.get_new_session() as session:
+            checkpoint = recorder.get_market_states(recorder.config_file_path, market, session)
+            assert checkpoint.saved_state['held-client']['last_state'] == '0'
+            assert session.get(Metadata, 'v2-submitted-order:held-client') is not None
+    finally:
+        release.set()
+        MarketsRecorder._shared_instance = prior
+        await sql.write_queue.close()
         sql.engine.dispose()

@@ -1017,3 +1017,29 @@ class InFlightOrderPyUnitTests(unittest.TestCase):
         restored = InFlightOrder.from_json(order_json)
         self.assertIsNone(restored.cancel_source)
         self.assertFalse(restored.is_open)
+
+    def test_pending_recorder_events_round_trip_and_malformed_state_fails_closed(self):
+        order = InFlightOrder(
+            client_order_id=self.client_order_id,
+            exchange_order_id=self.exchange_order_id,
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("1"),
+            creation_timestamp=10,
+            price=Decimal("2"),
+        )
+        order.recorder_pending_events["status:1"] = {
+            "identity": ["okx", self.client_order_id, "status:1"],
+            "kind": "order-status",
+            "payload": {"status": "FILLED", "timestamp": 20},
+        }
+        restored = InFlightOrder.from_json(json.loads(json.dumps(order.to_json())))
+        self.assertEqual(order.recorder_pending_events, restored.recorder_pending_events)
+
+        malformed = order.to_json()
+        malformed["recorder_pending_events"]["bad"] = {
+            "identity": ["okx"], "kind": "order-status", "payload": {}
+        }
+        with self.assertRaisesRegex(ValueError, "invalid pending recorder event"):
+            InFlightOrder.from_json(malformed)

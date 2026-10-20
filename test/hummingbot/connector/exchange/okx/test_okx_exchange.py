@@ -119,10 +119,11 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         tracker = MagicMock()
         tracker.all_fillable_orders = {order.client_order_id: order}
         tracker.all_updatable_orders = {}
+        tracker.process_trade_update_and_wait = AsyncMock(return_value=True)
         with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
                 patch.object(self.exchange, "_order_tracker", tracker):
             await self.exchange._user_stream_event_listener()
-        self.assertFalse(tracker.process_trade_update.call_args.args[0].is_taker)
+        self.assertFalse(tracker.process_trade_update_and_wait.call_args.args[0].is_taker)
 
     async def test_websocket_fill_time_is_attested_separately_from_update_time(self):
         order = InFlightOrder(
@@ -140,10 +141,11 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.exchange._set_current_timestamp(1781856002)
         tracker.all_fillable_orders = {order.client_order_id: order}
         tracker.all_updatable_orders = {}
+        tracker.process_trade_update_and_wait = AsyncMock(return_value=True)
         with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
                 patch.object(self.exchange, "_order_tracker", tracker):
             await self.exchange._user_stream_event_listener()
-        update = tracker.process_trade_update.call_args.args[0]
+        update = tracker.process_trade_update_and_wait.call_args.args[0]
         self.assertEqual(update.fill_timestamp, 1781856002)
         self.assertEqual(update.execution_timestamp_ms, 1781856001000)
         self.assertEqual(update.execution_timestamp_source, "okx.fillTime")
@@ -167,18 +169,20 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         tracker = MagicMock()
         tracker.all_fillable_orders = {order.client_order_id: order}
         tracker.all_updatable_orders = {order.client_order_id: order}
+        tracker.process_trade_update_and_wait = AsyncMock(return_value=True)
+        tracker.process_order_update_and_wait = AsyncMock()
         self.exchange._set_current_timestamp(1781856002)
         with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
                 patch.object(self.exchange, "_order_tracker", tracker):
             await self.exchange._user_stream_event_listener()
 
-        update = tracker.process_trade_update.call_args.args[0]
+        update = tracker.process_trade_update_and_wait.call_args.args[0]
         self.assertEqual(update.fill_price, Decimal(event["data"][0]["fillPx"]))
         self.assertEqual(update.fill_base_amount, Decimal(event["data"][0]["fillSz"]))
         self.assertEqual(update.fill_quote_amount, update.fill_base_amount * update.fill_price)
         self.assertIsNone(update.execution_timestamp_ms)
         self.assertIsNone(update.execution_timestamp_source)
-        order_update = tracker.process_order_update.call_args.kwargs["order_update"]
+        order_update = tracker.process_order_update_and_wait.call_args.kwargs["order_update"]
         self.assertEqual(order_update.new_state, OrderState.PARTIALLY_FILLED)
 
     async def test_preopen_instrument_is_not_mapped_as_live_rule(self):
@@ -1551,6 +1555,28 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
         self.assertNotIn(invalid_id, self.exchange.in_flight_orders)
         self.assertIn(uncertain_id, self.exchange.in_flight_orders)
         self.assertEqual([invalid_id], [event.order_id for event in self.order_failure_logger.event_log])
+
+    @aioresponses()
+    async def test_accepted_order_persistence_failure_retains_exchange_identity_without_failure_event(self, mock_api):
+        self._simulate_trading_rules_initialized()
+        mock_api.post(self.order_creation_url, payload=self.order_creation_request_successful_mock_response)
+        with patch.object(self.exchange._order_tracker, "process_order_update_and_wait",
+                          new_callable=AsyncMock, side_effect=RuntimeError("injected recorder failure")):
+            order_id = self.place_buy_order()
+
+            async def wait_for_order_id():
+                while True:
+                    order = self.exchange._order_tracker.fetch_order(order_id)
+                    if order is not None and order.exchange_order_id is not None:
+                        return
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(wait_for_order_id(), timeout=3)
+            await asyncio.sleep(0.05)
+
+        order = self.exchange.in_flight_orders[order_id]
+        self.assertEqual(str(self.expected_exchange_order_id), order.exchange_order_id)
+        self.assertFalse(order.is_failure)
+        self.assertEqual([], self.order_failure_logger.event_log)
 
     @aioresponses()
     async def test_update_order_status_when_request_fails_marks_order_as_not_found(self, mock_api):

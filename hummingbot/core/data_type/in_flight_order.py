@@ -87,6 +87,9 @@ class TradeUpdate(NamedTuple):
     execution_timestamp_ms: Optional[int] = None
     execution_timestamp_source: Optional[str] = None
     execution_timestamp_observed_at_ms: Optional[int] = None
+    # Captured locally before recorder acknowledgment waits; distinct from the
+    # exchange execution clock and preserved for exact tracker replay.
+    receipt_timestamp: Optional[float] = None
 
     @property
     def fee_asset(self):
@@ -97,6 +100,11 @@ class TradeUpdate(NamedTuple):
         is_taker = data.get("is_taker", True)
         if type(is_taker) is not bool:
             raise ValueError("TradeUpdate is_taker must be a boolean")
+        receipt_timestamp = data.get("receipt_timestamp")
+        if (receipt_timestamp is not None
+                and (type(receipt_timestamp) not in (int, float) or not math.isfinite(receipt_timestamp)
+                     or receipt_timestamp < 0)):
+            raise ValueError("TradeUpdate receipt_timestamp must be a finite non-negative number")
         raw_execution_timestamp_ms = data.get("execution_timestamp_ms")
         if "execution_timestamp_observed_at_ms" in data:
             raw_observed_at_ms = data.get("execution_timestamp_observed_at_ms")
@@ -132,6 +140,7 @@ class TradeUpdate(NamedTuple):
             execution_timestamp_ms=execution_timestamp_ms,
             execution_timestamp_source=execution_timestamp_source,
             execution_timestamp_observed_at_ms=execution_timestamp_observed_at_ms,
+            receipt_timestamp=receipt_timestamp,
         )
 
         return instance
@@ -178,6 +187,9 @@ class InFlightOrder:
         self.leverage = leverage
         self.position = position
         self.cancel_source: Optional[str] = None
+        # Recorder receipts waiting for native async persistence ACK. Entries
+        # are flat JSON DTOs keyed by a stable event key and survive restart.
+        self.recorder_pending_events: Dict[str, Dict[str, Any]] = {}
 
         self.executed_amount_base = s_decimal_0
         self.executed_amount_quote = s_decimal_0
@@ -313,6 +325,18 @@ class InFlightOrder:
         raw_cancel_source = data.get("cancel_source")
         if raw_cancel_source not in (None, ""):
             order.cancel_source = str(raw_cancel_source)
+        raw_pending_events = data.get("recorder_pending_events", {})
+        if not isinstance(raw_pending_events, dict):
+            raise ValueError("recorder_pending_events must be an object")
+        for event_key, entry in raw_pending_events.items():
+            if (not isinstance(event_key, str) or not event_key or not isinstance(entry, dict)
+                    or entry.get("kind") not in {"order-create", "order-status"}
+                    or not isinstance(entry.get("identity"), list)
+                    or len(entry["identity"]) != 3
+                    or not all(isinstance(value, str) and value for value in entry["identity"])
+                    or not isinstance(entry.get("payload"), dict)):
+                raise ValueError("invalid pending recorder event")
+            order.recorder_pending_events[event_key] = copy.deepcopy(entry)
 
         order.check_filled_condition()
         order.check_processed_by_exchange_condition()
@@ -340,6 +364,7 @@ class InFlightOrder:
             "creation_timestamp": self.creation_timestamp,
             "last_update_timestamp": self.last_update_timestamp,
             "cancel_source": self.cancel_source,
+            "recorder_pending_events": copy.deepcopy(self.recorder_pending_events),
             "order_fills": {key: fill.to_json() for key, fill in self.order_fills.items()},
             "cumulative_fee_paid_base": float(self.cumulative_fee_paid(self.base_asset)),
             "cumulative_fee_paid_quote": float(self.cumulative_fee_paid(self.quote_asset)),

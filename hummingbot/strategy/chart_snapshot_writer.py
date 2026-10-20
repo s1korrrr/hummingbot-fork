@@ -59,9 +59,9 @@ class BoundedChartSnapshotWriter:
                     error = None
                     try:
                         if phase == "write":
-                            job.recorder.store_or_update_chart_snapshots(payload)
+                            self._write_serialized(job.recorder, job.recorder.store_or_update_chart_snapshots, payload)
                         elif phase == "prune":
-                            job.recorder.prune_chart_snapshots(**payload)
+                            self._write_serialized(job.recorder, job.recorder.prune_chart_snapshots, **payload)
                         else:
                             raise ValueError("Unknown chart snapshot writer phase")
                     except Exception as exc:
@@ -74,3 +74,17 @@ class BoundedChartSnapshotWriter:
                     self._queue.task_done()
         finally:
             self._stopped.set()
+
+    def _write_serialized(self, recorder, operation, *args, **kwargs):
+        """Use the manager's single writer without blocking the strategy loop."""
+        manager = recorder._sql_manager
+        if manager is None:
+            operation(*args, **kwargs)
+            return
+        queue = manager.write_queue
+        future = asyncio.run_coroutine_threadsafe(
+            queue.write(lambda: operation(*args, **kwargs)), self._loop
+        )
+        # This wait is confined to the owned chart worker thread. The strategy
+        # loop remains free to process fills, timers, and the write completion.
+        future.result()

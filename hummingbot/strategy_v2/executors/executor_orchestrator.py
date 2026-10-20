@@ -1,4 +1,6 @@
 import asyncio
+import inspect
+import json
 import logging
 import uuid
 from collections import deque
@@ -17,6 +19,7 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.model.exact_order_values import OrderExact
 from hummingbot.model.order import Order
 from hummingbot.model.position import Position
+from hummingbot.model.sql_connection_manager import SQLWriteCancelledAfterCommit
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy_v2.controllers.native_policy_identity import is_ok_rsi_policy
 from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount, base_fee_quote_amount
@@ -302,6 +305,7 @@ class ExecutorOrchestrator:
         self.active_executors = {}
         self.stored_executors = {}
         self.positions_held = {}
+        self._pending_runtime_hold_ledgers = {}
         self.executors_ids_position_held = deque(maxlen=50)
         self.cached_performance = {}
         self._wallet_sale_receipts = {}
@@ -1950,6 +1954,96 @@ class ExecutorOrchestrator:
             self.sync_live_positions_to_db(controller_ids=controller_ids)
             self.sync_live_executors_to_db(controller_ids=controller_ids)
 
+    def snapshot_live_positions_for_db(self, *, controller_ids: Optional[Set[str]] = None):
+        """Capture mutable position and market-price state on the strategy loop."""
+        with self._executor_info_pass():
+            self._update_positions_from_done_executors(controller_ids=controller_ids, persist_hold_ledger=False)
+            selected = set(self.strategy.controllers) if controller_ids is None else set(controller_ids)
+            recorder = MarketsRecorder.get_existing_instance()
+            executor_infos = []
+            hold_ledgers = []
+            for owner_id, executors in tuple(self.active_executors.items()):
+                if owner_id not in selected:
+                    continue
+                for executor in tuple(executors):
+                    info = self._info(executor)
+                    serialized_info = info.model_dump_json()
+                    if recorder is not None and getattr(recorder, '_async_financial_events', False):
+                        executor_infos.append(recorder.capture_executor_info_payload(serialized_info))
+                    else:
+                        executor_infos.append(serialized_info)
+                    if (not self._is_unknown_wallet_sale(info)
+                            and self._has_held_position_orders(info) and info.controller_id is not None):
+                        position_side = self._determine_position_side(info)
+                        custom_info = json.loads(serialized_info).get('custom_info') or {}
+                        hold_ledgers.append({
+                            'controller_id': info.controller_id,
+                            'executor_id': info.id,
+                            'connector_name': info.connector_name,
+                            'trading_pair': info.trading_pair,
+                            'held_position_orders': custom_info.get('held_position_orders') or [],
+                            'position_side': position_side.name if position_side is not None else None,
+                            'fallback_timestamp': (info.close_timestamp if info.close_timestamp is not None
+                                                   else int(info.timestamp)),
+                        })
+                        self._pending_runtime_hold_ledgers[info.id] = hold_ledgers[-1]
+        timestamp = int(self.strategy.current_timestamp * 1e3)
+        rows = []
+        for controller_id, positions_list in tuple(self.positions_held.items()):
+            if controller_id not in selected:
+                continue
+            for position in tuple(positions_list):
+                if (position.connector_name not in self.strategy.markets
+                        or position.trading_pair not in self.strategy.markets.get(position.connector_name, set())):
+                    continue
+                mid_price = self.strategy.market_data_provider.get_price_by_type(
+                    position.connector_name, position.trading_pair, PriceType.MidPrice
+                )
+                summary = position.get_position_summary(mid_price)
+                rows.append({
+                    'id': str(uuid.uuid4()),
+                    'controller_id': controller_id,
+                    'connector_name': summary.connector_name,
+                    'trading_pair': summary.trading_pair,
+                    'side': summary.side.name,
+                    'timestamp': timestamp,
+                    'volume_traded_quote': summary.volume_traded_quote,
+                    'amount': summary.amount,
+                    'breakeven_price': summary.breakeven_price,
+                    'unrealized_pnl_quote': summary.unrealized_pnl_quote,
+                    'realized_pnl_quote': summary.realized_pnl_quote,
+                    'cum_fees_quote': summary.cum_fees_quote,
+                })
+        for pending_id, pending in self._pending_runtime_hold_ledgers.items():
+            if pending['controller_id'] in selected and not any(
+                    item['executor_id'] == pending_id for item in hold_ledgers):
+                hold_ledgers.append(pending)
+        position_sequences = (recorder.capture_live_position_snapshot_sequences(selected)
+                              if recorder is not None else {})
+        return (tuple(rows), tuple(sorted(selected)), timestamp,
+                position_sequences,
+                tuple(executor_infos), tuple(hold_ledgers))
+
+    async def persist_live_position_snapshot(self, snapshot):
+        rows, controller_ids, timestamp, position_sequences, executor_infos, hold_ledgers = snapshot
+        recorder = MarketsRecorder.get_instance()
+
+        def persist_immutable_snapshot():
+            for info_json in executor_infos:
+                if isinstance(info_json, dict):
+                    recorder._store_executor_info_payload(info_json)
+                else:
+                    recorder.store_executor_info_snapshot(info_json)
+            for ledger in hold_ledgers:
+                recorder.store_or_update_position_hold_ledger_entries(**ledger)
+            recorder.store_live_position_snapshot(rows, controller_ids, timestamp, position_sequences)
+
+        await recorder._sql_manager.write_queue.write(persist_immutable_snapshot)
+        for ledger in hold_ledgers:
+            executor_id = ledger['executor_id']
+            if self._pending_runtime_hold_ledgers.get(executor_id) == ledger:
+                self._pending_runtime_hold_ledgers.pop(executor_id, None)
+
     def execute_action(self, action: ExecutorAction):
         """
         Execute the action and handle executors based on action type.
@@ -1979,10 +2073,196 @@ class ExecutorOrchestrator:
         for action in actions:
             self.execute_action(action)
 
+    async def execute_action_async(self, action: ExecutorAction):
+        """Use durable off-loop intent writes for create and completed-store actions."""
+        if isinstance(action, CreateExecutorAction):
+            await self.create_executor_async(action)
+        elif isinstance(action, StoreExecutorAction):
+            await self.store_executor_async(action)
+        else:
+            self.execute_action(action)
+
+    async def execute_actions_async(self, actions: List[ExecutorAction]):
+        for action in actions:
+            await self.execute_action_async(action)
+
     def create_executor(self, action: CreateExecutorAction):
         """
         Create an executor based on the configuration in the action.
         """
+        prepared = self._prepare_executor_for_action(action)
+        if prepared is None:
+            return
+        executor, controller = prepared
+        # Persist intent before starting anything that can submit an order. A failed write must not start execution.
+        MarketsRecorder.get_instance().store_or_update_executor(executor)
+        self._activate_prepared_executor(executor, controller)
+
+    async def create_executor_async(self, action: CreateExecutorAction):
+        """Create only after a loop-captured intent snapshot receives commit ACK."""
+        prepared = self._prepare_executor_for_action(action, validate_controller=False)
+        if prepared is None:
+            return
+        executor, controller = prepared
+        info = executor.executor_info
+        recorder = MarketsRecorder.get_instance()
+        serialized_info = info.model_dump_json()
+        try:
+            await recorder.store_executor_info_snapshot_async(serialized_info)
+        except SQLWriteCancelledAfterCommit:
+            # The create intent exists durably but execution never started. Record
+            # that final state before surfacing cancellation to the caller.
+            terminal = self._terminalize_unstarted_executor_info(serialized_info)
+            await self._persist_terminal_intent_before_propagating(recorder, terminal)
+            raise
+        try:
+            refusal = await self._recheck_executor_activation(action, controller)
+        except asyncio.CancelledError:
+            terminal = self._terminalize_unstarted_executor_info(serialized_info)
+            await self._persist_terminal_intent_before_propagating(recorder, terminal)
+            raise
+        except Exception as admission_error:
+            terminal = self._terminalize_unstarted_executor_info(serialized_info)
+            try:
+                await self._persist_terminal_intent_before_propagating(recorder, terminal)
+            except BaseException as terminal_error:
+                raise terminal_error from admission_error
+            raise
+        if refusal is not None:
+            await self._persist_terminal_intent_before_propagating(
+                recorder, self._terminalize_unstarted_executor_info(serialized_info))
+            self.logger().warning("Executor intent durably refused before activation | controller=%s reason=%s",
+                                  action.controller_id, refusal)
+            raise RuntimeError(f"Executor admission changed after intent commit: {refusal}")
+        self._activate_prepared_executor(executor, controller)
+
+    async def _persist_terminal_intent_before_propagating(self, recorder, serialized_info):
+        """Finish the terminal intent write even if its caller is cancelled."""
+        task = asyncio.create_task(recorder.store_executor_info_snapshot_async(serialized_info))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except SQLWriteCancelledAfterCommit:
+                # The writer guarantees this signal follows a committed snapshot.
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+        if task.done() and not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                raise error
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    async def _recheck_executor_activation(self, action, prepared_controller):
+        """Refresh loop-owned entry gates after the durable intent await."""
+        strategy = self.strategy
+        if getattr(strategy, "_unattended_restart_hold", False) is True:
+            return "restart_hold"
+        if self._planned_resume_pending or getattr(strategy, "_is_stop_triggered", False) is True:
+            return "strategy_stopping_or_resume_pending"
+        if action.controller_id in getattr(strategy, "_controller_restart_required", {}):
+            return "controller_restart_required"
+        current_controller = strategy.controllers.get(action.controller_id)
+        if current_controller is not prepared_controller:
+            return "controller_ownership_changed"
+        if current_controller is not None and (
+                current_controller.status != RunnableStatus.RUNNING
+                or current_controller.config.manual_kill_switch):
+            return "controller_unavailable_or_killed"
+        if getattr(strategy, "_controller_reports_valid", None) is False:
+            return "execution_reports_unavailable"
+
+        validator = getattr(strategy, "validate_create_action_async", None)
+        if not callable(validator):
+            validator = getattr(strategy, "validate_create_action", None)
+        if callable(validator):
+            result = validator(action)
+            if inspect.isawaitable(result):
+                result = await result
+            if not result:
+                return "entry_validation_changed"
+        try:
+            self._validate_okx_wallet_reservation(action.executor_config, controller_id=action.controller_id)
+        except Exception:
+            return "wallet_reservation_changed"
+
+        # The controller validator can consume owner-local one-shot dispatch
+        # state (V1) or gate on current reports/permissions (V2/V3). Run it once,
+        # after all awaits, against fresh loop-owned reports and just before the
+        # no-await activation boundary.
+        current_controller = strategy.controllers.get(action.controller_id)
+        if current_controller is not prepared_controller:
+            return "controller_ownership_changed"
+        if current_controller is not None:
+            peers = getattr(current_controller, "_funding_peers", None)
+            report_ids = ({peer.config.id for peer in peers}
+                          if isinstance(peers, tuple) and peers else {action.controller_id})
+            reports = self.get_executors_report(controller_ids=report_ids)
+            if isinstance(peers, tuple) and peers:
+                for peer in peers:
+                    if strategy.controllers.get(peer.config.id) is not peer:
+                        return "funding_owner_identity_changed"
+                    peer.executors_info = reports.get(peer.config.id, [])
+            else:
+                current_controller.executors_info = reports.get(action.controller_id, [])
+            controller_validator = getattr(current_controller, "validate_executor_config", None)
+            if callable(controller_validator) and not controller_validator(action.executor_config):
+                return "controller_permission_changed"
+
+        # Async validation may yield while risk, operator, or cash state changes.
+        # Recheck synchronous owner latches after it returns, then activate without
+        # another await so no queued operator event can interleave before start.
+        if getattr(strategy, "_unattended_restart_hold", False) is True:
+            return "restart_hold"
+        if self._planned_resume_pending or getattr(strategy, "_is_stop_triggered", False) is True:
+            return "strategy_stopping_or_resume_pending"
+        if action.controller_id in getattr(strategy, "_controller_restart_required", {}):
+            return "controller_restart_required"
+        if strategy.controllers.get(action.controller_id) is not prepared_controller:
+            return "controller_ownership_changed"
+        if prepared_controller is not None and (
+                prepared_controller.status != RunnableStatus.RUNNING
+                or prepared_controller.config.manual_kill_switch):
+            return "controller_unavailable_or_killed"
+        if getattr(strategy, "_controller_reports_valid", None) is False:
+            return "execution_reports_unavailable"
+        try:
+            self._validate_okx_wallet_reservation(action.executor_config, controller_id=action.controller_id)
+        except Exception:
+            return "wallet_reservation_changed"
+        return None
+
+    @staticmethod
+    def _terminalize_unstarted_executor_info(serialized_info):
+        """Keep the durable intent explicit as refused, never as a resumable executor."""
+        info = json.loads(serialized_info)
+        info["status"] = RunnableStatus.TERMINATED.value
+        info["close_type"] = CloseType.FAILED.value
+        info["close_timestamp"] = float(info["timestamp"])
+        info["is_active"] = False
+        info["is_trading"] = False
+        custom_info = info.get("custom_info")
+        if not isinstance(custom_info, dict):
+            raise ValueError("Executor intent custom info is malformed")
+        custom_info["execution_started"] = False
+        custom_info["admission_refusal"] = "gate_changed_after_intent_commit"
+        return json.dumps(info, allow_nan=False, sort_keys=True)
+
+    def _activate_prepared_executor(self, executor, controller):
+        executor_config = executor.config
+        commit = getattr(controller, "commit_entry_executor", None)
+        if callable(commit):
+            commit(executor_config)
+        self.active_executors[executor_config.controller_id].append(executor)
+        if self._executor_start is None:
+            executor.start()
+        else:
+            self._executor_start(executor)
+        self.logger().debug(f"Created {type(executor).__name__} for controller {executor_config.controller_id}")
+
+    def _prepare_executor_for_action(self, action: CreateExecutorAction, *, validate_controller=True):
         if getattr(self.strategy, "_unattended_restart_hold", False) is True:
             raise RuntimeError("V2 unattended restart hold; executor creation is blocked")
         if self._planned_resume_pending:
@@ -2007,7 +2287,7 @@ class ExecutorOrchestrator:
                 raise RuntimeError(f'Unowned OKX orders require reconciliation: {unknown}')
         self._validate_okx_wallet_reservation(executor_config, controller_id=controller_id)
         controller = self.strategy.controllers.get(controller_id)
-        if controller is not None:
+        if controller is not None and validate_controller:
             if getattr(self.strategy, "_controller_reports_valid", None) is False:
                 raise RuntimeError("Current execution reports are unavailable")
             peers = getattr(controller, '_funding_peers', None)
@@ -2030,7 +2310,7 @@ class ExecutorOrchestrator:
                     getattr(controller, '_funding_assessment_hold', None)
                     or getattr(controller, '_funding_hold', None),
                     getattr(controller, '_recovery_fault', None) or getattr(controller, '_recovery_hold', None))
-                return
+                return None
         executor_config.controller_id = controller_id
 
         executor_class = self._resolve_executor_class(controller_id, executor_config)
@@ -2044,17 +2324,7 @@ class ExecutorOrchestrator:
         else:
             raise ValueError("Unsupported executor config type")
 
-        # Persist intent before starting anything that can submit an order. A failed write must not start execution.
-        MarketsRecorder.get_instance().store_or_update_executor(executor)
-        commit = getattr(controller, "commit_entry_executor", None)
-        if callable(commit):
-            commit(executor_config)
-        self.active_executors[controller_id].append(executor)
-        if self._executor_start is None:
-            executor.start()
-        else:
-            self._executor_start(executor)
-        self.logger().debug(f"Created {type(executor).__name__} for controller {controller_id}")
+        return executor, controller
 
     def _validate_okx_wallet_reservation(self, config, *, controller_id=None):
         if getattr(config, "connector_name", None) != "okx" or config.type not in {"position_executor", "order_executor"}:
@@ -2158,7 +2428,8 @@ class ExecutorOrchestrator:
                 f"Executor stop requested | controller={controller_id} executor={executor_id} "
                 f"keep_position={action.keep_position} filled_base={filled} pending_close_type={pending}")
 
-    def _update_positions_from_done_executors(self, *, controller_ids: Optional[Set[str]] = None):
+    def _update_positions_from_done_executors(self, *, controller_ids: Optional[Set[str]] = None,
+                                              persist_hold_ledger: bool = True):
         """
         Update positions from executors that are done but haven't been processed yet.
         This is called before generating reports to ensure position state is current.
@@ -2181,7 +2452,8 @@ class ExecutorOrchestrator:
             for executor in executors_to_process:
                 executor_info = self._info(executor)
                 self.executors_ids_position_held.append(executor_info.config.id)
-                self._persist_position_hold_entries_from_executor_info(executor_info)
+                if persist_hold_ledger:
+                    self._persist_position_hold_entries_from_executor_info(executor_info)
                 # Order-executor fills are never executor-owned, so trade-fill reconciliation
                 # already carries them (keyed per fill). Re-applying the order record here
                 # would subtract a sale twice until the next rebuild, and a sync in between
@@ -2271,6 +2543,39 @@ class ExecutorOrchestrator:
         self.active_executors[controller_id].remove(executor)
         del executor
         # Trigger garbage collection after executor cleanup
+
+    async def store_executor_async(self, action: StoreExecutorAction):
+        """Commit executor and held-position projections before releasing memory ownership."""
+        controller_id = action.controller_id
+        executor_id = action.executor_id
+        executor = next(
+            (item for item in self.active_executors.get(controller_id, []) if item.config.id == executor_id),
+            None,
+        )
+        if executor is None:
+            self.logger().error("Executor ID %s not found for controller %s.", executor_id, controller_id)
+            return
+        if executor.is_active:
+            self.logger().error("Executor ID %s is still active.", executor_id)
+            return
+
+        info = executor.executor_info
+        recorder = MarketsRecorder.get_instance()
+        await recorder.store_executor_info_snapshot_async(info.model_dump_json())
+        if not self._is_unknown_wallet_sale(info) and self._has_held_position_orders(info) and info.controller_id:
+            position_side = self._determine_position_side(info)
+            await recorder.store_position_hold_ledger_entries_async(
+                controller_id=info.controller_id,
+                executor_id=info.id,
+                connector_name=info.connector_name,
+                trading_pair=info.trading_pair,
+                held_position_orders=(info.custom_info or {}).get("held_position_orders") or [],
+                position_side=position_side.name if position_side is not None else None,
+                fallback_timestamp=(info.close_timestamp if info.close_timestamp is not None else int(info.timestamp)),
+            )
+        self._update_cached_performance(controller_id, info)
+        self._record_stored_executor(controller_id, info)
+        self.active_executors[controller_id].remove(executor)
 
     def get_executors_report(self, *, controller_ids: Optional[Set[str]] = None) -> Dict[str, List[ExecutorInfo]]:
         """

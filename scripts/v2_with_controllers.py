@@ -513,13 +513,21 @@ class V2WithControllers(StrategyV2Base):
         pair = pair or getattr(controller.config, 'trading_pair', None) or 'PORTFOLIO'
         issues = []
         hold_reason = 'none'
+        issue_since = getattr(self, '_native_buy_issue_since', None)
+        if issue_since is None:
+            issue_since = self._native_buy_issue_since = {}
+        active_issue_codes = set()
 
         def issue(code, detail, at=None):
-            issues.append({'code': code, 'controller_id': controller_id, 'pair': pair,
-                           'last_failure_at': (datetime.fromtimestamp(at, timezone.utc).isoformat()
-                                               if isinstance(at, (int, float)) else observed_at),
-                           'detail': str(detail)[:160],
-                           'operator_action': 'Inspect native admission receipts and reconcile the refused intent before retrying.'})
+            active_issue_codes.add(code)
+            since = issue_since.setdefault((controller_id, code), at if isinstance(at, (int, float)) else now)
+            record = {'code': code, 'controller_id': controller_id, 'pair': pair,
+                      'since': datetime.fromtimestamp(since, timezone.utc).isoformat(),
+                      'detail': str(detail)[:160],
+                      'operator_action': 'Inspect native admission receipts and reconcile the refused intent before retrying.'}
+            if isinstance(at, (int, float)):
+                record['last_failure_at'] = datetime.fromtimestamp(at, timezone.utc).isoformat()
+            issues.append(record)
 
         if isinstance(outcome, dict):
             last_failure = outcome.get('last_failure_at')
@@ -573,6 +581,9 @@ class V2WithControllers(StrategyV2Base):
         funding_store = getattr(controller, '_funding_store', None)
         unverified = (getattr(controller.config, 'funding', None) is not None
                       and not getattr(funding_store, 'status', None))
+        for key in list(issue_since):
+            if key[0] == controller_id and key[1] not in active_issue_codes:
+                issue_since.pop(key)
         status = 'blocked' if issues else 'unavailable' if unverified else 'healthy'
         return {'schema_version': 1, 'status': status,
                 'hold_reason': 'system' if status != 'healthy' else hold_reason, 'observed_at': observed_at,

@@ -231,6 +231,14 @@ def test_native_buy_failure_for_one_v3_pair_survives_another_pairs_activation():
     assert strategy._native_buy_admission(controller, outcomes)['status'] == 'healthy'
     assert strategy._native_buy_issue_since == {}
 
+    controller.contexts = {'SOL-USDC': SimpleNamespace(runtime=SimpleNamespace(fault='inventory_inconsistent'))}
+    symbol = strategy._native_buy_admission(controller, outcomes)
+    assert symbol['status'] == 'blocked'
+    assert [(issue['code'], issue['pair']) for issue in symbol['issues']] == [
+        ('symbol_runtime_fault', 'SOL-USDC')]
+    controller.contexts['SOL-USDC'].runtime.fault = None
+    assert strategy._native_buy_admission(controller, outcomes)['status'] == 'healthy'
+
 
 def test_native_runtime_snapshot_projects_exact_pair_failure_without_sql_read():
     from test.meridian_v3.test_unified_runtime import OWNER, unified

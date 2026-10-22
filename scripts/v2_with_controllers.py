@@ -557,6 +557,12 @@ class V2WithControllers(StrategyV2Base):
         portfolio = getattr(controller, 'portfolio', None)
         if getattr(portfolio, 'identity_hold', None):
             issue('portfolio_identity_unavailable', portfolio.identity_hold)
+        contexts = getattr(controller, 'contexts', None)
+        if isinstance(contexts, dict):
+            for symbol, context in contexts.items():
+                symbol_fault = getattr(getattr(context, 'runtime', None), 'fault', None)
+                if symbol_fault:
+                    issue('symbol_runtime_fault', symbol_fault, pair=symbol)
         gate = getattr(controller, '_entry_decision_gate', None)
         state = getattr(gate, 'last_state', None)
         auth = state.get('authorization') if isinstance(state, dict) else None

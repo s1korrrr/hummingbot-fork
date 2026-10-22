@@ -13,6 +13,7 @@ import pytest
 from controllers.generic.modular_spot_core.native_funding import NativeFundingStore
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.model.order import Order
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 from hummingbot.strategy_v2.paper_session import NativePaperSession
@@ -149,7 +150,7 @@ async def test_v3_factory_dispatch_is_revalidated_without_consuming_it_twice(tmp
                     if item.config.trading_pair == BTC] == [action.executor_config.id]
             assert not scenario.controller.validate_executor_config(action.executor_config)
             orchestrator._note_native_buy_outcome(action)
-            outcome = orchestrator._native_buy_outcomes[action.controller_id]
+            outcome = orchestrator._native_buy_outcomes[action.controller_id][BTC]
             assert outcome['failure_count'] == 0
             assert outcome['last_activated_at'] is not None
             with patch('time.time', side_effect=[2000.0, 900.0]):
@@ -176,16 +177,16 @@ def test_native_buy_health_retains_system_refusal_until_progress_and_detects_sta
     outcome = {'failure_count': 1, 'last_failure_at': 1000.0, 'last_failure_sequence': 2,
                'last_failure_code': 'controller_permission_changed', 'last_activated_at': 2000.0,
                'last_activated_sequence': 1}
-    first = strategy._native_buy_admission(controller, outcome)
+    first = strategy._native_buy_admission(controller, {'BTC-USDC': outcome})
     assert first['status'] == 'blocked' and first['hold_reason'] == 'system'
     assert [issue['code'] for issue in first['issues']] == ['native_buy_create_refused']
     controller._last_evaluated_candle_timestamp = 200
-    second = strategy._native_buy_admission(controller, outcome)
+    second = strategy._native_buy_admission(controller, {'BTC-USDC': outcome})
     assert [issue['code'] for issue in second['issues']] == [
         'native_buy_create_refused', 'durable_buy_authorization_unresolved']
     assert first['issues'][0]['since'] == second['issues'][0]['since']
     auth_since = second['issues'][1]['since']
-    assert strategy._native_buy_admission(controller, outcome)['issues'][1]['since'] == auth_since
+    assert strategy._native_buy_admission(controller, {'BTC-USDC': outcome})['issues'][1]['since'] == auth_since
     controller._funding_hold = 'Native BUY lacks immutable funding admission'
     exact = strategy._native_buy_admission(controller, None)
     assert exact['status'] == 'blocked' and exact['hold_reason'] == 'system'
@@ -194,7 +195,7 @@ def test_native_buy_health_retains_system_refusal_until_progress_and_detects_sta
     controller._entry_decision_gate.last_state['authorization'] = None
     outcome['last_activated_at'] = 900.0  # The wall clock moved backward after actual progress.
     outcome['last_activated_sequence'] = 3
-    cleared = strategy._native_buy_admission(controller, outcome)
+    cleared = strategy._native_buy_admission(controller, {'BTC-USDC': outcome})
     assert cleared['status'] == 'healthy' and cleared['issues'] == []
     assert cleared['failure_count'] == 1
     assert cleared['last_failure_at'] is not None and cleared['last_activated_at'] is not None
@@ -206,3 +207,51 @@ def test_native_buy_health_retains_system_refusal_until_progress_and_detects_sta
     controller.operator_entry_paused = True
     operator = strategy._native_buy_admission(controller, None)
     assert operator['status'] == 'healthy' and operator['hold_reason'] == 'operator'
+
+
+def test_native_buy_failure_for_one_v3_pair_survives_another_pairs_activation():
+    strategy = V2WithControllers.__new__(V2WithControllers)
+    controller = SimpleNamespace(config=SimpleNamespace(id='v3', manual_kill_switch=False),
+                                 entries_held=lambda: None)
+    btc = {'failure_count': 1, 'last_failure_at': 1000.0,
+           'last_failure_code': 'controller_permission_changed',
+           'last_failure_sequence': 1, 'last_activated_sequence': 0, 'last_activated_at': None}
+    eth = {'failure_count': 0, 'last_failure_at': None, 'last_failure_code': None,
+           'last_failure_sequence': 0, 'last_activated_sequence': 1, 'last_activated_at': 1001.0}
+    outcomes = {'BTC-USDC': btc, 'ETH-USDC': eth}
+    blocked = strategy._native_buy_admission(controller, outcomes)
+    assert blocked['status'] == 'blocked'
+    assert [(issue['code'], issue['pair']) for issue in blocked['issues']] == [
+        ('native_buy_create_refused', 'BTC-USDC')]
+    eth['last_activated_at'] = 1002.0
+    eth['last_activated_sequence'] = 2
+    assert strategy._native_buy_admission(controller, outcomes)['issues'][0]['pair'] == 'BTC-USDC'
+    btc['last_activated_at'] = 900.0  # Clock regression cannot hide the BTC progress.
+    btc['last_activated_sequence'] = 2
+    assert strategy._native_buy_admission(controller, outcomes)['status'] == 'healthy'
+    assert strategy._native_buy_issue_since == {}
+
+
+def test_native_runtime_snapshot_projects_exact_pair_failure_without_sql_read():
+    from test.meridian_v3.test_unified_runtime import OWNER, unified
+
+    strategy = V2WithControllers.__new__(V2WithControllers)
+    config = unified(execution_enabled=True)
+    controller = SimpleNamespace(config=config, entries_held=lambda: None)
+    strategy.controllers = {OWNER: controller}
+    strategy._daily_entry_risk = None
+    strategy._entry_risk_enrollment = None
+    strategy.executor_orchestrator = SimpleNamespace(_native_buy_outcomes={OWNER: {
+        'BTC-USDC': {'failure_count': 1, 'last_failure_at': 1000.0,
+                     'last_failure_code': 'controller_permission_changed',
+                     'last_failure_sequence': 1, 'last_activated_sequence': 0,
+                     'last_activated_at': None}}})
+    snapshot = {'controllers': [{'controller_id': OWNER}], 'schema_version': 1}
+    recorder = SimpleNamespace(_async_financial_events=True)
+    with patch.object(StrategyV2Base, '_build_runtime_status_snapshot', return_value=snapshot), \
+            patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+        result = strategy._build_runtime_status_snapshot()
+    admission = result['controllers'][0]['native_buy_admission']
+    assert admission['schema_version'] == 1 and admission['status'] == 'blocked'
+    assert admission['issues'][0]['pair'] == 'BTC-USDC'
+    assert admission['issues'][0]['last_failure_at'].endswith('+00:00')

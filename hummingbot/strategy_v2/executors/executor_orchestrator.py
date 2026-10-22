@@ -2158,12 +2158,12 @@ class ExecutorOrchestrator:
         outcomes = getattr(self, "_native_buy_outcomes", None)
         if outcomes is None:
             outcomes = self._native_buy_outcomes = {}
-        state = outcomes.setdefault(action.controller_id, {"failure_count": 0, "last_failure_at": None,
-                                                           "last_failure_code": None, "last_activated_at": None,
-                                                           "pair": None, "sequence": 0,
-                                                           "last_failure_sequence": 0,
-                                                           "last_activated_sequence": 0})
-        state["pair"] = action.executor_config.trading_pair
+        by_pair = outcomes.setdefault(action.controller_id, {})
+        pair = action.executor_config.trading_pair
+        state = by_pair.setdefault(pair, {"failure_count": 0, "last_failure_at": None,
+                                          "last_failure_code": None, "last_activated_at": None,
+                                          "sequence": 0, "last_failure_sequence": 0,
+                                          "last_activated_sequence": 0})
         state["sequence"] += 1
         if error is None:
             state["last_activated_at"] = time()

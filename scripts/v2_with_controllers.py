@@ -523,10 +523,9 @@ class V2WithControllers(StrategyV2Base):
 
         if isinstance(outcome, dict):
             last_failure = outcome.get('last_failure_at')
-            last_success = outcome.get('last_activated_at')
             code = outcome.get('last_failure_code')
             if isinstance(last_failure, (int, float)) and (
-                    not isinstance(last_success, (int, float)) or last_success < last_failure):
+                    outcome.get('last_failure_sequence', 0) > outcome.get('last_activated_sequence', 0)):
                 if code in ('wallet_reservation_changed',):
                     hold_reason = 'cash'
                 elif code in ('controller_unavailable_or_killed', 'restart_hold'):

@@ -78,6 +78,40 @@ class NativePaperFundingTests(IsolatedAsyncioTestCase):
                                                              connector_name='okx', trading_pair=PAIR, interval='1m', frame=frame, available_at=now)])
         return result
 
+    async def test_paper_driver_finishes_initial_assessment_before_first_buy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [funded_config()], Path(directory) / 'paper.sqlite')
+            try:
+                await self.seed(session)
+                owner = next(iter(session.controllers.values()))
+                self.assertEqual(len(session.executor_orchestrator.active_executors[owner.config.id]), 1)
+                self.assertIsNone(owner._funding_assessment_hold)
+                self.assertIsNone(owner._funding_assessment_task)
+                self.assertIsNone(owner._funding_assessment_future)
+                self.assertTrue(owner._funding_assessment_result)
+            finally:
+                await session.close()
+            self.assertIsNone(owner._funding_assessment_task)
+            self.assertIsNone(owner._funding_assessment_future)
+
+    async def test_paper_driver_holds_invalid_revision_proof_without_starting_worker(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            session = NativePaperSession(paper(), [funded_config()], Path(directory) / 'paper.sqlite')
+            try:
+                invalid = SimpleNamespace(assess_with_revision_check=lambda: {'revision_verified': False})
+                with patch.object(NativeFundingStore, 'assessment_snapshot', return_value=invalid):
+                    await self.seed(session)
+                owner = next(iter(session.controllers.values()))
+                self.assertIn('revision proof', owner._funding_assessment_hold)
+                self.assertIsNone(owner._funding_assessment_task)
+                self.assertIsNone(owner._funding_assessment_future)
+                self.assertEqual(session.executor_orchestrator.active_executors[owner.config.id], [])
+            finally:
+                await session.close()
+            self.assertIsNone(owner._funding_assessment_task)
+            self.assertIsNone(owner._funding_assessment_future)
+
     async def test_actual_native_dispatch_rejects_unaffordable_entry_before_order(self):
         with tempfile.TemporaryDirectory() as directory:
             session = NativePaperSession(paper(), [funded_config('10')], Path(directory) / 'paper.sqlite')

@@ -513,6 +513,9 @@ class NativePaperSession:
                                                                           'reason': 'public_book_unavailable'}}
                 continue
             await controller.update_processed_data()
+            prepare_funding = getattr(controller, 'prepare_paper_funding_assessment', None)
+            if callable(prepare_funding):
+                prepare_funding()
             actions.extend(controller.determine_executor_actions())
         actions.extend(self._store_actions(fresh_ids))
         self._validate_actions(actions)

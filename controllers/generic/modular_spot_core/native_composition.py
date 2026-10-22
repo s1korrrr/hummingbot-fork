@@ -428,6 +428,62 @@ class NativeComposition:
             self.processed_data = {'signal': 0, 'features': pd.DataFrame(),
                                    'data_health': {'ready': False, 'reason': type(exc).__name__}}
 
+    def prepare_paper_funding_assessment(self):
+        """Run the native funding read before a deterministic paper action pass."""
+        if self.config.funding is None:
+            return
+        task = getattr(self, '_funding_assessment_task', None)
+        future = getattr(self, '_funding_assessment_future', None)
+        if ((task is not None and not task.done()) or (future is not None and not future.done())):
+            self._funding_assessment_hold = 'Native funding assessment is still running in paper session'
+            self._funding_assessment_error = self._funding_assessment_hold
+            self._funding_assessment_refresh_pending = False
+            return
+        self._funding_assessment_task = None
+        self._funding_assessment_future = None
+
+        now = self.market_data_provider.time()
+        previous = getattr(self, '_funding_assessed_at', None)
+        if (previous is not None and 0 <= now - previous < 5
+                and self._has_current_funding_assessment()):
+            return
+        try:
+            if self._funding_store is None:
+                from hummingbot.connector.markets_recorder import MarketsRecorder
+                recorder = MarketsRecorder.get_existing_instance()
+                if recorder is None:
+                    raise DataUnavailable('Native recorder required for funding assessment')
+                self._funding_store = NativeFundingStore(self, recorder)
+            store = self._funding_store
+            store.prepare_runtime_binding()
+            binding = store.binding
+            generation = self._funding_assessment_generation
+            config_digest = configuration_digest(self.config.model_dump(mode='json'))
+            source_hash = self._native_source_hash
+            status = store.assessment_snapshot().assess_with_revision_check()
+            if status.pop('revision_verified', None) is not True:
+                raise RuntimeError('Funding assessment revision proof is missing or invalid')
+            if not self._funding_assessment_current(store, binding, config_digest, source_hash, generation):
+                raise RuntimeError('Native funding assessment became stale; refresh required')
+            completed_at = self.market_data_provider.time()
+            status['observed_at'] = now
+            status['completed_at'] = completed_at
+            age = completed_at - now
+            status['assessment_age_seconds'] = age
+            status['freshness'] = 'fresh' if 0 <= age < 5 else 'stale'
+            store.status = status
+            self._funding_assessment_context = (store, binding, config_digest, source_hash, generation)
+            self._funding_assessment_result = dict(status)
+            self._funding_assessment_refresh_pending = False
+            self._funding_assessment_error = None
+            self._funding_assessed_at = completed_at
+            self._funding_assessment_hold = None
+        except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError, SQLAlchemyError) as error:
+            self._funding_assessment_hold = str(error) or type(error).__name__
+            self._funding_assessment_error = self._funding_assessment_hold
+            self._funding_assessment_refresh_pending = False
+            self._funding_assessed_at = now
+
     def _refresh_funding_assessment(self):
         """Prepare binding on-loop, then fairly queue one immutable read assessment."""
         if self.config.funding is None:

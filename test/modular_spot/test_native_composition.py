@@ -318,6 +318,8 @@ def test_native_partial_cancel_late_fill_retains_identical_exposure_and_trail(
 
 def test_rsi_v5_held_recovery_high_water_and_sell_action_match_while_entries_disabled(recorder):
     wrapped, legacy = controllers(*FAMILIES[1], use_bag_freeze=False, early_stop_drawdown_pct=D('0'))
+    wrapped._funding_assessment_hold = 'Native funding assessment pending'
+    legacy._funding_assessment_hold = 'Native funding assessment pending'
     assert wrapped.determine_executor_actions() == []  # Establish the new owner while native inventory is flat.
     persist_position(recorder, wrapped.config.id)
     for owner in (wrapped, legacy):

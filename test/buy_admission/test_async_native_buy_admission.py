@@ -5,6 +5,7 @@ from test.hummingbot.strategy_v2.paper.test_paper_funding import funded_config, 
 from test.hummingbot.strategy_v2.paper.test_paper_session import PAIR, causal_reversal_frames
 from test.meridian_v3.lifecycle_harness import Scenario, creates, rebound
 from test.meridian_v3.test_unified_lifecycle import BTC
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -28,6 +29,14 @@ async def _capture_funded_action(session):
     try:
         for index, frame in enumerate(causal_reversal_frames()):
             now = 600000 + index * 60
+            owner = next(iter(session.controllers.values()))
+            owner._funding_assessed_at = None
+            owner._refresh_funding_assessment()
+            assessment = owner._funding_assessment_task
+            if assessment is not None:
+                await assessment
+            assert owner._funding_assessment_hold is None
+            owner._funding_assessed_at = now
             book = dict(trading_pair=PAIR, sequence=2 + index, timestamp=now,
                         bids=[(90, 10)], asks=[(90.1, 10)])
             candle = dict(connector_name='okx', trading_pair=PAIR, interval='1m', frame=frame, available_at=now)
@@ -43,17 +52,50 @@ async def test_v2_funds_exact_committed_native_intent_before_activation(tmp_path
     MarketsRecorder._shared_instance = None
     with patch('socket.socket.connect', side_effect=AssertionError('network forbidden')):
         session = NativePaperSession(paper(), [funded_config()], tmp_path / 'funded.sqlite')
+        release = None
         try:
             orchestrator = session.executor_orchestrator
             [action] = await _capture_funded_action(session)
             owner = session.controllers[action.controller_id]
             assert session.recorder.get_all_executors() == []
-            await orchestrator.create_executor_async(action)
+            started, release = Event(), Event()
+            original_snapshot = NativeFundingStore.assessment_snapshot
+
+            class BlockedPeriodicSnapshot:
+                def __init__(self, snapshot):
+                    self.snapshot = snapshot
+                    self.binding = snapshot.binding
+
+                def assess_with_revision_check(self):
+                    result = self.snapshot.assess()
+                    started.set()
+                    if not release.wait(2):
+                        raise RuntimeError('test reader was not released')
+                    _, latest = self.snapshot._load(allow_code_upgrade=False)
+                    result['revision_verified'] = latest['revision'] == result['revision']
+                    return result
+
+            with patch.object(NativeFundingStore, 'assessment_snapshot',
+                              lambda store: BlockedPeriodicSnapshot(original_snapshot(store))):
+                owner._funding_assessed_at = None
+                owner._refresh_funding_assessment()
+                assert await asyncio.to_thread(started.wait, 1)
+                assert owner._funding_assessment_refresh_pending is True
+                assert owner._funding_assessment_hold is None
+                await orchestrator.create_executor_async(action)
+                assert [item.config.id for item in orchestrator.active_executors[action.controller_id]] == [
+                    action.executor_config.id]
+                release.set()
+                await asyncio.wait_for(owner._funding_assessment_task, 1)
+                assert owner._funding_assessment_hold is None
+                assert owner._funding_assessment_refresh_pending is False
             assert [item.config.id for item in orchestrator.active_executors[action.controller_id]] == [action.executor_config.id]
             _, state = owner._funding_store._load()
             assert action.executor_config.id in state['claims']
             assert owner._committed_create_intent is None
         finally:
+            if release is not None:
+                release.set()
             await session.close()
             MarketsRecorder._shared_instance = previous
 

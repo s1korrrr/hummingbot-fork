@@ -56,6 +56,17 @@ async def test_actual_native_pairs_share_budget_and_retain_partial_fill_across_r
         try:
             for i, frame in enumerate(causal_reversal_frames()):
                 now = 600000 + i * 60
+                # The paper clock advances by a minute per frame. Await each
+                # read-only assessment so the fixture tests funded decisions,
+                # not a worker that production would finish before the next frame.
+                for owner in session.controllers.values():
+                    owner._funding_assessed_at = None
+                    owner._refresh_funding_assessment()
+                    pending_assessment = owner._funding_assessment_task
+                    if pending_assessment is not None:
+                        await pending_assessment
+                    assert owner._funding_store.status['assessment'] == 'read_only_native_evidence'
+                    owner._funding_assessed_at = now
                 await session.step(now, books=[dict(trading_pair=p, sequence=i + 1, timestamp=now,
                                                     bids=[(90, 10)], asks=[(90.1, 10)]) for p in pairs], candles=[dict(connector_name='okx',
                                                                                                                        trading_pair=p, interval='1m', frame=frame, available_at=now) for p in pairs])

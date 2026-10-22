@@ -4,9 +4,11 @@ One recorder/strategy envelope. Allocation and per-position quote are yaml-set.
 The default remains one controller/pair; strategy scope binds every native peer.
 This does not reserve funds from independent processes sharing the wallet.
 """
+import copy
 import json
 import re
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Literal
 
 from pydantic import Field
@@ -854,6 +856,78 @@ class NativeFundingStore:
                 'inventory_cost': str(projection['inventory_cost']),
                 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
                 'available_quote': str(self._available_quote(projection, pending))}
+
+    def assess_with_revision_check(self):
+        """Reject a read snapshot crossed by a durable funding checkpoint write."""
+        status = self.assess()
+        _, latest = self._load(allow_code_upgrade=False)
+        status['revision_verified'] = latest['revision'] == status['revision']
+        return status
+
+    def assessment_snapshot(self):
+        """Freeze controller-owned inputs and isolate recorder reads for worker assessment.
+
+        The read-only assessment still uses this store's validation and projection
+        code. The snapshot prevents the worker from traversing live controller or
+        connector objects, and the recorder adapter always opens fresh SQL sessions
+        instead of observing a synchronous decision's process-local read cache.
+        """
+        from hummingbot.model.executors import Executors
+
+        owners = {}
+        for controller_id, owner in self.owners.items():
+            config = owner.config.model_copy(deep=True)
+            connector = owner.market_data_provider.connectors[config.connector_name]
+            balance = (connector.get_available_balance('USDC')
+                       if self.policy.allocation_quote is None else ZERO)
+            orders = {}
+            for order_id, order in connector._order_tracker.all_orders.items():
+                orders[order_id] = SimpleNamespace(
+                    order_fills=set(order.order_fills),
+                    is_done=order.is_done,
+                    executed_amount_base=order.executed_amount_base,
+                    exchange_order_id=order.exchange_order_id,
+                )
+            connector_view = SimpleNamespace(
+                display_name=connector.display_name,
+                get_available_balance=lambda asset, value=balance: value if asset == 'USDC' else ZERO,
+                _order_tracker=SimpleNamespace(all_orders=orders),
+            )
+            owner_view = SimpleNamespace(
+                config=config,
+                executors_info=[info.model_copy(deep=True) for info in owner.executors_info],
+                positions_held=copy.deepcopy(owner.positions_held),
+                _native_source_hash=owner._native_source_hash,
+                _composition_digest=owner._composition_digest,
+                _composition_unchanged=lambda value=owner._composition_unchanged(): value,
+                market_data_provider=SimpleNamespace(connectors={config.connector_name: connector_view}),
+            )
+            owners[controller_id] = owner_view
+        peers = tuple(owners[key] for key in sorted(owners))
+        for owner in peers:
+            owner._funding_peers = peers
+
+        class FreshReadRecorder:
+            def __init__(self, recorder):
+                self._recorder = recorder
+                self.config_file_path = recorder.config_file_path
+                self.sql_manager = recorder.sql_manager
+
+            def __getattr__(self, name):
+                return getattr(self._recorder, name)
+
+            def get_all_executors(self):
+                with self.sql_manager.get_new_session() as session:
+                    rows = session.query(Executors).all()
+                    return [row.to_executor_info() for row in rows]
+
+        snapshot = copy.copy(self)
+        snapshot.owner = owners[self.owner.config.id]
+        snapshot.owners = owners
+        snapshot._binding_peers = peers
+        snapshot.policy = self.policy.model_copy(deep=True)
+        snapshot.recorder = FreshReadRecorder(self.recorder)
+        return snapshot
 
     def admit(self, executor_config, *, committed_intent_config=None):
         config = self.owner.config

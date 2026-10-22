@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import importlib
 import inspect
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -28,6 +29,8 @@ from .native_recovery import NativeRecoveryStore
 from .recipe_contract import RecipeBinding, configuration_digest, source_digest, verify_binding
 
 FAMILIES = {'ok_rsi': 'modular_ok_rsi', 'rsi_v5': 'modular_rsi_v5'}
+_FUNDING_ASSESSMENT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix='native-funding-read')
+_FUNDING_ASSESSMENT_STOP_WAIT_SECONDS = 2.0
 
 
 def source_root():
@@ -323,6 +326,13 @@ class NativeComposition:
         self._funding_store = None
         self._funding_hold = None
         self._funding_assessment_hold = None
+        self._funding_assessment_task = None
+        self._funding_assessment_future = None
+        self._funding_assessment_generation = 0
+        self._funding_assessment_context = None
+        self._funding_assessment_result = None
+        self._funding_assessment_refresh_pending = False
+        self._funding_assessment_error = None
         self._recovery_store = None
         self._recovery_hold = None
         self._recovery_fault = None
@@ -346,6 +356,15 @@ class NativeComposition:
     def start(self):
         if self.status != RunnableStatus.RUNNING:
             self._assert_control_loop_stopped()
+            task = getattr(self, '_funding_assessment_task', None)
+            future = getattr(self, '_funding_assessment_future', None)
+            if ((task is not None and not task.done())
+                    or (future is not None and not future.done())):
+                raise RuntimeError('Modular native funding assessment is still stopping; retry after it finishes')
+            self._funding_assessment_task = None
+            self._funding_assessment_future = None
+            self._funding_assessment_generation += 1
+            self._funding_assessed_at = None
             task = getattr(self, '_reader_close_task', None)
             if task is not None and not task.done():
                 raise RuntimeError('Modular native candle reader is still stopping; retry after it finishes')
@@ -358,6 +377,11 @@ class NativeComposition:
         super().start()
 
     def on_stop(self):
+        self._funding_assessment_generation += 1
+        future = getattr(self, '_funding_assessment_future', None)
+        if future is not None and not future.running():
+            future.cancel()
+            self._funding_assessed_at = None
         try:
             if self.shared_candles is not None:
                 close = self.shared_candles.pool.close()
@@ -380,6 +404,13 @@ class NativeComposition:
         try:
             await super().control_loop()
         finally:
+            task = getattr(self, '_funding_assessment_task', None)
+            if task is not None and not task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), _FUNDING_ASSESSMENT_STOP_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    self.logger().error(
+                        'Modular native funding assessment is still running; restart is held until it finishes')
             task = getattr(self, '_reader_close_task', None)
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
@@ -398,14 +429,22 @@ class NativeComposition:
                                    'data_health': {'ready': False, 'reason': type(exc).__name__}}
 
     def _refresh_funding_assessment(self):
-        """Prepare the runtime source binding, then inspect funding before a signal."""
+        """Prepare binding on-loop, then fairly queue one immutable read assessment."""
         if self.config.funding is None:
+            return
+        current_task = getattr(self, '_funding_assessment_task', None)
+        current_future = getattr(self, '_funding_assessment_future', None)
+        if ((current_task is not None and not current_task.done())
+                or (current_future is not None and not current_future.done())):
+            if self._has_current_funding_assessment():
+                self._funding_assessment_refresh_pending = True
+            else:
+                self._funding_assessment_hold = 'Native funding assessment pending'
             return
         now = self.market_data_provider.time()
         previous = getattr(self, '_funding_assessed_at', None)
         if previous is not None and 0 <= now - previous < 5:
             return
-        self._funding_assessed_at = now
         try:
             if self._funding_store is None:
                 from hummingbot.connector.markets_recorder import MarketsRecorder
@@ -414,11 +453,150 @@ class NativeComposition:
                     raise DataUnavailable('Native recorder required for funding assessment')
                 self._funding_store = NativeFundingStore(self, recorder)
             self._funding_store.prepare_runtime_binding()
-            self._funding_store.status = self._funding_store.assess()
-            self._funding_store.status['observed_at'] = now
-            self._funding_assessment_hold = None
+            store = self._funding_store
+            config_digest = configuration_digest(self.config.model_dump(mode='json'))
+            source_hash = self._native_source_hash
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is None:
+                status = store.assess()
+                completed_at = self.market_data_provider.time()
+                status['observed_at'] = now
+                status['completed_at'] = completed_at
+                status['assessment_age_seconds'] = completed_at - now
+                status['freshness'] = 'fresh' if 0 <= completed_at - now < 5 else 'stale'
+                store.status = status
+                self._funding_assessment_context = (
+                    store, store.binding, config_digest, source_hash, self._funding_assessment_generation)
+                self._funding_assessment_result = dict(status)
+                self._funding_assessment_refresh_pending = False
+                self._funding_assessment_error = None
+                self._funding_assessed_at = completed_at
+                self._funding_assessment_hold = None
+                return
+            snapshot = store.assessment_snapshot()
+            generation = self._funding_assessment_generation
+            future = _FUNDING_ASSESSMENT_EXECUTOR.submit(snapshot.assess_with_revision_check)
+            self._funding_assessed_at = now
+            self._funding_assessment_future = future
+            self._funding_assessment_refresh_pending = self._has_current_funding_assessment(
+                store=store, binding=snapshot.binding, config_digest=config_digest, source_hash=source_hash)
+            if not self._funding_assessment_refresh_pending:
+                self._funding_assessment_hold = 'Native funding assessment pending'
+            future.add_done_callback(
+                lambda completed: loop.call_soon_threadsafe(self._funding_assessment_future_finished, completed))
+            task = loop.create_task(self._publish_funding_assessment(
+                future, store, snapshot.binding, config_digest, source_hash, generation, now),
+                name=f'native-funding-assessment-{self.config.id}')
+            self._funding_assessment_task = task
+            task.add_done_callback(self._funding_assessment_finished)
         except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError, OSError, RuntimeError, SQLAlchemyError) as error:
             self._funding_assessment_hold = str(error) or type(error).__name__
+            self._funding_assessment_refresh_pending = False
+
+    async def _publish_funding_assessment(self, future, store, binding, config_digest, source_hash, generation, requested_at):
+        try:
+            status = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            if self._funding_assessment_current(store, binding, config_digest, source_hash, generation):
+                self._funding_assessment_hold = str(error) or type(error).__name__
+                self._funding_assessment_error = self._funding_assessment_hold
+                self._funding_assessment_refresh_pending = False
+                self._funding_assessed_at = self.market_data_provider.time()
+            return
+        revision_verified = status.pop('revision_verified', None)
+        if revision_verified is None:
+            if self._funding_assessment_current(store, binding, config_digest, source_hash, generation):
+                self._funding_assessed_at = self.market_data_provider.time()
+                self._funding_assessment_hold = 'Funding assessment revision proof is missing'
+                self._funding_assessment_error = self._funding_assessment_hold
+                self._funding_assessment_refresh_pending = False
+            return
+        if revision_verified is not True:
+            if self._funding_assessment_current(store, binding, config_digest, source_hash, generation):
+                self._funding_assessed_at = self.market_data_provider.time()
+                self._funding_assessment_refresh_pending = False
+                if not self._has_current_funding_assessment(
+                        store=store, binding=binding, config_digest=config_digest, source_hash=source_hash):
+                    self._funding_assessment_hold = 'Funding checkpoint changed during assessment; refresh required'
+            return
+        if not self._funding_assessment_current(store, binding, config_digest, source_hash, generation):
+            if self._funding_assessment_generation == generation:
+                self._funding_assessed_at = None
+                self._funding_assessment_hold = 'Native funding assessment became stale; refresh required'
+                self._funding_assessment_context = None
+                self._funding_assessment_result = None
+                self._funding_assessment_refresh_pending = False
+            return
+        status['observed_at'] = requested_at
+        completed_at = self.market_data_provider.time()
+        status['completed_at'] = completed_at
+        age = completed_at - requested_at
+        status['assessment_age_seconds'] = age
+        status['freshness'] = 'fresh' if 0 <= age < 5 else 'stale'
+        store.status = status
+        self._funding_assessment_context = (store, binding, config_digest, source_hash, generation)
+        self._funding_assessment_result = dict(status)
+        self._funding_assessment_error = None
+        self._funding_assessment_refresh_pending = False
+        self._funding_assessed_at = completed_at
+        self._funding_assessment_hold = None
+
+    def _has_current_funding_assessment(self, *, store=None, binding=None, config_digest=None, source_hash=None):
+        store = self._funding_store if store is None else store
+        if store is None or self._funding_assessment_hold or self._funding_assessment_context is None:
+            return False
+        if binding is None:
+            binding = store.binding
+        try:
+            if config_digest is None:
+                config_digest = configuration_digest(self.config.model_dump(mode='json'))
+            if source_hash is None:
+                source_hash = self._native_source_hash
+        except (PolicyError, ValueError, TypeError, KeyError, ArithmeticError):
+            return False
+        return self._funding_assessment_context == (
+            store, binding, config_digest, source_hash, self._funding_assessment_generation)
+
+    def _funding_assessment_current(self, store, binding, config_digest, source_hash, generation):
+        return (self._funding_assessment_generation == generation
+                and self._funding_store is store
+                and store.binding == binding
+                and self._native_source_hash == source_hash
+                and self._composition_unchanged()
+                and configuration_digest(self.config.model_dump(mode='json')) == config_digest)
+
+    def _funding_assessment_finished(self, task):
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._funding_assessment_hold = f'Native funding assessment task failed: {error}'
+            self._funding_assessment_error = self._funding_assessment_hold
+            self._funding_assessment_refresh_pending = False
+            self._funding_assessed_at = self.market_data_provider.time()
+        if self._funding_assessment_task is task:
+            self._funding_assessment_task = None
+            future = self._funding_assessment_future
+            if future is None or future.done():
+                self._funding_assessment_future = None
+
+    def _funding_assessment_future_finished(self, future):
+        if self._funding_assessment_future is not future:
+            return
+        task = self._funding_assessment_task
+        if task is not None and task.cancelled():
+            self._funding_assessment_future = None
+            self._funding_assessment_task = None
+            self._funding_assessed_at = None
+            self._funding_assessment_hold = 'Native funding assessment completed after cancellation; refresh required'
+            self._funding_assessment_context = None
+            self._funding_assessment_result = None
+            self._funding_assessment_refresh_pending = False
 
     STARTUP_RESTORE_GRACE_SECONDS: ClassVar[float] = 60.0
 
@@ -670,6 +848,13 @@ class NativeComposition:
         info['native_buy_gate'] = info.get('buy_gate')
         if info['entry_admission']['reason']:
             info['buy_gate'] = info['entry_admission']['reason']
+        assessment = dict(self._funding_assessment_result or {})
+        if assessment.get('observed_at') is not None:
+            age = self.market_data_provider.time() - assessment['observed_at']
+            assessment['assessment_age_seconds'] = age
+            assessment['freshness'] = 'fresh' if 0 <= age < 5 else 'stale'
+        assessment['refresh_pending'] = self._funding_assessment_refresh_pending
+        assessment['refresh_error'] = self._funding_assessment_error
         info['modular_composition'] = {'native_family': self._native_family,
                                        'execution_mode': self.config.execution_mode,
                                        'data_mode': self.config.data.mode,
@@ -678,6 +863,7 @@ class NativeComposition:
                                        'recovery_hold': self._recovery_hold,
                                        'funding_hold': self._funding_hold,
                                        'funding_assessment_hold': self._funding_assessment_hold,
+                                       'funding_assessment': assessment,
                                        'funding_sizing': getattr(self, '_funding_size', None),
                                        'funding': self._funding_store.status if self._funding_store else None}
         if hasattr(self.config, 'profile'):

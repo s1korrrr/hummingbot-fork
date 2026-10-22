@@ -163,8 +163,26 @@ async def test_wallet_transition_keeps_filled_active_buy_and_refuses_partial_or_
     with patch('socket.socket.connect', side_effect=AssertionError('network forbidden')):
         session = NativePaperSession(paper(), [funded_config()], tmp_path / 'wallet-transition.sqlite')
         try:
-            await fixtures.NativePaperFundingTests.seed(None, session)
             owner = next(iter(session.controllers.values()))
+            first_ready_buy_at = None
+            for index, frame in enumerate(fixtures.causal_reversal_frames()):
+                now = 600000 + index * 60
+                owner._funding_assessed_at = None
+                owner._refresh_funding_assessment()
+                pending = owner._funding_assessment_task
+                if pending is not None:
+                    await pending
+                assert owner._funding_store.status['assessment'] == 'read_only_native_evidence'
+                owner._funding_assessed_at = now
+                await session.step(now, books=[dict(trading_pair=fixtures.PAIR, sequence=2 + index,
+                                                    timestamp=now, bids=[(90, 10)], asks=[(90.1, 10)])],
+                                   candles=[dict(connector_name='okx', trading_pair=fixtures.PAIR, interval='1m',
+                                                 frame=frame, available_at=now)])
+                if session.executor_orchestrator.active_executors[owner.config.id]:
+                    first_ready_buy_at = now
+                    assert owner._funding_assessment_hold is None
+                    break
+            assert first_ready_buy_at is not None
             active = session.executor_orchestrator.active_executors[owner.config.id][0]
             prior_config = owner.config.model_dump(mode='json')
             old_store = owner._funding_store

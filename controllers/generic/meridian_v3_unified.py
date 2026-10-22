@@ -279,6 +279,22 @@ class MeridianUnifiedController(ControllerBase):
             return self._running() and context.runtime.recovery_permission(config)
         return self.entry_permission(config)
 
+    def validate_prepared_executor_config(self, config):
+        """Recheck the exact factory-dispatched request after intent commit.
+
+        Factory dispatch is one-shot. Repeating the initial validator rejects
+        the same request even though no order has started. Keep that dispatch
+        guard while refreshing the same owner permissions immediately before
+        activation.
+        """
+        context = self._context(config)
+        if (context is None or config.id not in context.runtime.dispatched
+                or context.runtime.pending.get(config.id) != config):
+            return False
+        if is_recovery_sell(config):
+            return self._running() and context.runtime.recovery_permission(config)
+        return self.entry_permission(config)
+
     def restart_continuity_executor_class(self, config):
         """Restore persisted p23 tranches with their exit floor and limit-only close policy."""
         from hummingbot.strategy_v2.executors.restart_continuity import RestartContinuityError

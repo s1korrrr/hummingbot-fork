@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -487,7 +488,102 @@ class V2WithControllers(StrategyV2Base):
         result['daily_entry_risk'] = self._daily_entry_risk.snapshot() if self._daily_entry_risk is not None else None
         enrollment = getattr(self, '_entry_risk_enrollment', None)
         result['entry_risk_enrollment'] = enrollment.snapshot() if enrollment is not None else None
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is not None and getattr(recorder, '_async_financial_events', False) is True:
+            outcomes = getattr(self.executor_orchestrator, '_native_buy_outcomes', {})
+            for row in result.get('controllers', []):
+                controller_id = row.get('controller_id')
+                controller = self.controllers.get(controller_id)
+                if controller is None:
+                    continue
+                native_policy = (is_ok_rsi_policy(controller.config)
+                                 or is_modular_policy(controller.config)
+                                 or is_meridian_operator_policy(controller.config))
+                if not native_policy:
+                    continue
+                row['native_buy_admission'] = self._native_buy_admission(controller, outcomes.get(controller_id))
         return result
+
+    def _native_buy_admission(self, controller, outcome):
+        """Project loop-owned gate state without a recorder read or admission side effect."""
+        controller_id = controller.config.id
+        now = time.time()
+        observed_at = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        pair = ((outcome or {}).get('pair') if isinstance(outcome, dict) else None)
+        pair = pair or getattr(controller.config, 'trading_pair', None) or 'PORTFOLIO'
+        issues = []
+        hold_reason = 'none'
+
+        def issue(code, detail, at=None):
+            issues.append({'code': code, 'controller_id': controller_id, 'pair': pair,
+                           'last_failure_at': (datetime.fromtimestamp(at, timezone.utc).isoformat()
+                                               if isinstance(at, (int, float)) else observed_at),
+                           'detail': str(detail)[:160],
+                           'operator_action': 'Inspect native admission receipts and reconcile the refused intent before retrying.'})
+
+        if isinstance(outcome, dict):
+            last_failure = outcome.get('last_failure_at')
+            last_success = outcome.get('last_activated_at')
+            code = outcome.get('last_failure_code')
+            if isinstance(last_failure, (int, float)) and (
+                    not isinstance(last_success, (int, float)) or last_success < last_failure):
+                if code in ('wallet_reservation_changed',):
+                    hold_reason = 'cash'
+                elif code in ('controller_unavailable_or_killed', 'restart_hold'):
+                    hold_reason = 'operator'
+                elif code in ('strategy_stopping_or_resume_pending',):
+                    hold_reason = 'risk'
+                else:
+                    issue('native_buy_create_refused', code or 'unknown', last_failure)
+        if getattr(self, '_risk_reconciliation_error', None):
+            issue('risk_reconciliation_unavailable', type(self._risk_reconciliation_error).__name__)
+        if getattr(controller, '_recovery_fault', None):
+            issue('native_recovery_fault', controller._recovery_fault)
+        if getattr(controller, '_entry_decision_error', None):
+            issue('entry_decision_unavailable', controller._entry_decision_error)
+        if getattr(controller, 'fault', None):
+            issue('controller_fault', controller.fault)
+        portfolio = getattr(controller, 'portfolio', None)
+        if getattr(portfolio, 'identity_hold', None):
+            issue('portfolio_identity_unavailable', portfolio.identity_hold)
+        gate = getattr(controller, '_entry_decision_gate', None)
+        state = getattr(gate, 'last_state', None)
+        auth = state.get('authorization') if isinstance(state, dict) else None
+        if (isinstance(auth, dict) and auth.get('dispatched') is False
+                and state.get('consumed_candle') == 0 and type(auth.get('candle')) is int
+                and isinstance(getattr(controller, '_last_evaluated_candle_timestamp', None), (int, float))
+                and controller._last_evaluated_candle_timestamp > auth['candle']
+                and not any(getattr(info, 'id', None) == auth.get('executor_id') and getattr(info, 'is_active', False)
+                            for info in getattr(controller, 'executors_info', ()) or ())):
+            issue('durable_buy_authorization_unresolved', auth.get('executor_id', 'unknown'))
+        funding_hold = (getattr(controller, '_funding_assessment_hold', None)
+                        or getattr(controller, '_funding_hold', None))
+        if funding_hold:
+            if str(funding_hold) in ('Native minimum exceeds funded per-entry cap',
+                                     'Funded per-entry cap exceeded') and hold_reason == 'none':
+                hold_reason = 'cash'
+            else:
+                issue('native_funding_reconciliation_required', funding_hold)
+        if not issues and hold_reason == 'none':
+            if (getattr(controller.config, 'manual_kill_switch', False)
+                    or getattr(controller, '_operator_entry_paused', False)
+                    or getattr(controller, 'operator_entry_paused', False)):
+                hold_reason = 'operator'
+            elif getattr(controller, 'entries_held', lambda: None)():
+                hold_reason = 'risk'
+        funding_store = getattr(controller, '_funding_store', None)
+        unverified = (getattr(controller.config, 'funding', None) is not None
+                      and not getattr(funding_store, 'status', None))
+        status = 'blocked' if issues else 'unavailable' if unverified else 'healthy'
+        return {'schema_version': 1, 'status': status,
+                'hold_reason': 'system' if status != 'healthy' else hold_reason, 'observed_at': observed_at,
+                'issues': issues, 'failure_count': outcome.get('failure_count', 0) if isinstance(outcome, dict) else 0,
+                'last_failure_at': (datetime.fromtimestamp(outcome['last_failure_at'], timezone.utc).isoformat()
+                                    if isinstance(outcome, dict) and isinstance(outcome.get('last_failure_at'), (int, float))
+                                    else None),
+                'last_activated_at': (datetime.fromtimestamp(outcome['last_activated_at'], timezone.utc).isoformat()
+                                      if isinstance(outcome, dict) and isinstance(outcome.get('last_activated_at'), (int, float))
+                                      else None)}
 
     def _validate_operator_watermarks(self, watermarks):
         if not isinstance(watermarks, dict) or not set(watermarks).issubset(self.controllers):

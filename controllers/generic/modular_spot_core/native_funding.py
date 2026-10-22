@@ -474,7 +474,15 @@ class NativeFundingStore:
         except (KeyError, IndexError, TypeError, ValueError, AttributeError, json.JSONDecodeError, SQLAlchemyError) as error:
             raise PolicyError('Legacy acquisition compatibility manifest differs') from error
 
-    def _evidence(self, state, raw, *, reconcile=False, allow_quiescent_legacy=False):
+    @staticmethod
+    def _committed_unstarted_intent(info, config):
+        """The exact just-ACKed create, before its controller writes a claim."""
+        return (config is not None
+                and ExecutorOrchestrator.is_committed_unstarted_intent(info, config, config.controller_id)
+                and _config_identity(info.config, info.controller_id) == _config_identity(config, config.controller_id))
+
+    def _evidence(self, state, raw, *, reconcile=False, allow_quiescent_legacy=False,
+                  committed_intent_config=None):
         config = self.owner.config
         if self.policy.scope == 'strategy':
             bind_funding_scope(self.owners)
@@ -505,7 +513,10 @@ class NativeFundingStore:
         fills = self.recorder.get_trades_for_config(self.recorder.config_file_path)
         connector = self.owner.market_data_provider.connectors[config.connector_name]
         orders = self.recorder.get_orders_for_config_and_market(self.recorder.config_file_path, connector)
-        if raw is None and (infos or fills or orders or any(peer.positions_held for peer in self.owners.values())):
+        if raw is None and (any(not ExecutorOrchestrator.is_refused_unstarted_intent(info)
+                                and not self._committed_unstarted_intent(info, committed_intent_config)
+                                for info in infos.values())
+                            or fills or orders or any(peer.positions_held for peer in self.owners.values())):
             raise PolicyError('Native history exists without funding checkpoint; reconcile explicitly')
         owned = {}
         for info in infos.values():
@@ -516,6 +527,9 @@ class NativeFundingStore:
             if cfg.side == TradeType.BUY:
                 claim = state['claims'].get(info.id)
                 if claim is None:
+                    if (ExecutorOrchestrator.is_refused_unstarted_intent(info)
+                            or self._committed_unstarted_intent(info, committed_intent_config)):
+                        continue
                     raise PolicyError('Native BUY lacks immutable funding admission')
                 if claim['config'] != _config_identity(cfg, info.controller_id):
                     if not ((info.custom_info or {}).get('planned_position_resume_compatibility_v1')
@@ -530,7 +544,8 @@ class NativeFundingStore:
             raise PolicyError('Native order lacks executor ownership')
         if any(key not in infos and state['releases'].get(key) != LEGACY_NEVER_STARTED for key in state['claims']):
             raise PolicyError('Unresolved funded intent requires explicit reconciliation')
-        if any(info.is_active and info.id not in {item.id for item in current} for info in saved):
+        if any(info.is_active and info.id not in {item.id for item in current}
+               and not self._committed_unstarted_intent(info, committed_intent_config) for info in saved):
             raise PolicyError('Unresolved native executor after restart')
         if any(fill.order_id not in owned for fill in fills):
             raise PolicyError('Native fill lacks executor ownership')
@@ -569,7 +584,9 @@ class NativeFundingStore:
             quantity = sum((amount for order, amount in projection['bought_by_order'].items()
                             if owned.get(order) == executor_id), ZERO)
             info = infos.get(executor_id)
-            if info is not None:
+            refused_unstarted = (info is not None
+                                 and ExecutorOrchestrator.is_refused_unstarted_intent(info))
+            if info is not None and not refused_unstarted:
                 receipt = (info.custom_info or {}).get('execution_receipt')
                 if not isinstance(receipt, dict) or decimal(receipt.get('entry_gross_base'), 'native entry receipt') != quantity:
                     raise PolicyError('Native executor and funding fill coverage differ')
@@ -639,6 +656,9 @@ class NativeFundingStore:
         so the commitment stays reserved until native reconciliation proves it.
         """
         custom = (info.custom_info or {}) if info is not None else {}
+        if (quantity == ZERO and info is not None
+                and ExecutorOrchestrator.is_refused_unstarted_intent(info)):
+            return {'schema': 1, 'source': 'native_refused_before_activation_v1', 'executor_id': info.id}
         if (info is None or quantity != ZERO or info.is_active
                 or getattr(info, 'close_type', None) != CloseType.INSUFFICIENT_BALANCE
                 or custom.get('entry_reconciliation') is not None or custom.get('order_ids')
@@ -785,7 +805,7 @@ class NativeFundingStore:
         from .native_funding_transition import apply_transition
         return apply_transition(self, transition_id)
 
-    def reconcile(self):
+    def reconcile(self, *, committed_intent_config=None):
         """Release only native-proven unused capacity; safe to retry after restart.
 
         This performs no exchange requests, order actions or balance mutations.
@@ -794,7 +814,8 @@ class NativeFundingStore:
         for _ in range(8):
             raw, state = self._load()
             previous = self._audit_hash(state)
-            projection, pending, _ = self._evidence(state, raw, reconcile=True)
+            projection, pending, _ = self._evidence(
+                state, raw, reconcile=True, committed_intent_config=committed_intent_config)
             state['fills'] = projection['fills']
             if previous == self._audit_hash(state) or self._write(raw, state):
                 self.status = {'released_intents': sum(receipt != LEGACY_NEVER_STARTED for receipt in state['releases'].values()), 'pending_quote': str(pending), 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
@@ -834,7 +855,7 @@ class NativeFundingStore:
                 'legacy_uncertain_quote': str(projection['legacy_uncertain_quote']),
                 'available_quote': str(self._available_quote(projection, pending))}
 
-    def admit(self, executor_config):
+    def admit(self, executor_config, *, committed_intent_config=None):
         config = self.owner.config
         if (executor_config.side != TradeType.BUY or executor_config.type != 'position_executor'
                 or executor_config.connector_name != config.connector_name or executor_config.trading_pair != config.trading_pair):
@@ -856,12 +877,13 @@ class NativeFundingStore:
             rate = decimal(fee.percent, 'native estimated fee')
             if fee.percent_token not in (None, base, quote) or fee.flat_fees or rate > self.policy.fee_reserve_fraction:
                 raise PolicyError('Native fee exceeds explicit funding fee bound or has unsupported fixed fees')
-        self.reconcile()
+        self.reconcile(committed_intent_config=committed_intent_config)
         claim = {'config': _config_identity(executor_config, config.id), 'amount': str(amount),
                  'price': str(price), 'fee_fraction': str(self.policy.fee_reserve_fraction)}
         for _ in range(8):
             raw, state = self._load()
-            projection, pending, infos = self._evidence(state, raw)
+            projection, pending, infos = self._evidence(
+                state, raw, committed_intent_config=committed_intent_config)
             existing = state['claims'].get(executor_config.id)
             if existing is not None:
                 if existing != claim or executor_config.id in infos:

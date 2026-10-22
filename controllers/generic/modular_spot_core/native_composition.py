@@ -625,7 +625,13 @@ class NativeComposition:
                     if recorder is None:
                         raise PolicyError('Native recorder required for candidate funding')
                     self._funding_store = NativeFundingStore(self, recorder)
-                self._funding_store.admit(config)
+                committed = getattr(self, '_committed_create_intent', None)
+                self._funding_store.admit(
+                    config,
+                    committed_intent_config=(config if isinstance(committed, tuple)
+                                             and len(committed) == 2
+                                             and committed[0] == config.id
+                                             and committed[1] is config else None))
                 self._funding_hold = None
             except Exception as error:
                 self._funding_hold = str(error) or type(error).__name__

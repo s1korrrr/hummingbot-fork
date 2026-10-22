@@ -66,5 +66,5 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
 
     :return: True if the trading pair is enabled, False otherwise
     """
-    return (exchange_info.get("instType", None) == "SPOT" and exchange_info.get("baseCcy") != ""
-            and exchange_info.get("quoteCcy") != "")
+    return (exchange_info.get("instType") == "SPOT" and exchange_info.get("state") == "live"
+            and bool(exchange_info.get("baseCcy")) and bool(exchange_info.get("quoteCcy")))

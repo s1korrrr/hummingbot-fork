@@ -20,7 +20,10 @@ class TripleBarrierConfig(BaseModel):
     time_limit: Optional[int] = None
     trailing_stop: Optional[TrailingStop] = None
     open_order_type: OrderType = OrderType.LIMIT
+    open_order_limit_max_age_seconds: int = 0
     take_profit_order_type: OrderType = OrderType.MARKET
+    trailing_stop_order_type: OrderType = OrderType.MARKET
+    trailing_stop_limit_max_age_seconds: int = 0
     stop_loss_order_type: OrderType = OrderType.MARKET
     time_limit_order_type: OrderType = OrderType.MARKET
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -39,7 +42,10 @@ class TripleBarrierConfig(BaseModel):
             time_limit=self.time_limit,
             trailing_stop=new_trailing_stop,
             open_order_type=self.open_order_type,
+            open_order_limit_max_age_seconds=self.open_order_limit_max_age_seconds,
             take_profit_order_type=self.take_profit_order_type,
+            trailing_stop_order_type=self.trailing_stop_order_type,
+            trailing_stop_limit_max_age_seconds=self.trailing_stop_limit_max_age_seconds,
             stop_loss_order_type=self.stop_loss_order_type,
             time_limit_order_type=self.time_limit_order_type
         )
@@ -56,4 +62,25 @@ class PositionExecutorConfig(ExecutorConfigBase):
     leverage: int = 1
     activation_bounds: Optional[List[Decimal]] = None
     level_id: Optional[str] = None
+    # Single-attempt entries cancel only the remainder and keep acquired inventory managed.
+    # Other strategies retain their existing retry/expiry semantics unless they opt in.
+    entry_order_policy: Literal["retry", "single_attempt"] = "retry"
+    require_terminal_entry_reconciliation: bool = False
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+def parse_position_config(payload):
+    """Decode the explicit native subtype without dropping durable entry policy."""
+    if not isinstance(payload, dict):
+        raise ValueError('Position configuration must be an object')
+    config_class = PositionExecutorConfig
+    if 'entry_acquisition_policy' in payload:
+        if payload['entry_acquisition_policy'] != 'down_only_maker_v1':
+            raise ValueError('Unsupported persisted position entry policy')
+        from controllers.directional_trading.ok_rsi_core.down_only_entry_execution import (
+            DownOnlyMakerPositionExecutorConfig,
+        )
+        config_class = DownOnlyMakerPositionExecutorConfig
+    if set(payload) - set(config_class.model_fields):
+        raise ValueError('Unknown persisted position configuration fields')
+    return config_class.model_validate(payload)

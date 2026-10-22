@@ -394,20 +394,83 @@ class HyperliquidExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorT
     @property
     def expected_trading_rule(self):
         coin_info = self.trading_rules_request_mock_response[0]['tokens'][1]
-        price_info = self.trading_rules_request_mock_response[1][0]
 
-        step_size = Decimal(str(10 ** -coin_info.get("szDecimals")))
-        price_size = Decimal(str(10 ** -len(price_info.get("markPx").split('.')[1])))
+        size_decimals = coin_info["szDecimals"]
+        step_size = Decimal("1").scaleb(-size_decimals)
+        price_size = Decimal("1").scaleb(-(CONSTANTS.SPOT_MAX_DECIMALS - size_decimals))
 
         return TradingRule(self.trading_pair,
                            min_base_amount_increment=step_size,
                            min_price_increment=price_size,
-                           min_order_size=step_size)
+                           min_order_size=step_size,
+                           min_notional_size=CONSTANTS.MIN_NOTIONAL_SIZE,
+                           max_price_significant_digits=Decimal(CONSTANTS.MAX_PRICE_SIGNIFICANT_DIGITS))
 
     @property
     def expected_logged_error_for_erroneous_trading_rule(self):
         erroneous_rule = self.trading_rules_request_erroneous_mock_response
         return f"Error parsing the trading pair rule {erroneous_rule}. Skipping."
+
+    def test_format_trading_rules_uses_token_precision_with_sparse_contexts(self):
+        exchange_info = [
+            {
+                "tokens": [
+                    {"name": "USDC", "szDecimals": 8, "index": 0},
+                    {"name": "ALPHA", "szDecimals": 2, "index": 1},
+                    {"name": "BETA", "szDecimals": 4, "index": 2},
+                ],
+                "universe": [
+                    {"name": "@72", "tokens": [1, 0], "index": 72, "isCanonical": False},
+                    {"name": "@107", "tokens": [2, 0], "index": 107, "isCanonical": False},
+                ],
+            },
+            [
+                {"coin": "@107", "markPx": "1234.56"},
+                {"coin": "@71", "markPx": "0.00000001"},
+                {"coin": "@72", "markPx": "0.123456"},
+            ],
+        ]
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(exchange_info)
+
+        rules = self.async_run_with_timeout(self.exchange._format_trading_rules(exchange_info))
+        rules_by_pair = {rule.trading_pair: rule for rule in rules}
+
+        self.assertEqual({"ALPHA-USDC", "BETA-USDC"}, set(rules_by_pair))
+        self.assertEqual(Decimal("0.01"), rules_by_pair["ALPHA-USDC"].min_base_amount_increment)
+        self.assertEqual(Decimal("0.000001"), rules_by_pair["ALPHA-USDC"].min_price_increment)
+        self.assertEqual(Decimal("0.0001"), rules_by_pair["BETA-USDC"].min_base_amount_increment)
+        self.assertEqual(Decimal("0.0001"), rules_by_pair["BETA-USDC"].min_price_increment)
+        self.assertEqual(Decimal("10"), rules_by_pair["ALPHA-USDC"].min_notional_size)
+        self.assertEqual(Decimal("10"), rules_by_pair["BETA-USDC"].min_notional_size)
+
+    def test_quantize_order_price_obeys_spot_decimal_and_significant_figure_limits(self):
+        exchange_info = [
+            {
+                "tokens": [
+                    {"name": "USDC", "szDecimals": 8, "index": 0},
+                    {"name": "BETA", "szDecimals": 4, "index": 1},
+                ],
+                "universe": [
+                    {"name": "@107", "tokens": [1, 0], "index": 107, "isCanonical": False},
+                ],
+            },
+            [{"coin": "@107", "markPx": "0.123456"}],
+        ]
+        self.exchange._initialize_trading_pair_symbols_from_exchange_info(exchange_info)
+        self.async_run_with_timeout(self.exchange._format_trading_rules(exchange_info))
+
+        self.assertEqual(
+            Decimal("0.1234"),
+            self.exchange.quantize_order_price("BETA-USDC", Decimal("0.123456")),
+        )
+        self.assertEqual(
+            Decimal("1234.5"),
+            self.exchange.quantize_order_price("BETA-USDC", Decimal("1234.56")),
+        )
+        self.assertEqual(
+            Decimal("123456"),
+            self.exchange.quantize_order_price("BETA-USDC", Decimal("123456")),
+        )
 
     @property
     def expected_exchange_order_id(self):

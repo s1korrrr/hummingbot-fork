@@ -1,7 +1,7 @@
 from decimal import Decimal
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SerializeAsAny, field_validator
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.arbitrage_executor.data_types import ArbitrageExecutorConfig
@@ -23,9 +23,9 @@ class ExecutorInfo(BaseModel):
     timestamp: float
     type: str
     status: RunnableStatus
-    config: AnyExecutorConfig = Field(..., discriminator="type")
-    net_pnl_pct: Decimal
-    net_pnl_quote: Decimal
+    config: SerializeAsAny[AnyExecutorConfig] = Field(..., discriminator="type")
+    net_pnl_pct: Optional[Decimal]
+    net_pnl_quote: Optional[Decimal]
     cum_fees_quote: Decimal
     filled_amount_quote: Decimal
     is_active: bool
@@ -35,6 +35,14 @@ class ExecutorInfo(BaseModel):
     close_type: Optional[CloseType] = None
     controller_id: Optional[str] = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @field_validator('config', mode='before')
+    @classmethod
+    def restore_native_position_subtype(cls, value):
+        if isinstance(value, dict) and value.get('type') == 'position_executor' and 'entry_acquisition_policy' in value:
+            from hummingbot.strategy_v2.executors.position_executor.data_types import parse_position_config
+            return parse_position_config(value)
+        return value
 
     @property
     def is_done(self):
@@ -59,12 +67,15 @@ class ExecutorInfo(BaseModel):
 
 
 class PerformanceReport(BaseModel):
-    realized_pnl_quote: Decimal = Decimal("0")
-    unrealized_pnl_quote: Decimal = Decimal("0")
-    unrealized_pnl_pct: Decimal = Decimal("0")
-    realized_pnl_pct: Decimal = Decimal("0")
-    global_pnl_quote: Decimal = Decimal("0")
-    global_pnl_pct: Decimal = Decimal("0")
+    pnl_available: bool = True
+    pnl_unavailable_reason: Optional[str] = None
+    wallet_sales: List[Dict] = Field(default_factory=list)
+    realized_pnl_quote: Optional[Decimal] = Decimal("0")
+    unrealized_pnl_quote: Optional[Decimal] = Decimal("0")
+    unrealized_pnl_pct: Optional[Decimal] = Decimal("0")
+    realized_pnl_pct: Optional[Decimal] = Decimal("0")
+    global_pnl_quote: Optional[Decimal] = Decimal("0")
+    global_pnl_pct: Optional[Decimal] = Decimal("0")
     volume_traded: Decimal = Decimal("0")
     positions_summary: List = []
     close_type_counts: Dict[CloseType, int] = {}

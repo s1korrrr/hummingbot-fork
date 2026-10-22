@@ -2463,8 +2463,14 @@ class KucoinExchangeTests(unittest.TestCase):
         self.assertEqual(0, len(self.buy_order_completed_logger.event_log))
 
         self.assertTrue(
-            self._is_logged("INFO", f"The {order.trade_type.name} order {order.client_order_id} amounting to "
-                                    f"0.1/{order.amount} {order.base_asset} has been filled at {Decimal('10010.5')} HBOT.")
+            any(
+                record.levelname == "INFO"
+                and record.getMessage().startswith(
+                    f"The {order.trade_type.name} order {order.client_order_id} amounting to "
+                    f"0.1/{order.amount} {order.base_asset} has been filled at {Decimal('10010.5')} HBOT."
+                )
+                for record in self.log_records
+            )
         )
 
     def test_user_stream_update_for_order_fill(self):

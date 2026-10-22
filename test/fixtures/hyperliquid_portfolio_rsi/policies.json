@@ -1,0 +1,30 @@
+{
+  "quote_asset": "USDC",
+  "pairs": [
+    {"pair_id": "SELL01-USDC", "base_asset": "SELL01", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL02-USDC", "base_asset": "SELL02", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL03-USDC", "base_asset": "SELL03", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL04-USDC", "base_asset": "SELL04", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL05-USDC", "base_asset": "SELL05", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL06-USDC", "base_asset": "SELL06", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL07-USDC", "base_asset": "SELL07", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL08-USDC", "base_asset": "SELL08", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL09-USDC", "base_asset": "SELL09", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL10-USDC", "base_asset": "SELL10", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL11-USDC", "base_asset": "SELL11", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL12-USDC", "base_asset": "SELL12", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL13-USDC", "base_asset": "SELL13", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL14-USDC", "base_asset": "SELL14", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL15-USDC", "base_asset": "SELL15", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL16-USDC", "base_asset": "SELL16", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL17-USDC", "base_asset": "SELL17", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL18-USDC", "base_asset": "SELL18", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL19-USDC", "base_asset": "SELL19", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "SELL20-USDC", "base_asset": "SELL20", "quote_asset": "USDC", "mode": "sell_only", "max_sell_fraction_per_tick": "0.20", "min_trade_value_quote": "5"},
+    {"pair_id": "TRADE01-USDC", "base_asset": "TRADE01", "quote_asset": "USDC", "mode": "buy_sell", "max_symbol_exposure_quote": "200", "min_quote_reserve": "100"},
+    {"pair_id": "TRADE02-USDC", "base_asset": "TRADE02", "quote_asset": "USDC", "mode": "buy_sell", "max_symbol_exposure_quote": "200", "min_quote_reserve": "100"},
+    {"pair_id": "TRADE03-USDC", "base_asset": "TRADE03", "quote_asset": "USDC", "mode": "buy_sell", "max_symbol_exposure_quote": "200", "min_quote_reserve": "100"},
+    {"pair_id": "TRADE04-USDC", "base_asset": "TRADE04", "quote_asset": "USDC", "mode": "buy_sell", "max_symbol_exposure_quote": "200", "min_quote_reserve": "100"},
+    {"pair_id": "TRADE05-USDC", "base_asset": "TRADE05", "quote_asset": "USDC", "mode": "buy_sell", "max_symbol_exposure_quote": "200", "min_quote_reserve": "100"}
+  ]
+}

@@ -1,0 +1,393 @@
+import json
+from decimal import Decimal as D
+from unittest import IsolatedAsyncioTestCase
+
+from hummingbot.connector.exchange.paper_trade.native_paper_trade_exchange import NativePaperTradeExchange
+from hummingbot.connector.trading_rule import TradingRule
+from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState
+from hummingbot.core.data_type.order_book import OrderBook
+from hummingbot.core.data_type.order_book_row import OrderBookRow
+from hummingbot.core.data_type.trade_fee import TradeFeeSchema
+from hummingbot.core.event.events import OrderFilledEvent
+
+PAIR = 'BTC-USDC'
+
+
+def paper():
+    book = OrderBook()
+    book.apply_snapshot([OrderBookRow(99, 10, 1)], [OrderBookRow(101, 10, 1)], 1)
+    rule = TradingRule(PAIR, min_order_size=D('.01'), min_price_increment=D('.01'),
+                       min_base_amount_increment=D('.01'), min_notional_size=D('1'))
+    result = NativePaperTradeExchange({PAIR: rule}, fee_schema=TradeFeeSchema(maker_percent_fee_decimal=D('.001'), taker_percent_fee_decimal=D('.002')), trade_participation=D('1'))
+    result.set_balance('BTC', D('0'))
+    result.set_balance('USDC', D('1000'))
+    result.tick(1000)
+    result.set_order_book(PAIR, 1, 1000, [(D('99'), D('10'))], [(D('101'), D('10'))])
+    return result
+
+
+def delayed_research_paper():
+    rule = TradingRule(PAIR, min_order_size=D('.01'), min_price_increment=D('.01'),
+                       min_base_amount_increment=D('.01'), min_notional_size=D('1'))
+    result = NativePaperTradeExchange({PAIR: rule}, fee_schema=TradeFeeSchema(
+        maker_percent_fee_decimal=D('.001'), taker_percent_fee_decimal=D('.002')),
+        trade_participation=D('.01'), research_execution_mode='delayed_observed_v1')
+    result.set_balance('BTC', D('5'))
+    result.set_balance('USDC', D('1000'))
+    result.tick(1000)
+    result.set_order_book(PAIR, 1, 1000, [(D('99'), D('10'))], [(D('101'), D('10'))])
+    return result
+
+
+class NativePaperTradeTests(IsolatedAsyncioTestCase):
+    def test_default_connector_keeps_prior_persisted_contract_identity(self):
+        state = paper().tracking_states
+        self.assertEqual(state['contract'], 'd0ed12c44b355b75d42a1714c7003b95bb07453c612e4f31c432cbe4f8922c88')  # noqa: mock
+        self.assertNotIn('research_events', state)
+        self.assertNotIn('observed_buckets', state)
+        self.assertNotIn('research_order_sequence', state)
+
+    async def test_research_open_ack_and_completed_second_delay_without_crossing_book(self):
+        market = delayed_research_paper()
+        oid = market.buy(PAIR, D('2'), OrderType.LIMIT, D('101'))
+        await market.drain()
+        order = market._order_tracker.fetch_order(oid)
+        self.assertEqual(order.executed_amount_base, D('0'))
+        self.assertEqual(order.current_state, OrderState.PENDING_CREATE)
+        market.tick(1001)
+        await market.process_observed_second(PAIR, 1000, D('100'), D('102'), D('100'))
+        self.assertEqual(order.current_state, OrderState.OPEN)
+        self.assertEqual(order.executed_amount_base, D('0'))
+        market.tick(1002)
+        await market.process_observed_second(PAIR, 1001, D('100'), D('102'), D('100'))
+        self.assertEqual(order.executed_amount_base, D('1'))
+        self.assertEqual(market.get_balance('BTC'), D('6'))
+
+    async def test_research_cancel_ack_precedes_same_clock_bucket_and_fifo_shares_both_sides(self):
+        market = delayed_research_paper()
+        buy = market.buy(PAIR, D('2'), OrderType.LIMIT_MAKER, D('99'))
+        sell = market.sell(PAIR, D('2'), OrderType.LIMIT_MAKER, D('101'))
+        market.tick(1001)
+        await market.settle_research_events()
+        market.tick(1002)
+        await market.process_observed_second(PAIR, 1001, D('98'), D('102'), D('100'))
+        self.assertEqual(market._order_tracker.fetch_order(buy).executed_amount_base, D('1'))
+        self.assertEqual(market._order_tracker.fetch_order(sell).executed_amount_base, D('0'))
+        market.cancel(PAIR, sell)
+        market.tick(1003)
+        await market.process_observed_second(PAIR, 1002, D('100'), D('102'), D('100'))
+        self.assertTrue(market._order_tracker.fetch_order(sell).is_cancelled)
+        self.assertEqual(market._order_tracker.fetch_order(sell).executed_amount_base, D('0'))
+
+    async def test_research_empty_or_sub_quantum_bucket_never_fills(self):
+        market = delayed_research_paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT_MAKER, D('99'))
+        market.tick(1002)
+        await market.settle_research_events()
+        await market.process_observed_second(PAIR, 1001, D('98'), D('102'), D('.9'))
+        self.assertEqual(market._order_tracker.fetch_order(oid).executed_amount_base, D('0'))
+        market.tick(1003)
+        await market.process_observed_second(PAIR, 1002, D('98'), D('102'), D('0'))
+        self.assertEqual(market._order_tracker.fetch_order(oid).executed_amount_base, D('0'))
+
+    async def test_research_pending_ack_and_bucket_restore_without_extra_capacity(self):
+        market = delayed_research_paper()
+        oid = market.buy(PAIR, D('2'), OrderType.LIMIT_MAKER, D('99'))
+        restored = delayed_research_paper()
+        restored.restore_tracking_states(json.loads(json.dumps(market.tracking_states)))
+        self.assertEqual(restored._order_tracker.fetch_order(oid).current_state, OrderState.PENDING_CREATE)
+        restored.tick(1001)
+        restored.set_order_book(PAIR, 2, 1001, [(99, 10)], [(101, 10)])
+        await restored.settle_research_events()
+        self.assertEqual(restored._order_tracker.fetch_order(oid).current_state, OrderState.OPEN)
+        restored.tick(1002)
+        await restored.process_observed_second(PAIR, 1001, D('98'), D('102'), D('100'))
+        self.assertEqual(restored._order_tracker.fetch_order(oid).executed_amount_base, D('1'))
+        again = delayed_research_paper()
+        again.restore_tracking_states(json.loads(json.dumps(restored.tracking_states)))
+        again.set_order_book(PAIR, 3, 1002, [(99, 10)], [(101, 10)])
+        with self.assertRaisesRegex(ValueError, 'repeated'):
+            await again.process_observed_second(PAIR, 1001, D('98'), D('102'), D('100'))
+        self.assertEqual(again._order_tracker.fetch_order(oid).executed_amount_base, D('1'))
+
+    async def test_research_post_only_reject_and_pending_cancel_settle_before_fills(self):
+        market = delayed_research_paper()
+        crossing = market.buy(PAIR, D('1'), OrderType.LIMIT_MAKER, D('101'))
+        canceled = market.buy(PAIR, D('1'), OrderType.LIMIT_MAKER, D('99'))
+        market.cancel(PAIR, canceled)
+        market.tick(1001)
+        await market.process_observed_second(PAIR, 1000, D('98'), D('102'), D('100'))
+        rejected_order = market._order_tracker.fetch_order(crossing)
+        canceled_order = market._order_tracker.fetch_order(canceled)
+        self.assertTrue(rejected_order.is_cancelled)
+        self.assertEqual(rejected_order.cancel_source, '31')
+        self.assertTrue(canceled_order.is_cancelled)
+        self.assertEqual(canceled_order.executed_amount_base, D('0'))
+
+    async def test_partial_fill_charges_fee_and_reserves_remaining_cash(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.tick(1001)
+        await market.process_trade(PAIR, 1, 1001, TradeType.SELL, D('98'), D('.1'))
+        order = market._order_tracker.fetch_order(oid)
+        self.assertEqual(order.executed_amount_base, D('.1'))
+        self.assertEqual(market.get_balance('BTC'), D('.1'))
+        self.assertEqual(market.get_balance('USDC'), D('990.0901'))
+        self.assertEqual(market.get_available_balance('USDC'), D('900.8119'))
+        fills = [e for e in market.event_logs if isinstance(e, OrderFilledEvent)]
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].trade_fee.percent, D('0'))
+        self.assertEqual(fills[0].trade_fee.flat_fees[0].token, 'USDC')
+        self.assertEqual(fills[0].trade_fee.flat_fees[0].amount, D('.0099'))
+
+    async def test_print_volume_shared_by_orders_and_duplicate_ignored(self):
+        market = paper()
+        a = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        b = market.buy(PAIR, D('1'), OrderType.LIMIT, D('98'))
+        await market.drain()
+        market.tick(1001)
+        await market.process_trade(PAIR, 1, 1001, TradeType.SELL, D('97'), D('1.2'))
+        self.assertEqual(market._order_tracker.fetch_order(a).executed_amount_base, D('1'))
+        self.assertEqual(market._order_tracker.fetch_order(b).executed_amount_base, D('.2'))
+        balance = market.get_balance('BTC')
+        market.tick(1001)
+        await market.process_trade(PAIR, 1, 1001, TradeType.SELL, D('97'), D('1.2'))
+        self.assertEqual(market.get_balance('BTC'), balance)
+
+    async def test_cancel_retains_partial_fill_and_restore_deduplicates(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.tick(1001)
+        await market.process_trade(PAIR, 1, 1001, TradeType.SELL, D('98'), D('.2'))
+        restored = paper()
+        restored.restore_tracking_states(json.loads(json.dumps(market.tracking_states)))
+        restored.set_order_book(PAIR, 2, 1001, [(99, 10)], [(101, 10)])
+        await restored.process_trade(PAIR, 1, 1001, TradeType.SELL, D('98'), D('.2'))
+        self.assertEqual(restored.get_balance('BTC'), D('.2'))
+        restored.cancel(PAIR, oid)
+        await restored.drain()
+        restored.tick(1002)
+        await restored.process_trade(PAIR, 2, 1002, TradeType.SELL, D('98'), D('1'))
+        self.assertEqual(restored.get_balance('BTC'), D('.2'))
+        self.assertTrue(restored._order_tracker.fetch_order(oid).is_cancelled)
+        self.assertEqual(restored.get_available_balance('USDC'), restored.get_balance('USDC'))
+
+    async def test_no_overcommit_invalid_inputs_and_market_rejected(self):
+        market = paper()
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('1'), OrderType.AMM_SWAP)
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('11'), OrderType.LIMIT, D('99'))
+        with self.assertRaises(ValueError):
+            market.sell(PAIR, D('1'), OrderType.LIMIT, D('102'))
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('1'), OrderType.LIMIT_MAKER, D('101'))
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('NaN'), OrderType.LIMIT, D('99'))
+        market.buy(PAIR, D('10'), OrderType.LIMIT, D('99'))
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+
+    async def test_restore_corruption_is_atomic(self):
+        market = paper()
+        market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        state = market.tracking_states
+        state['balances']['USDC'] = '-1'
+        target = paper()
+        with self.assertRaises(ValueError):
+            target.restore_tracking_states(state)
+        self.assertEqual(target.get_balance('USDC'), D('1000'))
+        self.assertEqual(target.in_flight_orders, {})
+
+    async def test_restore_rejects_off_step_order_values_atomically(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        state = market.tracking_states
+        for field, value in (('amount', '1.005'), ('price', '99.005')):
+            corrupted = json.loads(json.dumps(state))
+            corrupted['orders'][oid][field] = value
+            target = paper()
+            with self.assertRaisesRegex(ValueError, 'trading rules'):
+                target.restore_tracking_states(corrupted)
+            self.assertEqual(target.get_balance('USDC'), D('1000'))
+            self.assertEqual(target.in_flight_orders, {})
+        restored = paper()
+        restored.restore_tracking_states(json.loads(json.dumps(state)))
+        self.assertEqual(restored._order_tracker.fetch_order(oid).amount, D('1'))
+
+    async def test_market_consumes_depth_partial_ioc_and_no_reuse(self):
+        market = paper()
+        market.set_order_book(PAIR, 2, 1000, [(D('99'), D('.3'))], [(D('101'), D('.2')), (D('102'), D('.3'))])
+        oid = market.buy(PAIR, D('1'), OrderType.MARKET)
+        await market.drain()
+        order = market._order_tracker.fetch_order(oid)
+        self.assertEqual(order.executed_amount_base, D('.5'))
+        self.assertEqual(order.executed_amount_quote, D('50.8'))
+        self.assertTrue(order.is_cancelled)
+        self.assertEqual(market.get_balance('USDC'), D('949.0984'))
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('.1'), OrderType.MARKET)
+        with self.assertRaises(ValueError):
+            market.set_order_book(PAIR, 2, 1000, [(99, 1)], [(101, 1)])
+
+    async def test_native_buy_base_fee_and_sell_quote_fee(self):
+        market = paper()
+        rules = market.trading_rules
+        market = NativePaperTradeExchange(rules, fee_schema=TradeFeeSchema(
+            maker_percent_fee_decimal=D('.001'), taker_percent_fee_decimal=D('.002'),
+            buy_percent_fee_deducted_from_returns=True), trade_participation=D('1'))
+        market.set_balance('USDC', D('1000'))
+        market.set_balance('BTC', D('0'))
+        market.tick(1000)
+        market.set_order_book(PAIR, 1, 1000, [(99, 10)], [(101, 10)])
+        buy = market.buy(PAIR, D('1'), OrderType.MARKET)
+        await market.drain()
+        self.assertEqual(market.get_balance('BTC'), D('.998'))
+        self.assertEqual(market.get_balance('USDC'), D('899'))
+        record = market._order_tracker.fetch_order(buy).to_json()
+        from hummingbot.strategy_v2.executors.order_accounting import base_fee_amount
+        self.assertEqual(base_fee_amount(record, 'BTC'), D('.002'))
+        market.sell(PAIR, D('.99'), OrderType.MARKET)
+        await market.drain()
+        self.assertEqual(market.get_balance('BTC'), D('.008'))
+        self.assertEqual(market.get_balance('USDC'), D('996.81398'))
+
+    async def test_stale_future_inputs_restore_and_participation_bound(self):
+        market = paper()
+        market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        with self.assertRaises(ValueError):
+            await market.process_trade(PAIR, 1, 1001, TradeType.SELL, D('98'), D('1'))
+        market.tick(1006)
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('1'), OrderType.MARKET)
+        with self.assertRaises(ValueError):
+            await market.process_trade(PAIR, 1, 1000, TradeType.SELL, D('98'), D('1'))
+        target = paper()
+        target.restore_tracking_states(market.tracking_states)
+        self.assertFalse(target.ready)
+        with self.assertRaises(ValueError):
+            await target.process_trade(PAIR, 1, 1006, TradeType.SELL, D('98'), D('1'))
+        target.set_order_book(PAIR, 2, 1006, [(99, 1)], [(101, 1)])
+        self.assertTrue(target.ready)
+
+    async def test_retained_marks_value_a_stale_book_for_reports_but_never_trade_on_it(self):
+        market = paper()
+        market.tick(1006)
+        self.assertFalse(market.pair_ready(PAIR))
+        with self.assertRaises(ValueError):
+            market.get_price(PAIR, True)
+        with market.retained_marks({PAIR}):
+            self.assertEqual(market.get_price(PAIR, True), D('101'))
+            self.assertEqual(market.get_mid_price(PAIR), D('100'))
+            with self.assertRaises(ValueError):  # orders still require a fresh book
+                market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+            with self.assertRaises(ValueError):
+                await market.process_trade(PAIR, 1, 1006, TradeType.SELL, D('98'), D('1'))
+        with self.assertRaises(ValueError):
+            market.get_price(PAIR, True)
+        market.invalidate_order_book(PAIR)
+        self.assertFalse(market.has_observed_book(PAIR))
+        with self.assertRaises(ValueError):  # a mark is retained, never invented
+            with market.retained_marks({PAIR}):
+                pass
+
+    async def test_crossing_limit_reserves_taker_fee_before_async_fill(self):
+        market = paper()
+        market.set_balance('USDC', D('101.151'))
+        with self.assertRaises(ValueError):
+            market.buy(PAIR, D('1'), OrderType.LIMIT, D('101'))
+        market.set_balance('USDC', D('202.404'))
+        market.buy(PAIR, D('1'), OrderType.LIMIT, D('101'))
+        market.buy(PAIR, D('1'), OrderType.LIMIT, D('101'))
+        self.assertEqual(market.get_available_balance('USDC'), D('0'))
+        await market.drain()
+        self.assertEqual(market.get_balance('USDC'), D('0'))
+
+    async def test_restore_validates_actual_fee_and_preserves_liquidity_role(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.tick(1001)
+        await market.process_trade(PAIR, 1, 1001, TradeType.SELL, D('98'), D('.1'))
+        state = market.tracking_states
+        restored = paper()
+        restored.restore_tracking_states(state)
+        fill = next(iter(restored._order_tracker.fetch_order(oid).order_fills.values()))
+        self.assertFalse(fill.is_taker)
+        raw_fill = next(iter(state['orders'][oid]['order_fills'].values()))
+        raw_fill['fee']['flat_fees'][0]['amount'] = '-1'
+        target = paper()
+        with self.assertRaisesRegex(ValueError, 'actual fee'):
+            target.restore_tracking_states(state)
+        self.assertEqual(target.get_balance('USDC'), D('1000'))
+
+    async def test_canceled_empty_entry_reconciles_after_tracker_cache_eviction(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        live = market._order_tracker.fetch_order(oid)
+        self.assertTrue(live.is_cancelled)
+        self.assertEqual(live.executed_amount_base, D('0'))
+        market._order_tracker._cached_orders.clear()
+        self.assertIsNone(market._order_tracker.fetch_order(oid))
+        update = await market._request_order_status(live)
+        self.assertEqual(update.new_state, OrderState.CANCELED)
+        self.assertEqual(update.client_order_id, oid)
+        self.assertEqual(update.exchange_order_id, live.exchange_order_id)
+        proof = update.misc_updates['terminal_reconciliation']
+        self.assertEqual(proof['filled_base'], '0')
+        self.assertEqual(proof['state'], 'CANCELED')
+        self.assertEqual(proof['source'], 'native_paper_terminal_v1')
+
+    async def test_terminal_status_matches_order_ids_not_python_identity(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        live = market._order_tracker.fetch_order(oid)
+        clone = type(live).from_json(live.to_json())
+        self.assertIsNot(clone, live)
+        update = await market._request_order_status(clone)
+        self.assertEqual(update.new_state, OrderState.CANCELED)
+        self.assertEqual(update.client_order_id, oid)
+        self.assertEqual(update.misc_updates['terminal_reconciliation']['filled_base'], '0')
+
+    async def test_mismatched_exchange_order_id_fails_closed(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        live = market._order_tracker.fetch_order(oid)
+        clone = type(live).from_json(live.to_json())
+        clone.update_exchange_order_id('paper-other')
+        with self.assertRaisesRegex(ValueError, 'Paper order identity is unavailable for native reconciliation'):
+            await market._request_order_status(clone)
+
+    async def test_tracking_states_keep_canceled_orders_after_cache_eviction(self):
+        market = paper()
+        oid = market.buy(PAIR, D('1'), OrderType.LIMIT, D('99'))
+        await market.drain()
+        market.cancel(PAIR, oid)
+        await market.drain()
+        market._order_tracker._cached_orders.clear()
+        state = market.tracking_states
+        self.assertIn(oid, state['orders'])
+        restored = paper()
+        restored.restore_tracking_states(state)
+        restored.set_order_book(PAIR, 2, 1000, [(D('99'), D('10'))], [(D('101'), D('10'))])
+        tracked = restored._order_tracker.fetch_order(oid)
+        self.assertIsNotNone(tracked)
+        update = await restored._request_order_status(tracked)
+        self.assertEqual(update.new_state, OrderState.CANCELED)
+        self.assertEqual(update.misc_updates['terminal_reconciliation']['order_id'], oid)

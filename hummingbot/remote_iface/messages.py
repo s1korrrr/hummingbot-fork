@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from commlib.msg import PubSubMessage, RPCMessage
+from pydantic import ConfigDict
 
 
 class MQTT_STATUS_CODE:
@@ -128,3 +129,30 @@ class BalancePaperCommandMessage(RPCMessage):
         status: Optional[int] = MQTT_STATUS_CODE.SUCCESS
         msg: Optional[str] = ''
         data: Optional[str] = ''
+
+
+class NativeCommandMessage(RPCMessage):
+    class Request(RPCMessage.Request):
+        model_config = ConfigDict(extra="forbid", strict=True)
+        schema_version: int
+        request_id: str
+        action: str
+        expected_boot_id: str
+        expected_instance_id: str
+        expected_script_file: str
+        expected_config_file: str
+        expected_controller_ids: List[str]
+        observed_sequence: int
+
+    class Response(RPCMessage.Response):
+        schema_version: int = 1
+        request_id: str
+        boot_id: str
+        instance_id: str
+        action: str
+        accepted: bool
+        execution_completed: bool
+        state: str
+        sequence: int
+        reconciliation_complete: bool
+        error: Optional[str] = None

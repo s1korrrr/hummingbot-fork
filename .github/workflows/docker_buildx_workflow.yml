@@ -1,80 +1,204 @@
-name: Client Docker Buildx Workflow
+name: Source-bound Docker image verification
 
 on:
   pull_request:
-    types: [closed]
     branches:
       - master
       - development
-  release:
-    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      confirm_release:
+        description: Confirm immutable image publication after separate review approval.
+        required: true
+        type: boolean
+        default: false
+      source_commit:
+        description: Exact lowercase 40-hex master workflow commit to publish; must equal github.sha.
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  build_pr:
-    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
-    runs-on: ubuntu-latest
+  verify_pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    # Keep each architecture's Conda/build layers on a separate ephemeral disk.
+    # The combined build exhausted the hosted runner before it could save logs.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4.1.1
+      - name: Checkout exact pull request head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Derive exact source metadata
+        id: source_metadata
+        shell: bash
+        run: echo "build_date=$(git show -s --format=%cI HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Reclaim unused SDK space on the hosted runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This job builds the pinned Linux Conda runtime; these preinstalled
+          # SDKs are unused. Restrict cleanup to the disposable hosted runner.
+          test "${RUNNER_ENVIRONMENT}" = "github-hosted"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          # qemu-v10.0.4 manifest-list digest resolved from docker.io on 2026-08-25.
+          image: docker.io/tonistiigi/binfmt:qemu-v10.0.4@sha256:8f58e6214f4cc9dc83ce8f5acad1ece508eb6b20e696a8c1e9f274481982c541
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3.1.0
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          # Buildx v0.17.1 and BuildKit v0.17.3 manifest-list digest resolved on 2026-08-25.
+          version: v0.17.1
+          driver-opts: image=moby/buildkit:v0.17.3@sha256:b2498ea62630c147e98f96145c2988a74720700b250e4cf7a4328e14f5b99fc3
 
-      - name: Login to DockerHub
-        uses: docker/login-action@v3
+      - name: Build source-bound image without publishing
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          build-args: |
+            SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
+            COMMIT=${{ github.event.pull_request.head.sha }}
+            BRANCH=${{ github.head_ref }}
+            BUILD_DATE=${{ steps.source_metadata.outputs.build_date }}
+
+  validate_release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    outputs:
+      confirmed: ${{ steps.confirm.outputs.confirmed }}
+      source_commit: ${{ steps.confirm.outputs.source_commit }}
+      source_ref: ${{ steps.confirm.outputs.source_ref }}
+      evidence_set_sha256_amd64: ${{ steps.license_policy.outputs.evidence_set_sha256_amd64 }}
+      evidence_set_sha256_arm64: ${{ steps.license_policy.outputs.evidence_set_sha256_arm64 }}
+    steps:
+      - name: Checkout exact workflow source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Require current human-owned image license approval
+        id: license_policy
+        shell: bash
+        run: python3 scripts/validate_image_license_policy.py licenses/image-license-policy.json --github-output "${GITHUB_OUTPUT}"
+
+      - name: Validate explicit release confirmation and source identity
+        id: confirm
+        env:
+          CONFIRM_RELEASE: ${{ inputs.confirm_release }}
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          if [[ "${CONFIRM_RELEASE}" != "true" ]]; then
+            echo "Release publication was not confirmed." >&2
+            exit 1
+          fi
+          if [[ "${WORKFLOW_REF}" != "refs/heads/master" ]]; then
+            echo "Release publication requires the exact reviewed default ref refs/heads/master." >&2
+            exit 1
+          fi
+          if [[ ! "${WORKFLOW_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "github.sha must be an exact lowercase 40-hex Git SHA." >&2
+            exit 1
+          fi
+          if [[ ! "${REQUESTED_SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_commit must be an exact lowercase 40-hex Git SHA." >&2
+            exit 1
+          fi
+          if [[ "${REQUESTED_SOURCE_COMMIT}" != "${WORKFLOW_COMMIT}" ]]; then
+            echo "source_commit must equal the checked-out hardened workflow commit." >&2
+            exit 1
+          fi
+          {
+            echo "confirmed=true"
+            echo "source_commit=${WORKFLOW_COMMIT}"
+            echo "source_ref=${WORKFLOW_REF}"
+          } >> "${GITHUB_OUTPUT}"
+
+  publish_release:
+    needs: validate_release
+    if: github.event_name == 'workflow_dispatch' && needs.validate_release.outputs.confirmed == 'true' && needs.validate_release.outputs.source_ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    environment:
+      name: hummingbot-image-release
+    outputs:
+      image_digest: ${{ steps.validate_digest.outputs.image_digest }}
+    steps:
+      - name: Checkout exact confirmed source commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate_release.outputs.source_commit }}
+
+      - name: Derive exact source metadata
+        id: source_metadata
+        shell: bash
+        run: echo "build_date=$(git show -s --format=%cI HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+        with:
+          # qemu-v10.0.4 manifest-list digest resolved from docker.io on 2026-08-25.
+          image: docker.io/tonistiigi/binfmt:qemu-v10.0.4@sha256:8f58e6214f4cc9dc83ce8f5acad1ece508eb6b20e696a8c1e9f274481982c541
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+        with:
+          # Buildx v0.17.1 and BuildKit v0.17.3 manifest-list digest resolved on 2026-08-25.
+          version: v0.17.1
+          driver-opts: image=moby/buildkit:v0.17.3@sha256:b2498ea62630c147e98f96145c2988a74720700b250e4cf7a4328e14f5b99fc3
+
+      - name: Login to DockerHub after manual confirmation
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Development Image
-        if: github.base_ref == 'development'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: hummingbot/hummingbot:development
-
-      - name: Build and push Latest Image
-        if: github.base_ref == 'master'
-        uses: docker/build-push-action@v5
+      - name: Build and publish immutable source-bound image
+        id: image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: hummingbot/hummingbot:latest
+          outputs: type=image,name=hummingbot/hummingbot,push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            SOURCE_COMMIT=${{ needs.validate_release.outputs.source_commit }}
+            COMMIT=${{ needs.validate_release.outputs.source_commit }}
+            BRANCH=manual-release
+            BUILD_DATE=${{ steps.source_metadata.outputs.build_date }}
+            REQUIRE_APPROVED_LICENSE_EVIDENCE=true
+            EXPECTED_EVIDENCE_SET_SHA256_AMD64=${{ needs.validate_release.outputs.evidence_set_sha256_amd64 }}
+            EXPECTED_EVIDENCE_SET_SHA256_ARM64=${{ needs.validate_release.outputs.evidence_set_sha256_arm64 }}
 
-  build_release:
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4.1.1
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3.1.0
-
-      - name: Login to DockerHub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract tag name
-        id: get_tag
-        run: echo ::set-output name=VERSION::version-${GITHUB_REF#refs/tags/v}
-
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: hummingbot/hummingbot:${{ steps.get_tag.outputs.VERSION }}
+      - name: Validate and record canonical image digest
+        id: validate_digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          if [[ ! "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "IMAGE_DIGEST must be an exact sha256 digest." >&2
+            exit 1
+          fi
+          echo "image_digest=${IMAGE_DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "Published canonical digest: ${IMAGE_DIGEST}" >> "${GITHUB_STEP_SUMMARY}"

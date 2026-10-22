@@ -1,0 +1,1184 @@
+[
+  {
+    "at": 1789845099.885178,
+    "body": {
+      "counters": {
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "upstream_frames": 4
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.677831,
+          "rows": 90,
+          "sequence": 1
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.448929,
+          "rows": 90,
+          "sequence": 1
+        }
+      },
+      "published_at": 1789845099.886248,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845104.893305,
+    "body": {
+      "counters": {
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "upstream_frames": 4
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.677831,
+          "rows": 90,
+          "sequence": 1
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.448929,
+          "rows": 90,
+          "sequence": 1
+        }
+      },
+      "published_at": 1789845104.893967,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845109.9018,
+    "body": {
+      "counters": {
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "upstream_frames": 6
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.677831,
+          "rows": 90,
+          "sequence": 1
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.448929,
+          "rows": 90,
+          "sequence": 1
+        }
+      },
+      "published_at": 1789845109.902303,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845114.921542,
+    "body": {
+      "counters": {
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "upstream_frames": 6
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.677831,
+          "rows": 90,
+          "sequence": 1
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.448929,
+          "rows": 90,
+          "sequence": 1
+        }
+      },
+      "published_at": 1789845114.922141,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845119.930593,
+    "body": {
+      "counters": {
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 1,
+        "text_pongs": 1,
+        "upstream_frames": 8
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.677831,
+          "rows": 90,
+          "sequence": 1
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845000,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845097.448929,
+          "rows": 90,
+          "sequence": 1
+        }
+      },
+      "published_at": 1789845119.9313,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845124.940018,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 1,
+        "text_pongs": 1,
+        "upstream_frames": 12
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845124.940596,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845129.943485,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 1,
+        "text_pongs": 1,
+        "upstream_frames": 12
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845129.94446,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845134.943983,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 1,
+        "text_pongs": 1,
+        "upstream_frames": 14
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845134.946782,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845139.96307,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 2,
+        "text_pongs": 2,
+        "upstream_frames": 15
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845139.963525,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845144.969593,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 2,
+        "text_pongs": 2,
+        "upstream_frames": 20
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845144.971205,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845149.981406,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 2,
+        "text_pongs": 2,
+        "upstream_frames": 21
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845149.981792,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845154.984002,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 2,
+        "text_pongs": 2,
+        "upstream_frames": 22
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845154.984658,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845159.990515,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 3,
+        "text_pongs": 3,
+        "upstream_frames": 23
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845159.991327,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845165.007916,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 3,
+        "text_pongs": 3,
+        "upstream_frames": 24
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845165.008778,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845170.016263,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 3,
+        "text_pongs": 3,
+        "upstream_frames": 26
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845170.016635,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845175.027184,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 3,
+        "text_pongs": 3,
+        "upstream_frames": 26
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845175.027904,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845180.046169,
+    "body": {
+      "counters": {
+        "candle_events": 2,
+        "confirmed_rows": 2,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 4,
+        "text_pongs": 4,
+        "upstream_frames": 30
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845121.12582,
+          "rows": 90,
+          "sequence": 2
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845060,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845120.313256,
+          "rows": 90,
+          "sequence": 2
+        }
+      },
+      "published_at": 1789845180.047164,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845185.0577228,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 4,
+        "text_pongs": 4,
+        "upstream_frames": 35
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845185.058353,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845190.07129,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 4,
+        "text_pongs": 4,
+        "upstream_frames": 35
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845190.071733,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845195.07531,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 4,
+        "text_pongs": 4,
+        "upstream_frames": 37
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845195.076999,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845200.0772538,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 5,
+        "text_pongs": 5,
+        "upstream_frames": 37
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845200.078522,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845205.087569,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 5,
+        "text_pongs": 5,
+        "upstream_frames": 39
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845205.08834,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845210.09085,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 5,
+        "text_pongs": 5,
+        "upstream_frames": 39
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845210.091755,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845215.1063879,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 5,
+        "text_pongs": 5,
+        "upstream_frames": 42
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845215.107283,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845220.115977,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 6,
+        "text_pongs": 6,
+        "upstream_frames": 42
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845220.116416,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845225.1245031,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 6,
+        "text_pongs": 6,
+        "upstream_frames": 45
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845225.125066,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845230.136727,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 6,
+        "text_pongs": 6,
+        "upstream_frames": 45
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845230.137744,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845235.14817,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 6,
+        "text_pongs": 6,
+        "upstream_frames": 47
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845235.148774,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845240.160557,
+    "body": {
+      "counters": {
+        "candle_events": 4,
+        "confirmed_rows": 4,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 7,
+        "text_pongs": 7,
+        "upstream_frames": 47
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845180.945553,
+          "rows": 90,
+          "sequence": 3
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845120,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845181.414226,
+          "rows": 90,
+          "sequence": 3
+        }
+      },
+      "published_at": 1789845240.161399,
+      "ready": true,
+      "v": 1
+    }
+  },
+  {
+    "at": 1789845245.167043,
+    "body": {
+      "counters": {
+        "candle_events": 6,
+        "confirmed_rows": 6,
+        "connection_attempts": 1,
+        "rest_requests": 2,
+        "snapshots": 2,
+        "text_pings": 7,
+        "text_pongs": 7,
+        "upstream_frames": 51
+      },
+      "epoch": "a055fec5-ea21-4aa0-8a93-e30470873183",
+      "history": 90,
+      "pairs": {
+        "BTC-USDC": {
+          "last_open_time": 1789845180,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845241.027495,
+          "rows": 90,
+          "sequence": 4
+        },
+        "ETH-USDC": {
+          "last_open_time": 1789845180,
+          "online": true,
+          "ready": true,
+          "reason": "",
+          "received_at": 1789845241.240249,
+          "rows": 90,
+          "sequence": 4
+        }
+      },
+      "published_at": 1789845245.168309,
+      "ready": true,
+      "v": 1
+    }
+  }
+]

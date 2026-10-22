@@ -3,7 +3,7 @@ import json
 import re
 from decimal import Decimal
 from typing import Any, Callable, List, Optional, Tuple
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aioresponses import aioresponses
 from aioresponses.core import RequestCall
@@ -13,12 +13,186 @@ from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
 from hummingbot.connector.test_support.exchange_connector_test import AbstractExchangeConnectorTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import get_new_client_order_id
-from hummingbot.core.data_type.in_flight_order import InFlightOrder
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.event.events import BuyOrderCreatedEvent, OrderCancelledEvent, OrderType, TradeType
 
 
 class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
+
+    async def test_fill_role_uses_okx_execution_type(self):
+        order = InFlightOrder(
+            client_order_id="maker-entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT_MAKER, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+        with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+            request.return_value = {"code": "0", "data": [fill]}
+            maker = await self.exchange._all_trade_updates_for_order(order)
+            fill["execType"] = "T"
+            taker = await self.exchange._all_trade_updates_for_order(order)
+        self.assertFalse(maker[0].is_taker)
+        self.assertTrue(taker[0].is_taker)
+        self.assertTrue(self.exchange._is_taker_fill({"tradeId": "unknown"}))
+
+    async def test_rest_fill_time_is_attested_without_replacing_record_timestamp(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+        fill["ts"] = "1781855999000"
+        # Exactly at the +5s observation bound, while the REST record clock is 8s earlier.
+        fill["fillTime"] = "1781856007000"
+        self.exchange._set_current_timestamp(1781856002)
+        with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+            request.return_value = {"code": "0", "data": [fill]}
+            update = (await self.exchange._all_trade_updates_for_order(order))[0]
+        self.assertEqual(update.fill_timestamp, 1781855999)
+        self.assertEqual(update.execution_timestamp_ms, 1781856007000)
+        self.assertEqual(update.execution_timestamp_source, "okx.fillTime")
+        self.assertEqual(update.execution_timestamp_observed_at_ms, 1781856002000)
+
+        self.assertTrue(order.update_with_trade_update(update))
+        restored = InFlightOrder.from_json(json.loads(json.dumps(order.to_json())))
+        restored_update = restored.order_fills[update.trade_id]
+        self.assertEqual(restored_update.execution_timestamp_ms, 1781856007000)
+        self.assertEqual(restored_update.execution_timestamp_source, "okx.fillTime")
+        self.assertEqual(restored_update.execution_timestamp_observed_at_ms, 1781856002000)
+
+        old_payload = update.to_json()
+        old_payload.pop("execution_timestamp_observed_at_ms")
+        old_payload["fill_timestamp"] = 1781855990
+        old_without_basis = TradeUpdate.from_json(old_payload)
+        self.assertIsNone(old_without_basis.execution_timestamp_ms)
+        self.assertIsNone(old_without_basis.execution_timestamp_source)
+
+    async def test_rest_oversized_fill_time_keeps_financial_receipt(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+        fill["fillTime"] = "9" * 4301
+        self.exchange._set_current_timestamp(1781856002)
+        with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+            request.return_value = {"code": "0", "data": [fill]}
+            update = (await self.exchange._all_trade_updates_for_order(order))[0]
+        self.assertEqual(update.fill_price, Decimal(fill["fillPx"]))
+        self.assertEqual(update.fill_base_amount, Decimal(fill["fillSz"]))
+        self.assertEqual(update.fill_quote_amount, Decimal(fill["fillSz"]) * Decimal(fill["fillPx"]))
+        self.assertIsNone(update.execution_timestamp_ms)
+        self.assertIsNone(update.execution_timestamp_source)
+
+    async def test_invalid_or_far_future_rest_fill_time_keeps_fill_unknown(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        self.exchange._set_current_timestamp(1781856000)
+        for invalid in ("0", "bad", "1781856006001"):
+            fill = self._order_fills_request_full_fill_mock_response(order)["data"][0]
+            fill["fillTime"] = invalid
+            with patch.object(self.exchange, "_request_order_fills", new_callable=AsyncMock) as request:
+                request.return_value = {"code": "0", "data": [fill]}
+                update = (await self.exchange._all_trade_updates_for_order(order))[0]
+            self.assertIsNone(update.execution_timestamp_ms)
+            self.assertIsNone(update.execution_timestamp_source)
+
+    async def test_websocket_maker_fill_role_is_preserved(self):
+        order = InFlightOrder(
+            client_order_id="maker-entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT_MAKER, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        event = self.trade_event_for_full_fill_websocket_update(order)
+        event["data"][0]["state"] = "partially_filled"
+        event["data"][0]["execType"] = "M"
+
+        async def one_event():
+            yield event
+
+        tracker = MagicMock()
+        tracker.all_fillable_orders = {order.client_order_id: order}
+        tracker.all_updatable_orders = {}
+        tracker.process_trade_update_and_wait = AsyncMock(return_value=True)
+        with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
+                patch.object(self.exchange, "_order_tracker", tracker):
+            await self.exchange._user_stream_event_listener()
+        self.assertFalse(tracker.process_trade_update_and_wait.call_args.args[0].is_taker)
+
+    async def test_websocket_fill_time_is_attested_separately_from_update_time(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        event = self.trade_event_for_full_fill_websocket_update(order)
+        event["data"][0].update({"uTime": "1781856002000", "fillTime": "1781856001000"})
+
+        async def one_event():
+            yield event
+
+        tracker = MagicMock()
+        self.exchange._set_current_timestamp(1781856002)
+        tracker.all_fillable_orders = {order.client_order_id: order}
+        tracker.all_updatable_orders = {}
+        tracker.process_trade_update_and_wait = AsyncMock(return_value=True)
+        with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
+                patch.object(self.exchange, "_order_tracker", tracker):
+            await self.exchange._user_stream_event_listener()
+        update = tracker.process_trade_update_and_wait.call_args.args[0]
+        self.assertEqual(update.fill_timestamp, 1781856002)
+        self.assertEqual(update.execution_timestamp_ms, 1781856001000)
+        self.assertEqual(update.execution_timestamp_source, "okx.fillTime")
+
+    async def test_websocket_oversized_fill_time_keeps_fill_and_order_status(self):
+        order = InFlightOrder(
+            client_order_id="entry", exchange_order_id="venue-order", trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT, trade_type=TradeType.BUY, amount=Decimal("1"),
+            price=Decimal("100"), creation_timestamp=1234567890,
+        )
+        event = self.trade_event_for_full_fill_websocket_update(order)
+        event["data"][0].update({
+            "state": "partially_filled",
+            "uTime": "1781856002000",
+            "fillTime": "9" * 4301,
+        })
+
+        async def one_event():
+            yield event
+
+        tracker = MagicMock()
+        tracker.all_fillable_orders = {order.client_order_id: order}
+        tracker.all_updatable_orders = {order.client_order_id: order}
+        tracker.process_trade_update_and_wait = AsyncMock(return_value=True)
+        tracker.process_order_update_and_wait = AsyncMock()
+        self.exchange._set_current_timestamp(1781856002)
+        with patch.object(self.exchange, "_iter_user_event_queue", one_event), \
+                patch.object(self.exchange, "_order_tracker", tracker):
+            await self.exchange._user_stream_event_listener()
+
+        update = tracker.process_trade_update_and_wait.call_args.args[0]
+        self.assertEqual(update.fill_price, Decimal(event["data"][0]["fillPx"]))
+        self.assertEqual(update.fill_base_amount, Decimal(event["data"][0]["fillSz"]))
+        self.assertEqual(update.fill_quote_amount, update.fill_base_amount * update.fill_price)
+        self.assertIsNone(update.execution_timestamp_ms)
+        self.assertIsNone(update.execution_timestamp_source)
+        order_update = tracker.process_order_update_and_wait.call_args.kwargs["order_update"]
+        self.assertEqual(order_update.new_state, OrderState.PARTIALLY_FILLED)
+
+    async def test_preopen_instrument_is_not_mapped_as_live_rule(self):
+        info = {"instType": "SPOT", "instId": "LAT-USDC", "baseCcy": "LAT", "quoteCcy": "USDC",
+                "state": "preopen", "minSz": "10000", "tickSz": "0.0000001", "lotSz": "1"}
+        with patch.object(self.exchange, "trading_pair_associated_to_exchange_symbol",
+                          new_callable=AsyncMock, side_effect=KeyError("LAT-USDC")) as lookup:
+            rules = await self.exchange._format_trading_rules({"data": [info]})
+        self.assertEqual(rules, [])
+        lookup.assert_not_awaited()
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -254,6 +428,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 {
                     "instType": "SPOT",
                     "instId": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
+                    "state": "live",
                     "uly": self.exchange_symbol_for_tokens(self.base_asset, self.quote_asset),
                     "category": "1",
                     "baseCcy": self.base_asset,
@@ -787,7 +962,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "fillSz": "0",
                     "fillPx": "0",
                     "tradeId": "0",
-                    "accFillSz": "323",
+                    "accFillSz": str(order.executed_amount_base),
                     "fillNotionalUsd": "",
                     "fillTime": "0",
                     "fillFee": "0",
@@ -847,7 +1022,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "fillSz": "",
                     "fillPx": "",
                     "tradeId": "",
-                    "accFillSz": "323",
+                    "accFillSz": str(order.amount),
                     "fillNotionalUsd": "",
                     "fillTime": "0",
                     "fillFee": str(-self.expected_fill_fee.flat_fees[0].amount),
@@ -907,7 +1082,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "fillSz": str(order.amount),
                     "fillPx": str(order.price),
                     "tradeId": self.expected_fill_trade_id,
-                    "accFillSz": "323",
+                    "accFillSz": str(order.amount),
                     "fillNotionalUsd": "",
                     "fillTime": "0",
                     "fillFee": str(-self.expected_fill_fee.flat_fees[0].amount),
@@ -976,8 +1151,12 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
 
     def test_time_synchronizer_related_request_error_detection(self):
         exception = IOError("Error executing request POST https://okx.com/api/v3/order. HTTP status is 401. "
-                            'Error: {"code":"50113","msg":"message"}')
+                            'Error: {"code":"50102","msg":"Timestamp request expired."}')
         self.assertTrue(self.exchange._is_request_exception_related_to_time_synchronizer(exception))
+
+        exception = IOError("Error executing request POST https://okx.com/api/v3/order. HTTP status is 401. "
+                            'Error: {"code":"50113","msg":"Invalid Sign"}')
+        self.assertFalse(self.exchange._is_request_exception_related_to_time_synchronizer(exception))
 
         exception = IOError("Error executing request POST https://okx.com/api/v3/order. HTTP status is 401. "
                             'Error: {"code":"50114","msg":"message"}')
@@ -1028,7 +1207,7 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                     "side": order.trade_type.name.lower(),
                     "posSide": "long",
                     "tdMode": "isolated",
-                    "accFillSz": "0",
+                    "accFillSz": str(order.amount),
                     "fillPx": "0",
                     "tradeId": "1",
                     "fillSz": str(order.amount),
@@ -1350,3 +1529,79 @@ class OkxExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
                 f"{Decimal('100.000000')} {self.trading_pair} at {Decimal('10000')}."
             )
         )
+
+    @aioresponses()
+    async def test_create_order_fails_and_raises_failure_event(self, mock_api):
+        # A transport rejection without an OKX order acknowledgement is uncertain, not permission to retry.
+        self._simulate_trading_rules_initialized()
+        sent = asyncio.Event()
+        mock_api.post(self.order_creation_url, status=400, callback=lambda *args, **kwargs: sent.set())
+        order_id = self.place_buy_order()
+        await asyncio.wait_for(sent.wait(), timeout=3)
+        await asyncio.sleep(0.1)
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+        self.assertFalse(self.exchange.in_flight_orders[order_id].is_failure)
+        self.assertEqual([], self.order_failure_logger.event_log)
+
+    @aioresponses()
+    async def test_create_order_fails_when_trading_rule_error_and_raises_failure_event(self, mock_api):
+        self._simulate_trading_rules_initialized()
+        sent = asyncio.Event()
+        mock_api.post(self.order_creation_url, status=400, callback=lambda *args, **kwargs: sent.set())
+        invalid_id = self.place_buy_order(amount=Decimal("0.0001"), price=Decimal("0.0001"))
+        uncertain_id = self.place_buy_order()
+        await asyncio.wait_for(sent.wait(), timeout=3)
+        await asyncio.sleep(0.1)
+        self.assertNotIn(invalid_id, self.exchange.in_flight_orders)
+        self.assertIn(uncertain_id, self.exchange.in_flight_orders)
+        self.assertEqual([invalid_id], [event.order_id for event in self.order_failure_logger.event_log])
+
+    @aioresponses()
+    async def test_accepted_order_persistence_failure_retains_exchange_identity_without_failure_event(self, mock_api):
+        self._simulate_trading_rules_initialized()
+        mock_api.post(self.order_creation_url, payload=self.order_creation_request_successful_mock_response)
+        with patch.object(self.exchange._order_tracker, "process_order_update_and_wait",
+                          new_callable=AsyncMock, side_effect=RuntimeError("injected recorder failure")):
+            order_id = self.place_buy_order()
+
+            async def wait_for_order_id():
+                while True:
+                    order = self.exchange._order_tracker.fetch_order(order_id)
+                    if order is not None and order.exchange_order_id is not None:
+                        return
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(wait_for_order_id(), timeout=3)
+            await asyncio.sleep(0.05)
+
+        order = self.exchange.in_flight_orders[order_id]
+        self.assertEqual(str(self.expected_exchange_order_id), order.exchange_order_id)
+        self.assertFalse(order.is_failure)
+        self.assertEqual([], self.order_failure_logger.event_log)
+
+    @aioresponses()
+    async def test_update_order_status_when_request_fails_marks_order_as_not_found(self, mock_api):
+        self.exchange.start_tracking_order(order_id="uncertain", exchange_order_id="venue",
+                                           trading_pair=self.trading_pair, trade_type=TradeType.BUY,
+                                           price=Decimal("10000"), amount=Decimal("1"), order_type=OrderType.LIMIT)
+        order = self.exchange.in_flight_orders["uncertain"]
+        self.configure_http_error_order_status_response(order, mock_api)
+        await self.exchange._update_order_status()
+        self.assertIn("uncertain", self.exchange.in_flight_orders)
+        self.assertFalse(order.is_done)
+        self.assertEqual(0, self.exchange._order_tracker._order_not_found_records.get("uncertain", 0))
+
+    @aioresponses()
+    async def test_update_order_status_when_filled_correctly_processed_even_when_trade_fill_update_fails(self, mock_api):
+        # OKX terminal status is withheld until its reported fills are accounted for.
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + '1', exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair, order_type=OrderType.LIMIT, trade_type=TradeType.BUY,
+            price=Decimal('10000'), amount=Decimal('1'))
+        order = self.exchange.in_flight_orders[self.client_order_id_prefix + '1']
+        self.configure_erroneous_http_fill_trade_response(order=order, mock_api=mock_api)
+        self.configure_completely_filled_order_status_response(order=order, mock_api=mock_api)
+        await self.exchange._update_order_status()
+        await asyncio.sleep(0)
+        self.assertFalse(order.is_done)
+        self.assertIn(order.client_order_id, self.exchange.in_flight_orders)
+        self.assertEqual(Decimal('0'), order.executed_amount_base)

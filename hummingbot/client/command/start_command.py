@@ -8,6 +8,7 @@ from hummingbot import init_logging
 from hummingbot.client.command.gateway_api_manager import GatewayChainApiManager
 from hummingbot.client.config.config_validators import validate_bool
 from hummingbot.client.config.config_var import ConfigVar
+from hummingbot.client.native_commands import native_command_boundary
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.exceptions import OracleRateUnavailable
 
@@ -50,6 +51,7 @@ class StartCommand(GatewayChainApiManager):
             return
         safe_ensure_future(self.start_check(log_level, v2_conf, is_quickstart), loop=self.ev_loop)
 
+    @native_command_boundary("start")
     async def start_check(self,  # type: HummingbotApplication
                           log_level: Optional[str] = None,
                           v2_conf: Optional[str] = None,
@@ -141,6 +143,7 @@ class StartCommand(GatewayChainApiManager):
         self._in_start_check = False
 
         # Patch MQTT loggers if MQTT is available
+        self.start_market_event_notifiers()
         if self._mqtt:
             self._mqtt.patch_loggers()
             self._mqtt.start_market_events_fw()
@@ -152,8 +155,9 @@ class StartCommand(GatewayChainApiManager):
         from hummingbot.client.settings import SCRIPT_STRATEGY_CONF_DIR_PATH
 
         conf_path = SCRIPT_STRATEGY_CONF_DIR_PATH / conf_name
-        with open(conf_path) as f:
-            return yaml.safe_load(f) or {}
+        from hummingbot.client.native_sources import read_config_text
+
+        return yaml.safe_load(read_config_text(conf_path)) or {}
 
     async def confirm_oracle_conversion_rate(self,  # type: HummingbotApplication
                                              ) -> bool:

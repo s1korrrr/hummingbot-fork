@@ -1,0 +1,31 @@
+........................................................................ [ 31%]
+........................................................................ [ 62%]
+........................................................................ [ 93%]
+..............                                                           [100%]
+=============================== warnings summary ===============================
+test/modular_spot/test_native_recovery.py::test_shared_candle_failure_blocks_acquisitions_without_a_loss_sale
+  /Users/s1kor/anaconda3/envs/hummingbot/lib/python3.13/asyncio/base_events.py:750: RuntimeWarning: coroutine 'safe_wrapper' was never awaited
+    self._ready.clear()
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+test/modular_spot/test_native_recovery.py::test_shared_candle_failure_blocks_acquisitions_without_a_loss_sale
+  /Users/s1kor/anaconda3/envs/hummingbot/lib/python3.13/asyncio/base_events.py:750: RuntimeWarning: coroutine 'ModularSpotController.control_loop' was never awaited
+    self._ready.clear()
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+test/modular_spot/test_native_recovery.py::test_shared_candle_failure_blocks_acquisitions_without_a_loss_sale
+  /Users/s1kor/anaconda3/envs/hummingbot/lib/python3.13/weakref.py:382: RuntimeWarning: coroutine 'ModularSpotController.control_loop' was never awaited
+    self._iterating = set()
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+230 passed, 3 warnings in 5.73s
+/Users/s1kor/anaconda3/envs/hummingbot/lib/python3.13/site-packages/_pytest/pathlib.py:103: PytestWarning: (rm_rf) unknown function <built-in function scandir> when removing /private/var/folders/g6/mrhqfgk15_d2gjj52991r1jr0000gn/T/pytest-of-s1kor/garbage-cf241af6-18ab-448b-9efb-922f3c0b1211/test_verified_python_buffer_us0/sealed-runtime/lib:
+<class 'PermissionError'>: [Errno 1] Operation not permitted: '/private/var/folders/g6/mrhqfgk15_d2gjj52991r1jr0000gn/T/pytest-of-s1kor/garbage-cf241af6-18ab-448b-9efb-922f3c0b1211/test_verified_python_buffer_us0/sealed-runtime/lib'
+  warnings.warn(
+/Users/s1kor/anaconda3/envs/hummingbot/lib/python3.13/site-packages/_pytest/pathlib.py:103: PytestWarning: (rm_rf) unknown function <built-in function scandir> when removing /private/var/folders/g6/mrhqfgk15_d2gjj52991r1jr0000gn/T/pytest-of-s1kor/garbage-989695d4-310c-4447-82e6-1b1637a5b68c/test_verified_python_buffer_us0/sealed-runtime/lib:
+<class 'PermissionError'>: [Errno 1] Operation not permitted: '/private/var/folders/g6/mrhqfgk15_d2gjj52991r1jr0000gn/T/pytest-of-s1kor/garbage-989695d4-310c-4447-82e6-1b1637a5b68c/test_verified_python_buffer_us0/sealed-runtime/lib'
+  warnings.warn(

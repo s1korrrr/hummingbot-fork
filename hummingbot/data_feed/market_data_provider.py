@@ -13,10 +13,12 @@ from hummingbot.client.config.config_helpers import (
 )
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.common import GroupedSetDict, LazyDict, PriceType, TradeType
 from hummingbot.core.data_type.order_book_query_result import OrderBookQueryResult
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from hummingbot.core.rate_oracle.utils import find_rate
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -26,6 +28,7 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 class MarketDataProvider:
     _logger: Optional[HummingbotLogger] = None
+    _rates_request_timeout = 5.0
     gateway_price_provider_by_chain: Dict = {
         "ethereum": "uniswap/router",
         "solana": "jupiter/router",
@@ -41,10 +44,15 @@ class MarketDataProvider:
                  connectors: Dict[str, ConnectorBase],
                  rates_update_interval: int = 60):
         self.candles_feeds = {}  # Stores instances of candle feeds
+        self._candle_throttlers: Dict[str, AsyncThrottler] = {}
         self.connectors = connectors  # Stores instances of connectors
         self._rates_update_task = None
         self._rates_update_interval = rates_update_interval
         self._rates = {}
+        self._rate_refresh_state: Dict[Tuple[str, str], Dict] = {}
+        self._last_rate_refresh_errors: Dict[str, str] = {}
+        self._ticker_rates: Dict[Tuple[str, str], Optional[Tuple[Decimal, float]]] = {}
+        self._ticker_observations = {}
         self._non_trading_connectors = LazyDict[str, ConnectorBase](self._create_non_trading_connector)
         self._non_trading_connectors_started: Dict[str, bool] = {}  # Track which connectors have been started
         self._rates_required = GroupedSetDict[str, ConnectorPair]()
@@ -57,7 +65,12 @@ class MarketDataProvider:
             self._rates_update_task.cancel()
             self._rates_update_task = None
         self.candles_feeds.clear()
+        self._candle_throttlers.clear()
         self._rates_required.clear()
+        self._rate_refresh_state.clear()
+        self._last_rate_refresh_errors.clear()
+        self._ticker_rates.clear()
+        self._ticker_observations.clear()
         # Stop non-trading connectors that were started for public data access
         for connector in self._non_trading_connectors.values():
             safe_ensure_future(connector.stop_network())
@@ -80,6 +93,8 @@ class MarketDataProvider:
         """
         for connector_pair in connector_pairs:
             self._rates_required.add_or_update(connector_pair.connector_name, connector_pair)
+            if "/" not in connector_pair.connector_name and "gateway" not in connector_pair.connector_name:
+                self._ticker_rates.setdefault((connector_pair.connector_name, connector_pair.trading_pair), None)
         if not self._rates_update_task:
             self._rates_update_task = safe_ensure_future(self.update_rates_task())
 
@@ -90,6 +105,11 @@ class MarketDataProvider:
         """
         for connector_pair in connector_pairs:
             self._rates_required.remove(connector_pair.connector_name, connector_pair)
+
+        for connector_pair in connector_pairs:
+            self._rate_refresh_state.pop((connector_pair.connector_name, connector_pair.trading_pair), None)
+            self._ticker_rates.pop((connector_pair.connector_name, connector_pair.trading_pair), None)
+            self._ticker_observations.pop((connector_pair.connector_name, connector_pair.trading_pair), None)
 
         # Stop the rates update task if no more rates are required
         if len(self._rates_required) == 0 and self._rates_update_task:
@@ -155,7 +175,8 @@ class MarketDataProvider:
                                 gateway_task_metadata.append((connector_pair, connector_pair.trading_pair))
 
                             except Exception as e:
-                                self.logger().warning(f"Error preparing price request for {connector_pair.trading_pair}: {e}")
+                                self.logger().warning(
+                                    f"Error preparing price request for {connector_pair.trading_pair}: {e}")
                                 continue
                     else:
                         # Non-gateway connector
@@ -179,10 +200,18 @@ class MarketDataProvider:
                         connector_instance = self._non_trading_connectors[connector]
                         prices = await self._safe_get_last_traded_prices(
                             connector=connector_instance,
-                            trading_pairs=[pair.trading_pair for pair in connector_pairs])
+                            trading_pairs=[pair.trading_pair for pair in connector_pairs],
+                            timeout=self._rates_request_timeout)
+                        for connector_pair in connector_pairs:
+                            pair = connector_pair.trading_pair
+                            self._ticker_rates[(connector, pair)] = (
+                                prices[pair], time.monotonic()) if pair in prices else None
                         for pair, rate in prices.items():
                             rate_oracle.set_price(pair, rate)
                     except Exception as e:
+                        for connector_pair in connector_pairs:
+                            self._ticker_rates[(connector, connector_pair.trading_pair)] = None
+                            self._ticker_observations.pop((connector, connector_pair.trading_pair), None)
                         self.logger().error(f"Error fetching prices from {connector}: {e}", exc_info=True)
 
                 await asyncio.sleep(self._rates_update_interval)
@@ -226,6 +255,11 @@ class MarketDataProvider:
 
             # Create a new feed with updated max_records
             candle_feed = CandlesFactory.get_candle(config)
+            throttler = self._candle_throttlers.get(config.connector)
+            if throttler is None:
+                throttler = AsyncThrottler(rate_limits=candle_feed.rate_limits)
+                self._candle_throttlers[config.connector] = throttler
+            candle_feed.set_throttler(throttler)
             self.candles_feeds[key] = candle_feed
             if hasattr(candle_feed, 'start'):
                 candle_feed.start()
@@ -363,6 +397,12 @@ class MarketDataProvider:
         elif connector_config is not None:
             # Provide empty strings for all config keys (for public data access without auth)
             api_keys = {key: "" for key in connector_config.__class__.model_fields.keys() if key != "connector"}
+            if connector_name == "okx":
+                # Region selects the public REST host; it is not an authentication secret.
+                region = connector_config.okx_registration_sub_domain
+                if region not in ("www", "app", "my"):
+                    raise ValueError("Invalid OKX public connector registration region")
+                api_keys["okx_registration_sub_domain"] = region
         else:
             # No config found, return empty dict
             api_keys = {}
@@ -786,29 +826,235 @@ class MarketDataProvider:
         :param pair: A trading pair, e.g. BTC-USDT
         :return A conversion rate
         """
-        return RateOracle.get_instance().get_pair_rate(pair)
+        oracle = RateOracle.get_instance()
+        if not self._ticker_rates:
+            return self._get_cached_rate(pair)
+
+        # Replace all managed edges in a local copy, including their inverse. Cross-rate
+        # discovery must never route through a stale managed quote in the global oracle.
+        prices = dict(oracle.prices)
+        grouped = {}
+        for (connector, source_pair), quote in sorted(self._ticker_rates.items()):
+            grouped.setdefault(source_pair, []).append(quote)
+        blocked = set()
+        now = time.monotonic()
+        max_age = self._rates_update_interval + self._rates_request_timeout
+        for source_pair, quotes in grouped.items():
+            base, counter = source_pair.split("-")
+            inverse = f"{counter}-{base}"
+            prices.pop(source_pair, None)
+            prices.pop(inverse, None)
+            if any(quote is None or not 0 <= now - quote[1] <= max_age for quote in quotes):
+                blocked.update((source_pair, inverse))
+        for source_pair, quotes in grouped.items():
+            if source_pair not in blocked:
+                # Every registered source must be fresh. Choose the first connector
+                # alphabetically, independent of refresh order and global overwrites.
+                prices[source_pair] = quotes[0][0]
+        rate = find_rate(prices, pair)
+        if rate is None:
+            raise ValueError(f"Registered ticker rate is unavailable or stale: {pair}")
+        return rate
+
+    def _get_cached_rate(self, pair: str) -> Decimal:
+        """
+        Finds a conversion rate for a given trading pair, this can be direct or indirect prices as
+        long as it can find a route to achieve this.
+
+        :param pair: A trading pair, e.g. BTC-USDT
+        :return A conversion rate
+        """
+        managed_pairs = {trading_pair for _, trading_pair in self._rate_refresh_state}
+        managed_pairs.update(
+            entry.trading_pair
+            for connector, entries in self._rates_required.items()
+            if '/' not in connector and 'gateway' not in connector
+            for entry in entries
+        )
+        oracle = RateOracle.get_instance()
+        if not managed_pairs:
+            return oracle.get_pair_rate(pair)
+
+        # Resolve inverses and intermediate legs from the same freshness-filtered
+        # map. Falling back to the shared oracle would resurrect expired samples.
+        prices = dict(oracle.prices)
+        fresh_prices = {}
+        now = self.time()
+        for managed_pair in managed_pairs:
+            base, quote = managed_pair.split('-')
+            prices.pop(managed_pair, None)
+            prices.pop(f"{quote}-{base}", None)
+            states = [entry for (_, trading_pair), entry in self._rate_refresh_state.items()
+                      if trading_pair == managed_pair and entry.get('last_success') is not None
+                      and 0 <= now - entry['last_success'] <= self._rates_update_interval * 2]
+            if states:
+                fresh_prices[managed_pair] = max(states, key=lambda entry: entry['last_success'])['price']
+            elif pair in (managed_pair, f"{quote}-{base}"):
+                raise ValueError(f"Conversion rate {pair} unavailable or stale; awaiting a successful price refresh")
+        prices.update(fresh_prices)
+        rate = find_rate(prices, pair)
+        if rate is None:
+            raise ValueError(f"Conversion rate {pair} unavailable or stale; awaiting a successful price refresh")
+        return rate
+
+    def get_rate_health(self) -> List[Dict]:
+        """Expose failed and expired refreshes without claiming cached rates are current."""
+        now = self.time()
+        health = []
+        for connector, pair in sorted(self._rate_refresh_state.keys() | self._ticker_rates.keys()):
+            entry = self._rate_refresh_state.get((connector, pair),
+                                                 {'last_success': None, 'error': None, 'failures': 0})
+            age = None if entry.get('last_success') is None else now - entry['last_success']
+            managed = (connector, pair) in self._ticker_rates
+            max_age = (self._rates_update_interval + self._rates_request_timeout
+                       if managed else self._rates_update_interval * 2)
+            if managed:
+                quote = self._ticker_rates[(connector, pair)]
+                age = None if quote is None else time.monotonic() - quote[1]
+            if age is None:
+                state = 'unavailable'
+            elif not 0 <= age <= max_age:
+                state = 'stale'
+            else:
+                state = 'degraded' if entry['error'] is not None else 'ready'
+            health.append({'connector': connector, 'trading_pair': pair, 'state': state,
+                           'age_seconds': age, 'max_age_seconds': max_age,
+                           'source': 'registered_ticker' if managed else 'cached_conversion',
+                           'error': entry['error'], 'consecutive_failures': entry['failures']})
+        return health
 
     async def _safe_get_last_traded_prices(self, connector, trading_pairs, timeout=5):
-        try:
-            tasks = [self._safe_get_last_traded_price(connector, trading_pair) for trading_pair in trading_pairs]
-            prices = await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
-            return {pair: Decimal(rate) for pair, rate in zip(trading_pairs, prices)}
-        except Exception as e:
-            error_detail = f"{type(e).__name__}: {e}" if str(e).strip() else type(e).__name__
-            logging.error(
-                f"Error getting last traded prices in connector {connector} for trading pairs {trading_pairs}: "
-                f"{error_detail}"
-            )
-            return {}
+        pairs = list(dict.fromkeys(trading_pairs))
 
-    async def _safe_get_last_traded_price(self, connector, trading_pair):
+        async def fetch(pair):
+            price = await asyncio.wait_for(self._safe_get_last_traded_price(connector, pair, propagate_errors=True), timeout=timeout)
+            return price, self.time()
+
+        results = await asyncio.gather(*(fetch(pair) for pair in pairs), return_exceptions=True)
+        prices = {}
+        failures = []
+        connector_name = getattr(connector, 'name', None)
+        if not isinstance(connector_name, str):
+            connector_name = type(connector).__name__
+        for pair, result in zip(pairs, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            entry = self._rate_refresh_state.setdefault((connector_name, pair), {'last_success': None})
+            if isinstance(result, Exception):
+                entry.update(error=type(result).__name__, failures=entry.get('failures', 0) + 1)
+                failures.append(f"{pair} ({type(result).__name__})")
+            else:
+                price, received_at = result
+                prices[pair] = price
+                entry.update(last_success=received_at, price=price, error=None, failures=0)
+        error_label = ', '.join(sorted(failures))
+        previous_error = self._last_rate_refresh_errors.get(connector_name, '')
+        if error_label != previous_error:
+            if error_label:
+                self.logger().warning(
+                    f"Price refresh incomplete for {connector_name}: {error_label}; retrying on the next refresh. "
+                    f"Registered ticker rates are unavailable after a failed refresh and expire after "
+                    f"{self._rates_update_interval + self._rates_request_timeout}s; "
+                    f"legacy cached conversion rates expire after {self._rates_update_interval * 2}s."
+                )
+            else:
+                self.logger().info(f"Price refresh recovered for {connector_name}.")
+            self._last_rate_refresh_errors[connector_name] = error_label
+        return prices
+
+    async def _safe_get_last_traded_price(self, connector, trading_pair, timeout=5, *, propagate_errors=False):
         try:
-            last_traded = await connector._get_last_traded_price(trading_pair=trading_pair)
-            return Decimal(last_traded)
+            last_traded = await asyncio.wait_for(
+                connector._get_last_traded_price(trading_pair=trading_pair), timeout=timeout)
+            if isinstance(last_traded, bool):
+                raise ValueError("Boolean price is invalid")
+            rate = Decimal(str(last_traded))
+            if not rate.is_finite() or rate <= 0:
+                raise ValueError("Ticker price must be finite and positive")
+            self._record_ticker_observation(connector, trading_pair, available=True)
+            return rate
+        except asyncio.CancelledError:
+            self._record_ticker_observation(connector, trading_pair, available=False)
+            raise
         except Exception as e:
+            self._record_ticker_observation(connector, trading_pair, available=False)
+            if propagate_errors:
+                raise
             error_detail = f"{type(e).__name__}: {e}" if str(e).strip() else type(e).__name__
             logging.error(
                 f"Error getting last traded price in connector {connector} for trading pair {trading_pair}: "
                 f"{error_detail}"
             )
-            return Decimal(0)
+            return None
+
+    @staticmethod
+    def _observation_timestamp(value):
+        from datetime import datetime, timezone
+
+        if isinstance(value, bool):
+            return None
+        try:
+            timestamp = float(value)
+            if timestamp <= 0:
+                return None
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        except (ArithmeticError, TypeError, ValueError, OSError):
+            return None
+
+    def _record_ticker_observation(self, connector, trading_pair, *, available):
+        connector_name = getattr(connector, "name", None)
+        if not isinstance(connector_name, str):
+            return
+        key = (connector_name, trading_pair)
+        if not available:
+            self._ticker_observations.pop(key, None)
+            return
+        received_at, received_monotonic = time.time(), time.monotonic()
+        source_at = None
+        source_timestamp = getattr(connector, "last_traded_price_source_timestamp", None)
+        if callable(source_timestamp):
+            try:
+                value = source_timestamp(trading_pair)
+                if self._observation_timestamp(value) is not None and float(value) <= received_at:
+                    source_at = float(value)
+            except Exception:
+                # An observation accessor must never change the valid price result.
+                source_at = None
+        self._ticker_observations[key] = (source_at, received_at, received_monotonic)
+
+    def get_market_data_health(self, connector_name, trading_pair, interval, *, observed_at,
+                               candle_connector=None, candle_pair=None):
+        """Read existing observations only; never create a connector/feed or fetch data."""
+        price = {"source": "last_traded_ticker", "source_at": None, "received_at": None, "availability": "unavailable"}
+        observation = self._ticker_observations.get((connector_name, trading_pair))
+        if observation is not None:
+            source_at, received_at, received_monotonic = observation
+            price.update(source_at=self._observation_timestamp(source_at),
+                         received_at=self._observation_timestamp(received_at))
+            max_age = self._rates_update_interval + self._rates_request_timeout
+            age = time.monotonic() - received_monotonic
+            if source_at is not None:
+                price["availability"] = "stale" if age > max_age or observed_at - source_at > max_age else "available"
+        candle = {"source_at": None, "received_at": None, "interval_seconds": None,
+                  "timestamp_semantics": None, "closed": None, "last_expected_closed_at": None,
+                  "connector": candle_connector or connector_name, "pair": candle_pair or trading_pair}
+        key = f"{candle_connector or connector_name}_{candle_pair or trading_pair}_{interval}"
+        feed = self.candles_feeds.get(key)
+        if feed is not None and getattr(feed, "closed_candles_only", False) is True:
+            try:
+                seconds = float(feed.interval_in_seconds)
+                if self._observation_timestamp(seconds) is not None:
+                    candle.update(interval_seconds=seconds, timestamp_semantics="open")
+                    frame = feed.candles_df
+                    timestamps = pd.to_numeric(frame["timestamp"], errors="coerce")
+                    closed = timestamps[(timestamps > 0) & (timestamps + seconds <= observed_at)]
+                    if not closed.empty:
+                        candle.update(source_at=self._observation_timestamp(closed.max()), closed=True)
+                    # Only fixed intraday UTC intervals have a proven epoch anchor.
+                    if seconds <= 43200 and 86400 % seconds == 0:
+                        candle["last_expected_closed_at"] = self._observation_timestamp(
+                            observed_at // seconds * seconds - seconds)
+            except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError):
+                pass
+        return {"pair": trading_pair, "connector": connector_name,
+                "observed_at": self._observation_timestamp(observed_at), "price": price, "candle": candle}

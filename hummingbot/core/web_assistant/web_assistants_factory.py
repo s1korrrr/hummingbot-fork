@@ -44,6 +44,10 @@ class WebAssistantsFactory:
     def throttler(self) -> AsyncThrottlerBase:
         return self._throttler
 
+    def set_throttler(self, throttler: AsyncThrottlerBase) -> None:
+        """Replace the request throttler while preserving connection and processor configuration."""
+        self._throttler = throttler
+
     @property
     def auth(self) -> Optional[AuthBase]:
         return self._auth

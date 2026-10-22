@@ -1,7 +1,7 @@
 from test.hummingbot.data_feed.candles_feed.test_candles_base import TestCandlesBase
 
 from hummingbot.connector.test_support.network_mocking_assistant import NetworkMockingAssistant
-from hummingbot.data_feed.candles_feed.okx_spot_candles import OKXSpotCandles
+from hummingbot.data_feed.candles_feed.okx_spot_candles import OKXSpotCandles, constants as CONSTANTS
 
 
 class TestOKXSpotCandles(TestCandlesBase):
@@ -29,6 +29,12 @@ class TestOKXSpotCandles(TestCandlesBase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.mocking_assistant = NetworkMockingAssistant()
+
+    def test_public_ip_rate_limits_reserve_half_for_non_candle_traffic(self):
+        limits = {rate_limit.limit_id: rate_limit.limit for rate_limit in self.data_feed.rate_limits}
+
+        self.assertEqual(10, limits[CONSTANTS.CANDLES_ENDPOINT])
+        self.assertEqual(5, limits[CONSTANTS.HEALTH_CHECK_ENDPOINT])
 
     @staticmethod
     def get_candles_rest_data_mock():
@@ -117,8 +123,61 @@ class TestOKXSpotCandles(TestCandlesBase):
                  "297.60067612",
                  "12874025.740848533",
                  "12874025.740848533",
-                 "0"]]}
+                 "1"]]}
         return data
+
+    def test_parse_rest_candles_omits_unconfirmed_head(self):
+        data = self.get_candles_rest_data_mock()
+        data["data"][0][8] = "0"
+
+        rows = self.data_feed._parse_rest_candles(data)
+
+        self.assertEqual(3, len(rows))
+        self.assertNotIn(1705431600.0, [row[0] for row in rows])
+
+    def test_parse_websocket_message_omits_unconfirmed_candle(self):
+        data = self.get_candles_ws_data_mock_2()
+        data["data"][0][8] = "0"
+
+        row = self.data_feed._parse_websocket_message(data)
+
+        self.assertIsNone(row)
+
+    def test_parse_websocket_message_maps_confirmed_spot_volumes(self):
+        data = self.get_candles_ws_data_mock_1()
+
+        row = self.data_feed._parse_websocket_message(data)
+
+        self.assertEqual("942.87870026", row["volume"])
+        self.assertEqual("40743115.773175484", row["quote_asset_volume"])
+
+    def test_parse_rest_candles_omits_malformed_row_without_confirmation(self):
+        data = self.get_candles_rest_data_mock()
+        data["data"][0] = data["data"][0][0:8]
+
+        rows = self.data_feed._parse_rest_candles(data)
+
+        self.assertEqual(3, len(rows))
+        self.assertTrue(
+            self.is_logged(
+                "WARNING",
+                "Ignoring 1 malformed OKX spot candle row(s) without confirmation state.",
+            )
+        )
+
+    def test_parse_websocket_message_omits_malformed_row_without_confirmation(self):
+        data = self.get_candles_ws_data_mock_1()
+        data["data"][0] = data["data"][0][0:8]
+
+        row = self.data_feed._parse_websocket_message(data)
+
+        self.assertIsNone(row)
+        self.assertTrue(
+            self.is_logged(
+                "WARNING",
+                "Ignoring malformed OKX spot candle without confirmation state.",
+            )
+        )
 
     @staticmethod
     def _success_subscription_mock():

@@ -6,6 +6,7 @@ import grp
 import logging
 import os
 import pwd
+import signal
 import subprocess
 from pathlib import Path
 from typing import Coroutine, List
@@ -25,7 +26,7 @@ from hummingbot.client.config.config_helpers import (
     read_system_configs_from_yml,
 )
 from hummingbot.client.config.security import Security
-from hummingbot.client.hummingbot_application import HummingbotApplication
+from hummingbot.client.hummingbot_application import HummingbotApplication, validate_runtime_instance_id
 from hummingbot.client.settings import SCRIPT_STRATEGY_CONF_DIR_PATH, STRATEGIES_CONF_DIR_PATH, AllConnectorSettings
 from hummingbot.client.ui import login_prompt
 from hummingbot.client.ui.style import load_style
@@ -41,6 +42,10 @@ class CmdlineParser(argparse.ArgumentParser):
                           type=str,
                           required=False,
                           help="Specify a file in `conf/` to load as the strategy config file.")
+        self.add_argument("--instance-id",
+                          type=validate_runtime_instance_id,
+                          default=None,
+                          help="Override this process MQTT identity without changing conf_client.yml.")
         self.add_argument("--v2",
                           type=str,
                           required=False,
@@ -90,6 +95,7 @@ def autofix_permissions(user_group_spec: str):
 
 async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsManager):
     """Start Hummingbot using unified HummingbotApplication in either UI or headless mode."""
+    instance_id = validate_runtime_instance_id(getattr(args, "instance_id", None))
     client_config_map = load_client_config_map_from_file()
 
     if args.auto_set_permissions is not None:
@@ -100,6 +106,7 @@ async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsMana
         return
 
     await Security.wait_til_decryption_done()
+    client_config_map.decrypt_all_secure_data()
     await create_yml_files_legacy()
     # Initialize logging with basic setup first - will be re-initialized later with correct strategy file name if needed
     init_logging("hummingbot_logs.yml", client_config_map)
@@ -112,7 +119,12 @@ async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsMana
     AllConnectorSettings.initialize_paper_trade_settings(client_config_map.paper_trade.paper_trade_exchanges)
 
     # Create unified application that handles both headless and UI modes
-    hb = HummingbotApplication.main_application(client_config_map=client_config_map, headless_mode=args.headless)
+    hb = HummingbotApplication.main_application(
+        client_config_map=client_config_map, headless_mode=args.headless, instance_id=instance_id
+    )
+
+    if args.headless:
+        await hb.prepare_headless_startup()
 
     # Load and start strategy if provided
     if args.v2_conf is not None or args.config_file_name is not None:
@@ -169,11 +181,25 @@ async def load_and_start_strategy(hb: HummingbotApplication, args: argparse.Name
 
         if args.headless:
             logging.getLogger().info(f"Starting V2 script strategy: {strategy_name}")
-            success = await hb.trading_core.start_strategy(
-                strategy_name,
-                args.v2_conf,
-                args.v2_conf
-            )
+            from hummingbot.client.native_lifecycle import NativeLifecycle
+            from hummingbot.client.native_sources import NativeSourceGuard, capture_sources, native_sources
+            observer = getattr(hb, 'native_lifecycle', None)
+            sources = capture_sources(args.v2_conf, script_file, None) if isinstance(observer, NativeLifecycle) else None
+            guard = NativeSourceGuard(sources) if sources is not None else None
+            token = native_sources.set(guard) if guard is not None else None
+            try:
+                success = await hb.trading_core.start_strategy(
+                    strategy_name,
+                    args.v2_conf,
+                    args.v2_conf
+                )
+                if success and guard is not None:
+                    observer.capture(hb.trading_core)
+                    observer.loaded_sources = dict(sources)
+            finally:
+                if guard is not None:
+                    guard.active = False
+                    native_sources.reset(token)
             if not success:
                 logging.getLogger().error("Failed to start strategy")
                 return False
@@ -224,9 +250,69 @@ async def load_and_start_strategy(hb: HummingbotApplication, args: argparse.Name
     return True
 
 
+RESTART_STOP_TIMEOUT_SECONDS = 50.0  # below the execution containers' stop grace period
+
+
+async def graceful_signal_stop(hb, exit_process=os._exit, timeout: float = RESTART_STOP_TIMEOUT_SECONDS):
+    """SIGTERM/SIGINT: suspend executors for an exact restart, persist, then exit.
+
+    Resting orders are not cancelled here: executors already cancelled their
+    entry remainders during suspension, and anything still resting is re-tracked
+    and reconciled by restart continuity on the next boot.
+    """
+    logger = logging.getLogger(__name__)
+    logger.warning("Stop signal received; suspending executors for restart")
+    code = 0
+    try:
+        result = await asyncio.wait_for(hb.stop_loop(skip_order_cancellation=True), timeout=timeout)
+        if not stop_succeeded(result):
+            code = 1
+            logger.error(f"Native stop refused or incomplete ({stop_detail(result)}); suspending directly")
+            strategy = getattr(getattr(hb, "trading_core", None), "strategy", None)
+            if strategy is not None and callable(getattr(strategy, "on_stop", None)):
+                await asyncio.wait_for(strategy.on_stop(), timeout=timeout)
+        else:
+            logger.warning("Graceful restart stop complete")
+    except Exception:
+        code = 1
+        logger.exception("Graceful restart stop incomplete; restart continuity restores from the last checkpoint")
+    finally:
+        logging.shutdown()
+        exit_process(code)
+
+
+def stop_succeeded(result) -> bool:
+    """stop_loop returns None directly, or a native command response / ShutdownResult."""
+    if result is None:
+        return True
+    if isinstance(result, dict):
+        return not result.get("error")
+    return getattr(result, "reconciliation_complete", False) is True
+
+
+def stop_detail(result) -> str:
+    if isinstance(result, dict):
+        return str(result.get("error"))
+    return str(getattr(result, "reason", result))
+
+
+def install_signal_stop(hb, loop: asyncio.AbstractEventLoop):
+    state = {"stopping": False}
+
+    def request_stop():
+        if state["stopping"]:
+            return
+        state["stopping"] = True
+        loop.create_task(graceful_signal_stop(hb))
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_stop)
+
+
 async def run_application(hb: HummingbotApplication, args: argparse.Namespace, client_config_map):
     """Run the application in headless or UI mode."""
     if args.headless:
+        install_signal_stop(hb, asyncio.get_running_loop())
         # Re-initialize logging with proper strategy file name for headless mode
         from hummingbot import init_logging
         log_file_name = hb.strategy_file_name.split(".")[0] if hb.strategy_file_name else "hummingbot"

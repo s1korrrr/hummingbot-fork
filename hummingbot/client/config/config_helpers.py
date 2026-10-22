@@ -1,5 +1,6 @@
 import contextlib
 import inspect
+import io
 import json
 import logging
 import shutil
@@ -264,7 +265,8 @@ class ClientConfigAdapter:
             if isinstance(value, SecretStr):
                 clear_text_value = value.get_secret_value() if isinstance(value, SecretStr) else value
                 if not Security.secrets_manager:
-                    logging.getLogger().warning(f"Ignore the following error if your config file {attr} contains secret(s)")
+                    conf_dict[attr] = clear_text_value
+                    continue
                 conf_dict[attr] = Security.secrets_manager.encrypt_secret_value(attr, clear_text_value)
 
     def _decrypt_secrets(self, conf_dict: Dict[str, Any]):
@@ -667,7 +669,11 @@ def load_client_config_map_from_file() -> ClientConfigAdapter:
         )
     client_config = ClientConfigMap(**filtered_config_data)
     config_map = ClientConfigAdapter(client_config)
-    save_to_yml(yml_path, config_map)
+    from hummingbot.client.config.security import Security  # avoids circular import
+
+    if Security.secrets_manager is not None:
+        config_map.decrypt_all_secure_data()
+        save_to_yml(yml_path, config_map)
     return config_map
 
 
@@ -827,15 +833,22 @@ def save_to_yml_legacy(yml_path: str, cm: Dict[str, ConfigVar]):
     """
     try:
         with open(yml_path, encoding="utf-8") as stream:
-            data = yaml_parser.load(stream) or {}
-            for key in cm:
-                cvar = cm.get(key)
-                if isinstance(cvar.value, Decimal):
-                    data[key] = float(cvar.value)
-                else:
-                    data[key] = cvar.value
-            with open(yml_path, "w+", encoding="utf-8") as outfile:
-                yaml_parser.dump(data, outfile)
+            original = stream.read()
+        data = yaml_parser.load(original) or {}
+        for key in cm:
+            cvar = cm.get(key)
+            if isinstance(cvar.value, Decimal):
+                data[key] = float(cvar.value)
+            else:
+                data[key] = cvar.value
+        rendered = io.StringIO()
+        yaml_parser.dump(data, rendered)
+        if rendered.getvalue() == original:
+            # Unchanged content never rewrites the file, so a read-only conf
+            # mount stays silent instead of logging a write error at boot.
+            return
+        with open(yml_path, "w+", encoding="utf-8") as outfile:
+            outfile.write(rendered.getvalue())
     except Exception as e:
         logging.getLogger().error("Error writing configs: %s" % (str(e),), exc_info=True)
 

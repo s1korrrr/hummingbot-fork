@@ -1,0 +1,7 @@
+# Loads only the editable SUI controller; does not expand the multi-asset group.
+# Do not run alongside another controller managing the same SUI inventory.
+script_file_name: v2_with_controllers.py
+controllers_config:
+  - ok_rsi_sui_sell_only.yml
+max_global_drawdown_quote: '100'
+max_controller_drawdown_quote: '50'

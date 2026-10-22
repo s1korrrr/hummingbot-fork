@@ -1,0 +1,439 @@
+use crate::{
+    auth::{Auth, Consumer},
+    state::{Event, Shared},
+};
+use anyhow::{Context, Result, ensure};
+use axum::{
+    Json, Router,
+    extract::{
+        Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
+    },
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    sync::{Semaphore, broadcast},
+    time::{interval, timeout},
+};
+use tokio_util::sync::CancellationToken;
+
+/// Total concurrent authenticated streams across all consumers.
+pub const GLOBAL_STREAMS: usize = 32;
+
+#[derive(Clone)]
+pub struct App {
+    pub state: Shared,
+    pub auth: Arc<Auth>,
+    pub clients: Arc<Semaphore>,
+    pub stop: CancellationToken,
+    pub market_picture: Option<crate::market_picture::SharedProjection>,
+    pub market_picture_clients: Arc<Semaphore>,
+}
+/// Single-token router: one consumer with the whole catalog and history.
+pub fn router(
+    state: Shared,
+    token: String,
+    stop: CancellationToken,
+    market_picture: Option<crate::market_picture::SharedProjection>,
+) -> Router {
+    router_with_auth(
+        state,
+        Auth::single(token, crate::model::MAX_HISTORY, GLOBAL_STREAMS),
+        stop,
+        market_picture,
+    )
+}
+pub fn router_with_auth(
+    state: Shared,
+    auth: Auth,
+    stop: CancellationToken,
+    market_picture: Option<crate::market_picture::SharedProjection>,
+) -> Router {
+    let total: usize = auth
+        .consumers()
+        .iter()
+        .map(|c| c.streams.available_permits())
+        .sum();
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/metrics", get(metrics))
+        .route("/v2/market-picture/history", get(market_picture_history))
+        .route("/v2/market-picture/updates", get(market_picture_updates))
+        .route("/v1/stream", get(upgrade))
+        .with_state(App {
+            state,
+            auth: Arc::new(auth),
+            clients: Arc::new(Semaphore::new(total.clamp(GLOBAL_STREAMS, 256))),
+            stop,
+            market_picture,
+            market_picture_clients: Arc::new(Semaphore::new(16)),
+        })
+}
+async fn health(State(app): State<App>, headers: HeaderMap) -> Response {
+    if app.auth.authenticate(&headers).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(app.state.lock().await.health()).into_response()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsQuery {
+    window: Option<usize>,
+}
+/// Read-only per-pair freshness, reconnect and rejection metrics plus a window digest for the
+/// active/active comparison. Scoped to the caller's pairs; no credentials, no mutation.
+async fn metrics(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<MetricsQuery>,
+) -> Response {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let window = query.window.unwrap_or(1440);
+    if !(2..=crate::model::MAX_HISTORY).contains(&window) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let at = crate::model::now();
+    let value = app
+        .state
+        .lock()
+        .await
+        .metrics(consumer.pairs.as_ref(), window, at);
+    Json(value).into_response()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketPictureQuery {
+    pair: String,
+    interval: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketPictureUpdatesQuery {
+    pair: String,
+    interval: String,
+    epoch: Option<String>,
+    sequence: Option<u64>,
+}
+
+async fn market_picture_updates(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<MarketPictureUpdatesQuery>,
+) -> Response {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") || !consumer.allows_pair(&query.pair) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(interval) = crate::market_picture::Interval::parse(&query.interval) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !crate::model::valid_pair(&query.pair)
+        || query.epoch.as_deref().is_some_and(|epoch| epoch.len() > 64)
+        || query.epoch.is_some() != query.sequence.is_some()
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(_permit) = app.market_picture_clients.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let now_ms = (crate::model::now() * 1000.0).round() as u64;
+    let updates = if let Some(projection) = app.market_picture {
+        let projection = projection.lock().await;
+        match projection.updates(
+            &query.pair,
+            interval,
+            query.epoch.as_deref(),
+            query.sequence,
+            now_ms,
+        ) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    } else {
+        let mut response = crate::market_picture::Projection::unavailable(
+            &query.pair,
+            interval,
+            now_ms,
+            "projection_disabled",
+        );
+        response.schema_version = "market-picture.source-updates.v1".into();
+        crate::market_picture::UpdatesResponse {
+            mode: "full".into(),
+            from_sequence: None,
+            history: response,
+            upserts: Vec::new(),
+            deleted_open_time_ms: Vec::new(),
+        }
+    };
+    match serde_json::to_vec(&updates) {
+        Ok(bytes)
+            if bytes.len()
+                <= if updates.mode == "delta" {
+                    crate::market_picture::MAX_UPDATE_RESPONSE_BYTES
+                } else {
+                    crate::market_picture::MAX_RESPONSE_BYTES
+                } =>
+        {
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn market_picture_history(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<MarketPictureQuery>,
+) -> Response {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") || !consumer.allows_pair(&query.pair) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(interval) = crate::market_picture::Interval::parse(&query.interval) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !crate::model::valid_pair(&query.pair) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(_permit) = app.market_picture_clients.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let now_ms = (crate::model::now() * 1000.0).round() as u64;
+    let response = if let Some(projection) = app.market_picture {
+        let projection = projection.lock().await;
+        match projection.response(&query.pair, interval, now_ms) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    } else {
+        crate::market_picture::Projection::unavailable(
+            &query.pair,
+            interval,
+            now_ms,
+            "projection_disabled",
+        )
+    };
+    match serde_json::to_vec(&response) {
+        Ok(bytes) if bytes.len() <= crate::market_picture::MAX_RESPONSE_BYTES => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+async fn upgrade(State(app): State<App>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    let Some(consumer) = app.auth.authenticate(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if headers.contains_key("origin") {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(consumer_permit) = consumer.streams.clone().try_acquire_owned() else {
+        app.state.lock().await.count("client_stream_cap_refused");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Ok(permit) = app.clients.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    ws.max_message_size(131072)
+        .max_frame_size(131072)
+        .on_upgrade(move |socket| async move {
+            let _permits = (permit, consumer_permit);
+            if let Err(error) = serve(socket, app.clone(), consumer.clone()).await {
+                let kind = match error.downcast_ref::<Disconnect>() {
+                    Some(Disconnect::WriteDeadline { .. }) => "client_write_deadline",
+                    Some(Disconnect::SubscribeTimeout) => "client_subscribe_timeout",
+                    Some(Disconnect::Transport(_)) => "client_transport_error",
+                    Some(Disconnect::UnexpectedMessage) => "client_unexpected_message",
+                    Some(Disconnect::Scope(_)) => "client_scope_refused",
+                    Some(Disconnect::Lagged(_)) => "client_lagged",
+                    None => "client_other_error",
+                };
+                eprintln!("local stream closed consumer={}: {error:#}", consumer.id);
+                let mut state = app.state.lock().await;
+                state.count("client_disconnect_errors");
+                state.count(kind);
+            }
+        })
+        .into_response()
+}
+/// Why a local stream ended. Distinct causes were previously all reported as the same
+/// "deadline has elapsed" / "unexpected client message" text.
+#[derive(Debug)]
+enum Disconnect {
+    WriteDeadline { bytes: usize, limit: Duration },
+    SubscribeTimeout,
+    Transport(String),
+    UnexpectedMessage,
+    Scope(String),
+    Lagged(String),
+}
+impl std::fmt::Display for Disconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriteDeadline { bytes, limit } => write!(
+                f,
+                "client did not drain a {bytes}-byte frame within {limit:?} (slow or stalled reader)"
+            ),
+            Self::SubscribeTimeout => f.write_str("no subscription message within 5s of connect"),
+            Self::Transport(error) => write!(f, "client transport error: {error}"),
+            Self::UnexpectedMessage => f.write_str("unexpected client message"),
+            Self::Scope(why) => write!(f, "subscription outside consumer scope: {why}"),
+            Self::Lagged(why) => write!(f, "client lagged behind the producer backlog: {why}"),
+        }
+    }
+}
+impl std::error::Error for Disconnect {}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Subscription {
+    v: u8,
+    op: String,
+    pairs: Vec<String>,
+    history: usize,
+}
+/// Two seconds for control-sized frames plus one second per 512 KiB, so a full-history
+/// snapshot is not judged by the same deadline as a heartbeat. Capped at 20 seconds.
+pub fn write_deadline(bytes: usize) -> Duration {
+    Duration::from_secs(2) + Duration::from_secs_f64((bytes as f64 / 524_288.0).min(18.0))
+}
+async fn send(socket: &mut WebSocket, value: Value) -> Result<()> {
+    let text = value.to_string();
+    let bytes = text.len();
+    let limit = write_deadline(bytes);
+    timeout(limit, socket.send(Message::Text(text.into())))
+        .await
+        .map_err(|_| Disconnect::WriteDeadline { bytes, limit })?
+        .map_err(|error| Disconnect::Transport(error.to_string()))?;
+    Ok(())
+}
+fn filter(event: Event, sent: &mut BTreeMap<String, u64>) -> Option<Event> {
+    let frame = event.metadata();
+    let pair = frame["pair"].as_str()?;
+    let last = sent.get_mut(pair)?;
+    let sequence = frame["sequence"].as_u64()?;
+    if sequence <= *last {
+        return None;
+    }
+    *last = sequence;
+    Some(event)
+}
+
+async fn serve(mut socket: WebSocket, app: App, consumer: Arc<Consumer>) -> Result<()> {
+    let message = timeout(Duration::from_secs(5), socket.recv())
+        .await
+        .map_err(|_| Disconnect::SubscribeTimeout)?
+        .context("no subscription")?
+        .map_err(|error| Disconnect::Transport(error.to_string()))?;
+    let Message::Text(text) = message else {
+        anyhow::bail!("subscription must be text");
+    };
+    let sub: Subscription = serde_json::from_str(&text)?;
+    ensure!(
+        sub.v == 1 && sub.op == "subscribe" && !sub.pairs.is_empty(),
+        "invalid subscription"
+    );
+    let mut sent = BTreeMap::new();
+    let mut receiver = {
+        let s = app.state.lock().await;
+        ensure!(
+            sub.history >= 2 && sub.history <= s.capacity,
+            "history outside capacity"
+        );
+        if sub.history > consumer.max_history {
+            return Err(Disconnect::Scope(format!(
+                "history {} above the consumer ceiling {}",
+                sub.history, consumer.max_history
+            ))
+            .into());
+        }
+        if let Some(pair) = sub.pairs.iter().find(|pair| !consumer.allows_pair(pair)) {
+            return Err(Disconnect::Scope(format!("pair {pair} not granted")).into());
+        }
+        ensure!(
+            sub.pairs.len() <= s.pairs.len()
+                && sub.pairs.iter().collect::<BTreeSet<_>>().len() == sub.pairs.len(),
+            "duplicate or oversized subscription"
+        );
+        ensure!(
+            sub.pairs.iter().all(|p| s.pairs.contains_key(p)),
+            "unknown pair"
+        );
+        s.events.subscribe()
+    };
+    // Materialize one pair at a time instead of duplicating the entire universe's
+    // full history as JSON. Receiver registration still precedes every snapshot.
+    for pair in &sub.pairs {
+        let frame = {
+            let s = app.state.lock().await;
+            sent.insert(pair.clone(), s.pairs[pair].sequence);
+            s.frame(pair, sub.history)
+        };
+        send(&mut socket, frame).await?;
+    }
+    let mut heartbeats = interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            biased;
+            _ = app.stop.cancelled() => { let _ = timeout(Duration::from_secs(2), socket.send(Message::Close(None))).await; break; }
+            _ = heartbeats.tick() => {
+                // Producer publishes while holding this same lock. Drain + sample are atomic,
+                // so a heartbeat can never announce a sequence before its delta/snapshot.
+                let (queued, heartbeat) = {
+                    let s = app.state.lock().await; let mut queued = Vec::new();
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(frame) => if let Some(frame) = filter(frame,&mut sent) { queued.push(frame); },
+                            Err(broadcast::error::TryRecvError::Empty) => break,
+                            Err(error) => return Err(Disconnect::Lagged(error.to_string()).into()),
+                        }
+                    }
+                    let mut heartbeat = s.envelope("heartbeat");
+                    heartbeat["states"] = json!(sent.iter().map(|(pair,seq)| (pair,json!({"ready":s.pairs[pair].ready,"sequence":seq}))).collect::<BTreeMap<_,_>>());
+                    (queued, heartbeat)
+                };
+                for event in queued { send(&mut socket,event.into_frame(sub.history)).await?; }
+                send(&mut socket,heartbeat).await?;
+            }
+            frame = receiver.recv() => {
+                if let Some(event) = filter(frame.map_err(|error| Disconnect::Lagged(error.to_string()))?,&mut sent) { send(&mut socket,event.into_frame(sub.history)).await?; }
+            }
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Ping(v))) => { timeout(Duration::from_secs(2),socket.send(Message::Pong(v))).await.map_err(|_| Disconnect::WriteDeadline { bytes: 0, limit: Duration::from_secs(2) })?.map_err(|error| Disconnect::Transport(error.to_string()))?; },
+                    Some(Ok(Message::Pong(_))) => {},
+                    None | Some(Ok(Message::Close(_))) => break,
+                    Some(Err(error)) => return Err(Disconnect::Transport(error.to_string()).into()),
+                    Some(Ok(_)) => return Err(Disconnect::UnexpectedMessage.into()),
+                }
+            }
+        }
+    }
+    Ok(())
+}

@@ -1,0 +1,13 @@
+services:
+  mqtt:
+    container_name: hummingbot-broker
+    image: emqx:5.8.8
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1883:1883"
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx_ctl", "status"]
+      interval: 5s
+      timeout: 10s
+      retries: 6
+      start_period: 10s

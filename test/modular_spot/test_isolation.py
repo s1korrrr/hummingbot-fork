@@ -1,0 +1,62 @@
+"""Structural isolation checks, not substitutes for native runtime tests."""
+import ast
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+ENTRY = ROOT / 'controllers/generic/modular_spot.py'
+CORE = ENTRY.parent / 'modular_spot_core'
+
+
+def test_controller_does_not_inherit_a_strategy_family():
+    tree = ast.parse(ENTRY.read_text())
+    controller = next(x for x in tree.body if isinstance(x, ast.ClassDef) and x.name == 'ModularSpotController')
+    assert [ast.unparse(base) for base in controller.bases] == ['ControllerBase']
+
+
+def test_legacy_imports_are_confined_to_explicit_composition_seams_without_registry_mutations():
+    for path in [ENTRY, *CORE.glob('*.py')]:
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                if node.module.startswith('controllers.'):
+                    permitted = {
+                        'native_composition.py': {'controllers.directional_trading.ok_rsi_core.candles',
+                                                  'controllers.directional_trading.ok_rsi_core.context',
+                                                  # master 9b59a22dd: down-only planned resume seam
+                                                  'controllers.directional_trading.ok_rsi_core.down_only_entry_execution'},
+                        'native_recovery.py': {'controllers.directional_trading.hl_rsi',
+                                               'controllers.directional_trading.rsi_v5'},
+                        # Live OK RSI continuous adaptive trailing, shared rather than copied.
+                        'bag.py': {'controllers.shared.trailing'},
+                    }
+                    public_recipe_import = (
+                        path.name in {'native_recipe.py', 'recipe_compiler.py'}
+                        and node.module == 'controllers.generic'
+                        and [alias.name for alias in node.names] == ['rsi_modular'])
+                    assert (node.module.startswith('controllers.generic.modular_spot_core')
+                            or node.module in permitted.get(path.name, set()) or public_recipe_import)
+            if isinstance(node, ast.Import):
+                assert all(not name.name.startswith('controllers.directional_trading') for name in node.names)
+            if isinstance(node, ast.Attribute):
+                assert node.attr not in {'_executor_mapping', 'monkeypatch'}
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                assert node.func.attr not in {'buy', 'sell', 'place_order', 'create_order'}
+
+
+def test_execution_config_remains_native_and_order_lifecycle_is_inherited():
+    tree = ast.parse((CORE / 'execution.py').read_text())
+    classes = [x for x in tree.body if isinstance(x, ast.ClassDef)]
+    assert len(classes) == 1 and classes[0].name == 'ModularPositionExecutor'
+    assert [ast.unparse(x) for x in classes[0].bases] == ['PositionExecutor']
+    methods = {x.name for x in classes[0].body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert not methods.intersection({'process_order_filled_event', 'process_order_canceled_event',
+                                     'process_order_failed_event', '_control_single_attempt_entry',
+                                     'control_shutdown_process', 'place_open_order'})
+
+
+def test_no_import_time_tasks_or_client_construction():
+    for path in [ENTRY, *CORE.glob('*.py')]:
+        tree = ast.parse(path.read_text())
+        for statement in tree.body:
+            if isinstance(statement, ast.Expr):
+                assert isinstance(statement.value, ast.Constant)

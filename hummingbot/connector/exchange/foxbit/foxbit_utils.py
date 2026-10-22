@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict
 
-from pydantic import Field, SecretStr
+from pydantic import ConfigDict, Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.connector.exchange.foxbit import foxbit_constants as CONSTANTS
@@ -129,7 +129,9 @@ def get_base_quote_from_trading_pair(trading_pair: str):
 
 
 class FoxbitConfigMap(BaseConnectorConfigMap):
-    connector: str = Field(default="foxbit", client_data=None)
+    model_config = ConfigDict(title="foxbit")
+
+    connector: str = Field(default="foxbit")
     foxbit_api_key: SecretStr = Field(
         default=...,
         json_schema_extra = {
@@ -158,11 +160,8 @@ class FoxbitConfigMap(BaseConnectorConfigMap):
         }
     )
 
-    class Config:
-        title = "foxbit"
 
-
-KEYS = FoxbitConfigMap.construct()
+KEYS = FoxbitConfigMap.model_construct()
 
 OTHER_DOMAINS = []
 OTHER_DOMAINS_PARAMETER = {}

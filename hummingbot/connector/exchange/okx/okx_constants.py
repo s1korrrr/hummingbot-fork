@@ -52,6 +52,8 @@ OKX_ORDER_BOOK_PATH = '/api/v5/market/books'
 # Auth required
 OKX_PLACE_ORDER_PATH = "/api/v5/trade/order"
 OKX_ORDER_DETAILS_PATH = '/api/v5/trade/order'
+OKX_PENDING_ORDERS_PATH = "/api/v5/trade/orders-pending"
+OKX_PENDING_ALGO_ORDERS_PATH = "/api/v5/trade/orders-algo-pending"
 OKX_ORDER_CANCEL_PATH = '/api/v5/trade/cancel-order'
 OKX_BATCH_ORDER_CANCEL_PATH = '/api/v5/trade/cancel-batch-orders'
 OKX_BALANCE_PATH = '/api/v5/account/balance'
@@ -90,6 +92,8 @@ ORDER_TYPE_MAP = {
 NO_LIMIT = sys.maxsize
 
 RATE_LIMITS = [
+    RateLimit(limit_id=OKX_PENDING_ORDERS_PATH, limit=60, time_interval=2),
+    RateLimit(limit_id=OKX_PENDING_ALGO_ORDERS_PATH, limit=20, time_interval=2),
     RateLimit(WS_CONNECTION_LIMIT_ID, limit=3, time_interval=1),
     RateLimit(WS_REQUEST_LIMIT_ID, limit=100, time_interval=10),
     RateLimit(WS_SUBSCRIPTION_LIMIT_ID, limit=240, time_interval=60 * 60),

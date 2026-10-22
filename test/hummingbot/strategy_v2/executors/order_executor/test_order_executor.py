@@ -6,8 +6,9 @@ from unittest.mock import MagicMock, PropertyMock, patch
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
 from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
@@ -147,6 +148,51 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertTrue(self.is_partially_logged("ERROR", "Order failed order_id=OID-FAIL"))
         self.assertTrue(self.is_partially_logged("ERROR", "pair=ETH-USDT"))
 
+    def test_process_order_failed_event_fail_closes_permanent_min_notional_failure(self):
+        config = OrderExecutorConfig(
+            id="test",
+            timestamp=123,
+            side=TradeType.SELL,
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            amount=Decimal("0.02"),
+            price=Decimal("100"),
+            execution_strategy=ExecutionStrategy.LIMIT_MAKER,
+        )
+        executor = self.get_order_executor_from_config(config)
+        executor._status = RunnableStatus.RUNNING
+
+        order_id = "OID-FAIL"
+        order = InFlightOrder(
+            client_order_id=order_id,
+            trading_pair=config.trading_pair,
+            order_type=OrderType.LIMIT_MAKER,
+            trade_type=config.side,
+            price=Decimal("100"),
+            amount=Decimal("0.02"),
+            creation_timestamp=1640001112.223,
+            initial_state=OrderState.OPEN,
+        )
+        tracked_order = TrackedOrder(order_id)
+        tracked_order.order = order
+        executor._order = tracked_order
+
+        failure_event = MarketOrderFailureEvent(
+            order_id=order_id,
+            timestamp=1640001112.223,
+            order_type=OrderType.LIMIT_MAKER,
+            error_message="Order notional 1.50 is lower than minimum notional size 5.00 for the pair ETH-USDT.",
+            error_type="ValueError",
+        )
+        executor.process_order_failed_event(1, self.strategy.connectors["binance"], failure_event)
+
+        self.assertIn(tracked_order, executor._failed_orders)
+        self.assertIsNone(executor._order)
+        self.assertEqual(executor.close_type, CloseType.FAILED)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertEqual(executor._current_retries, 0)
+        self.assertTrue(self.is_partially_logged("ERROR", "Order failed permanently order_id=OID-FAIL"))
+
     @patch.object(OrderExecutor, "get_in_flight_order")
     def test_process_order_completed_event(self, in_flight_order_mock):
         # Create the order that will be returned by get_in_flight_order
@@ -161,6 +207,11 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             creation_timestamp=1640001112.223,
             initial_state=OrderState.COMPLETED
         )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id="fill", client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair, fill_timestamp=123, fill_price=Decimal("100"),
+            fill_base_amount=Decimal("1"), fill_quote_amount=Decimal("1") * 100,
+            fee=AddedToCostTradeFee()))
         in_flight_order_mock.return_value = order
 
         # Setup executor
@@ -410,7 +461,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         executor._order.order = order
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.strategy.cancel.assert_called_once_with(
             connector_name=config.connector_name,
             trading_pair=config.trading_pair,
@@ -418,7 +469,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         )
 
     @patch.object(OrderExecutor, '_sleep')
-    async def test_control_shutdown_process_with_filled_order(self, mock_sleep):
+    async def test_control_shutdown_process_with_filled_order_and_late_early_stop(self, mock_sleep):
         config = OrderExecutorConfig(
             id="test",
             timestamp=123,
@@ -443,14 +494,35 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             creation_timestamp=1640001112.223,
             initial_state=OrderState.FILLED
         )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id="fill", client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair, fill_timestamp=123, fill_price=Decimal("100"),
+            fill_base_amount=Decimal("1"), fill_quote_amount=Decimal("1") * 100,
+            fee=AddedToCostTradeFee()))
         executor._order = TrackedOrder("OID-FILLED")
         executor._order.order = order
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(len(executor._held_position_orders), 1)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertTrue(executor.terminated.is_set())
+        held_orders = list(executor._held_position_orders)
+        closed_at = executor.close_timestamp
+        removed_listeners = self.strategy.connectors["binance"].remove_listener.call_count
+
+        # A stale controller stop action can arrive after this loop has terminated.
+        executor.early_stop(keep_position=True)
+        executor.early_stop(keep_position=False)
+        self.assertEqual(executor.status, RunnableStatus.TERMINATED)
+        self.assertTrue(executor.executor_info.is_done)
+        self.assertTrue(executor.terminated.is_set())
+        self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
+        self.assertEqual(executor.close_timestamp, closed_at)
+        self.assertEqual(executor._held_position_orders, held_orders)
+        self.assertEqual(self.strategy.connectors["binance"].remove_listener.call_count, removed_listeners)
+        self.strategy.cancel.assert_not_called()
 
     @patch.object(OrderExecutor, '_sleep')
     async def test_control_shutdown_process_with_partial_filled_orders(self, mock_sleep):
@@ -478,12 +550,17 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             creation_timestamp=1640001112.223,
             initial_state=OrderState.PARTIALLY_FILLED
         )
+        order.update_with_trade_update(TradeUpdate(
+            trade_id="fill", client_order_id=order.client_order_id, exchange_order_id=order.exchange_order_id,
+            trading_pair=order.trading_pair, fill_timestamp=123, fill_price=Decimal("100"),
+            fill_base_amount=Decimal(".4"), fill_quote_amount=Decimal(".4") * 100,
+            fee=AddedToCostTradeFee()))
         tracked_order = TrackedOrder("OID-PARTIAL")
         tracked_order.order = order
         executor._partial_filled_orders = [tracked_order]
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.assertEqual(executor.close_type, CloseType.POSITION_HOLD)
         self.assertEqual(len(executor._held_position_orders), 1)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
@@ -504,7 +581,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         executor._status = RunnableStatus.SHUTTING_DOWN
 
         await executor.control_shutdown_process()
-        mock_sleep.assert_called_once_with(5.0)
+        mock_sleep.assert_called_once_with(1.0)
         self.assertEqual(executor.status, RunnableStatus.TERMINATED)
 
     @patch.object(OrderExecutor, 'current_market_price', new_callable=PropertyMock)
@@ -759,7 +836,7 @@ class TestOrderExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         # Second control task call - should refresh as price moved beyond threshold
         await executor.control_task()
         mock_cancel_order.assert_called_once()
-        mock_place_open_order.assert_called_once()
+        mock_place_open_order.assert_not_called()
 
         # Verify the new order price calculation
         new_price = executor.get_order_price()

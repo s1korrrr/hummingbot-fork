@@ -20,6 +20,34 @@ if typing.TYPE_CHECKING:  # avoid circular import problems
 s_decimal_0 = Decimal("0")
 
 GET_EX_ORDER_ID_TIMEOUT = 10  # seconds
+EXECUTION_TIMESTAMP_FUTURE_TOLERANCE_MS = 5_000
+MAX_UNIX_TIMESTAMP_MS = 253_402_300_799_999
+OKX_FILL_TIME_SOURCE = "okx.fillTime"
+
+
+def _normalize_execution_timestamp_ms_at_observation_ms(value: Any, observed_at_ms: Any) -> Optional[int]:
+    if isinstance(value, str):
+        if not value or len(value) > 15 or not value.isascii() or not value.isdigit():
+            return None
+        value = int(value)
+    if (type(value) is not int or value <= 0 or value > MAX_UNIX_TIMESTAMP_MS
+            or type(observed_at_ms) is not int or observed_at_ms <= 0
+            or observed_at_ms > MAX_UNIX_TIMESTAMP_MS):
+        return None
+    if value > observed_at_ms + EXECUTION_TIMESTAMP_FUTURE_TOLERANCE_MS:
+        return None
+    return value
+
+
+def normalize_execution_timestamp_ms(value: Any, observed_at_seconds: Any) -> Optional[int]:
+    """Return a positive millisecond timestamp no more than 5 seconds after observation."""
+    if type(observed_at_seconds) not in (int, float):
+        return None
+    try:
+        observed_at_ms = int(observed_at_seconds * 1000)
+    except (OverflowError, ValueError):
+        return None
+    return _normalize_execution_timestamp_ms_at_observation_ms(value, observed_at_ms)
 
 
 class OrderState(Enum):
@@ -56,6 +84,12 @@ class TradeUpdate(NamedTuple):
     fill_quote_amount: Decimal
     fee: TradeFeeBase
     is_taker: bool = True  # CEXs deliver trade events from the taker's perspective
+    execution_timestamp_ms: Optional[int] = None
+    execution_timestamp_source: Optional[str] = None
+    execution_timestamp_observed_at_ms: Optional[int] = None
+    # Captured locally before recorder acknowledgment waits; distinct from the
+    # exchange execution clock and preserved for exact tracker replay.
+    receipt_timestamp: Optional[float] = None
 
     @property
     def fee_asset(self):
@@ -63,6 +97,35 @@ class TradeUpdate(NamedTuple):
 
     @classmethod
     def from_json(cls, data: Dict[str, Any]):
+        is_taker = data.get("is_taker", True)
+        if type(is_taker) is not bool:
+            raise ValueError("TradeUpdate is_taker must be a boolean")
+        receipt_timestamp = data.get("receipt_timestamp")
+        if (receipt_timestamp is not None
+                and (type(receipt_timestamp) not in (int, float) or not math.isfinite(receipt_timestamp)
+                     or receipt_timestamp < 0)):
+            raise ValueError("TradeUpdate receipt_timestamp must be a finite non-negative number")
+        raw_execution_timestamp_ms = data.get("execution_timestamp_ms")
+        if "execution_timestamp_observed_at_ms" in data:
+            raw_observed_at_ms = data.get("execution_timestamp_observed_at_ms")
+            execution_timestamp_ms = _normalize_execution_timestamp_ms_at_observation_ms(
+                raw_execution_timestamp_ms if type(raw_execution_timestamp_ms) is int else None,
+                raw_observed_at_ms,
+            ) if type(raw_observed_at_ms) is int else None
+            execution_timestamp_observed_at_ms = raw_observed_at_ms if execution_timestamp_ms is not None else None
+        else:
+            execution_timestamp_ms = normalize_execution_timestamp_ms(
+                raw_execution_timestamp_ms if type(raw_execution_timestamp_ms) is int else None,
+                data.get("fill_timestamp"),
+            )
+            execution_timestamp_observed_at_ms = None
+        execution_timestamp_source = (
+            data.get("execution_timestamp_source") if execution_timestamp_ms is not None else None
+        )
+        if execution_timestamp_source != "okx.fillTime":
+            execution_timestamp_ms = None
+            execution_timestamp_source = None
+            execution_timestamp_observed_at_ms = None
         instance = TradeUpdate(
             trade_id=data["trade_id"],
             client_order_id=data["client_order_id"],
@@ -73,12 +136,19 @@ class TradeUpdate(NamedTuple):
             fill_base_amount=Decimal(data["fill_base_amount"]),
             fill_quote_amount=Decimal(data["fill_quote_amount"]),
             fee=TradeFeeBase.from_json(data["fee"]),
+            is_taker=is_taker,
+            execution_timestamp_ms=execution_timestamp_ms,
+            execution_timestamp_source=execution_timestamp_source,
+            execution_timestamp_observed_at_ms=execution_timestamp_observed_at_ms,
+            receipt_timestamp=receipt_timestamp,
         )
 
         return instance
 
     def to_json(self) -> Dict[str, Any]:
         json_dict = self._asdict()
+        if self.execution_timestamp_observed_at_ms is None:
+            json_dict.pop("execution_timestamp_observed_at_ms")
         json_dict.update({
             "fill_price": str(self.fill_price),
             "fill_base_amount": str(self.fill_base_amount),
@@ -116,6 +186,10 @@ class InFlightOrder:
         self.current_state = initial_state
         self.leverage = leverage
         self.position = position
+        self.cancel_source: Optional[str] = None
+        # Recorder receipts waiting for native async persistence ACK. Entries
+        # are flat JSON DTOs keyed by a stable event key and survive restart.
+        self.recorder_pending_events: Dict[str, Dict[str, Any]] = {}
 
         self.executed_amount_base = s_decimal_0
         self.executed_amount_quote = s_decimal_0
@@ -248,6 +322,21 @@ class InFlightOrder:
                                   for key, value
                                   in data.get("order_fills", {}).items()})
         order.last_update_timestamp = data.get("last_update_timestamp", order.creation_timestamp)
+        raw_cancel_source = data.get("cancel_source")
+        if raw_cancel_source not in (None, ""):
+            order.cancel_source = str(raw_cancel_source)
+        raw_pending_events = data.get("recorder_pending_events", {})
+        if not isinstance(raw_pending_events, dict):
+            raise ValueError("recorder_pending_events must be an object")
+        for event_key, entry in raw_pending_events.items():
+            if (not isinstance(event_key, str) or not event_key or not isinstance(entry, dict)
+                    or entry.get("kind") not in {"order-create", "order-status"}
+                    or not isinstance(entry.get("identity"), list)
+                    or len(entry["identity"]) != 3
+                    or not all(isinstance(value, str) and value for value in entry["identity"])
+                    or not isinstance(entry.get("payload"), dict)):
+                raise ValueError("invalid pending recorder event")
+            order.recorder_pending_events[event_key] = copy.deepcopy(entry)
 
         order.check_filled_condition()
         order.check_processed_by_exchange_condition()
@@ -274,6 +363,8 @@ class InFlightOrder:
             "position": self.position.value,
             "creation_timestamp": self.creation_timestamp,
             "last_update_timestamp": self.last_update_timestamp,
+            "cancel_source": self.cancel_source,
+            "recorder_pending_events": copy.deepcopy(self.recorder_pending_events),
             "order_fills": {key: fill.to_json() for key, fill in self.order_fills.items()},
             "cumulative_fee_paid_base": float(self.cumulative_fee_paid(self.base_asset)),
             "cumulative_fee_paid_quote": float(self.cumulative_fee_paid(self.quote_asset)),
@@ -341,12 +432,28 @@ class InFlightOrder:
         if self.exchange_order_id is None and order_update.exchange_order_id is not None:
             self.update_exchange_order_id(order_update.exchange_order_id)
 
-        self.current_state = order_update.new_state
+        refused_regression = (
+            self.current_state in {OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED}
+            and order_update.new_state in {
+                OrderState.OPEN,
+                OrderState.PENDING_CREATE,
+                OrderState.PENDING_CANCEL,
+                OrderState.PARTIALLY_FILLED,
+            }
+        )
+        if not refused_regression:
+            self.current_state = order_update.new_state
+        if order_update.misc_updates:
+            cancel_source = order_update.misc_updates.get("cancel_source")
+            if cancel_source not in (None, ""):
+                self.cancel_source = str(cancel_source)
         self.check_processed_by_exchange_condition()
 
         updated: bool = prev_data != (self.exchange_order_id, self.current_state)
 
-        if updated:
+        if updated and not (
+            refused_regression and order_update.update_timestamp < self.last_update_timestamp
+        ):
             self.last_update_timestamp = order_update.update_timestamp
 
         return updated
@@ -393,6 +500,27 @@ class InFlightOrder:
             f"{self.client_order_id} for {self.amount} {self.trading_pair} "
             f"at {self.price}."
         )
+
+    def build_order_filled_message(self, fill_price: Decimal, fill_fee: TradeFeeBase, is_taker: bool) -> str:
+        remaining = self.amount - self.executed_amount_base
+        role = "taker" if is_taker else "maker"
+        return (
+            f"The {self.trade_type.name.upper()} order {self.client_order_id} "
+            f"amounting to {self.executed_amount_base}/{self.amount} {self.base_asset} "
+            f"has been filled at {fill_price} {self.quote_asset}. "
+            f"remaining {remaining} {self.base_asset} "
+            f"notional {self.executed_amount_quote} {self.quote_asset} "
+            f"fee {self._format_fill_fee_text(fill_fee)} "
+            f"close {self.order_type.name}/{role}"
+        )
+
+    @staticmethod
+    def _format_fill_fee_text(fill_fee: TradeFeeBase) -> str:
+        parts = [f"{item.amount} {item.token}" for item in fill_fee.flat_fees]
+        if fill_fee.percent:
+            token = f" {fill_fee.percent_token}" if fill_fee.percent_token else ""
+            parts.append(f"{fill_fee.percent * Decimal('100')}%{token}")
+        return ", ".join(parts) if parts else "unavailable"
 
 
 class PerpetualDerivativeInFlightOrder(InFlightOrder):

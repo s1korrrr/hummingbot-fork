@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Text
+from sqlalchemy import Column, Integer, Text, inspect
 
 from hummingbot.model.db_migration.base_transformation import DatabaseTransformation
 from hummingbot.model.decimal_type_decorator import SqliteDecimal
@@ -149,3 +149,80 @@ class AddTradeFeeInQuote(DatabaseTransformation):
     @property
     def to_version(self):
         return 20230516
+
+
+class AddPositionHoldLedger(DatabaseTransformation):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        from hummingbot.model.position_hold_ledger import PositionHoldLedger
+
+        PositionHoldLedger.__table__.create(bind=db_handle.engine, checkfirst=True)
+        for index in PositionHoldLedger.__table__.indexes:
+            index.create(bind=db_handle.engine, checkfirst=True)
+        return db_handle
+
+    def apply_sqlite_transaction(self, connection):
+        from hummingbot.model.position_hold_ledger import PositionHoldLedger
+
+        PositionHoldLedger.__table__.create(bind=connection, checkfirst=True)
+        for index in PositionHoldLedger.__table__.indexes:
+            index.create(bind=connection, checkfirst=True)
+
+    @property
+    def name(self):
+        return "AddPositionHoldLedger"
+
+    @property
+    def to_version(self):
+        return 20260327
+
+
+class AddExactTradeFillReceipts(DatabaseTransformation):
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        with db_handle.engine.begin() as connection:
+            self.apply_sqlite_transaction(connection)
+        return db_handle
+
+    def apply_sqlite_transaction(self, connection):
+        # Fresh create_all may already have supplied these columns on an old metadata-only DB.
+        columns = {column["name"] for column in inspect(connection).get_columns("TradeFill")}
+        for name in ("exact_amount", "exact_price", "exact_trade_fee_in_quote", "exact_receipt_source"):
+            if name not in columns:
+                connection.exec_driver_sql(f'ALTER TABLE "TradeFill" ADD COLUMN "{name}" TEXT NULL')
+
+    @property
+    def name(self):
+        return "AddExactTradeFillReceipts"
+
+    @property
+    def to_version(self):
+        return 20260910
+
+
+class AddTradeFillExecutionTimestamp(DatabaseTransformation):
+    def apply(self, db_handle: SQLConnectionManager) -> SQLConnectionManager:
+        with db_handle.engine.begin() as connection:
+            self.apply_sqlite_transaction(connection)
+        return db_handle
+
+    def apply_sqlite_transaction(self, connection):
+        # Fresh create_all may already have supplied these columns on an old metadata-only DB.
+        columns = {column["name"] for column in inspect(connection).get_columns("TradeFill")}
+        if "execution_timestamp_ms" not in columns:
+            connection.exec_driver_sql(
+                'ALTER TABLE "TradeFill" ADD COLUMN "execution_timestamp_ms" BIGINT NULL'
+            )
+        if "execution_timestamp_source" not in columns:
+            connection.exec_driver_sql(
+                'ALTER TABLE "TradeFill" ADD COLUMN "execution_timestamp_source" TEXT NULL'
+            )
+
+    @property
+    def name(self):
+        return "AddTradeFillExecutionTimestamp"
+
+    @property
+    def to_version(self):
+        return 20261019

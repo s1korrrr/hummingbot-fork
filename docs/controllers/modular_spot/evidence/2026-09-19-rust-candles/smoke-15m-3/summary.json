@@ -1,0 +1,703 @@
+{
+  "requested_seconds": 900,
+  "observed_seconds": 900.0144658750505,
+  "pairs": [
+    "1INCH-USDC",
+    "2Z-USDC",
+    "A-USDC",
+    "AAVE-USDC",
+    "ACE-USDC",
+    "ACH-USDC",
+    "ADA-USDC",
+    "AEVO-USDC",
+    "AGLD-USDC",
+    "AI-USDC",
+    "AIXBT-USDC",
+    "ALGO-USDC",
+    "ALLO-USDC",
+    "ANIME-USDC",
+    "APE-USDC",
+    "API3-USDC",
+    "APT-USDC",
+    "AR-USDC",
+    "ARB-USDC",
+    "ARG-USDC",
+    "ARKM-USDC",
+    "ASP-USDC",
+    "ASTER-USDC",
+    "ASTR-USDC",
+    "ATH-USDC",
+    "ATOM-USDC",
+    "AUCTION-USDC",
+    "AVAX-USDC",
+    "AVNT-USDC",
+    "AXS-USDC",
+    "BABY-USDC",
+    "BABYDOGE-USDC",
+    "BANANA-USDC",
+    "BAND-USDC",
+    "BARD-USDC",
+    "BASED-USDC",
+    "BAT-USDC",
+    "BCH-USDC",
+    "BERA-USDC",
+    "BICO-USDC",
+    "BIGTIME-USDC",
+    "BIO-USDC",
+    "BLUR-USDC",
+    "BNB-USDC",
+    "BNT-USDC",
+    "BOME-USDC",
+    "BONK-USDC",
+    "BREV-USDC",
+    "BTC-USDC",
+    "CAT-USDC",
+    "CATI-USDC",
+    "CC-USDC",
+    "CELO-USDC",
+    "CELR-USDC",
+    "CFG-USDC",
+    "CFX-USDC",
+    "CHIP-USDC",
+    "CHZ-USDC",
+    "CITY-USDC",
+    "COMP-USDC",
+    "CORE-USDC",
+    "CP-USDC",
+    "CRO-USDC",
+    "CRV-USDC",
+    "CSPR-USDC",
+    "CTC-USDC",
+    "CVC-USDC",
+    "CVX-USDC",
+    "DASH-USDC",
+    "DATA-USDC",
+    "DEGEN-USDC",
+    "DGB-USDC",
+    "DOGE-USDC",
+    "DOGS-USDC",
+    "DOOD-USDC",
+    "DOS-USDC",
+    "DOT-USDC",
+    "DYDX-USDC",
+    "EDGE-USDC",
+    "EGLD-USDC",
+    "EIGEN-USDC",
+    "ELF-USDC",
+    "ENA-USDC",
+    "ENJ-USDC",
+    "ENS-USDC",
+    "ETC-USDC",
+    "ETH-USDC",
+    "ETHFI-USDC",
+    "ETHW-USDC",
+    "FET-USDC",
+    "FIL-USDC",
+    "FLOKI-USDC",
+    "FLOW-USDC",
+    "FLR-USDC",
+    "FLUID-USDC",
+    "FOGO-USDC",
+    "G-USDC",
+    "GALA-USDC",
+    "GAS-USDC",
+    "GLM-USDC",
+    "GMT-USDC",
+    "GOAT-USDC",
+    "GRAM-USDC",
+    "GRASS-USDC",
+    "GRT-USDC",
+    "GRVT-USDC",
+    "HBAR-USDC",
+    "HMSTR-USDC",
+    "HUMA-USDC",
+    "HYPE-USDC",
+    "ICP-USDC",
+    "ICX-USDC",
+    "ID-USDC",
+    "ILV-USDC",
+    "IMX-USDC",
+    "INJ-USDC",
+    "IOST-USDC",
+    "IOTA-USDC",
+    "IRYS-USDC",
+    "JOE-USDC",
+    "JTO-USDC",
+    "JUP-USDC",
+    "KAIA-USDC",
+    "KAITO-USDC",
+    "KAT-USDC",
+    "KITE-USDC",
+    "KMNO-USDC",
+    "KNC-USDC",
+    "KSM-USDC",
+    "LAYER-USDC",
+    "LDO-USDC",
+    "LEO-USDC",
+    "LINEA-USDC",
+    "LINK-USDC",
+    "LPT-USDC",
+    "LQTY-USDC",
+    "LRC-USDC",
+    "LSK-USDC",
+    "LTC-USDC",
+    "LUNA-USDC",
+    "MAGIC-USDC",
+    "MANA-USDC",
+    "MASK-USDC",
+    "ME-USDC",
+    "MEGA-USDC",
+    "MEME-USDC",
+    "MENGO-USDC",
+    "MERL-USDC",
+    "METIS-USDC",
+    "MEW-USDC",
+    "MINA-USDC",
+    "MMT-USDC",
+    "MON-USDC",
+    "MOODENG-USDC",
+    "MORPHO-USDC",
+    "MOVE-USDC",
+    "NAVX-USDC",
+    "NEAR-USDC",
+    "NEIRO-USDC",
+    "NEO-USDC",
+    "NES-USDC",
+    "NIGHT-USDC",
+    "NMR-USDC",
+    "NOT-USDC",
+    "OFC-USDC",
+    "OKB-USDC",
+    "OL-USDC",
+    "OMI-USDC",
+    "ONDO-USDC",
+    "ONE-USDC",
+    "ONT-USDC",
+    "OP-USDC",
+    "ORBS-USDC",
+    "ORDI-USDC",
+    "PARTI-USDC",
+    "PENDLE-USDC",
+    "PENGU-USDC",
+    "PEOPLE-USDC",
+    "PEPE-USDC",
+    "PI-USDC",
+    "PNUT-USDC",
+    "POL-USDC",
+    "POR-USDC",
+    "PROMPT-USDC",
+    "PROS-USDC",
+    "PROVE-USDC",
+    "PUMP-USDC",
+    "PYTH-USDC",
+    "QTUM-USDC",
+    "RAY-USDC",
+    "RE-USDC",
+    "RENDER-USDC",
+    "RESOLV-USDC",
+    "ROBO-USDC",
+    "RON-USDC",
+    "RPL-USDC",
+    "RSR-USDC",
+    "RVN-USDC",
+    "S-USDC",
+    "SAFE-USDC",
+    "SAHARA-USDC",
+    "SAND-USDC",
+    "SATS-USDC",
+    "SCR-USDC",
+    "SEI-USDC",
+    "SENT-USDC",
+    "SHIB-USDC",
+    "SKL-USDC",
+    "SKY-USDC",
+    "SLX-USDC",
+    "SNT-USDC",
+    "SNX-USDC",
+    "SOL-USDC",
+    "SONIC-USDC",
+    "SOPH-USDC",
+    "SPACE-USDC",
+    "SPK-USDC",
+    "SPURS-USDC",
+    "SSV-USDC",
+    "STORJ-USDC",
+    "STRK-USDC",
+    "STX-USDC",
+    "SUI-USDC",
+    "SUSHI-USDC",
+    "SWFTC-USDC",
+    "T-USDC",
+    "TAO-USDC",
+    "THETA-USDC",
+    "TIA-USDC",
+    "TNSR-USDC",
+    "TOSHI-USDC",
+    "TRA-USDC",
+    "TRB-USDC",
+    "TRUMP-USDC",
+    "TRX-USDC",
+    "TURBO-USDC",
+    "UMA-USDC",
+    "UNI-USDC",
+    "VELO-USDC",
+    "VELODROME-USDC",
+    "VIRTUAL-USDC",
+    "W-USDC",
+    "WAXP-USDC",
+    "WCT-USDC",
+    "WIF-USDC",
+    "WIN-USDC",
+    "WLD-USDC",
+    "WLFI-USDC",
+    "WOO-USDC",
+    "XAAPL-USDC",
+    "XAMD-USDC",
+    "XAMZN-USDC",
+    "XCBRS-USDC",
+    "XCH-USDC",
+    "XCOIN-USDC",
+    "XCRCL-USDC",
+    "XCRWV-USDC",
+    "XEWY-USDC",
+    "XGOOGL-USDC",
+    "XHOOD-USDC",
+    "XINTC-USDC",
+    "XLITE-USDC",
+    "XLM-USDC",
+    "XMETA-USDC",
+    "XMRVL-USDC",
+    "XMSTR-USDC",
+    "XMU-USDC",
+    "XNBIS-USDC",
+    "XNVDA-USDC",
+    "XPL-USDC",
+    "XQQQ-USDC",
+    "XRP-USDC",
+    "XSKHY-USDC",
+    "XSNDK-USDC",
+    "XSOXL-USDC",
+    "XSPCX-USDC",
+    "XSPY-USDC",
+    "XTESTA-USDC",
+    "XTSLA-USDC",
+    "XTZ-USDC",
+    "YB-USDC",
+    "YFI-USDC",
+    "YGG-USDC",
+    "ZAMA-USDC",
+    "ZBCN-USDC",
+    "ZEC-USDC",
+    "ZEN-USDC",
+    "ZENT-USDC",
+    "ZETA-USDC",
+    "ZIL-USDC",
+    "ZK-USDC",
+    "ZORA-USDC",
+    "ZRO-USDC",
+    "ZRX-USDC"
+  ],
+  "pair_count": 294,
+  "readers": 2,
+  "history": 90,
+  "started_at": 1789845884.0744488,
+  "steady_at": 1789845949.807504,
+  "finished_at": 1789846849.8270879,
+  "planned_outages": [
+    [
+      [
+        1789846189.8266299,
+        1789846190.13729
+      ],
+      [
+        1789846399.8292742,
+        1789846466.257499
+      ]
+    ],
+    [
+      [
+        1789846399.8292742,
+        1789846466.257501
+      ]
+    ]
+  ],
+  "clock_step_seconds": 0.00545293022878468,
+  "clock_samples": [
+    {
+      "offset": 0.028369903564453125,
+      "rtt": 0.338841125019826,
+      "sampled_at": 1789845884.43405
+    },
+    {
+      "offset": 0.004923582077026367,
+      "rtt": 0.2840470419614576,
+      "sampled_at": 1789845884.718098
+    },
+    {
+      "offset": 0.0043430328369140625,
+      "rtt": 0.28909395897062495,
+      "sampled_at": 1789845885.0072021
+    },
+    {
+      "offset": 0.04059243202209473,
+      "rtt": 0.3553841660032049,
+      "sampled_at": 1789846850.184098
+    }
+  ],
+  "clock_offset_seconds": 0.004923582077026367,
+  "receipt_to_adapter_seconds": [
+    {
+      "count": 4287,
+      "p50": 0.0013661384582519531,
+      "p95": 0.017798900604248047,
+      "p99": 0.028511762619018555,
+      "max": 0.029829978942871094
+    },
+    {
+      "count": 4287,
+      "p50": 0.0014262199401855469,
+      "p95": 0.018058061599731445,
+      "p99": 0.02822589874267578,
+      "max": 0.031198978424072266
+    }
+  ],
+  "close_to_adapter_seconds_including_recovery": [
+    {
+      "count": 4287,
+      "p50": 0.8614456653594971,
+      "p95": 1.3641026020050049,
+      "p99": 1.4487404823303223,
+      "max": 1.934497356414795
+    },
+    {
+      "count": 4287,
+      "p50": 0.8621127605438232,
+      "p95": 1.3638687133789062,
+      "p99": 1.4491395950317383,
+      "max": 1.9354526996612549
+    }
+  ],
+  "receipt_to_native_read_seconds": [
+    {
+      "count": 4287,
+      "p50": 0.020280122756958008,
+      "p95": 0.05331110954284668,
+      "p99": 0.08293509483337402,
+      "max": 0.0878148078918457
+    },
+    {
+      "count": 4287,
+      "p50": 0.029078960418701172,
+      "p95": 0.05463695526123047,
+      "p99": 0.060463905334472656,
+      "max": 0.06462883949279785
+    }
+  ],
+  "native_frame_read_seconds": {
+    "count": 8574,
+    "p50": 0.0003352909698151052,
+    "p95": 0.0006450419896282256,
+    "p99": 0.0011211669771000743,
+    "max": 0.01735475001623854
+  },
+  "native_frames_checked": 8574,
+  "event_loop_lag_seconds": {
+    "count": 41732,
+    "p50": 0.001190791041590273,
+    "p95": 0.0026120839943177994,
+    "p99": 0.004267375003546476,
+    "max": 0.12148091699462384
+  },
+  "producer_rss_kib": {
+    "count": 192,
+    "p50": 27840,
+    "p95": 51712,
+    "p99": 51712,
+    "max": 51712
+  },
+  "coverage": [
+    [
+      {
+        "open_time": 1789845960,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846020,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846080,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846140,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846200,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846260,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846320,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846380,
+        "available_by_end": 294,
+        "incremental_deliveries": 171,
+        "missing": [],
+        "planned_interruption": true
+      },
+      {
+        "open_time": 1789846440,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846500,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846560,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846620,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846680,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846740,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      }
+    ],
+    [
+      {
+        "open_time": 1789845960,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846020,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846080,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846140,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846200,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846260,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846320,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846380,
+        "available_by_end": 294,
+        "incremental_deliveries": 171,
+        "missing": [],
+        "planned_interruption": true
+      },
+      {
+        "open_time": 1789846440,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846500,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846560,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846620,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846680,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      },
+      {
+        "open_time": 1789846740,
+        "available_by_end": 294,
+        "incremental_deliveries": 294,
+        "missing": [],
+        "planned_interruption": false
+      }
+    ]
+  ],
+  "events": [
+    {
+      "type": "producer_started",
+      "at": 1789845885.019691,
+      "pid": 67447
+    },
+    {
+      "type": "reader_error",
+      "reader": 0,
+      "at": 1789845885.048755,
+      "error": "ClientConnectorError"
+    },
+    {
+      "type": "reader_error",
+      "reader": 1,
+      "at": 1789845885.0487602,
+      "error": "ClientConnectorError"
+    },
+    {
+      "type": "all_readers_ready",
+      "at": 1789845949.807504
+    },
+    {
+      "type": "consumer_restart",
+      "reader": 0,
+      "at": 1789846189.8266299
+    },
+    {
+      "type": "consumer_recovered",
+      "reader": 0,
+      "at": 1789846190.137291
+    },
+    {
+      "type": "planned_producer_restart",
+      "at": 1789846399.8292742
+    },
+    {
+      "type": "producer_stopped",
+      "at": 1789846399.881921,
+      "returncode": 0
+    },
+    {
+      "type": "producer_started",
+      "at": 1789846401.900457,
+      "pid": 77404
+    },
+    {
+      "type": "reader_error",
+      "reader": 0,
+      "at": 1789846401.921988,
+      "error": "ClientConnectorError"
+    },
+    {
+      "type": "reader_error",
+      "reader": 1,
+      "at": 1789846401.922011,
+      "error": "ClientConnectorError"
+    },
+    {
+      "type": "all_readers_recovered",
+      "at": 1789846466.257484,
+      "seconds": 66.42787266697269
+    },
+    {
+      "type": "producer_stopped",
+      "at": 1789846850.255332,
+      "returncode": 0
+    }
+  ],
+  "errors": [],
+  "consumer_restart_exercised": true,
+  "producer_restart_exercised": true,
+  "producer_restart_recovered": true,
+  "final_ready": [
+    294,
+    294
+  ],
+  "authority": "repository-process-only",
+  "execution_connectors_created": false,
+  "coverage_passed": true,
+  "incremental_coverage_passed": true,
+  "local_latency_target_passed": true,
+  "passed": true
+}

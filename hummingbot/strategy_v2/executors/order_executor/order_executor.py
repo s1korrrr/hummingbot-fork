@@ -51,6 +51,8 @@ class OrderExecutor(ExecutorBase):
         self._failed_orders: list[TrackedOrder] = []
         self._canceled_orders: list[TrackedOrder] = []
         self._partial_filled_orders: list[TrackedOrder] = []
+        self._cancel_pending = False
+        self._cancel_requested_at = None
         self._current_retries = 0
         self._max_retries = max_retries
 
@@ -91,15 +93,13 @@ class OrderExecutor(ExecutorBase):
         if not self._order or not self._order.order or not self._order.order.is_open:
             return
 
-        current_price = self.current_market_price
+        if self._cancel_pending:
+            self.cancel_order()
+            return
+        target_price = self.get_order_price()
         threshold = self.config.chaser_config.refresh_threshold
-
-        if self.config.side == TradeType.BUY:
-            if current_price - self._order.order.price > (current_price * threshold):
-                self.renew_order()
-        else:  # SELL
-            if self._order.order.price - current_price > (current_price * threshold):
-                self.renew_order()
+        if abs(target_price - self._order.order.price) > self.current_market_price * threshold:
+            self.renew_order()
 
     def early_stop(self, keep_position: bool = True):
         """
@@ -107,51 +107,67 @@ class OrderExecutor(ExecutorBase):
 
         :return: None
         """
+        if self.is_closed:
+            return
         self._status = RunnableStatus.SHUTTING_DOWN
 
     async def control_shutdown_process(self):
         """
         Control the shutdown process of the executor.
         """
-        if self._order:
-            if self._order.is_open:
-                self.cancel_order()
-            elif self._order.is_filled:
-                self.close_type = CloseType.POSITION_HOLD
-                self._held_position_orders.append(self._order.order.to_json())
-                self._held_position_orders.extend([order.order.to_json() for order in self._partial_filled_orders])
-                self.stop()
+        if self._order and not self._order.is_done:
+            self.cancel_order()
         else:
-            if self._partial_filled_orders:
-                self._held_position_orders.extend([order.order.to_json() for order in self._partial_filled_orders])
-                self.close_type = CloseType.POSITION_HOLD
-            else:
-                self.close_type = CloseType.EARLY_STOP
-            self.stop()
-        await self._sleep(5.0)
+            self._finish_with_fills()
+        await self._sleep(1.0)
+
+    def _all_orders(self):
+        return list({order.order_id: order for order in [
+            *self._partial_filled_orders, *self._canceled_orders, *self._failed_orders, self._order
+        ] if order is not None}.values())
+
+    def _finish_with_fills(self):
+        self._held_position_orders = [order.order.to_json() for order in self._all_orders()
+                                      if order.order and order.executed_amount_base > Decimal("0")]
+        self.close_type = CloseType.POSITION_HOLD if self._held_position_orders else CloseType.EARLY_STOP
+        self.stop()
 
     def evaluate_max_retries(self):
-        """
-        Evaluate if the maximum number of retries has been reached.
-        """
         if self._current_retries > self._max_retries:
-            self.stop()
+            self._status = RunnableStatus.SHUTTING_DOWN
 
     def place_open_order(self):
         """
         Place the order based on the execution strategy.
         """
+        if self._order is not None:
+            return
+        remaining = self.config.amount - sum((order.executed_amount_base for order in self._all_orders()), Decimal("0"))
+        if remaining <= Decimal("0") or (remaining < self.config.amount and self._unplaceable_remainder(remaining)):
+            # A partial fill can leave a remainder the venue would reject (below its minimum
+            # size or notional). That remainder is dust: finish with the fills instead of
+            # re-submitting an order that can never be accepted.
+            self._finish_with_fills()
+            return
         order_id = self.place_order(
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             order_type=self.get_order_type(),
-            amount=self.config.amount,
+            amount=remaining,
             price=self.get_order_price(),
             side=self.config.side,
             position_action=self.config.position_action,
         )
         self._order = TrackedOrder(order_id=order_id)
         self.logger().debug(self._log_message(f"Placing order order_id={order_id}"))
+
+    def _unplaceable_remainder(self, remaining: Decimal) -> bool:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        connector = self.connectors[self.config.connector_name]
+        amount = Decimal(str(connector.quantize_order_amount(self.config.trading_pair, remaining)))
+        price = self.get_order_price()
+        return (amount <= Decimal("0") or amount < Decimal(str(rules.min_order_size))
+                or (price.is_finite() and amount * price < Decimal(str(rules.min_notional_size))))
 
     def get_order_type(self) -> OrderType:
         """
@@ -188,6 +204,37 @@ class OrderExecutor(ExecutorBase):
         return aligned_price
 
     def get_order_price(self) -> Decimal:
+        price = self._unbounded_order_price()
+        if self.config.min_sell_price is not None:
+            connector = self.connectors[self.config.connector_name]
+            base, quote = self.config.trading_pair.split('-')
+            floor = self.config.min_sell_price
+            remaining = self.config.amount - sum((order.executed_amount_base for order in self._all_orders()), Decimal('0'))
+            if remaining <= 0:
+                return max(price, floor)
+            fee = connector.get_fee(base_currency=base, quote_currency=quote, order_type=self.get_order_type(),
+                                    order_side=self.config.side, amount=remaining, price=floor)
+            rate = Decimal(str(fee.percent))
+            estimated = fee.fee_amount_in_token(self.config.trading_pair, floor, remaining, quote, exchange=connector)
+            if not rate.is_finite() or not Decimal('0') <= rate < Decimal('1') or not estimated.is_finite():
+                raise ValueError('Recovery exit fee estimate is unavailable')
+            flat_quote = max(Decimal('0'), estimated - floor * remaining * rate)
+            price = max(price, (floor + flat_quote / remaining) / (Decimal('1') - rate))
+            rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+            tick = self._to_price_tick(rules)
+            if tick is not None:
+                price = (price / tick).to_integral_value(rounding=ROUND_CEILING) * tick
+        return price
+
+    @staticmethod
+    def _to_price_tick(rules):
+        try:
+            tick = Decimal(str(rules.min_price_increment))
+            return tick if tick.is_finite() and tick > 0 else None
+        except Exception:
+            return None
+
+    def _unbounded_order_price(self) -> Decimal:
         """
         Get the order price based on the execution strategy.
 
@@ -228,14 +275,16 @@ class OrderExecutor(ExecutorBase):
         :param new_price: The new price for the order.
         """
         self.cancel_order()
-        self.place_open_order()
         self.logger().debug(self._log_message("Renewing order"))
 
     def cancel_order(self):
         """
         Cancel the current order.
         """
-        if self._order and self._order.order and self._order.order.is_open:
+        retry_due = self._cancel_requested_at is None or self._strategy.current_timestamp - self._cancel_requested_at >= 5
+        if retry_due and self._order and self._order.order and self._order.order.is_open:
+            self._cancel_pending = True
+            self._cancel_requested_at = self._strategy.current_timestamp
             self._strategy.cancel(
                 connector_name=self.config.connector_name,
                 trading_pair=self.config.trading_pair,
@@ -250,8 +299,10 @@ class OrderExecutor(ExecutorBase):
         :param order_id: The order ID to update.
         """
         in_flight_order = self.get_in_flight_order(self.config.connector_name, order_id)
-        if self._order and self._order.order_id == order_id:
-            self._order.order = in_flight_order
+        if in_flight_order is not None:
+            for order in self._all_orders():
+                if order.order_id == order_id:
+                    order.order = in_flight_order
 
     def process_order_created_event(self, _, market, event: Union[BuyOrderCreatedEvent, SellOrderCreatedEvent]):
         """
@@ -271,28 +322,47 @@ class OrderExecutor(ExecutorBase):
         """
         self.update_tracked_order_with_order_id(event.order_id)
         if self._order and self._order.order_id == event.order_id:
-            self._held_position_orders.append(self._order.order.to_json())
-            self.close_type = CloseType.POSITION_HOLD
-            self.stop()
+            self._finish_with_fills()
 
     def process_order_canceled_event(self, _, market: ConnectorBase, event: OrderCancelledEvent):
         """
         Process the order canceled event.
         """
         if self._order and event.order_id == self._order.order_id:
+            if self._order.order is None:
+                self.update_tracked_order_with_order_id(event.order_id)
             if self._order.executed_amount_base > Decimal("0"):
                 self._partial_filled_orders.append(self._order)
             else:
                 self._canceled_orders.append(self._order)
             self._order = None
+            self._cancel_pending = False
+            self._cancel_requested_at = None
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         """
         Process the order failed event.
         """
         if self._order and event.order_id == self._order.order_id:
+            if self._order.order is None:
+                self.update_tracked_order_with_order_id(event.order_id)
             self._failed_orders.append(self._order)
             self._order = None
+            self._cancel_pending = False
+            self._cancel_requested_at = None
+            if self._is_permanent_validation_failure(event):
+                self.close_type = CloseType.FAILED
+                self.logger().error(
+                    self._log_message(
+                        f"Order failed permanently order_id={event.order_id}. "
+                        f"Not retrying due to validation error"
+                    )
+                )
+                if any(order.executed_amount_base > 0 for order in self._all_orders()):
+                    self._finish_with_fills()
+                else:
+                    self.stop()
+                return
             self.logger().error(
                 self._log_message(
                     f"Order failed order_id={event.order_id}. "
@@ -300,6 +370,22 @@ class OrderExecutor(ExecutorBase):
                 )
             )
             self._current_retries += 1
+
+    @staticmethod
+    def _is_permanent_validation_failure(event: MarketOrderFailureEvent) -> bool:
+        error_type = str(getattr(event, "error_type", "") or "").lower()
+        error_message = str(getattr(event, "error_message", "") or "").lower()
+        if not error_message:
+            return False
+        permanent_markers = (
+            "minimum notional size",
+            "minimum order size",
+            "lower than minimum",
+            "order value is lower than minimum",
+        )
+        if error_type and error_type != "valueerror":
+            return False
+        return any(marker in error_message for marker in permanent_markers)
 
     def get_custom_info(self) -> Dict:
         """
@@ -313,6 +399,8 @@ class OrderExecutor(ExecutorBase):
             "current_retries": self._current_retries,
             "max_retries": self._max_retries,
             "order_id": self._order.order_id if self._order else None,
+            "order_ids": [order.order_id for order in self._all_orders()],
+            "executed_amount_base": sum((order.executed_amount_base for order in self._all_orders()), Decimal("0")),
             "order_last_update": self._order.last_update_timestamp if self._order else None,
             "held_position_orders": self._held_position_orders,
         }

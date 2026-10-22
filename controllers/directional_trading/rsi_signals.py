@@ -59,7 +59,7 @@ class RSISignalContext:
         volume_ratio: Current volume / average volume
         divergence: Detected divergence type
         divergence_strength: How strong the divergence is (0-1)
-        mean_reversion_score: Probability of mean reversion (0-1)
+        mean_reversion_score: Uncalibrated symmetric RSI extremeness (0-1)
         signal_strength: Overall signal strength (0-1)
     """
 
@@ -130,9 +130,10 @@ def calculate_volume_ratio(
 
 def calculate_rsi_mean_reversion_score(rsi: float) -> float:
     """
-    Calculate probability score for RSI mean reversion.
+    Calculate uncalibrated symmetric RSI extremeness on a 0-1 scale.
 
-    Returns a 0-1 score where 1 means highest reversion probability.
+    The score increases with distance from RSI 50. It is a heuristic,
+    with no fitted outcome, event definition, or forecast horizon.
     """
     if rsi is None or pd.isna(rsi):
         return 0.0
@@ -150,7 +151,9 @@ def calculate_signal_strength(
     regime_confidence: float = 0.5,
 ) -> float:
     """
-    Calculate overall RSI signal strength combining multiple factors.
+    Calculate heuristic RSI signal strength using fixed factor weights.
+
+    This score is not an outcome-fitted probability.
     """
     if rsi is None or pd.isna(rsi):
         return 0.0

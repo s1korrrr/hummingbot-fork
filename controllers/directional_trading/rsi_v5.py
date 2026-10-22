@@ -17,22 +17,18 @@ Key Features:
 - No time limit on executors - hold until trailing stop or bag freeze
 """
 import logging
+import re
+import time as _time
+import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import pandas_ta as ta  # noqa: F401
 from pydantic import Field as PydanticField, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
 
-from controllers.directional_trading.rsi_signals import (
-    analyze_rsi_trend_confirmation,
-    calculate_rsi_mean_reversion_score,
-    calculate_signal_strength,
-    calculate_volume_ratio,
-    get_adaptive_trailing_params,
-)
 from hummingbot.client.config.config_data_types import ClientFieldData
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
@@ -42,14 +38,20 @@ from hummingbot.strategy_v2.controllers.directional_trading_controller_base impo
     DirectionalTradingControllerBase,
     DirectionalTradingControllerConfigBase,
 )
-from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
+from hummingbot.strategy_v2.executors.order_executor.data_types import (
+    ExecutionStrategy,
+    LimitChaserConfig,
+    OrderExecutorConfig,
+)
 from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
     TrailingStop,
     TripleBarrierConfig,
 )
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
+from hummingbot.strategy_v2.utils.common import parse_enum_value
 from hummingbot.strategy_v2.utils.market_analysis import (
     MarketRegime,
     MarketRegimeDetector,
@@ -58,10 +60,35 @@ from hummingbot.strategy_v2.utils.market_analysis import (
     TrendDirection,
 )
 
+from .pandas_compat import pandas_copy_on_write_warning_category
+from .rsi_signals import (
+    analyze_rsi_trend_confirmation,
+    calculate_rsi_mean_reversion_score,
+    calculate_signal_strength,
+    calculate_volume_ratio,
+    get_adaptive_trailing_params,
+)
+
+_PANDAS_COPY_ON_WRITE_WARNING = pandas_copy_on_write_warning_category(pd.errors)
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        category=_PANDAS_COPY_ON_WRITE_WARNING,
+        message=".*mode.copy_on_write.*",
+    )
+    import pandas_ta as ta  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Pydantic Field helper (same as rsi_v1 for prompt/client_data compat)
 # ---------------------------------------------------------------------------
 _CLIENT_FIELD_SCHEMA_KEYS = ("prompt", "prompt_on_new", "is_secure", "is_connect_key", "is_updatable")
+_DECIMAL_CONVERSION_ERRORS = (ArithmeticError, TypeError, ValueError)
+_DECIMAL_ATTRIBUTE_ERRORS = (AttributeError, ArithmeticError, TypeError, ValueError)
+_MARKET_DATA_ERRORS = (AttributeError, KeyError, RuntimeError, TypeError, ValueError, ArithmeticError)
+_PROVIDER_ERRORS = (AttributeError, KeyError, RuntimeError, TypeError, ValueError)
+_INDICATOR_ERRORS = (AttributeError, KeyError, IndexError, RuntimeError, TypeError, ValueError, ArithmeticError)
+_STATUS_FORMAT_ERRORS = (AttributeError, KeyError, OSError, TypeError, ValueError, ArithmeticError)
+_PANDAS_TA_NUMERIC_SUFFIX = re.compile(r"\d+(?:\.\d+)?(?:_\d+(?:\.\d+)?)*\Z")
 
 
 def _extract_client_field_value(client_data: Optional[ClientFieldData], key: str):
@@ -164,6 +191,13 @@ class BuyConfirmationSetup:
     armed_timestamp: float
     trough_rsi: float
     trough_price: float
+    armed_signal_score: int = 0
+    armed_min_signal_score: int = 0
+
+    def score_qualified(self) -> bool:
+        if self.armed_min_signal_score <= 0:
+            return True
+        return self.armed_signal_score >= self.armed_min_signal_score
 
 
 @dataclass
@@ -198,6 +232,7 @@ class AggregatedInventoryState:
     total_amount: Decimal
     bag_count: int
     cost_basis: Optional[Decimal]
+    cum_fees_quote: Decimal = Decimal("0")
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +258,7 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     candles_trading_pair: str = Field(default=None, client_data=ClientFieldData(prompt=lambda mi: "Candles trading pair:", prompt_on_new=False, is_updatable=False))
     candles_config: List[CandlesConfig] = []
     interval: str = Field(default="1m", client_data=ClientFieldData(prompt=lambda mi: "Candle interval:", prompt_on_new=True, is_updatable=False))
+    max_candle_age_intervals: float = Field(default=2.5, gt=0.0, client_data=ClientFieldData(prompt=lambda mi: "Max candle age in intervals:", prompt_on_new=False, is_updatable=True))
     strict_hmm_mode: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Require real HMM regime detector?:", prompt_on_new=False, is_updatable=False))
     trend_confirmation_enabled: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Use multi-timeframe trend confirmation?:", prompt_on_new=False, is_updatable=True))
     trend_confirmation_medium_interval: Optional[str] = Field(default="5m", client_data=ClientFieldData(prompt=lambda mi: "Trend medium interval:", prompt_on_new=False, is_updatable=True))
@@ -234,6 +270,9 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     recovery_trail_pullback_pct: float = Field(default=0.0035, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery trailing pullback pct:", prompt_on_new=False, is_updatable=True))
     recovery_rsi_rollover_delta: float = Field(default=2.0, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery RSI rollover delta:", prompt_on_new=False, is_updatable=True))
     recovery_cancel_stale_order_pct: float = Field(default=0.0025, ge=0.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery stale-order cancel pct:", prompt_on_new=False, is_updatable=True))
+    recovery_sell_execution_strategy: ExecutionStrategy = Field(default=ExecutionStrategy.LIMIT_CHASER, client_data=ClientFieldData(prompt=lambda mi: "Recovery sell execution strategy (LIMIT/LIMIT_MAKER/LIMIT_CHASER/MARKET):", prompt_on_new=False, is_updatable=True))
+    recovery_limit_chaser_distance_pct: Decimal = Field(default=Decimal("0.002"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Recovery limit chaser distance pct:", prompt_on_new=False, is_updatable=True))
+    recovery_limit_chaser_refresh_threshold_pct: Decimal = Field(default=Decimal("0.003"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Recovery limit chaser refresh threshold pct:", prompt_on_new=False, is_updatable=True))
     recovery_partial_exit_fraction: float = Field(default=0.5, gt=0.0, le=1.0, client_data=ClientFieldData(prompt=lambda mi: "Recovery partial exit fraction:", prompt_on_new=False, is_updatable=True))
 
     # --- Core indicators ---
@@ -241,8 +280,8 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     atr_length: int = Field(default=14, ge=2, client_data=ClientFieldData(prompt=lambda mi: "ATR length:", is_updatable=False))
     ema_fast_length: int = Field(default=9, ge=2, client_data=ClientFieldData(prompt=lambda mi: "EMA fast:", prompt_on_new=False, is_updatable=False))
     ema_slow_length: int = Field(default=21, ge=2, client_data=ClientFieldData(prompt=lambda mi: "EMA slow:", prompt_on_new=False, is_updatable=False))
-    rsi_buy_threshold: float = Field(default=31.0, client_data=ClientFieldData(prompt=lambda mi: "RSI buy threshold:", prompt_on_new=False, is_updatable=True))
-    rsi_sell_threshold: float = Field(default=75.0, client_data=ClientFieldData(prompt=lambda mi: "RSI sell threshold:", prompt_on_new=False, is_updatable=True))
+    rsi_buy_threshold: float = Field(default=31.0, gt=0.0, lt=100.0, client_data=ClientFieldData(prompt=lambda mi: "RSI buy threshold:", prompt_on_new=False, is_updatable=True))
+    rsi_sell_threshold: float = Field(default=75.0, gt=0.0, lt=100.0, client_data=ClientFieldData(prompt=lambda mi: "RSI sell threshold:", prompt_on_new=False, is_updatable=True))
 
     # --- Bollinger Bands ---
     bb_length: int = Field(default=20, ge=5, client_data=ClientFieldData(prompt=lambda mi: "BB length:", prompt_on_new=False, is_updatable=False))
@@ -267,16 +306,19 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
     sell_only_if_profitable: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Only sell if profitable?:", prompt_on_new=False, is_updatable=True))
     sell_rsi_overbought: float = Field(default=76.0, ge=50.0, le=100.0, client_data=ClientFieldData(prompt=lambda mi: "RSI overbought trigger for sell:", prompt_on_new=False, is_updatable=True))
     min_profit_pct_for_sell: Decimal = Field(default=Decimal("0.002"), client_data=ClientFieldData(prompt=lambda mi: "Min profit pct for sell:", prompt_on_new=False, is_updatable=True))
+    signal_sell_inventory_slice_multiplier: Decimal = Field(default=Decimal("0"), ge=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Signal SELL inventory slice multiplier (0=all):", prompt_on_new=False, is_updatable=True))
     recent_trades_lookback: int = Field(default=15, client_data=ClientFieldData(prompt=lambda mi: "Recent trades lookback:", prompt_on_new=False, is_updatable=False))
 
     # --- Position sizing & risk limits ---
-    usd_per_entry: Decimal = Field(default=Decimal("30"), client_data=ClientFieldData(prompt=lambda mi: "USD per entry:", prompt_on_new=True, is_updatable=True))
-    max_total_position_usd: Decimal = Field(default=Decimal("500"), client_data=ClientFieldData(prompt=lambda mi: "Max total position USD:", prompt_on_new=True, is_updatable=True))
+    usd_per_entry: Decimal = Field(default=Decimal("30"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "USD per entry:", prompt_on_new=True, is_updatable=True))
+    max_total_position_usd: Decimal = Field(default=Decimal("500"), gt=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Max total position USD:", prompt_on_new=True, is_updatable=True))
 
     # --- Trailing take profit ---
     use_trailing_exit: bool = Field(default=True, client_data=ClientFieldData(prompt=lambda mi: "Use trailing exit?:", prompt_on_new=False, is_updatable=True))
     trailing_activation_pct: float = Field(default=0.047, client_data=ClientFieldData(prompt=lambda mi: "Trailing activation pct:", prompt_on_new=False, is_updatable=True))
     trailing_delta_pct: float = Field(default=0.034, client_data=ClientFieldData(prompt=lambda mi: "Trailing delta pct:", prompt_on_new=False, is_updatable=True))
+    trailing_stop_order_type: OrderType = Field(default=OrderType.LIMIT, client_data=ClientFieldData(prompt=lambda mi: "Trailing close order type (LIMIT/MARKET):", prompt_on_new=False, is_updatable=True))
+    trailing_stop_limit_max_age_seconds: int = Field(default=3, ge=0, client_data=ClientFieldData(prompt=lambda mi: "Trailing limit fallback seconds (0=disabled):", prompt_on_new=False, is_updatable=True))
     use_adaptive_trailing: bool = Field(default=False, client_data=ClientFieldData(prompt=lambda mi: "Volatility-adaptive trailing?:", prompt_on_new=False, is_updatable=True))
     trailing_atr_baseline: float = Field(default=0.002, ge=0.0001, client_data=ClientFieldData(prompt=lambda mi: "Trailing ATR baseline:", prompt_on_new=False, is_updatable=True))
 
@@ -288,6 +330,7 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
 
     # --- Entry spacing (DCA ladder) ---
     executor_price_gap_threshold: Decimal = Field(default=Decimal("0.0045"), client_data=ClientFieldData(prompt=lambda mi: "Min price gap between entries:", prompt_on_new=False, is_updatable=True))
+    sell_executor_price_gap_threshold: Decimal = Field(default=Decimal("0.01"), ge=Decimal("0"), client_data=ClientFieldData(prompt=lambda mi: "Min price gap between sell executors:", prompt_on_new=False, is_updatable=True))
     cooldown_time: int = Field(default=90, ge=15, client_data=ClientFieldData(prompt=lambda mi: "Base cooldown seconds:", prompt_on_new=False, is_updatable=True))
 
     # --- Adaptive controls ---
@@ -364,6 +407,27 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
         normalized = str(v).strip()
         return normalized or None
 
+    @field_validator("trailing_stop_order_type", mode="before")
+    @classmethod
+    def validate_trailing_stop_order_type(cls, v) -> OrderType:
+        if v is None:
+            return OrderType.LIMIT
+        if isinstance(v, str):
+            v = v.replace("OrderType.", "")
+        parsed = parse_enum_value(OrderType, v, "trailing_stop_order_type")
+        if parsed == OrderType.LIMIT_MAKER:
+            raise ValueError("trailing_stop_order_type must be LIMIT or MARKET")
+        return parsed
+
+    @field_validator("recovery_sell_execution_strategy", mode="before")
+    @classmethod
+    def validate_recovery_sell_execution_strategy(cls, v) -> ExecutionStrategy:
+        if v is None:
+            return ExecutionStrategy.LIMIT_CHASER
+        if isinstance(v, str):
+            v = v.replace("ExecutionStrategy.", "")
+        return parse_enum_value(ExecutionStrategy, v, "recovery_sell_execution_strategy")
+
     @model_validator(mode="after")
     def harmonize_sell_threshold_fields(self):
         default_rsi_sell = float(type(self).model_fields["rsi_sell_threshold"].default)
@@ -374,7 +438,10 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
         rsi_sell_custom = abs(rsi_sell - default_rsi_sell) > 1e-9
         sell_overbought_custom = abs(sell_overbought - default_sell_overbought) > 1e-9
 
-        if sell_overbought_custom and not rsi_sell_custom:
+        if not rsi_sell_custom and not sell_overbought_custom:
+            object.__setattr__(self, "rsi_sell_threshold", default_sell_overbought)
+            object.__setattr__(self, "sell_rsi_overbought", default_sell_overbought)
+        elif sell_overbought_custom and not rsi_sell_custom:
             object.__setattr__(self, "rsi_sell_threshold", sell_overbought)
         elif rsi_sell_custom and not sell_overbought_custom:
             object.__setattr__(self, "sell_rsi_overbought", rsi_sell)
@@ -382,6 +449,13 @@ class RSIv5ControllerConfig(DirectionalTradingControllerConfigBase):
             object.__setattr__(self, "rsi_sell_threshold", sell_overbought)
         else:
             object.__setattr__(self, "sell_rsi_overbought", rsi_sell)
+
+        if float(self.rsi_buy_threshold) >= float(self.sell_rsi_overbought):
+            raise ValueError("rsi_buy_threshold must be below the effective RSI sell threshold")
+        if self.usd_per_entry > self.max_total_position_usd:
+            raise ValueError("usd_per_entry must be less than or equal to max_total_position_usd")
+        if float(self.min_position_size_multiplier) > float(self.max_position_size_multiplier):
+            raise ValueError("min_position_size_multiplier must be less than or equal to max_position_size_multiplier")
 
         return self
 
@@ -428,6 +502,13 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         self._cost_basis_cache_ts: Optional[float] = None
         self._consecutive_losses: int = 0
         self._last_loss_timestamp: Optional[float] = None
+        self._final_executor_results: Dict[str, Decimal] = {}
+        self._executor_result_conflict_ids: set[str] = set()
+        self._operator_entry_paused: bool = False
+        self._operator_pause_reason: Optional[str] = None
+        self._operator_pause_scope: Optional[str] = None
+        self._operator_pause_updated_at: Optional[float] = None
+        self._operator_last_command_id: Optional[str] = None
         # Indicator max_records must cover the slowest indicator
         self.max_records = max(500, config.bb_length * 3, config.macd_slow * 3, config.rsi_length * 5)
         if not getattr(self.config, "candles_config", None) or len(self.config.candles_config) == 0:
@@ -439,6 +520,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             allow_rule_based_fallback=False,
             htf_confirm=False,
         )
+
+        self._last_chart_snapshot_timestamps: Dict[str, int] = {}
+        self._chart_snapshot_bootstrapped: Dict[str, bool] = {}
 
         super().__init__(config, *args, **kwargs)
 
@@ -498,11 +582,170 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 interval=interval,
                 max_records=self.max_records,
             )
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             return None
         if candles_df is None or candles_df.empty:
             return None
         return candles_df.copy()
+
+    def _chart_snapshot_intervals(self) -> List[str]:
+        intervals = [self.config.interval]
+        if self.config.trend_confirmation_enabled:
+            for interval in (
+                self.config.trend_confirmation_medium_interval,
+                self.config.trend_confirmation_long_interval,
+            ):
+                if interval and interval not in intervals:
+                    intervals.append(interval)
+        return intervals
+
+    @staticmethod
+    def _chart_series_value(row: pd.Series, key: str):
+        try:
+            value = row.get(key)
+        except (AttributeError, TypeError):
+            value = None
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return value
+
+    @staticmethod
+    def _chart_timestamp_millis(value) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            timestamp = float(value)
+            if timestamp > 10_000_000_000:
+                return int(timestamp)
+            return int(timestamp * 1000)
+        except (TypeError, ValueError):
+            return None
+
+    def _chart_prepare_interval_frame(self, interval: str) -> Optional[pd.DataFrame]:
+        if interval == self.config.interval:
+            features = (self.processed_data or {}).get("features")
+            if isinstance(features, pd.DataFrame) and not features.empty:
+                return features.copy()
+        return self._get_interval_candles_df(interval)
+
+    def _build_chart_snapshot_payload_for_row(
+        self,
+        *,
+        bot_name: str,
+        interval: str,
+        row: pd.Series,
+        enforce_latest_guard: bool,
+    ) -> Optional[Dict[str, object]]:
+        candle_timestamp = self._chart_timestamp_millis(self._chart_series_value(row, "timestamp"))
+        if candle_timestamp is None:
+            return None
+        if enforce_latest_guard and self._last_chart_snapshot_timestamps.get(interval) == candle_timestamp:
+            return None
+        close_price = self._chart_series_value(row, "close")
+        if close_price is None:
+            return None
+        # A historical candle can only carry features attributed to that row.
+        # Current controller state must never be painted back across bootstrap history.
+        rsi_value = self._chart_series_value(row, f"RSI_{self.config.rsi_length}")
+        signal_value = self._chart_series_value(row, "signal")
+        payload = {
+            "bot_name": bot_name,
+            "controller_id": self.config.id,
+            "pair": self.config.trading_pair,
+            "interval": interval,
+            "candle_timestamp": candle_timestamp,
+            "open_price": float(self._chart_series_value(row, "open") or 0),
+            "high_price": float(self._chart_series_value(row, "high") or 0),
+            "low_price": float(self._chart_series_value(row, "low") or 0),
+            "close_price": float(close_price),
+            "volume": float(self._chart_series_value(row, "volume") or 0),
+            "rsi": None if rsi_value is None else float(rsi_value),
+            "signal": None if signal_value is None else int(signal_value),
+        }
+        return payload
+
+    def build_chart_snapshot_rows(self, bot_name: str) -> List[Dict[str, object]]:
+        rows: List[Dict[str, object]] = []
+        for interval in self._chart_snapshot_intervals():
+            frame = self._chart_prepare_interval_frame(interval)
+            if frame is None or frame.empty:
+                continue
+            interval_rows: List[Dict[str, object]] = []
+            if not self._chart_snapshot_bootstrapped.get(interval):
+                for _, row in frame.iterrows():
+                    payload = self._build_chart_snapshot_payload_for_row(
+                        bot_name=bot_name,
+                        interval=interval,
+                        row=row,
+                        enforce_latest_guard=False,
+                    )
+                    if payload is not None:
+                        interval_rows.append(payload)
+            else:
+                payload = self._build_chart_snapshot_payload_for_row(
+                    bot_name=bot_name,
+                    interval=interval,
+                    row=frame.iloc[-1],
+                    enforce_latest_guard=True,
+                )
+                if payload is not None:
+                    interval_rows.append(payload)
+            rows.extend(interval_rows)
+        return rows
+
+    def chart_snapshot_rows_persisted(self, rows: List[Dict[str, object]]) -> None:
+        """Advance chart guards only after the native recorder commits the batch."""
+        for row in rows:
+            if row.get("controller_id") != self.config.id or row.get("pair") != self.config.trading_pair:
+                continue
+            interval = row["interval"]
+            timestamp = int(row["candle_timestamp"])
+            self._last_chart_snapshot_timestamps[interval] = max(
+                timestamp, self._last_chart_snapshot_timestamps.get(interval, timestamp))
+            self._chart_snapshot_bootstrapped[interval] = True
+
+    def set_operator_entry_pause(
+        self,
+        enabled: bool,
+        *,
+        reason: Optional[str] = None,
+        scope: Optional[str] = None,
+        command_id: Optional[str] = None,
+        updated_at: Optional[float] = None,
+    ) -> None:
+        self._operator_entry_paused = enabled
+        self._operator_pause_reason = reason
+        self._operator_pause_scope = scope
+        self._operator_pause_updated_at = updated_at or _time.time()
+        self._operator_last_command_id = command_id
+        log_fn = self.logger().warning if enabled else self.logger().info
+        log_fn(
+            f"Operator entry pause {'enabled' if enabled else 'disabled'} | "
+            f"pair={self.config.trading_pair} scope={scope or 'n/a'} reason={reason or 'n/a'}"
+        )
+
+    def get_operator_state(self) -> dict:
+        return {
+            "entry_paused": self._operator_entry_paused,
+            "reason": self._operator_pause_reason,
+            "scope": self._operator_pause_scope,
+            "updated_at": self._operator_pause_updated_at,
+            "last_command_id": self._operator_last_command_id,
+        }
+
+    def get_custom_info(self) -> dict:
+        mid_price = self._get_mid_price()
+        return {
+            "pair": self.config.trading_pair,
+            "signal": (self.processed_data or {}).get("signal", 0),
+            "mid_price": float(mid_price) if mid_price is not None else None,
+            "buy_gate": self._last_gate_reason.get(TradeType.BUY),
+            "sell_gate": self._last_gate_reason.get(TradeType.SELL),
+            "operator": self.get_operator_state(),
+        }
 
     def _split_entries_enabled(self) -> bool:
         return bool(
@@ -569,7 +812,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         try:
             if explicit_fraction is not None and Decimal(str(explicit_fraction)) > 0:
                 return max(Decimal("0"), min(Decimal("1"), Decimal(str(explicit_fraction))))
-        except Exception:
+        except _DECIMAL_CONVERSION_ERRORS:
             pass
         if role == "scout":
             return self._effective_scout_fraction(context_bias)
@@ -604,7 +847,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 f"Trading rule unavailable | {self._controller_pair_log_prefix()} "
                 f"connector={self.config.connector_name}"
             )
-        except Exception as e:
+        except _PROVIDER_ERRORS as e:
             self.logger().warning(
                 f"Trading rule lookup failed | {self._controller_pair_log_prefix()} "
                 f"error={type(e).__name__}: {e}"
@@ -619,7 +862,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             value = getattr(rule, attr_name, Decimal("0")) or Decimal("0")
             decimal_value = Decimal(str(value))
             return decimal_value if decimal_value.is_finite() and decimal_value > 0 else Decimal("0")
-        except Exception:
+        except _DECIMAL_ATTRIBUTE_ERRORS:
             return Decimal("0")
 
     def _quantize_amount(self, amount: Decimal) -> Decimal:
@@ -631,7 +874,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     )
                 )
             )
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             return amount
 
     @staticmethod
@@ -656,6 +899,45 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         min_quote_from_base = min_base * price if min_base > 0 else Decimal("0")
         return max(min_quote_from_base, min_notional, min_order_value)
 
+    def _held_dust_max_quote(self) -> Decimal:
+        """Held remainders worth less than this are dust, swept into the next sell."""
+        try:
+            value = Decimal(str(getattr(self.config, "sell_remainder_sweep_max_quote", 0) or 0))
+        except (InvalidOperation, TypeError, ValueError):
+            return Decimal("0")
+        return value if value.is_finite() and value > 0 else Decimal("0")
+
+    def _held_amount_is_dust(self, amount, basis) -> bool:
+        """A held remainder is dust when it cannot be sold alone at the market, or
+        is worth less than the sweep bound at the better of cost and market.
+
+        Dust is not counted, trailed, recovered or used as an entry-spacing
+        anchor; the next sell of the pair sweeps it. A bag that is sellable at
+        the market is never dust, even if its cost is below the exchange
+        minimum. Without a market price only the price-independent minimum
+        order size reclassifies a remainder, so an outage cannot drop a trail.
+        """
+        amount = self._decimal_or_none(amount)
+        if amount is None or amount <= 0:
+            return True
+        rule = self._get_trading_rule()
+        min_size = self._rule_decimal(rule, "min_order_size")
+        if min_size > 0 and amount < min_size:
+            return True
+        mid = self._decimal_or_none(self._get_mid_price())
+        if mid is None or mid <= 0:
+            return False
+        min_amount = self._minimum_entry_amount(mid, rule)
+        min_quote = self._minimum_entry_quote(mid, rule)
+        if amount < min_amount or (min_quote > 0 and amount * mid < min_quote):
+            return True
+        basis = self._decimal_or_none(basis)
+        value_price = max(mid, basis) if basis is not None and basis > 0 else mid
+        return amount * value_price < self._held_dust_max_quote()
+
+    def _held_position_is_dust(self, position) -> bool:
+        return self._held_amount_is_dust(getattr(position, "amount", None), getattr(position, "breakeven_price", None))
+
     def _minimum_entry_amount(self, price: Decimal, rule: Optional[TradingRule] = None) -> Decimal:
         if price <= 0:
             return Decimal("0")
@@ -667,6 +949,51 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if increment > 0:
             min_amount = self._ceil_to_increment(min_amount, increment)
         return max(min_amount, Decimal("0"))
+
+    def _resolve_recovery_sell_amount(
+        self,
+        *,
+        position_amount: Decimal,
+        target_amount: Decimal,
+        price: Decimal,
+        available_base: Optional[Decimal] = None,
+    ) -> Decimal:
+        if position_amount <= 0 or target_amount <= 0 or price <= 0:
+            return Decimal("0")
+
+        max_sellable = position_amount
+        if available_base is not None:
+            max_sellable = min(max_sellable, available_base)
+        if max_sellable <= 0:
+            return Decimal("0")
+
+        rule = self._get_trading_rule()
+        min_quote = self._minimum_entry_quote(price, rule)
+        min_amount = self._minimum_entry_amount(price, rule)
+        if max_sellable < min_amount or (min_quote > 0 and max_sellable * price < min_quote):
+            return Decimal("0")
+
+        sell_amount = min(target_amount, max_sellable)
+        if sell_amount < min_amount or (min_quote > 0 and sell_amount * price < min_quote):
+            sell_amount = min_amount
+
+        remaining_amount = max_sellable - sell_amount
+        if remaining_amount > 0 and (
+            remaining_amount < min_amount or (min_quote > 0 and remaining_amount * price < min_quote)
+        ):
+            sell_amount = max_sellable
+
+        sell_amount = min(sell_amount, max_sellable)
+        sell_amount = self._quantize_amount(sell_amount)
+        if sell_amount > max_sellable:
+            sell_amount = max_sellable
+        if sell_amount <= 0:
+            return Decimal("0")
+        if sell_amount < min_amount or (min_quote > 0 and sell_amount * price < min_quote):
+            if max_sellable >= min_amount and (min_quote <= 0 or max_sellable * price >= min_quote):
+                return max_sellable
+            return Decimal("0")
+        return sell_amount
 
     def _resolve_buy_entry_plan(
         self,
@@ -757,7 +1084,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         side = getattr(getattr(position, "side", None), "name", str(getattr(position, "side", "unknown")))
         try:
             breakeven = Decimal(str(getattr(position, "breakeven_price", "0"))).quantize(Decimal("1e-8"))
-        except Exception:
+        except _DECIMAL_CONVERSION_ERRORS:
             breakeven = Decimal("0")
         return f"{connector}|{pair}|{side}|{breakeven}"
 
@@ -801,7 +1128,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             if position.connector_name == self.config.connector_name
             and position.trading_pair == self.config.trading_pair
             and position.side == TradeType.BUY
-            and position.amount > 0
+            and not self._held_position_is_dust(position)  # a sold-down bag's trail is finished
         }
         for key in list(self._recovery_trails.keys()):
             if key not in active_keys:
@@ -836,6 +1163,21 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             "rsi_rollover": rsi_rollover,
             "price_below_ema": price_below_ema,
         }
+
+    def _held_bag_recovery_sell_rsi_threshold(self) -> float:
+        return float(self.config.sell_rsi_overbought)
+
+    def _held_bag_recovery_is_overbought(self, current_rsi: Optional[float]) -> bool:
+        threshold = self._held_bag_recovery_sell_rsi_threshold()
+        return current_rsi is not None and current_rsi >= threshold
+
+    def _recovery_sell_chaser_config(self) -> Optional[LimitChaserConfig]:
+        if self.config.recovery_sell_execution_strategy != ExecutionStrategy.LIMIT_CHASER:
+            return None
+        return LimitChaserConfig(
+            distance=Decimal(str(self.config.recovery_limit_chaser_distance_pct)),
+            refresh_threshold=Decimal(str(self.config.recovery_limit_chaser_refresh_threshold_pct)),
+        )
 
     def _sell_trend_hold_active(
         self,
@@ -925,7 +1267,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             order_price = getattr(executor.config, "price", None)
             try:
                 order_price_decimal = Decimal(str(order_price)) if order_price is not None else None
-            except Exception:
+            except _DECIMAL_CONVERSION_ERRORS:
                 order_price_decimal = None
             if order_price_decimal is None or order_price_decimal <= 0:
                 continue
@@ -937,7 +1279,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                         keep_position=True,
                     )
                 )
-                self.logger().info(
+                self.logger().debug(
                     f"Cancel stale recovery sell | {self._controller_pair_log_prefix()} "
                     f"executor={executor.id} reason={hold_reason} "
                     f"order_price={order_price_decimal} current={current_price}"
@@ -963,7 +1305,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             order_price = getattr(executor_config, "price", None)
             try:
                 order_price_decimal = Decimal(str(order_price)) if order_price is not None else None
-            except Exception:
+            except _DECIMAL_CONVERSION_ERRORS:
                 order_price_decimal = None
             if order_price_decimal is None or order_price_decimal <= 0:
                 continue
@@ -988,7 +1330,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     keep_position=True,
                 )
             )
-            self.logger().info(
+            self.logger().debug(
                 f"Cancel stale signal sell | {self._controller_pair_log_prefix()} "
                 f"executor={executor.id} reason={cancel_reason} "
                 f"order_price={order_price_decimal} current={current_price}"
@@ -1004,10 +1346,39 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             and position.amount > 0
         ]
 
+    @staticmethod
+    def _decimal_or_none(value: object) -> Optional[Decimal]:
+        if value is None:
+            return None
+        try:
+            decimal_value = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return decimal_value if decimal_value.is_finite() else None
+
+    def _get_available_asset_balance(self, asset: Optional[str]) -> Optional[Decimal]:
+        if asset is None:
+            return None
+        try:
+            raw_available = self.market_data_provider.get_available_balance(self.config.connector_name, asset)
+            available = self._decimal_or_none(raw_available)
+            if available is not None or raw_available is None:
+                return available
+        except AttributeError:
+            pass
+        except _PROVIDER_ERRORS:
+            pass
+        try:
+            raw_balance = self.market_data_provider.get_balance(self.config.connector_name, asset)
+            return self._decimal_or_none(raw_balance)
+        except _PROVIDER_ERRORS:
+            return None
+
     def _aggregate_held_inventory(self, side: TradeType = TradeType.BUY) -> AggregatedInventoryState:
         positions = self._held_positions(side)
         total_amount = Decimal("0")
         weighted_cost_quote = Decimal("0")
+        cum_fees_quote = Decimal("0")
         complete_cost_basis = True
 
         for position in positions:
@@ -1026,6 +1397,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 complete_cost_basis = False
                 continue
             weighted_cost_quote += amount * breakeven
+            position_fees = self._decimal_or_none(getattr(position, "cum_fees_quote", Decimal("0")))
+            if position_fees is not None and position_fees > 0:
+                cum_fees_quote += position_fees
 
         cost_basis: Optional[Decimal] = None
         if total_amount > 0 and complete_cost_basis:
@@ -1036,32 +1410,120 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             total_amount=total_amount,
             bag_count=len(positions),
             cost_basis=cost_basis,
+            cum_fees_quote=cum_fees_quote,
         )
+
+    def _check_active_executor_drawdown_stop(
+        self,
+        current_price: Decimal,
+        existing_executor_ids: Optional[set] = None,
+    ) -> List[ExecutorAction]:
+        actions: List[ExecutorAction] = []
+        threshold = Decimal(str(self.config.early_stop_drawdown_pct))
+        if threshold <= 0 or current_price <= 0:
+            return actions
+
+        stopped_executor_ids = existing_executor_ids if existing_executor_ids is not None else set()
+        keep_position = self.config.early_stop_keep_position
+        for side in (TradeType.BUY, TradeType.SELL):
+            for executor in self._filter_same_side(side, active_only=True):
+                executor_id = getattr(executor, "id", None)
+                if executor_id is None or executor_id in stopped_executor_ids:
+                    continue
+                ref_price = self._executor_ref_price(executor)
+                if ref_price is None or ref_price <= 0:
+                    continue
+                pnl_pct = (
+                    (current_price - ref_price) / ref_price
+                    if side == TradeType.BUY
+                    else (ref_price - current_price) / ref_price
+                )
+                if pnl_pct > -threshold:
+                    continue
+
+                actions.append(
+                    StopExecutorAction(
+                        executor_id=executor_id,
+                        controller_id=self.config.id,
+                        keep_position=keep_position,
+                    )
+                )
+                stopped_executor_ids.add(executor_id)
+                self.logger().warning(
+                    f"Early stop | {self._controller_pair_log_prefix()} executor={executor_id} "
+                    f"side={'BUY' if side == TradeType.BUY else 'SELL'} "
+                    f"ref={ref_price} current={current_price} pnl={pnl_pct} keep={keep_position}"
+                )
+        return actions
 
     def _get_base_balance(self) -> Optional[Decimal]:
         base_asset, _ = self._base_quote_assets()
-        if base_asset is None:
-            return None
-        try:
-            balance = self.market_data_provider.get_balance(self.config.connector_name, base_asset)
-            return Decimal(str(balance)) if balance is not None else None
-        except Exception:
-            return None
+        return self._get_available_asset_balance(base_asset)
 
     def _get_sellable_inventory_amount(self) -> Decimal:
         inventory = self._aggregate_held_inventory(TradeType.BUY)
         if inventory.total_amount <= 0:
             return Decimal("0")
         base_balance = self._get_base_balance()
-        if base_balance is not None and base_balance > 0:
+        if base_balance is not None:
             return min(inventory.total_amount, base_balance)
-        return inventory.total_amount
+        return Decimal("0")
 
     def _position_amount(self, side: TradeType) -> Decimal:
         return self._aggregate_held_inventory(side).total_amount
 
     def _get_position_cost_basis(self) -> Optional[Decimal]:
         return self._aggregate_held_inventory(TradeType.BUY).cost_basis
+
+    def _inventory_balance_shortfall_amount(
+        self,
+        inventory: Optional[AggregatedInventoryState] = None,
+    ) -> Optional[Decimal]:
+        inventory_state = inventory if inventory is not None else self._aggregate_held_inventory(TradeType.BUY)
+        if inventory_state.total_amount <= 0:
+            return Decimal("0")
+        base_balance = self._get_base_balance()
+        if base_balance is None:
+            return None
+        return max(inventory_state.total_amount - base_balance, Decimal("0"))
+
+    def _inventory_balance_shortfall_value(
+        self,
+        current_price: Optional[Decimal],
+        inventory: Optional[AggregatedInventoryState] = None,
+    ) -> Optional[Decimal]:
+        if current_price is None or current_price <= 0:
+            return None
+        shortfall_amount = self._inventory_balance_shortfall_amount(inventory)
+        if shortfall_amount is None:
+            return None
+        return shortfall_amount * current_price
+
+    def _inventory_net_pnl_pct(self, current_price: Optional[Decimal]) -> Optional[Decimal]:
+        if current_price is None or current_price <= 0:
+            return None
+        inventory = self._aggregate_held_inventory(TradeType.BUY)
+        if inventory.total_amount <= 0 or inventory.cost_basis is None or inventory.cost_basis <= 0:
+            return None
+        cost_quote = inventory.total_amount * inventory.cost_basis
+        if cost_quote <= 0:
+            return None
+        gross_pnl_quote = (current_price - inventory.cost_basis) * inventory.total_amount
+        return (gross_pnl_quote - inventory.cum_fees_quote) / cost_quote
+
+    def _position_net_pnl_pct(self, position: object, current_price: Decimal) -> Optional[Decimal]:
+        if current_price <= 0:
+            return None
+        amount = self._decimal_or_none(getattr(position, "amount", None))
+        breakeven = self._decimal_or_none(getattr(position, "breakeven_price", None))
+        if amount is None or amount <= 0 or breakeven is None or breakeven <= 0:
+            return None
+        cost_quote = amount * breakeven
+        if cost_quote <= 0:
+            return None
+        fees_quote = self._decimal_or_none(getattr(position, "cum_fees_quote", Decimal("0"))) or Decimal("0")
+        gross_pnl_quote = (current_price - breakeven) * amount
+        return (gross_pnl_quote - fees_quote) / cost_quote
 
     def _base_quote_assets(self) -> Tuple[Optional[str], Optional[str]]:
         parts = self.config.trading_pair.split("-")
@@ -1073,7 +1535,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return f"controller={self.config.id} pair={self.config.trading_pair}"
 
     def _held_bag_count(self, side: TradeType = TradeType.BUY) -> int:
-        return self._aggregate_held_inventory(side).bag_count
+        return sum(1 for position in self._held_positions(side) if not self._held_position_is_dust(position))
 
     def _position_log_context(self) -> str:
         mid_price = self._get_mid_price()
@@ -1165,7 +1627,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                         f"reason={normalized_reason} {self._position_log_context()}"
                     ),
                 )
-        except Exception:
+        except _STATUS_FORMAT_ERRORS:
             pass
 
     @staticmethod
@@ -1201,11 +1663,17 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             return "n/a"
         return "yes" if value else "no"
 
-    def _log_signal_transition(self, key: str, signature: str, message: str):
+    def _log_signal_transition(self, key: str, signature: str, message: str, *, level: int = logging.DEBUG):
         previous_signature = self._last_signal_log_signature.get(key)
         if previous_signature != signature:
             self._last_signal_log_signature[key] = signature
-            self.logger().info(message)
+            logger = self.logger()
+            if level >= logging.WARNING:
+                logger.warning(message)
+            elif level >= logging.INFO:
+                logger.info(message)
+            else:
+                logger.debug(message)
 
     @staticmethod
     def _summary_signal_label(signal: int) -> str:
@@ -1244,6 +1712,19 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return f"{numeric:.{precision}f}".rstrip("0").rstrip(".")
 
     @staticmethod
+    def _summary_timestamp_label(value: Optional[object]) -> str:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return "n/a"
+        if numeric != numeric or numeric in (float("inf"), float("-inf")):
+            return "n/a"
+        try:
+            return datetime.fromtimestamp(numeric, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (OSError, OverflowError, ValueError):
+            return "n/a"
+
+    @staticmethod
     def _short_regime_label(regime_label: Optional[str]) -> str:
         if not regime_label:
             return "detecting"
@@ -1275,7 +1756,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         state = processed.get("signal_state", {})
         current_signal = processed.get("signal", 0)
         regime_label = processed.get("regime")
-        cost_basis = indicators.get("cost_basis")
+        cost_basis = self._decimal_or_none(indicators.get("cost_basis"))
+        if cost_basis is None:
+            cost_basis = self._get_position_cost_basis()
         buy_role = str(state.get("buy_entry_role", "none") or "none")
 
         mid_price = self._get_mid_price()
@@ -1294,9 +1777,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         unrealized_pnl_pct: Optional[Decimal] = None
         profit_headroom_pct: Optional[Decimal] = None
-        if cost_basis is not None and mid_price is not None and Decimal(str(cost_basis)) > 0:
-            basis = Decimal(str(cost_basis))
-            unrealized_pnl_pct = (mid_price - basis) / basis
+        if cost_basis is not None and mid_price is not None and cost_basis > 0:
+            unrealized_pnl_pct = (mid_price - cost_basis) / cost_basis
             profit_headroom_pct = unrealized_pnl_pct - self.config.min_profit_pct_for_sell
 
         now_ts = self.market_data_provider.time() if self.market_data_provider else 0.0
@@ -1344,7 +1826,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         elif current_signal < 0 and sell_gate != "ready":
             note = f"sell blocked {sell_gate}"
         elif pos_usd > 0 and profit_headroom_pct is not None:
-            note = f"headroom {self._summary_pct(profit_headroom_pct)}"
+            if profit_headroom_pct < 0:
+                note = f"sell gap {self._summary_pct(abs(profit_headroom_pct))}"
+            else:
+                note = f"sell buffer {self._summary_pct(profit_headroom_pct)}"
         elif len(held_bags) > 0:
             note = f"held bags {len(held_bags)}"
         elif current_signal != 0:
@@ -1374,23 +1859,242 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             f"${float(pos_usd):.0f}/${float(self.config.max_total_position_usd):.0f} ({util:.0%})"
         )
 
+        rsi_value = indicators.get("rsi")
+        rsi_buy_threshold = float(self.config.rsi_buy_threshold)
+        rsi_sell_threshold = float(self.config.sell_rsi_overbought)
+        has_inventory = pos_usd > 0 or len(held_bags) > 0
+
+        recovery_target_pct = Decimal(str(self.config.bag_recovery_target_pct))
+        if self.config.sell_only_if_profitable:
+            recovery_target_pct = max(
+                recovery_target_pct, Decimal(str(self.config.min_profit_pct_for_sell))
+            )
+
+        rsi_proximity_label, rsi_text = self._rsi_proximity_label(
+            rsi_value=rsi_value,
+            rsi_sell_threshold=rsi_sell_threshold,
+            rsi_buy_threshold=rsi_buy_threshold,
+            has_inventory=has_inventory,
+        )
+        buy_gauge = self._buy_gauge_label(rsi_value, rsi_buy_threshold)
+        sell_gauge = self._sell_gauge_label(
+            unrealized_pnl_pct=unrealized_pnl_pct,
+            target_pct=recovery_target_pct,
+            has_inventory=has_inventory,
+        )
+        gates_mask = self._gates_mask_label(
+            has_inventory=has_inventory,
+            rsi_value=rsi_value,
+            rsi_sell_threshold=rsi_sell_threshold,
+            unrealized_pnl_pct=unrealized_pnl_pct,
+            recovery_target_pct=recovery_target_pct,
+            sell_reversal_confirmed=bool(state.get("sell_reversal_confirmed")),
+            buy_gate=buy_gate,
+        )
+
+        plan_fields = self._compute_plan_fields()
+
         return {
             "pair": self.config.trading_pair,
             "price": self._summary_price(mid_price),
+            "timestamp": self._summary_timestamp_label(processed.get("timestamp") or processed.get("candle_timestamp")),
             "controller_id": self.config.id,
             "state": state_label,
             "signal": self._summary_signal_label(current_signal),
             "score": f"{state.get('signal_score', 0)}/{self.config.min_signal_score}",
             "regime": self._short_regime_label(regime_label),
             "trend": self._processed_trend_confirmation().get("direction", "unavailable"),
-            "avg_buy": self._summary_price(Decimal(str(cost_basis)) if cost_basis is not None else None),
+            "avg_buy": self._summary_price(cost_basis),
             "exposure": exposure_text,
             "execs": f"B{len(active_buys)} S{len(active_sells)} H{len(held_bags)}",
             "u_pnl": self._summary_pct(unrealized_pnl_pct),
             "u_pnl_pct": self._summary_pct(unrealized_pnl_pct),
+            "rsi": rsi_text,
+            "rsi_proximity": rsi_proximity_label,
+            "buy_gauge": buy_gauge,
+            "sell_gauge": sell_gauge,
+            "gates_mask": gates_mask,
             "gate": relevant_gate,
             "note": note,
+            "focus": note,
             "attention_score": attention_score,
+            **plan_fields,
+        }
+
+    def _compute_plan_fields(self) -> Dict[str, str]:
+        """Build the structured ``plan_*`` fields consumed by the parent ``PLANS`` summary table.
+
+        The parent strategy renders one row per controller. Cells adapt per ``plan_mode``:
+
+        - ``EXITS``   → ``target`` recovery %, ``anchor`` = min-profit price + price gap,
+          ``next`` = recovery arm price + price gap.
+        - ``TRAIL``   → ``anchor`` = peak price, ``next`` = pullback % + partial-done flag.
+        - ``ENTRIES`` → ``target`` = ``rsi≤<buy_threshold>``, ``anchor`` = scout slice,
+          ``next`` = runner slice.
+
+        ``sellable`` / ``held`` / ``active`` / ``free`` / ``managed`` feed the
+        compact inventory reconciliation table rendered next to the action plan.
+        """
+        if not self.config:
+            return {
+                "plan_mode": "—",
+                "plan_target": "—",
+                "plan_anchor": "—",
+                "plan_next": "—",
+                "plan_slice": "—",
+                "plan_liquidity": "—",
+                "plan_sellable": "—",
+                "plan_held": "—",
+                "plan_active": "—",
+                "plan_untracked": "—",
+                "plan_free": "—",
+                "plan_managed": "—",
+            }
+
+        processed = self.processed_data or {}
+        thresholds = processed.get("thresholds", {})
+        rsi_buy = float(thresholds.get("rsi_buy", self.config.rsi_buy_threshold))
+        mid_price = self._get_mid_price()
+        inventory = self._aggregate_held_inventory(TradeType.BUY)
+        has_inventory = inventory.total_amount > 0
+        recovery_target_pct = Decimal(str(self.config.bag_recovery_target_pct))
+        if self.config.sell_only_if_profitable:
+            recovery_target_pct = max(
+                recovery_target_pct, Decimal(str(self.config.min_profit_pct_for_sell))
+            )
+
+        base_asset, _ = self._base_quote_assets()
+        base_suffix = f" {base_asset}" if base_asset else ""
+        idle_compact = self._idle_wallet_label(mid_price).replace("idle wallet ", "idle ", 1)
+
+        if not has_inventory:
+            try:
+                usd_per_entry = Decimal(str(getattr(self.config, "usd_per_entry", Decimal("0")) or Decimal("0")))
+            except (InvalidOperation, TypeError, ValueError):
+                usd_per_entry = Decimal("0")
+            try:
+                scout_fraction = Decimal(str(getattr(self.config, "scout_entry_fraction", Decimal("0")) or Decimal("0")))
+            except (InvalidOperation, TypeError, ValueError):
+                scout_fraction = Decimal("0")
+            scout_fraction = max(Decimal("0"), min(Decimal("1"), scout_fraction))
+            runner_fraction = max(Decimal("0"), Decimal("1") - scout_fraction)
+            scout_quote = usd_per_entry * scout_fraction if usd_per_entry > 0 else None
+            runner_quote = usd_per_entry * runner_fraction if usd_per_entry > 0 else None
+            held_value, active_value, untracked_value = self._inventory_reconciliation_values(mid_price)
+            managed_value = (held_value or Decimal("0")) + active_value
+
+            plan_anchor = (
+                f"scout {self._status_money_label(scout_quote)} ({float(scout_fraction) * 100:.0f}%)"
+                if scout_quote is not None
+                else "scout —"
+            )
+            plan_next = (
+                f"runner {self._status_money_label(runner_quote)} ({float(runner_fraction) * 100:.0f}%)"
+                if runner_quote is not None
+                else "runner —"
+            )
+            return {
+                "plan_mode": "ENTRIES",
+                "plan_target": f"rsi≤{rsi_buy:.2f}",
+                "plan_anchor": plan_anchor,
+                "plan_next": plan_next,
+                "plan_slice": "—",
+                "plan_liquidity": idle_compact,
+                "plan_sellable": "—",
+                "plan_held": self._status_compact_money_label(held_value),
+                "plan_active": self._status_compact_money_label(active_value),
+                "plan_untracked": self._status_compact_money_label(untracked_value),
+                "plan_free": self._status_compact_money_label(untracked_value),
+                "plan_managed": self._status_compact_money_label(managed_value),
+            }
+
+        breakeven = inventory.cost_basis
+        min_sell_price: Optional[Decimal] = None
+        recovery_arm_price: Optional[Decimal] = None
+        if breakeven is not None and breakeven > 0:
+            min_sell_price = breakeven * (Decimal("1") + Decimal(str(self.config.min_profit_pct_for_sell)))
+            recovery_arm_price = breakeven * (Decimal("1") + recovery_target_pct)
+
+        next_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
+        next_amount = inventory.total_amount * next_fraction if inventory.total_amount > 0 else Decimal("0")
+        next_quote = next_amount * recovery_arm_price if recovery_arm_price is not None else None
+
+        sellable_amount = self._get_sellable_inventory_amount()
+        held_amount = inventory.total_amount
+        if held_amount > 0 and sellable_amount < held_amount:
+            sellable_label = f"{sellable_amount:.4f}/{held_amount:.4f}{base_suffix}"
+        else:
+            sellable_label = f"{held_amount:.4f}{base_suffix}"
+        held_value, active_value, untracked_value = self._inventory_reconciliation_values(mid_price)
+        managed_value = (held_value or Decimal("0")) + active_value
+        plan_liquidity = f"sell {sellable_label} · {self._inventory_reconciliation_label(mid_price)}"
+
+        plan_slice = (
+            f"{float(next_fraction) * 100:.0f}% ≈ {next_amount:.4f}{base_suffix} "
+            f"({self._status_money_label(next_quote)})"
+        )
+        plan_target = self._status_pct_label(recovery_target_pct)
+
+        trail_snapshots = self._status_recovery_trails()
+        if trail_snapshots:
+            top_trail = max(
+                trail_snapshots,
+                key=lambda trail: float(trail.get("armed_timestamp") or 0.0),
+            )
+            peak_price = top_trail.get("peak_price")
+            peak_decimal: Optional[Decimal]
+            pullback_pct: Optional[Decimal]
+            try:
+                peak_decimal = Decimal(str(peak_price)) if peak_price is not None else None
+                if mid_price is not None and peak_decimal is not None and peak_decimal > 0:
+                    pullback_pct = max((peak_decimal - mid_price) / peak_decimal, Decimal("0"))
+                else:
+                    pullback_pct = None
+            except (InvalidOperation, TypeError, ValueError):
+                peak_decimal = None
+                pullback_pct = None
+
+            partial_done = bool(top_trail.get("partial_exit_done"))
+            partial_label = "partial-done" if partial_done else "full-stack"
+            pullback_text = (
+                f"pullback {self._status_pct_label(pullback_pct)}"
+                if pullback_pct is not None
+                else "pullback n/a"
+            )
+            return {
+                "plan_mode": "TRAIL",
+                "plan_target": plan_target,
+                "plan_anchor": f"peak {self._summary_price(peak_decimal)}",
+                "plan_next": f"{pullback_text} · {partial_label}",
+                "plan_slice": plan_slice,
+                "plan_liquidity": plan_liquidity,
+                "plan_sellable": sellable_label,
+                "plan_held": self._status_compact_money_label(held_value),
+                "plan_active": self._status_compact_money_label(active_value),
+                "plan_untracked": self._status_compact_money_label(untracked_value),
+                "plan_free": self._status_compact_money_label(untracked_value),
+                "plan_managed": self._status_compact_money_label(managed_value),
+            }
+
+        return {
+            "plan_mode": "EXITS",
+            "plan_target": plan_target,
+            "plan_anchor": (
+                f"min {self._summary_price(min_sell_price)} "
+                f"({self._status_price_gap_label(min_sell_price, mid_price)})"
+            ),
+            "plan_next": (
+                f"arm {self._summary_price(recovery_arm_price)} "
+                f"({self._status_price_gap_label(recovery_arm_price, mid_price)})"
+            ),
+            "plan_slice": plan_slice,
+            "plan_liquidity": plan_liquidity,
+            "plan_sellable": sellable_label,
+            "plan_held": self._status_compact_money_label(held_value),
+            "plan_active": self._status_compact_money_label(active_value),
+            "plan_untracked": self._status_compact_money_label(untracked_value),
+            "plan_free": self._status_compact_money_label(untracked_value),
+            "plan_managed": self._status_compact_money_label(managed_value),
         }
 
     @staticmethod
@@ -1416,6 +2120,125 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         progress = cls._clamp_progress(progress)
         filled = max(0, min(width, int(round(progress * width))))
         return f"{'█' * filled}{'░' * (width - filled)}"
+
+    @classmethod
+    def _gauge_summary(
+        cls,
+        progress: Optional[float],
+        *,
+        width: int = 10,
+        idle_label: str = "—",
+        ready_label: str = "FIRE",
+    ) -> str:
+        """Compact ASCII gauge: ``██░░░░░░░░ 24%``, ``░░░░░░░░░░ —``, or ready label."""
+        if progress is None:
+            return f"{'░' * width} {idle_label:>4}"
+        clamped = cls._clamp_progress(progress)
+        bar = cls._progress_gauge(clamped, width)
+        if clamped >= 1.0:
+            return f"{bar} {ready_label:>4}"
+        return f"{bar} {int(round(clamped * 100)):>3}%"
+
+    @staticmethod
+    def _rsi_proximity_label(
+        *,
+        rsi_value: Optional[object],
+        rsi_sell_threshold: float,
+        rsi_buy_threshold: float,
+        has_inventory: bool,
+    ) -> Tuple[str, str]:
+        """Return ``("42.5/79.7", "42.46")`` for the CONTROLLERS SUMMARY ``rsi`` column."""
+        try:
+            numeric = float(rsi_value) if rsi_value is not None else None
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is None:
+            return ("n/a", "n/a")
+        target = rsi_sell_threshold if has_inventory else rsi_buy_threshold
+        return (f"{numeric:.1f}/{target:.1f}", f"{numeric:.2f}")
+
+    @classmethod
+    def _buy_gauge_label(
+        cls,
+        rsi_value: Optional[object],
+        rsi_buy_threshold: float,
+    ) -> str:
+        """Progress toward the buy trigger.
+
+        ``progress = clamp((50 - rsi) / (50 - rsi_buy_threshold), 0, 1)`` so the gauge
+        only fills as RSI crosses below the neutral midline. Above 50 the bar is empty.
+        """
+        try:
+            numeric = float(rsi_value) if rsi_value is not None else None
+        except (TypeError, ValueError):
+            numeric = None
+        if numeric is None:
+            return cls._gauge_summary(None)
+        denom = 50.0 - float(rsi_buy_threshold)
+        if denom <= 0:
+            progress = 1.0 if numeric <= float(rsi_buy_threshold) else 0.0
+        else:
+            progress = (50.0 - numeric) / denom
+        return cls._gauge_summary(progress, ready_label="BUY")
+
+    @classmethod
+    def _sell_gauge_label(
+        cls,
+        *,
+        unrealized_pnl_pct: Optional[Decimal],
+        target_pct: Decimal,
+        has_inventory: bool,
+    ) -> str:
+        """Progress toward the bag-recovery profit target. ``—`` when flat / no basis."""
+        if not has_inventory or unrealized_pnl_pct is None:
+            return cls._gauge_summary(None)
+        try:
+            target_value = float(target_pct)
+            if target_value <= 0:
+                return cls._gauge_summary(None)
+            progress = float(unrealized_pnl_pct) / target_value
+        except (InvalidOperation, TypeError, ValueError, ZeroDivisionError):
+            return cls._gauge_summary(None)
+        return cls._gauge_summary(max(0.0, progress), ready_label="SELL")
+
+    @classmethod
+    def _gates_mask_label(
+        cls,
+        *,
+        has_inventory: bool,
+        rsi_value: Optional[object],
+        rsi_sell_threshold: float,
+        unrealized_pnl_pct: Optional[Decimal],
+        recovery_target_pct: Decimal,
+        sell_reversal_confirmed: bool,
+        buy_gate: Optional[str],
+    ) -> str:
+        """Compact gate truthtable for the CONTROLLERS SUMMARY ``gates`` column.
+
+        HOLDING → ``P{✓|✗} R{✓|✗} V{✓|✗} T{·|▲}`` for profit / RSI / reversal / trail.
+        FLAT    → ``buy:{compact_reason}`` (e.g. ``buy:ok``, ``buy:trd``, ``buy:ib-cd``).
+        """
+        if has_inventory:
+            try:
+                profit_ready = (
+                    unrealized_pnl_pct is not None
+                    and Decimal(str(unrealized_pnl_pct)) >= Decimal(str(recovery_target_pct))
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                profit_ready = False
+            try:
+                rsi_ready = rsi_value is not None and float(rsi_value) >= float(rsi_sell_threshold)
+            except (TypeError, ValueError):
+                rsi_ready = False
+            check = lambda flag: "✓" if flag else "✗"  # noqa: E731 - tiny inline closure
+            return (
+                f"P{check(profit_ready)}"
+                f" R{check(rsi_ready)}"
+                f" V{check(sell_reversal_confirmed)}"
+            )
+        compact = (buy_gate or "ready").lower()
+        compact = "ok" if compact == "ready" else compact
+        return f"buy:{compact}"
 
     @staticmethod
     def _lane_badge(side: str, progress: float, ready: bool) -> str:
@@ -1517,25 +2340,26 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         badge = self._lane_badge("buy", progress, ready)
         gauge = self._progress_gauge(progress)
+        headline = normalized_buy_reason if normalized_buy_reason != "ready" else buy_decision
         details: List[str] = [
             f"{badge} {gauge} {progress * 100:.0f}%",
-            f"{buy_decision}:{normalized_buy_reason}",
-            f"RSI {self._fmt(last_rsi, 2)}/{rsi_buy:.2f}",
-            f"score {signal_score}/{min_score} {self._flag_icon(signal_score >= min_score)}",
-            f"rev {self._flag_icon(raw_reversal)}",
+            f"🎯 {headline}",
+            f"📉 RSI {self._fmt(last_rsi, 2)}/{rsi_buy:.2f}",
         ]
         if need_parts and not ready:
-            details.append(f"need {', '.join(need_parts)}")
-        if buy_entry_role not in ("", "none"):
-            details.append(f"{buy_entry_role} {buy_entry_fraction * 100:.0f}%")
-        details.append(f"ctx {buy_context_bias}")
-        details.append(f"parts p{self._flag_icon(raw_prev_was_min)} u{self._flag_icon(raw_turning_up)} o{self._flag_icon(raw_was_oversold)} l{self._flag_icon(raw_near_bottom)}")
-        details.append(f"score r{self._flag_icon(score_rsi_oversold)} b{self._flag_icon(score_bb_touch)} m{self._flag_icon(score_macd_turn)} mr{self._flag_icon(score_mean_reversion)}")
-        if buy_confirmation_active:
+            details.append(f"⏳ {', '.join(need_parts)}")
+        elif signal_score < min_score:
+            details.append(f"⏳ score {min_score - signal_score}")
+        if ready and buy_entry_role not in ("", "none"):
+            details.append(f"🧩 {buy_entry_role} {buy_entry_fraction * 100:.0f}%")
+        if ready and buy_context_bias not in ("", "neutral"):
+            details.append(f"🧭 {buy_context_bias}")
+        if buy_confirmation_active and not ready:
             details.append(
-                f"confirm {self._fmt(buy_confirmation_rebound_delta, 2)}/{self._fmt(buy_confirmation_rebound_target, 2)} {self._flag_icon(buy_confirmation_price_rebounded)}"
+                f"🔁 {self._fmt(buy_confirmation_rebound_delta, 2)}/{self._fmt(buy_confirmation_rebound_target, 2)} {self._flag_icon(buy_confirmation_price_rebounded)}"
             )
-        details.append(f"gate {gate}")
+        if gate != "ready":
+            details.append(f"🧱 {gate}")
         return self._status_row("BUY", *details)
 
     def _sell_signal_status_line(
@@ -1584,11 +2408,11 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         badge = self._lane_badge("sell", progress, current_signal < 0)
         gauge = self._progress_gauge(progress)
+        headline = normalized_sell_reason if normalized_sell_reason != "ready" else sell_decision
         details: List[str] = [
             f"{badge} {gauge} {progress * 100:.0f}%",
-            f"{sell_decision}:{normalized_sell_reason}",
-            f"RSI {self._fmt(last_rsi, 2)}/{rsi_sell:.2f}",
-            f"rev {self._flag_icon(sell_reversal_confirmed)}",
+            f"🎯 {headline}",
+            f"📈 RSI {self._fmt(last_rsi, 2)}/{rsi_sell:.2f}",
         ]
         rsi_gap = max(0.0, (rsi_sell - last_rsi)) if last_rsi is not None else None
         need_parts: List[str] = []
@@ -1597,25 +2421,21 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         if has_inventory:
             if pnl_pct is not None:
-                details.append(f"pnl {float(pnl_pct) * 100:+.2f}%/{float(profit_target) * 100:.2f}%")
+                details.append(f"💰 {float(pnl_pct) * 100:+.2f}%/{float(profit_target) * 100:.2f}%")
                 if self.config.sell_only_if_profitable and pnl_pct < profit_target:
                     need_parts.append(f"pnl {float(profit_target - pnl_pct) * 100:.2f}%")
             else:
-                details.append("pnl n/a")
+                details.append("💰 n/a")
         else:
-            details.append("inv flat")
+            details.append("📦 flat")
         if need_parts and current_signal >= 0:
-            details.append(f"need {', '.join(need_parts)}")
-        details.append(f"profit {self._flag_icon(sell_profitability_ok)}")
-        details.append(f"hold {self._flag_icon(sell_trend_hold)}")
-        details.append(f"roll {self._flag_icon(sell_rsi_rollover)}")
-        details.append(f"ema {self._flag_icon(sell_price_below_ema)}")
-        details.append(f"macd {self._flag_icon(sell_macd_rollover)}")
-        if self.config.sell_only_if_profitable:
-            details.append(f"min {float(profit_target) * 100:.2f}%")
-        details.append(f"mid {self._fmt(mid_price, 4)}")
-        details.append(f"cost {self._fmt(cost_basis, 4)}")
-        details.append(f"gate {gate}")
+            details.append(f"⏳ {', '.join(need_parts)}")
+        if sell_trend_hold:
+            details.append("🌿 trend-hold")
+        if sell_reversal_confirmed and current_signal >= 0:
+            details.append("✅ reversal-ready")
+        if gate != "ready":
+            details.append(f"🧱 {gate}")
         return self._status_row("SELL", *details)
 
     # -----------------------------------------------------------------------
@@ -1639,12 +2459,38 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return False
 
     def _track_executor_result(self, executor) -> None:
+        is_done = getattr(executor, "is_done", None)
+        is_final = (
+            is_done
+            if isinstance(is_done, bool)
+            else getattr(executor, "status", None) == RunnableStatus.TERMINATED
+        )
+        if not is_final:
+            return
+        executor_id = getattr(executor, "id", None)
+        if executor_id is None:
+            return
         if not hasattr(executor, "net_pnl_quote") or executor.net_pnl_quote is None:
             return
-        if executor.net_pnl_quote < 0:
+        try:
+            net_pnl_quote = Decimal(str(executor.net_pnl_quote))
+        except (InvalidOperation, TypeError, ValueError):
+            return
+        executor_id = str(executor_id)
+        if executor_id in self._final_executor_results:
+            if self._final_executor_results[executor_id] != net_pnl_quote:
+                self._executor_result_conflict_ids.add(executor_id)
+                self.logger().error(
+                    f"Conflicting final executor result | {self._controller_pair_log_prefix()} "
+                    f"executor={executor_id} previous={self._final_executor_results[executor_id]} "
+                    f"current={net_pnl_quote}"
+                )
+            return
+        self._final_executor_results[executor_id] = net_pnl_quote
+        if net_pnl_quote < Decimal("0"):
             self._consecutive_losses += 1
             self._last_loss_timestamp = self.market_data_provider.time()
-        else:
+        elif net_pnl_quote > Decimal("0"):
             self._consecutive_losses = 0
             self._last_loss_timestamp = None
 
@@ -1667,7 +2513,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             atr = tr.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
             last_val = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else None
             return atr, last_val
-        except Exception:
+        except _INDICATOR_ERRORS:
             return None, None
 
     # -----------------------------------------------------------------------
@@ -1728,7 +2574,11 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return gap
 
     def _has_sufficient_price_gap(self, side: TradeType, new_price: Optional[Decimal]) -> bool:
-        gap_thr = self._effective_price_gap()
+        gap_thr = (
+            Decimal(str(self.config.sell_executor_price_gap_threshold or Decimal("0")))
+            if side == TradeType.SELL
+            else self._effective_price_gap()
+        )
         if gap_thr <= 0:
             return True
         if new_price is None or new_price <= 0:
@@ -1739,21 +2589,55 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         pct_gap = abs(new_price - ref_price) / ref_price
         return pct_gap >= gap_thr
 
+    def _has_sufficient_avg_entry_gap_for_buy(self, new_price: Optional[Decimal]) -> bool:
+        if self._held_bag_count(TradeType.BUY) == 0:
+            return True  # only real bags impose entry spacing; dust is swept by the next sell
+        gap_thr = self._effective_price_gap()
+        if gap_thr <= 0:
+            return True
+        if new_price is None or new_price <= 0:
+            return False
+        avg_entry = self._get_position_cost_basis()
+        if avg_entry is None or avg_entry <= 0:
+            return True
+        pct_gap = abs(new_price - avg_entry) / avg_entry
+        return pct_gap >= gap_thr
+
     def _last_same_side_ref_price(self, side: TradeType) -> Optional[Decimal]:
-        active = self._filter_same_side(side, active_only=True)
-        if not active:
+        if side == TradeType.SELL:
+            candidates = self.filter_executors(
+                executors=self.executors_info,
+                filter_func=lambda ex: (
+                    ex.connector_name == self.config.connector_name
+                    and ex.trading_pair == self.config.trading_pair
+                    and ex.side == side
+                    and (ex.is_active or self._executor_has_fill(ex))
+                ),
+            )
+        else:
+            candidates = self._filter_same_side(side, active_only=True)
+        if not candidates:
             return None
-        latest = max(active, key=lambda x: x.timestamp)
+        latest = max(
+            candidates,
+            key=lambda x: float(getattr(x, "close_timestamp", None) or getattr(x, "timestamp", 0.0) or 0.0),
+        )
         return self._executor_ref_price(latest)
 
     def _executor_ref_price(self, executor_info) -> Optional[Decimal]:
         try:
+            config = getattr(executor_info, "config", None)
             ci = executor_info.custom_info or {}
-            for key in ("current_position_average_price", "entry_price", "order_price"):
-                val = ci.get(key)
-                if val is not None and float(val) > 0:
-                    return Decimal(str(val))
-        except Exception:
+            for candidate in (
+                getattr(config, "price", None),
+                getattr(config, "entry_price", None),
+                ci.get("order_price"),
+                ci.get("entry_price"),
+                ci.get("current_position_average_price"),
+            ):
+                if candidate is not None and float(candidate) > 0:
+                    return Decimal(str(candidate))
+        except _DECIMAL_ATTRIBUTE_ERRORS:
             pass
         return None
 
@@ -1763,14 +2647,14 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 self.config.connector_name,
                 self.config.trading_pair,
             )
-        except Exception:
+        except _PROVIDER_ERRORS:
             return None
         try:
             tick_size = getattr(rule, "min_price_increment", None)
             tick = Decimal(str(tick_size)) if tick_size is not None else None
             if tick is not None and tick > 0:
                 return tick
-        except Exception:
+        except _DECIMAL_CONVERSION_ERRORS:
             return None
         return None
 
@@ -1809,7 +2693,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 price_type,
             )
             ref_price = Decimal(str(ref_price_val)) if ref_price_val is not None else fallback_price
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             ref_price = fallback_price
 
         tick = self._get_min_price_increment()
@@ -1950,7 +2834,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 and pending_setup.trough_price > 0
                 and last_close > pending_setup.trough_price
             )
-            if signal_score < min_score:
+            if not pending_setup.score_qualified():
                 reason = "need-score"
             elif rebound_target > rebound_delta:
                 reason = "need-rebound"
@@ -2008,7 +2892,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         )
         trend_hold_active = False
 
-        if cost_basis is not None and mid_price is not None and cost_basis > 0:
+        net_pnl_pct = self._inventory_net_pnl_pct(mid_price)
+        if net_pnl_pct is not None:
+            pnl_pct = float(net_pnl_pct)
+        elif cost_basis is not None and mid_price is not None and cost_basis > 0:
             pnl_pct = float((mid_price - cost_basis) / cost_basis)
 
         if current_signal < 0:
@@ -2141,6 +3028,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 armed_timestamp=timestamp,
                 trough_rsi=last_rsi,
                 trough_price=last_close,
+                armed_signal_score=signal_score,
+                armed_min_signal_score=max(1, int(self.config.min_signal_score)),
             )
             armed = True
             return False, setup, armed
@@ -2148,6 +3037,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         if setup is None:
             return False, None, armed
 
+        if signal_score > setup.armed_signal_score:
+            setup.armed_signal_score = signal_score
+        if setup.armed_min_signal_score <= 0:
+            setup.armed_min_signal_score = max(1, int(self.config.min_signal_score))
         if last_rsi < setup.trough_rsi:
             setup.trough_rsi = last_rsi
         if last_close < setup.trough_price:
@@ -2155,7 +3048,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
         rsi_rebounded = last_rsi >= (setup.trough_rsi + self.config.buy_confirmation_rsi_delta)
         price_rebounded = last_close > setup.trough_price
-        confirmed = signal_score >= self.config.min_signal_score and rsi_rebounded and price_rebounded
+        confirmed = setup.score_qualified() and rsi_rebounded and price_rebounded
         if confirmed:
             return True, None, armed
 
@@ -2221,6 +3114,121 @@ class RSIv5Controller(DirectionalTradingControllerBase):
     # Signal pipeline
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _interval_to_seconds(interval: Optional[str]) -> Optional[float]:
+        if interval is None:
+            return None
+        text = str(interval).strip().lower()
+        if not text:
+            return None
+        unit = text[-1]
+        try:
+            value = float(text[:-1])
+        except ValueError:
+            return None
+        multipliers = {
+            "s": 1.0,
+            "m": 60.0,
+            "h": 3600.0,
+            "d": 86400.0,
+            "w": 604800.0,
+        }
+        multiplier = multipliers.get(unit)
+        if multiplier is None or value <= 0:
+            return None
+        return value * multiplier
+
+    @staticmethod
+    def _timestamp_to_seconds(timestamp: float) -> float:
+        return timestamp / 1000.0 if timestamp > 10_000_000_000 else timestamp
+
+    @staticmethod
+    def _finite_numeric_series(series: pd.Series) -> bool:
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.isna().any():
+            return False
+        return bool(numeric.map(lambda value: float("-inf") < float(value) < float("inf")).all())
+
+    @staticmethod
+    def _column_has_finite_latest_value(df: pd.DataFrame, column: str) -> bool:
+        series = df[column]
+        if not isinstance(series, pd.Series) or series.empty:
+            return False
+        numeric = pd.to_numeric(pd.Series([series.iloc[-1]]), errors="coerce").iloc[0]
+        return bool(pd.notna(numeric) and float("-inf") < float(numeric) < float("inf"))
+
+    def _resolve_bollinger_column(self, df: pd.DataFrame, band: str) -> Optional[str]:
+        historical_name = f"{band}_{self.config.bb_length}_{self.config.bb_std}"
+        exact_count = sum(column == historical_name for column in df.columns)
+        if exact_count > 1:
+            return None
+        if exact_count == 1 and self._column_has_finite_latest_value(df, historical_name):
+            return historical_name
+
+        logical_prefix = f"{historical_name}_"
+        candidates = [
+            column
+            for column in df.columns
+            if isinstance(column, str)
+            and column.startswith(logical_prefix)
+            and _PANDAS_TA_NUMERIC_SUFFIX.fullmatch(column[len(logical_prefix):]) is not None
+            and self._column_has_finite_latest_value(df, column)
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _build_data_health(self, df: pd.DataFrame, now_ts: float) -> Dict[str, object]:
+        health: Dict[str, object] = {
+            "ready": False,
+            "reason": "unknown",
+            "row_count": int(len(df)) if df is not None else 0,
+            "last_candle_ts": None,
+            "candle_age_seconds": None,
+            "interval_seconds": self._interval_to_seconds(self.config.interval),
+        }
+        if df is None or df.empty:
+            health["reason"] = "no_candles"
+            return health
+        if "timestamp" not in df.columns:
+            health["reason"] = "missing_timestamp"
+            return health
+
+        timestamps = pd.to_numeric(df["timestamp"], errors="coerce")
+        if timestamps.isna().any():
+            health["reason"] = "invalid_timestamp"
+            return health
+        normalized_ts = timestamps.map(lambda value: self._timestamp_to_seconds(float(value)))
+        if normalized_ts.duplicated().any():
+            health["reason"] = "duplicate_timestamp"
+            return health
+        if not normalized_ts.is_monotonic_increasing:
+            health["reason"] = "out_of_order_timestamp"
+            return health
+
+        last_ts = float(normalized_ts.iloc[-1])
+        health["last_candle_ts"] = last_ts
+        candle_age = float(now_ts) - last_ts
+        health["candle_age_seconds"] = candle_age
+        interval_seconds = health["interval_seconds"]
+        if interval_seconds is not None:
+            max_age = float(interval_seconds) * float(self.config.max_candle_age_intervals)
+            if candle_age > max_age:
+                health["reason"] = "stale_candle"
+                return health
+
+        required_cols = ("open", "high", "low", "close")
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            health["reason"] = f"missing_{missing_cols[0]}"
+            return health
+        for col in required_cols:
+            if not self._finite_numeric_series(df[col]):
+                health["reason"] = f"invalid_{col}"
+                return health
+
+        health["ready"] = True
+        health["reason"] = "ok"
+        return health
+
     async def update_processed_data(self):
         if not self.market_data_provider:
             self.logger().warning(
@@ -2238,15 +3246,54 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             max_records=self.max_records,
         )
         if df is None or df.empty:
-            self.processed_data = {"signal": 0, "features": pd.DataFrame()}
+            self.processed_data = {
+                "signal": 0,
+                "features": pd.DataFrame(),
+                "data_health": {
+                    "ready": False,
+                    "reason": "no_candles",
+                    "row_count": 0,
+                    "last_candle_ts": None,
+                    "candle_age_seconds": None,
+                    "interval_seconds": self._interval_to_seconds(self.config.interval),
+                },
+            }
             return
         df = df.copy()
         signal_series: Optional[pd.Series] = None
         last_candle_ts: Optional[float] = None
+        data_health = self._build_data_health(df, now_ts)
+        if data_health.get("last_candle_ts") is not None:
+            last_candle_ts = float(data_health["last_candle_ts"])
+        if not bool(data_health.get("ready")):
+            self._restore_buy_confirmation_after_veto(self._pending_buy_confirmation)
+            self.processed_data = {
+                "signal": 0,
+                "features": df,
+                "data_health": data_health,
+                "timestamp": now_ts,
+                "candle_timestamp": last_candle_ts,
+                "signal_state": {
+                    "condition_ok": False,
+                    "condition_reason": data_health.get("reason", "data_unhealthy"),
+                },
+            }
+            self._log_signal_transition(
+                key="data_health",
+                signature=f"{data_health.get('reason')}|{data_health.get('last_candle_ts')}",
+                message=(
+                    f"Data not ready | {self._controller_pair_log_prefix()} "
+                    f"reason={data_health.get('reason')} "
+                    f"last_candle_ts={data_health.get('last_candle_ts')} "
+                    f"age={self._fmt(data_health.get('candle_age_seconds'), 2)}s"
+                ),
+                level=logging.WARNING,
+            )
+            return
         try:
-            if "timestamp" in df.columns and pd.notna(df["timestamp"].iloc[-1]):
+            if last_candle_ts is None and "timestamp" in df.columns and pd.notna(df["timestamp"].iloc[-1]):
                 last_candle_ts = float(df["timestamp"].iloc[-1])
-        except Exception:
+        except _INDICATOR_ERRORS:
             last_candle_ts = None
 
         last_close: Optional[float] = None
@@ -2271,7 +3318,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 last_rsi = float(df[rsi_col].iloc[-1]) if pd.notna(df[rsi_col].iloc[-1]) else None
                 if len(df) > 1 and pd.notna(df[rsi_col].iloc[-2]):
                     rsi_prev = float(df[rsi_col].iloc[-2])
-        except Exception as e:
+        except _INDICATOR_ERRORS as e:
             self.logger().error(
                 f"RSI error | {self._controller_pair_log_prefix()} error={type(e).__name__}: {e}",
                 exc_info=True,
@@ -2286,7 +3333,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 last_atr = atr_value
                 if last_close and last_close > 0:
                     atr_pct = atr_value / last_close
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         # --- EMAs ---
@@ -2299,22 +3346,22 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 ema_fast = float(df[ema_fast_col].iloc[-1])
             if ema_slow_col in df.columns and pd.notna(df[ema_slow_col].iloc[-1]):
                 ema_slow = float(df[ema_slow_col].iloc[-1])
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         # --- Bollinger Bands ---
         try:
             df.ta.bbands(length=self.config.bb_length, std=self.config.bb_std, append=True)
-            bbl_col = f"BBL_{self.config.bb_length}_{self.config.bb_std}"
-            bbu_col = f"BBU_{self.config.bb_length}_{self.config.bb_std}"
-            bbm_col = f"BBM_{self.config.bb_length}_{self.config.bb_std}"
-            if bbl_col in df.columns and pd.notna(df[bbl_col].iloc[-1]):
+            bbl_col = self._resolve_bollinger_column(df, "BBL")
+            bbu_col = self._resolve_bollinger_column(df, "BBU")
+            bbm_col = self._resolve_bollinger_column(df, "BBM")
+            if bbl_col is not None:
                 bb_lower = float(df[bbl_col].iloc[-1])
-            if bbu_col in df.columns and pd.notna(df[bbu_col].iloc[-1]):
+            if bbu_col is not None:
                 bb_upper = float(df[bbu_col].iloc[-1])
-            if bbm_col in df.columns and pd.notna(df[bbm_col].iloc[-1]):
+            if bbm_col is not None:
                 bb_mid = float(df[bbm_col].iloc[-1])
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         # --- MACD ---
@@ -2325,7 +3372,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 macd_hist = float(df[hist_col].iloc[-1])
                 if len(df) > 1 and pd.notna(df[hist_col].iloc[-2]):
                     macd_hist_prev = float(df[hist_col].iloc[-2])
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
 
         self._latest_atr_pct = atr_pct
@@ -2364,9 +3411,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     f"Regime unavailable | {self._controller_pair_log_prefix()} "
                     f"reason={regime_error}"
                 ),
+                level=logging.WARNING,
             )
             regime = None
-        except Exception as e:
+        except _INDICATOR_ERRORS as e:
             regime_error = f"{type(e).__name__}: {e}"
             self._log_signal_transition(
                 key="regime_error",
@@ -2375,6 +3423,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     f"Regime detection error | {self._controller_pair_log_prefix()} "
                     f"reason={regime_error}"
                 ),
+                level=logging.WARNING,
             )
             regime = None
 
@@ -2396,12 +3445,12 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         mean_reversion_score: float = 0.0
         try:
             volume_ratio = calculate_volume_ratio(df)
-        except Exception:
+        except _INDICATOR_ERRORS:
             pass
         if last_rsi is not None:
             try:
                 mean_reversion_score = calculate_rsi_mean_reversion_score(last_rsi)
-            except Exception:
+            except (TypeError, ValueError, ArithmeticError):
                 pass
 
         # --- BUY reversal detection ---
@@ -2427,7 +3476,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     "was_oversold": bool(raw_reversal_series["was_oversold"].iloc[-1]),
                     "near_bottom": bool(raw_reversal_series["near_bottom"].iloc[-1]),
                 }
-        except Exception:
+        except _INDICATOR_ERRORS:
             raw_buy_reversal = False
 
         # --- Signal scoring (RSI is mandatory gate) ---
@@ -2591,7 +3640,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 signal_series = signal_frame["signal"]
                 df["signal_state"] = signal_frame["signal_state"]
             df["signal"] = signal_series
-        except Exception:
+        except _INDICATOR_ERRORS:
             if "signal" not in df.columns:
                 df["signal"] = 0
 
@@ -2609,6 +3658,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             "regime_error": regime_error,
             "trend_confirmation": self._trend_confirmation_dict(trend_confirmation),
             "timestamp": now_ts,
+            "candle_timestamp": last_candle_ts,
+            "data_health": data_health,
             "thresholds": {
                 "rsi_buy": rsi_buy_eff, "rsi_sell": rsi_sell_eff,
                 "cooldown": effective_cooldown,
@@ -2739,10 +3790,10 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         rsi_oversold_now = rsi <= buy_thr
         score = score + rsi_oversold_now.astype(int)
 
-        bbl_col = f"BBL_{self.config.bb_length}_{self.config.bb_std}"
-        if bbl_col in df.columns:
+        bbl_col = self._resolve_bollinger_column(df, "BBL")
+        if bbl_col is not None:
             bbl = pd.to_numeric(df[bbl_col], errors="coerce")
-            score = score + (close <= bbl).astype(int)
+            score = score + (rsi_oversold_now & (close <= bbl)).astype(int)
 
         hist_col = f"MACDh_{self.config.macd_fast}_{self.config.macd_slow}_{self.config.macd_signal}"
         ema_fast_col = f"EMA_{self.config.ema_fast_length}"
@@ -2752,7 +3803,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             macd_h = pd.to_numeric(df[hist_col], errors="coerce")
             macd_h_prev = macd_h.shift(1)
             macd_turn = ((macd_h > macd_h_prev) & ((macd_h > 0) | (macd_h_prev < 0))).fillna(False)
-            score = score + macd_turn.astype(int)
+            score = score + (rsi_oversold_now & macd_turn).astype(int)
 
         mean_reversion_score = rsi.apply(calculate_rsi_mean_reversion_score)
         score = score + (rsi_oversold_now & (mean_reversion_score >= 0.5)).astype(int)
@@ -2762,7 +3813,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             atr_series, _ = self._compute_atr_series(df.copy(), self.config.atr_length)
             if atr_series is not None:
                 atr_pct = pd.to_numeric(atr_series, errors="coerce") / close.replace(0, pd.NA)
-        except Exception:
+        except _INDICATOR_ERRORS:
             atr_pct = pd.Series(index=df.index, dtype=float)
 
         condition_ok = pd.Series(True, index=df.index, dtype=bool)
@@ -2955,7 +4006,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             pending_setup=self._pending_buy_confirmation,
         )
         if setup_armed and next_setup is not None:
-            self.logger().info(
+            self.logger().debug(
                 f"BUY setup armed | {self._controller_pair_log_prefix()} "
                 f"mode={self.config.buy_confirmation_mode} rsi={last_rsi:.2f} score={signal_score} "
                 f"trough_rsi={next_setup.trough_rsi:.2f} wait={self.config.buy_confirmation_max_wait_seconds}s"
@@ -3179,6 +4230,18 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         buy_entry_role = str(state.get("buy_entry_role", "none") or "none")
         runner_entry = signal > 0 and buy_entry_role == "runner"
 
+        if self._executor_result_conflict_ids:
+            self._record_gate_reason(target_side, "executor_result_conflict")
+            return False
+
+        if getattr(self.config, "manual_kill_switch", False):
+            self._record_gate_reason(target_side, "manual_kill_switch")
+            return False
+
+        if signal > 0 and self._operator_entry_paused:
+            self._record_gate_reason(target_side, "operator_pause")
+            return False
+
         # Consecutive loss pause
         if signal > 0 and self._check_consecutive_loss_pause():
             self._record_gate_reason(target_side, "consecutive_loss_pause")
@@ -3217,7 +4280,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 self.config.connector_name, self.config.trading_pair, PriceType.MidPrice,
             )
             new_price = Decimal(str(mp_val)) if mp_val is not None else None
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             new_price = None
         if new_price is None or new_price <= 0:
             self._record_gate_reason(target_side, "price_unavailable")
@@ -3228,10 +4291,23 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             if should_hold:
                 self._record_gate_reason(target_side, "trend_hold")
                 return False
+            if self._held_bag_count() > 0:
+                self._record_gate_reason(target_side, "held_bag_recovery")
+                return False
+            sell_price = self._shade_limit_maker_price(
+                trade_type=TradeType.SELL,
+                fallback_price=new_price,
+            )
+            if not self._has_sufficient_price_gap(target_side, sell_price):
+                self._record_gate_reason(target_side, "price_gap")
+                return False
 
         # Max total position
         if signal > 0:
-            _, entry_usd, _, _, _ = self._resolve_buy_entry_plan(new_price, state)
+            _, entry_usd, entry_price, _, _ = self._resolve_buy_entry_plan(new_price, state)
+            if not self._has_sufficient_avg_entry_gap_for_buy(entry_price):
+                self._record_gate_reason(target_side, "avg_entry_gap")
+                return False
             current_pos = self._get_total_position_value_usd()
             if current_pos + entry_usd > self.config.max_total_position_usd:
                 self._record_gate_reason(target_side, "max_position")
@@ -3272,33 +4348,24 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             self._record_gate_reason(target_side, "price_gap")
             return False
 
-        # Balance check for BUY (skipped when balance is 0 → backtesting mode)
+        # Balance check for BUY
         if signal > 0:
             _, quote = self._base_quote_assets()
             if quote is not None:
-                try:
-                    balance = self.market_data_provider.get_balance(self.config.connector_name, quote)
-                    if balance is not None and balance > 0:
-                        _, entry_usd_check, _, _, _ = self._resolve_buy_entry_plan(new_price, state)
-                        if Decimal(str(balance)) < entry_usd_check:
-                            self._record_gate_reason(target_side, "balance_low")
-                            return False
-                except Exception:
-                    pass
+                balance = self._get_available_asset_balance(quote)
+                _, entry_usd_check, _, _, _ = self._resolve_buy_entry_plan(new_price, state)
+                if balance is None or balance <= Decimal("0") or balance < entry_usd_check:
+                    self._record_gate_reason(target_side, "balance_low")
+                    return False
 
-        # Balance check for SELL (skipped when balance is 0 → backtesting mode)
+        # Balance check for SELL
         if signal < 0:
             base, _ = self._base_quote_assets()
             if base is not None:
-                try:
-                    sellable_amount = self._get_sellable_inventory_amount()
-                    if sellable_amount <= Decimal("0"):
-                        balance = self.market_data_provider.get_balance(self.config.connector_name, base)
-                        if balance is not None and Decimal(str(balance)) <= Decimal("0"):
-                            self._record_gate_reason(target_side, "base_balance_low")
-                            return False
-                except Exception:
-                    pass
+                sellable_amount = self._get_sellable_inventory_amount()
+                if sellable_amount <= Decimal("0"):
+                    self._record_gate_reason(target_side, "base_balance_low")
+                    return False
 
         self._record_gate_reason(target_side, "ready")
         return True
@@ -3322,7 +4389,19 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 fallback_price=price,
             )
             position_amount = self._get_sellable_inventory_amount()
-            sell_amount = (position_amount if position_amount > 0 else entry_amount_base).quantize(min_step)
+            target_amount = position_amount
+            slice_multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
+            if slice_multiplier > 0 and ref_price > 0:
+                target_quote = self.config.usd_per_entry * slice_multiplier
+                target_amount = min(position_amount, target_quote / ref_price)
+            sell_amount = self._resolve_recovery_sell_amount(
+                position_amount=position_amount,
+                target_amount=target_amount,
+                price=ref_price,
+                available_base=position_amount,
+            )
+            if sell_amount <= 0 and position_amount > 0:
+                sell_amount = position_amount.quantize(min_step)
             return OrderExecutorConfig(
                 timestamp=self.market_data_provider.time(),
                 connector_name=self.config.connector_name,
@@ -3339,7 +4418,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         # BUY: PositionExecutor with trailing stop
         planned_usd, effective_usd, entry_price, entry_amount_base, uplifted = self._resolve_buy_entry_plan(price, state)
         if uplifted:
-            self.logger().info(
+            self.logger().debug(
                 f"BUY min-notional uplift | {self._controller_pair_log_prefix()} "
                 f"role={str(state.get('buy_entry_role', 'full') or 'full')} "
                 f"planned={planned_usd:.6f} effective={effective_usd:.6f} entry_price={entry_price:.6f}"
@@ -3361,7 +4440,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     delta = base_delta
                 if activation > 0 and delta > 0:
                     trailing_stop_cfg = TrailingStop(activation_price=activation, trailing_delta=delta)
-            except Exception as e:
+            except (TypeError, ValueError, ArithmeticError) as e:
                 self.logger().warning(
                     f"Trailing stop config failed | {self._controller_pair_log_prefix()} "
                     f"error={type(e).__name__}: {e}"
@@ -3380,6 +4459,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             trailing_stop=trailing_stop_cfg,
             open_order_type=OrderType.LIMIT_MAKER,
             take_profit_order_type=self.config.take_profit_order_type,
+            trailing_stop_order_type=self.config.trailing_stop_order_type,
+            trailing_stop_limit_max_age_seconds=self.config.trailing_stop_limit_max_age_seconds,
             stop_loss_order_type=OrderType.MARKET,
             # PositionExecutor only supports MARKET stop-loss and time-limit exits.
             time_limit_order_type=OrderType.MARKET,
@@ -3407,7 +4488,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             current_price = self._get_mid_price()
             if current_price is None:
                 return actions
-        except Exception:
+        except _MARKET_DATA_ERRORS:
             return actions
 
         now_ts = self.market_data_provider.time()
@@ -3437,41 +4518,17 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             )
             actions.extend(recovery_actions)
 
-        # --- Track closed executors for consecutive loss counting ---
+        # --- Track only authoritative terminal executor results ---
         for ex in self.executors_info:
-            if not ex.is_active and hasattr(ex, "_v5_tracked"):
-                continue
             if not ex.is_active:
                 self._track_executor_result(ex)
-                ex._v5_tracked = True  # type: ignore[attr-defined]
 
-        # --- Early stop on deep drawdown ---
-        threshold = Decimal(str(self.config.early_stop_drawdown_pct))
-        keep_pos = self.config.early_stop_keep_position
-        if threshold > 0:
-            for side in (TradeType.BUY, TradeType.SELL):
-                inventory = self._aggregate_held_inventory(side)
-                if inventory.total_amount <= Decimal("0"):
-                    continue
-                try:
-                    if inventory.cost_basis is None or inventory.cost_basis <= 0:
-                        continue
-                    if side == TradeType.BUY:
-                        pnl_pct = (current_price - inventory.cost_basis) / inventory.cost_basis
-                    else:
-                        pnl_pct = (inventory.cost_basis - current_price) / inventory.cost_basis
-                except Exception:
-                    continue
-                if pnl_pct <= -threshold:
-                    active_side = self._filter_same_side(side, active_only=True)
-                    for ex in active_side:
-                        actions.append(StopExecutorAction(
-                            executor_id=ex.id, controller_id=self.config.id, keep_position=keep_pos,
-                        ))
-                        self.logger().info(
-                            f"Early stop | {self._controller_pair_log_prefix()} executor={ex.id} "
-                            f"side={'BUY' if side == TradeType.BUY else 'SELL'} pnl={pnl_pct} keep={keep_pos}"
-                        )
+        # --- Early stop on active executor deep drawdown ---
+        existing_stop_ids = {
+            action.executor_id for action in actions
+            if isinstance(action, StopExecutorAction)
+        }
+        actions.extend(self._check_active_executor_drawdown_stop(current_price, existing_stop_ids))
 
         return actions
 
@@ -3524,7 +4581,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             actions.append(StopExecutorAction(
                 executor_id=ex.id, controller_id=self.config.id, keep_position=True,
             ))
-            self.logger().warning(
+            self.logger().debug(
                 f"BAG FREEZE | {self._controller_pair_log_prefix()} executor={ex.id} "
                 f"ref={self._executor_ref_price(ex)} current={current_price}"
             )
@@ -3554,18 +4611,13 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         actions: List[ExecutorAction] = []
         recovery_target = Decimal(str(self.config.bag_recovery_target_pct))
 
-        if current_signal < 0 or self._active_sell_executors():
+        if self._active_sell_executors():
             return actions
 
         base_asset, _ = self._base_quote_assets()
         available_base: Optional[Decimal] = None
         if base_asset is not None:
-            try:
-                balance = self.market_data_provider.get_balance(self.config.connector_name, base_asset)
-                if balance is not None:
-                    available_base = Decimal(str(balance))
-            except Exception:
-                available_base = None
+            available_base = self._get_available_asset_balance(base_asset)
 
         if available_base is not None and available_base <= Decimal("0"):
             return actions
@@ -3573,6 +4625,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         state = (self.processed_data or {}).get("signal_state", {})
         current_rsi = state.get("rsi")
         ema_fast = state.get("ema_fast")
+        recovery_overbought_threshold = self._held_bag_recovery_sell_rsi_threshold()
         effective_target = recovery_target
         if self.config.sell_only_if_profitable:
             effective_target = max(effective_target, Decimal(str(self.config.min_profit_pct_for_sell)))
@@ -3581,7 +4634,7 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             if (pos.connector_name != self.config.connector_name
                     or pos.trading_pair != self.config.trading_pair
                     or pos.side != TradeType.BUY
-                    or pos.amount <= Decimal("0")):
+                    or self._held_position_is_dust(pos)):
                 continue
 
             try:
@@ -3591,7 +4644,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
             except (AttributeError, TypeError):
                 continue
 
-            pnl_pct = (current_price - breakeven) / breakeven
+            pnl_pct = self._position_net_pnl_pct(pos, current_price)
+            if pnl_pct is None:
+                continue
             position_key = self._recovery_position_key(pos)
             if pnl_pct < effective_target:
                 self._recovery_trails.pop(position_key, None)
@@ -3599,6 +4654,8 @@ class RSIv5Controller(DirectionalTradingControllerBase):
 
             trail = self._recovery_trails.get(position_key)
             if trail is None:
+                if not self._held_bag_recovery_is_overbought(current_rsi):
+                    continue
                 trail = RecoveryTrailState(
                     position_key=position_key,
                     armed_timestamp=now_ts,
@@ -3610,10 +4667,11 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                     last_reason="armed",
                 )
                 self._recovery_trails[position_key] = trail
-                self.logger().info(
+                self.logger().debug(
                     f"RECOVERY armed | {self._controller_pair_log_prefix()} "
                     f"breakeven={breakeven} current={current_price} pnl={float(pnl_pct) * 100:.2f}% "
-                    f"target={float(effective_target) * 100:.2f}%"
+                    f"target={float(effective_target) * 100:.2f}% "
+                    f"rsi={self._fmt(current_rsi, 2)} thr={recovery_overbought_threshold:.2f}"
                 )
                 continue
 
@@ -3647,21 +4705,38 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 else:
                     continue
 
-            min_step = Decimal("1e-8")
             ref_price = self._shade_limit_maker_price(
                 trade_type=TradeType.SELL,
                 fallback_price=current_price,
             )
+            recovery_execution_strategy = self.config.recovery_sell_execution_strategy
+            chaser_config = self._recovery_sell_chaser_config()
+            sell_price = current_price if recovery_execution_strategy == ExecutionStrategy.MARKET else ref_price
             target_amount = Decimal(str(pos.amount))
-            if self._is_strong_bullish_trend() and not trail.partial_exit_done:
-                partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
-                if Decimal("0") < partial_fraction < Decimal("1"):
-                    target_amount = target_amount * partial_fraction
-                    reversal_reason = f"partial-{reversal_reason}"
-            if available_base is not None:
-                target_amount = min(target_amount, available_base)
-            sell_amount = target_amount.quantize(min_step)
+            partial_fraction = Decimal(str(self.config.recovery_partial_exit_fraction))
+            signal_slice_multiplier = Decimal(str(self.config.signal_sell_inventory_slice_multiplier))
+            if current_signal < 0 and signal_slice_multiplier > 0 and sell_price > 0:
+                target_quote = self.config.usd_per_entry * signal_slice_multiplier
+                target_amount = min(target_amount, target_quote / sell_price)
+                reversal_reason = f"slice-{reversal_reason}"
+            elif current_signal >= 0 and Decimal("0") < partial_fraction < Decimal("1"):
+                target_amount = target_amount * partial_fraction
+                reversal_reason = f"partial-{reversal_reason}"
+            sell_amount = self._resolve_recovery_sell_amount(
+                position_amount=Decimal(str(pos.amount)),
+                target_amount=target_amount,
+                price=sell_price,
+                available_base=available_base,
+            )
             if sell_amount <= Decimal("0"):
+                continue
+            if not self._has_sufficient_price_gap(TradeType.SELL, sell_price):
+                trail.last_reason = "price-gap"
+                self.logger().debug(
+                    f"RECOVERY TRAIL HOLD | {self._controller_pair_log_prefix()} "
+                    f"reason=price-gap current={current_price} sell_price={sell_price} "
+                    f"last_sell={self._last_same_side_ref_price(TradeType.SELL)}"
+                )
                 continue
             sell_config = OrderExecutorConfig(
                 timestamp=self.market_data_provider.time(),
@@ -3669,8 +4744,9 @@ class RSIv5Controller(DirectionalTradingControllerBase):
                 trading_pair=self.config.trading_pair,
                 side=TradeType.SELL,
                 amount=sell_amount,
-                price=ref_price,
-                execution_strategy=ExecutionStrategy.LIMIT_MAKER,
+                price=None if recovery_execution_strategy == ExecutionStrategy.MARKET else ref_price,
+                chaser_config=chaser_config,
+                execution_strategy=recovery_execution_strategy,
                 position_action=PositionAction.CLOSE,
                 leverage=self.config.leverage,
                 level_id=f"recovery_exit:{position_key}",
@@ -3730,6 +4806,40 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return f"   {label:<8} {body}"
 
     @staticmethod
+    def _status_money_label(value: Optional[object], precision: int = 2, *, signed: bool = False) -> str:
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return "$n/a"
+        sign = "+" if signed else ""
+        return f"${amount:{sign}.{precision}f}"
+
+    @staticmethod
+    def _status_compact_money_label(value: Optional[object]) -> str:
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return "$n/a"
+        if abs(amount) >= Decimal("1000"):
+            return f"${amount / Decimal('1000'):.1f}k"
+        return f"${amount:.0f}"
+
+    @staticmethod
+    def _status_signed_pct_label(value: Optional[object], precision: int = 2) -> str:
+        try:
+            return f"{float(value) * 100:+.{precision}f}%"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    @staticmethod
+    def _status_price_gap_label(target_price: Optional[Decimal], current_price: Optional[Decimal]) -> str:
+        if target_price is None or current_price is None or current_price <= 0:
+            return "n/a"
+        if current_price >= target_price:
+            return "ready"
+        return RSIv5Controller._status_signed_pct_label((target_price - current_price) / current_price)
+
+    @staticmethod
     def _executor_has_fill(executor) -> bool:
         try:
             return Decimal(str(getattr(executor, "filled_amount_quote", Decimal("0")) or Decimal("0"))) > 0
@@ -3772,21 +4882,26 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         base_balance = self._get_base_balance()
         base_asset, _ = self._base_quote_assets()
         amount_suffix = f" {base_asset}" if base_asset else ""
+        shortfall_amount = self._inventory_balance_shortfall_amount(inventory)
         position_value = self._get_total_position_value_usd()
         try:
             max_position = Decimal(str(getattr(self.config, "max_total_position_usd", Decimal("0"))))
         except (InvalidOperation, TypeError, ValueError):
             max_position = Decimal("0")
         utilization = self._get_position_utilization()
-        return self._status_row(
-            "position",
+        parts = [
             f"held={inventory.total_amount:.8f}{amount_suffix}",
             f"sellable={sellable_amount:.8f}{amount_suffix}",
+        ]
+        if shortfall_amount is not None and shortfall_amount > 0:
+            parts.append(f"short={shortfall_amount:.8f}{amount_suffix}")
+        parts.extend([
             f"bags={inventory.bag_count}",
             f"base={self._fmt(base_balance, 8)}",
             f"cost={self._fmt(inventory.cost_basis, 4)}",
             f"exp=${float(position_value):.0f}/${float(max_position):.0f} ({utilization:.0%})",
-        )
+        ])
+        return self._status_row("position", *parts)
 
     def _status_exit_owner_line(self, current_signal: int) -> str:
         signal_sells = self._active_signal_sell_executors()
@@ -3911,109 +5026,55 @@ class RSIv5Controller(DirectionalTradingControllerBase):
         return self._status_row("recovery", *parts)
 
     def to_format_status(self) -> List[str]:
-        """Return a compact operator panel for BUY/SELL readiness and live state."""
-        if not self.config:
-            return ["Configuration not available."]
+        """Per-controller body for the operator console.
 
-        processed = self.processed_data or {}
-        indicators = processed.get("indicators", {})
-        thresholds = processed.get("thresholds", {})
-        state = processed.get("signal_state", {})
-        mid_price = self._get_mid_price()
-        rsi = indicators.get("rsi")
-        cost_basis = indicators.get("cost_basis")
-        current_signal = processed.get("signal", 0)
-        rsi_buy = thresholds.get("rsi_buy", self.config.rsi_buy_threshold)
-        rsi_sell = thresholds.get("rsi_sell", self.config.sell_rsi_overbought)
-        last_close = state.get("close")
-        signal_score = int(state.get("signal_score", 0) or 0)
-        raw_reversal = bool(state.get("rsi_reversal"))
-        condition_ok = bool(state.get("condition_ok", True))
-        condition_reason = state.get("condition_reason", "ok")
-        buy_decision = str(state.get("buy_decision", "idle"))
-        buy_reason = str(state.get("buy_reason", "none"))
-        sell_decision = str(state.get("sell_decision", "idle"))
-        sell_reason = str(state.get("sell_reason", "none"))
-        has_inventory = any(
-            position.connector_name == self.config.connector_name
-            and position.trading_pair == self.config.trading_pair
-            and position.side == TradeType.BUY
-            and position.amount > 0
-            for position in self.positions_held
-        ) or self._get_total_position_value_usd() > 0
+        All controller-level information now lives in the parent strategy's
+        ``CONTROLLERS`` / ``SIGNALS`` / ``PLANS`` summary tables (RSI proximity,
+        buy/sell gauges, gate truth table, focus notes, exit/entry plan), and
+        per-executor / per-position runtime detail lives in the parent's
+        ``ACTIVE EXECUTORS`` / ``POSITIONS HELD`` tables. Returning an empty
+        list lets the parent suppress the per-controller section entirely
+        (header, body, and the aggregate ``active_exec total=...`` line) so a
+        multi-pair ``rsi_v5`` desk renders the shared tables only.
+        """
+        return []
 
-        rsi_window = max(6.0, min(15.0, abs(float(rsi_sell) - float(rsi_buy)) * 0.35))
-        buy_line = self._buy_signal_status_line(
-            current_signal=current_signal,
-            last_rsi=rsi,
-            last_close=float(last_close) if last_close is not None else None,
-            rsi_buy=float(rsi_buy),
-            rsi_window=rsi_window,
-            signal_score=signal_score,
-            raw_reversal=raw_reversal,
-            condition_ok=condition_ok,
-            condition_reason=condition_reason,
-            buy_decision=buy_decision,
-            buy_reason=buy_reason,
-            raw_prev_was_min=bool(state.get("raw_reversal_prev_was_min")),
-            raw_turning_up=bool(state.get("raw_reversal_turning_up")),
-            raw_was_oversold=bool(state.get("raw_reversal_was_oversold")),
-            raw_near_bottom=bool(state.get("raw_reversal_near_bottom")),
-            score_rsi_oversold=bool(state.get("score_rsi_oversold")),
-            score_bb_touch=bool(state.get("score_bb_touch")),
-            score_macd_turn=bool(state.get("score_macd_turn")),
-            score_mean_reversion=bool(state.get("score_mean_reversion")),
-            buy_confirmation_active=bool(state.get("buy_confirmation_active")),
-            buy_confirmation_rebound_delta=state.get("buy_confirmation_rebound_delta"),
-            buy_confirmation_rebound_target=state.get("buy_confirmation_rebound_target"),
-            buy_confirmation_price_rebounded=state.get("buy_confirmation_price_rebounded"),
-            buy_entry_role=str(state.get("buy_entry_role", "none")),
-            buy_entry_fraction=float(state.get("buy_entry_fraction", 0.0) or 0.0),
-            buy_context_bias=str(state.get("buy_context_bias", "neutral")),
-        )
-        sell_line = self._sell_signal_status_line(
-            current_signal=current_signal,
-            last_rsi=rsi,
-            rsi_sell=float(rsi_sell),
-            rsi_window=rsi_window,
-            has_inventory=has_inventory,
-            cost_basis=Decimal(str(cost_basis)) if cost_basis is not None else None,
-            mid_price=mid_price,
-            sell_decision=sell_decision,
-            sell_reason=sell_reason,
-            sell_profitability_ok=bool(state.get("sell_profitability_ok")),
-            sell_rsi_rollover=bool(state.get("sell_rsi_rollover")),
-            sell_price_below_ema=bool(state.get("sell_price_below_ema")),
-            sell_macd_rollover=bool(state.get("sell_macd_rollover")),
-            sell_reversal_confirmed=bool(state.get("sell_reversal_confirmed")),
-            sell_trend_hold=bool(state.get("sell_trend_hold")),
-        )
-        try:
-            now_ts = float(self.market_data_provider.time()) if self.market_data_provider else 0.0
-        except Exception:
-            now_ts = 0.0
-        trend = self._processed_trend_confirmation()
-        market_line = self._status_row(
-            "market",
-            f"◉ {self._fmt(mid_price, 4)}",
-            f"signal={self._summary_signal_label(current_signal)}",
-            f"regime={processed.get('regime', 'n/a')}",
-            f"htf={trend.get('direction', 'unavailable')}",
-            f"conf={self._fmt(trend.get('confidence'), 2)}",
-            f"align={self._fmt(trend.get('alignment_score'), 2)}",
-        )
-        lines = [
-            market_line,
-            buy_line,
-            sell_line,
-            self._status_inventory_line(),
-            self._status_exit_owner_line(current_signal),
+    def _idle_wallet_label(self, current_price: Optional[Decimal]) -> str:
+        """Return ``idle wallet $X.YZ`` for the off-controller base-asset wallet headroom."""
+        base_balance = self._get_base_balance()
+        managed_value = self._get_total_position_value_usd()
+        idle_value: Optional[Decimal] = None
+        if base_balance is not None and current_price is not None and current_price > 0:
+            wallet_value = base_balance * current_price
+            idle_value = max(wallet_value - managed_value, Decimal("0"))
+        return f"idle wallet {self._status_money_label(idle_value)}"
+
+    def _inventory_reconciliation_values(
+        self,
+        current_price: Optional[Decimal],
+    ) -> Tuple[Optional[Decimal], Decimal, Optional[Decimal]]:
+        inventory = self._aggregate_held_inventory(TradeType.BUY)
+        held_value: Optional[Decimal] = None
+        if current_price is not None and current_price > 0:
+            held_value = inventory.total_amount * current_price
+        active_value = self._get_active_buy_executor_position_value_usd()
+        base_balance = self._get_base_balance()
+        untracked_value: Optional[Decimal] = None
+        if base_balance is not None and current_price is not None and current_price > 0:
+            wallet_value = base_balance * current_price
+            managed_value = (held_value or Decimal("0")) + active_value
+            untracked_value = max(wallet_value - managed_value, Decimal("0"))
+        return held_value, active_value, untracked_value
+
+    def _inventory_reconciliation_label(self, current_price: Optional[Decimal]) -> str:
+        inventory = self._aggregate_held_inventory(TradeType.BUY)
+        held_value, active_value, untracked_value = self._inventory_reconciliation_values(current_price)
+        parts = [
+            f"H{self._status_compact_money_label(held_value)}",
+            f"A{self._status_compact_money_label(active_value)}",
+            f"U{self._status_compact_money_label(untracked_value)}",
         ]
-        for extra_line in (
-            self._status_buy_executor_line(now_ts),
-            self._status_sell_executor_line(now_ts),
-            self._status_recovery_line(mid_price),
-        ):
-            if extra_line:
-                lines.append(extra_line)
-        return lines
+        shortfall_value = self._inventory_balance_shortfall_value(current_price, inventory)
+        if shortfall_value is not None and shortfall_value > 0:
+            parts.append(f"short {self._status_compact_money_label(shortfall_value)}")
+        return " ".join(parts)

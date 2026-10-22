@@ -531,13 +531,17 @@ def analyze_volume(
 
     if vol_series is None or vol_series.empty:
         return result
+    vol_series = pd.to_numeric(vol_series, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     # Basic metrics
-    result.current_volume = float(vol_series.iloc[-1])
-    result.average_volume = float(vol_series.tail(lookback).mean())
+    current_volume = float(vol_series.iloc[-1])
+    average_volume = float(vol_series.tail(lookback).mean())
+    if not np.isfinite(current_volume) or not np.isfinite(average_volume) or average_volume <= 0:
+        return result
+    result.current_volume = current_volume
+    result.average_volume = average_volume
 
-    if result.average_volume > 0:
-        result.volume_ratio = round(result.current_volume / result.average_volume, 3)
+    result.volume_ratio = round(result.current_volume / result.average_volume, 3)
 
     # Classify condition
     ratio = result.volume_ratio
@@ -608,7 +612,7 @@ def detect_support_resistance(
 
     recent = df.tail(lookback).copy()
 
-    if "high" not in recent.columns or "low" not in recent.columns:
+    if not {"high", "low", "close"}.issubset(set(recent.columns)):
         return result
 
     high = recent["high"].astype(float)
@@ -1037,6 +1041,7 @@ class MarketRegimeDetector:
         self._fit_lock = threading.Lock()
         self._last: Optional[MarketRegime] = None
         self._hist = deque(maxlen=max(3, smoothing_window))
+        self._last_observation = None
         self._vol_low = 0.005
         self._vol_high = 0.02
         self._scaler_mu = None
@@ -1167,8 +1172,15 @@ class MarketRegimeDetector:
                 raw = "HV_Range" if vol_lvl == "high" else "LV_Range"
 
         # Smooth transitions
-        self._hist.append(raw)
+        observation = last.get("timestamp", df_ta.index[-1])
+        if self._last_observation == observation and self._hist:
+            self._hist[-1] = raw
+        else:
+            self._hist.append(raw)
+            self._last_observation = observation
         final = self._smoothed_label(raw)
+        if prob_dict is not None:
+            conf = prob_dict.get(final, 0.0)
 
         # Build result
         regime = MarketRegime(
@@ -1270,16 +1282,22 @@ class MarketRegimeDetector:
         if not req.issubset(set(df.columns)) or len(df) < 60:
             return None, None
 
-        x = df.copy()
-        for c in ["open", "high", "low", "close", "volume"]:
+        columns = ["open", "high", "low", "close", "volume"]
+        x = df[[*columns, *(["timestamp"] if "timestamp" in df.columns else [])]].copy()
+        for c in columns:
             x[c] = pd.to_numeric(x[c], errors="coerce")
-        x.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
+        if not np.isfinite(x[columns].to_numpy(dtype=float)).all():
+            return None, None
+        if (x[["open", "high", "low", "close"]] <= 0).any().any() or (x["volume"] < 0).any():
+            return None, None
 
         if len(x) < 60:
             return None, None
 
         ta = self._indicators(x)
-        if ta is None:
+        if ta is None or ta.index[-1] != x.index[-1]:
+            return None, None
+        if not np.isfinite(ta[self.features].to_numpy(dtype=float)).all():
             return None, None
 
         if fit_scaler:

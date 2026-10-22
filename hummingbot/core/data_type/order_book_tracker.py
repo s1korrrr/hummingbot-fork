@@ -1,4 +1,5 @@
 import asyncio
+import bisect
 import logging
 import time
 from collections import defaultdict, deque
@@ -11,6 +12,7 @@ import pandas as pd
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.data_type.order_book_observation import OrderBookObservation
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.event.events import OrderBookTradeEvent
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -245,6 +247,7 @@ class OrderBookTracker:
         self._order_books_initialized: asyncio.Event = asyncio.Event()
         self._tracking_tasks: Dict[str, asyncio.Task] = {}
         self._order_books: Dict[str, OrderBook] = {}
+        self._book_observations = {}
         self._tracking_message_queues: Dict[str, asyncio.Queue] = {}
         self._past_diffs_windows: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=self.PAST_DIFF_WINDOW_SIZE))
         self._order_book_diff_stream: asyncio.Queue = asyncio.Queue()
@@ -282,6 +285,20 @@ class OrderBookTracker:
     @property
     def ready(self) -> bool:
         return self._order_books_initialized.is_set()
+
+    def get_order_book_observation(self, trading_pair: str) -> Optional[OrderBookObservation]:
+        """Only applied stream messages establish timing; initialization is insufficient.
+
+        Tie the observation to the book object so replacement/reconnect cannot inherit
+        a timestamp from a previous book. A read never refreshes either clock.
+        """
+        entry = self._book_observations.get(trading_pair)
+        if entry is None or self._order_books.get(trading_pair) is not entry[0]:
+            return None
+        if (getattr(self._data_source, 'requires_order_book_stream_validation', False) is True
+                and self._data_source.order_book_stream_valid(trading_pair, entry[2]) is not True):
+            return None
+        return entry[1]
 
     @property
     def snapshot(self) -> Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]:
@@ -353,7 +370,11 @@ class OrderBookTracker:
             for _, task in self._tracking_tasks.items():
                 task.cancel()
             self._tracking_tasks.clear()
+        # A restarted pair must buffer early stream messages, not route them to
+        # its cancelled consumer's queue before the new book is initialized.
+        self._tracking_message_queues.clear()
         self._order_books_initialized.clear()
+        self._book_observations.clear()
 
     async def wait_ready(self):
         await self._order_books_initialized.wait()
@@ -552,8 +573,10 @@ class OrderBookTracker:
                     pair_metrics_cache[trading_pair] = self._metrics.get_or_create_pair_metrics(trading_pair)
                 pair_metrics = pair_metrics_cache[trading_pair]
 
-                # Check the order book's initial update ID. If it's larger, don't bother.
-                if order_book.snapshot_uid > ob_message.update_id:
+                # A validated WS stream replaces the initial REST baseline. Its snapshot
+                # and subsequent linked diffs can be queued before that replacement applies.
+                validates_stream = getattr(self._data_source, 'requires_order_book_stream_validation', False) is True
+                if not validates_stream and order_book.snapshot_uid > ob_message.update_id:
                     messages_rejected += 1
                     self._metrics.total_diffs_rejected += 1
                     pair_metrics.diffs_rejected += 1
@@ -649,8 +672,23 @@ class OrderBookTracker:
                 else:
                     message = await message_queue.get()
 
+                stream_epoch = message.content.get('stream_epoch')
+                validates_stream = getattr(self._data_source, 'requires_order_book_stream_validation', False) is True
+                if validates_stream:
+                    if (stream_epoch is None
+                            or self._data_source.order_book_stream_valid(trading_pair, stream_epoch) is not True):
+                        # REST cannot replace a sequenced WS baseline. Queued data from
+                        # a revoked stream cannot repair its book either.
+                        continue
+                    applied = self._book_observations.get(trading_pair)
+                    if (message.type is OrderBookMessageType.DIFF
+                            and (applied is None or applied[0] is not order_book or applied[2] != stream_epoch)):
+                        await self._data_source.request_order_book_resync(trading_pair)
+                        continue  # Parsing a recovery snapshot is not proof it was applied.
                 if message.type is OrderBookMessageType.DIFF:
                     order_book.apply_diffs(message.bids, message.asks, message.update_id)
+                    self._book_observations[trading_pair] = (
+                        order_book, OrderBookObservation(message.timestamp, time.time()), stream_epoch)
                     past_diffs_window.append(message)
                     diff_messages_accepted += 1
 
@@ -662,10 +700,23 @@ class OrderBookTracker:
                     last_message_timestamp = now
                 elif message.type is OrderBookMessageType.SNAPSHOT:
                     past_diffs: List[OrderBookMessage] = list(past_diffs_window)
+                    if validates_stream:
+                        past_diffs = [diff for diff in past_diffs if diff.content.get('stream_epoch') == stream_epoch]
+                        past_diffs_window.clear()
+                        past_diffs_window.extend(past_diffs)
                     order_book.restore_from_snapshot_and_diffs(message, past_diffs)
+                    # Same ordering as OrderBook.restore_from_snapshot_and_diffs:
+                    # an older snapshot can be followed by already-applied diffs.
+                    replay = past_diffs[bisect.bisect_right(past_diffs, message):]
+                    last = replay[-1] if replay else message
+                    self._book_observations[trading_pair] = (
+                        order_book, OrderBookObservation(last.timestamp, time.time()), last.content.get('stream_epoch'))
             except asyncio.CancelledError:
                 raise
             except Exception:
+                self._book_observations.pop(trading_pair, None)
+                if getattr(self._data_source, 'requires_order_book_stream_validation', False) is True:
+                    await self._data_source.request_order_book_resync(trading_pair)
                 self.logger().network(
                     f"Unexpected error tracking order book for {trading_pair}.",
                     exc_info=True,

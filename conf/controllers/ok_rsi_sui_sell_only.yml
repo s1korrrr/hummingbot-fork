@@ -1,0 +1,33 @@
+# SUI-only OKX EEA spot profile. Prepared wallet-sale policy; owner must activate live.
+id: ok-rsi-sui-usdc-sell-only
+controller_name: ok_rsi
+controller_type: directional_trading
+connector_name: okx
+trading_pair: SUI-USDC
+trade_mode: sell_only
+leverage: 1
+position_mode: ONEWAY
+manual_kill_switch: true
+
+# Existing sell-only group settings, isolated to SUI.
+interval: 1m
+trend_confirmation_enabled: true
+trend_confirmation_medium_interval: 5m
+trend_confirmation_long_interval: 15m
+derived_higher_timeframe_max_records: 100
+strict_hmm_mode: true
+total_amount_quote: '500'
+usd_per_entry: '25'
+max_total_position_usd: '500'
+max_executors_per_side: 1
+
+# Owner permits sales without acquisition basis or a profitability gate; no buying.
+sell_only_if_profitable: false
+sell_rsi_overbought: 76.0
+sell_only_inventory_fraction: '0.10'
+sell_only_strict_fraction: true
+sell_all_below_quote: '0'
+stop_loss: null
+take_profit: null
+time_limit: null
+early_stop_keep_position: true

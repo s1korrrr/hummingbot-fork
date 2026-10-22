@@ -27,6 +27,7 @@ from hummingbot.data_feed.candles_feed.kucoin_spot_candles.kucoin_spot_candles i
 from hummingbot.data_feed.candles_feed.mexc_perpetual_candles.mexc_perpetual_candles import MexcPerpetualCandles
 from hummingbot.data_feed.candles_feed.mexc_spot_candles.mexc_spot_candles import MexcSpotCandles
 from hummingbot.data_feed.candles_feed.okx_perpetual_candles.okx_perpetual_candles import OKXPerpetualCandles
+from hummingbot.data_feed.candles_feed.okx_service_candles.okx_service_candles import OKXServiceCandles
 from hummingbot.data_feed.candles_feed.okx_spot_candles.okx_spot_candles import OKXSpotCandles
 from hummingbot.data_feed.candles_feed.pacifica_perpetual_candles import PacificaPerpetualCandles
 
@@ -60,6 +61,7 @@ class CandlesFactory:
         "ascend_ex": AscendExSpotCandles,
         "okx_perpetual": OKXPerpetualCandles,
         "okx": OKXSpotCandles,
+        "okx_service": OKXServiceCandles,
         "kraken": KrakenSpotCandles,
         "mexc": MexcSpotCandles,
         "mexc_perpetual": MexcPerpetualCandles,
@@ -73,6 +75,23 @@ class CandlesFactory:
         "pacifica_perpetual": PacificaPerpetualCandles,
     }
 
+    # Opt-in connector aliases, empty unless a process routes one (see okx_service_candles.service_hub). A route keeps
+    # the caller's connector name, so keys, namespaces and recorded identities stay unchanged.
+    _routes: Dict[str, str] = {}
+
+    @classmethod
+    def route(cls, connector: str, target: str) -> None:
+        """Serve `connector` from the `target` feed class; an existing different route is an error."""
+        if target not in cls._candles_map:
+            raise UnsupportedConnectorException(target)
+        if cls._routes.get(connector, target) != target:
+            raise ValueError(f"The connector {connector} is already routed to {cls._routes[connector]}.")
+        cls._routes[connector] = target
+
+    @classmethod
+    def unroute(cls, connector: str) -> None:
+        cls._routes.pop(connector, None)
+
     @classmethod
     def get_candle(cls, candles_config: CandlesConfig) -> CandlesBase:
         """
@@ -82,7 +101,7 @@ class CandlesFactory:
         :return: Instance of CandleBase or its subclass.
         :raises UnsupportedConnectorException: If the connector is not supported.
         """
-        connector_class = cls._candles_map.get(candles_config.connector)
+        connector_class = cls._candles_map.get(cls._routes.get(candles_config.connector, candles_config.connector))
         if connector_class:
             return connector_class(candles_config.trading_pair, candles_config.interval, candles_config.max_records)
         else:

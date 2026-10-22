@@ -110,7 +110,9 @@ class ExecutorBase(RunnableBase):
         """
         def _safe_decimal(value) -> Decimal:
             d = Decimal(str(value))
-            return d if d.is_finite() else Decimal("0")
+            if not d.is_finite():
+                raise ValueError(f"Non-finite executor performance: {self.config.id}")
+            return d
 
         ei = ExecutorInfo(
             id=self.config.id,
@@ -307,10 +309,22 @@ class ExecutorBase(RunnableBase):
         :param price: The price for the order.
         :return: The result of the order placement.
         """
+        if getattr(self._strategy, "_unattended_restart_hold", False) is True:
+            raise RuntimeError("V2 unattended restart hold; executor order submission is blocked")
+        if self._stack_recovery_required():
+            raise RuntimeError("Stack requires startup reconciliation; executor order submission is blocked")
         if side == TradeType.BUY:
             return self._strategy.buy(connector_name, trading_pair, amount, order_type, price, position_action)
         else:
             return self._strategy.sell(connector_name, trading_pair, amount, order_type, price, position_action)
+
+    def _stack_recovery_required(self) -> bool:
+        if getattr(self._strategy, "_unattended_restart_hold", False) is True:
+            return True
+        orchestrator = getattr(self._strategy, "executor_orchestrator", None)
+        # Startup ownership transfer is the only order gate. An unresolved persisted
+        # row is reported (recovery_required) but never blocks other executors' orders.
+        return getattr(orchestrator, "_planned_resume_pending", False) is True
 
     def get_price(self, connector_name: str, trading_pair: str, price_type: PriceType = PriceType.MidPrice):
         """

@@ -1,0 +1,174 @@
+{
+  "requested_seconds": 150,
+  "observed_seconds": 150.0161843749811,
+  "pairs": [
+    "BTC-USDC",
+    "ETH-USDC"
+  ],
+  "pair_count": 2,
+  "readers": 2,
+  "history": 90,
+  "started_at": 1789845093.931645,
+  "steady_at": 1789845097.698247,
+  "finished_at": 1789845247.715183,
+  "planned_outages": [
+    [],
+    []
+  ],
+  "clock_step_seconds": 0.0007714360835961998,
+  "clock_samples": [
+    {
+      "offset": 0.03681516647338867,
+      "rtt": 0.340056957968045,
+      "sampled_at": 1789845094.283212
+    },
+    {
+      "offset": 0.006072521209716797,
+      "rtt": 0.28340654203202575,
+      "sampled_at": 1789845094.56663
+    },
+    {
+      "offset": 0.005259037017822266,
+      "rtt": 0.2802073329803534,
+      "sampled_at": 1789845094.846844
+    },
+    {
+      "offset": 0.028049468994140625,
+      "rtt": 0.32531133299926296,
+      "sampled_at": 1789845248.0406039
+    }
+  ],
+  "clock_offset_seconds": 0.005259037017822266,
+  "receipt_to_adapter_seconds": [
+    {
+      "count": 6,
+      "p50": 0.0013082027435302734,
+      "p95": 0.0027551651000976562,
+      "p99": 0.0027551651000976562,
+      "max": 0.0027551651000976562
+    },
+    {
+      "count": 6,
+      "p50": 0.0011820793151855469,
+      "p95": 0.0023322105407714844,
+      "p99": 0.0023322105407714844,
+      "max": 0.0023322105407714844
+    }
+  ],
+  "close_to_adapter_seconds_including_recovery": [
+    {
+      "count": 6,
+      "p50": 1.0355091094970703,
+      "p95": 1.4203572273254395,
+      "p99": 1.4203572273254395,
+      "max": 1.4203572273254395
+    },
+    {
+      "count": 6,
+      "p50": 1.0350861549377441,
+      "p95": 1.4201149940490723,
+      "p99": 1.4201149940490723,
+      "max": 1.4201149940490723
+    }
+  ],
+  "receipt_to_native_read_seconds": [
+    {
+      "count": 6,
+      "p50": 0.013816118240356445,
+      "p95": 0.027627944946289062,
+      "p99": 0.027627944946289062,
+      "max": 0.027627944946289062
+    },
+    {
+      "count": 6,
+      "p50": 0.01471710205078125,
+      "p95": 0.028866052627563477,
+      "p99": 0.028866052627563477,
+      "max": 0.028866052627563477
+    }
+  ],
+  "native_frame_read_seconds": {
+    "count": 12,
+    "p50": 0.0011856670025736094,
+    "p95": 0.010087417031172663,
+    "p99": 0.010087417031172663,
+    "max": 0.010087417031172663
+  },
+  "native_frames_checked": 12,
+  "event_loop_lag_seconds": {
+    "count": 6998,
+    "p50": 0.0019232499948702748,
+    "p95": 0.0026852499763481315,
+    "p99": 0.0037796669825911518,
+    "max": 0.008651832952164113
+  },
+  "producer_rss_kib": {
+    "count": 30,
+    "p50": 16752,
+    "p95": 16752,
+    "p99": 16752,
+    "max": 16752
+  },
+  "coverage": [
+    [
+      {
+        "open_time": 1789845120,
+        "available_by_end": 2,
+        "incremental_deliveries": 2,
+        "missing": [],
+        "planned_interruption": false
+      }
+    ],
+    [
+      {
+        "open_time": 1789845120,
+        "available_by_end": 2,
+        "incremental_deliveries": 2,
+        "missing": [],
+        "planned_interruption": false
+      }
+    ]
+  ],
+  "events": [
+    {
+      "type": "producer_started",
+      "at": 1789845094.852171,
+      "pid": 51061
+    },
+    {
+      "type": "reader_error",
+      "reader": 0,
+      "at": 1789845094.875078,
+      "error": "ClientConnectorError"
+    },
+    {
+      "type": "reader_error",
+      "reader": 1,
+      "at": 1789845094.875082,
+      "error": "ClientConnectorError"
+    },
+    {
+      "type": "all_readers_ready",
+      "at": 1789845097.698247
+    },
+    {
+      "type": "producer_stopped",
+      "at": 1789845248.094795,
+      "returncode": 0
+    }
+  ],
+  "errors": [],
+  "consumer_restart_exercised": false,
+  "producer_restart_exercised": false,
+  "producer_restart_recovered": false,
+  "final_ready": [
+    2,
+    2
+  ],
+  "authority": "repository-process-only",
+  "execution_connectors_created": false,
+  "coverage_passed": true,
+  "incremental_coverage_passed": true,
+  "local_latency_target_passed": true,
+  "passed": false
+}

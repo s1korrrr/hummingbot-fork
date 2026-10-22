@@ -2,6 +2,7 @@ import platform
 import threading
 from typing import TYPE_CHECKING
 
+from hummingbot.client.native_commands import native_command_boundary
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 
@@ -17,6 +18,7 @@ class StopCommand:
             return
         safe_ensure_future(self.stop_loop(skip_order_cancellation), loop=self.ev_loop)
 
+    @native_command_boundary("stop")
     async def stop_loop(self,  # type: HummingbotApplication
                         skip_order_cancellation: bool = False):
         self.logger().info("stop command initiated.")
@@ -34,6 +36,7 @@ class StopCommand:
         # Stop strategy if running
         if self.trading_core._strategy_running:
             await self.trading_core.stop_strategy()
+        self.stop_market_event_notifiers()
 
         # Cancel outstanding orders
         if not skip_order_cancellation:
@@ -53,7 +56,7 @@ class StopCommand:
 
         # Stop markets recorder
         if self.trading_core.markets_recorder:
-            self.trading_core.markets_recorder.stop()
+            await self.trading_core.markets_recorder.stop_async()
             self.trading_core.markets_recorder = None
 
         # Clear strategy references

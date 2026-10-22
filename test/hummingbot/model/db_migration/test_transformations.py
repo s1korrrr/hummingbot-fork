@@ -1,7 +1,12 @@
 from unittest import TestCase
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from hummingbot.model.db_migration.transformations import AddTradeFeeInQuote, ConvertPriceAndAmountColumnsToBigint
+from hummingbot.model.db_migration.transformations import (
+    AddPositionHoldLedger,
+    AddTradeFeeInQuote,
+    ConvertPriceAndAmountColumnsToBigint,
+)
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
 
 
 class ConvertPriceAndAmountColumnsToBigintTests(TestCase):
@@ -41,3 +46,18 @@ class AddTradeFeeInQuoteTests(TestCase):
 
     def test_to_version(self):
         self.assertEqual(20230516, AddTradeFeeInQuote(self).to_version)
+
+
+class AddPositionHoldLedgerTests(TestCase):
+    def test_name(self):
+        self.assertEqual("AddPositionHoldLedger", AddPositionHoldLedger(self).name)
+
+    def test_to_version(self):
+        self.assertEqual(20260327, AddPositionHoldLedger(self).to_version)
+
+    def test_apply_creates_position_hold_ledger_table(self):
+        mock = MagicMock()
+        with patch.object(PositionHoldLedger.__table__, "create") as table_create:
+            AddPositionHoldLedger(migrator=self).apply(mock)
+
+        table_create.assert_called_once_with(bind=mock.engine, checkfirst=True)

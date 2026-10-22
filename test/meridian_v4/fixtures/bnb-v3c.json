@@ -1,0 +1,68 @@
+{
+  "acquisition": {
+    "cooldown_seconds": 1
+  },
+  "research": {
+    "adaptive_trailing": {
+      "activation_exponent": "0.70",
+      "activation_max": "0.05",
+      "activation_min": "0.003",
+      "baseline_atr_pct": "0.002",
+      "delta_exponent": "0.35",
+      "delta_max": "0.02",
+      "delta_min": "0.001",
+      "max_multiplier": "2.5",
+      "min_locked_profit": "0.010",
+      "min_multiplier": "0.5"
+    },
+    "bag": {
+      "chaser_distance_pct": "0.002",
+      "chaser_refresh_threshold_pct": "0.003",
+      "early_stop_drawdown_pct": "0.03",
+      "maker_fee_rate": "0.0008",
+      "min_profit_pct_for_sell": "0.02",
+      "price_tick": "0.1",
+      "recovery_arm_rsi": "65.0",
+      "recovery_rsi_rollover_delta": "2",
+      "recovery_target_pct": "0.02",
+      "recovery_trail_pullback_pct": "0.009000000000000001",
+      "remainder_sweep_quote": "5",
+      "sell_price_gap_pct": "0.01",
+      "sell_rsi_rollover_delta": "0.5",
+      "sell_trend_hold_min_confidence": "0.2",
+      "slice_quote": "200",
+      "stale_cancel_pct": "0.005",
+      "trend_adx_threshold": "18.0",
+      "trend_higher_records": "85",
+      "trend_sell_threshold_boost": "4.0",
+      "trend_short_records": "500"
+    },
+    "buy_gap": {
+      "atr_multiplier": "2.5",
+      "base_gap": "0.008",
+      "max_gap": "0.03",
+      "min_gap": "0.005"
+    },
+    "capital": {
+      "max_active_tranches": "64",
+      "slice_quote": "100"
+    },
+    "flash_crash": {
+      "cooldown_seconds": "300",
+      "drop_pct": "0.04",
+      "lookback": "5"
+    },
+    "wallet_quote": "1000000"
+  },
+  "schema": "spot_modular.minute_candidate.v1",
+  "signal": {
+    "max_atr_fraction": "0.0012",
+    "min_atr_fraction": "0.0002",
+    "oversold": "29.0",
+    "rsi_length": 17
+  },
+  "trailing": {
+    "activation": "0.025",
+    "delta": "0.005"
+  }
+}

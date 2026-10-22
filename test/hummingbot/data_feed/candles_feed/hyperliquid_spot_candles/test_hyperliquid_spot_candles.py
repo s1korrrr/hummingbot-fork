@@ -170,6 +170,31 @@ class TestHyperliquidSpotC0andles(TestCandlesBase):
         self.assertEqual(self.data_feed._universe, self.get_universe_data_mock())
 
     @aioresponses()
+    def test_initialize_coins_dict_skips_sparse_rows_and_resolves_requested_quote(self, mock_api):
+        universe = {
+            "tokens": [
+                {"index": 0, "name": "USDC"},
+                {"index": 150, "name": "HYPE"},
+                {"index": 235, "name": "USDE"},
+            ],
+            "universe": [
+                {"tokens": [999, 0], "name": "@invalid"},
+                {"tokens": [150, 0], "name": "@107"},
+                {"tokens": [150, 235], "name": "@255"},
+            ],
+        }
+        data_feed = HyperliquidSpotCandles(trading_pair="HYPE-USDC", interval="1m")
+        mock_api.post(url=data_feed.rest_url, payload=universe)
+
+        self.run_async_with_timeout(data_feed._initialize_coins_dict())
+
+        self.assertEqual(data_feed._coins_dict["HYPE"], "@107")
+        self.assertEqual(data_feed._coins_dict["HYPE-USDC"], "@107")
+        self.assertEqual(data_feed._coins_dict["HYPE-USDE"], "@255")
+        self.assertEqual(data_feed._rest_payload(start_time=1)["req"]["coin"], "@107")
+        self.assertEqual(data_feed.ws_subscription_payload()["subscription"]["coin"], "@107")
+
+    @aioresponses()
     def test_ping_pong(self, mock_api):
         self.assertEqual(self.data_feed._ping_payload, CONSTANTS.PING_PAYLOAD)
         self.assertEqual(self.data_feed._ping_timeout, CONSTANTS.PING_TIMEOUT)

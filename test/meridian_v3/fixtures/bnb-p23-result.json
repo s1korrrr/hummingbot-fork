@@ -1,0 +1,310 @@
+{
+  "artifacts": {
+    "bag_ledger": {
+      "bytes": 47299,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/runs/p23/bag_ledger.jsonl",
+      "sha256": "f324e6acbac2ff28e5b238f5451bc620af5a42ef3f3a70068c4bef02b30a9ace"
+    },
+    "entry_decisions": {
+      "bytes": 962157,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/runs/p23/entry_decisions.jsonl",
+      "sha256": "ef1add3750157801e23fa280daf1180789e6a208aefacc418b5373af2fa5474f"
+    },
+    "equity": {
+      "bytes": 7156465,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/runs/p23/equity.csv",
+      "sha256": "80cc1a3d5d9a3a52547b4dcdbbd8e62b4f046377e84cb738f1994e4255c7fee2"
+    },
+    "trades": {
+      "bytes": 67173,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/runs/p23/trades.jsonl",
+      "sha256": "b5dfb005bf640d2e7efef7d59c92a884cc82451db6e19a2525d9e0ccc58a2f56"
+    }
+  },
+  "bars": 177120,
+  "entry_eligibility": {
+    "outcomes": {
+      "ADMITTED": 149,
+      "BAG_GAP_NOT_MET": 38,
+      "BUY_GAP_NOT_MET": 432,
+      "DEPTH_BUDGET": 272,
+      "FLASH_CRASH_PAUSE": 295,
+      "MAX_EXECUTORS": 8
+    },
+    "signals": 1194
+  },
+  "metrics": {
+    "closed_trades": 149,
+    "final_equity_quote": 5961.727672750004,
+    "initial_cash_quote": 5000.0,
+    "max_drawdown_quote": -288.44358491000276,
+    "model_cost_fraction": 0.003,
+    "net_pnl_quote": 961.7276727500039,
+    "open_trades_at_end": 0,
+    "return_fraction": 0.1923455345500007,
+    "trades": 149
+  },
+  "model": {
+    "accounting": "SPOT_BUY_1X_SINGLE_PAIR_SIMULATOR",
+    "acquisition": {
+      "cooldown_seconds": 1,
+      "entry_timeout_seconds": 300,
+      "fractions": [
+        "0.200000",
+        "0.200000",
+        "0.200000",
+        "0.200000",
+        "0.200000"
+      ],
+      "minimum_drop": "0.008"
+    },
+    "candidate": {
+      "bytes": 1942,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/trials/p23/candidate.json",
+      "sha256": "28e41498968eef239d60c0af6d28120e66037758e582ef9d9f49997f2d911f3d"
+    },
+    "capital": "Live OK RSI capital model (controllers.generic.modular_spot_core.bag.live_capital_exposure/decision, shared with the controller and recomputed by the verifier for every capital decision), in the live gate order: fewer than max_active_tranches active buys; the slice_quote plan, first resized (live V2 funding, when funded_cap_quote is set) to (funded_cap_quote - max(0, net cash spent, inventory cost)) / (1 + funding_fee_reserve), at cost; then held bag (non-dust) plus active buys marked at the bar close plus the buy must stay within position_cap_quote when one is set (absent: no position cap). Without funding (V1) a buy the wallet cannot pay for is refused (live balance_low), wallet cash being equity minus inventory at mark (realized PnL is reinvested). With funding (V2) the buy never exceeds wallet cash net of the round-trip cost reserve (the research wallet, research.wallet_quote or the pair allocation, stays 1x cash); the live V2 strategy-wide allocation (2500 across pairs) is not modelled for this single pair, and funding cost is per lot where live blends one running average. The verifier re-derives every decision's active tranches, held bag, exposure, cash and funded used from the ledgers. Not modelled: dynamic signal-strength sizing (live dynamic_position_sizing, V2 0.5-1.0x, V1 0.5-1.25x; every buy plans the full slice_quote); the live buy-threshold shifts by HMM regime (+-3) and by trend confirmation (down trend: -0.4 x boost x confidence, floor 20); the adaptive (ATR-scaled 45-90 s) and consecutive-loss cooldowns (the sealed acquisition.cooldown_seconds applies instead) and the flash-crash pause unless research.flash_crash. The live scout/runner split is disabled in live (buy_confirmation_mode none). Replaces the fixed-allocation-at-cost entry capital of plain bag mode. research.depth_budget (a research setting, not live OK RSI) then refuses a buy when the bag at cost plus active buys at their quote plus the buy would exceed wallet x min(1, base_fraction + (1 - base_fraction) x depth / full_depth), depth being the price's drawdown below the higher of the highest closed-candle high over lookback_minutes and the held (non-dust) bag's breakeven; the verifier recomputes the recent high from the bars, the breakeven and deployed quote from the ledgers and the decision with the native function.",
+    "decision": "completed candle t enters no earlier than candle t+1 close",
+    "differences": [
+      "No native paper order, partial fill, cancel, spread, liquidity, or persistence lifecycle",
+      "Hummingbot simulator deducts combined round-trip fee and displacement as one trade_cost",
+      "Global Wilder RSI seed approximates native bounded-window reseeding",
+      "Native 90-second cooldown and five-stage dip condition rounded to 1m decisions",
+      "Native daily-loss/drawdown admission rails are not simulated",
+      "Cash admission reserves each active notional plus modeled round-trip cost; completed PnL restores cash"
+    ],
+    "displacement_bps_per_side": 7,
+    "entry": "market close fill on next bar; exported entry timestamp is close availability time, amount floored to BNB step",
+    "exit": "Native modular_spot bag decisions (controllers.generic.modular_spot_core.bag.decide, shared with the controller) replayed on a fixed intrabar candle path (open-low-high-close for up bars, open-high-low-close for down bars; the opposite ordering is not run). Tranches that never become bags exit on the Hummingbot simulator's close-based trailing stop; a tranche whose trailing exit lands on a bar cannot be moved into a bag by that bar's low. Active tranches down early_stop_drawdown_pct from fill are held with keep_position (no sale, slot freed); held inventory sells only via the recovery trail (net target, RSI-overbought arm, pullback or RSI rollover below EMA9, or the live sell signal at the first tick after a close unless trend-held) through a resting LIMIT_CHASER maker sell at market*(1+distance), floored at breakeven*(1+min_profit)+fees/amount grossed up by the maker fee, re-quoted on the chaser threshold, cancelled when stale under trend hold, filled on touch; the trail is frozen while a sell is live; remaining held inventory is marked at the final close. Per path point: fill on touch, then the live tick order (stale cancel, recovery, early stops), then the chaser requote. Entry capital in bag mode is the native fixed allocation minus active tranches and bag cost (no compounding; live OK RSI compounds via the wallet). Fee convention: the candle model charges the full round-trip cost at entry, so held fees (and therefore the 4% arm/delete line, the 2% sell-signal gate and the floor) are about 0.22 percentage points stricter than live, which carries only the entry fee. Not modelled: HMM regime threshold shift (regime treated as absent), queue position and partial fills, spread (ask = path price), shared-wallet balance caps, restarts. The 1% sell-gap reference is the newest filled bag sell among the 20 most recent stored executors (live orchestrator window; closed tranches, held tranches and finished bag sells). Market entries always fill here, so expired or unfilled live entries never take window slots, and partial fills are not modelled. Indicators: Wilder RSI, EMA span 9 (adjust=False), MACD 14/22/9, Wilder ATR 14; trend from the live analyze_rsi_trend_confirmation on 499 closed 1m candles and 5m/15m derived from 1274.",
+    "fee_per_side": ".0008",
+    "initial_cash": "5000",
+    "pair_quote_cap": "5000",
+    "promotion": "NONE",
+    "research": {
+      "adaptive_trailing": {
+        "activation_exponent": "0.70",
+        "activation_max": "0.05",
+        "activation_min": "0.003",
+        "baseline_atr_pct": "0.002",
+        "delta_exponent": "0.35",
+        "delta_max": "0.02",
+        "delta_min": "0.001",
+        "max_multiplier": "2.5",
+        "min_locked_profit": "0.013",
+        "min_multiplier": "0.5"
+      },
+      "bag": {
+        "chaser_distance_pct": "0.002",
+        "chaser_refresh_threshold_pct": "0.003",
+        "early_stop_drawdown_pct": "0.03",
+        "maker_fee_rate": "0.0008",
+        "min_profit_pct_for_sell": "0.02",
+        "price_tick": "0.01",
+        "recovery_arm_rsi": "65.0",
+        "recovery_rsi_rollover_delta": "2",
+        "recovery_target_pct": "0.02",
+        "recovery_trail_pullback_pct": "0.009000000000000001",
+        "remainder_sweep_quote": "5",
+        "sell_price_gap_pct": "0.01",
+        "sell_rsi_rollover_delta": "0.5",
+        "sell_trend_hold_min_confidence": "0.2",
+        "slice_quote": "200",
+        "stale_cancel_pct": "0.005",
+        "trend_adx_threshold": "18.0",
+        "trend_higher_records": "85",
+        "trend_sell_threshold_boost": "4.0",
+        "trend_short_records": "500"
+      },
+      "buy_gap": {
+        "atr_multiplier": "2.5",
+        "base_gap": "0.008",
+        "max_gap": "0.03",
+        "min_gap": "0.005"
+      },
+      "capital": {
+        "max_active_tranches": "8",
+        "slice_quote": "100"
+      },
+      "depth_budget": {
+        "base_fraction": "0.75",
+        "full_depth": "0.175",
+        "lookback_minutes": "1440"
+      },
+      "flash_crash": {
+        "cooldown_seconds": "29993",
+        "drop_pct": "0.01060362829599566",
+        "lookback": "17"
+      },
+      "max_hold_seconds": null,
+      "reuse_vacant_stages": false,
+      "stop_loss": null,
+      "wallet_quote": "5000"
+    },
+    "round_trip_cost_fraction": "0.003",
+    "signal": {
+      "breakout_lookback": 20,
+      "kind": "rsi_rebound",
+      "max_atr_fraction": "0.01",
+      "min_atr_fraction": "0.0002",
+      "oversold": "29.0",
+      "require_uptrend": true,
+      "rsi_length": 17
+    },
+    "trailing": {
+      "activation": "0.04",
+      "delta": "0.005"
+    }
+  },
+  "pair": "BNB-USDC",
+  "prepared": {
+    "bytes": 57346,
+    "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/trials/p23/prepared.json",
+    "sha256": "a2d4e2479676bfe620d1904ec32c44c3220342a6615307fb7dae8872990d5283"
+  },
+  "resolution": "1m",
+  "runtime_identity": {
+    "kind": "LOCAL_CANDLE_BACKTEST",
+    "network": "FORBIDDEN_SOCKET_GUARD",
+    "python_executable": "/Users/s1kor/anaconda3/envs/hummingbot/bin/python3.13",
+    "python_sha256": "050174ce713e424283f6a5a5de88f8d9edff63f60c6b1b66461baa9e4455fa08",
+    "python_version": "3.13.13"
+  },
+  "schema": "spot_modular.minute_result.v1",
+  "source_files": [
+    {
+      "bytes": 76287,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/quants/scripts/research/spot_modular_minute.py",
+      "sha256": "f182d7542539d61e1a217bfcdc77a909de786df8f1b87cc20697a8b0234898f2"
+    },
+    {
+      "bytes": 54858,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/quants/core/backtesting/spot_modular_minute.py",
+      "sha256": "98ecf59661f2ee38549d2afe2a04c9ace83bf5804ad6502ae93d94cbc2a54c17"
+    },
+    {
+      "bytes": 13049,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/quants/core/backtesting/engine.py",
+      "sha256": "2f8fad4e0143aaab6da3511d576d024c82765f6f70a33cabdb5652500f1ff131"
+    },
+    {
+      "bytes": 203,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/controllers/generic/modular_spot_core/acquisition.py",
+      "sha256": "db1ff2012c37c50fd4b003063d6823957a930fe6e0e01905f2279f2d7d9c17fb"
+    },
+    {
+      "bytes": 3153,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/controllers/generic/modular_spot_core/config.py",
+      "sha256": "3d0fc2d08124ed85a9b32322f5881cc8a1c57bac5943c3dbb0489791777fcf9b"
+    },
+    {
+      "bytes": 198,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/controllers/generic/modular_spot_core/domain.py",
+      "sha256": "8baa19a62ce4e002eb398eeead526465cc859b419d3857c90d1170757eeaaa8d"
+    },
+    {
+      "bytes": 1656,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/controllers/generic/modular_spot_core/signals.py",
+      "sha256": "b906eb3a99bcf8cb1ec62874cf3459406fb89a0cbce73c381181e16a31abca62"
+    },
+    {
+      "bytes": 3020,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/controllers/shared/trailing.py",
+      "sha256": "b16d7bcd226851014f6409aac1571b51ce32c5b2f948290920af048ee7326b0c"
+    },
+    {
+      "bytes": 29471,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/controllers/generic/modular_spot_core/bag.py",
+      "sha256": "df5e06d515f111e1be97a1a2ea9e09406b3244ac032e8b88c793c690082f2bfd"
+    },
+    {
+      "bytes": 8135,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/controllers/directional_trading/rsi_signals.py",
+      "sha256": "ffbed24745dea67bb5dfe0290b3115af210296641ed617b93bae8b33dc3eebc3"
+    },
+    {
+      "bytes": 4996,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/components/candle_aggregation.py",
+      "sha256": "b5b67496af99cb9562014190fa12cb7d64f75c7d7e194ee47e36b2222c6756e1"
+    },
+    {
+      "bytes": 53466,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/utils/market_analysis.py",
+      "sha256": "491c447f0f87da06b8a7cec65215c9ba1f79d99e0c8a79052aa6ad52ea842bae"
+    },
+    {
+      "bytes": 22751,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/data_feed/candles_feed/candles_base.py",
+      "sha256": "301258166e4d8ccfe3d2b0b6070051ba128b62d8371c98c6719a1809693bcd59"
+    },
+    {
+      "bytes": 18104,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/components/held_inventory.py",
+      "sha256": "780045cfb7480793a07bebacb388df35d80654bb7ae0c6dcef0c3cb75f2cc214"
+    },
+    {
+      "bytes": 864,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/components/acquisition.py",
+      "sha256": "c0786dd85c3ea69f5efb01b6f2b6a6b48a5545bf17d3266cdb89c65011a0cb80"
+    },
+    {
+      "bytes": 1828,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/components/config.py",
+      "sha256": "9b86f6745166b8c7f866459af1ffd5912e5fda7db4b76925ffc9b997e3480a18"
+    },
+    {
+      "bytes": 1192,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/components/domain.py",
+      "sha256": "6aee8f6e832535a2baadacdfaf64e5487d58a75c7c5e251aa23d5b46ad316407"
+    },
+    {
+      "bytes": 21111,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/backtesting/backtesting_engine_base.py",
+      "sha256": "0984377ce23675aacc58285f0fe98ab1cc0279c30aa1f1e7ca4aa016c38152a1"
+    },
+    {
+      "bytes": 8493,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/backtesting/backtesting_data_provider.py",
+      "sha256": "edef84f20616e1f163355cc567a2aedff612b824b678090a6383264ad2cfcf19"
+    },
+    {
+      "bytes": 3746,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/backtesting/executor_simulator_base.py",
+      "sha256": "019977a67fe17cafefd644323fefa39c42ca61445522eda140ac2fcc7bd6b9e0"
+    },
+    {
+      "bytes": 5015,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/backtesting/executors_simulator/position_executor_simulator.py",
+      "sha256": "a6a39cc2b103503878ffa92976e3b4219d5cb50e3b208529b086a2004d8703ab"
+    },
+    {
+      "bytes": 39939,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/controllers/controller_base.py",
+      "sha256": "0dc64dbc506a2c122554457b8e3424690e5f9492332ce98b907a9bb5e0e88da7"
+    },
+    {
+      "bytes": 950,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/models/executor_actions.py",
+      "sha256": "9158a732c6878c8d1cc2a00937b8b3960ef7c41395f7ed7abe278c85d94fab93"
+    },
+    {
+      "bytes": 2834,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/models/executors.py",
+      "sha256": "b58ed634bb09294199f9e2e42d09f67fee18349f5e707c30912a7c83a58d6dd2"
+    },
+    {
+      "bytes": 3413,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/models/executors_info.py",
+      "sha256": "e3d0192055934244026a324a4e051b14b0e66d09fada2c4bede2ca9176c51710"
+    },
+    {
+      "bytes": 3925,
+      "path": "/Users/s1kor/dev/trading/rsibot/quants-lab/output/backtests/bnb_spot_modular/campaigns/records/bnb-20260925-tuning-v3-depth-06/source/hb-0d179c02_q-cf24a6c/hummingbot/hummingbot/strategy_v2/executors/position_executor/data_types.py",
+      "sha256": "41e7c2feb29a3a0df1b646b7ab2b28a0e30f0ea6638b6e45805b684ce9cbbd08"
+    }
+  ],
+  "status": "COMPLETED_CANDLE_MODEL",
+  "window": [
+    1777593600,
+    1788220800
+  ]
+}

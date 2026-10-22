@@ -8,7 +8,14 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional
 from cachetools import TTLCache
 
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import (
+    OKX_FILL_TIME_SOURCE,
+    InFlightOrder,
+    OrderState,
+    OrderUpdate,
+    TradeUpdate,
+    normalize_execution_timestamp_ms,
+)
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
 from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
@@ -162,6 +169,10 @@ class ClientOrderTracker:
             elif order.is_failure:
                 # If the order is marked as failed but is still in the tracking states, it was a lost order
                 self._lost_orders[order.client_order_id] = order
+            elif order.order_fills or order.recorder_pending_events:
+                # A terminal financial or order-status receipt may be present
+                # because recorder ACK had not completed when state was saved.
+                self._cached_orders[order.client_order_id] = order
 
     def fetch_tracked_order(self, client_order_id: str) -> Optional[InFlightOrder]:
         return self._in_flight_orders.get(client_order_id, None)
@@ -200,16 +211,38 @@ class ClientOrderTracker:
     def process_order_update(self, order_update: OrderUpdate):
         return safe_ensure_future(self._process_order_update(order_update))
 
+    async def process_order_update_and_wait(self, order_update: OrderUpdate):
+        """Apply a venue update and await recorder durability before cleanup."""
+        await self._process_order_update(order_update)
+
     def process_trade_update(self, trade_update: TradeUpdate):
         client_order_id: str = trade_update.client_order_id
 
         tracked_order: Optional[InFlightOrder] = self.all_fillable_orders.get(client_order_id)
 
         if tracked_order:
+            if trade_update.receipt_timestamp is None:
+                trade_update = trade_update._replace(receipt_timestamp=self.current_timestamp)
             previous_executed_amount_base: Decimal = tracked_order.executed_amount_base
 
             updated: bool = tracked_order.update_with_trade_update(trade_update)
             if updated:
+                execution_timestamp_ms = None
+                execution_timestamp_source = None
+                if (trade_update.execution_timestamp_source == OKX_FILL_TIME_SOURCE
+                        and type(trade_update.execution_timestamp_ms) is int):
+                    execution_timestamp_ms = normalize_execution_timestamp_ms(
+                        trade_update.execution_timestamp_ms, self.current_timestamp
+                    )
+                    if execution_timestamp_ms is not None:
+                        execution_timestamp_source = OKX_FILL_TIME_SOURCE
+                if ((trade_update.execution_timestamp_ms is not None
+                     or trade_update.execution_timestamp_source is not None)
+                        and execution_timestamp_ms is None):
+                    self.logger().warning(
+                        "Invalid fill execution-time attestation for %s/%s; fill remains recorded without it",
+                        trade_update.client_order_id, trade_update.trade_id,
+                    )
                 self._trigger_order_fills(
                     tracked_order=tracked_order,
                     prev_executed_amount_base=previous_executed_amount_base,
@@ -218,7 +251,27 @@ class ClientOrderTracker:
                     fill_fee=trade_update.fee,
                     trade_id=trade_update.trade_id,
                     exchange_order_id=trade_update.exchange_order_id,
+                    is_taker=trade_update.is_taker,
+                    execution_timestamp_ms=execution_timestamp_ms,
+                    execution_timestamp_source=execution_timestamp_source,
+                    receipt_timestamp=trade_update.receipt_timestamp,
                 )
+            return updated
+        return False
+
+    async def process_trade_update_and_wait(self, trade_update: TradeUpdate) -> bool:
+        """Process one fill and await any registered recorder's durable ACK."""
+        if trade_update.receipt_timestamp is None:
+            trade_update = trade_update._replace(receipt_timestamp=self.current_timestamp)
+        updated = self.process_trade_update(trade_update)
+        from hummingbot.connector.markets_recorder import MarketsRecorder
+
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is not None:
+            # A duplicate is not proof that the first callback committed. Its
+            # exact receipt may still be retained for retry after a prior error.
+            await recorder.flush_financial_events()
+        return updated
 
     async def process_order_not_found(self, client_order_id: str):
         """
@@ -287,12 +340,32 @@ class ClientOrderTracker:
                         f"The complete update will be processed with incomplete information."
                     )
 
+            terminal = order_update.new_state in {OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED}
+            if terminal:
+                # Status polling may race a separate user-stream coroutine. Do
+                # not evict a terminal order until its exact fill receipts ACK.
+                from hummingbot.connector.markets_recorder import MarketsRecorder
+
+                recorder = MarketsRecorder.get_existing_instance()
+                if recorder is not None:
+                    await recorder.flush_financial_events()
+
             previous_state: OrderState = tracked_order.current_state
 
             updated: bool = tracked_order.update_with_order_update(order_update)
             if updated:
                 self._trigger_order_creation(tracked_order, previous_state, order_update.new_state)
-                self._trigger_order_completion(tracked_order, order_update)
+                self._trigger_order_completion(tracked_order, order_update, defer_cleanup=True)
+            # Callback writes may already be pending from an earlier delivery
+            # that failed its ACK. Flush even for duplicate updates so redelivery
+            # can recover rather than falsely report settlement.
+            from hummingbot.connector.markets_recorder import MarketsRecorder
+
+            recorder = MarketsRecorder.get_existing_instance()
+            if recorder is not None:
+                await recorder.flush_financial_events()
+            if terminal:
+                self.stop_tracking_order(tracked_order.client_order_id)
         else:
             lost_order = self.fetch_lost_order(
                 client_order_id=order_update.client_order_id, exchange_order_id=order_update.exchange_order_id
@@ -341,11 +414,14 @@ class ClientOrderTracker:
         fill_fee: TradeFeeBase,
         trade_id: str,
         exchange_order_id: str,
+        execution_timestamp_ms: Optional[int] = None,
+        execution_timestamp_source: Optional[str] = None,
+        receipt_timestamp: Optional[float] = None,
     ):
         self._connector.trigger_event(
             MarketEvent.OrderFilled,
             OrderFilledEvent(
-                timestamp=self.current_timestamp,
+                timestamp=self.current_timestamp if receipt_timestamp is None else receipt_timestamp,
                 order_id=order.client_order_id,
                 trading_pair=order.trading_pair,
                 trade_type=order.trade_type,
@@ -357,6 +433,8 @@ class ClientOrderTracker:
                 leverage=int(order.leverage),
                 position=order.position.value,
                 exchange_order_id=exchange_order_id,
+                execution_timestamp_ms=execution_timestamp_ms,
+                execution_timestamp_source=execution_timestamp_source,
             ),
         )
 
@@ -406,12 +484,14 @@ class ClientOrderTracker:
                              fill_price: Decimal,
                              fill_fee: TradeFeeBase,
                              trade_id: str,
-                             exchange_order_id: str):
+                             exchange_order_id: str,
+                             is_taker: bool = True,
+                             execution_timestamp_ms: Optional[int] = None,
+                             execution_timestamp_source: Optional[str] = None,
+                             receipt_timestamp: Optional[float] = None):
         if prev_executed_amount_base < tracked_order.executed_amount_base:
             self.logger().info(
-                f"The {tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} "
-                f"amounting to {tracked_order.executed_amount_base}/{tracked_order.amount} {tracked_order.base_asset} "
-                f"has been filled at {fill_price} {tracked_order.quote_asset}."
+                tracked_order.build_order_filled_message(fill_price, fill_fee, is_taker)
             )
             self._trigger_filled_event(
                 order=tracked_order,
@@ -420,9 +500,13 @@ class ClientOrderTracker:
                 fill_fee=fill_fee,
                 trade_id=trade_id,
                 exchange_order_id=exchange_order_id,
+                execution_timestamp_ms=execution_timestamp_ms,
+                execution_timestamp_source=execution_timestamp_source,
+                receipt_timestamp=receipt_timestamp,
             )
 
-    def _trigger_order_completion(self, tracked_order: InFlightOrder, order_update: Optional[OrderUpdate] = None):
+    def _trigger_order_completion(self, tracked_order: InFlightOrder, order_update: Optional[OrderUpdate] = None,
+                                  defer_cleanup: bool = False):
         if tracked_order.is_open:
             return
 
@@ -438,7 +522,8 @@ class ClientOrderTracker:
             self._trigger_failure_event(tracked_order, order_update)
             self.logger().info(f"Order {tracked_order.client_order_id} has failed. Order Update: {order_update}")
 
-        self.stop_tracking_order(tracked_order.client_order_id)
+        if not defer_cleanup:
+            self.stop_tracking_order(tracked_order.client_order_id)
 
     @staticmethod
     def _restore_order_from_json(serialized_order: Dict):

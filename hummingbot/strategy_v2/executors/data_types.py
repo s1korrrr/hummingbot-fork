@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Literal, Optional
 
 import base58
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from hummingbot.client.settings import AllConnectorSettings
 from hummingbot.core.data_type.common import TradeType
@@ -13,8 +13,17 @@ from hummingbot.core.data_type.common import TradeType
 
 class ExecutorConfigBase(BaseModel):
     id: str = None  # Make ID optional
-    type: Literal["position_executor", "dca_executor", "grid_executor", "order_executor",
-                  "xemm_executor", "arbitrage_executor", "twap_executor", "lp_executor"]
+    type: Literal[
+        "position_executor",
+        "absolute_barrier_position_executor",
+        "dca_executor",
+        "grid_executor",
+        "order_executor",
+        "xemm_executor",
+        "arbitrage_executor",
+        "twap_executor",
+        "lp_executor",
+    ]
     timestamp: Optional[float] = None
     controller_id: str = "main"
 
@@ -38,6 +47,8 @@ class ExecutorConfigBase(BaseModel):
 
 
 class ConnectorPair(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     connector_name: str
     trading_pair: str
 
@@ -45,9 +56,6 @@ class ConnectorPair(BaseModel):
         return self.connector_name in sorted(
             AllConnectorSettings.get_gateway_amm_connector_names()
         )
-
-    class Config:
-        frozen = True  # This makes the model immutable and thus hashable
 
     def __iter__(self):
         yield self.connector_name
@@ -64,6 +72,11 @@ class PositionSummary(BaseModel):
     unrealized_pnl_quote: Decimal
     realized_pnl_quote: Decimal
     cum_fees_quote: Decimal
+    remaining_fees_quote: Optional[Decimal] = None
+    mark_price_quote: Optional[Decimal] = None
+    mark_observed_at: Optional[str] = None
+    mark_timestamp_semantics: Optional[str] = None
+    mark_availability: str = "unavailable"
 
     @property
     def amount_quote(self) -> Decimal:

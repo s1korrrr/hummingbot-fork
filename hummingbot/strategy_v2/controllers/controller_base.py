@@ -9,7 +9,6 @@ from pydantic import ConfigDict, Field, field_validator
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.core.data_type.common import MarketDict, PositionAction, PriceType, TradeType
-from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy_v2.executors.order_executor.data_types import (
@@ -26,7 +25,8 @@ from hummingbot.strategy_v2.models.position_config import InitialPositionConfig
 from hummingbot.strategy_v2.runnable_base import RunnableBase
 
 if TYPE_CHECKING:
-    from hummingbot.strategy_v2.executors.data_types import PositionSummary
+    from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase, PositionSummary
+    from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
 
 
 @dataclass
@@ -205,16 +205,42 @@ class ControllerBase(RunnableBase):
         self.executors_update_event = asyncio.Event()
         self.executors_info_queue = asyncio.Queue()
 
+    def validate_executor_config(self, config: "ExecutorConfigBase") -> bool:
+        """Recheck the current controller stop state at the execution boundary."""
+        return self.status == RunnableStatus.RUNNING and not self.config.manual_kill_switch
+
+    def get_executor_class_for_config(
+        self,
+        config: "ExecutorConfigBase",
+    ) -> Optional[type["ExecutorBase"]]:
+        """Return a controller-local executor implementation override.
+
+        Default controllers use the orchestrator's immutable type mapping.
+        Specialized controllers may override this hook without changing executor
+        construction for any other controller in the process.
+        """
+        return None
+
     def start(self):
         """
-        Allow controllers to be restarted after being stopped.
+        Restart a stopped controller after its previous loop finishes cleanup.
+        A pending stop raises RuntimeError; the caller must retry after it drains.
         """
         if self._status != RunnableStatus.RUNNING:
-            self.terminated.clear()
-            self._status = RunnableStatus.RUNNING
+            self._assert_control_loop_stopped()
+            was_ready = self.executors_update_event.is_set()
             self.executors_update_event.set()
-            safe_ensure_future(self.control_loop())
+            try:
+                self._start_control_loop()
+            except BaseException:
+                if not was_ready:
+                    self.executors_update_event.clear()
+                raise
+
+    async def on_start(self):
+        # Reader/feed I/O belongs to the accepted loop and its finalizer.
         self.initialize_candles()
+        await super().on_start()
 
     def initialize_candles(self):
         """
@@ -251,10 +277,34 @@ class ControllerBase(RunnableBase):
         Update the controller configuration. With the variables that in the client_data have the is_updatable flag set
         to True. This will be only available for those variables that don't interrupt the bot operation.
         """
-        for name, field_info in self.config.__class__.model_fields.items():
-            json_schema_extra = field_info.json_schema_extra or {}
-            if json_schema_extra.get("is_updatable", False):
-                setattr(self.config, name, getattr(new_config, name))
+        requested = new_config.model_dump()
+        # Some controllers intentionally omit a default from their canonical
+        # serialization to preserve a pre-upgrade identity hash. Compare the
+        # actual validated fields so an unchanged reload remains well-defined.
+        validated = type(self.config).model_validate(requested)
+        restart_fields = []
+        for name, field_info in type(self.config).model_fields.items():
+            if (getattr(self.config, name) != getattr(validated, name)
+                    and not (field_info.json_schema_extra or {}).get("is_updatable", False)):
+                restart_fields.append(name)
+        if restart_fields:
+            raise ValueError("restart required for config fields: " + ", ".join(restart_fields))
+        # Validate a complete snapshot, then swap it. Assignment validation on individual fields can mutate
+        # the original object before a coupled-field validator raises.
+        self.config = validated
+
+    def build_chart_snapshot_rows(self, bot_name: str) -> List[Dict[str, object]]:
+        """
+        Optional hook for controllers that want to persist per-candle visual state
+        for the reporting dashboard. Default controllers do not emit chart snapshots.
+        """
+        return []
+
+    def chart_snapshot_prune_requests(self) -> List[Dict[str, object]]:
+        """
+        Optional hook for controllers that want recorder-side retention pruning.
+        """
+        return []
 
     async def control_task(self):
         if self.market_data_provider.ready and self.executors_update_event.is_set():

@@ -1,4 +1,7 @@
 import asyncio
+import json
+import os
+import time
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,18 +16,67 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import (
+    OKX_FILL_TIME_SOURCE,
+    InFlightOrder,
+    OrderState,
+    OrderUpdate,
+    TradeUpdate,
+    normalize_execution_timestamp_ms,
+)
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+from hummingbot.core.data_type.terminal_reconciliation import terminal_reconciliation
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
+def _discard_task_result(task: asyncio.Task) -> None:
+    try:
+        task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
+
+
+class OkxOrderRejectedError(IOError):
+    """The exchange explicitly rejected this submission (distinct from transport uncertainty)."""
+
+
+# The compiled network loop (NetworkIterator) marks a connector NOT_CONNECTED, silently and without stop_network(),
+# when one check call outlives check_network_timeout (a stalled event loop or a paused Docker VM), and calls
+# start_network() on the next good check. start_network() stops and rebuilds every order book, the user stream and
+# the polling tasks. While networking was never stopped and the previous good check is this recent, that rebuild
+# only discards healthy state (measured 2026-09-26: V2 926 s of cold books from 12 such rebuilds in 5 h), so it is
+# skipped. A longer silence, or any logged stop, still rebuilds.
+NETWORK_REBUILD_GAP_SECONDS = 120.0
+
+
 class OkxExchange(ExchangePyBase):
 
+    UNATTENDED_RESTART_HOLD_CONTRACT_VERSION = 1
+    supports_terminal_fill_reconciliation = True
+
     web_utils = web_utils
+
+    def _execution_timestamp_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        observed_at_seconds = self.current_timestamp
+        execution_timestamp_ms = normalize_execution_timestamp_ms(
+            data.get("fillTime"), observed_at_seconds
+        )
+        if execution_timestamp_ms is None:
+            return {
+                "execution_timestamp_ms": None,
+                "execution_timestamp_source": None,
+                "execution_timestamp_observed_at_ms": None,
+            }
+        return {
+            "execution_timestamp_ms": execution_timestamp_ms,
+            "execution_timestamp_source": OKX_FILL_TIME_SOURCE,
+            "execution_timestamp_observed_at_ms": int(observed_at_seconds * 1000),
+        }
 
     def __init__(self,
                  okx_api_key: str,
@@ -45,7 +97,31 @@ class OkxExchange(ExchangePyBase):
         self.okx_registration_sub_domain = okx_registration_sub_domain or "www"
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        self._last_traded_price_source_timestamps = {}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
+        self._spot_ticker_lock = asyncio.Lock()
+        self._spot_ticker_cache = None
+        self.check_network_timeout = 30.0
+        self._networking_running = False
+        self._last_good_network_check = None
+        self._good_network_check_gap = None
+
+    async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
+        if os.environ.get('RSIBOT_V2_UNATTENDED_RESTART_HOLD') == '1':
+            raise RuntimeError('V2 unattended restart hold forbids order submission')
+        if os.environ.get('RSIBOT_V2_DURABLE_ORDER_TRACKING') == '1':
+            from hummingbot.connector.markets_recorder import MarketsRecorder
+            recorder = MarketsRecorder.get_existing_instance()
+            if (recorder is None or recorder.config_file_path not in {'rsi_modular_v2.yml', 'meridian_v3.yml'}
+                    or self not in recorder._markets):
+                raise ValueError('A matching durable V2 or Meridian V3 native recorder is required before submission')
+            # The existing MarketState is the native order-tracker checkpoint,
+            # including PENDING_CREATE. Commit its client ID before venue I/O.
+            # Keep the historical namespace for existing recovery readers; the
+            # immutable receipt and MarketState checkpoint commit together.
+            await recorder.store_submitted_order_checkpoint_async(
+                recorder.config_file_path, self, order.to_json(), order.client_order_id)
+        return await super()._place_order_and_process_update(order, **kwargs)
 
     @property
     def authenticator(self):
@@ -54,6 +130,11 @@ class OkxExchange(ExchangePyBase):
             secret_key=self.okx_secret_key,
             passphrase=self.okx_passphrase,
             time_provider=self._time_synchronizer)
+
+    async def native_orders_reconciled(self) -> bool:
+        from hummingbot.connector.exchange.okx.native_reconciliation import verify_no_open_orders
+
+        return await verify_no_open_orders(self)
 
     @property
     def name(self) -> str:
@@ -87,6 +168,51 @@ class OkxExchange(ExchangePyBase):
     def check_network_request_path(self):
         return CONSTANTS.OKX_SERVER_TIME_PATH
 
+    async def check_network(self) -> NetworkStatus:
+        probe = asyncio.create_task(self._make_network_check_request())
+        try:
+            done, _pending = await asyncio.wait({probe}, timeout=4.0)
+            if probe not in done:
+                probe.cancel()
+                probe.add_done_callback(_discard_task_result)
+                if getattr(self, "_okx_time_ok", False):
+                    return self._good_network_check()
+                return NetworkStatus.NOT_CONNECTED
+            exc = probe.exception()
+            if exc is not None:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc
+                self._okx_time_ok = False
+                return NetworkStatus.NOT_CONNECTED
+            self._okx_time_ok = True
+            return self._good_network_check()
+        except asyncio.CancelledError:
+            if not probe.done():
+                probe.cancel()
+                probe.add_done_callback(_discard_task_result)
+            raise
+
+    def _good_network_check(self) -> NetworkStatus:
+        now = time.monotonic()
+        last = self._last_good_network_check
+        self._good_network_check_gap = None if last is None else now - last
+        self._last_good_network_check = now
+        return NetworkStatus.CONNECTED
+
+    async def start_network(self):
+        gap = self._good_network_check_gap
+        if self._networking_running and gap is not None and gap <= NETWORK_REBUILD_GAP_SECONDS:
+            self.logger().info(f"Network check recovered {gap:.0f} s after the previous good check and networking was "
+                               "never stopped; keeping the running order books and streams.")
+            return
+        self._networking_running = False
+        await super().start_network()
+        self._networking_running = True
+
+    async def stop_network(self):
+        self._networking_running = False
+        await super().stop_network()
+
     @property
     def trading_pairs(self):
         return self._trading_pairs
@@ -103,23 +229,28 @@ class OkxExchange(ExchangePyBase):
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER, OrderType.MARKET]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception):
-        error_description = str(request_exception)
-        is_time_synchronizer_related = '"code":"50113"' in error_description
-        return is_time_synchronizer_related
+        # RESTAssistant includes the response body after "Error: ". Only an explicit
+        # timestamp rejection is safe to retry; 50113 means invalid signature.
+        try:
+            response = json.loads(str(request_exception).split("Error: ", 1)[-1])
+        except (TypeError, ValueError):
+            return False
+        return isinstance(response, dict) and response.get("code") == "50102"
+
+    async def _recover_time_synchronizer(self, rejected_generation: int):
+        # Recovery is serialized with initialization, and concurrent rejected
+        # requests reuse a successful replacement instead of flooding public/time.
+        await self._time_synchronizer.reset_server_time_offset_with_time_provider(
+            time_provider=self.web_utils.get_current_server_time(throttler=self._throttler, domain=self.domain),
+            rejected_generation=rejected_generation,
+        )
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        # TODO: implement this method correctly for the connector
-        # The default implementation was added when the functionality to detect not found orders was introduced in the
-        # ExchangePyBase class. Also fix the unit test test_lost_order_removed_if_not_found_during_order_status_update
-        # when replacing the dummy implementation
+        # Missing history is not a terminal order acknowledgement. Keep ownership until an explicit final state.
         return False
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        # TODO: implement this method correctly for the connector
-        # The default implementation was added when the functionality to detect not found orders was introduced in the
-        # ExchangePyBase class. Also fix the unit test test_cancel_order_not_found_in_the_exchange when replacing the
-        # dummy implementation
-        # _place_cancel already takes care of all expected exceptions.
+        # Cancellation acceptance / missing-order replies are asynchronous and require final status reconciliation.
         return False
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
@@ -190,6 +321,9 @@ class OkxExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
 
+        if os.environ.get('RSIBOT_V2_UNATTENDED_RESTART_HOLD') == '1':
+            raise RuntimeError('V2 unattended restart hold forbids order submission')
+
         data = {
             "clOrdId": order_id,
             "tdMode": "cash",
@@ -213,8 +347,20 @@ class OkxExchange(ExchangePyBase):
         )
         data = exchange_order_id["data"][0]
         if data["sCode"] != "0":
-            raise IOError(f"Error submitting order {order_id}: {data['sMsg']}")
+            raise OkxOrderRejectedError(f"Error submitting order {order_id}: {data['sCode']}: {data['sMsg']}")
         return str(data["ordId"]), self.current_timestamp
+
+    def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
+                          order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):
+        if isinstance(exception, OkxOrderRejectedError):
+            order = self._order_tracker.fetch_order(order_id)
+            if order is not None and order.exchange_order_id is None and order.executed_amount_base == 0:
+                order.terminal_reconciliation = terminal_reconciliation(order, 'okx_submission_rejected_v1', 'REJECTED', '0')
+            return super()._on_order_failure(order_id, trading_pair, amount, trade_type, order_type, price, exception, **kwargs)
+        self.logger().error(
+            f"Submission status unknown for {order_id}: {type(exception).__name__}: {exception}. "
+            "Keeping the client order identity reserved; polling order details before any retry."
+        )
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         """
@@ -242,29 +388,74 @@ class OkxExchange(ExchangePyBase):
 
         return final_result
 
-    async def get_last_traded_prices(self, trading_pairs: List[str] = None) -> Dict[str, float]:
-        params = {"instType": "SPOT"}
+    async def _spot_ticker_snapshot(self) -> Tuple[Dict[str, float], Dict[str, Optional[float]]]:
+        # ponytail: 2s all-spot ticker cache; provider-level batch if 5s still times out
+        async with self._spot_ticker_lock:
+            now = time.monotonic()
+            cached = self._spot_ticker_cache
+            if cached is not None and now - cached[0] < 2.0:
+                return cached[1], cached[2]
+            resp_json = await self._api_get(
+                path_url=CONSTANTS.OKX_TICKERS_PATH,
+                params={"instType": "SPOT"},
+            )
+            prices: Dict[str, float] = {}
+            timestamps: Dict[str, Optional[float]] = {}
+            for ticker in resp_json["data"]:
+                last = ticker.get("last")
+                if not last:
+                    continue
+                inst_id = ticker["instId"]
+                prices[inst_id] = float(last)
+                try:
+                    source_timestamp = Decimal(str(ticker.get("ts"))) / Decimal("1000")
+                    timestamps[inst_id] = (
+                        float(source_timestamp)
+                        if source_timestamp.is_finite() and source_timestamp > 0
+                        else None
+                    )
+                except (ArithmeticError, TypeError, ValueError):
+                    timestamps[inst_id] = None
+            self._spot_ticker_cache = (time.monotonic(), prices, timestamps)
+            return prices, timestamps
 
-        if trading_pairs and len(trading_pairs) == 1:
-            return {trading_pairs[0]: await self._get_last_traded_price(trading_pairs[0])}
-        resp_json = await self._api_get(
-            path_url=CONSTANTS.OKX_TICKERS_PATH,
-            params=params,
-        )
-        # some markets have no last traded price, so filter them out
-        last_traded_prices = {ticker["instId"]: float(ticker["last"]) for ticker in resp_json["data"] if ticker["last"]}
-        return last_traded_prices
-
-    async def _get_last_traded_price(self, trading_pair: str) -> float:
+    async def _fetch_single_ticker(self, trading_pair: str) -> float:
         params = {"instId": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)}
-
         resp_json = await self._api_request(
             path_url=CONSTANTS.OKX_TICKER_PATH,
             params=params,
         )
-
         ticker_data, *_ = resp_json["data"]
+        try:
+            source_timestamp = Decimal(str(ticker_data.get("ts"))) / Decimal("1000")
+            source_timestamp = float(source_timestamp) if source_timestamp.is_finite() and source_timestamp > 0 else None
+        except (ArithmeticError, TypeError, ValueError):
+            source_timestamp = None
+        if not hasattr(self, "_last_traded_price_source_timestamps"):
+            self._last_traded_price_source_timestamps = {}
+        self._last_traded_price_source_timestamps[trading_pair] = source_timestamp
         return float(ticker_data["last"])
+
+    async def get_last_traded_prices(self, trading_pairs: List[str] = None) -> Dict[str, float]:
+        if trading_pairs and len(trading_pairs) == 1:
+            return {trading_pairs[0]: await self._fetch_single_ticker(trading_pairs[0])}
+        prices, _timestamps = await self._spot_ticker_snapshot()
+        if not trading_pairs:
+            return prices
+        return {pair: prices[pair] for pair in trading_pairs if pair in prices}
+
+    async def _get_last_traded_price(self, trading_pair: str) -> float:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        prices, timestamps = await self._spot_ticker_snapshot()
+        if symbol not in prices:
+            raise IOError(f"OKX ticker missing last price for {symbol}")
+        if not hasattr(self, "_last_traded_price_source_timestamps"):
+            self._last_traded_price_source_timestamps = {}
+        self._last_traded_price_source_timestamps[trading_pair] = timestamps.get(symbol)
+        return prices[symbol]
+
+    def last_traded_price_source_timestamp(self, trading_pair: str) -> Optional[float]:
+        return self._last_traded_price_source_timestamps.get(trading_pair)
 
     async def _update_balances(self):
         msg = await self._api_request(
@@ -302,11 +493,14 @@ class OkxExchange(ExchangePyBase):
             path_url=self.trading_rules_request_path,
             params={"instType": "SPOT"},
         )
+        # Refresh the symbol map from this payload first: the rules are formatted from the same payload and
+        # resolve each instrument through the map, so a pair that went live since the last refresh must be in it
+        # (otherwise every new listing logged "Error parsing the trading pair rule" with a KeyError once).
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
         trading_rules_list = await self._format_trading_rules(exchange_info)
         self._trading_rules.clear()
         for trading_rule in trading_rules_list:
             self._trading_rules[trading_rule.trading_pair] = trading_rule
-        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=exchange_info)
 
     async def _format_trading_rules(self, raw_trading_pair_info: List[Dict[str, Any]]) -> List[TradingRule]:
         trading_rules = []
@@ -375,25 +569,81 @@ class OkxExchange(ExchangePyBase):
                     fill_quote_amount=Decimal(fill_data["fillSz"]) * Decimal(fill_data["fillPx"]),
                     fill_price=Decimal(fill_data["fillPx"]),
                     fill_timestamp=int(fill_data["ts"]) * 1e-3,
+                    is_taker=self._is_taker_fill(fill_data),
+                    **self._execution_timestamp_fields(fill_data),
                 )
                 trade_updates.append(trade_update)
 
         return trade_updates
+
+    def _is_taker_fill(self, data: Dict[str, Any]) -> bool:
+        role = data.get("execType")
+        if role == "M":
+            return False
+        if role != "T":
+            self.logger().warning("OKX fill execution role unavailable; treating as taker trade_id=%s",
+                                  data.get("tradeId"))
+        return True
+
+    @staticmethod
+    def _okx_order_misc_updates(data: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        source = data.get("cancelSource")
+        if source is None:
+            return None
+        text = str(source).strip()
+        if not text:
+            return None
+        return {"cancel_source": text}
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         updated_order_data = await self._request_order_update(order=tracked_order)
 
         order_data = updated_order_data["data"][0]
         new_state = CONSTANTS.ORDER_STATE[order_data["state"]]
+        if new_state in {OrderState.CANCELED, OrderState.FILLED}:
+            await self._reconcile_terminal_order_fills(tracked_order, order_data)
 
+        misc_updates = self._okx_order_misc_updates(order_data)
+        # Funding release requires the actual venue identity, not the request's
+        # substituted client ID. Older incomplete status fixtures remain usable
+        # by ordinary status polling but cannot attest funding release.
+        if (new_state in {OrderState.CANCELED, OrderState.FILLED}
+                and order_data.get('clOrdId') == tracked_order.client_order_id
+                and order_data.get('side') == tracked_order.trade_type.name.lower()
+                and order_data.get('instId')
+                and order_data['instId'] == await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair)):
+            misc_updates = dict(misc_updates or {})
+            misc_updates['terminal_reconciliation'] = terminal_reconciliation(
+                tracked_order, 'okx_terminal_status_v1', new_state.name, order_data['accFillSz'])
+        cancel_source = None if misc_updates is None else misc_updates.get("cancel_source")
+        if cancel_source:
+            tracked_order.cancel_source = cancel_source
         order_update = OrderUpdate(
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=str(order_data["ordId"]),
             trading_pair=tracked_order.trading_pair,
             update_timestamp=int(order_data["uTime"]) * 1e-3,
             new_state=new_state,
+            misc_updates=misc_updates,
         )
         return order_update
+
+    async def _reconcile_terminal_order_fills(self, order: InFlightOrder, data: Dict[str, Any]):
+        try:
+            expected = Decimal(str(data["accFillSz"]))
+            exchange_id = str(data["ordId"])
+        except (KeyError, ValueError, ArithmeticError) as exc:
+            raise IOError("Terminal order fill total is unavailable") from exc
+        if not expected.is_finite() or expected < 0 or expected > order.amount:
+            raise IOError("Terminal order fill total is invalid")
+        if not exchange_id or (order.exchange_order_id is not None and exchange_id != order.exchange_order_id):
+            raise IOError("Terminal order identity differs from the tracked order")
+        order.update_exchange_order_id(exchange_id)
+        if order.executed_amount_base < expected:
+            for trade_update in await self._all_trade_updates_for_order(order):
+                await self._order_tracker.process_trade_update_and_wait(trade_update)
+        if order.executed_amount_base != expected:
+            raise IOError(f"Terminal fill reconciliation pending: expected={expected}, observed={order.executed_amount_base}")
 
     async def _user_stream_event_listener(self):
         async for stream_message in self._iter_user_event_queue():
@@ -428,18 +678,23 @@ class OkxExchange(ExchangePyBase):
                                 fill_quote_amount=Decimal(data["fillSz"]) * Decimal(data["fillPx"]),
                                 fill_price=Decimal(data["fillPx"]),
                                 fill_timestamp=int(data["uTime"]) * 1e-3,
+                                is_taker=self._is_taker_fill(data),
+                                **self._execution_timestamp_fields(data),
                             )
-                            self._order_tracker.process_trade_update(trade_update)
+                            await self._order_tracker.process_trade_update_and_wait(trade_update)
 
                         if updatable_order is not None:
+                            if order_status in {OrderState.CANCELED, OrderState.FILLED}:
+                                await self._reconcile_terminal_order_fills(updatable_order, data)
                             order_update = OrderUpdate(
                                 trading_pair=updatable_order.trading_pair,
                                 update_timestamp=int(data["uTime"]) * 1e-3,
                                 new_state=order_status,
                                 client_order_id=updatable_order.client_order_id,
                                 exchange_order_id=str(data["ordId"]),
+                                misc_updates=self._okx_order_misc_updates(data),
                             )
-                            self._order_tracker.process_order_update(order_update=order_update)
+                            await self._order_tracker.process_order_update_and_wait(order_update=order_update)
 
                 elif channel == CONSTANTS.OKX_WS_ACCOUNT_CHANNEL:
                     for data in stream_message.get("data", []):

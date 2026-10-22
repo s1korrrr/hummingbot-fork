@@ -5,10 +5,13 @@ import functools
 import logging
 import threading
 import time
+import weakref
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal
+from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from hummingbot import get_logging_conf
@@ -21,15 +24,19 @@ if TYPE_CHECKING:  # pragma: no cover
     from hummingbot.client.hummingbot_application import HummingbotApplication  # noqa: F401
     from hummingbot.core.event.event_listener import EventListener  # noqa: F401
 
+from commlib.endpoints import EndpointState
 from commlib.node import Node, NodeState
 from commlib.transports.mqtt import ConnectionParameters as MQTTConnectionParameters
 
+from hummingbot.client.native_commands import NativeCommands
+from hummingbot.client.native_lifecycle import NativeLifecycle, publish_lifecycle
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, DeductedFromReturnsTradeFee
 from hummingbot.core.event import events
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.pubsub import PubSub
 from hummingbot.core.utils.async_utils import call_sync, safe_ensure_future
 from hummingbot.notifier.notifier_base import NotifierBase
+from hummingbot.remote_iface import commlib_compat
 from hummingbot.remote_iface.messages import (
     MQTT_STATUS_CODE,
     BalanceLimitCommandMessage,
@@ -40,12 +47,16 @@ from hummingbot.remote_iface.messages import (
     ImportCommandMessage,
     InternalEventMessage,
     LogMessage,
+    NativeCommandMessage,
     NotifyMessage,
     StartCommandMessage,
     StatusCommandMessage,
     StatusUpdateMessage,
     StopCommandMessage,
 )
+
+# One RPC endpoint thread per command must not spin the GIL away from the event loop.
+commlib_compat.install()
 
 mqtts_logger: HummingbotLogger = None
 
@@ -142,7 +153,26 @@ class MQTTCommands:
             on_request=self._on_cmd_balance_paper
         )
 
+        from hummingbot.client.native_commands import NativeCommands
+
+        if isinstance(getattr(self._hb_app, "native_commands", None), NativeCommands):
+            self._node.create_rpc(
+                rpc_name=f"{TopicSpecs.PREFIX.format(namespace=self._node.namespace, instance_id=self._hb_app.instance_id)}/native_command",
+                msg_type=NativeCommandMessage,
+                on_request=self._on_cmd_native,
+            )
+
+    def _on_cmd_native(self, msg: NativeCommandMessage.Request):
+        request = msg.model_dump()
+        try:
+            result = call_sync(self._hb_app.native_commands.execute(request), loop=self._ev_loop, timeout=42)
+        except Exception as error:
+            result = self._hb_app.native_commands._response(request, False, False, f"Native RPC failed: {type(error).__name__}")
+        return NativeCommandMessage.Response(**result)
+
     def _on_cmd_start(self, msg: StartCommandMessage.Request):
+        if isinstance(getattr(self._hb_app, "native_commands", None), NativeCommands):
+            return StartCommandMessage.Response(status=MQTT_STATUS_CODE.ERROR, msg="Use identity-bound native_command in native mode")
         response = StartCommandMessage.Response()
         timeout = 30
         try:
@@ -178,6 +208,8 @@ class MQTTCommands:
         return response
 
     def _on_cmd_stop(self, msg: StopCommandMessage.Request):
+        if isinstance(getattr(self._hb_app, "native_commands", None), NativeCommands):
+            return StopCommandMessage.Response(status=MQTT_STATUS_CODE.ERROR, msg="Use identity-bound native_command in native mode")
         response = StopCommandMessage.Response()
         timeout = 30
         try:
@@ -201,6 +233,8 @@ class MQTTCommands:
         return response
 
     def _on_cmd_config(self, msg: ConfigCommandMessage.Request):
+        if isinstance(getattr(self._hb_app, "native_commands", None), NativeCommands):
+            return ConfigCommandMessage.Response(status=MQTT_STATUS_CODE.ERROR, msg="Use identity-bound native_command in native mode")
         response = ConfigCommandMessage.Response()
         try:
             if len(msg.params) == 0:
@@ -251,6 +285,8 @@ class MQTTCommands:
         return response
 
     def _on_cmd_import(self, msg: ImportCommandMessage.Request):
+        if isinstance(getattr(self._hb_app, "native_commands", None), NativeCommands):
+            return ImportCommandMessage.Response(status=MQTT_STATUS_CODE.ERROR, msg="Use identity-bound native_command in native mode")
         response = ImportCommandMessage.Response()
         timeout = 30  # seconds
         strategy_name = msg.strategy
@@ -278,7 +314,7 @@ class MQTTCommands:
         response = StatusCommandMessage.Response()
         timeout = 30  # seconds
         try:
-            if self._hb_app.strategy is None:
+            if self._hb_app.trading_core.strategy is None:
                 response.status = MQTT_STATUS_CODE.ERROR
                 response.msg = 'No strategy is currently running!'
                 return response
@@ -316,6 +352,8 @@ class MQTTCommands:
         return response
 
     def _on_cmd_balance_limit(self, msg: BalanceLimitCommandMessage.Request):
+        if isinstance(getattr(self._hb_app, "native_commands", None), NativeCommands):
+            return BalanceLimitCommandMessage.Response(status=MQTT_STATUS_CODE.ERROR, msg="Use identity-bound native_command in native mode")
         response = BalanceLimitCommandMessage.Response()
         try:
             data = self._hb_app.balance(
@@ -329,6 +367,8 @@ class MQTTCommands:
         return response
 
     def _on_cmd_balance_paper(self, msg: BalancePaperCommandMessage.Request):
+        if isinstance(getattr(self._hb_app, "native_commands", None), NativeCommands):
+            return BalancePaperCommandMessage.Response(status=MQTT_STATUS_CODE.ERROR, msg="Use identity-bound native_command in native mode")
         response = BalancePaperCommandMessage.Response()
         try:
             data = self._hb_app.balance(
@@ -527,6 +567,7 @@ class MQTTStatusUpdates:
             topic=self._topic,
             msg_type=StatusUpdateMessage
         )
+        self.dropped_status_update_count = 0
 
         if self._node.state == NodeState.RUNNING:
             self.status_updates_pub.run()
@@ -536,13 +577,16 @@ class MQTTStatusUpdates:
             self._ev_loop.call_soon_threadsafe(self.add_msg_to_queue, msg, msg_type)
             return
 
-        self.status_updates_pub.publish(
-            StatusUpdateMessage(
-                msg=msg,
-                type=msg_type,
-                timestamp=int(time.time() * 1e3)
+        try:
+            self.status_updates_pub.publish(
+                StatusUpdateMessage(
+                    msg=msg,
+                    type=msg_type,
+                    timestamp=int(time.time() * 1e3)
+                )
             )
-        )
+        except Exception:
+            self.dropped_status_update_count += 1
 
     def stop(self):
         self.status_updates_pub.stop()
@@ -572,7 +616,14 @@ class MQTTGateway(Node):
                  ):
         self._health = False
         self._initial_connection_succeeded = False
+        self._construction_complete = False
+        self._unhealthy_since = None
         self._restarting = False
+        self._reconnect_lock = asyncio.Lock()
+        self._reconnect_owner = None
+        self._retained_publishers = weakref.WeakSet()
+        self._retained_listeners = set()
+        self._native_lifecycle_task = None
         self._stop_event_async = asyncio.Event()
         self._notifier: MQTTNotifier = None
         self._status_updates: MQTTStatusUpdates = None
@@ -580,6 +631,8 @@ class MQTTGateway(Node):
         self._commands: MQTTCommands = None
         self._logh: MQTTLogHandler = None
         self._external_events: MQTTExternalEvents = None
+        self._transport_disconnect_errors = 0
+        self._last_transport_disconnect_error: Optional[Exception] = None
         self._hb_app: "HummingbotApplication" = hb_app
         self._ev_loop = self._hb_app.ev_loop
         self._params = self._create_mqtt_params_from_conf()
@@ -605,7 +658,7 @@ class MQTTGateway(Node):
 
     @property
     def health(self):
-        return self._health
+        return self._health and not self._restarting
 
     def _safe_get_log_handlers(self, max_tries=3):  # pragma: no cover
         current_try = 0
@@ -619,19 +672,11 @@ class MQTTGateway(Node):
         return list([logging.getLogger(name) for name in log_keys])
 
     def _remove_log_handlers(self):  # pragma: no cover
-        loggers = self._safe_get_log_handlers()
-        log_conf = get_logging_conf()
-
-        if 'loggers' not in log_conf:
+        if self._logh is None:
             return
-
-        logs = [key for key, val in log_conf.get('loggers').items()]
-        for logger in loggers:
-            if 'hummingbot' in logger.name:
-                for log in logs:
-                    if log in logger.name:
-                        self.remove_log_handler(logger)
-
+        for logger in self._safe_get_log_handlers() + [self._get_root_logger()]:
+            logger.removeHandler(self._logh)
+        self._logh.close()
         self._logh = None
 
     def _init_logger(self):
@@ -668,6 +713,69 @@ class MQTTGateway(Node):
 
     def add_log_handler(self, logger: HummingbotLogger):
         logger.addHandler(self._logh)
+
+    def _reset_node_executor_after_stop(self):
+        old_executor = getattr(self, "_executor", None)
+        if old_executor is not None:
+            try:
+                old_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:  # pragma: no cover - for older ThreadPoolExecutor implementations
+                old_executor.shutdown(wait=False)
+            except Exception:
+                self.logger().debug("Failed to shut down stale MQTT node executor.", exc_info=True)
+
+        self._executor = ThreadPoolExecutor()
+        self._workers = []
+
+    def _patch_endpoint_disconnect_handler(self, endpoint):
+        transport = getattr(endpoint, "_transport", None)
+        client = getattr(transport, "_client", None)
+        if (
+            transport is None
+            or client is None
+            or getattr(transport, "_hbot_disconnect_handler_patched", False) is True
+        ):
+            return endpoint
+
+        def safe_on_disconnect(client_obj, userdata, rc, *args, **kwargs):
+            # commlib's callback calls loop_stop and synchronously reconnects,
+            # even for an intentional disconnect (rc=0). That competes with our
+            # serialized gateway recovery and can deadlock shutdown in thread
+            # joins. Paho owns its I/O loop; the gateway owns endpoint recovery.
+            transport._connected = False
+            self._health = False
+            if rc != 0:
+                self._transport_disconnect_errors += 1
+                self._last_transport_disconnect_error = ConnectionError(f'MQTT disconnected: {rc}')
+            return None
+
+        client.on_disconnect = safe_on_disconnect
+        transport._hbot_disconnect_handler_patched = True
+        return endpoint
+
+    def create_publisher(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_publisher(*args, **kwargs))
+
+    def create_mpublisher(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_mpublisher(*args, **kwargs))
+
+    def create_subscriber(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_subscriber(*args, **kwargs))
+
+    def create_psubscriber(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_psubscriber(*args, **kwargs))
+
+    def create_rpc(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_rpc(*args, **kwargs))
+
+    def create_rpc_client(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_rpc_client(*args, **kwargs))
+
+    def create_action(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_action(*args, **kwargs))
+
+    def create_action_client(self, *args, **kwargs):
+        return self._patch_endpoint_disconnect_handler(super().create_action_client(*args, **kwargs))
 
     def _init_notifier(self):
         if self._hb_app.client_config_map.mqtt_bridge.mqtt_notifier:
@@ -742,7 +850,9 @@ class MQTTGateway(Node):
         return conn_params
 
     def _check_connections(self) -> bool:
-        if self._restarting:
+        # A failed first publisher leaves empty endpoint lists. Empty lists do
+        # not establish a working gateway or permit the monitor to stop retrying.
+        if self._restarting or not self._construction_complete or not self._publishers:
             return False
         for c in self._publishers:
             if not c._transport.is_connected:
@@ -774,21 +884,76 @@ class MQTTGateway(Node):
             self._health = await self._ev_loop.run_in_executor(
                 None, self._check_connections)
             if self.health:
+                self._unhealthy_since = None
                 if not self._initial_connection_succeeded:
                     self._initial_connection_succeeded = True
                     self._hb_app.logger().debug('Monitoring MQTT Gateway health for disconnections.')
-
-                await asyncio.sleep(self._INTERVAL_HEALTH_CHECK)
-            elif self._initial_connection_succeeded and not self._stop_event_async.is_set():
-                await self._restart_gateway()
+            elif self._initial_connection_succeeded and not self._stop_event_async.is_set() and not self._restarting:
+                now = self._ev_loop.time()
+                if self._unhealthy_since is None:
+                    self._unhealthy_since = now
+                # A freshly created publisher connects asynchronously. Keep health
+                # false, but do not tear down the whole gateway for that handshake.
+                elif now - self._unhealthy_since >= 5.0:
+                    await self._restart_gateway()
+                    self._unhealthy_since = None
+            await asyncio.sleep(self._INTERVAL_HEALTH_CHECK)
 
     async def _restart_gateway(self):
+        async with self._reconnect_lock:
+            self._reconnect_owner = asyncio.current_task()
+            try:
+                await self._restart_gateway_owned()
+            finally:
+                self._reconnect_owner = None
+
+    async def _stop_transports_for_reconnect(self):
+        # Detach event-loop owners before transport threads are joined. Node.stop
+        # owns only commlib endpoints; it must not block strategy ticks.
+        if self._native_lifecycle_task is not None:
+            self._native_lifecycle_task.cancel()
+            self._native_lifecycle_task = None
+        self.broadcast_status_update("offline", msg_type="availability")
+        self._remove_notifier()
+        self._remove_log_handlers()
+        self._remove_market_event_listeners()
+        self._status_updates = None
+        teardown = self._ev_loop.run_in_executor(None, self._stop_node_transports)
+        cancelled = None
+        while True:
+            try:
+                await asyncio.shield(teardown)
+                break
+            except asyncio.CancelledError as exc:
+                # A worker thread cannot be cancelled. Retain exclusive ownership
+                # until it exits, including when a caller's timeout cancels us.
+                cancelled = exc
+        if cancelled is not None:
+            raise cancelled
+
+    def _stop_node_transports(self):
+        # Connection health can change between checks. Join every captured
+        # transport unconditionally before Node.stop performs endpoint cleanup.
+        endpoints = (self._publishers + self._subscribers + self._rpc_services
+                     + self._rpc_clients + self._action_services + self._action_clients)
+        for endpoint in endpoints:
+            endpoint._transport.stop()
+            endpoint._state = EndpointState.DISCONNECTED
+        super().stop()
+
+    async def _restart_gateway_owned(self):
         self._hb_app.logger().warning('MQTT Gateway is disconnected, attempting to reconnect.')
 
         try:
             self._restarting = True
-            self.stop(False)
+            self._health = False
+            self._construction_complete = False
+            external_listeners = self._external_events._listeners if self._external_events is not None else None
+            await self._stop_transports_for_reconnect()
             await asyncio.sleep(self._INTERVAL_RESTART_SHORT)
+            self._reset_node_executor_after_stop()
+            self._params = self._create_mqtt_params_from_conf()
+            self._conn_params = self._params
 
             self._publishers = []
             self._subscribers = []
@@ -796,7 +961,11 @@ class MQTTGateway(Node):
             # self._rpc_clients = []
 
             self.start(False)
-            if self._hb_app.strategy is not None:
+            if external_listeners is not None and self._external_events is not None:
+                self._external_events._listeners = external_listeners
+            for retained in list(self._retained_publishers) + list(self._retained_listeners):
+                retained._rebind()
+            if getattr(getattr(self._hb_app, "trading_core", None), "strategy", None) is not None:
                 self.start_market_events_fw()
 
             await asyncio.sleep(self._INTERVAL_RESTART_SHORT)
@@ -807,10 +976,17 @@ class MQTTGateway(Node):
                 None, self._check_connections)
 
             if self._health:
-                self._hb_app.logger().warning('MQTT Gateway successfully reconnected.')
+                self._hb_app.logger().info('MQTT Gateway successfully reconnected.')
 
         except Exception as e:
-            self._hb_app.logger().error(f'MQTT Gateway failed to reconnect: {e}. Sleeping 10 seconds before retry.')
+            self._health = False
+            self._construction_complete = False
+            self._hb_app.logger().error(
+                f'MQTT Gateway failed to reconnect: {type(e).__name__}: {e}. Sleeping 10 seconds before retry.',
+                exc_info=True,
+            )
+        finally:
+            self._restarting = False
 
         await asyncio.sleep(self._INTERVAL_RESTART_LONG)
 
@@ -818,6 +994,10 @@ class MQTTGateway(Node):
         self._stop_event_async.set()
 
     def start(self, with_health: bool = True) -> None:
+        if self._restarting and asyncio.current_task() is not self._reconnect_owner:
+            raise RuntimeError("MQTT reconnect teardown is still in progress")
+        self._construction_complete = False
+        self._health = False
         self._init_logger()
         self._init_notifier()
         self._init_status_updates()
@@ -827,10 +1007,26 @@ class MQTTGateway(Node):
         if with_health:
             self._start_health_monitoring_loop()
 
+        observer = getattr(self._hb_app, "native_lifecycle", None)
+        native_pub = self.create_mpublisher() if isinstance(observer, NativeLifecycle) else None
         self.run()
+        if native_pub is not None:
+            self._native_lifecycle_task = safe_ensure_future(
+                publish_lifecycle(observer, self._hb_app.trading_core, native_pub,
+                                  f"{self._topic_prefix}/native_lifecycle", self._hb_app.logger()),
+                loop=self._ev_loop,
+            )
         self.broadcast_status_update("online", msg_type="availability")
+        self._construction_complete = True
 
     def stop(self, with_health: bool = True):
+        if self._restarting:
+            raise RuntimeError("MQTT reconnect teardown is still in progress")
+        self._construction_complete = False
+        self._health = False
+        if self._native_lifecycle_task is not None:
+            self._native_lifecycle_task.cancel()
+            self._native_lifecycle_task = None
         self.broadcast_status_update("offline", msg_type="availability")
         super().stop()
         if self._hb_thread:
@@ -869,10 +1065,46 @@ class MQTTLogHandler(logging.Handler):
         self.name = self.__class__.__name__
         self.log_pub = self._node.create_publisher(topic=self._topic,
                                                    msg_type=LogMessage)
+        self.dropped_log_count = 0
+        self._pending = Queue(maxsize=256)
+        self._stopping = threading.Event()
+        self._queue_lock = threading.Lock()
+        self._worker = threading.Thread(target=self._publish_pending, name="mqtt-log-publisher", daemon=True)
+        self._worker.start()
+
+    def _publish_pending(self):
+        while not self._stopping.is_set():
+            try:
+                message = self._pending.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                if self._stopping.is_set():
+                    self.dropped_log_count += 1
+                else:
+                    self.log_pub.publish(message)
+            except Exception:
+                self.dropped_log_count += 1
+            finally:
+                self._pending.task_done()
+
+    def close(self):
+        # Do not join a potentially blocked transport on the strategy thread.
+        # At most one publish is in flight; queued observations are retired.
+        with self._queue_lock:
+            self._stopping.set()
+            while True:
+                try:
+                    self._pending.get_nowait()
+                except Empty:
+                    break
+                self.dropped_log_count += 1
+                self._pending.task_done()
+        super().close()
 
     def emit(self, record: logging.LogRecord):
-        if threading.current_thread() != threading.main_thread():  # pragma: no cover
-            self._ev_loop.call_soon_threadsafe(self.emit, record)
+        if self._stopping.is_set():
+            self.dropped_log_count += 1
             return
         msg_str = self.format(record)
         msg = LogMessage(
@@ -883,7 +1115,14 @@ class MQTTLogHandler(logging.Handler):
             logger_name=record.name
 
         )
-        self.log_pub.publish(msg)
+        with self._queue_lock:
+            if self._stopping.is_set():
+                self.dropped_log_count += 1
+                return
+            try:
+                self._pending.put_nowait(msg)
+            except Full:
+                self.dropped_log_count += 1
 
 
 class MQTTExternalEvents:
@@ -984,13 +1223,21 @@ class ETopicListener:
         else:
             self._topic = topic
         self._on_message = on_message
+        self._node._retained_listeners.add(self)
+        self._sub = None
+        if not self._node._restarting:
+            self._rebind()
+
+    def _rebind(self):
         self._sub = self._node.create_psubscriber(topic=self._topic,
                                                   on_message=self._on_message)
         if self._node.state == NodeState.RUNNING:
             self._sub.run()
 
     def stop(self):
-        self._sub.stop()
+        self._node._retained_listeners.discard(self)
+        if self._sub is not None and not self._node._restarting:
+            self._sub.stop()
 
 
 class EEventQueueFactory:
@@ -1135,6 +1382,12 @@ class ETopicPublisher:
             self._topic = f'{self._topic_prefix}/{topic}'
         else:
             self._topic = topic
+        self._node._retained_publishers.add(self)
+        self._pub = None
+        if not self._node._restarting:
+            self._rebind()
+
+    def _rebind(self):
         self._pub = self._node.create_mpublisher()
         if self._node.state == NodeState.RUNNING:
             self._pub.run()
@@ -1143,6 +1396,8 @@ class ETopicPublisher:
         if threading.current_thread() != threading.main_thread():  # pragma: no cover
             asyncio.get_event_loop().call_soon_threadsafe(self.send, msg)
             return
+        if self._pub is None:
+            raise RuntimeError("MQTT publisher is awaiting reconnect")
         self._pub.publish(msg, self._topic)
 
     def __call__(self, msg: Dict[str, Any]):
@@ -1161,6 +1416,12 @@ class EMTopicPublisher:
             instance_id=self._node._hb_app.instance_id
         )
 
+        self._node._retained_publishers.add(self)
+        self._pub = None
+        if not self._node._restarting:
+            self._rebind()
+
+    def _rebind(self):
         self._pub = self._node.create_mpublisher()
         if self._node.state == NodeState.RUNNING:
             self._pub.run()
@@ -1170,6 +1431,8 @@ class EMTopicPublisher:
             asyncio.get_event_loop().call_soon_threadsafe(self.send, msg)
             return
         _topic = self._make_topic(topic)
+        if self._pub is None:
+            raise RuntimeError("MQTT publisher is awaiting reconnect")
         self._pub.publish(msg, _topic)
 
     def _make_topic(self, topic: str):

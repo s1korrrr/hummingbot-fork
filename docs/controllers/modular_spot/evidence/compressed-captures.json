@@ -1,0 +1,157 @@
+{
+  "reason": "Preserve byte-exact historical captures without text normalization and satisfy the 500 KiB repository file limit. Local original captures remain protected and unchanged. Decompress each published_path to recover original_path bytes.",
+  "captures": [
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/checks/rust-candles-native-final.xml",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/checks/rust-candles-native-final.xml.gz",
+      "original_sha256": "1d2788e37c702965a103ee0ae4cfd5cb38db13f20705d9784250a4ea3e891ee1",
+      "published_sha256": "b5ba05f1ccc4728290d76f18b978a8721b11520875d9dce0e0983c70d7e74b02",
+      "original_bytes": 94216,
+      "published_bytes": 11671
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/checks/rust-candles-native-final2.xml",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/checks/rust-candles-native-final2.xml.gz",
+      "original_sha256": "c08de017fc13c9df0a352906b5cdf5ac7e4a3bf30e2b72dacc883327b84bf1b4",
+      "published_sha256": "0c25f02a1b5e71ef4af1e7ec24429ca85c950b2a89740e91dda2fb202c717095",
+      "original_bytes": 94519,
+      "published_bytes": 11743
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/compatibility/config-proof.py",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/compatibility/config-proof.py.gz",
+      "original_sha256": "c72c0e2419a86b540181a6ab3c8d577fdbb94ba1650a11234fe953af5daa40bf",
+      "published_sha256": "2f31940bd65393d4ea24b2dda59979782caedd749dace8dfb934f6087b962dac",
+      "original_bytes": 3239,
+      "published_bytes": 1454
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/instruments-response.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/instruments-response.json.gz",
+      "original_sha256": "401ecddf47cb4829a0cf281c47b0cbf1e4f054da33af2cea1e9c10431ed75279",
+      "published_sha256": "b4aea9dec4852d5e575a3c49287660e0be8f308ae6c1c4f67dc0ea44138d771a",
+      "original_bytes": 1525906,
+      "published_bytes": 42006
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/smoke-15m-3/adapter-receipts.jsonl",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/smoke-15m-3/adapter-receipts.jsonl.gz",
+      "original_sha256": "4e1f81d29aca1a252e608c5e381c1ae2adda51c77771a30f15cd33bb406ca472",
+      "published_sha256": "5174b71d032b8289d010168895b4ebf05b6150d1f4e6f37ded65a68ad495b70c",
+      "original_bytes": 2126391,
+      "published_bytes": 106259
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/smoke-15m-3/health.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-rust-candles/smoke-15m-3/health.json.xz",
+      "original_sha256": "08c34d5c349496a8b7bea0fea74f1b7392091428b581667ff8e33b05d3aba330",
+      "published_sha256": "f850b5356e0eab16ce768c8603e8eb95c847122aa831510064f900828410f9c7",
+      "original_bytes": 13561473,
+      "published_bytes": 57848
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/checks/pr57-universe-final.xml",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/checks/pr57-universe-final.xml.gz",
+      "original_sha256": "9e364485d41642c66e0bc56710f748153601f1a1da5a39592875f081cb7aa982",
+      "published_sha256": "aec5b84f69e48ee16af9c95d8b7111523a2100773debb36888c5fdccc8be5e0a",
+      "original_bytes": 88752,
+      "published_bytes": 11147
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/api-compatibility.patch",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/api-compatibility.patch.gz",
+      "original_sha256": "5647ffc84ac7ac060d27d4c030168e71c9e77a9020c055c8086dc59dc602379b",
+      "published_sha256": "5853aea03c335445e6329940cbaefdd5f644140f4f04dd98bb210e532d75e247",
+      "original_bytes": 7807,
+      "published_bytes": 2465
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/api-native-optional-schemas.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/api-native-optional-schemas.json.gz",
+      "original_sha256": "d2f0b7f20ec7b35777961a10ac7dea9e63ea7210933ebcabf656ce456b715624",
+      "published_sha256": "86d08a3e1d3832befb99ad3412bcc6ad5575b8d93010a65a8455078e9ca81f13",
+      "original_bytes": 2764,
+      "published_bytes": 530
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/api_native_roundtrip.py",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/api_native_roundtrip.py.gz",
+      "original_sha256": "9c2ca3d98550f4790f0f4d627155899589b6f8d6bdcb4d449760e2ad1e13a437",
+      "published_sha256": "24874657e948abc97a798228a26012e056bcff8cc73302983ec6ae7b2c1f45c9",
+      "original_bytes": 1096,
+      "published_bytes": 572
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/after/check.py",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/after/check.py.gz",
+      "original_sha256": "28ae09e9923ec1eb727efcd29aed9f835a9321c08c200120ee6f25326e35cdff",
+      "published_sha256": "ea04e412b09b0af15fb242a114f251ccccc89a58dd01e5cc6c8be7cd0629c3ef",
+      "original_bytes": 4624,
+      "published_bytes": 1923
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/after/evidence.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/after/evidence.json.gz",
+      "original_sha256": "b0d2b2cc7da3ce08758d25994541c601834f4af935d3d1a2e49e45c71b0eaaf0",
+      "published_sha256": "eab71cb19cec02931647502f7962caf8820e4b31396385622f01bc8ee247cb15",
+      "original_bytes": 1680,
+      "published_bytes": 654
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/baseline/check.py",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/baseline/check.py.gz",
+      "original_sha256": "f979488accdd17e552281fbc70635bc90474e70ae7ef44709393ffb0b8f76109",
+      "published_sha256": "245a77869d62a7ddf90956daa75d18a248005fb6df27e590c8373927ae6e6c83",
+      "original_bytes": 4594,
+      "published_bytes": 1913
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/baseline/evidence.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/capacity/baseline/evidence.json.gz",
+      "original_sha256": "501820e939220b32f76ac2882224f9f6df3ca443a6f6bfa375ab6396d3607e23",
+      "published_sha256": "6044d2363a245f7a7082bdfa563605a0da06e57ced60614dedbc60693a068b4a",
+      "original_bytes": 1686,
+      "published_bytes": 653
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/native-exports/custom-packet.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/native-exports/custom-packet.json.gz",
+      "original_sha256": "290187f50eea4de5e18c44ee2d04af9bc1c6fdcad317b90ac42284001f5d463f",
+      "published_sha256": "c06a1f6c5d8349e9c686209bfd4ee59909a444045201b3bc5fb75d5b1c7e3306",
+      "original_bytes": 14069,
+      "published_bytes": 3151
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/native-exports/default-packet.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/native-exports/default-packet.json.gz",
+      "original_sha256": "bb2a9a337958598ed3ea59298b523558425477f086fd662fecaadc2af99218db",
+      "published_sha256": "c5fe87ebe7a6dff91d6ef26664b3c3408474c578907a0c00555549f4be16801d",
+      "original_bytes": 14120,
+      "published_bytes": 3171
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/native-exports/receipt.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/native-exports/receipt.json.gz",
+      "original_sha256": "0f6ae3ab1f391adfe9928170195972a2ef60a8bedb41cfe4ac9f66ad25ba97f7",
+      "published_sha256": "a0c7fdc0d495e73a2137748635bc2d9c05bf6bda49541634982bcc9da265ff50",
+      "original_bytes": 2669,
+      "published_bytes": 1038
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/pr188-native-owner-handoff-fix.patch",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/compatibility/pr188-native-owner-handoff-fix.patch.gz",
+      "original_sha256": "eff4852e144b347d6ecb8cf7a59c13a0c17ed0c9be545ee37822c6b2ed6557f2",
+      "published_sha256": "f5cbae8a8b8a2d2f2a3b57ab9e702d73b994420f500b4cc2f7fd505092f1dca9",
+      "original_bytes": 5815,
+      "published_bytes": 1855
+    },
+    {
+      "original_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/instruments-response.json",
+      "published_path": "docs/controllers/modular_spot/evidence/2026-09-19-universe/instruments-response.json.gz",
+      "original_sha256": "401ecddf47cb4829a0cf281c47b0cbf1e4f054da33af2cea1e9c10431ed75279",
+      "published_sha256": "b4aea9dec4852d5e575a3c49287660e0be8f308ae6c1c4f67dc0ea44138d771a",
+      "original_bytes": 1525906,
+      "published_bytes": 42006
+    }
+  ]
+}

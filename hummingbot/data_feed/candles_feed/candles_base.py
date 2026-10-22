@@ -9,6 +9,7 @@ import pandas as pd
 from bidict import bidict
 
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+from hummingbot.core.api_throttler.async_throttler_base import AsyncThrottlerBase
 from hummingbot.core.network_base import NetworkBase
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils.async_utils import safe_ensure_future
@@ -63,6 +64,10 @@ class CandlesBase(NetworkBase):
             self.logger().exception(
                 f"Interval {interval} is not supported. Available Intervals: {self.intervals.keys()}")
             raise
+
+    def set_throttler(self, throttler: AsyncThrottlerBase) -> None:
+        """Share a venue-level request budget without sharing feed connections or processors."""
+        self._api_factory.set_throttler(throttler)
 
     async def start_network(self):
         """
@@ -325,6 +330,11 @@ class CandlesBase(NetworkBase):
         """
         while not self.ready:
             await self._ws_candle_available.wait()
+            if len(self._candles) == 0:
+                # A reset can clear the deque after the availability event was set. Drop the stale
+                # signal and wait for a fresh websocket candle instead of retrying on deque[0].
+                self._ws_candle_available.clear()
+                continue
             try:
                 end_time = self._round_timestamp_to_interval_multiple(self._candles[0][0])
                 missing_records = self._candles.maxlen - len(self._candles)
@@ -349,16 +359,24 @@ class CandlesBase(NetworkBase):
         exchange.
         """
         ws: Optional[WSAssistant] = None
+        interrupted = False
         while True:
             try:
                 ws: WSAssistant = await self._connected_websocket_assistant()
                 await self._subscribe_channels(ws)
+                if interrupted:
+                    self.logger().info(
+                        f"Candle websocket resubscribed | feed={self.name} interval={self.interval} ready={self.ready}")
+                    interrupted = False
                 await self._process_websocket_messages(websocket_assistant=ws)
             except asyncio.CancelledError:
                 raise
             except ConnectionError as connection_exception:
-                self.logger().warning(f"The websocket connection was closed ({connection_exception})")
+                interrupted = True
+                self.logger().warning(
+                    f"The websocket connection was closed ({connection_exception}) | feed={self.name} interval={self.interval}")
             except Exception:
+                interrupted = True
                 self.logger().exception(
                     "Unexpected error occurred when listening to public klines. Retrying in 1 seconds...",
                 )

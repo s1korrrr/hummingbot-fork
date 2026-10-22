@@ -1,0 +1,31 @@
+id: ok-rsi-btc
+legacy_controller_ids:
+  - rsi-v5-btc-usdc-1m
+controller_name: ok_rsi
+controller_type: directional_trading
+connector_name: okx
+trading_pair: BTC-USDC
+trade_mode: buy_sell
+manual_kill_switch: false
+sell_only_if_profitable: true
+stop_loss: null
+take_profit: null
+time_limit: null
+early_stop_keep_position: true
+leverage: 1
+position_mode: ONEWAY
+strict_hmm_mode: false
+use_trailing_exit: true
+use_adaptive_trailing: true
+trailing_activation_pct: 0.015
+trailing_delta_pct: 0.0035
+entry_limit_max_age_seconds: 30
+trailing_activation_min_pct: 0.003
+trailing_activation_max_pct: 0.05
+trailing_delta_min_pct: 0.001
+trailing_delta_max_pct: 0.02
+trailing_min_locked_profit_pct: 0.004
+trailing_activation_volatility_exponent: 0.70
+trailing_delta_volatility_exponent: 0.35
+trailing_min_multiplier: 0.5
+trailing_max_multiplier: 2.5

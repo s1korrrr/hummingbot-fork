@@ -73,6 +73,256 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.resume_test_event.set()
         raise exception
 
+    def _book_event(self, sequence=10, previous=-1, action="snapshot", bids=None, pair=None):
+        return {"arg": {"channel": "books", "instId": pair or self.trading_pair}, "action": action,
+                "data": [{"ts": "1800000000100", "seqId": sequence, "prevSeqId": previous,
+                          "bids": [["99", "1"]] if bids is None else bids, "asks": []}]}
+
+    async def _seed_stream(self):
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._book_event(), output)
+        return output.get_nowait()
+
+    async def test_recovery_snapshot_deadline_disconnects_after_successful_sends(self):
+        await self._seed_stream()
+        ws = AsyncMock()
+        disconnected = asyncio.Event()
+        ws.disconnect.side_effect = disconnected.set
+        self.data_source._ws_assistant = ws
+        self.data_source._BOOK_RECOVERY_TIMEOUT = .01
+        await self.data_source.request_order_book_resync(self.trading_pair)
+        # Traffic on other channels cannot keep an invalid book latched forever.
+        await asyncio.wait_for(disconnected.wait(), timeout=.5)
+        self.assertEqual(2, ws.send.await_count)
+        self.assertNotIn(self.trading_pair, self.data_source._valid_streams)
+        self.assertFalse(self.data_source._recovering_streams)
+
+    async def test_snapshot_cancels_recovery_deadline(self):
+        await self._seed_stream()
+        ws = AsyncMock()
+        self.data_source._ws_assistant = ws
+        await self.data_source.request_order_book_resync(self.trading_pair)
+        task = self.data_source._book_snapshot_deadlines[self.trading_pair]
+        recovered = await self._seed_stream()
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+        self.assertNotIn(self.trading_pair, self.data_source._book_snapshot_deadlines)
+        self.assertTrue(self.data_source.order_book_stream_valid(self.trading_pair, recovered.content['stream_epoch']))
+        ws.disconnect.assert_not_awaited()
+
+    async def test_old_snapshot_deadline_does_not_disconnect_replacement_socket(self):
+        await self._seed_stream()
+        old, replacement = AsyncMock(), AsyncMock()
+        self.data_source._ws_assistant = old
+        self.data_source._BOOK_RECOVERY_TIMEOUT = .01
+        await self.data_source.request_order_book_resync(self.trading_pair)
+        task = self.data_source._book_snapshot_deadlines[self.trading_pair]
+        self.data_source._ws_assistant = replacement
+        await task
+        old.disconnect.assert_not_awaited()
+        replacement.disconnect.assert_not_awaited()
+
+    async def test_old_socket_cannot_replace_current_snapshot_deadline(self):
+        old, current = AsyncMock(), AsyncMock()
+        self.data_source._ws_assistant = current
+        self.data_source._require_snapshot_before_deadline(self.trading_pair, current)
+        task = self.data_source._book_snapshot_deadlines[self.trading_pair]
+        self.data_source._require_snapshot_before_deadline(self.trading_pair, old)
+        assert self.data_source._book_snapshot_deadlines[self.trading_pair] is task
+        self.data_source._invalidate_connection()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_old_snapshot_deadline_does_not_disconnect_new_epoch(self):
+        await self._seed_stream()
+        ws = AsyncMock()
+        self.data_source._ws_assistant = ws
+        self.data_source._BOOK_RECOVERY_TIMEOUT = .01
+        await self.data_source.request_order_book_resync(self.trading_pair)
+        task = self.data_source._book_snapshot_deadlines[self.trading_pair]
+        self.data_source._invalidate_book_stream(self.trading_pair)
+        await task
+        ws.disconnect.assert_not_awaited()
+
+    async def test_initial_subscription_requires_snapshot_before_deadline(self):
+        ws = AsyncMock()
+        disconnected = asyncio.Event()
+        ws.disconnect.side_effect = disconnected.set
+        self.data_source._ws_assistant = ws
+        self.data_source._BOOK_RECOVERY_TIMEOUT = .01
+        await self.data_source._subscribe_channels(ws)
+        await asyncio.wait_for(disconnected.wait(), timeout=.5)
+        self.assertFalse(self.data_source._book_snapshot_deadlines)
+
+    async def test_interruption_cancels_deadline_and_late_snapshot_cannot_revive_socket(self):
+        await self._seed_stream()
+        ws = AsyncMock()
+        self.data_source._ws_assistant = ws
+        await self.data_source.request_order_book_resync(self.trading_pair)
+        task = self.data_source._book_snapshot_deadlines[self.trading_pair]
+        await self.data_source._on_order_stream_interruption(ws)
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertTrue(task.cancelled())
+        queue = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._book_event(), queue)
+        self.assertTrue(queue.empty())
+        self.assertFalse(self.data_source._valid_streams)
+
+    async def test_unlinked_diff_is_not_published(self):
+        await self._seed_stream()
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._book_event(12, 11, "update"), output)
+        self.assertTrue(output.empty())
+
+    async def test_invalid_numeric_level_revokes_the_stream_before_publishing(self):
+        for price, amount in [('NaN', '1'), ('Infinity', '1'), ('0', '1'), ('-1', '1'),
+                              ('100', 'NaN'), ('100', '-1'), ('100', 'Infinity')]:
+            with self.subTest(price=price, amount=amount):
+                queue = asyncio.Queue()
+                await self.data_source._parse_order_book_diff_message(self._book_event(), queue)
+                epoch = queue.get_nowait().content['stream_epoch']
+                await self.data_source._parse_order_book_diff_message(
+                    self._book_event(11, 10, 'update', bids=[[price, amount]]), queue)
+                self.assertTrue(queue.empty())
+                self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, epoch))
+
+    async def test_gap_is_isolated_to_one_pair(self):
+        other_pair = "OTHER-HBOT"
+        self.connector._set_trading_pair_symbol_map(bidict({self.trading_pair: self.trading_pair, other_pair: other_pair}))
+        await self._seed_stream()
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._book_event(pair=other_pair), output)
+        other = output.get_nowait()
+        await self.data_source._parse_order_book_diff_message(self._book_event(12, 11, "update"), output)
+        self.assertTrue(self.data_source.order_book_stream_valid(other_pair, other.content["stream_epoch"]))
+        self.assertTrue(output.empty())
+
+    async def test_gap_invalidates_old_epoch_and_recovers_once_with_snapshot(self):
+        snapshot = await self._seed_stream()
+        old_epoch = snapshot.content["stream_epoch"]
+        self.assertTrue(self.data_source.order_book_stream_valid(self.trading_pair, old_epoch))
+        self.data_source._ws_assistant = AsyncMock()
+        output = asyncio.Queue()
+        queued_snapshot = self._book_event()
+        self.data_source._channel_originating_message(queued_snapshot)
+        await self.data_source._parse_order_book_diff_message(self._book_event(12, 11, "update"), output)
+        self.assertTrue(output.empty())
+        self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, old_epoch))
+        self.assertEqual(2, self.data_source._ws_assistant.send.await_count)
+        requests = [call.args[0].payload for call in self.data_source._ws_assistant.send.call_args_list]
+        self.assertEqual(["unsubscribe", "subscribe"], [request["op"] for request in requests])
+        self.assertTrue(all(request["args"] == [{"channel": "books", "instId": self.trading_pair}]
+                            for request in requests))
+        await self.data_source._parse_order_book_diff_message(self._book_event(13, 12, "update"), output)
+        await self.data_source._parse_order_book_diff_message(queued_snapshot, output)
+        self.assertTrue(output.empty())
+        self.assertEqual(2, self.data_source._ws_assistant.send.await_count)
+        await self.data_source._parse_order_book_diff_message(self._book_event(20), output)
+        recovered = output.get_nowait()
+        self.assertGreater(recovered.content["stream_epoch"], old_epoch)
+        self.assertTrue(self.data_source.order_book_stream_valid(self.trading_pair, recovered.content["stream_epoch"]))
+        self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, old_epoch))
+
+    async def test_start_and_rest_snapshot_do_not_establish_ws_continuity(self):
+        self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, 0))
+        response = {"data": self._book_event()["data"]}
+        with patch.object(self.data_source, "_request_order_book_snapshot", new=AsyncMock(return_value=response)):
+            snapshot = await self.data_source._order_book_snapshot(self.trading_pair)
+        self.assertNotIn("stream_epoch", snapshot.content)
+        self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, 0))
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._book_event(11, 10, "update"), output)
+        self.assertTrue(output.empty())
+
+    async def test_empty_same_sequence_heartbeat_and_maintenance_reset(self):
+        await self._seed_stream()
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(self._book_event(10, 10, "update", bids=[]), output)
+        self.assertEqual(OrderBookMessageType.DIFF, output.get_nowait().type)
+        await self.data_source._parse_order_book_diff_message(self._book_event(2, 10, "update"), output)
+        self.assertEqual(OrderBookMessageType.DIFF, output.get_nowait().type)
+        await self.data_source._parse_order_book_diff_message(self._book_event(3, 2, "update"), output)
+        self.assertTrue(self.data_source.order_book_stream_valid(self.trading_pair, output.get_nowait().content["stream_epoch"]))
+
+    async def test_nonempty_same_sequence_and_malformed_messages_invalidate(self):
+        malformed = self._book_event(11, 10, "update")
+        del malformed["data"][0]["seqId"]
+        for raw in (self._book_event(10, 10, "update"), malformed):
+            await self._seed_stream()
+            output = asyncio.Queue()
+            await self.data_source._parse_order_book_diff_message(raw, output)
+            self.assertTrue(output.empty())
+            self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, 0))
+
+    async def test_disconnect_rejects_queued_old_connection_snapshot(self):
+        old = await self._seed_stream()
+        queued = self._book_event()
+        self.data_source._channel_originating_message(queued)
+        await self.data_source._on_order_stream_interruption(AsyncMock())
+        self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, old.content["stream_epoch"]))
+        output = asyncio.Queue()
+        await self.data_source._parse_order_book_diff_message(queued, output)
+        self.assertTrue(output.empty())
+        with patch.object(self.data_source._api_factory, 'get_ws_assistant',
+                          new=AsyncMock(return_value=AsyncMock())):
+            await self.data_source._connected_websocket_assistant()
+        await self.data_source._parse_order_book_diff_message(self._book_event(), output)
+        self.assertTrue(self.data_source.order_book_stream_valid(self.trading_pair, output.get_nowait().content["stream_epoch"]))
+
+    async def test_processing_failure_invalidates_before_outer_retry_delay(self):
+        old = await self._seed_stream()
+        with patch("hummingbot.core.data_type.order_book_tracker_data_source."
+                   "OrderBookTrackerDataSource._process_websocket_messages", new=AsyncMock(side_effect=ConnectionError)):
+            with self.assertRaises(ConnectionError):
+                await self.data_source._process_websocket_messages(AsyncMock())
+        self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, old.content["stream_epoch"]))
+        epoch = self.data_source._stream_epochs[self.trading_pair]
+        await self.data_source._on_order_stream_interruption(AsyncMock())
+        self.assertEqual(epoch, self.data_source._stream_epochs[self.trading_pair])
+
+    async def test_gap_recovery_failure_remains_invalid_and_disconnects(self):
+        await self._seed_stream()
+        self.data_source._ws_assistant = AsyncMock()
+        self.data_source._ws_assistant.send.side_effect = asyncio.TimeoutError
+        await self.data_source._parse_order_book_diff_message(self._book_event(12, 11, "update"), asyncio.Queue())
+        self.data_source._ws_assistant.disconnect.assert_awaited_once()
+        self.assertFalse(self.data_source.order_book_stream_valid(self.trading_pair, 0))
+
+    async def test_same_second_later_diff_survives_rest_snapshot_restore(self):
+        snapshot = {'data': [{'ts': '1800000000100', 'seqId': 10,
+                             'bids': [['99', '1']], 'asks': [['101', '1']]}]}
+        with patch.object(self.data_source, '_request_order_book_snapshot', new=AsyncMock(return_value=snapshot)):
+            snapshot_message = await self.data_source._order_book_snapshot(self.trading_pair)
+        await self._seed_stream()
+        output = asyncio.Queue()
+        raw_diff = {'arg': {'channel': 'books', 'instId': self.trading_pair}, 'action': 'update',
+                    'data': [{'ts': '1800000000900', 'seqId': 11, 'prevSeqId': 10,
+                              'bids': [['99', '2']], 'asks': []}]}
+        await self.data_source._parse_order_book_diff_message(raw_diff, output)
+        diff = output.get_nowait()
+        book = OrderBook()
+        book.restore_from_snapshot_and_diffs(snapshot_message, [diff])
+        self.assertEqual(2, list(book.bid_entries())[0].amount)
+        self.assertEqual(1800000000100, snapshot_message.update_id)
+        self.assertEqual(1800000000900, diff.update_id)
+        self.assertAlmostEqual(1800000000.9, diff.timestamp)
+
+    async def test_same_second_later_diff_survives_websocket_snapshot_restore(self):
+        output = asyncio.Queue()
+        raw = {'arg': {'channel': 'books', 'instId': self.trading_pair}, 'action': 'snapshot',
+               'data': [{'ts': '1800000000100', 'seqId': 10, 'prevSeqId': -1,
+                         'bids': [['99', '1']], 'asks': [['101', '1']]}]}
+        await self.data_source._parse_order_book_snapshot_message(raw, output)
+        snapshot = output.get_nowait()
+        raw['action'] = 'update'
+        raw['data'] = [{'ts': '1800000000900', 'seqId': 11, 'prevSeqId': 10,
+                        'bids': [['99', '3']], 'asks': []}]
+        await self.data_source._parse_order_book_diff_message(raw, output)
+        diff = output.get_nowait()
+        book = OrderBook()
+        book.restore_from_snapshot_and_diffs(snapshot, [diff])
+        self.assertEqual(3, list(book.bid_entries())[0].amount)
+        self.assertEqual(1800000000100, snapshot.update_id)
+
     @aioresponses()
     async def test_get_new_order_book_successful(self, mock_api):
         url = web_utils.public_rest_url(path_url=CONSTANTS.OKX_ORDER_BOOK_PATH)
@@ -108,7 +358,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         order_book: OrderBook = await self.data_source.get_new_order_book(self.trading_pair)
 
-        expected_update_id = int(int(resp["data"][0]["ts"]) * 1e-3)
+        expected_update_id = int(resp["data"][0]["ts"])
 
         self.assertEqual(expected_update_id, order_book.snapshot_uid)
         bids = list(order_book.bid_entries())
@@ -188,7 +438,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
 
         self.assertTrue(self._is_logged(
             "INFO",
-            "Subscribed to public order book and trade channels..."
+            "Sent public order book and trade subscription requests; awaiting snapshots."
         ))
 
     @patch("aiohttp.ClientSession.ws_connect", new_callable=AsyncMock)
@@ -349,10 +599,12 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         except asyncio.CancelledError:
             pass
 
-        self.assertTrue(
-            self._is_logged("ERROR", "Unexpected error when processing public order book updates from exchange"))
+        self.assertTrue(msg_queue.empty())
+        self.assertTrue(self._is_logged(
+            "WARNING", f"OKX order book continuity lost for {self.trading_pair}; awaiting recovery snapshot"))
 
     async def test_listen_for_order_book_diffs_successful(self):
+        await self._seed_stream()
         mock_queue = AsyncMock()
         diff_event = {
             "arg": {
@@ -372,7 +624,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                         ["8475.55", "101", "0", "1"],
                     ],
                     "ts": "1597026383085",
-                    "checksum": -855196043
+                    "checksum": 0, "seqId": 11, "prevSeqId": 10
                 }
             ]
         }
@@ -389,7 +641,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderBookMessageType.DIFF, msg.type)
         self.assertEqual(-1, msg.trade_id)
         self.assertEqual(int(diff_event["data"][0]["ts"]) * 1e-3, msg.timestamp)
-        expected_update_id = int(int(diff_event["data"][0]["ts"]) * 1e-3)
+        expected_update_id = int(diff_event["data"][0]["ts"])
         self.assertEqual(expected_update_id, msg.update_id)
 
         bids = msg.bids
@@ -424,24 +676,24 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
                         ["8475.55", "101", "0", "1"],
                     ],
                     "ts": "1597026383085",
-                    "checksum": -855196043
+                    "checksum": 0, "seqId": 10, "prevSeqId": -1
                 }
             ]
         }
         mock_queue.get.side_effect = [snapshot_event, asyncio.CancelledError()]
-        self.data_source._message_queue[self.data_source._snapshot_messages_queue_key] = mock_queue
+        self.data_source._message_queue[self.data_source._diff_messages_queue_key] = mock_queue
 
         msg_queue: asyncio.Queue = asyncio.Queue()
 
         self.listening_task = self.local_event_loop.create_task(
-            self.data_source.listen_for_order_book_snapshots(self.local_event_loop, msg_queue))
+            self.data_source.listen_for_order_book_diffs(self.local_event_loop, msg_queue))
 
         msg: OrderBookMessage = await msg_queue.get()
 
         self.assertEqual(OrderBookMessageType.SNAPSHOT, msg.type)
         self.assertEqual(-1, msg.trade_id)
         self.assertEqual(int(snapshot_event["data"][0]["ts"]) * 1e-3, msg.timestamp)
-        expected_update_id = int(int(snapshot_event["data"][0]["ts"]) * 1e-3)
+        expected_update_id = int(snapshot_event["data"][0]["ts"])
         self.assertEqual(expected_update_id, msg.update_id)
 
         bids = msg.bids
@@ -528,7 +780,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderBookMessageType.SNAPSHOT, msg.type)
         self.assertEqual(-1, msg.trade_id)
         self.assertEqual(int(resp["data"][0]["ts"]) * 1e-3, msg.timestamp)
-        expected_update_id = int(int(resp["data"][0]["ts"]) * 1e-3)
+        expected_update_id = int(resp["data"][0]["ts"])
         self.assertEqual(expected_update_id, msg.update_id)
 
         bids = msg.bids
@@ -542,7 +794,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(0.60038921, asks[0].amount)
         self.assertEqual(expected_update_id, asks[0].update_id)
 
-    async def test_channel_originating_message_snapshot_queue(self):
+    async def test_channel_originating_message_snapshot_uses_serial_book_queue(self):
         event_message = {
             "arg": {
                 "channel": "books",
@@ -563,7 +815,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
             ]
         }
         channel_result = self.data_source._channel_originating_message(event_message)
-        self.assertEqual(channel_result, self.data_source._snapshot_messages_queue_key)
+        self.assertEqual(channel_result, self.data_source._diff_messages_queue_key)
 
     async def test_channel_originating_message_diff_queue(self):
         event_message = {
@@ -613,7 +865,7 @@ class OkxAPIOrderBookDataSourceUnitTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn(new_pair, self.data_source._trading_pairs)
 
         self.assertTrue(
-            self._is_logged("INFO", f"Subscribed to {new_pair} order book and trade channels")
+            self._is_logged("INFO", f"Sent {new_pair} order book and trade subscription requests; awaiting snapshot.")
         )
 
     async def test_subscribe_to_trading_pair_websocket_not_connected(self):

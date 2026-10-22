@@ -1,24 +1,33 @@
 import asyncio
+import json
+import tempfile
+import time
 import types
 import unittest
 from decimal import Decimal
+from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from types import SimpleNamespace
 from typing import List
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pandas as pd
 
 import hummingbot.strategy.strategy_v2_base as strategy_v2_base_module
+from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
+from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.exchange.paper_trade.paper_trade_exchange import QuantizationParams
+from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.connector.test_support.mock_paper_exchange import MockPaperExchange
 from hummingbot.core.clock import Clock
 from hummingbot.core.clock_mode import ClockMode
-from hummingbot.core.data_type.common import PositionMode, TradeType
+from hummingbot.core.data_type.common import PositionAction, PositionMode, TradeType
 from hummingbot.core.event.events import OrderType
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
+from hummingbot.strategy_v2.components.data_reader import DataPolicy
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
+from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
@@ -54,7 +63,16 @@ class DummyReloadControllerV2(DummyReloadControllerBase):
 
 
 class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
+    CONTROLLERS_TITLE = "📊 CONTROLLERS"
+    SIGNALS_TITLE = "📡 SIGNALS"
+    PLANS_TITLE = "🧭 PLANS"
+    INVENTORY_TITLE = "🎒 INVENTORY"
+
     def setUp(self):
+        application_patch = patch("hummingbot.client.hummingbot_application.HummingbotApplication.main_application",
+                                  return_value=MagicMock(_mqtt=None))
+        application_patch.start()
+        self.addCleanup(application_patch.stop)
         self.start: pd.Timestamp = pd.Timestamp("2021-01-01", tz="UTC")
         self.end: pd.Timestamp = pd.Timestamp("2021-01-01 01:00:00", tz="UTC")
         self.start_timestamp: float = self.start.timestamp()
@@ -65,7 +83,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.connector_name: str = "mock_paper_exchange"
         self.trading_pair: str = "HBOT-USDT"
         self.strategy_config = StrategyV2ConfigBase()
-        with patch('asyncio.create_task', return_value=MagicMock()):
+        with patch('asyncio.create_task', side_effect=lambda coro: (coro.close(), MagicMock())[1]):
             # Initialize the strategy with mock components
             with patch("hummingbot.strategy.strategy_v2_base.StrategyV2Base.listen_to_executor_actions", return_value=AsyncMock()):
                 with patch('hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator') as MockExecutorOrchestrator:
@@ -73,9 +91,540 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
                         self.strategy = StrategyV2Base({self.connector_name: self.connector}, config=self.strategy_config)
                         # Set mocks to strategy attributes
                         self.strategy.executor_orchestrator = MockExecutorOrchestrator.return_value
+                        self.strategy.executor_orchestrator._claimed_resume_unresolved = {}
                         self.strategy.market_data_provider = MockMarketDataProvider.return_value
                         self.strategy.controllers = {'controller_1': MagicMock(), 'controller_2': MagicMock()}
         self.strategy.logger().setLevel(1)
+
+    def assert_no_status_separator_blocks(self, status: str):
+        self.assertFalse(
+            any(line.strip() and set(line.strip()) == {"="} for line in status.splitlines()),
+            status,
+        )
+
+    def test_async_persistence_opt_in_is_limited_to_exact_native_okx_owners(self):
+        connector = SimpleNamespace(name="okx")
+        base = SimpleNamespace(
+            config_file_path="rsi_modular_v2.yml", strategy_name="v2_with_controllers",
+            _markets=[connector],
+        )
+        self.assertTrue(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"okx": connector},
+        ))
+
+        for config_path in ("generic.yml", "paper.yml", "ok_rsi_bak.yml"):
+            base.config_file_path = config_path
+            self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+                base, {"okx": connector},
+            ))
+        base.config_file_path = "meridian_v3.yml"
+        base.strategy_name = "legacy_strategy"
+        self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"okx": connector},
+        ))
+        base.strategy_name = "v2_with_controllers"
+        self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"mock_paper_exchange": SimpleNamespace(name="mock_paper_exchange")},
+        ))
+        self.assertFalse(strategy_v2_base_module._qualified_native_async_recorder(
+            base, {"okx": SimpleNamespace(name="okx")},
+        ))
+
+    def test_direct_strategy_orders_are_never_fenced_by_reported_unfinished_executor(self):
+        self.strategy.executor_orchestrator.recovery_required = {"removed-owner": ["entry-1"]}
+        self.strategy.executor_orchestrator._planned_resume_pending = False
+        with patch.object(self.strategy, "buy_with_specific_market") as buy, \
+                patch.object(self.strategy, "sell_with_specific_market") as sell:
+            self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+            self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+        buy.assert_called_once()
+        sell.assert_called_once()
+
+    def test_direct_strategy_sell_blocked_during_pending_planned_resume(self):
+        self.strategy.executor_orchestrator.recovery_required = {}
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        with patch.object(self.strategy, "sell_with_specific_market") as sell:
+            with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+                self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+        sell.assert_not_called()
+
+    async def test_controller_config_persistence_waits_for_successful_startup_resume(self):
+        controller_config = MagicMock(id='controller-1')
+        recorder = MagicMock()
+        events = []
+
+        async def store(configs):
+            events.append('store')
+        recorder.store_controller_configs_async = AsyncMock(side_effect=store)
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        self.strategy.executor_orchestrator._resume_preflight_failed = False
+        self.strategy.executor_orchestrator._planned_resume_failure = None
+        with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+                patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[controller_config]), \
+                patch.object(self.strategy, 'add_controller'):
+            self.strategy.initialize_controllers()
+            recorder.store_controller_config.assert_not_called()
+
+            def successful_claim():
+                events.append('claim')
+                self.strategy.executor_orchestrator._planned_resume_pending = False
+                return True
+
+            self.strategy.executor_orchestrator.resume_planned_positions_if_ready.side_effect = successful_claim
+            self.strategy.update_executors_info = MagicMock()
+            self.strategy._sync_runtime_state_to_db_if_due = MagicMock()
+            self.strategy._write_chart_snapshots_if_due = MagicMock()
+            self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+            self.strategy.update_controllers_configs = MagicMock()
+            self.strategy.market_data_provider.ready = True
+            self.strategy.determine_executor_actions = MagicMock(return_value=[])
+
+            self.strategy.on_tick()
+            await self.strategy.await_controller_config_persistence()
+
+        recorder.store_controller_configs_async.assert_awaited_once()
+        self.assertEqual(events, ['claim', 'store'])
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    async def test_real_ok_rsi_controller_task_waits_for_recovery_claim_before_metadata_writes(self):
+        from controllers.directional_trading.ok_rsi import OKRSIController
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+        from controllers.directional_trading.ok_rsi_core.entry_decisions import MetadataEntryDecisionStore
+        from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+
+        with tempfile.TemporaryDirectory() as directory:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()), SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(directory) / "startup-ordering.sqlite"),
+            )
+            previous_recorder = MarketsRecorder._shared_instance
+            recorder = MarketsRecorder(
+                manager, [], "ok_rsi.yml", "v2_with_controllers",
+                market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False),
+            )
+            store = MetadataEntryDecisionStore(
+                manager, "ok_rsi.yml", "ok-rsi-startup", "okx", "BTC-USDC", "1m",
+            )
+            provider = MagicMock()
+            provider.ready = True
+            provider.time.return_value = 180.0
+            controller = OKRSIController(
+                OKRSIControllerConfig(
+                    id="ok-rsi-startup", connector_name="okx", trading_pair="BTC-USDC",
+                    strict_hmm_mode=False,
+                ),
+                market_data_provider=provider,
+                actions_queue=asyncio.Queue(),
+                entry_decision_store=store,
+            )
+            controller.update_interval = 0.001
+            controller.initialize_candles = MagicMock()
+            controller._last_evaluated_candle_timestamp = 60.0
+
+            async def update_processed_data():
+                controller.processed_data = {
+                    "signal": 0,
+                    "candle_timestamp": 60,
+                    "data_health": {"ready": True},
+                    "signal_state": {"raw_buy_candidate": False, "condition_ok": True},
+                }
+
+            controller.update_processed_data = update_processed_data
+            controller.executors_update_event.set()
+            self.strategy.controllers = {controller.config.id: controller}
+            orchestrator = self.strategy.executor_orchestrator
+            orchestrator._planned_resume_pending = True
+            orchestrator._resume_preflight_failed = False
+            orchestrator._planned_resume_failure = None
+            orchestrator.resume_planned_positions_if_ready.return_value = False
+            events = []
+            self.strategy.update_executors_info = lambda: events.append('reports')
+            original_start = controller.start
+            controller.start = lambda: (events.append('start'), original_start())[1]
+            self.strategy._sync_runtime_state_to_db_if_due = MagicMock()
+            self.strategy._write_chart_snapshots_if_due = MagicMock()
+            self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+            self.strategy.update_controllers_configs = MagicMock()
+            self.strategy.determine_executor_actions = MagicMock(return_value=[])
+            self.strategy.market_data_provider.ready = True
+
+            def persisted_row_counts():
+                with manager.engine.connect() as connection:
+                    return {
+                        table: connection.exec_driver_sql(f'SELECT COUNT(*) FROM "{table}"').scalar_one()
+                        for table in ("Controllers", "Executors", "Order", "Position", "Metadata")
+                    }
+
+            try:
+                with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+                    before = persisted_row_counts()
+                    self.strategy.start(self.clock, self.start_timestamp)
+                    await asyncio.sleep(0.02)
+                    self.assertIsNone(store.load())
+                    self.assertNotEqual(controller.status, RunnableStatus.RUNNING)
+                    self.assertEqual(persisted_row_counts(), before)
+
+                    def successful_claim():
+                        orchestrator._planned_resume_pending = False
+                        return True
+
+                    orchestrator.resume_planned_positions_if_ready.side_effect = successful_claim
+                    self.strategy.on_tick()
+                    for _ in range(20):
+                        if store.load() is not None:
+                            break
+                        await asyncio.sleep(0.01)
+                    controller.stop()
+                    task = controller._control_loop_task
+                    if task is not None:
+                        await asyncio.wait_for(task, timeout=1)
+                    self.assertIsNotNone(store.load())
+                    self.assertEqual(persisted_row_counts()["Order"], before["Order"])
+                    self.assertEqual(events[:2], ['reports', 'start'])
+            finally:
+                controller.stop()
+                if controller._control_loop_task is not None and not controller._control_loop_task.done():
+                    await asyncio.wait_for(controller._control_loop_task, timeout=1)
+                manager.engine.dispose()
+                MarketsRecorder._shared_instance = previous_recorder
+
+    def test_controller_start_is_idempotent_for_ordinary_startup(self):
+        controller = MagicMock()
+        self.strategy.controllers = {"controller-1": controller}
+        orchestrator = self.strategy.executor_orchestrator
+        orchestrator._planned_resume_pending = False
+        orchestrator._resume_preflight_failed = False
+        orchestrator._planned_resume_failure = None
+
+        self.strategy.start(self.clock, self.start_timestamp)
+        self.strategy.start(self.clock, self.start_timestamp + 1)
+
+        controller.start.assert_called_once_with()
+        self.assertTrue(self.strategy._controllers_started)
+
+    def test_controller_start_waits_only_for_a_pending_claim_and_unattended_hold(self):
+        controller = MagicMock()
+        self.strategy.controllers = {"controller-1": controller}
+        orchestrator = self.strategy.executor_orchestrator
+        orchestrator._planned_resume_pending = True
+        orchestrator._resume_preflight_failed = False
+        orchestrator._planned_resume_failure = None
+        orchestrator._claimed_resume_unresolved = {}
+
+        self.strategy.start(self.clock, self.start_timestamp)
+        controller.start.assert_not_called()
+        self.assertFalse(self.strategy._controllers_started)
+
+        orchestrator._planned_resume_pending = False
+        self.strategy._unattended_restart_hold = True
+        self.strategy._start_controllers_if_safe()
+        controller.start.assert_not_called()
+
+        self.strategy._unattended_restart_hold = False
+        self.strategy._start_controllers_if_safe()
+        controller.start.assert_called_once_with()
+
+    def test_failed_or_unresolved_claims_never_stop_controllers(self):
+        # Restart continuity D2: a claimed row survives every later boot until it is
+        # reconciled, so a fence here would stop the whole bot on every restart.
+        for failure in ("preflight_failed", "claim_failed", "unresolved"):
+            with self.subTest(failure=failure):
+                controller = MagicMock()
+                self.strategy.controllers = {"controller-1": controller}
+                self.strategy._controllers_started = False
+                self.strategy._controller_start_requested = True
+                orchestrator = self.strategy.executor_orchestrator
+                orchestrator._planned_resume_pending = False
+                orchestrator._resume_preflight_failed = failure == "preflight_failed"
+                orchestrator._planned_resume_failure = "proof rejected" if failure == "claim_failed" else None
+                orchestrator._claimed_resume_unresolved = (
+                    {"controller-1": {"executor": ("okx", "BTC-USDC")}} if failure == "unresolved" else {})
+
+                self.strategy._start_controllers_if_safe()
+
+                controller.start.assert_called_once_with()
+                self.assertTrue(self.strategy._controllers_started)
+
+    @staticmethod
+    def _direct_ok_rsi_config(controller_id: str, *, origin: str = None):
+        # Other native tests intentionally purge and re-import ``controllers``.
+        # Resolve the class from the current module instance at call time so the
+        # fixture has the same identity as StrategyV2Base's runtime import.
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+
+        data = (DataPolicy(mode="shared", transport="stream", origin=origin,
+                           token_file="/tmp/test-candle-token") if origin else None)
+        return OKRSIControllerConfig(id=controller_id, data=data)
+
+    def test_mixed_direct_ok_rsi_candle_policies_fail_before_controller_creation(self):
+        configs = [self._direct_ok_rsi_config("service", origin="http://127.0.0.1:8100"),
+                   self._direct_ok_rsi_config("native")]
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                patch.object(self.strategy, "add_controller") as add_controller:
+            with self.assertRaisesRegex(ValueError, "direct OK RSI candle policy"):
+                self.strategy.initialize_controllers()
+        add_controller.assert_not_called()
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    def test_conflicting_direct_ok_rsi_service_sources_fail_before_controller_creation(self):
+        configs = [self._direct_ok_rsi_config("first", origin="http://127.0.0.1:8100"),
+                   self._direct_ok_rsi_config("second", origin="http://127.0.0.1:8101")]
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                patch.object(self.strategy, "add_controller") as add_controller:
+            with self.assertRaisesRegex(ValueError, "direct OK RSI candle policy"):
+                self.strategy.initialize_controllers()
+        add_controller.assert_not_called()
+
+    def test_uniform_direct_ok_rsi_candle_policies_allow_controller_creation(self):
+        for origin in (None, "http://127.0.0.1:8100"):
+            with self.subTest(origin=origin):
+                configs = [self._direct_ok_rsi_config("first", origin=origin),
+                           self._direct_ok_rsi_config("second", origin=origin)]
+                with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                        patch.object(self.strategy, "add_controller") as add_controller, \
+                        patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+                    self.strategy.initialize_controllers()
+                self.assertEqual(add_controller.call_count, 2)
+
+    def test_direct_ok_rsi_policy_guard_does_not_restrict_subclass_composition(self):
+        from controllers.directional_trading.ok_rsi_core.config import OKRSIControllerConfig
+
+        class CompositionConfig(OKRSIControllerConfig):
+            pass
+
+        configs = [self._direct_ok_rsi_config("direct"),
+                   CompositionConfig(id="composed", data=DataPolicy(
+                       mode="shared", transport="stream", origin="http://127.0.0.1:8100",
+                       token_file="/tmp/test-candle-token"))]
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=configs), \
+                patch.object(self.strategy, "add_controller") as add_controller, \
+                patch.object(MarketsRecorder, "get_instance", return_value=MagicMock()):
+            self.strategy.initialize_controllers()
+        self.assertEqual(add_controller.call_count, 2)
+
+    def test_direct_ok_rsi_candle_policy_reload_does_not_change_existing_source(self):
+        native = self._direct_ok_rsi_config("direct")
+        self.strategy.controllers = {"direct": MagicMock(config=native)}
+        self.strategy.config_update_interval = 0
+        service = self._direct_ok_rsi_config("direct", origin="http://127.0.0.1:8100")
+        with patch.object(StrategyV2ConfigBase, "load_controller_configs", return_value=[service]), \
+                patch.object(type(self.strategy), "current_timestamp", new_callable=PropertyMock, return_value=100), \
+                patch.object(self.strategy, "add_controller") as add_controller:
+            self.strategy.update_controllers_configs()
+        add_controller.assert_not_called()
+        self.strategy.controllers["direct"].update_config.assert_not_called()
+        self.assertIn("direct OK RSI candle policy", self.strategy._last_controller_reload_error)
+
+    async def test_controller_config_persistence_is_immediate_without_pending_resume(self):
+        controller_config = MagicMock(id='controller-1')
+        recorder = MagicMock()
+        recorder.store_controller_configs_async = AsyncMock()
+        self.strategy.executor_orchestrator._planned_resume_pending = False
+        self.strategy.executor_orchestrator._resume_preflight_failed = False
+        self.strategy.executor_orchestrator._planned_resume_failure = None
+        with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+                patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[controller_config]), \
+                patch.object(self.strategy, 'add_controller'):
+            self.strategy.initialize_controllers()
+            await self.strategy.await_controller_config_persistence()
+
+        recorder.store_controller_configs_async.assert_awaited_once()
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [])
+
+    def test_controller_config_persistence_stays_deferred_after_resume_failure(self):
+        controller_config = MagicMock(id='controller-1')
+        recorder = MagicMock()
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        self.strategy.executor_orchestrator._resume_preflight_failed = False
+        self.strategy.executor_orchestrator._planned_resume_failure = None
+        with patch.object(MarketsRecorder, 'get_instance', return_value=recorder), \
+                patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[controller_config]), \
+                patch.object(self.strategy, 'add_controller'):
+            self.strategy.initialize_controllers()
+            self.strategy.executor_orchestrator._planned_resume_pending = True
+
+            def failed_claim():
+                self.strategy.executor_orchestrator._planned_resume_pending = False
+                self.strategy.executor_orchestrator._resume_preflight_failed = True
+                self.strategy.executor_orchestrator._planned_resume_failure = 'preflight rejected'
+                return True
+
+            self.strategy.executor_orchestrator.resume_planned_positions_if_ready.side_effect = failed_claim
+            self.strategy.update_executors_info = MagicMock()
+            self.strategy._sync_runtime_state_to_db_if_due = MagicMock()
+            self.strategy._write_chart_snapshots_if_due = MagicMock()
+            self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+            self.strategy.update_controllers_configs = MagicMock()
+            self.strategy.market_data_provider.ready = True
+            self.strategy.determine_executor_actions = MagicMock(return_value=[])
+
+            self.strategy.on_tick()
+
+        recorder.store_controller_config.assert_not_called()
+        self.assertEqual(self.strategy._controller_configs_pending_persistence, [controller_config])
+
+    def unfinished_claim_orchestrator(self):
+        # A real orchestrator instance, so any admission guard it defines is consulted.
+        from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+        orchestrator = ExecutorOrchestrator.__new__(ExecutorOrchestrator)
+        orchestrator.strategy = self.strategy
+        orchestrator._planned_resume_pending = False
+        orchestrator._resume_preflight_failed = False
+        orchestrator._claimed_resume_unresolved = {'controller_1': {'failed-entry': (self.connector_name, self.trading_pair)}}
+        orchestrator.active_executors = {'controller_1': []}
+        orchestrator.recovery_required = {'controller_1': ['failed-entry']}
+        orchestrator.execute_actions = MagicMock()
+        self.strategy.executor_orchestrator = orchestrator
+        return orchestrator
+
+    def test_unfinished_claim_and_failed_preflight_never_fence_orders(self):
+        # "We never want to block orders": an unfinished resume claim is reported,
+        # while direct and executor BUY/SELL on the same pair keep trading.
+        from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+        orchestrator = self.unfinished_claim_orchestrator()
+        config = OrderExecutorConfig(id='held-exit', controller_id='controller_1', timestamp=1,
+                                     connector_name=self.connector_name, trading_pair=self.trading_pair,
+                                     side=TradeType.SELL, amount=Decimal('1'), price=Decimal('1'),
+                                     execution_strategy=ExecutionStrategy.LIMIT, position_action=PositionAction.CLOSE)
+        executor = ExecutorBase(self.strategy, [self.connector_name], config)
+        for preflight_failed in (False, True):
+            orchestrator._resume_preflight_failed = preflight_failed
+            with self.subTest(preflight_failed=preflight_failed), \
+                    patch.object(self.strategy, 'buy_with_specific_market', return_value='buy') as buy, \
+                    patch.object(self.strategy, 'sell_with_specific_market', return_value='sell') as sell:
+                self.assertEqual(self.strategy.buy(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT), 'buy')
+                self.assertEqual(self.strategy.sell(self.connector_name, self.trading_pair, Decimal('1'), OrderType.LIMIT), 'sell')
+                self.assertEqual(executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                                      TradeType.SELL, Decimal('1'), position_action=PositionAction.CLOSE), 'sell')
+                self.assertEqual(executor.place_order(self.connector_name, self.trading_pair, OrderType.LIMIT,
+                                                      TradeType.BUY, Decimal('1')), 'buy')
+                self.assertEqual(buy.call_count, 2)
+                self.assertEqual(sell.call_count, 2)
+
+    def test_unfinished_claim_and_failed_preflight_are_visible_in_native_status(self):
+        orchestrator = self.unfinished_claim_orchestrator()
+        observation = self.strategy._runtime_position_resume_observation()
+        self.assertEqual(observation['unfinished_claim_controllers'], ['controller_1'])
+        status = self.strategy.format_status()
+        self.assertIn('POSITION OWNERSHIP RECONCILIATION REQUIRED', status)
+        self.assertIn('Orders are never fenced', status)
+        orchestrator._resume_preflight_failed = True
+        observation = self.strategy._runtime_position_resume_observation()
+        self.assertTrue(observation['preflight_failed'])
+        self.assertIsNone(self.strategy._runtime_reconciliation_observation()['pending_count'])
+
+    def test_native_admission_readiness_requires_explicit_financial_ack(self):
+        self.strategy.ready_to_trade = True
+        self.strategy._controller_reports_valid = True
+        self.strategy._is_stop_triggered = False
+        self.strategy._unattended_restart_hold = False
+        recorder = MagicMock(_async_financial_events=True)
+        with patch.object(self.strategy, '_build_controller_status_entries', return_value=[]), \
+                patch.object(self.strategy, '_get_balances_snapshot', return_value=[]), \
+                patch.object(self.strategy, '_runtime_status_snapshot_bot_name', return_value='candidate'), \
+                patch.object(self.strategy, '_build_runtime_operations_snapshot', return_value={}), \
+                patch.object(self.strategy, 'get_active_orders', return_value=[]), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock,
+                             return_value=1792310400.0), \
+                patch.object(MarketsRecorder, 'get_existing_instance', return_value=recorder):
+            recorder.financial_persistence_status.return_value = {
+                'mode': 'acknowledged_async', 'pending_count': 0, 'failed_count': 0,
+                'reconciliation_needed': False, 'acknowledged': None, 'error_type': None,
+            }
+            self.assertFalse(self.strategy._build_runtime_status_snapshot()['trading_admission_ready'])
+            recorder.financial_persistence_status.return_value['acknowledged'] = True
+            self.assertTrue(self.strategy._build_runtime_status_snapshot()['trading_admission_ready'])
+            recorder.financial_persistence_status.return_value['acknowledged'] = None
+            with patch.object(MarketsRecorder, 'get_existing_instance', return_value=None):
+                self.assertIsNone(self.strategy._build_runtime_status_snapshot()['trading_admission_ready'])
+
+    def test_unattended_v2_restart_hold_blocks_direct_buy_and_sell(self):
+        self.strategy._unattended_restart_hold = True
+        with patch.object(self.strategy, "buy_with_specific_market") as buy, \
+                patch.object(self.strategy, "sell_with_specific_market") as sell:
+            with self.assertRaisesRegex(RuntimeError, "unattended restart hold"):
+                self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+            with self.assertRaisesRegex(RuntimeError, "unattended restart hold"):
+                self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT)
+        buy.assert_not_called()
+        sell.assert_not_called()
+
+    def test_unattended_v2_restart_hold_does_not_resume_or_dispatch_on_tick(self):
+        self.strategy._unattended_restart_hold = True
+        self.strategy.executor_orchestrator.resume_planned_positions_if_ready = MagicMock(return_value=True)
+        self.strategy.determine_executor_actions = MagicMock()
+        self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+
+        self.strategy.on_tick()
+
+        self.strategy.executor_orchestrator.resume_planned_positions_if_ready.assert_not_called()
+        self.strategy.determine_executor_actions.assert_not_called()
+        self.strategy._write_runtime_status_snapshot_if_due.assert_called_once()
+
+    def test_unattended_v2_restart_hold_reports_while_connector_is_unready(self):
+        self.strategy._unattended_restart_hold = True
+        self.strategy.ready_to_trade = False
+        self.strategy._write_runtime_status_snapshot_if_due = MagicMock()
+        with patch.object(self.strategy, 'connectors', {'unready': MagicMock(ready=False, name='mock')}):
+            self.strategy.tick(self.start_timestamp)
+        self.strategy._write_runtime_status_snapshot_if_due.assert_called_once()
+
+    def test_unattended_v2_restart_hold_persists_status_when_market_is_unready(self):
+        self.strategy._unattended_restart_hold = True
+        self.strategy.ready_to_trade = False
+        self.strategy._controller_reports_valid = False
+        self.strategy._last_runtime_status_snapshot_ts = 0
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(self.strategy, '_runtime_status_snapshot_enabled', return_value=True), \
+                patch.object(self.strategy, '_runtime_status_snapshot_dir', return_value=Path(tmp)), \
+                patch.object(self.strategy, '_build_runtime_status_snapshot',
+                             return_value={'bot_name': 'rsi_modular_v2', 'unattended_restart_hold': True}), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock, return_value=100):
+            self.strategy._write_runtime_status_snapshot_if_due()
+            snapshot = json.loads((Path(tmp) / 'rsi_modular_v2.status.json').read_text())
+        self.assertTrue(snapshot['unattended_restart_hold'])
+
+    def test_runtime_status_snapshot_preserves_native_position_mark_provenance(self):
+        position = SimpleNamespace(
+            trading_pair="ETH-USDC", side=TradeType.BUY, amount=Decimal("0.25"),
+            breakeven_price=Decimal("3900"), unrealized_pnl_quote=Decimal("25"),
+            realized_pnl_quote=Decimal("0"), cum_fees_quote=Decimal("0.1"),
+            mark_price_quote=Decimal("4000"), mark_observed_at="2026-10-18T08:00:00+00:00",
+            mark_timestamp_semantics="sampled_at", mark_availability="available",
+        )
+        entry = {"controller_id": "meridian-v3", "summary": {"pair": None}, "positions": [position],
+                 "executors": [], "performance": None}
+        with patch.object(self.strategy, "_build_controller_status_entries", return_value=[entry]), \
+                patch.object(self.strategy, "_get_balances_snapshot", return_value=[]), \
+                patch.object(self.strategy, "_build_runtime_operations_snapshot", return_value={}), \
+                patch.object(self.strategy, "get_active_orders", return_value=[]), \
+                patch("hummingbot.strategy.native_observability.controller_observation", return_value={}), \
+                patch("hummingbot.strategy.native_observability.active_order_observations",
+                      return_value=([], "available")), \
+                patch.object(type(self.strategy), "current_timestamp", new_callable=PropertyMock, return_value=1792310400.0):
+            snapshot = self.strategy._build_runtime_status_snapshot()
+
+        held = snapshot["positions_held"][0]
+        self.assertEqual(held["value_quote"], 975.0)  # Breakeven cost remains separate from the current mark.
+        self.assertEqual(held["mark_price_quote"], "4000")
+        self.assertEqual(held["mark_observed_at"], "2026-10-18T08:00:00+00:00")
+        self.assertEqual(held["mark_timestamp_semantics"], "sampled_at")
+        self.assertEqual(held["mark_availability"], "available")
+
+    async def test_unattended_v2_restart_hold_discards_queued_actions(self):
+        action = CreateExecutorAction(controller_id="controller_1",
+                                      executor_config=self.get_position_config_market_short())
+        self.strategy._unattended_restart_hold = True
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[action], asyncio.CancelledError])
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+        self.strategy.update_executors_info = MagicMock()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.strategy.listen_to_executor_actions()
+
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+        self.strategy.update_executors_info.assert_not_called()
 
     async def test_start(self):
         self.assertFalse(self.strategy.ready_to_trade)
@@ -124,16 +673,42 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             is_trading=True,
             custom_info={}
         )
-        # Set up controller_reports with the new structure
-        self.strategy.controller_reports = {
-            "controller_1": {"executors": [executor_1], "positions": [], "performance": None},
-            "controller_2": {"executors": [executor_2], "positions": [], "performance": None}
+        self.strategy.executor_orchestrator.active_executors = {
+            "controller_1": [SimpleNamespace(executor_info=executor_1)],
+            "controller_2": [SimpleNamespace(executor_info=executor_2)],
         }
         self.strategy.closed_executors_buffer = 0
 
         actions = self.strategy.store_actions_proposal()
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].executor_id, "1")
+
+    def test_store_actions_proposal_ignores_stored_history(self):
+        stored_executor = ExecutorInfo(
+            id="stored-db-executor",
+            controller_id="controller_1",
+            type="position_executor",
+            status=RunnableStatus.TERMINATED,
+            timestamp=10,
+            config=PositionExecutorConfig(id="stored-db-executor", timestamp=1234567890, trading_pair="ETH-USDT",
+                                          connector_name="binance",
+                                          side=TradeType.BUY, entry_price=Decimal("100"), amount=Decimal("1")),
+            net_pnl_pct=Decimal(0),
+            net_pnl_quote=Decimal(0),
+            cum_fees_quote=Decimal(0),
+            filled_amount_quote=Decimal(0),
+            is_active=False,
+            is_trading=False,
+            custom_info={"persistence_source": "db"},
+        )
+        self.strategy.controller_reports = {
+            "controller_1": {"executors": [stored_executor], "positions": [], "performance": None},
+        }
+        self.strategy.executor_orchestrator.active_executors = {"controller_1": []}
+        self.strategy.closed_executors_buffer = 0
+
+        actions = self.strategy.store_actions_proposal()
+        self.assertEqual(actions, [])
 
     def test_get_executors_by_controller(self):
         # Set up controller_reports with the new structure
@@ -154,6 +729,17 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         executors = self.strategy.get_all_executors()
         self.assertEqual(len(executors), 3)
+
+    def test_get_active_executors(self):
+        active_executor_1 = MagicMock()
+        active_executor_2 = MagicMock()
+        self.strategy.executor_orchestrator.active_executors = {
+            "controller_1": [SimpleNamespace(executor_info=active_executor_1)],
+            "controller_2": [SimpleNamespace(executor_info=active_executor_2)],
+        }
+
+        executors = self.strategy.get_active_executors()
+        self.assertEqual(executors, [active_executor_1, active_executor_2])
 
     def test_set_leverage(self):
         mock_connector = MagicMock()
@@ -224,6 +810,10 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         for controller in self.strategy.controllers.values():
             controller.stop.assert_called_once()
 
+    def test_shutdown_without_explicit_preference_keeps_position(self):
+        self.strategy.controllers["controller_1"].config = MagicMock(spec=[])
+        self.assertTrue(self.strategy._shutdown_keep_position_preferences()["controller_1"])
+
     def test_parse_markets_str_valid(self):
         test_input = "binance.JASMY-USDT,RLC-USDT:kucoin.BTC-USDT"
         expected_output = {
@@ -274,6 +864,102 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         mock_reload.assert_called_once_with(mock_module)
 
+    def test_protected_controller_source_is_checked_once_per_load_batch(self):
+        from hummingbot.strategy.strategy_v2_base import ControllerImplementationChanged
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            module_file = Path(temp_dir) / "shared_controller.py"
+            implementation_file = Path(temp_dir) / "implementation.py"
+            module_file.write_text("module source", encoding="utf-8")
+            implementation_file.write_text("implementation v1", encoding="utf-8")
+            module_path = f"{strategy_v2_base_module.settings.CONTROLLERS_MODULE}.fixture.shared_controller"
+            protected_module = types.ModuleType(module_path)
+            protected_module.__file__ = str(module_file)
+            protected_module.ProtectedController = type(
+                "ProtectedController",
+                (ControllerBase,),
+                {
+                    "allow_implementation_hot_reload": False,
+                    "implementation_source_files": classmethod(lambda cls: [str(implementation_file)]),
+                },
+            )
+            self.strategy_config.controllers_config = [f"controller_{i}.yml" for i in range(5)]
+            source_paths = {module_file.resolve(), implementation_file.resolve()}
+            read_counts = {path: 0 for path in source_paths}
+            config_reads = []
+            original_read_bytes = Path.read_bytes
+
+            def delayed_source_read(path):
+                if path.resolve() in source_paths:
+                    read_counts[path.resolve()] += 1
+                    time.sleep(0.002)
+                return original_read_bytes(path)
+
+            def read_config(_path):
+                config_reads.append(_path)
+                config_name = Path(_path).name
+                return (
+                    "controller_type: fixture\n"
+                    "controller_name: shared_controller\n"
+                    f"fixture_id: {config_name}\n"
+                )
+
+            def load_config(data, _root, _module):
+                return data
+
+            with patch("hummingbot.strategy_v2.controllers.controller_loader.load_controller_config", side_effect=load_config), \
+                    patch("hummingbot.client.native_sources.read_config_text", side_effect=read_config, create=True), \
+                    patch.object(strategy_v2_base_module.importlib, "import_module", return_value=protected_module) as importer, \
+                    patch.object(strategy_v2_base_module.inspect, "getsourcefile", return_value=str(module_file)), \
+                    patch.object(Path, "read_bytes", delayed_source_read):
+                started = time.perf_counter()
+                first = self.strategy_config.load_controller_configs()
+                first_elapsed = time.perf_counter() - started
+                self.assertEqual(len(first), 5)
+                self.assertEqual(
+                    read_counts,
+                    {path: 1 for path in source_paths},
+                    f"five-config first batch performed repeated source reads ({first_elapsed:.6f}s)",
+                )
+                self.assertEqual([item["fixture_id"] for item in first], [f"controller_{i}.yml" for i in range(5)])
+                self.assertEqual(importer.call_count, 1)
+
+                importer.reset_mock()
+                second = self.strategy_config.load_controller_configs(reload_changed_modules=True)
+                self.assertEqual(len(second), 5)
+                self.assertEqual(read_counts, {path: 2 for path in source_paths})
+                self.assertEqual([item["fixture_id"] for item in second], [f"controller_{i}.yml" for i in range(5)])
+                self.assertEqual(importer.call_count, 1)
+
+                config_read_count = len(config_reads)
+                implementation_file.write_text("implementation v2", encoding="utf-8")
+                with self.assertRaises(ControllerImplementationChanged):
+                    self.strategy_config.load_controller_configs(reload_changed_modules=True)
+                self.assertEqual(len(config_reads), config_read_count)
+                self.assertEqual(read_counts, {path: 3 for path in source_paths})
+
+    def test_unprotected_controller_modules_keep_per_config_reload_behavior(self):
+        module_path = f"{strategy_v2_base_module.settings.CONTROLLERS_MODULE}.fixture.legacy_controller"
+        module = types.ModuleType(module_path)
+        module.__file__ = "/tmp/legacy_controller.py"
+        self.strategy_config.controllers_config = ["legacy_a.yml", "legacy_b.yml"]
+
+        def read_config(path):
+            return f"controller_type: fixture\ncontroller_name: legacy_controller\nname: {path}\n"
+
+        with patch("hummingbot.strategy_v2.controllers.controller_loader.load_controller_config", side_effect=lambda data, _root, _module: data), \
+                patch("hummingbot.client.native_sources.read_config_text", side_effect=read_config, create=True), \
+                patch.object(strategy_v2_base_module.importlib, "import_module", return_value=module) as importer, \
+                patch.object(strategy_v2_base_module.importlib, "reload", return_value=module) as reload_module, \
+                patch.object(strategy_v2_base_module.inspect, "getsourcefile", return_value=module.__file__), \
+                patch.object(strategy_v2_base_module.os.path, "exists", return_value=True), \
+                patch.object(strategy_v2_base_module.os.path, "getmtime", side_effect=[10, 20]):
+            loaded = self.strategy_config.load_controller_configs(reload_changed_modules=True)
+
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(importer.call_count, 2)
+        reload_module.assert_called_once_with(module)
+
     def test_update_controllers_configs_contains_reload_errors(self):
         mock_logger = MagicMock()
         self.strategy.config_update_interval = 0
@@ -319,6 +1005,95 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(replacement_controller.positions_held, current_controller.positions_held)
         self.assertEqual(replacement_controller.performance_report, current_controller.performance_report)
         self.assertEqual(replacement_controller.processed_data, current_controller.processed_data)
+
+    def test_source_change_latches_admission_block_and_preserves_controller(self):
+        from hummingbot.strategy.strategy_v2_base import ControllerImplementationChanged
+        current = DummyReloadControllerV1(
+            config=MagicMock(id='controller_1'),
+            market_data_provider=self.strategy.market_data_provider,
+            actions_queue=self.strategy.actions_queue)
+        self.strategy.controllers = {'controller_1': current}
+        self.strategy.config_update_interval = 0
+        error = ControllerImplementationChanged(current.__class__.__module__)
+        with patch.object(StrategyV2ConfigBase, 'load_controller_configs', side_effect=error), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock, return_value=100):
+            self.strategy.update_controllers_configs()
+        assert self.strategy.controllers['controller_1'] is current
+        assert current.stop_calls == 0
+        assert not self.strategy.validate_create_action(SimpleNamespace(controller_id='controller_1'))
+        assert self.strategy.validate_create_action(SimpleNamespace(controller_id='other'))
+        assert 'RESTART REQUIRED' in self.strategy.format_status()
+        assert not self.strategy._is_stop_triggered
+        with patch.object(StrategyV2ConfigBase, 'load_controller_configs', return_value=[]), \
+                patch.object(type(self.strategy), 'current_timestamp', new_callable=PropertyMock, return_value=101):
+            self.strategy.update_controllers_configs()
+        assert not self.strategy.validate_create_action(SimpleNamespace(controller_id='controller_1'))
+
+    def test_zero_spot_base_is_a_sell_note_not_a_blanket_order_failure(self):
+        self.strategy.markets = {self.connector_name: {self.trading_pair}}
+        self.strategy.ready_to_trade = True
+        self.strategy.controllers = {}
+        self.connector.set_balance('HBOT', Decimal('0'))
+        self.connector.set_balance('USDT', Decimal('1000'))
+        market = MarketTradingPairTuple(self.connector, self.trading_pair, 'HBOT', 'USDT')
+        with patch.object(self.strategy, 'get_market_trading_pair_tuples', return_value=[market]):
+            status = self.strategy.format_status()
+        assert 'Cannot place order' not in status
+        assert 'BALANCE NOTES' in status
+        assert 'no available HBOT to sell' in status
+        assert 'buys require USDT' in status
+
+    def test_status_surfaces_stale_conversion_prices(self):
+        self.strategy.markets = {self.connector_name: {self.trading_pair}}
+        self.strategy.ready_to_trade = True
+        self.strategy.controllers = {}
+        self.strategy.market_data_provider.get_rate_health.return_value = [
+            {'connector': 'okx', 'trading_pair': 'BTC-USDT', 'state': 'stale',
+             'age_seconds': 180, 'error': 'TimeoutError', 'consecutive_failures': 3}]
+        status = self.strategy.format_status()
+        assert 'BTC-USDT' in status
+        assert 'STALE' in status
+        assert '180s' in status
+
+    async def test_source_restart_blocks_queued_creates_but_preserves_stop_actions(self):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+        create = CreateExecutorAction(controller_id='controller_1', executor_config=self.get_position_config_market_short())
+        stop = StopExecutorAction(controller_id='controller_1', executor_id='existing', keep_position=True)
+        self.strategy._controller_restart_required = {'controller_1': 'source changed'}
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+        self.strategy.executor_orchestrator.execute_actions.assert_called_once_with([stop])
+
+    async def test_unfinished_claim_never_skips_queued_creates(self):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+        create = CreateExecutorAction(controller_id='controller_1', executor_config=self.get_position_config_market_short())
+        stop = StopExecutorAction(controller_id='controller_1', executor_id='proven-entry', keep_position=True)
+        self.unfinished_claim_orchestrator()._resume_preflight_failed = True
+        self.strategy.update_executors_info = MagicMock()
+        self.strategy.validate_create_action = MagicMock(return_value=True)
+        self.strategy._is_stop_triggered = False
+        self.strategy._controller_reports_valid = True
+        self.strategy.controllers['controller_1'] = MagicMock(status=RunnableStatus.RUNNING)
+        self.strategy.controllers['controller_1'].config.manual_kill_switch = False
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[create, stop], asyncio.CancelledError])
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+        self.assertEqual(self.strategy.executor_orchestrator.execute_actions.call_args_list, [call([create]), call([stop])])
 
     def create_mock_executor_config(self):
         return MagicMock(
@@ -480,6 +1255,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         self.assertIn("$100.00", status)  # Check for performance data in the summary table
         self.assertIn("$50.00", status)
         self.assertIn("$150.00", status)
+        self.assert_no_status_separator_blocks(status)
 
     def test_format_status_includes_controller_summary_price(self):
         self.strategy.ready_to_trade = True
@@ -491,6 +1267,7 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         controller_mock.get_status_summary.return_value = {
             "pair": "ETH-USDC",
             "price": "2191.5",
+            "timestamp": "2009-02-13 23:30:00 UTC",
             "state": "ENTERING",
             "signal": "BUY",
             "score": "3/3",
@@ -499,9 +1276,21 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             "exposure": "$0/$500 (0%)",
             "execs": "B0 S0 H0",
             "u_pnl": "n/a",
+            "rsi": "28.90",
+            "rsi_proximity": "28.9/35.0",
+            "buy_gauge": "██████████  BUY",
+            "sell_gauge": "░░░░░░░░░░    —",
+            "gates_mask": "buy:ok",
             "gate": "ready",
             "note": "monitoring",
+            "focus": "monitoring",
             "attention_score": 10,
+            "plan_mode": "ENTRIES",
+            "plan_target": "rsi≤35.00",
+            "plan_anchor": "scout $25.00 (35%)",
+            "plan_next": "runner $46.00 (65%)",
+            "plan_slice": "—",
+            "plan_liquidity": "idle $1303.42",
         }
         self.strategy.controllers = {"controller_1": controller_mock}
         self.strategy.controller_reports = {
@@ -514,13 +1303,40 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         status = self.strategy.format_status()
 
-        self.assertIn("CONTROLLERS SUMMARY", status)
-        self.assertIn("price", status)
-        self.assertIn("2191.5", status)
-        self.assertIn("ETH-USDC", status)
-        self.assertIn("breakeven", status)
-        self.assertIn("u%", status)
-        self.assertIn("2188", status)
+        # Shared operator-console layout: SIGNALS / PLANS / runtime tables.
+        self.assertNotIn(f"\n{self.CONTROLLERS_TITLE}\n", status)
+        self.assertIn(f"\n{self.SIGNALS_TITLE}\n", status)
+        self.assertIn(f"\n{self.PLANS_TITLE}\n", status)
+        self.assertNotIn(f"\n{self.INVENTORY_TITLE}\n", status)
+        self.assertNotIn("CONTROLLERS SUMMARY", status)
+        self.assert_no_status_separator_blocks(status)
+
+        # SIGNALS section owns the per-pair overview plus RSI proximity + gates.
+        signals_block = status.split(f"\n{self.SIGNALS_TITLE}\n", 1)[1].split(f"\n{self.PLANS_TITLE}\n", 1)[0]
+        self.assertLess(signals_block.index("pair"), signals_block.index("timestamp"))
+        self.assertLess(signals_block.index("timestamp"), signals_block.index("price"))
+        self.assertLess(signals_block.index("price"), signals_block.index("avg"))
+        self.assertIn("ETH-USDC", signals_block)
+        self.assertIn("2191.5", signals_block)
+        self.assertIn("2009-02-13 23:30:00 UTC", signals_block)
+        self.assertIn("2188", signals_block)
+        self.assertIn("28.9/35.0", signals_block)
+        self.assertIn("buy:ok", signals_block)
+        self.assertIn("monitoring", signals_block)
+
+        # PLANS section owns the per-controller exit/entry decision detail and compact inventory scale.
+        plans_block = status.split(f"\n{self.PLANS_TITLE}\n", 1)[1]
+        self.assertIn("ENTRIES", plans_block)
+        self.assertIn("rsi≤35.00", plans_block)
+        self.assertIn("scout $25.00 (35%)", plans_block)
+        self.assertIn("runner $46.00 (65%)", plans_block)
+        self.assertIn("inventory", plans_block)
+        self.assertIn("idle $1303.42", plans_block)
+
+        # Legacy columns are gone (no verbose breakeven / u% in any controller-summary table).
+        controller_tables = status.split("PERFORMANCE SUMMARY")[0].split("POSITIONS HELD")[0]
+        self.assertNotIn("breakeven", controller_tables)
+        self.assertNotIn("u%", controller_tables)
 
     def test_format_status_surfaces_focus_queue_and_active_executor_pnl(self):
         self.strategy.ready_to_trade = True
@@ -540,8 +1356,14 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             "exposure": "$50/$500 (10%)",
             "execs": "B1 S0 H1",
             "u_pnl": "n/a",
+            "rsi": "28.90",
+            "rsi_proximity": "28.9/35.0",
+            "buy_gauge": "██████████  BUY",
+            "sell_gauge": "██░░░░░░░░ 24%",
+            "gates_mask": "P✗ R✗ V✓",
             "gate": "ready",
             "note": "1 buy active",
+            "focus": "1 buy active",
             "attention_score": 90,
         }
         self.strategy.controllers = {"controller_1": controller_mock}
@@ -573,8 +1395,11 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         status = self.strategy.format_status()
 
-        self.assertIn("Focus Queue (attention):", status)
-        self.assertIn("ETH-USDC | 1 buy active", status)
+        # Focus information is now a column inside SIGNALS, not a separate
+        # standalone "Focus Queue (attention):" block. The dashboard runtime-status
+        # parser falls back to the column when the bullet list is absent.
+        self.assertNotIn("Focus Queue (attention):", status)
+        self.assertIn("1 buy active", status)
         self.assertNotIn("uPnL $50.00 / 5.00%", status)
         self.assertNotIn("gPnL $150.00 / 15.00%", status)
         self.assertIn("ACTIVE EXECUTORS (1)", status)
@@ -666,10 +1491,74 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         self.assertIn("POSITIONS HELD (2)", status)
         self.assertEqual(status.count("POSITIONS HELD"), 1)
-        self.assertIn("ETH-USDC", status)
-        self.assertIn("BTC-USDC", status)
-        self.assertIn("breakeven", status)
+        positions_block = status.split("POSITIONS HELD (2)", 1)[1].split("\n\nController:", 1)[0]
+        self.assertIn("ETH-USDC", positions_block)
+        self.assertIn("BTC-USDC", positions_block)
+        self.assertIn("breakeven", positions_block)
+        self.assertNotIn("controller", positions_block)
+        self.assertNotIn("side", positions_block)
         self.assertNotIn("No positions held.", status)
+
+    def test_format_status_keeps_controller_sections_in_stable_pair_order(self):
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+
+        controller_1 = MagicMock()
+        controller_1.to_format_status.return_value = ["Controller 1 status"]
+        controller_1.get_status_summary.return_value = {
+            "pair": "ETH-USDC",
+            "price": "2191.5",
+            "state": "BUILDING",
+            "signal": "NEUTRAL",
+            "score": "1/2",
+            "regime": "HV-up",
+            "avg_buy": "2188",
+            "exposure": "$100/$500 (20%)",
+            "execs": "B1 S0 H0",
+            "u_pnl": "$5.00 / 2.50%",
+            "u_pnl_pct": "2.50%",
+            "gate": "ready",
+            "note": "monitoring",
+            "attention_score": 10,
+        }
+        controller_2 = MagicMock()
+        controller_2.to_format_status.return_value = ["Controller 2 status"]
+        controller_2.get_status_summary.return_value = {
+            "pair": "BTC-USDC",
+            "price": "74800",
+            "state": "EXITING",
+            "signal": "SELL",
+            "score": "3/2",
+            "regime": "HV-down",
+            "avg_buy": "71791",
+            "exposure": "$400/$500 (80%)",
+            "execs": "B0 S1 H1",
+            "u_pnl": "$20.00 / 4.00%",
+            "u_pnl_pct": "4.00%",
+            "gate": "trend-hold",
+            "note": "sell active",
+            "attention_score": 999,
+        }
+        self.strategy.controllers = {"controller_1": controller_1, "controller_2": controller_2}
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [],
+                "positions": [],
+                "performance": None,
+            },
+            "controller_2": {
+                "executors": [],
+                "positions": [],
+                "performance": None,
+            },
+        }
+
+        status = self.strategy.format_status()
+
+        btc_index = status.index("Controller: controller_2 | BTC-USDC | EXITING | SELL")
+        eth_index = status.index("Controller: controller_1 | ETH-USDC | BUILDING | NEUTRAL")
+        self.assertLess(btc_index, eth_index)
 
     def test_format_status_handles_controller_formatter_exception(self):
         self.strategy.ready_to_trade = True
@@ -714,15 +1603,190 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
 
         self.assertIn("Status formatter error for `controller_1`", status)
         self.assertIn("Controller-specific status is unavailable", status)
-        self.assertIn("🕘 Recent Executors (Last 3):", status)
-        self.assertIn("1. 🔴 SELL position | 🟢 running | 🧯 early-stop", status)
-        self.assertIn("💰 PnL 0.00% / $0", status)
-        self.assertIn("🎯 Entry 100", status)
-        self.assertIn("🪜 Level entry_2", status)
-        self.assertIn("🧵 Trail waiting", status)
-        self.assertIn("🚀 Arm 96.2", status)
-        self.assertIn("↔ Gap 2.10%", status)
-        self.assertIn("🏷 Refs OID-1, OID-2", status)
+        self.assertIn("ACTIVE EXECUTORS (1)", status)
+        self.assertIn("active_exec total=1 | buy=0 sell=1", status)
+        self.assertIn("pnl=$0.00 / 0.00%", status)
+        self.assertIn("fill=$0", status)
+        self.assertIn("trail=waiting:1", status)
+        self.assertIn("entry_2", status)
+        self.assertIn("2.10%", status)
+        self.assertIn("0/5", status)
+        self.assertNotIn("🕘 Recent Executors (Last 3):", status)
+        self.assertNotIn("🏷 Refs OID-1, OID-2", status)
+
+    def test_format_status_suppresses_empty_per_controller_block(self):
+        """Per-controller section disappears when
+        ``to_format_status()`` returns ``[]`` and the controller has no active
+        executor needing a runtime line — preventing 4 lines of pure noise per
+        controller in the operator console (RSIv5Controller is the canonical
+        empty-body case post-2026-04-28)."""
+        self.strategy.ready_to_trade = True
+        self.strategy.markets = {"mock_paper_exchange": {"ETH-USDT"}}
+        type(self.strategy).current_timestamp = PropertyMock(return_value=1234567905)
+
+        controller_mock = MagicMock()
+        controller_mock.to_format_status.return_value = []
+        controller_mock.get_status_summary.return_value = {
+            "pair": "ETH-USDC",
+            "price": "2191.5",
+            "state": "HOLDING",
+            "signal": "NEUTRAL",
+            "score": "0/3",
+            "regime": "HV-down",
+            "avg_buy": "2188.0",
+            "exposure": "$25/$500 (5%)",
+            "execs": "B0 S0 H1",
+            "u_pnl": "$0.00 / 0.00%",
+            "u_pnl_pct": "0.00%",
+            "rsi": "50.00",
+            "rsi_proximity": "50.0/80.0",
+            "buy_gauge": "░░░░░░░░░░    —",
+            "sell_gauge": "██░░░░░░░░ 24%",
+            "gates_mask": "P✗ R✗ V✗",
+            "gate": "ready",
+            "note": "sell buffer 5.0%",
+            "focus": "sell buffer 5.0%",
+            "attention_score": 80,
+            "plan_mode": "EXITS",
+            "plan_target": "7.00%",
+            "plan_anchor": "min 2192.38 (+0.04%)",
+            "plan_next": "arm 2341.16 (+6.83%)",
+            "plan_slice": "15% ≈ 0.0017 ETH ($3.97)",
+            "plan_liquidity": "sellable 0.0114 ETH · idle $0.00",
+            "plan_sellable": "0.0114 ETH",
+            "plan_held": "$25",
+            "plan_active": "$0",
+            "plan_untracked": "$0",
+            "plan_free": "$0",
+            "plan_managed": "$25",
+        }
+        self.strategy.controllers = {"controller_1": controller_mock}
+        self.strategy.controller_reports = {
+            "controller_1": {
+                "executors": [],
+                "positions": [],
+                "performance": None,
+            }
+        }
+
+        status = self.strategy.format_status()
+
+        self.assertNotIn("Controller: controller_1", status)
+        self.assertNotIn(f"\n{self.CONTROLLERS_TITLE}\n", status)
+        self.assertIn(f"\n{self.SIGNALS_TITLE}\n", status)
+        self.assertIn(f"\n{self.PLANS_TITLE}\n", status)
+        self.assertNotIn(f"\n{self.INVENTORY_TITLE}\n", status)
+        self.assert_no_status_separator_blocks(status)
+        # Plan and inventory information live in the parent PLANS table, not in a per-controller block.
+        plans_block = status.split(f"\n{self.PLANS_TITLE}\n", 1)[1]
+        self.assertIn("EXITS", plans_block)
+        self.assertIn("min 2192.38 (+0.04%)", plans_block)
+        self.assertIn("arm 2341.16 (+6.83%)", plans_block)
+        self.assertIn("15% ≈ 0.0017 ETH ($3.97)", plans_block)
+        self.assertIn("inventory", plans_block)
+        self.assertIn("sell 0.0114 ETH", plans_block)
+        self.assertIn("bag $25", plans_block)
+        self.assertNotIn("sellable", plans_block)
+        self.assertNotIn("active buys$", plans_block)
+        self.assertNotIn("frees$", plans_block)
+        self.assertNotIn("managed$", plans_block)
+
+    async def test_queued_create_is_rejected_after_controller_kill(self):
+        action = CreateExecutorAction(controller_id="killed", executor_config=self.get_position_config_market_short())
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[action], asyncio.CancelledError])
+        killed = MagicMock()
+        killed.status = RunnableStatus.TERMINATED
+        killed.config.manual_kill_switch = True
+        self.strategy.controllers = {"killed": killed}
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+
+    async def test_queued_actions_do_not_read_reports_while_planned_resume_is_pending(self):
+        action = CreateExecutorAction(controller_id="controller_1",
+                                      executor_config=self.get_position_config_market_short())
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[[action], asyncio.CancelledError])
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+        self.strategy.update_executors_info = MagicMock()
+
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+
+        self.strategy.update_executors_info.assert_not_called()
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+
+    async def _listen_once(self, actions):
+        self.strategy.actions_queue = MagicMock()
+        self.strategy.actions_queue.get = AsyncMock(side_effect=[actions, asyncio.CancelledError])
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
+        try:
+            await self.strategy.listen_to_executor_actions()
+        except asyncio.CancelledError:
+            pass
+
+    def _refusal_controller(self):
+        controller = MagicMock(status=RunnableStatus.RUNNING)
+        controller.config.manual_kill_switch = False
+        self.strategy.controllers = {"controller_1": controller}
+        self.strategy._is_stop_triggered = False
+        self.strategy._controller_reports_valid = True
+        self.strategy.update_executors_info = MagicMock()
+        self.strategy.executor_orchestrator.execute_actions = MagicMock()
+        return controller
+
+    async def test_create_refused_by_risk_validation_is_reported_to_its_controller(self):
+        controller = self._refusal_controller()
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.validate_create_action = MagicMock(return_value=False)
+        await self._listen_once([action])
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+        controller.create_action_refused.assert_called_once_with(action)
+
+    async def test_create_refused_for_unavailable_controller_is_reported(self):
+        controller = self._refusal_controller()
+        controller.status = RunnableStatus.TERMINATED
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.validate_create_action = MagicMock(return_value=True)
+        await self._listen_once([action])
+        controller.create_action_refused.assert_called_once_with(action)
+
+    async def test_creates_dropped_by_a_pending_resume_are_reported(self):
+        controller = self._refusal_controller()
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+        await self._listen_once([action])
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
+        controller.create_action_refused.assert_called_once_with(action)
+
+    async def test_orchestrator_create_failure_reports_the_failed_and_unprocessed_creates(self):
+        from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+        controller = self._refusal_controller()
+        first = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        second = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        stop = StopExecutorAction(controller_id="controller_1", executor_id="existing", keep_position=True)
+        self.strategy.validate_create_action = MagicMock(return_value=True)
+        self.strategy.executor_orchestrator.execute_actions = MagicMock(
+            side_effect=RuntimeError("Insufficient unreserved USDC"))
+        await self._listen_once([first, stop, second])
+        self.assertEqual(controller.create_action_refused.call_args_list, [call(first), call(second)])
+
+    async def test_controller_without_the_refusal_hook_is_unchanged(self):
+        controller = self._refusal_controller()
+        del controller.create_action_refused
+        action = CreateExecutorAction(controller_id="controller_1", executor_config=self.get_position_config_market_short())
+        self.strategy.validate_create_action = MagicMock(return_value=False)
+        await self._listen_once([action])
+        self.strategy.executor_orchestrator.execute_actions.assert_not_called()
 
     async def test_listen_to_executor_actions(self):
         self.strategy.actions_queue = MagicMock()
@@ -734,7 +1798,13 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
             asyncio.CancelledError,
         ])
         self.strategy.executor_orchestrator.execute_actions = MagicMock()
+
+        async def execute_one(action):
+            self.strategy.executor_orchestrator.execute_actions([action])
+        self.strategy.executor_orchestrator.execute_action_async = AsyncMock(side_effect=execute_one)
         controller_mock = MagicMock()
+        controller_mock.status = RunnableStatus.RUNNING
+        controller_mock.config.manual_kill_switch = False
         self.strategy.controllers = {"controller_1": controller_mock}
 
         # Test for exception handling inside the method.
@@ -765,6 +1835,10 @@ class StrategyV2BaseBasicTest(unittest.TestCase):
                    for record in self.log_records)
 
     def setUp(self):
+        application_patch = patch("hummingbot.client.hummingbot_application.HummingbotApplication.main_application",
+                                  return_value=MagicMock(_mqtt=None))
+        application_patch.start()
+        self.addCleanup(application_patch.stop)
         self.log_records = []
         self.start: pd.Timestamp = pd.Timestamp("2019-01-01", tz="UTC")
         self.end: pd.Timestamp = pd.Timestamp("2019-01-01 01:00:00", tz="UTC")
@@ -794,7 +1868,7 @@ class StrategyV2BaseBasicTest(unittest.TestCase):
         )
         self.clock.add_iterator(self.connector)
         StrategyV2Base.markets = {self.connector_name: {self.trading_pair}}
-        with patch('asyncio.create_task', return_value=MagicMock()):
+        with patch('asyncio.create_task', side_effect=lambda coro: (coro.close(), MagicMock())[1]):
             with patch("hummingbot.strategy.strategy_v2_base.StrategyV2Base.listen_to_executor_actions", return_value=AsyncMock()):
                 with patch('hummingbot.strategy.strategy_v2_base.ExecutorOrchestrator'):
                     with patch('hummingbot.strategy.strategy_v2_base.MarketDataProvider'):
@@ -851,17 +1925,35 @@ class StrategyV2BaseBasicTest(unittest.TestCase):
         self.clock.backtest_til(self.start_timestamp + self.clock_tick_size)
         self.strategy.buy(self.connector_name, self.trading_pair, Decimal("1"), OrderType.LIMIT, Decimal("90"))
         self.strategy.sell(self.connector_name, self.trading_pair, Decimal("1.1"), OrderType.LIMIT, Decimal("110"))
-        expected_status = """
-  Balances:
-               Exchange Asset  Total Balance  Available Balance
-    mock_paper_exchange  HBOT            500              498.9
-    mock_paper_exchange  USDT           5000               4910
+        status = self.strategy.format_status()
 
-  Orders:
-               Exchange    Market Side  Price  Amount      Age
-    mock_paper_exchange HBOT-USDT  buy     90       1"""
-        self.assertTrue(expected_status in self.strategy.format_status())
-        self.assertTrue("mock_paper_exchange HBOT-USDT sell    110     1.1 " in self.strategy.format_status())
+        self.assertIn("Balances:", status)
+        self.assertIn("Value (USD)", status)
+        self.assertIn("mock_paper_exchange  HBOT", status)
+        self.assertIn("mock_paper_exchange  USDT", status)
+        self.assertIn("mock_paper_exchange HBOT-USDT  buy     90       1", status)
+        self.assertIn("mock_paper_exchange HBOT-USDT sell    110     1.1 ", status)
+
+    @patch("hummingbot.strategy.strategy_v2_base.RateOracle.get_instance")
+    def test_get_balance_df_includes_usd_value_column(self, rate_oracle_get_instance):
+        mock_oracle = MagicMock()
+        mock_oracle.quote_token = "USD"
+        mock_oracle.get_pair_rate.side_effect = lambda pair: {
+            "HBOT-USD": Decimal("2"),
+            "USDT-USD": Decimal("1"),
+        }.get(pair)
+        rate_oracle_get_instance.return_value = mock_oracle
+
+        df = self.strategy.get_balance_df()
+
+        self.assertEqual(
+            ["Exchange", "Asset", "Total Balance", "Available Balance", "Value (USD)"],
+            list(df.columns),
+        )
+        hbot_row = df[df["Asset"] == "HBOT"].iloc[0]
+        usdt_row = df[df["Asset"] == "USDT"].iloc[0]
+        self.assertEqual(1000.0, hbot_row["Value (USD)"])
+        self.assertEqual(5000.0, usdt_row["Value (USD)"])
 
     def test_cancel_buy_order_basic(self):
         self.clock.add_iterator(self.strategy)

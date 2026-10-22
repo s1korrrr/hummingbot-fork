@@ -41,8 +41,13 @@ Clone the repo and use the provided `docker-compose.yml` file:
 git clone https://github.com/hummingbot/hummingbot.git
 cd hummingbot
 
-# Run Setup & Deploy
+# Configure optional Gateway support
 make setup
+
+# Select an immutable published engine image digest
+export HUMMINGBOT_IMAGE='hummingbot/hummingbot@sha256:<64-hex-digest>'
+
+# Deploy the exact selected engine image
 make deploy
 
 # Attach to the running instance
@@ -67,13 +72,39 @@ make setup
 Include Gateway? [y/N]
 ```
 
-Then run:
+Then select an immutable Hummingbot engine image and deploy:
 ```bash
+export HUMMINGBOT_IMAGE='hummingbot/hummingbot@sha256:<64-hex-digest>'
 make deploy
 
 # Attach to the running instance
 docker attach hummingbot
 ```
+
+`make deploy` rejects mutable tags such as `latest` and `development`. To deploy
+an image built from the current checkout, first create it from a clean Git
+worktree, then pass Docker's exact local image ID:
+
+```bash
+make build TAG=:local
+export HUMMINGBOT_IMAGE="$(docker image inspect --format '{{.Id}}' hummingbot/hummingbot:local)"
+make setup
+make deploy
+```
+
+Use `make deploy` as the enforced deployment entry point. Direct
+`docker compose up` only checks that `HUMMINGBOT_IMAGE` is non-empty; it does
+not validate the immutable reference grammar. `make setup` writes a one-line
+`.compose.env` containing only the optional Gateway profile. `make deploy`
+treats that file as exact declarative data and rejects manual additions. It
+also clears ambient Compose routing and disables automatic `.env` loading, so
+the selected Compose file and optional Gateway profile cannot be replaced by
+untracked configuration. Deploy and shutdown both use the fixed Compose project
+name `hummingbot` so ambient project routing cannot redirect the lifecycle.
+
+The optional Gateway service is a separate image and currently remains pinned
+to `hummingbot/gateway:latest`; enabling that profile does not provide the same
+immutable-image guarantee as the Hummingbot engine service.
 
 By default, Gateway will start in development mode with unencrypted HTTP endpoints. To run in production model with encrypted HTTPS, use the `DEV=false` flag and run `gateway generate-certs` in Hummingbot to generate the certificates needed. See [Development vs Production Modes](http://hummingbot.org/gateway/installation/#development-vs-production-modes) for more information.
 

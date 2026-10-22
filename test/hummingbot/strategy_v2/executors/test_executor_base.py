@@ -145,6 +145,51 @@ class TestExecutorBase(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         )
         self.assertEqual(sell_order_id, "OID-SELL-1")
 
+    def test_reported_recovery_rows_never_fence_non_position_executor_orders(self):
+        self.strategy.executor_orchestrator = MagicMock()
+        self.strategy.executor_orchestrator.recovery_required = {"other-controller": ["unfinished"]}
+        self.strategy.executor_orchestrator._planned_resume_pending = False
+
+        for side in (TradeType.BUY, TradeType.SELL):
+            with self.subTest(side=side):
+                self.component.place_order(
+                    connector_name="connector1", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
+                    side=side, amount=Decimal("1"), price=Decimal("1000"))
+
+        self.strategy.buy.assert_called_once()
+        self.strategy.sell.assert_called_once()
+
+    def test_pending_planned_resume_blocks_order_before_recovery_rows_load(self):
+        self.strategy.executor_orchestrator = MagicMock()
+        self.strategy.executor_orchestrator.recovery_required = {}
+        self.strategy.executor_orchestrator._planned_resume_pending = True
+
+        with self.assertRaisesRegex(RuntimeError, "startup reconciliation"):
+            self.component.place_order(
+                connector_name="connector1", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
+                side=TradeType.SELL, amount=Decimal("1"), price=Decimal("1000"))
+
+        self.strategy.sell.assert_not_called()
+
+    def test_reconciled_recovery_rows_allow_new_orders(self):
+        self.strategy.executor_orchestrator = MagicMock()
+        self.strategy.executor_orchestrator.recovery_required = {"old-controller": []}
+        self.strategy.executor_orchestrator._planned_resume_pending = False
+
+        order_id = self.component.place_order(
+            connector_name="connector1", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
+            side=TradeType.BUY, amount=Decimal("1"), price=Decimal("1000"))
+
+        self.assertEqual(order_id, "OID-BUY-1")
+
+    def test_unattended_v2_restart_hold_blocks_executor_sell(self):
+        self.strategy._unattended_restart_hold = True
+        with self.assertRaisesRegex(RuntimeError, "unattended restart hold"):
+            self.component.place_order(
+                connector_name="connector1", trading_pair="ETH-USDT", order_type=OrderType.LIMIT,
+                side=TradeType.SELL, amount=Decimal("1"), price=Decimal("1000"))
+        self.strategy.sell.assert_not_called()
+
     async def test_executor_starts_and_stops(self):
         self.assertEqual(RunnableStatus.NOT_STARTED, self.component.status)
         self.component.start()

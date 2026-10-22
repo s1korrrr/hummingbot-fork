@@ -1,12 +1,19 @@
 import asyncio
+import json
+import sqlite3
+import tempfile
+import threading
 import time
+from collections import Counter
 from decimal import Decimal
+from pathlib import Path
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Awaitable
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, update
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
@@ -22,10 +29,17 @@ from hummingbot.core.event.events import (
     SellOrderCreatedEvent,
 )
 from hummingbot.logger import HummingbotLogger
+from hummingbot.model.chart_snapshot import ChartSnapshot
+from hummingbot.model.controller_candle_watermark import (
+    ControllerCandleWatermarkNamespace,
+    ControllerCandleWatermarkOutcome,
+    ControllerCandleWatermarkState,
+)
 from hummingbot.model.executors import Executors
 from hummingbot.model.market_data import MarketData
 from hummingbot.model.order import Order
 from hummingbot.model.position import Position
+from hummingbot.model.position_hold_ledger import PositionHoldLedger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
 from hummingbot.model.trade_fill import TradeFill
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -579,6 +593,34 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         # Should now have 3 positions
         self.assertEqual(3, len(positions))
 
+        # Test clearing an existing position by persisting a flat amount
+        flat_position = Position(
+            id="1213",
+            timestamp=1213,
+            controller_id="test_controller",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            side=TradeType.BUY.name,
+            amount=Decimal("0"),
+            breakeven_price=Decimal("0"),
+            unrealized_pnl_quote=Decimal("0"),
+            realized_pnl_quote=Decimal("0"),
+            cum_fees_quote=Decimal("0"),
+            volume_traded_quote=Decimal("0")
+        )
+        recorder.update_or_store_position(flat_position)
+
+        with self.manager.get_new_session() as session:
+            positions = session.query(Position).all()
+        self.assertEqual(2, len(positions))
+        self.assertFalse(any(
+            position.controller_id == "test_controller"
+            and position.connector_name == "binance"
+            and position.trading_pair == "ETH-USDT"
+            and position.side == TradeType.BUY.name
+            for position in positions
+        ))
+
     def test_get_positions_methods(self):
         recorder = MarketsRecorder(
             sql=self.manager,
@@ -664,6 +706,60 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("pos3", [p.id for p in positions_by_ids])
         self.assertNotIn("pos2", [p.id for p in positions_by_ids])
 
+    def test_store_or_update_position_hold_ledger_entries(self):
+        recorder = MarketsRecorder(
+            sql=self.manager,
+            markets=[self],
+            config_file_path=self.config_file_path,
+            strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(
+                market_data_collection_enabled=False,
+                market_data_collection_interval=60,
+                market_data_collection_depth=20,
+            ),
+        )
+
+        held_order = {
+            "client_order_id": "OID-1",
+            "exchange_order_id": "EX-1",
+            "trade_type": "BUY",
+            "price": "100",
+            "amount": "1",
+            "executed_amount_base": "1",
+            "executed_amount_quote": "100",
+            "cumulative_fee_paid_quote": "1",
+            "last_update_timestamp": 1234,
+        }
+        recorder.store_or_update_position_hold_ledger_entries(
+            controller_id="controller1",
+            executor_id="executor1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            held_position_orders=[held_order],
+        )
+
+        with self.manager.get_new_session() as session:
+            entries = session.query(PositionHoldLedger).all()
+        self.assertEqual(1, len(entries))
+        self.assertIsNone(entries[0].position_side)
+        self.assertEqual("BUY", entries[0].order_side)
+        self.assertEqual(Decimal("100"), entries[0].executed_amount_quote)
+
+        updated_held_order = dict(held_order, executed_amount_quote="110", cumulative_fee_paid_quote="1.5")
+        recorder.store_or_update_position_hold_ledger_entries(
+            controller_id="controller1",
+            executor_id="executor1",
+            connector_name="binance",
+            trading_pair="ETH-USDT",
+            held_position_orders=[updated_held_order],
+        )
+
+        controller_entries = recorder.get_position_hold_ledger_entries_by_controller("controller1")
+        self.assertEqual(1, len(controller_entries))
+        self.assertEqual(Decimal("110"), controller_entries[0].executed_amount_quote)
+        self.assertEqual(Decimal("1.5"), controller_entries[0].cumulative_fee_paid_quote)
+        self.assertEqual("OID-1", controller_entries[0].to_order_record()["client_order_id"])
+
     def test_store_or_update_executor(self):
         recorder = MarketsRecorder(
             sql=self.manager,
@@ -694,6 +790,117 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
             query = session.query(Executors)
             executors = query.all()
         self.assertEqual(1, len(executors))
+
+    def test_cached_executor_reads_follow_every_executors_write(self):
+        recorder = MarketsRecorder(
+            sql=self.manager, markets=[self], config_file_path=self.config_file_path, strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False,
+                                                                 market_data_collection_interval=60,
+                                                                 market_data_collection_depth=20))
+        recorder.cache_executor_reads()
+
+        def executor(executor_id, pnl):
+            config = PositionExecutorConfig(id=executor_id, timestamp=1234, trading_pair="ETH-USDT",
+                                            connector_name="binance", side=TradeType.BUY, entry_price=Decimal("1000"),
+                                            amount=Decimal("1"))
+            mock = MagicMock(spec=PositionExecutor)
+            mock.config = config
+            mock.executor_info = ExecutorInfo(
+                id=executor_id, timestamp=1234, type="position_executor", status=RunnableStatus.RUNNING,
+                controller_id="c", custom_info={}, config=config, net_pnl_pct=Decimal("0"), net_pnl_quote=Decimal(pnl),
+                cum_fees_quote=Decimal("0"), filled_amount_quote=Decimal("1"), is_active=True, is_trading=True)
+            return mock
+
+        def pnls():
+            return {info.id: info.net_pnl_quote for info in recorder.get_all_executors()}
+
+        self.assertEqual({}, pnls())
+        recorder.store_or_update_executor(executor("a", "1"))  # insert through the recorder
+        self.assertEqual({"a": Decimal("1")}, pnls())
+        recorder.store_or_update_executor(executor("a", "2"))  # update through the recorder
+        self.assertEqual({"a": Decimal("2")}, pnls())
+        with self.manager.get_new_session() as session, session.begin():  # a direct ORM writer
+            session.add(Executors(**json.loads(executor("b", "3").executor_info.model_dump_json())))
+        self.assertEqual({"a": Decimal("2"), "b": Decimal("3")}, pnls())
+        with self.manager.get_new_session() as session, session.begin():  # a direct Core statement
+            session.execute(update(Executors).where(Executors.id == "b").values(net_pnl_quote=4))
+        self.assertEqual(Decimal("4"), pnls()["b"])
+        with self.manager.get_new_session() as session, session.begin():  # a row of another controller
+            other = json.loads(executor("z", "5").executor_info.model_dump_json())
+            session.add(Executors(**{**other, "controller_id": "other"}))
+        self.assertEqual(["a", "b"], [info.id for info in recorder.get_executors_by_controller("c")])
+        self.assertEqual(["z"], [info.id for info in recorder.get_executors_by_controller("other")])
+        self.assertEqual([], recorder.get_executors_by_controller(None))
+        selects = []
+        event.listen(self.manager.engine, "before_cursor_execute",
+                     lambda conn, cursor, text, *args: selects.append(text) if "FROM \"Executors\"" in text else None)
+        first, second = recorder.get_all_executors(), recorder.get_all_executors()
+        self.assertEqual([], selects)  # unchanged table: served from memory
+        self.assertIsNot(first[0], second[0])  # callers never share one cached object
+        first[0].net_pnl_quote = Decimal("99")
+        self.assertNotEqual(Decimal("99"), pnls()[first[0].id])
+
+        writes = []
+        event.listen(self.manager.engine, "before_cursor_execute",
+                     lambda conn, cursor, text, *args: writes.append(text) if text.lstrip().startswith(
+                         ("INSERT", "UPDATE")) else None)
+        recorder.store_or_update_executor(executor("a", "2"))  # foreign writes above cleared what "a" holds
+        self.assertEqual(1, len(writes))
+        writes.clear()
+        recorder.store_or_update_executor(executor("a", "2"))  # identical to the last own write
+        self.assertEqual([], writes)
+        with self.manager.get_new_session() as session, session.begin():  # a foreign writer changes "a"
+            session.execute(update(Executors).where(Executors.id == "a").values(net_pnl_quote=7))
+        writes.clear()
+        recorder.store_or_update_executor(executor("a", "2"))  # must be written again
+        self.assertEqual(1, len(writes))
+        self.assertEqual(Decimal("2"), pnls()["a"])
+
+    def test_shared_executor_reads_last_one_scope_and_follow_every_write(self):
+        recorder = MarketsRecorder(
+            sql=self.manager, markets=[self], config_file_path=self.config_file_path, strategy_name=self.strategy_name,
+            market_data_collection=MarketDataCollectionConfigMap(market_data_collection_enabled=False,
+                                                                 market_data_collection_interval=60,
+                                                                 market_data_collection_depth=20))
+
+        def executor(executor_id, pnl, controller="c"):
+            config = PositionExecutorConfig(id=executor_id, timestamp=1234, trading_pair="ETH-USDT",
+                                            connector_name="binance", side=TradeType.BUY, entry_price=Decimal("1000"),
+                                            amount=Decimal("1"))
+            mock = MagicMock(spec=PositionExecutor)
+            mock.config = config
+            mock.executor_info = ExecutorInfo(
+                id=executor_id, timestamp=1234, type="position_executor", status=RunnableStatus.RUNNING,
+                controller_id=controller, custom_info={}, config=config, net_pnl_pct=Decimal("0"),
+                net_pnl_quote=Decimal(pnl), cum_fees_quote=Decimal("0"), filled_amount_quote=Decimal("1"),
+                is_active=True, is_trading=True)
+            return mock
+
+        def pnls():
+            return {info.id: info.net_pnl_quote for info in recorder.get_all_executors()}
+
+        selects = []
+        event.listen(self.manager.engine, "before_cursor_execute",
+                     lambda conn, cursor, text, *args: selects.append(text) if "FROM \"Executors\"" in text else None)
+        recorder.store_or_update_executor(executor("a", "1"))
+        recorder.store_or_update_executor(executor("z", "9", controller="other"))
+        selects.clear()
+        with recorder.shared_executor_reads():
+            first = pnls()
+            with recorder.shared_executor_reads():  # a nested scope shares the outer one
+                self.assertEqual(first, pnls())
+            self.assertEqual(["a"], [info.id for info in recorder.get_executors_by_controller("c")])
+            self.assertEqual(1, len(selects))  # one query serves the whole synchronous decision
+            recorder.get_all_executors()[0].net_pnl_quote = Decimal("99")
+            self.assertEqual(Decimal("1"), pnls()["a"])  # callers never share one object
+            recorder.store_or_update_executor(executor("a", "2"))  # an own write inside the scope
+            self.assertEqual(Decimal("2"), pnls()["a"])
+            with self.manager.get_new_session() as session, session.begin():  # any writer through this engine
+                session.execute(update(Executors).where(Executors.id == "a").values(net_pnl_quote=3))
+            self.assertEqual(Decimal("3"), pnls()["a"])
+        selects.clear()
+        pnls(), pnls()
+        self.assertEqual(2, len(selects))  # outside a scope every read is live, as before
 
     def test_add_market(self):
         """Test adding a new market dynamically to the recorder."""
@@ -1095,3 +1302,665 @@ class MarketsRecorderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(0.05, record.base_fee)
         self.assertEqual(5.0, record.quote_fee)
         self.assertEqual(0.002, record.position_rent_refunded)
+
+    @staticmethod
+    def _watermark_namespace(
+        *, controller_id: str = "ok-rsi-btc", trading_pair: str = "BTC-USDC"
+    ) -> ControllerCandleWatermarkNamespace:
+        return ControllerCandleWatermarkNamespace(
+            controller_id=controller_id,
+            connector_name="okx",
+            trading_pair=trading_pair,
+            interval="1m",
+        )
+
+    @classmethod
+    def _watermark_state(
+        cls,
+        *,
+        controller_id: str = "ok-rsi-btc",
+        trading_pair: str = "BTC-USDC",
+        timestamp: int = 1_700_033_100,
+        revision: int = 0,
+    ) -> ControllerCandleWatermarkState:
+        return ControllerCandleWatermarkState(
+            namespace=cls._watermark_namespace(controller_id=controller_id, trading_pair=trading_pair),
+            candle_open_timestamp_s=timestamp,
+            revision=revision,
+            schema_version=1,
+            updated_at_ms=(timestamp + 60) * 1000,
+        )
+
+    @staticmethod
+    def _file_recorder(db_path: Path) -> MarketsRecorder:
+        manager = SQLConnectionManager(
+            ClientConfigAdapter(ClientConfigMap()),
+            SQLConnectionType.TRADE_FILLS,
+            db_path=str(db_path),
+        )
+        recorder = MarketsRecorder.__new__(MarketsRecorder)
+        recorder._sql_manager = manager
+        return recorder
+
+    def test_chart_batch_does_not_hold_sqlite_writer_during_remaining_identity_reads(self):
+        """A slow chart lookup must not consume the native fill callback's lock budget."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()),
+                SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(temp_dir) / "chart-financial.sqlite"),
+            )
+            recorder = MarketsRecorder(
+                sql=manager,
+                markets=[self],
+                config_file_path=self.config_file_path,
+                strategy_name=self.strategy_name,
+                market_data_collection=MarketDataCollectionConfigMap(
+                    market_data_collection_enabled=False,
+                    market_data_collection_interval=60,
+                    market_data_collection_depth=20,
+                ),
+            )
+            with manager.engine.connect() as connection:
+                self.assertEqual(2000, connection.exec_driver_sql("PRAGMA busy_timeout").scalar())
+
+            rows = [
+                {
+                    "bot_name": "offline-chart-test",
+                    "controller_id": "offline-controller",
+                    "pair": self.trading_pair,
+                    "interval": "1m",
+                    "candle_timestamp": 1_700_000_000_000 + index * 60_000,
+                    "open_price": 100.0,
+                    "high_price": 101.0,
+                    "low_price": 99.0,
+                    "close_price": 100.0 + index / 1000,
+                    "volume": 1.0,
+                    "rsi": 45.0,
+                }
+                for index in range(500)
+            ]
+            recorder.store_or_update_chart_snapshots(rows[:250])
+            batch = [{**row, "rsi": 46.0} for row in rows[:250]] + rows[250:]
+            first_update = threading.Event()
+            chart_done = threading.Event()
+            chart_errors = []
+            counts = Counter()
+
+            def before_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if threading.current_thread().name != "chart-financial-probe":
+                    return
+                kind = statement.lstrip().split(None, 1)[0].upper()
+                counts[kind] += 1
+                if first_update.is_set() and kind == "SELECT" and '"ChartSnapshot"' in statement:
+                    time.sleep(0.006)
+
+            def after_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if threading.current_thread().name == "chart-financial-probe" and statement.lstrip().upper().startswith("UPDATE"):
+                    first_update.set()
+
+            event.listen(manager.engine, "before_cursor_execute", before_execute)
+            event.listen(manager.engine, "after_cursor_execute", after_execute)
+
+            def write_chart():
+                try:
+                    recorder.store_or_update_chart_snapshots(batch)
+                except Exception as exc:
+                    chart_errors.append(exc)
+                finally:
+                    chart_done.set()
+
+            worker = threading.Thread(target=write_chart, name="chart-financial-probe")
+            worker.start()
+            try:
+                self.assertTrue(first_update.wait(10), "chart batch never reached its first update")
+                fill = OrderFilledEvent(
+                    timestamp=1_700_000_000,
+                    order_id="offline-chart-fill",
+                    trading_pair=self.trading_pair,
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("100"),
+                    amount=Decimal("1"),
+                    trade_fee=AddedToCostTradeFee(),
+                    exchange_trade_id="offline-chart-fill-id",
+                )
+                recorder._did_fill_order(MarketEvent.OrderFilled.value, self, fill)
+            finally:
+                worker.join(timeout=10)
+                event.remove(manager.engine, "before_cursor_execute", before_execute)
+                event.remove(manager.engine, "after_cursor_execute", after_execute)
+
+            self.assertTrue(chart_done.is_set(), "chart worker did not finish")
+            self.assertEqual([], chart_errors)
+            self.assertLessEqual(counts["SELECT"], 3)
+            with manager.get_new_session() as session:
+                self.assertEqual(500, session.query(ChartSnapshot).count())
+                self.assertEqual(1, session.query(TradeFill).count())
+                self.assertEqual(
+                    46.0,
+                    session.query(ChartSnapshot.rsi).filter(
+                        ChartSnapshot.candle_timestamp == rows[0]["candle_timestamp"]
+                    ).scalar(),
+                )
+
+    def test_chart_batch_prefetch_keeps_legacy_merge_duplicate_and_identity_semantics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = self._file_recorder(Path(temp_dir) / "chart-merge.sqlite")
+            base = {
+                "bot_name": "offline-chart-test",
+                "controller_id": "offline-controller",
+                "pair": self.trading_pair,
+                "interval": "1m",
+                "candle_timestamp": 1_700_000_000_000,
+                "open_price": 100.0,
+                "high_price": 101.0,
+                "low_price": 99.0,
+                "close_price": 100.0,
+                "volume": 1.0,
+                "rsi": 45.0,
+            }
+            recorder.store_or_update_chart_snapshots([{**base, "buy_decision": "observed"}])
+            with recorder.sql_manager.get_new_session() as session:
+                existing_id = session.query(ChartSnapshot.id).scalar()
+
+            new = {**base, "candle_timestamp": base["candle_timestamp"] + 60_000, "id": existing_id + 100}
+            recorder.store_or_update_chart_snapshots([
+                {**base, "id": existing_id + 200, "rsi": None, "signal": 0},
+                {**new, "rsi": 46.0, "buy_decision": "first"},
+                {**new, "id": existing_id + 300, "rsi": 47.0, "buy_decision": None},
+            ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).order_by(ChartSnapshot.candle_timestamp).all()
+                self.assertEqual(2, len(rows))
+                self.assertEqual(existing_id, rows[0].id)
+                self.assertIsNone(rows[0].rsi)
+                self.assertEqual(0, rows[0].signal)
+                self.assertEqual("observed", rows[0].buy_decision)
+                self.assertEqual(existing_id + 100, rows[1].id)
+                self.assertEqual(47.0, rows[1].rsi)
+                self.assertIsNone(rows[1].buy_decision)
+
+            # SQLite integer affinity accepted this caller input before the
+            # prefetch optimization; the fallback must retain that matching.
+            recorder.store_or_update_chart_snapshots([
+                {**base, "candle_timestamp": str(base["candle_timestamp"]), "rsi": 48.0}
+            ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(2, len(rows))
+                self.assertEqual(48.0, next(row.rsi for row in rows if row.id == existing_id))
+
+            with self.assertRaises(TypeError):
+                recorder.store_or_update_chart_snapshots([
+                    {**base, "rsi": 49.0},
+                    {**base, "candle_timestamp": base["candle_timestamp"] + 120_000,
+                     "unexpected_column": 1},
+                ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(2, len(rows))
+                self.assertEqual(48.0, next(row.rsi for row in rows if row.id == existing_id))
+
+    def test_duplicate_chart_identity_preserves_intermediate_constraint_and_batch_rollback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = self._file_recorder(Path(temp_dir) / "chart-intermediate-constraint.sqlite")
+            base = {
+                "bot_name": "offline-chart-test",
+                "controller_id": "offline-controller",
+                "pair": self.trading_pair,
+                "interval": "1m",
+                "candle_timestamp": 1_700_000_000_000,
+                "open_price": 100.0,
+                "high_price": 101.0,
+                "low_price": 99.0,
+                "close_price": 100.0,
+            }
+            recorder.store_or_update_chart_snapshots([base])
+
+            # The original per-row SELECT autoflushes the invalid first
+            # update before the later correction can mask the constraint.
+            with self.assertRaises(IntegrityError):
+                recorder.store_or_update_chart_snapshots([
+                    {**base, "open_price": None},
+                    {**base, "open_price": 101.0},
+                ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(1, len(rows))
+                self.assertEqual(100.0, rows[0].open_price)
+
+            new = {**base, "candle_timestamp": base["candle_timestamp"] + 60_000}
+            with self.assertRaises(IntegrityError):
+                recorder.store_or_update_chart_snapshots([
+                    {**new, "open_price": None},
+                    {**new, "open_price": 101.0},
+                ])
+            with recorder.sql_manager.get_new_session() as session:
+                rows = session.query(ChartSnapshot).all()
+                self.assertEqual(1, len(rows))
+                self.assertEqual(100.0, rows[0].open_price)
+
+    def test_financial_commit_between_chart_prefetch_and_flush_does_not_invalidate_chart_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()),
+                SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(temp_dir) / "chart-prefetch-interleave.sqlite"),
+            )
+            recorder = MarketsRecorder(
+                sql=manager,
+                markets=[self],
+                config_file_path=self.config_file_path,
+                strategy_name=self.strategy_name,
+                market_data_collection=MarketDataCollectionConfigMap(
+                    market_data_collection_enabled=False,
+                    market_data_collection_interval=60,
+                    market_data_collection_depth=20,
+                ),
+            )
+            row = {
+                "bot_name": "offline-chart-test",
+                "controller_id": "offline-controller",
+                "pair": self.trading_pair,
+                "interval": "1m",
+                "candle_timestamp": 1_700_000_000_000,
+                "open_price": 100.0,
+                "high_price": 101.0,
+                "low_price": 99.0,
+                "close_price": 100.0,
+                "rsi": 45.0,
+            }
+            recorder.store_or_update_chart_snapshots([row])
+            read_completed = threading.Event()
+            release_read = threading.Event()
+            chart_done = threading.Event()
+            chart_errors = []
+
+            def after_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if (threading.current_thread().name == "chart-prefetch-interleave"
+                        and statement.lstrip().upper().startswith("SELECT")
+                        and '"ChartSnapshot"' in statement
+                        and not read_completed.is_set()):
+                    read_completed.set()
+                    if not release_read.wait(5):
+                        raise TimeoutError("financial commit did not release chart prefetch")
+
+            event.listen(manager.engine, "after_cursor_execute", after_execute)
+
+            def write_chart():
+                try:
+                    recorder.store_or_update_chart_snapshots([{**row, "rsi": 46.0}])
+                except Exception as exc:
+                    chart_errors.append(exc)
+                finally:
+                    chart_done.set()
+
+            worker = threading.Thread(target=write_chart, name="chart-prefetch-interleave")
+            worker.start()
+            try:
+                self.assertTrue(read_completed.wait(5), "chart identity prefetch did not run")
+                fill = OrderFilledEvent(
+                    timestamp=1_700_000_000,
+                    order_id="offline-prefetch-fill",
+                    trading_pair=self.trading_pair,
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("100"),
+                    amount=Decimal("1"),
+                    trade_fee=AddedToCostTradeFee(),
+                    exchange_trade_id="offline-prefetch-fill-id",
+                )
+                recorder._did_fill_order(MarketEvent.OrderFilled.value, self, fill)
+            finally:
+                release_read.set()
+                worker.join(timeout=10)
+                event.remove(manager.engine, "after_cursor_execute", after_execute)
+
+            self.assertTrue(chart_done.is_set())
+            self.assertEqual([], chart_errors)
+            with manager.get_new_session() as session:
+                self.assertEqual(1, session.query(TradeFill).count())
+                self.assertEqual(46.0, session.query(ChartSnapshot.rsi).scalar())
+
+    def test_chart_prune_and_actual_fill_commit_concurrently_without_losing_either_receipt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = SQLConnectionManager(
+                ClientConfigAdapter(ClientConfigMap()),
+                SQLConnectionType.TRADE_FILLS,
+                db_path=str(Path(temp_dir) / "chart-prune-financial.sqlite"),
+            )
+            recorder = MarketsRecorder(
+                sql=manager,
+                markets=[self],
+                config_file_path=self.config_file_path,
+                strategy_name=self.strategy_name,
+                market_data_collection=MarketDataCollectionConfigMap(
+                    market_data_collection_enabled=False,
+                    market_data_collection_interval=60,
+                    market_data_collection_depth=20,
+                ),
+            )
+            with manager.engine.connect() as connection:
+                self.assertEqual("wal", connection.exec_driver_sql("PRAGMA journal_mode").scalar())
+                self.assertEqual(2000, connection.exec_driver_sql("PRAGMA busy_timeout").scalar())
+
+            base_timestamp = 1_700_000_000_000
+            rows = [
+                {
+                    "bot_name": "offline-chart-test",
+                    "controller_id": "offline-controller",
+                    "pair": self.trading_pair,
+                    "interval": "1m",
+                    "candle_timestamp": base_timestamp + index * 60_000,
+                    "open_price": 100.0,
+                    "high_price": 101.0,
+                    "low_price": 99.0,
+                    "close_price": 100.0,
+                }
+                for index in range(4096)
+            ]
+            for offset in range(0, len(rows), 500):
+                recorder.store_or_update_chart_snapshots(rows[offset:offset + 500])
+
+            delete_executed = threading.Event()
+            fill_insert_attempt = threading.Event()
+            prune_done = threading.Event()
+            prune_errors = []
+
+            def before_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if (threading.current_thread() is threading.main_thread()
+                        and statement.lstrip().startswith('INSERT INTO "TradeFillExact"')):
+                    fill_insert_attempt.set()
+
+            def after_execute(_connection, _cursor, statement, _parameters, _context, _executemany):
+                if (threading.current_thread().name == "chart-prune-probe"
+                        and statement.lstrip().startswith('DELETE FROM "ChartSnapshot"')):
+                    delete_executed.set()
+                    if not fill_insert_attempt.wait(5):
+                        raise TimeoutError("fill callback did not reach its native insert")
+
+            event.listen(manager.engine, "before_cursor_execute", before_execute)
+            event.listen(manager.engine, "after_cursor_execute", after_execute)
+
+            def prune():
+                try:
+                    recorder.prune_chart_snapshots(
+                        controller_id="offline-controller",
+                        pair=self.trading_pair,
+                        interval="1m",
+                        keep_after_timestamp=rows[2048]["candle_timestamp"],
+                    )
+                except Exception as exc:
+                    prune_errors.append(exc)
+                finally:
+                    prune_done.set()
+
+            worker = threading.Thread(target=prune, name="chart-prune-probe")
+            worker.start()
+            try:
+                self.assertTrue(delete_executed.wait(5), "prune never executed its indexed delete")
+                fill = OrderFilledEvent(
+                    timestamp=1_700_000_000,
+                    order_id="offline-prune-fill",
+                    trading_pair=self.trading_pair,
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("100"),
+                    amount=Decimal("1"),
+                    trade_fee=AddedToCostTradeFee(),
+                    exchange_trade_id="offline-prune-fill-id",
+                )
+                recorder._did_fill_order(MarketEvent.OrderFilled.value, self, fill)
+            finally:
+                fill_insert_attempt.set()
+                worker.join(timeout=10)
+                event.remove(manager.engine, "before_cursor_execute", before_execute)
+                event.remove(manager.engine, "after_cursor_execute", after_execute)
+
+            self.assertTrue(prune_done.is_set())
+            self.assertEqual([], prune_errors)
+            with manager.get_new_session() as session:
+                self.assertEqual(2048, session.query(ChartSnapshot).count())
+                self.assertEqual(
+                    rows[2048]["candle_timestamp"],
+                    session.query(ChartSnapshot.candle_timestamp).order_by(ChartSnapshot.candle_timestamp).first()[0],
+                )
+                self.assertEqual(
+                    rows[-1]["candle_timestamp"],
+                    session.query(ChartSnapshot.candle_timestamp).order_by(ChartSnapshot.candle_timestamp.desc()).first()[0],
+                )
+                self.assertEqual(1, session.query(TradeFill).count())
+
+    def test_watermark_explicit_seed_reopen_and_missing_row_are_typed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "seed.sqlite"
+            first = self._file_recorder(db_path)
+            state = self._watermark_state()
+
+            seeded = first.seed_controller_candle_watermark(state)
+            self.assertEqual(seeded.outcome, ControllerCandleWatermarkOutcome.SEEDED)
+            self.assertEqual(seeded.state, state)
+
+            reopened = self._file_recorder(db_path)
+            loaded = reopened.load_controller_candle_watermark(state.namespace)
+            self.assertEqual(loaded.outcome, ControllerCandleWatermarkOutcome.ALREADY_COMMITTED)
+            self.assertEqual(loaded.state, state)
+
+            missing = reopened.load_controller_candle_watermark(
+                self._watermark_namespace(controller_id="ok-rsi-shadow")
+            )
+            self.assertEqual(missing.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+            self.assertIsNone(missing.state)
+
+    def test_watermark_cas_is_monotonic_first_writer_only_and_namespace_isolated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "cas.sqlite"
+            first = self._file_recorder(db_path)
+            second = self._file_recorder(db_path)
+            btc = self._watermark_state()
+            eth = self._watermark_state(controller_id="ok-rsi-eth", trading_pair="ETH-USDC")
+            self.assertEqual(
+                first.seed_controller_candle_watermark(btc).outcome,
+                ControllerCandleWatermarkOutcome.SEEDED,
+            )
+            self.assertEqual(
+                first.seed_controller_candle_watermark(eth).outcome,
+                ControllerCandleWatermarkOutcome.SEEDED,
+            )
+            stale_first = first.load_controller_candle_watermark(btc.namespace).state
+            stale_second = second.load_controller_candle_watermark(btc.namespace).state
+
+            advanced = first.compare_and_advance_controller_candle_watermark(
+                stale_first,
+                desired_candle_open_timestamp_s=1_700_033_160,
+                updated_at_ms=1_700_033_220_000,
+            )
+            self.assertEqual(advanced.outcome, ControllerCandleWatermarkOutcome.ADVANCED_BY_CALLER)
+            self.assertTrue(advanced.proposal_eligible)
+            self.assertEqual(advanced.state.revision, 1)
+
+            duplicate = second.compare_and_advance_controller_candle_watermark(
+                stale_second,
+                desired_candle_open_timestamp_s=1_700_033_160,
+                updated_at_ms=1_700_033_220_000,
+            )
+            self.assertEqual(duplicate.outcome, ControllerCandleWatermarkOutcome.ALREADY_COMMITTED)
+            self.assertFalse(duplicate.proposal_eligible)
+
+            conflict = second.compare_and_advance_controller_candle_watermark(
+                stale_second,
+                desired_candle_open_timestamp_s=1_700_033_220,
+                updated_at_ms=1_700_033_280_000,
+            )
+            self.assertEqual(conflict.outcome, ControllerCandleWatermarkOutcome.CAS_CONFLICT)
+
+            regression = first.compare_and_advance_controller_candle_watermark(
+                advanced.state,
+                desired_candle_open_timestamp_s=1_700_033_100,
+                updated_at_ms=1_700_033_280_000,
+            )
+            self.assertEqual(regression.outcome, ControllerCandleWatermarkOutcome.REGRESSION)
+            self.assertEqual(first.load_controller_candle_watermark(eth.namespace).state, eth)
+
+    def test_watermark_missing_incompatible_and_corrupt_store_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "invalid.sqlite"
+            recorder = self._file_recorder(db_path)
+            namespace = self._watermark_namespace()
+            recorder.sql_manager.engine.dispose()
+            raw = sqlite3.connect(db_path)
+            raw.execute("DROP TABLE controller_candle_watermark")
+            raw.commit()
+            raw.close()
+
+            missing_table = recorder.load_controller_candle_watermark(namespace)
+            self.assertEqual(missing_table.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+
+            raw = sqlite3.connect(db_path)
+            raw.execute(
+                "CREATE TABLE controller_candle_watermark ("
+                "controller_id TEXT PRIMARY KEY, connector_name TEXT, trading_pair TEXT, interval TEXT, "
+                "candle_open_timestamp_s TEXT, revision TEXT, schema_version TEXT, updated_at_ms TEXT)"
+            )
+            raw.commit()
+            raw.close()
+            incompatible = recorder.load_controller_candle_watermark(namespace)
+            self.assertEqual(incompatible.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+
+            recorder.sql_manager.engine.dispose()
+            raw = sqlite3.connect(db_path)
+            raw.execute("DROP TABLE controller_candle_watermark")
+            raw.execute(
+                "CREATE TABLE controller_candle_watermark ("
+                "controller_id TEXT NOT NULL, connector_name TEXT NOT NULL, trading_pair TEXT NOT NULL, "
+                "interval TEXT NOT NULL, candle_open_timestamp_s BIGINT NOT NULL, revision BIGINT NOT NULL, "
+                "schema_version INTEGER NOT NULL, updated_at_ms BIGINT NOT NULL, "
+                "PRIMARY KEY (controller_id, connector_name, trading_pair, interval))"
+            )
+            raw.execute(
+                "INSERT INTO controller_candle_watermark VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("ok-rsi-btc", "okx", "BTC-USDC", "1m", 1_700_033_101, 0, 1, 1_700_033_160_000),
+            )
+            raw.commit()
+            raw.close()
+            corrupt = recorder.load_controller_candle_watermark(namespace)
+            self.assertEqual(corrupt.outcome, ControllerCandleWatermarkOutcome.INVALID_STATE)
+
+    def test_watermark_lock_and_commit_failure_roll_back_without_grant(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "failures.sqlite"
+            recorder = self._file_recorder(db_path)
+            state = self._watermark_state()
+            self.assertEqual(
+                recorder.seed_controller_candle_watermark(state).outcome,
+                ControllerCandleWatermarkOutcome.SEEDED,
+            )
+
+            locked = sqlite3.connect(db_path, timeout=0)
+            locked.execute("BEGIN IMMEDIATE")
+            locked.execute("UPDATE controller_candle_watermark SET updated_at_ms = updated_at_ms")
+            try:
+                result = recorder.compare_and_advance_controller_candle_watermark(
+                    state,
+                    desired_candle_open_timestamp_s=1_700_033_160,
+                    updated_at_ms=1_700_033_220_000,
+                )
+            finally:
+                locked.rollback()
+                locked.close()
+            self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+            self.assertFalse(result.proposal_eligible)
+
+            flush_session = recorder.sql_manager.get_new_session()
+            with patch.object(flush_session, "flush", side_effect=RuntimeError("injected flush failure")):
+                with patch.object(recorder.sql_manager, "get_new_session", return_value=flush_session):
+                    flush_failed = recorder.compare_and_advance_controller_candle_watermark(
+                        state,
+                        desired_candle_open_timestamp_s=1_700_033_160,
+                        updated_at_ms=1_700_033_220_000,
+                    )
+            flush_session.close()
+            self.assertEqual(flush_failed.outcome, ControllerCandleWatermarkOutcome.COMMIT_FAILED)
+            self.assertFalse(flush_failed.proposal_eligible)
+            self.assertEqual(recorder.load_controller_candle_watermark(state.namespace).state, state)
+
+            session = recorder.sql_manager.get_new_session()
+            with patch.object(session, "commit", side_effect=RuntimeError("injected commit failure")):
+                with patch.object(recorder.sql_manager, "get_new_session", return_value=session):
+                    failed = recorder.compare_and_advance_controller_candle_watermark(
+                        state,
+                        desired_candle_open_timestamp_s=1_700_033_160,
+                        updated_at_ms=1_700_033_220_000,
+                    )
+            session.close()
+            self.assertEqual(failed.outcome, ControllerCandleWatermarkOutcome.COMMIT_FAILED)
+            self.assertFalse(failed.proposal_eligible)
+            self.assertEqual(recorder.load_controller_candle_watermark(state.namespace).state, state)
+
+    def test_watermark_session_acquisition_failures_are_typed_for_load_seed_and_cas(self):
+        error_factories = (
+            ("runtime", lambda: RuntimeError("injected session factory failure")),
+            ("sqlalchemy", lambda: SQLAlchemyError("injected session factory failure")),
+            (
+                "operational",
+                lambda: OperationalError(
+                    "open session",
+                    {},
+                    RuntimeError("injected session factory failure"),
+                ),
+            ),
+        )
+
+        for error_name, error_factory in error_factories:
+            with self.subTest(api="load", error=error_name), tempfile.TemporaryDirectory() as temp_dir:
+                recorder = self._file_recorder(Path(temp_dir) / "load.sqlite")
+                with patch.object(
+                    recorder.sql_manager,
+                    "get_new_session",
+                    side_effect=error_factory(),
+                ):
+                    result = recorder.load_controller_candle_watermark(self._watermark_namespace())
+                self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+                self.assertFalse(result.proposal_eligible)
+                self.assertIsNone(result.state)
+
+            with self.subTest(api="seed", error=error_name), tempfile.TemporaryDirectory() as temp_dir:
+                recorder = self._file_recorder(Path(temp_dir) / "seed.sqlite")
+                state = self._watermark_state()
+                read_session = recorder.sql_manager.get_new_session()
+                with patch.object(
+                    recorder.sql_manager,
+                    "get_new_session",
+                    side_effect=[read_session, error_factory()],
+                ):
+                    result = recorder.seed_controller_candle_watermark(state)
+                self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+                self.assertFalse(result.proposal_eligible)
+                self.assertIsNone(result.state)
+                self.assertEqual(
+                    recorder.load_controller_candle_watermark(state.namespace).outcome,
+                    ControllerCandleWatermarkOutcome.INVALID_STATE,
+                )
+
+            with self.subTest(api="cas", error=error_name), tempfile.TemporaryDirectory() as temp_dir:
+                recorder = self._file_recorder(Path(temp_dir) / "cas.sqlite")
+                state = self._watermark_state()
+                self.assertEqual(
+                    recorder.seed_controller_candle_watermark(state).outcome,
+                    ControllerCandleWatermarkOutcome.SEEDED,
+                )
+                with patch.object(
+                    recorder.sql_manager,
+                    "get_new_session",
+                    side_effect=error_factory(),
+                ):
+                    result = recorder.compare_and_advance_controller_candle_watermark(
+                        state,
+                        desired_candle_open_timestamp_s=1_700_033_160,
+                        updated_at_ms=1_700_033_220_000,
+                    )
+                self.assertEqual(result.outcome, ControllerCandleWatermarkOutcome.STORE_UNAVAILABLE)
+                self.assertFalse(result.proposal_eligible)
+                self.assertEqual(result.state, state)
+                self.assertEqual(recorder.load_controller_candle_watermark(state.namespace).state, state)

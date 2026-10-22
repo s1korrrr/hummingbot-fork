@@ -1,0 +1,329 @@
+"""Tidewater (V4) configuration: Meridian V3's unified runtime with paced capital.
+
+Tidewater reuses Meridian V3's symbol runtimes, portfolio writer, grants and exits
+unchanged, and binds its own identity (controller, recipe, portfolio, stage table). It
+adds the tide gate (occupancy-paced spacing between buys of a pair) and a per-pair
+concentration limit, and an opt-in resting-entry policy. Meridian V3's files are imported,
+never edited, so V3's sealed source closure does not move.
+
+The per-pair limit lives in the symbol runtimes' native live capital (position cap, funded
+cap, depth budget) and in Tidewater's pre-admission check. The P0 mandate keeps its
+per-asset limit at the envelope: P0 marks the whole target infeasible when any one pair
+exceeds its per-asset limit (`portfolio_v3/allocation.py`), which would hold every pair.
+"""
+from decimal import Decimal
+from pathlib import Path
+from types import MappingProxyType
+from typing import Literal
+
+from pydantic import Field, model_validator
+
+from controllers.generic import meridian_v3_recipe as recipe
+from controllers.generic.meridian_v3_portfolio import CapitalStage
+from controllers.generic.meridian_v3_unified_core import config as meridian
+from controllers.generic.meridian_v3_unified_core.config import MeridianUnifiedConfig, SymbolRuntimeConfig
+from controllers.generic.modular_spot_core.config import TrailingPolicy
+from controllers.generic.modular_spot_core.program_budget import BudgetPolicy
+from controllers.generic.tidewater_v4_core.capitulation import CapitulationOverride
+from controllers.generic.tidewater_v4_core.entry_veto import ENTRY_VETOES
+from controllers.generic.tidewater_v4_core.recovery_gap import recovery_buy_gap
+from controllers.generic.tidewater_v4_core.runner import RunnerConfig
+from controllers.generic.tidewater_v4_core.spacing import SpacingConfig
+from controllers.generic.tidewater_v4_core.tide_gate import TideGateConfig
+from hummingbot.strategy_v2.components.recipe_contract import (
+    RecipeBinding,
+    configuration_digest,
+    digest,
+    source_records,
+    verify_binding,
+)
+from hummingbot.strategy_v2.portfolio_v3.contracts import P0Policy, PortfolioMandate
+
+RECIPE_ID = 'tidewater_v4_runtime_v1'
+PORTFOLIO_ID = 'tidewater_v4'
+CONTROLLER_NAME = 'tidewater_v4'
+PRODUCER = meridian.PRODUCER
+PAIRS = meridian.PAIRS
+ID_PREFIX = 'modular_spot_tidewater_v4_'
+
+# envelope, per-pair limit (symbol runtimes and Tidewater admission), order, concurrent tranches.
+# Each tranche reserves order x (1 + fee reserve) = 50.15, so six fit under 350 and a seventh does
+# not. At zero depth the depth budget (0.75 x 350 = 262.5) allows five; it grows as
+# 262.5 + 500 x depth, so the sixth needs about a 7.5% drop from the 24 h high.
+UNCAPPED_QUOTE = Decimal('1000000')
+# The shared native live-capital model admits at most 64 concurrent active tranches per pair
+# (`LiveCapitalConfig.max_active_tranches`, sealed V3 code). Held bags do not count, so this limits
+# concurrency, not capital; results report how often the slot limit refused an entry.
+UNCAPPED_TRANCHES = 64
+
+CAPITAL_STAGES = MappingProxyType({
+    'tidewater_1000': CapitalStage(Decimal('1000'), Decimal('350'), Decimal('50'), 6),
+    # Operator 2026-10-06 (via the regime campaign session): one pair uses the whole envelope, so
+    # the tide gate is exercised on a single pair. Only that pair may have entries enabled.
+    # Nineteen 50.15 tranches fit under 1,000; a twentieth does not.
+    'tidewater_bnb_1000': CapitalStage(Decimal('1000'), Decimal('1000'), Decimal('50'), 19),
+    # Operator 2026-10-06: "50 usd per entry, without any cap" (spacing rules such as the flash-crash
+    # pause, the buy gap and the tide gate are a different thing and stay). The envelope, per-pair
+    # limit, depth budget and tranche ceiling are set to values 50-quote entries cannot reach in a
+    # backtest window, so no cap binds; results report the peak usage to prove it.
+    'tidewater_bnb_uncapped': CapitalStage(UNCAPPED_QUOTE, UNCAPPED_QUOTE, Decimal('50'), UNCAPPED_TRANCHES),
+})
+# Single-pair stages: the only pair allowed to acquire. The others stay managed, entries off.
+SINGLE_PAIR_STAGES = MappingProxyType({'tidewater_bnb_1000': 'BNB-USDC', 'tidewater_bnb_uncapped': 'BNB-USDC'})
+# Occupancy reference of the tide gate: committed usage / reference. A capped stage paces against
+# its envelope; the uncapped stage paces against 1,000, and usage may exceed it (the gate then
+# uses its maximum spacing; it never stops buying by itself, except upward adds above
+# `upward_max_occupancy` of the reference).
+PACING_REFERENCE = MappingProxyType({'tidewater_1000': Decimal('1000'), 'tidewater_bnb_1000': Decimal('1000'),
+                                     'tidewater_bnb_uncapped': Decimal('1000')})
+
+# Frozen priors (operator preference, not fitted). See the design doc, section T1.
+TIDE_GATE_V1 = TideGateConfig(low_occupancy='0.30', high_occupancy='0.90', max_multiplier='4',
+                              upward_max_occupancy='0.50')
+# Research candidate fields. At None each is left out of the sealed payload and the recipe digest,
+# so a configuration that does not use them keeps its pre-candidate recipe and configuration digests.
+VARIANT_FIELDS = ('entry_veto', 'capitulation_override')
+# Likewise, `census` is left out of the sealed payload and the recipe digest while False.
+INERT_FALSE_FIELDS = ('census',)
+
+# V4.1 options, frozen from the BNB May–Aug data study before any economic run
+# (docs/evidence/2026-10-06-bnb-data-deep-dive/SYNTHESIS.md, revision 3). M2 + M4: buys keep
+# 2 x ATR_1h from every open zone. Fixed trailing (M6): run-ups after lows are the same size in every
+# volatility state, so the exit is a fixed percent: 1.2% net of fees (about 1.5% gross at 15 bps per
+# side), 0.5% delta, locked gain 0.7% net.
+SPACING_V41 = SpacingConfig(atr_multiplier='2', zones='all')
+FIXED_TRAILING_V41 = TrailingPolicy(activation='.012', delta='.005')
+
+# Protected runner (opt-in research option, runner.py): the V4 iteration-5 lead, candidate B
+# (bnb-20261007-v4-iter5-rally-01, cm5-r20run50): keep half of each harvested tranche, floor margin 1%,
+# trail at 2 x the 14-day daily ATR. Left out of the sealed payload and the recipe digest while None.
+RUNNER_ITER5_B = RunnerConfig(runner_fraction='0.5', floor_margin='0.01', atr_multiplier='2', atr_days=14)
+# R20 (opt-in research option, recovery_gap.py): V3 with a 0.20% minimum buy gap instead of the recipe's 0.5%
+# floor while the recovery regime holds (the held bag is empty or dust at the bid, or the bid is at or above its
+# breakeven). Left out of the sealed payload and the recipe digest while None.
+R20_RECOVERY_MIN_GAP = Decimal('0.0020')
+OPTIONAL_FIELDS = ('exit_runner', 'recovery_min_gap')
+
+
+def source_files():
+    """Meridian V3's sealed closure plus every Tidewater file. Tidewater code is bound by its
+    own seal; Meridian's seal is computed from Meridian's list only and does not change."""
+    core = Path(__file__).resolve().parent
+    files = [*meridian.source_files(), core.parent / 'tidewater_v4.py', *sorted(core.glob('*.py'))]
+    return list(dict.fromkeys(files))
+
+
+class TidewaterConfig(MeridianUnifiedConfig):
+    controller_name: Literal['tidewater_v4'] = CONTROLLER_NAME
+    recipe_version: Literal['tidewater_v4_runtime_v1'] = RECIPE_ID
+    id: str = Field(pattern=r'^modular_spot_tidewater_v4_(observation|paper|live)$')
+    capital_stage: Literal['tidewater_1000', 'tidewater_bnb_1000', 'tidewater_bnb_uncapped'] = Field(
+        json_schema_extra={'is_updatable': False})
+    # None disables the tide gate (ablation arm); the per-pair limit still applies.
+    tide_gate: TideGateConfig | None = TIDE_GATE_V1
+    # 'strict' re-checks a submitted entry with the full submit-time permission, as V3 does.
+    # 'stable' revokes a submitted entry only for hard reasons (design T7).
+    resting_entry: Literal['strict', 'stable'] = 'strict'
+    # Research candidates (opt-in, sealed). 'e0' refuses a first-entry BUY when the frozen volatility
+    # model's probability exceeds its threshold; 'x0' is its seeded-hash placebo (entry_veto.py). CP lifts the native flash pause for a
+    # DCA buy in a deep capitulation (capitulation.py). Neither ever sells, cancels or demotes.
+    entry_veto: Literal['e0', 'x0'] | None = None
+    capitulation_override: CapitulationOverride | None = None
+    # Signal census (census.py): records every raw signal and its outcomes, with no decision effect.
+    # Every campaign arm sets it, the baseline included; every candidate requires it.
+    census: bool = False
+    # V4.1 options; the defaults keep the V3 modules and the existing recipe digest.
+    # Hourly-ATR spacing and zone memory in pace() (None: off).
+    spacing: SpacingConfig | None = None
+    # 'off' removes the native flash-crash pause (no time pause in V4.1).
+    flash_pause: Literal['native', 'off'] = 'native'
+    # 'fixed_v41' replaces the ATR-adaptive trailing with FIXED_TRAILING_V41.
+    exit_trailing: Literal['adaptive', 'fixed_v41'] = 'adaptive'
+    # Protected runner on harvested tranches (None: off). Research option: paper and replay only.
+    exit_runner: RunnerConfig | None = None
+    # R20: the recipe BuyGapConfig's min_gap in the recovery regime (None: off). Research option: paper and replay only.
+    recovery_min_gap: Decimal | None = Field(default=None, ge=0, lt=1)
+
+    @model_validator(mode='before')
+    @classmethod
+    def stage_envelope(cls, values):
+        if isinstance(values, dict) and 'total_amount_quote' not in values and values.get('capital_stage') in CAPITAL_STAGES:
+            values = {**values, 'total_amount_quote': CAPITAL_STAGES[values['capital_stage']].envelope_quote}
+        return values
+
+    @model_validator(mode='after')
+    def validate_runtime(self):
+        if tuple(sorted(self.priority)) != tuple(sorted(PAIRS)) or len(set(self.priority)) != 5:
+            raise ValueError('explicit priority over exactly the five Tidewater pairs is required')
+        if self.initial_positions:
+            raise ValueError('unverified inventory adoption is not supported')
+        if self.total_amount_quote != self.stage().envelope_quote:
+            raise ValueError(f'the Tidewater {self.capital_stage} envelope is {self.stage().envelope_quote} quote')
+        only = SINGLE_PAIR_STAGES.get(self.capital_stage)
+        if only is not None and {s.trading_pair for s in self.symbols if s.entry_enabled} != {only}:
+            raise ValueError(f'the {self.capital_stage} stage allows entries on {only} only')
+        if self.id != f'{ID_PREFIX}{self.execution_mode}':
+            raise ValueError('controller identity must name its execution mode')
+        if self.execution_mode == 'paper':
+            if self.connector_name != 'okx_paper_trade' or self.data.mode != 'native':
+                raise ValueError('Tidewater paper requires the isolated native paper connector and injected candles')
+            if self.live_capital is not None:
+                raise ValueError('the native paper wallet needs no live capital binding')
+        else:
+            if self.connector_name != 'okx' or self.data.mode != 'shared':
+                raise ValueError('observation and live read shared OKX candles through the native connector')
+            if self.live_capital is not None and (self.execution_mode != 'live'
+                                                  or self.live_capital.account_id != self.account_id
+                                                  or self.live_capital.connector != self.connector_name
+                                                  or self.live_capital.envelope_quote != self.stage().envelope_quote):
+                raise ValueError('live capital must bind this live account, connector and the stage envelope')
+        if self.execution_mode == 'observation' and self.execution_enabled:
+            raise ValueError('observation mode cannot dispatch execution')
+        if self.exit_runner is not None and self.execution_mode == 'live':
+            raise ValueError('the protected runner is a research option (paper and replay only)')
+        if self.recovery_min_gap is not None and self.execution_mode == 'live':
+            raise ValueError('the recovery minimum gap (R20) is a research option (paper and replay only)')
+        if self.execution_enabled and self.recipe_binding is None:
+            raise ValueError('executable Tidewater requires a sealed recipe binding')
+        symbols = self.symbol_configs()
+        if self.recovery_min_gap is not None:
+            for symbol in symbols.values():
+                if symbol.buy_gap is None:
+                    raise ValueError('the recovery minimum gap replaces the min_gap of a configured live buy gap')
+                try:
+                    recovery_buy_gap(symbol.buy_gap, self.recovery_min_gap)
+                except ValueError as exc:
+                    raise ValueError(f'the recovery minimum gap is not a valid min_gap: {exc}') from None
+        if (self.entry_veto is not None or self.capitulation_override is not None) and not self.census:
+            raise ValueError('a research candidate requires census=True (its population must be recorded)')
+        cp = self.capitulation_override
+        if cp is not None and any(s.flash_crash is None or s.depth_budget is None
+                                  or s.depth_budget.lookback_minutes != cp.lookback_minutes for s in symbols.values()):
+            raise ValueError('the capitulation override needs the flash pause and a 1,440-minute depth-budget high')
+        if self.recipe_binding is not None:
+            if self.recipe_binding.recipe_id != RECIPE_ID or self.recipe_binding.recipe_sha256 != self.recipe_digest():
+                raise ValueError('Tidewater recipe binding differs')
+            verify_binding(self.recipe_binding, self.sealed_payload(), source_sha256=digest(self.source_manifest()))
+        return self
+
+    # ------------------------------------------------------------------ bindings
+    def stage(self):
+        return CAPITAL_STAGES[self.capital_stage]
+
+    def pair_limit_quote(self):
+        return self.stage().per_asset_quote
+
+    def pacing_reference_quote(self):
+        """The tide gate's occupancy reference (the envelope for capped stages)."""
+        return PACING_REFERENCE[self.capital_stage]
+
+    def entry_veto_model(self):
+        return None if self.entry_veto is None else ENTRY_VETOES[self.entry_veto]
+
+    def variants(self):
+        """The research candidates this configuration enables, for receipts and reporting."""
+        return {'census': self.census, 'entry_veto': self.entry_veto,
+                'capitulation_override': None if self.capitulation_override is None
+                else self.capitulation_override.model_dump(mode='json')}
+
+    def v41_options(self):
+        """The V4.1 options that differ from the V3 modules, or {} (then the digest is unchanged)."""
+        options = {}
+        if self.spacing is not None:
+            options['spacing'] = self.spacing.model_dump(mode='json')
+        if self.flash_pause != 'native':
+            options['flash_pause'] = self.flash_pause
+        if self.exit_trailing != 'adaptive':
+            options['exit_trailing'] = self.exit_trailing
+        return options
+
+    def recipe_modules(self):
+        """Meridian's p23 modules with the V4.1 recipe options applied (shared module code unchanged)."""
+        modules = dict(super().recipe_modules())
+        if self.flash_pause == 'off':
+            modules['flash_crash'] = None
+        if self.exit_trailing == 'fixed_v41':
+            modules.update(adaptive_trailing=None, trailing=FIXED_TRAILING_V41)
+        return modules
+
+    def symbol_configs(self):
+        """Meridian's per-symbol native configuration at Tidewater's stage, under Tidewater's
+        budget group and program revision."""
+        result = {}
+        for pair, config in super().symbol_configs().items():
+            values = config.model_dump()
+            values.update(budget=BudgetPolicy(group=CONTROLLER_NAME, max_quote=self.stage().envelope_quote, max_assets=5),
+                          program_revision=CONTROLLER_NAME)
+            result[pair] = SymbolRuntimeConfig(**values)
+        return result
+
+    def mandate(self):
+        stage = self.stage()
+        return PortfolioMandate(
+            portfolio_id=PORTFOLIO_ID, account_id=self.account_id, version=RECIPE_ID, mode='observation',
+            reference_quote=stage.envelope_quote, funding_envelope_quote=stage.envelope_quote,
+            per_asset_quote=stage.envelope_quote, order_quote=stage.order_quote,
+            gross_reference_ratio=1, gross_nav_ratio=1,
+            cash_reserve_quote=self.risk.cash_reserve_quote, fee_reserve_fraction=self.risk.fee_reserve_fraction,
+            pairs=PAIRS, loss_policy_sha256=digest({'loss_rails': 'none', 'guards': self.risk.model_dump(mode='json'),
+                                                    'exit_floor': 'protected', 'no_loss_sell': True}),
+            max_age_ms=self.max_snapshot_age_ms, target_lifetime_ms=self.target_lifetime_ms)
+
+    def p0_policy(self):
+        return P0Policy(version=RECIPE_ID, horizon_ms=60000, pair_priority=self.priority, producers=(PRODUCER,))
+
+    def source_manifest(self):
+        return source_records(meridian.source_root(), source_files())
+
+    def sealed_payload(self):
+        payload = super().sealed_payload()
+        for name in VARIANT_FIELDS:
+            if payload.get(name, False) is None:
+                del payload[name]
+        for name in INERT_FALSE_FIELDS:
+            if payload.get(name) is False:
+                del payload[name]
+        for name in OPTIONAL_FIELDS:
+            if name in payload and payload[name] is None:
+                del payload[name]
+        return payload
+
+    def _digest_payload(self):
+        payload = {'recipe_id': RECIPE_ID, 'candidate_sha256': recipe.CANDIDATE_SHA256,
+                   'result_sha256': recipe.RESULT_SHA256, 'mandate_sha256': self.mandate().identity,
+                   'policy_sha256': self.p0_policy().identity,
+                   # A module switched off by a V4.1 option is recorded as None.
+                   'modules': {k: None if v is None else v.model_dump(mode='json')
+                               for k, v in self.recipe_modules().items()},
+                   'capital': self.recipe_capital().model_dump(mode='json'),
+                   'pair_limit_quote': str(self.pair_limit_quote()),
+                   'pacing_reference_quote': str(self.pacing_reference_quote()),
+                   'tide_gate': None if self.tide_gate is None else self.tide_gate.model_dump(mode='json'),
+                   'resting_entry': self.resting_entry}
+        options = self.v41_options()
+        if options:  # absent for configurations without V4.1 options, so their digests do not move
+            payload['v41'] = options
+        # Research candidates, likewise absent unless enabled.
+        if self.entry_veto is not None:  # the frozen model constants are part of the recipe
+            payload['entry_veto'] = {'id': self.entry_veto, 'model': self.entry_veto_model().model_dump(mode='json')}
+        if self.capitulation_override is not None:
+            payload['capitulation_override'] = self.capitulation_override.model_dump(mode='json')
+        if self.census:
+            payload['census'] = True
+        if self.exit_runner is not None:  # absent unless enabled, so other digests do not move
+            payload['exit_runner'] = self.exit_runner.model_dump(mode='json')
+        if self.recovery_min_gap is not None:  # likewise
+            payload['recovery_min_gap'] = str(self.recovery_min_gap)
+        return payload
+
+    def recipe_digest(self):
+        return digest(self._digest_payload())
+
+    def seal(self):
+        return RecipeBinding(recipe_id=RECIPE_ID, recipe_sha256=self.recipe_digest(),
+                             source_sha256=digest(self.source_manifest()),
+                             configuration_sha256=configuration_digest(self.sealed_payload()))
+
+    def get_controller_class(self):
+        from controllers.generic.tidewater_v4 import TidewaterController
+        return TidewaterController

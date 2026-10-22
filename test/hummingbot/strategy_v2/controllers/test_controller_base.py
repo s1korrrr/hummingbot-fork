@@ -91,8 +91,16 @@ class TestControllerBase(IsolatedAsyncioWrapperTestCase):
             total_amount_quote=Decimal("200"),
             manual_kill_switch=True
         )
-        self.controller.update_config(new_config)
-        # Controller name is not updatable
+        original = self.controller.config
+        with self.assertRaisesRegex(ValueError, "restart required for config fields"):
+            self.controller.update_config(new_config)
+        self.assertIs(self.controller.config, original)
+        self.assertEqual(original.total_amount_quote, Decimal("100"))
+        self.assertFalse(original.manual_kill_switch)
+
+        # Only runtime-updatable fields may change without restarting the owner.
+        allowed = original.model_copy(update={"total_amount_quote": Decimal("200"), "manual_kill_switch": True})
+        self.controller.update_config(allowed)
         self.assertEqual(self.controller.config.controller_name, "test_controller")
 
         # Total amount quote is updatable

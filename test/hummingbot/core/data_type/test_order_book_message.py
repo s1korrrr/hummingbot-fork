@@ -1,6 +1,7 @@
 import time
 import unittest
 
+from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_row import OrderBookRow
 
@@ -247,3 +248,51 @@ class OrderBookMessageTest(unittest.TestCase):
         self.assertTrue(diff1 < snapshot2)  # based on id
         self.assertTrue(trade1 < snapshot1)  # based on timestamp
         self.assertTrue(diff2 < trade1)  # if same ts, ob messages < trade messages
+
+    def test_book_equality_hash_and_order_use_real_update_id(self):
+        first = OrderBookMessage(OrderBookMessageType.DIFF, {"update_id": 100}, 1000)
+        same = OrderBookMessage(OrderBookMessageType.DIFF, {"update_id": 100}, 2000)
+        later = OrderBookMessage(OrderBookMessageType.DIFF, {"update_id": 101}, 500)
+        self.assertFalse(first == later)
+        self.assertEqual(first, same)
+        self.assertFalse(first != same)
+        self.assertEqual(hash(first), hash(same))
+        self.assertEqual(2, len({first, same, later}))
+        self.assertFalse(first < first)
+        self.assertFalse(first < same)
+        self.assertTrue(first < later)
+        self.assertFalse(later < first)
+        self.assertTrue(later > first)
+        self.assertTrue(first <= same)
+        self.assertTrue(first >= same)
+        self.assertFalse(first > same)
+        self.assertFalse(later <= first)
+
+    def test_equal_id_diff_precedes_snapshot_and_mixed_time_order_is_symmetric(self):
+        diff = OrderBookMessage(OrderBookMessageType.DIFF, {"update_id": 100}, 10)
+        snapshot = OrderBookMessage(OrderBookMessageType.SNAPSHOT, {"update_id": 100}, 10)
+        trade = OrderBookMessage(OrderBookMessageType.TRADE, {"trade_id": 100}, 10)
+        earlier_trade = OrderBookMessage(OrderBookMessageType.TRADE, {"trade_id": 99}, 9)
+        self.assertNotEqual(diff, snapshot)
+        self.assertTrue(diff < snapshot)
+        self.assertFalse(snapshot < diff)
+        self.assertTrue(diff < trade)
+        self.assertFalse(trade < diff)
+        self.assertTrue(earlier_trade < diff)
+        self.assertFalse(diff < earlier_trade)
+        self.assertFalse(trade < trade)
+        self.assertFalse(diff == object())
+        with self.assertRaises(TypeError):
+            diff < object()
+
+    def test_restore_skips_old_and_equal_diff_but_keeps_later_same_second_diff(self):
+        def message(kind, update_id, price, amount):
+            return OrderBookMessage(kind, {"update_id": update_id, "bids": [(price, amount)], "asks": []},
+                                    update_id * 1e-3)
+        snapshot = message(OrderBookMessageType.SNAPSHOT, 1800000000500, 99, 10)
+        before = message(OrderBookMessageType.DIFF, 1800000000100, 98, 5)
+        equal = message(OrderBookMessageType.DIFF, 1800000000500, 97, 7)
+        after = message(OrderBookMessageType.DIFF, 1800000000900, 99, 12)
+        book = OrderBook()
+        book.restore_from_snapshot_and_diffs(snapshot, [before, equal, after])
+        self.assertEqual([(99, 12)], [(row.price, row.amount) for row in book.bid_entries()])

@@ -34,6 +34,21 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
             self.provider.initialize_candles_feed_list(config)
             self.assertTrue("mock_connector_BTC-USDT_1m" in self.provider.candles_feeds)
 
+    @patch.object(CandlesBase, "start", MagicMock())
+    def test_candle_feeds_share_throttler_within_connector_only(self):
+        okx_btc = self.provider.get_candles_feed(
+            CandlesConfig(connector="okx", trading_pair="BTC-USDT", interval="1m", max_records=100)
+        )
+        okx_eth = self.provider.get_candles_feed(
+            CandlesConfig(connector="okx", trading_pair="ETH-USDT", interval="5m", max_records=100)
+        )
+        binance_btc = self.provider.get_candles_feed(
+            CandlesConfig(connector="binance", trading_pair="BTC-USDT", interval="1m", max_records=100)
+        )
+
+        self.assertIs(okx_btc._api_factory.throttler, okx_eth._api_factory.throttler)
+        self.assertIsNot(okx_btc._api_factory.throttler, binance_btc._api_factory.throttler)
+
     def test_get_non_trading_connector(self):
         connector = self.provider.get_non_trading_connector("binance")
         self.assertEqual(connector._trading_required, False)
@@ -199,7 +214,7 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(result, {"BTC-USDT": 100})
         connector._get_last_traded_price.side_effect = Exception("Error")
         result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT"])
-        self.assertEqual(result, {"BTC-USDT": Decimal("0")})
+        self.assertEqual(result, {})
 
     async def test_safe_get_last_traded_prices_logs_exception_class_for_empty_timeout_message(self):
         connector = AsyncMock()
@@ -210,7 +225,7 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
 
         connector._get_last_traded_price.side_effect = slow_last_trade_price
 
-        with patch("hummingbot.data_feed.market_data_provider.logging.error") as mock_log_error:
+        with patch.object(self.provider.logger(), "warning") as mock_log_error:
             result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT"], timeout=0.001)
 
         self.assertEqual(result, {})
@@ -494,6 +509,37 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
         result = MarketDataProvider.get_connector_config_map("binance")
 
         self.assertEqual(result, {"api_key": "", "secret_key": ""})
+
+    def test_public_okx_connector_preserves_region_without_credentials(self):
+        from hummingbot.connector.exchange.okx.okx_exchange import OkxExchange
+        from hummingbot.connector.exchange.okx.okx_utils import OKXConfigMap
+
+        for region, domain in [("www", "https://www.okx.com/"),
+                               ("app", "https://us.okx.com/"),
+                               ("my", "https://eea.okx.com/")]:
+            with self.subTest(region=region):
+                config = OKXConfigMap(okx_api_key="private-key", okx_secret_key="private-secret",
+                                      okx_passphrase="private-passphrase", okx_registration_sub_domain=region)
+                with patch('hummingbot.client.settings.AllConnectorSettings.get_connector_config_keys',
+                           return_value=config):
+                    params = MarketDataProvider.get_connector_config_map("okx")
+                self.assertEqual(params["okx_registration_sub_domain"], region)
+                for field in ("okx_api_key", "okx_secret_key", "okx_passphrase"):
+                    self.assertEqual(params[field], "")
+                connector = OkxExchange(trading_required=False, trading_pairs=[], **params)
+                self.assertFalse(connector.is_trading_required)
+                self.assertEqual(connector.domain, domain)
+
+    def test_public_okx_connector_rejects_invalid_region(self):
+        from hummingbot.connector.exchange.okx.okx_utils import OKXConfigMap
+
+        for region in ("", "unknown", None):
+            with self.subTest(region=region):
+                config = OKXConfigMap.model_construct(okx_registration_sub_domain=region)
+                with patch('hummingbot.client.settings.AllConnectorSettings.get_connector_config_keys',
+                           return_value=config):
+                    with self.assertRaisesRegex(ValueError, "Invalid OKX public connector registration region"):
+                        MarketDataProvider.get_connector_config_map("okx")
 
     def test_get_connector_with_fallback_existing_connector(self):
         # Test when connector exists in self.connectors
@@ -807,3 +853,116 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
             # Verify cache update was called with limited size
             append_calls = mock_feed._candles.append.call_count
             self.assertLessEqual(append_calls, 80)
+
+    async def test_ticker_timeout_preserves_completed_pairs_and_drains_pending(self):
+        cancelled = asyncio.Event()
+
+        async def fetch(trading_pair):
+            if trading_pair == "BTC-USDT":
+                return 100
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        connector = AsyncMock()
+        connector._get_last_traded_price.side_effect = fetch
+        result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT", "ETH-USDT"], timeout=0.01)
+        self.assertEqual(result, {"BTC-USDT": Decimal("100")})
+        self.assertTrue(cancelled.is_set())
+
+    async def test_ticker_rejects_invalid_prices_without_losing_good_pair(self):
+        for invalid in [0, -1, float("nan"), float("inf"), "bad"]:
+            connector = AsyncMock()
+            connector._get_last_traded_price.side_effect = lambda trading_pair: 100 if trading_pair == "BTC-USDT" else invalid
+            result = await self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT", "ETH-USDT"])
+            self.assertEqual(result, {"BTC-USDT": Decimal("100")})
+
+    async def test_ticker_cancellation_drains_child_requests(self):
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def fetch(trading_pair):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        connector = AsyncMock()
+        connector._get_last_traded_price.side_effect = fetch
+        task = asyncio.create_task(self.provider._safe_get_last_traded_prices(connector, ["BTC-USDT"]))
+        await started.wait()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(cancelled.is_set())
+
+    async def test_failed_registered_ticker_cannot_fall_back_to_stale_oracle(self):
+        connector_pair = ConnectorPair(connector_name="binance", trading_pair="BTC-USDT")
+        self.provider._rates_required.add_or_update("binance", connector_pair)
+        self.provider._non_trading_connectors = {"binance": AsyncMock()}
+        with patch.object(self.provider, '_safe_get_last_traded_prices', return_value={}), \
+                patch('hummingbot.data_feed.market_data_provider.RateOracle.get_instance') as oracle, \
+                patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+            oracle.return_value.get_pair_rate.return_value = Decimal("50000")
+            with self.assertRaises(asyncio.CancelledError):
+                await self.provider.update_rates_task()
+            with self.assertRaisesRegex(ValueError, "unavailable or stale"):
+                self.provider.get_rate("BTC-USDT")
+            oracle.return_value.set_price.assert_not_called()
+
+    async def test_registered_ticker_expires_if_refresh_task_stalls(self):
+        connector_pair = ConnectorPair(connector_name="binance", trading_pair="BTC-USDT")
+        self.provider._rates_required.add_or_update("binance", connector_pair)
+        self.provider._non_trading_connectors = {"binance": AsyncMock()}
+        with patch.object(self.provider, '_safe_get_last_traded_prices', return_value={"BTC-USDT": Decimal("100")}), \
+                patch('hummingbot.data_feed.market_data_provider.RateOracle.get_instance') as oracle, \
+                patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+            oracle.return_value.get_pair_rate.return_value = Decimal("100")
+            with self.assertRaises(asyncio.CancelledError):
+                await self.provider.update_rates_task()
+        with patch('hummingbot.data_feed.market_data_provider.time.monotonic', return_value=float('inf')):
+            with self.assertRaisesRegex(ValueError, "unavailable or stale"):
+                self.provider.get_rate("BTC-USDT")
+
+    async def test_stale_registered_price_cannot_be_used_inverse_or_cross(self):
+        from hummingbot.core.rate_oracle.utils import find_rate
+        self.provider._rates_required.add_or_update('binance', ConnectorPair(connector_name='binance', trading_pair='BTC-USDC'))
+        self.provider._non_trading_connectors = {'binance': AsyncMock()}
+        with patch.object(self.provider, '_safe_get_last_traded_prices', return_value={}), \
+                patch('hummingbot.data_feed.market_data_provider.RateOracle.get_instance') as oracle, \
+                patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+            oracle.return_value.prices = {'BTC-USDC': Decimal('100'), 'ETH-USDC': Decimal('10')}
+            oracle.return_value.get_pair_rate.side_effect = lambda pair: find_rate(oracle.return_value.prices, pair)
+            with self.assertRaises(asyncio.CancelledError):
+                await self.provider.update_rates_task()
+            for pair in ['USDC-BTC', 'BTC-ETH']:
+                with self.assertRaisesRegex(ValueError, 'unavailable or stale'):
+                    self.provider.get_rate(pair)
+            self.assertEqual(oracle.return_value.prices['BTC-USDC'], Decimal('100'))
+
+    async def test_fresh_registered_price_is_not_overwritten_by_global_oracle(self):
+        self.provider._rates_required.add_or_update('binance', ConnectorPair(connector_name='binance', trading_pair='BTC-USDC'))
+        self.provider._non_trading_connectors = {'binance': AsyncMock()}
+        with patch.object(self.provider, '_safe_get_last_traded_prices', return_value={'BTC-USDC': Decimal('100')}), \
+                patch('hummingbot.data_feed.market_data_provider.RateOracle.get_instance') as oracle, \
+                patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+            oracle.return_value.prices = {'BTC-USDC': Decimal('999')}
+            oracle.return_value.get_pair_rate.return_value = Decimal('999')
+            with self.assertRaises(asyncio.CancelledError):
+                await self.provider.update_rates_task()
+            self.assertEqual(self.provider.get_rate('BTC-USDC'), Decimal('100'))
+            self.assertEqual(self.provider.get_rate('USDC-BTC'), Decimal('.01'))
+            self.assertEqual(oracle.return_value.prices['BTC-USDC'], Decimal('999'))
+
+    async def test_one_failed_connector_cannot_be_masked_by_other_source_of_pair(self):
+        for name in ['okx', 'binance']:
+            self.provider._rates_required.add_or_update(name, ConnectorPair(connector_name=name, trading_pair='BTC-USDC'))
+        self.provider._non_trading_connectors = {name: AsyncMock() for name in ['okx', 'binance']}
+        with patch.object(self.provider, '_safe_get_last_traded_prices', side_effect=[{}, {'BTC-USDC': Decimal('100')}]), \
+                patch('hummingbot.data_feed.market_data_provider.RateOracle.get_instance') as oracle, \
+                patch('asyncio.sleep', side_effect=asyncio.CancelledError()):
+            oracle.return_value.prices = {'BTC-USDC': Decimal('100')}
+            oracle.return_value.get_pair_rate.return_value = Decimal('100')
+            with self.assertRaises(asyncio.CancelledError):
+                await self.provider.update_rates_task()
+            with self.assertRaisesRegex(ValueError, 'unavailable or stale'):
+                self.provider.get_rate('BTC-USDC')

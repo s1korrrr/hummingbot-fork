@@ -1,7 +1,8 @@
+import json
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
-import numpy
 import pandas as pd
 from sqlalchemy import JSON, BigInteger, Column, ForeignKey, Index, Integer, Text
 from sqlalchemy.orm import Session, relationship
@@ -38,9 +39,79 @@ class TradeFill(HummingbotBase):
     leverage = Column(Integer, nullable=False, default=1)
     trade_fee = Column(JSON, nullable=False)
     trade_fee_in_quote = Column(SqliteDecimal(6))
+    # Additive exact receipts: legacy integers retain their original six-decimal scale.
+    exact_amount = Column(Text, nullable=True)
+    exact_price = Column(Text, nullable=True)
+    exact_trade_fee_in_quote = Column(Text, nullable=True)
+    exact_receipt_source = Column(Text, nullable=True)
+    execution_timestamp_ms = Column(BigInteger, nullable=True)
+    execution_timestamp_source = Column(Text, nullable=True)
     exchange_trade_id = Column(Text, primary_key=True, nullable=False)
     position = Column(Text, nullable=True, default=PositionAction.NIL.value)
     order = relationship("Order", back_populates="trade_fills")
+
+    @staticmethod
+    def decimal_text(value) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            decimal = Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError) as error:
+            raise ValueError("Invalid trade fill decimal") from error
+        if not decimal.is_finite():
+            raise ValueError("Non-finite trade fill decimal")
+        return str(decimal)
+
+    @property
+    def has_exact_receipt(self) -> bool:
+        return self.exact_receipt_source is not None or any(
+            getattr(self, f"exact_{field}") is not None for field in ("amount", "price", "trade_fee_in_quote"))
+
+    def _decimal_value(self, field: str) -> Optional[Decimal]:
+        if self.has_exact_receipt and self.exact_receipt_source != "order_filled_event_v1":
+            raise ValueError("Missing or unsupported exact trade fill provenance")
+        value = getattr(self, f"exact_{field}") if self.has_exact_receipt else getattr(self, field)
+        text = self.decimal_text(value)
+        if text is None:
+            if field in ("amount", "price"):
+                raise ValueError(f"Missing exact trade fill {field}" if self.has_exact_receipt
+                                 else f"Missing legacy trade fill {field}")
+            return None
+        result = Decimal(text)
+        if field in ("amount", "price") and result <= 0:
+            raise ValueError(f"Trade fill {field} must be positive")
+        return result
+
+    @property
+    def amount_decimal(self) -> Decimal:
+        return self._decimal_value("amount")
+
+    @property
+    def price_decimal(self) -> Decimal:
+        return self._decimal_value("price")
+
+    @property
+    def trade_fee_in_quote_decimal(self) -> Optional[Decimal]:
+        return self._decimal_value("trade_fee_in_quote")
+
+    @property
+    def receipt_precision(self) -> Dict[str, str]:
+        precision = {}
+        for field in ("amount", "price", "trade_fee_in_quote"):
+            try:
+                value = self._decimal_value(field)
+            except ValueError:
+                value = None
+            precision[field] = ("unavailable" if value is None else
+                                "exact_decimal" if self.has_exact_receipt else "legacy_6dp")
+        return precision
+
+    def value_for_file_export(self, field: str):
+        if field in ("amount", "price", "trade_fee_in_quote"):
+            return self._decimal_value(field)
+        if field == "receipt_precision":
+            return json.dumps(self.receipt_precision, sort_keys=True)
+        return getattr(self, field)
 
     def __repr__(self) -> str:
         return f"TradeFill(config_file_path='{self.config_file_path}', strategy='{self.strategy}', " \
@@ -48,7 +119,9 @@ class TradeFill(HummingbotBase):
                f"quote_asset='{self.quote_asset}', timestamp={self.timestamp}, order_id='{self.order_id}', " \
                f"trade_type='{self.trade_type}', order_type='{self.order_type}', price={self.price}, " \
                f"amount={self.amount}, leverage={self.leverage}, trade_fee={self.trade_fee}, " \
-               f"exchange_trade_id={self.exchange_trade_id}, position={self.position})"
+               f"exchange_trade_id={self.exchange_trade_id}, position={self.position}, " \
+               f"execution_timestamp_ms={self.execution_timestamp_ms}, " \
+               f"execution_timestamp_source={self.execution_timestamp_source})"
 
     @staticmethod
     def get_trades(sql_session: Session,
@@ -117,8 +190,8 @@ class TradeFill(HummingbotBase):
                 trade.symbol,
                 trade.order_type.lower(),
                 trade.trade_type.lower(),
-                trade.price,
-                trade.amount,
+                trade.price_decimal,
+                trade.amount_decimal,
                 trade.leverage,
                 trade.position,
                 age,
@@ -133,8 +206,8 @@ class TradeFill(HummingbotBase):
         return {
             "market": trade_fill.market,
             "trade_id": trade_fill.exchange_trade_id,
-            "price": numpy.format_float_positional(trade_fill.price),
-            "quantity": numpy.format_float_positional(trade_fill.amount),
+            "price": format(trade_fill.price_decimal, "f"),
+            "quantity": format(trade_fill.amount_decimal, "f"),
             "symbol": trade_fill.symbol,
             "trade_timestamp": trade_fill.timestamp,
             "trade_type": trade_fill.trade_type,
@@ -165,4 +238,8 @@ class TradeFill(HummingbotBase):
             "leverage",
             "trade_fee",
             "trade_fee_in_quote",
-            "position", ]
+            "position",
+            "exact_receipt_source",
+            "receipt_precision",
+            "execution_timestamp_ms",
+            "execution_timestamp_source", ]

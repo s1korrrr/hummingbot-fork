@@ -27,6 +27,9 @@ class StopExecutorAction(ExecutorAction):
     """
     executor_id: str
     keep_position: Optional[bool] = False
+    # Stop only the entry acquisition (cancel the resting remainder); a filled
+    # position keeps its exit barriers. Used for signal invalidation/kill switch.
+    acquisition_only: bool = False
 
 
 class StoreExecutorAction(ExecutorAction):

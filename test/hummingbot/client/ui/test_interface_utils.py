@@ -111,7 +111,8 @@ class InterfaceUtilsTest(unittest.TestCase):
             self.async_run_with_timeout(start_trade_monitor(mock_result))
         self.assertEqual(2, mock_result.log.call_count)
         self.assertEqual('Trades: 0, Total P&L: 0.00, Return %: 0.00%', mock_result.log.call_args_list[0].args[0])
-        self.assertEqual('Trades: 2, Total P&L: N/A, Return %: 1.50%', mock_result.log.call_args_list[1].args[0])
+        self.assertEqual('Trades: 2, Total P&L: 2.00 BTC, 3.00 USDT, Return %: 1.50%',
+                         mock_result.log.call_args_list[1].args[0])
 
     @patch("hummingbot.client.ui.interface_utils._sleep", new_callable=AsyncMock)
     @patch("hummingbot.client.ui.interface_utils.PerformanceMetrics.create", new_callable=AsyncMock)

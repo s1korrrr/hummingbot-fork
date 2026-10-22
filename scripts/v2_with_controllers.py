@@ -509,18 +509,18 @@ class V2WithControllers(StrategyV2Base):
         controller_id = controller.config.id
         now = time.time()
         observed_at = datetime.fromtimestamp(now, timezone.utc).isoformat()
-        pair = ((outcome or {}).get('pair') if isinstance(outcome, dict) else None)
-        pair = pair or getattr(controller.config, 'trading_pair', None) or 'PORTFOLIO'
+        own_pair = getattr(controller.config, 'trading_pair', None) or 'PORTFOLIO'
         issues = []
         hold_reason = 'none'
         issue_since = getattr(self, '_native_buy_issue_since', None)
         if issue_since is None:
             issue_since = self._native_buy_issue_since = {}
-        active_issue_codes = set()
+        active_issue_keys = set()
 
-        def issue(code, detail, at=None):
-            active_issue_codes.add(code)
-            since = issue_since.setdefault((controller_id, code), at if isinstance(at, (int, float)) else now)
+        def issue(code, detail, at=None, pair='PORTFOLIO'):
+            key = (controller_id, code, pair)
+            active_issue_keys.add(key)
+            since = issue_since.setdefault(key, at if isinstance(at, (int, float)) else now)
             record = {'code': code, 'controller_id': controller_id, 'pair': pair,
                       'since': datetime.fromtimestamp(since, timezone.utc).isoformat(),
                       'detail': str(detail)[:160],
@@ -529,11 +529,15 @@ class V2WithControllers(StrategyV2Base):
                 record['last_failure_at'] = datetime.fromtimestamp(at, timezone.utc).isoformat()
             issues.append(record)
 
-        if isinstance(outcome, dict):
-            last_failure = outcome.get('last_failure_at')
-            code = outcome.get('last_failure_code')
+        pair_outcomes = outcome if isinstance(outcome, dict) else {}
+        for pair, state in pair_outcomes.items():
+            if not isinstance(pair, str) or not isinstance(state, dict):
+                issue('native_buy_outcome_unavailable', 'Malformed native buy outcome')
+                continue
+            last_failure = state.get('last_failure_at')
+            code = state.get('last_failure_code')
             if isinstance(last_failure, (int, float)) and (
-                    outcome.get('last_failure_sequence', 0) > outcome.get('last_activated_sequence', 0)):
+                    state.get('last_failure_sequence', 0) > state.get('last_activated_sequence', 0)):
                 if code in ('wallet_reservation_changed',):
                     hold_reason = 'cash'
                 elif code in ('controller_unavailable_or_killed', 'restart_hold'):
@@ -541,13 +545,13 @@ class V2WithControllers(StrategyV2Base):
                 elif code in ('strategy_stopping_or_resume_pending',):
                     hold_reason = 'risk'
                 else:
-                    issue('native_buy_create_refused', code or 'unknown', last_failure)
+                    issue('native_buy_create_refused', code or 'unknown', last_failure, pair=pair)
         if getattr(self, '_risk_reconciliation_error', None):
             issue('risk_reconciliation_unavailable', type(self._risk_reconciliation_error).__name__)
         if getattr(controller, '_recovery_fault', None):
-            issue('native_recovery_fault', controller._recovery_fault)
+            issue('native_recovery_fault', controller._recovery_fault, pair=own_pair)
         if getattr(controller, '_entry_decision_error', None):
-            issue('entry_decision_unavailable', controller._entry_decision_error)
+            issue('entry_decision_unavailable', controller._entry_decision_error, pair=own_pair)
         if getattr(controller, 'fault', None):
             issue('controller_fault', controller.fault)
         portfolio = getattr(controller, 'portfolio', None)
@@ -562,7 +566,7 @@ class V2WithControllers(StrategyV2Base):
                 and controller._last_evaluated_candle_timestamp > auth['candle']
                 and not any(getattr(info, 'id', None) == auth.get('executor_id') and getattr(info, 'is_active', False)
                             for info in getattr(controller, 'executors_info', ()) or ())):
-            issue('durable_buy_authorization_unresolved', auth.get('executor_id', 'unknown'))
+            issue('durable_buy_authorization_unresolved', auth.get('executor_id', 'unknown'), pair=own_pair)
         funding_hold = (getattr(controller, '_funding_assessment_hold', None)
                         or getattr(controller, '_funding_hold', None))
         if funding_hold:
@@ -570,7 +574,7 @@ class V2WithControllers(StrategyV2Base):
                                      'Funded per-entry cap exceeded') and hold_reason == 'none':
                 hold_reason = 'cash'
             else:
-                issue('native_funding_reconciliation_required', funding_hold)
+                issue('native_funding_reconciliation_required', funding_hold, pair=own_pair)
         if not issues and hold_reason == 'none':
             if (getattr(controller.config, 'manual_kill_switch', False)
                     or getattr(controller, '_operator_entry_paused', False)
@@ -582,18 +586,21 @@ class V2WithControllers(StrategyV2Base):
         unverified = (getattr(controller.config, 'funding', None) is not None
                       and not getattr(funding_store, 'status', None))
         for key in list(issue_since):
-            if key[0] == controller_id and key[1] not in active_issue_codes:
+            if key[0] == controller_id and key not in active_issue_keys:
                 issue_since.pop(key)
         status = 'blocked' if issues else 'unavailable' if unverified else 'healthy'
+        failure_times = [state.get('last_failure_at') for state in pair_outcomes.values() if isinstance(state, dict)
+                         and isinstance(state.get('last_failure_at'), (int, float))]
+        activation_times = [state.get('last_activated_at') for state in pair_outcomes.values() if isinstance(state, dict)
+                            and isinstance(state.get('last_activated_at'), (int, float))]
         return {'schema_version': 1, 'status': status,
                 'hold_reason': 'system' if status != 'healthy' else hold_reason, 'observed_at': observed_at,
-                'issues': issues, 'failure_count': outcome.get('failure_count', 0) if isinstance(outcome, dict) else 0,
-                'last_failure_at': (datetime.fromtimestamp(outcome['last_failure_at'], timezone.utc).isoformat()
-                                    if isinstance(outcome, dict) and isinstance(outcome.get('last_failure_at'), (int, float))
-                                    else None),
-                'last_activated_at': (datetime.fromtimestamp(outcome['last_activated_at'], timezone.utc).isoformat()
-                                      if isinstance(outcome, dict) and isinstance(outcome.get('last_activated_at'), (int, float))
-                                      else None)}
+                'issues': issues, 'failure_count': sum(state.get('failure_count', 0) for state in pair_outcomes.values()
+                                                       if isinstance(state, dict)),
+                'last_failure_at': (datetime.fromtimestamp(max(failure_times), timezone.utc).isoformat()
+                                    if failure_times else None),
+                'last_activated_at': (datetime.fromtimestamp(max(activation_times), timezone.utc).isoformat()
+                                      if activation_times else None)}
 
     def _validate_operator_watermarks(self, watermarks):
         if not isinstance(watermarks, dict) or not set(watermarks).issubset(self.controllers):

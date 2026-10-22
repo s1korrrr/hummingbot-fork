@@ -789,6 +789,43 @@ class TestStrategyV2Base(IsolatedAsyncioWrapperTestCase):
         # Since no actions are returned, execute_action should not be called
         mock_execute_action.assert_not_called()
 
+    def _tick_with_actions(self, actions, async_native):
+        self.strategy.ready_to_trade = True
+        self.strategy.market_data_provider.ready = True
+        self.strategy.executor_orchestrator.resume_planned_positions_if_ready.return_value = True
+        for name in ("_persist_controller_configs_if_safe", "update_executors_info",
+                     "_start_controllers_if_safe", "_sync_runtime_state_to_db_if_due",
+                     "_write_chart_snapshots_if_due", "_write_runtime_status_snapshot_if_due",
+                     "update_controllers_configs"):
+            setattr(self.strategy, name, MagicMock())
+        self.strategy.determine_executor_actions = MagicMock(return_value=actions)
+        recorder = SimpleNamespace(_async_financial_events=async_native)
+        with patch.object(MarketsRecorder, "get_existing_instance", return_value=recorder):
+            self.strategy.on_tick()
+
+    def test_generic_tick_actions_keep_synchronous_dispatch_without_queue_growth(self):
+        from hummingbot.strategy_v2.models.executor_actions import StoreExecutorAction
+        create = CreateExecutorAction(controller_id="controller_1",
+                                      executor_config=self.get_position_config_market_short())
+        store = StoreExecutorAction(controller_id="controller_1", executor_id="finished")
+        self._tick_with_actions([create, store], async_native=False)
+        self._tick_with_actions([create], async_native=False)
+        self.assertEqual(self.strategy.executor_orchestrator.execute_action.call_args_list,
+                         [call(create), call(store), call(create)])
+        self.assertTrue(self.strategy.actions_queue.empty())
+        self.assertEqual(self.strategy._pending_store_action_ids, set())
+
+    def test_native_tick_actions_keep_acknowledged_async_dispatch(self):
+        from hummingbot.strategy_v2.models.executor_actions import StoreExecutorAction
+        create = CreateExecutorAction(controller_id="controller_1",
+                                      executor_config=self.get_position_config_market_short())
+        store = StoreExecutorAction(controller_id="controller_1", executor_id="finished")
+        self._tick_with_actions([create, store, store], async_native=True)
+        self.strategy.executor_orchestrator.execute_action.assert_not_called()
+        self.assertEqual(self.strategy.actions_queue.qsize(), 2)
+        self.assertEqual(self.strategy.actions_queue.get_nowait(), [create])
+        self.assertEqual(self.strategy.actions_queue.get_nowait(), [store])
+
     async def test_on_stop(self):
         # Make the executor orchestrator stop method async
         self.strategy.executor_orchestrator.stop = AsyncMock()

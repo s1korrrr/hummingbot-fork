@@ -505,12 +505,15 @@ class StrategyV2Base(StrategyPyBase):
             self.update_controllers_configs()
             if self.market_data_provider.ready and not self._is_stop_triggered:
                 executor_actions: List[ExecutorAction] = self.determine_executor_actions()
+                recorder = MarketsRecorder.get_existing_instance()
+                native_async_mode = (recorder is not None
+                                     and getattr(recorder, "_async_financial_events", False) is True)
                 for action in executor_actions:
                     if isinstance(action, CreateExecutorAction) and action.controller_id in self._controller_restart_required:
                         continue
-                    if isinstance(action, CreateExecutorAction):
+                    if native_async_mode and isinstance(action, CreateExecutorAction):
                         self.actions_queue.put_nowait([action])
-                    elif isinstance(action, StoreExecutorAction):
+                    elif native_async_mode and isinstance(action, StoreExecutorAction):
                         key = (action.controller_id, action.executor_id)
                         if key not in self._pending_store_action_ids:
                             self._pending_store_action_ids.add(key)

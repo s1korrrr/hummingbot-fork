@@ -152,6 +152,13 @@ async def test_v3_factory_dispatch_is_revalidated_without_consuming_it_twice(tmp
             outcome = orchestrator._native_buy_outcomes[action.controller_id]
             assert outcome['failure_count'] == 0
             assert outcome['last_activated_at'] is not None
+            with patch('time.time', side_effect=[2000.0, 900.0]):
+                orchestrator._note_native_buy_outcome(action, RuntimeError(
+                    'Executor admission changed after intent commit: controller_permission_changed'))
+                orchestrator._note_native_buy_outcome(action)
+            assert outcome['last_failure_at'] == 2000.0
+            assert outcome['last_activated_at'] == 900.0
+            assert outcome['last_failure_sequence'] < outcome['last_activated_sequence']
         finally:
             await scenario.close()
             MarketsRecorder._shared_instance = previous
@@ -166,8 +173,9 @@ def test_native_buy_health_retains_system_refusal_until_progress_and_detects_sta
                                                                    'dispatched': False}, 'consumed_candle': 0},
                                      _local_authorization=('abandoned', 'fingerprint', 100), _awaiting_commit=None),
                                  _last_evaluated_candle_timestamp=100, executors_info=[], entries_held=lambda: None)
-    outcome = {'failure_count': 1, 'last_failure_at': 1000.0,
-               'last_failure_code': 'controller_permission_changed', 'last_activated_at': None}
+    outcome = {'failure_count': 1, 'last_failure_at': 1000.0, 'last_failure_sequence': 2,
+               'last_failure_code': 'controller_permission_changed', 'last_activated_at': 2000.0,
+               'last_activated_sequence': 1}
     first = strategy._native_buy_admission(controller, outcome)
     assert first['status'] == 'blocked' and first['hold_reason'] == 'system'
     assert [issue['code'] for issue in first['issues']] == ['native_buy_create_refused']
@@ -180,7 +188,8 @@ def test_native_buy_health_retains_system_refusal_until_progress_and_detects_sta
     assert 'native_funding_reconciliation_required' in [issue['code'] for issue in exact['issues']]
     controller._funding_hold = None
     controller._entry_decision_gate.last_state['authorization'] = None
-    outcome['last_activated_at'] = 1001.0
+    outcome['last_activated_at'] = 900.0  # The wall clock moved backward after actual progress.
+    outcome['last_activated_sequence'] = 3
     cleared = strategy._native_buy_admission(controller, outcome)
     assert cleared['status'] == 'healthy' and cleared['issues'] == []
     assert cleared['failure_count'] == 1

@@ -2160,13 +2160,18 @@ class ExecutorOrchestrator:
             outcomes = self._native_buy_outcomes = {}
         state = outcomes.setdefault(action.controller_id, {"failure_count": 0, "last_failure_at": None,
                                                            "last_failure_code": None, "last_activated_at": None,
-                                                           "pair": None})
+                                                           "pair": None, "sequence": 0,
+                                                           "last_failure_sequence": 0,
+                                                           "last_activated_sequence": 0})
         state["pair"] = action.executor_config.trading_pair
+        state["sequence"] += 1
         if error is None:
             state["last_activated_at"] = time()
+            state["last_activated_sequence"] = state["sequence"]
             return
         state["failure_count"] += 1
         state["last_failure_at"] = time()
+        state["last_failure_sequence"] = state["sequence"]
         message = str(error)
         if message.startswith("Executor admission changed after intent commit:"):
             state["last_failure_code"] = message.split(":", 1)[-1].strip()[:80]

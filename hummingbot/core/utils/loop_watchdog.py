@@ -1,8 +1,8 @@
-"""Event-loop stall evidence: name the code that held the loop instead of inferring it.
+"""Event-loop stall evidence: retain a sampled stack and measured wall/CPU clocks.
 
 A daemon thread watches a heartbeat the loop refreshes every `interval` seconds. When
 the heartbeat is older than `threshold`, the thread logs the loop thread's current
-stack once for that stall; when the loop runs again it logs how long it was held.
+stack once for that stall; when the loop runs again it logs wall and CPU elapsed.
 Observation only: it never touches orders, state or the work the loop does.
 """
 import logging
@@ -24,6 +24,8 @@ class LoopWatchdog:
         self.loop, self.interval, self.threshold = loop, interval, threshold
         self.logger = logger or logging.getLogger(__name__)
         self.beat = time.monotonic()
+        self.loop_cpu = None
+        self.process_cpu = None
         self.loop_thread = None
         self.stall_reported = False
         self.stopped = threading.Event()
@@ -42,10 +44,19 @@ class LoopWatchdog:
 
     def _beat(self):
         now = time.monotonic()
+        loop_cpu, process_cpu = time.thread_time(), time.process_time()
         if self.stall_reported:
             self.stall_reported = False
-            self.logger.warning("Event loop resumed after %.1fs without running", now - self.beat)
+            # Read both clocks here on the loop thread. Dereferencing another thread's
+            # pthread clock races thread exit; a sampled stack alone cannot show CPU use.
+            loop_elapsed = (f"{loop_cpu - self.loop_cpu:.3f}s" if self.loop_cpu is not None
+                            and loop_cpu >= self.loop_cpu and self.loop_thread == threading.get_ident() else "unavailable")
+            process_elapsed = (f"{process_cpu - self.process_cpu:.3f}s" if self.process_cpu is not None
+                               and process_cpu >= self.process_cpu else "unavailable")
+            self.logger.warning("Event loop resumed after %.1fs without running; loop_cpu=%s process_cpu=%s",
+                                now - self.beat, loop_elapsed, process_elapsed)
         self.beat = now
+        self.loop_cpu, self.process_cpu = loop_cpu, process_cpu
         if not self.stopped.is_set():
             self.loop.call_later(self.interval, self._beat)
 

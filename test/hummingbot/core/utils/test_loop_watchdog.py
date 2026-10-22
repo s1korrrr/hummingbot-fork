@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 
 from hummingbot.core.utils.loop_watchdog import LoopWatchdog
@@ -29,6 +30,12 @@ def test_stall_names_the_blocking_code_and_its_duration(caplog):
     resumed = [r.getMessage() for r in caplog.records if "Event loop resumed" in r.getMessage()]
     assert len(held) == 1 and "blocking_candle_work" in held[0]
     assert len(resumed) == 1 and float(resumed[0].split("after ")[1].split("s")[0]) >= 0.5
+    loop_cpu = re.search(r"loop_cpu=([0-9.]+)s", resumed[0])
+    process_cpu = re.search(r"process_cpu=([0-9.]+)s", resumed[0])
+    assert loop_cpu is not None and process_cpu is not None
+    # A sampled stack alone cannot say whether its code spent the wall gap on CPU.
+    # This fixture sleeps; its loop CPU time must remain below its held wall time.
+    assert float(loop_cpu.group(1)) < float(resumed[0].split("after ")[1].split("s")[0])
 
 
 def test_a_responsive_loop_logs_nothing(caplog):

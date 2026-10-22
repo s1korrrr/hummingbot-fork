@@ -974,7 +974,63 @@ class OKRSIController(hl_rsi.HLRSIController):
         if recorder is None:
             return None
         with recorder._sql_manager.get_new_session() as session:
-            return session.get(Executors, executor_id) is not None
+            row = session.get(Executors, executor_id)
+            from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+            if row is None:
+                return False
+            if row is not None and (row.controller_id != self.config.id
+                                    or not ExecutorOrchestrator.is_refused_unstarted_intent(row.to_executor_info())):
+                return True
+        return not self._refused_intents_have_clear_financial_witness()
+
+    def _refused_intents_have_clear_financial_witness(self):
+        """One independent order/fill/tracker read for all refused rows in a pass."""
+        recorder = MarketsRecorder.get_existing_instance()
+        if recorder is None:
+            return False
+        from hummingbot.model.order import Order
+        from hummingbot.model.trade_fill import TradeFill
+        from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+        owned = {key for info in recorder.get_all_executors()
+                 for key in ExecutorOrchestrator._owned_order_keys(info)}
+        scope = (self.config.connector_name, self.config.trading_pair)
+        with recorder._sql_manager.get_new_session() as session:
+            recorded_orders = session.query(Order).filter(
+                Order.config_file_path == recorder.config_file_path,
+                Order.market == scope[0], Order.symbol == scope[1]).all()
+            recorded_fills = session.query(TradeFill).filter(
+                TradeFill.config_file_path == recorder.config_file_path,
+                TradeFill.market == scope[0], TradeFill.symbol == scope[1]).all()
+        if any((*scope, order.id) not in owned for order in recorded_orders):
+            return False
+        if any((*scope, fill.order_id) not in owned for fill in recorded_fills):
+            return False
+        connector = self.market_data_provider.connectors[scope[0]]
+        if any((*scope, order_id) not in owned for order_id, order in connector._order_tracker.all_orders.items()
+               if order.trading_pair == scope[1]):
+            return False
+        return True
+
+    def _load_native_executor_history(self):
+        """Keep a just-ACKed create out of its own capital/dust history pass."""
+        history = super()._load_native_executor_history()
+        if history is None:
+            return None
+        from hummingbot.strategy_v2.executors.executor_orchestrator import ExecutorOrchestrator
+        committed = getattr(self, '_committed_create_intent', None)
+        refused_ids = {info.id for info in history if ExecutorOrchestrator.is_refused_unstarted_intent(info)}
+        refused_clear = self._refused_intents_have_clear_financial_witness() if refused_ids else False
+        result = []
+        for info in history:
+            if (isinstance(committed, tuple) and len(committed) == 2
+                    and committed[0] == info.id and committed[1] is not None
+                    and ExecutorOrchestrator.is_committed_unstarted_intent(
+                        info, committed[1], self.config.id)):
+                continue
+            if info.id in refused_ids and refused_clear:
+                continue
+            result.append(info)
+        return result
 
     def _release_entry_decision(self):
         self._get_entry_decision_gate().release()

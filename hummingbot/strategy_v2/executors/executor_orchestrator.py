@@ -2100,41 +2100,78 @@ class ExecutorOrchestrator:
 
     async def create_executor_async(self, action: CreateExecutorAction):
         """Create only after a loop-captured intent snapshot receives commit ACK."""
-        prepared = self._prepare_executor_for_action(action, validate_controller=False)
-        if prepared is None:
-            return
-        executor, controller = prepared
-        info = executor.executor_info
         recorder = MarketsRecorder.get_instance()
-        serialized_info = info.model_dump_json()
+        native = getattr(recorder, "_async_financial_events", False) is True
         try:
-            await recorder.store_executor_info_snapshot_async(serialized_info)
-        except SQLWriteCancelledAfterCommit:
-            # The create intent exists durably but execution never started. Record
-            # that final state before surfacing cancellation to the caller.
-            terminal = self._terminalize_unstarted_executor_info(serialized_info)
-            await self._persist_terminal_intent_before_propagating(recorder, terminal)
-            raise
-        try:
-            refusal = await self._recheck_executor_activation(action, controller)
-        except asyncio.CancelledError:
-            terminal = self._terminalize_unstarted_executor_info(serialized_info)
-            await self._persist_terminal_intent_before_propagating(recorder, terminal)
-            raise
-        except Exception as admission_error:
-            terminal = self._terminalize_unstarted_executor_info(serialized_info)
+            prepared = self._prepare_executor_for_action(action, validate_controller=False)
+            if prepared is None:
+                return
+            executor, controller = prepared
+            info = executor.executor_info
+            serialized_info = info.model_dump_json()
             try:
+                await recorder.store_executor_info_snapshot_async(serialized_info)
+            except SQLWriteCancelledAfterCommit:
+                terminal = self._terminalize_unstarted_executor_info(serialized_info)
                 await self._persist_terminal_intent_before_propagating(recorder, terminal)
-            except BaseException as terminal_error:
-                raise terminal_error from admission_error
+                raise
+            try:
+                # Authority applies only to this committed config and only until
+                # the no-await activation boundary.
+                if controller is not None:
+                    controller._committed_create_intent = (action.executor_config.id, action.executor_config)
+                refusal = await self._recheck_executor_activation(action, controller)
+            except asyncio.CancelledError:
+                terminal = self._terminalize_unstarted_executor_info(serialized_info)
+                await self._persist_terminal_intent_before_propagating(recorder, terminal)
+                raise
+            except Exception as admission_error:
+                terminal = self._terminalize_unstarted_executor_info(serialized_info)
+                try:
+                    await self._persist_terminal_intent_before_propagating(recorder, terminal)
+                except BaseException as terminal_error:
+                    raise terminal_error from admission_error
+                raise
+            finally:
+                if controller is not None:
+                    controller._committed_create_intent = None
+            if refusal is not None:
+                await self._persist_terminal_intent_before_propagating(
+                    recorder, self._terminalize_unstarted_executor_info(serialized_info))
+                self.logger().warning("Executor intent durably refused before activation | controller=%s reason=%s",
+                                      action.controller_id, refusal)
+                raise RuntimeError(f"Executor admission changed after intent commit: {refusal}")
+            self._activate_prepared_executor(executor, controller)
+        except BaseException as error:
+            if native:
+                self._note_native_buy_outcome(action, error=error)
             raise
-        if refusal is not None:
-            await self._persist_terminal_intent_before_propagating(
-                recorder, self._terminalize_unstarted_executor_info(serialized_info))
-            self.logger().warning("Executor intent durably refused before activation | controller=%s reason=%s",
-                                  action.controller_id, refusal)
-            raise RuntimeError(f"Executor admission changed after intent commit: {refusal}")
-        self._activate_prepared_executor(executor, controller)
+        else:
+            if native:
+                self._note_native_buy_outcome(action)
+
+    def _note_native_buy_outcome(self, action, error=None):
+        """Retain bounded owner-visible admission outcomes between status samples."""
+        if getattr(action.executor_config, "side", None) != TradeType.BUY:
+            return
+        from time import time
+        outcomes = getattr(self, "_native_buy_outcomes", None)
+        if outcomes is None:
+            outcomes = self._native_buy_outcomes = {}
+        state = outcomes.setdefault(action.controller_id, {"failure_count": 0, "last_failure_at": None,
+                                                           "last_failure_code": None, "last_activated_at": None,
+                                                           "pair": None})
+        state["pair"] = action.executor_config.trading_pair
+        if error is None:
+            state["last_activated_at"] = time()
+            return
+        state["failure_count"] += 1
+        state["last_failure_at"] = time()
+        message = str(error)
+        if message.startswith("Executor admission changed after intent commit:"):
+            state["last_failure_code"] = message.split(":", 1)[-1].strip()[:80]
+        else:
+            state["last_failure_code"] = type(error).__name__
 
     async def _persist_terminal_intent_before_propagating(self, recorder, serialized_info):
         """Finish the terminal intent write even if its caller is cancelled."""
@@ -2200,6 +2237,13 @@ class ExecutorOrchestrator:
             report_ids = ({peer.config.id for peer in peers}
                           if isinstance(peers, tuple) and peers else {action.controller_id})
             reports = self.get_executors_report(controller_ids=report_ids)
+            # The just-ACKed intent has not activated yet. It is authoritative
+            # for durability, but cannot be counted as live exposure during its
+            # own permission check. Every other saved/current executor remains.
+            own = reports.get(action.controller_id, [])
+            reports[action.controller_id] = [info for info in own
+                                             if not self.is_committed_unstarted_intent(
+                                                 info, action.executor_config, action.controller_id)]
             if isinstance(peers, tuple) and peers:
                 for peer in peers:
                     if strategy.controllers.get(peer.config.id) is not peer:
@@ -2207,7 +2251,10 @@ class ExecutorOrchestrator:
                     peer.executors_info = reports.get(peer.config.id, [])
             else:
                 current_controller.executors_info = reports.get(action.controller_id, [])
-            controller_validator = getattr(current_controller, "validate_executor_config", None)
+            prepared_validator = getattr(type(current_controller), "validate_prepared_executor_config", None)
+            controller_validator = (prepared_validator.__get__(current_controller, type(current_controller))
+                                    if callable(prepared_validator) else
+                                    getattr(current_controller, "validate_executor_config", None))
             if callable(controller_validator) and not controller_validator(action.executor_config):
                 return "controller_permission_changed"
 
@@ -2249,6 +2296,51 @@ class ExecutorOrchestrator:
         custom_info["execution_started"] = False
         custom_info["admission_refusal"] = "gate_changed_after_intent_commit"
         return json.dumps(info, allow_nan=False, sort_keys=True)
+
+    @staticmethod
+    def is_refused_unstarted_intent(info):
+        """Recognize only this orchestrator's terminal, never-activated intent."""
+        custom = info.custom_info if isinstance(info.custom_info, dict) else {}
+        return (info.status == RunnableStatus.TERMINATED and info.close_type == CloseType.FAILED
+                and info.is_active is False and info.is_trading is False
+                and info.close_timestamp is not None
+                and int(info.close_timestamp) == int(info.timestamp)
+                and custom.get("execution_started") is False
+                and custom.get("admission_refusal") == "gate_changed_after_intent_commit"
+                and not custom.get("order_ids") and not custom.get("execution_order_snapshots")
+                and custom.get("entry_reconciliation") is None
+                and ExecutorOrchestrator._empty_prestart_execution_receipt(custom)
+                and not ExecutorOrchestrator._owned_order_keys(info)
+                and all(getattr(info, key) == 0 for key in
+                        ("net_pnl_quote", "cum_fees_quote", "filled_amount_quote")))
+
+    @staticmethod
+    def is_committed_unstarted_intent(info, config, controller_id):
+        custom = info.custom_info if isinstance(info.custom_info, dict) else {}
+        return (info.id == config.id and info.controller_id == controller_id
+                and info.status == RunnableStatus.NOT_STARTED and info.close_type is None
+                and info.is_active is True and info.is_trading is False
+                and info.config.model_dump(mode="json") == config.model_dump(mode="json")
+                and not custom.get("order_ids") and not custom.get("execution_order_snapshots")
+                and ExecutorOrchestrator._empty_prestart_execution_receipt(custom)
+                and custom.get("entry_reconciliation") is None
+                and not ExecutorOrchestrator._owned_order_keys(info)
+                and all(getattr(info, key) == 0 for key in
+                        ("net_pnl_quote", "cum_fees_quote", "filled_amount_quote")))
+
+    @staticmethod
+    def _empty_prestart_execution_receipt(custom):
+        receipt = custom.get("execution_receipt")
+        if receipt is None:
+            return True
+        expected = {"entry_gross_base", "entry_gross_quote", "exit_gross_base", "exit_gross_quote",
+                    "fees_quote", "remaining_owned_base", "residual_dust_base", "accounting_owner"}
+        if not isinstance(receipt, dict) or set(receipt) != expected or receipt["accounting_owner"] != "executor":
+            return False
+        try:
+            return all(Decimal(str(receipt[key])) == 0 for key in expected - {"accounting_owner"})
+        except (ArithmeticError, TypeError, ValueError):
+            return False
 
     def _activate_prepared_executor(self, executor, controller):
         executor_config = executor.config

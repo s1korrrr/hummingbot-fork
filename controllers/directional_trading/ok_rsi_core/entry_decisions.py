@@ -50,9 +50,11 @@ class EntryDecisionGate:
         self._eligible_candle = None
         self._local_authorization = None
         self._awaiting_commit = None
+        self.last_state = None
 
     def _load(self):
         state = self.store.load()
+        self.last_state = state
         if state is None:
             return None
         required = {"version", "candle", "armed", "consumed_candle", "authorization"}
@@ -94,10 +96,12 @@ class EntryDecisionGate:
                 return previous
             current = dict(previous, armed=False, consumed_candle=candle)
             self.store.save(previous, current)
+            self.last_state = current
             return current
         if exists is False:
             current = dict(previous, armed=True, consumed_candle=0, authorization=None)
             self.store.save(previous, current)
+            self.last_state = current
             return current
         return previous
 
@@ -140,6 +144,7 @@ class EntryDecisionGate:
         if not candidate and data.get("signal") != 1 and not signal_state.get("buy_confirmation_active", False):
             current["armed"] = True
         self.store.save(previous, current)
+        self.last_state = current
         eligible = current["armed"] and data.get("signal") == 1
         self._eligible_candle = candle if eligible else None
         return eligible
@@ -156,6 +161,7 @@ class EntryDecisionGate:
         # Replace both atomically when a later, cleared setup is admitted.
         current = dict(previous, armed=False, consumed_candle=0, authorization=auth)
         self.store.save(previous, current)
+        self.last_state = current
         self._eligible_candle = None
         self._local_authorization = (executor_id, fingerprint, candle)
         return True
@@ -170,6 +176,7 @@ class EntryDecisionGate:
                 or (auth["executor_id"], auth["fingerprint"], auth["candle"]) != identity):
             return False
         self.store.save(previous, dict(previous, authorization=dict(auth, dispatched=True)))
+        self.last_state = dict(previous, authorization=dict(auth, dispatched=True))
         self._local_authorization = None
         self._awaiting_commit = (executor_id, fingerprint, auth["candle"])
         return True
@@ -184,6 +191,7 @@ class EntryDecisionGate:
         current = dict(previous, armed=False, consumed_candle=candle,
                        authorization=dict(auth, dispatched=True))
         self.store.save(previous, current)
+        self.last_state = current
         self._local_authorization = None
         self._awaiting_commit = None
         return True
@@ -206,6 +214,7 @@ class EntryDecisionGate:
             return False
         current = dict(previous, armed=True, consumed_candle=0, authorization=None)
         self.store.save(previous, current)
+        self.last_state = current
         self._local_authorization = None
         self._awaiting_commit = None
         return True
@@ -218,6 +227,7 @@ class EntryDecisionGate:
             return False
         current = dict(previous, armed=True, consumed_candle=0, authorization=None)
         self.store.save(previous, current)
+        self.last_state = current
         self._local_authorization = None
         self._awaiting_commit = None
         return True

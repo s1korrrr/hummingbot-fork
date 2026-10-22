@@ -180,8 +180,12 @@ def test_native_buy_health_retains_system_refusal_until_progress_and_detects_sta
     assert first['status'] == 'blocked' and first['hold_reason'] == 'system'
     assert [issue['code'] for issue in first['issues']] == ['native_buy_create_refused']
     controller._last_evaluated_candle_timestamp = 200
-    assert [issue['code'] for issue in strategy._native_buy_admission(controller, outcome)['issues']] == [
+    second = strategy._native_buy_admission(controller, outcome)
+    assert [issue['code'] for issue in second['issues']] == [
         'native_buy_create_refused', 'durable_buy_authorization_unresolved']
+    assert first['issues'][0]['since'] == second['issues'][0]['since']
+    auth_since = second['issues'][1]['since']
+    assert strategy._native_buy_admission(controller, outcome)['issues'][1]['since'] == auth_since
     controller._funding_hold = 'Native BUY lacks immutable funding admission'
     exact = strategy._native_buy_admission(controller, None)
     assert exact['status'] == 'blocked' and exact['hold_reason'] == 'system'
@@ -194,6 +198,7 @@ def test_native_buy_health_retains_system_refusal_until_progress_and_detects_sta
     assert cleared['status'] == 'healthy' and cleared['issues'] == []
     assert cleared['failure_count'] == 1
     assert cleared['last_failure_at'] is not None and cleared['last_activated_at'] is not None
+    assert strategy._native_buy_issue_since == {}
 
     controller.config.funding = object()
     assert strategy._native_buy_admission(controller, None)['status'] == 'unavailable'

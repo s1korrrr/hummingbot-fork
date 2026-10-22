@@ -245,6 +245,12 @@ class NativePaperSession:
             raise ValueError('New paper database or explicit existing-state restore required')
         if restore and json.loads(marker.read_text()) != identity:
             raise ValueError('Paper session marker/config identity mismatch')
+        self._restore_requested = restore
+        self._marker_path = marker
+        self._market_state_restore_verified = False
+        self._restored_market_state_sha256 = None
+        self._restored_market_state_snapshot = None
+        self._restored_financial_status = {'mode': 'synchronous_readback', 'status': 'not_required'}
         self.connectors = {connector.name: connector}
         self.markets = {connector.name: set(connector.trading_pairs)}
         self.market_data_provider = InjectedPaperMarketData(connector)
@@ -285,7 +291,17 @@ class NativePaperSession:
             # This process owns the paper database, so every Executors write passes this engine.
             self.recorder.cache_executor_reads()
             if restore:
+                with self._sql.get_new_session() as db_session:
+                    market_state = self.recorder.get_market_states('native-paper-session', connector,
+                                                                   session=db_session)
+                    saved_state = copy.deepcopy(market_state.saved_state) if market_state is not None else None
                 self.recorder.restore_market_states('native-paper-session', connector)
+                if saved_state is not None:
+                    self._restored_market_state_snapshot = copy.deepcopy(saved_state)
+                    self._market_state_restore_verified = connector.tracking_states == saved_state
+                    self._restored_market_state_sha256 = hashlib.sha256(
+                        json.dumps(saved_state, sort_keys=True, default=str).encode()).hexdigest()
+                    self._restored_financial_status = self._synchronous_financial_readback()
             self.recorder.start()
             self._prior_oracle = prior_oracle
             self._oracle = RateOracle(source=_InjectedRates())
@@ -314,6 +330,147 @@ class NativePaperSession:
     @property
     def current_timestamp(self):
         return self._connector.current_timestamp
+
+    def reconciliation_status(self):
+        """Return native restore evidence without changing or repairing paper state."""
+        if not self._restore_requested:
+            return {'status': 'not_required'}
+
+        try:
+            marker_matches = (self._marker_path.is_file() and not self._marker_path.is_symlink()
+                              and json.loads(self._marker_path.read_text()) == self._identity)
+        except (OSError, ValueError, TypeError):
+            marker_matches = False
+
+        recovery = self.executor_orchestrator.recovery_required
+        unresolved_executors = sorted(
+            f'{owner}:{executor_id}'
+            for owner, executor_ids in recovery.items() if owner != 'unowned_orders'
+            for executor_id in executor_ids
+        )
+        active_order_ids = set(getattr(self._connector, 'in_flight_orders', {}))
+        owned_order_ids = {
+            order.order_id
+            for executors in self.executor_orchestrator.active_executors.values()
+            for executor in executors
+            for order in (getattr(executor, '_entry_orders', lambda: [])()
+                          + getattr(executor, '_exit_orders', lambda: [])())
+            if order is not None
+        }
+        unresolved_orders = sorted(
+            set(recovery.get('unowned_orders', ())) | (active_order_ids - owned_order_ids)
+        )
+        unresolved_owners = sorted(
+            f'{controller.config.id}:{reason}'
+            for controller in self.controllers.values()
+            for reason in (getattr(controller, '_recovery_hold', '') or getattr(controller, 'recovery_hold', ''),
+                           getattr(controller, '_recovery_fault', ''))
+            if reason
+        )
+        interrupted_step = self._failure is not None or self._failure_path.exists()
+        persistence_status_reader = getattr(self.recorder, 'financial_persistence_status', None)
+        if callable(persistence_status_reader):
+            native_status = persistence_status_reader()
+            if native_status.get('mode') == 'legacy_sync':
+                readback = self._restored_financial_status
+                recorder_status = {
+                    **readback,
+                    'mode': 'synchronous',
+                    'source_status': native_status,
+                }
+                financial_state_clear = (readback.get('status') == 'verified'
+                                         and native_status.get('pending_count') == 0
+                                         and native_status.get('failed_count') == 0
+                                         and native_status.get('error_type') is None)
+            else:
+                recorder_status = native_status
+                financial_state_clear = (native_status['pending_count'] == 0
+                                         and native_status['failed_count'] == 0
+                                         and not native_status['reconciliation_needed']
+                                         and native_status.get('error_type') is None
+                                         and native_status.get('mode') == 'acknowledged_async'
+                                         and native_status.get('acknowledged') is True)
+        else:
+            recorder_status = self._restored_financial_status
+            financial_state_clear = recorder_status['status'] == 'verified'
+        inventory_status = ('verified' if self._market_state_restore_verified and financial_state_clear
+                            and not unresolved_executors and not unresolved_orders and not unresolved_owners
+                            else 'unverified')
+        balances_sha256 = hashlib.sha256(json.dumps(
+            {asset: str(amount) for asset, amount in sorted(self._connector.get_all_balances().items())},
+            sort_keys=True).encode()).hexdigest()
+        return {
+            'status': 'verified' if marker_matches and not interrupted_step and not unresolved_executors
+                      and not unresolved_orders and inventory_status == 'verified' else 'unresolved',
+            'observed_at': self.current_timestamp,
+            'session_identity': {
+                'schema': 'native_paper_reconciliation_v1',
+                'marker_matches': marker_matches,
+                'source_runtime_sha256': self._identity['source_runtime_sha256'],
+                'controllers_sha256': self._identity['controllers_sha256'],
+            },
+            'interrupted_step': interrupted_step,
+            'unresolved_executors': unresolved_executors,
+            'unresolved_orders': unresolved_orders,
+            'unresolved_owners': unresolved_owners,
+            'inventory_consistency': {
+                'status': inventory_status,
+                'market_state_restore_verified': self._market_state_restore_verified,
+                'restored_market_state_sha256': self._restored_market_state_sha256,
+                'current_balances_sha256': balances_sha256,
+                'financial_persistence': recorder_status,
+            },
+        }
+
+    def _synchronous_financial_readback(self):
+        """Prove restored fill identity against durable rows for old synchronous recorders."""
+        if type(self.recorder) is not MarketsRecorder:
+            return {'mode': 'synchronous_readback', 'status': 'unverified',
+                    'reason': 'recorder implementation is not the pinned native MarketsRecorder'}
+        try:
+            from decimal import Decimal
+
+            from hummingbot.model.exact_order_values import TradeFillExact
+            from hummingbot.model.order import Order
+            from hummingbot.model.trade_fill import TradeFill
+
+            verified_fills = 0
+            with self._sql.get_new_session() as db_session:
+                market_state = self.recorder.get_market_states(
+                    'native-paper-session', self._connector, session=db_session)
+                if (market_state is None or self._restored_market_state_snapshot is None
+                        or market_state.saved_state != self._restored_market_state_snapshot):
+                    return {'mode': 'synchronous_readback', 'status': 'unverified',
+                            'reason': 'persisted market state is missing or differs from initial restored snapshot'}
+                for order_id, order_state in self._restored_market_state_snapshot['orders'].items():
+                    if order_state.get('recorder_pending_events'):
+                        return {'mode': 'synchronous_readback', 'status': 'unverified',
+                                'reason': 'restored order has pending recorder events without an acknowledgement'}
+                    order_row = db_session.get(Order, order_id)
+                    if (order_row is None or order_row.config_file_path != 'native-paper-session'
+                            or order_row.market != self._connector.display_name):
+                        return {'mode': 'synchronous_readback', 'status': 'unverified',
+                                'reason': 'restored order has no matching committed order row'}
+                    for fill_id, fill in order_state.get('order_fills', {}).items():
+                        identity = (self._connector.display_name, order_id, fill_id)
+                        row = db_session.get(TradeFill, identity)
+                        exact = db_session.get(TradeFillExact, identity)
+                        if (row is None or exact is None
+                                or row.config_file_path != 'native-paper-session'
+                                or row.exchange_trade_id != fill_id
+                                or Decimal(row.exact_amount or 'NaN') != Decimal(str(fill['fill_base_amount']))
+                                or Decimal(row.exact_price or 'NaN') != Decimal(str(fill['fill_price']))
+                                or Decimal(exact.amount) != Decimal(str(fill['fill_base_amount']))
+                                or Decimal(exact.price) != Decimal(str(fill['fill_price']))):
+                            return {'mode': 'synchronous_readback', 'status': 'unverified',
+                                    'reason': f'restored fill {order_id}/{fill_id} lacks matching exact rows'}
+                        verified_fills += 1
+            return {'mode': 'synchronous_readback', 'status': 'verified',
+                    'evidence': 'fresh SQL session matched restored MarketState, orders, and exact fill rows',
+                    'verified_fill_count': verified_fills}
+        except Exception as error:
+            return {'mode': 'synchronous_readback', 'status': 'unverified',
+                    'reason': f'financial readback failed: {type(error).__name__}'}
 
     def _start_executor(self, executor):
         # Executors pace venue retries with a wall-clock sleep. The paper clock advances only through step(),

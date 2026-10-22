@@ -350,6 +350,10 @@ async def test_genuine_breakout_native_executor_partial_fill_fees_and_restore_ho
             assert restored.restored
             assert next(iter(restored.session.controllers.values())).recovery_hold
             assert restored.session._connector.get_balance("BTC") == Decimal(".01")
+            restored_status = restored.status(600062, [])
+            assert restored_status["restored"] is True
+            assert restored_status["reconciliation"]["status"] == "unresolved"
+            assert restored_status["reconciliation"]["unresolved_owners"]
     finally:
         if runtime is not None:
             await runtime.close()

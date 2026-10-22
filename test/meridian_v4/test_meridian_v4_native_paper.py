@@ -1,4 +1,7 @@
 """Synthetic native paper lifecycle checks for V4, not historical economics or live receipts."""
+import copy
+import json
+import sqlite3
 import tempfile
 from decimal import Decimal as D
 from pathlib import Path
@@ -125,6 +128,137 @@ class MeridianV4RestingEntryTests(IsolatedAsyncioTestCase):
     Live paper evidence: D2h's ETH entry was cancelled after 28 s with `modular_entry_permission_revoked`
     because a quiet BNB book made the shared paper connector not ready (`data_hold`) for one tick."""
     setUp = session_tests.NativePaperSessionTests.setUp
+
+    async def test_restore_exposes_native_reconciliation_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / 'v4.sqlite'
+            session = NativePaperSession(paper(), [config(execution_enabled=True)], db)
+            before, rebound = frames(.05)
+            await session.step(600000, books=[dict(**BOOK, sequence=2, timestamp=600000)],
+                               candles=[candles(before, 600000)])
+            receipt = await session.step(600060, books=[dict(**BOOK, sequence=3, timestamp=600060)],
+                                         candles=[candles(rebound, 600060)])
+            controller = session.controllers[OWNER]
+            self.assertEqual(len(receipt['actions']), 1, controller.runtime.reason)
+            amount = session.executor_orchestrator.active_executors[OWNER][0]._open_order.order.amount
+            await session.step(600061, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600061,
+                                                    side=TradeType.SELL, price=D('99.49'), amount=amount)])
+            await session.close()
+
+            restored = NativePaperSession(paper(), [config(execution_enabled=True)], db, restore=True)
+            try:
+                evidence = restored.reconciliation_status()
+                self.assertEqual(evidence['status'], 'verified')
+                self.assertTrue(evidence['session_identity']['marker_matches'])
+                self.assertFalse(evidence['interrupted_step'])
+                self.assertEqual(evidence['unresolved_executors'], [])
+                self.assertEqual(evidence['unresolved_orders'], [])
+                self.assertEqual(evidence['inventory_consistency']['status'], 'verified')
+                restored.recorder.financial_persistence_status = lambda: {
+                    'mode': 'legacy_sync', 'pending_count': 0, 'failed_count': 0,
+                    'reconciliation_needed': True, 'error_type': None,
+                }
+                self.assertEqual(restored.reconciliation_status()['status'], 'verified')
+                restored.recorder.financial_persistence_status = lambda: {
+                    'mode': 'legacy_sync', 'pending_count': 1, 'failed_count': 0,
+                    'reconciliation_needed': True, 'error_type': None,
+                }
+                self.assertEqual(restored.reconciliation_status()['status'], 'unresolved')
+                del restored.recorder.financial_persistence_status
+                restored.executor_orchestrator.recovery_required[OWNER] = ['old-executor']
+                unresolved = restored.reconciliation_status()
+                self.assertEqual(unresolved['status'], 'unresolved')
+                self.assertEqual(unresolved['unresolved_executors'], [f'{OWNER}:old-executor'])
+                restored.executor_orchestrator.recovery_required.clear()
+                restored.executor_orchestrator.recovery_required['unowned_orders'] = ['old-order']
+                unresolved_order = restored.reconciliation_status()
+                self.assertEqual(unresolved_order['status'], 'unresolved')
+                self.assertEqual(unresolved_order['unresolved_orders'], ['old-order'])
+                restored.executor_orchestrator.recovery_required.clear()
+                restored._failure_path.write_text('{"status":"in_progress"}')
+                interrupted = restored.reconciliation_status()
+                self.assertEqual(interrupted['status'], 'unresolved')
+                self.assertTrue(interrupted['interrupted_step'])
+                restored._failure_path.unlink()
+                restored._market_state_restore_verified = False
+                unverified_inventory = restored.reconciliation_status()
+                self.assertEqual(unverified_inventory['status'], 'unresolved')
+                self.assertEqual(unverified_inventory['inventory_consistency']['status'], 'unverified')
+                restored._market_state_restore_verified = True
+                controller = restored.controllers[OWNER]
+                controller.recovery_hold = 'inventory_reconciliation_required'
+                held_inventory = restored.reconciliation_status()
+                self.assertEqual(held_inventory['status'], 'unresolved')
+                self.assertEqual(held_inventory['unresolved_owners'], [f'{OWNER}:inventory_reconciliation_required'])
+                controller.recovery_hold = ''
+                await restored.step(600062, books=[dict(**BOOK, sequence=4, timestamp=600062)],
+                                    candles=[candles(frames(.05)[1], 600062)])
+                self.assertEqual(restored.reconciliation_status()['status'], 'verified')
+            finally:
+                await restored.close()
+
+    async def test_restore_readback_requires_matching_persisted_exact_fill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / 'v4-corrupt-fill.sqlite'
+            session = NativePaperSession(paper(), [config(execution_enabled=True)], db)
+            before, rebound = frames(.05)
+            await session.step(600000, books=[dict(**BOOK, sequence=2, timestamp=600000)],
+                               candles=[candles(before, 600000)])
+            receipt = await session.step(600060, books=[dict(**BOOK, sequence=3, timestamp=600060)],
+                                         candles=[candles(rebound, 600060)])
+            self.assertEqual(len(receipt['actions']), 1)
+            await session.step(600061, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600061,
+                                                    side=TradeType.SELL, price=D('99.49'), amount=D('.5'))])
+            partial_state = copy.deepcopy(session._connector.tracking_states)
+            self.assertEqual(len(session.recorder.get_trades_for_config('native-paper-session')), 1)
+            self.assertEqual(sum(len(order['order_fills']) for order in partial_state['orders'].values()), 1)
+            market_name = session._connector.display_name
+            await session.close()
+
+            with sqlite3.connect(db) as connection:
+                connection.execute('UPDATE MarketState SET saved_state = ? WHERE config_file_path = ? AND market = ?',
+                                   (json.dumps(partial_state), 'native-paper-session', market_name))
+
+            restored = NativePaperSession(paper(), [config(execution_enabled=True)], db, restore=True)
+            try:
+                financial = restored.reconciliation_status()['inventory_consistency']['financial_persistence']
+                self.assertEqual(financial['status'], 'verified')
+                self.assertEqual(financial['verified_fill_count'], 1)
+            finally:
+                await restored.close()
+
+            pending_state = copy.deepcopy(partial_state)
+            next(iter(pending_state['orders'].values()))['recorder_pending_events'] = {
+                'fixture-pending': {
+                    'kind': 'order-status',
+                    'identity': ['fixture-pending', market_name, 'paper'],
+                    'payload': {},
+                }
+            }
+            with sqlite3.connect(db) as connection:
+                connection.execute('UPDATE MarketState SET saved_state = ? WHERE config_file_path = ? AND market = ?',
+                                   (json.dumps(pending_state), 'native-paper-session', market_name))
+            restored = NativePaperSession(paper(), [config(execution_enabled=True)], db, restore=True)
+            try:
+                financial = restored.reconciliation_status()['inventory_consistency']['financial_persistence']
+                self.assertEqual(financial['status'], 'unverified')
+                self.assertIn('pending recorder events', financial['reason'])
+            finally:
+                await restored.close()
+
+            with sqlite3.connect(db) as connection:
+                connection.execute('UPDATE MarketState SET saved_state = ? WHERE config_file_path = ? AND market = ?',
+                                   (json.dumps(partial_state), 'native-paper-session', market_name))
+                cursor = connection.execute('DELETE FROM TradeFillExact')
+                self.assertGreater(cursor.rowcount, 0)
+
+            restored = NativePaperSession(paper(), [config(execution_enabled=True)], db, restore=True)
+            try:
+                financial = restored.reconciliation_status()['inventory_consistency']['financial_persistence']
+                self.assertEqual(financial['status'], 'unverified')
+                self.assertIn('lacks matching exact rows', financial['reason'])
+            finally:
+                await restored.close()
 
     async def rest_entry(self, session):
         before, rebound = frames(.05)

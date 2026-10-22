@@ -144,6 +144,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         self._entry_decision_store = kwargs.pop("entry_decision_store", None)
         self._entry_decision_gate = None
         self._entry_decision_error = None
+        self._entry_decision_error_stage = None
         self._entry_acquisition_policy = config.entry_acquisition_policy
         self._entry_acquisition_shadow_policy = config.entry_acquisition_shadow_policy
         self._entry_acquisition_shadow = (
@@ -946,10 +947,11 @@ class OKRSIController(hl_rsi.HLRSIController):
         self._watermark_state = result.state
         self._watermark_proposal_grant = True
 
-    def _entry_admission_failed(self, reason):
+    def _entry_admission_failed(self, reason, stage="other"):
         if reason != self._entry_decision_error:
             self.logger().error(f"Entry decision admission blocked | {self.config.id} | {reason}")
         self._entry_decision_error = reason
+        self._entry_decision_error_stage = stage
 
     def _get_entry_decision_gate(self):
         from controllers.directional_trading.ok_rsi_core.entry_decisions import (
@@ -1055,6 +1057,7 @@ class OKRSIController(hl_rsi.HLRSIController):
         signal = data.get("signal", 0)
         # Only the owner's completed-candle evaluation may clear or consume a setup.
         candle = data.get("candle_timestamp")
+        stage = "other"
         try:
             now = self.market_data_provider.time()
             seconds = CandlesBase.interval_to_seconds[self.config.interval]
@@ -1062,8 +1065,14 @@ class OKRSIController(hl_rsi.HLRSIController):
                          and math.isfinite(candle) and candle == self._last_evaluated_candle_timestamp
                          and isinstance(now, (int, float)) and math.isfinite(now)
                          and candle + seconds <= now)
+            stage = "observation"
             gate = self._get_entry_decision_gate()
             eligible = gate.observe(data) if evaluated else False
+            if (evaluated and gate.last_observation_storage_ok is True
+                    and self._entry_decision_error_stage == "observation"):
+                self._entry_decision_error = None
+                self._entry_decision_error_stage = None
+            stage = "proposal"
             # SELL management remains independent of BUY admission storage.
             if signal < 0:
                 return super().create_actions_proposal()
@@ -1083,9 +1092,10 @@ class OKRSIController(hl_rsi.HLRSIController):
                     if gate.reserve(config.id, executor_fingerprint(config), int(data["candle_timestamp"])):
                         admitted.append(action)
             self._entry_decision_error = None
+            self._entry_decision_error_stage = None
             return admitted
         except Exception as exc:
-            self._entry_admission_failed(f"{type(exc).__name__}: {exc}")
+            self._entry_admission_failed(f"{type(exc).__name__}: {exc}", stage=stage)
             return super().create_actions_proposal() if signal < 0 else []
 
     def _select_signal_candles(self, df: pd.DataFrame, now_ts: float) -> pd.DataFrame:

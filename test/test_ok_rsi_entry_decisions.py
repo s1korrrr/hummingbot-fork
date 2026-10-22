@@ -179,9 +179,11 @@ def test_invalid_persisted_state_and_write_failure_raise(store):
         session.commit()
     with pytest.raises(ValueError):
         EntryDecisionGate(store).observe(observation(60, False))
+    gate = EntryDecisionGate(store)
     with patch.object(store, "load", return_value=None), patch.object(store, "save", side_effect=OSError("disk")):
         with pytest.raises(OSError):
-            EntryDecisionGate(store).observe(observation(60, False))
+            gate.observe(observation(60, False))
+    assert gate.last_observation_storage_ok is False
 
 
 def test_no_clear_on_missing_candidate_bad_timestamp_or_unhealthy_condition(store):
@@ -202,6 +204,7 @@ def controller_stub(store):
     controller._entry_decision_store = store
     controller._entry_decision_gate = None
     controller._entry_decision_error = None
+    controller._entry_decision_error_stage = None
     controller.processed_data = observation(60, False)
     controller._last_evaluated_candle_timestamp = 60
     controller.market_data_provider = SimpleNamespace(time=lambda: 600)
@@ -257,14 +260,76 @@ def test_controller_validate_failure_releases_candle(store):
         assert store.load()["authorization"]["executor_id"] == "first"
 
 
-def test_controller_failure_blocks_buy_but_does_not_swallow_existing_gate_rejection(store):
+@pytest.mark.parametrize("failing_operation", ["load", "save"])
+def test_controller_failure_blocks_buy_but_does_not_swallow_existing_gate_rejection(store, failing_operation):
     from controllers.directional_trading.hl_rsi import HLRSIController
     controller = controller_stub(store)
-    with patch.object(store, "load", side_effect=OSError("disk unavailable")):
+    with patch.object(store, failing_operation, side_effect=OSError("disk unavailable")):
         assert controller.create_actions_proposal() == []
         assert "disk unavailable" in controller._entry_decision_error
+        assert controller._entry_decision_error_stage == "observation"
     with patch.object(HLRSIController, "validate_executor_config", return_value=False):
         assert not controller.validate_executor_config(config_stub())
+
+
+@pytest.mark.parametrize("signal", [0, -1], ids=["neutral", "sell"])
+def test_successful_ineligible_observation_clears_previous_admission_error(store, signal):
+    from controllers.directional_trading.hl_rsi import HLRSIController
+
+    controller = controller_stub(store)
+    controller._entry_decision_error = "OperationalError: database is locked"
+    controller._entry_decision_error_stage = "observation"
+    controller.processed_data = observation(120, False, signal)
+    controller._last_evaluated_candle_timestamp = 120
+    if signal < 0:
+        with patch.object(HLRSIController, "create_actions_proposal", return_value=["sell"]):
+            assert controller.create_actions_proposal() == ["sell"]
+    else:
+        assert controller.create_actions_proposal() == []
+
+    assert controller._entry_decision_error is None
+    assert store.load()["candle"] == 120
+
+
+def test_successful_neutral_observation_preserves_later_proposal_error_until_eligible_proposal(store):
+    from controllers.directional_trading.hl_rsi import HLRSIController
+
+    controller = controller_stub(store)
+    controller._entry_decision_error = "ValueError: executor fingerprint failed"
+    controller._entry_decision_error_stage = "proposal"
+    controller.processed_data = observation(60, False)
+    controller._last_evaluated_candle_timestamp = 60
+    assert controller.create_actions_proposal() == []
+    assert controller._entry_decision_error == "ValueError: executor fingerprint failed"
+
+    action = SimpleNamespace(executor_config=config_stub())
+    controller.processed_data = observation(120, True, 1)
+    controller._last_evaluated_candle_timestamp = 120
+    with patch.object(HLRSIController, "create_actions_proposal", return_value=[action]):
+        assert controller.create_actions_proposal() == [action]
+    assert controller._entry_decision_error is None
+    assert controller._entry_decision_error_stage is None
+
+
+@pytest.mark.parametrize(
+    "observation_overrides",
+    [
+        {"data_health": {"ready": False}},
+        {"signal_suppression_reason": "stale_candles"},
+    ],
+    ids=["unhealthy", "suppressed"],
+)
+def test_unstored_observation_does_not_clear_previous_admission_error(store, observation_overrides):
+    controller = controller_stub(store)
+    controller._entry_decision_error = "OperationalError: database is locked"
+    controller._entry_decision_error_stage = "observation"
+    controller.processed_data = observation(120, False, **observation_overrides)
+    controller._last_evaluated_candle_timestamp = 120
+
+    assert controller.create_actions_proposal() == []
+    assert controller._entry_decision_error == "OperationalError: database is locked"
+    assert controller._entry_decision_error_stage == "observation"
+    assert store.load() is None
 
 
 def test_episode_reconciliation_stops_and_sell_actions_continue_but_buy_is_blocked(store):

@@ -51,6 +51,7 @@ class EntryDecisionGate:
         self._local_authorization = None
         self._awaiting_commit = None
         self.last_state = None
+        self.last_observation_storage_ok = False
 
     def _load(self):
         state = self.store.load()
@@ -106,6 +107,7 @@ class EntryDecisionGate:
         return previous
 
     def observe(self, data):
+        self.last_observation_storage_ok = False
         self._eligible_candle = None
         timestamp = data.get("candle_timestamp")
         signal_state = data.get("signal_state", {})
@@ -120,18 +122,22 @@ class EntryDecisionGate:
         candle = int(timestamp)
         previous = self._reconcile(self._load())
         if previous is not None and candle < previous["candle"]:
+            self.last_observation_storage_ok = True
             return False
         # An unconsumed authorization still needs an executor-row verdict.
         # Advancing candles must not erase it before commit or reconciliation.
         if (previous is not None and candle > previous["candle"]
                 and previous["authorization"] is not None
                 and previous["consumed_candle"] == 0):
+            self.last_observation_storage_ok = True
             return False
         if previous is not None and candle == previous["candle"]:
             if previous["consumed_candle"] == candle:
+                self.last_observation_storage_ok = True
                 return False
             eligible = previous["armed"] and data.get("signal") == 1
             self._eligible_candle = candle if eligible else None
+            self.last_observation_storage_ok = True
             return eligible
         current = dict(previous) if previous else {
             "version": 1, "candle": candle, "armed": False,
@@ -145,6 +151,7 @@ class EntryDecisionGate:
             current["armed"] = True
         self.store.save(previous, current)
         self.last_state = current
+        self.last_observation_storage_ok = True
         eligible = current["armed"] and data.get("signal") == 1
         self._eligible_candle = candle if eligible else None
         return eligible

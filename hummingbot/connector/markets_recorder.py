@@ -75,6 +75,14 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 class MarketsRecorder:
     _logger = None
     _shared_instance: "MarketsRecorder" = None
+    _native_terminal_order_statuses = frozenset({
+        MarketEvent.BuyOrderCompleted.name,
+        MarketEvent.SellOrderCompleted.name,
+        MarketEvent.OrderCancelled.name,
+        'OrderCanceled',  # Legacy connector spelling retained in native databases.
+        MarketEvent.OrderExpired.name,
+        MarketEvent.OrderFailure.name,
+    })
     market_event_tag_map: Dict[int, MarketEvent] = {
         event_obj.value: event_obj
         for event_obj in MarketEvent.__members__.values()
@@ -1210,6 +1218,15 @@ class MarketsRecorder:
             else:
                 return query.limit(number_of_rows).all()
 
+    def get_order_status_history(self, order_id: str) -> List[str]:
+        """Return immutable native status receipts for one order in event-time order."""
+        with self._sql_manager.get_new_session() as session:
+            rows = (session.query(OrderStatus.status)
+                    .filter(OrderStatus.order_id == order_id)
+                    .order_by(OrderStatus.timestamp, OrderStatus.id)
+                    .all())
+            return [status for (status,) in rows]
+
     def get_trades_for_config(self, config_file_path: str, number_of_rows: Optional[int] = None) -> List[TradeFill]:
         with self._sql_manager.get_new_session() as session:
             return trade_fills_for_config(session, config_file_path, number_of_rows)
@@ -1390,8 +1407,23 @@ class MarketsRecorder:
 
     def _apply_order_status_payload(self, session, order, payload):
         if self._claim_recorder_sequence(session, payload, 'order', payload['order_id']):
-            order.last_status = payload['event_status']
-            order.last_update_timestamp = payload['timestamp']
+            current_status = order.last_status
+            incoming_status = payload['event_status']
+            current_terminal = current_status in self._native_terminal_order_statuses
+            incoming_terminal = incoming_status in self._native_terminal_order_statuses
+            # A captured native terminal event closes the lifecycle. A delayed
+            # or replayed fill/create callback cannot reopen it, even when its
+            # callback timestamp is equal or later. Conflicting terminal
+            # receipts remain in OrderStatus for reconciliation; do not choose
+            # a later terminal by capture order and hide that conflict.
+            terminal_transition = (current_terminal and incoming_terminal
+                                   and incoming_status == current_status
+                                   and payload['timestamp'] >= order.last_update_timestamp)
+            nonterminal_transition = (not current_terminal and not incoming_terminal
+                                      and payload['timestamp'] >= order.last_update_timestamp)
+            if terminal_transition or nonterminal_transition or (not current_terminal and incoming_terminal):
+                order.last_status = payload['event_status']
+                order.last_update_timestamp = payload['timestamp']
         duplicate = (payload.get('recorder_sequence') is not None and session.query(OrderStatus).filter_by(
             order_id=payload['order_id'], timestamp=payload['timestamp'], status=payload['event_status'],
         ).first() is not None)

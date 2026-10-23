@@ -26,6 +26,14 @@ from .domain import PolicyError, decimal, identity
 
 ZERO = Decimal('0')
 LEGACY_NEVER_STARTED = {'schema': 1, 'source': 'never_started_intent_v1'}
+_TERMINAL_ORDER_STATUS_KIND = {
+    'BuyOrderCompleted': 'BUY_FILLED',
+    'SellOrderCompleted': 'SELL_FILLED',
+    'OrderCancelled': 'CANCELED',
+    'OrderCanceled': 'CANCELED',
+    'OrderExpired': 'EXPIRED',
+    'OrderFailure': 'FAILED',
+}
 
 
 class CandidateFundingPolicy(PolicyModel):
@@ -764,6 +772,12 @@ class NativeFundingStore:
                              or recorded_order.market != self.owner.config.connector_name):
             raise PolicyError('Native recorded order conflicts with terminal funding release')
         if getattr(info.config, 'entry_chain_contract', None) == ACQUISITION_CHAIN_V1:
+            status_history = (self.recorder.get_order_status_history(order_id)
+                              if recorded_order is not None else [])
+            terminal_kinds = {_TERMINAL_ORDER_STATUS_KIND[status] for status in status_history
+                              if status in _TERMINAL_ORDER_STATUS_KIND}
+            if len(terminal_kinds) > 1:
+                raise PolicyError('Native recorded child has conflicting terminal order receipts')
             if rejected:
                 if (recorded_order is not None
                         and (recorded_order.last_status != 'OrderFailure'
@@ -771,10 +785,15 @@ class NativeFundingStore:
                              or recorded_order.symbol != receipt['trading_pair']
                              or recorded_order.market != self.owner.config.connector_name)):
                     raise PolicyError('Native recorded child status conflicts with terminal funding release')
+                if terminal_kinds and terminal_kinds != {'FAILED'}:
+                    raise PolicyError('Native recorded child status conflicts with terminal funding release')
             else:
                 expected_statuses = ({'OrderCancelled', 'OrderCanceled'} if receipt['state'] == 'CANCELED'
                                      else {'BuyOrderCompleted'})
                 if recorded_order.last_status not in expected_statuses:
+                    raise PolicyError('Native recorded child status conflicts with terminal funding release')
+                expected_kind = 'CANCELED' if receipt['state'] == 'CANCELED' else 'BUY_FILLED'
+                if terminal_kinds and terminal_kinds != {expected_kind}:
                     raise PolicyError('Native recorded child status conflicts with terminal funding release')
         # Terminal proof seals a single native submission. A later changed fill
         # is a contradiction and blocks new risk; exits continue independently.

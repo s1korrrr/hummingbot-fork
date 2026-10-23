@@ -143,6 +143,7 @@ def make_store(infos, fills, orders, *, allocation=ALLOCATION, max_position='505
                                sql_manager=SimpleNamespace(get_new_session=lambda: Session(engine)),
                                get_all_executors=lambda: list(infos),
                                get_trades_for_config=lambda path: list(fills),
+                               get_order_status_history=lambda order_id: [],
                                get_orders_for_config_and_market=lambda path, connector: list(orders))
     store = object.__new__(NativeFundingStore)
     store.owner, store.recorder, store.policy = owner, recorder, policy

@@ -12,7 +12,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.strategy_v2.executors.acquisition_chain import ACQUISITION_CHAIN_V1
 
 
-def _release_case(contract, last_status):
+def _release_case(contract, last_status, status_history=()):
     _, custom, proofs = chain_case()
     config = make_config(id='parent-btc', controller_id='owner', trading_pair='BTC-USDC',
                          entry_chain_contract=contract)
@@ -24,6 +24,7 @@ def _release_case(contract, last_status):
                             market_data_provider=SimpleNamespace(connectors={'okx': connector}))
     store = object.__new__(NativeFundingStore)
     store.owner = owner
+    store.recorder = SimpleNamespace(get_order_status_history=lambda order_id: list(status_history))
     recorded = SimpleNamespace(id='first', exchange_order_id='venue-first', symbol='BTC-USDC',
                                market='okx', last_status=last_status)
     return store, info, proofs[0], [recorded]
@@ -53,3 +54,10 @@ def test_rejected_chain_child_cannot_have_a_created_recorder_order():
     with pytest.raises(PolicyError, match='recorded child status'):
         store._validate_order_release(info, proof, 0, [], orders)
     store._validate_order_release(info, proof, 0, [], [])
+
+
+def test_chain_release_rejects_conflicting_terminal_recorder_history():
+    store, info, proof, orders = _release_case(
+        ACQUISITION_CHAIN_V1, 'OrderCancelled', ('BuyOrderCreated', 'OrderCancelled', 'BuyOrderCompleted'))
+    with pytest.raises(PolicyError, match='conflicting terminal order receipts'):
+        store._validate_order_release(info, proof, 0, [], orders)

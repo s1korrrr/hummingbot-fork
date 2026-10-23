@@ -6,18 +6,23 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 from unittest.mock import MagicMock
 
+import pytest
+
 from hummingbot.client.config.client_config_map import ClientConfigMap, MarketDataCollectionConfigMap
 from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.connector.client_order_tracker import ClientOrderTracker
 from hummingbot.connector.markets_recorder import MarketsRecorder
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
-from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, OrderCancelledEvent
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
+from hummingbot.core.event.events import BuyOrderCreatedEvent, MarketEvent, OrderCancelledEvent, OrderFilledEvent
 from hummingbot.model.exact_order_values import OrderExact
 from hummingbot.model.market_state import MarketState
+from hummingbot.model.metadata import Metadata
 from hummingbot.model.order import Order
 from hummingbot.model.order_status import OrderStatus
 from hummingbot.model.sql_connection_manager import SQLConnectionManager, SQLConnectionType
+from hummingbot.model.trade_fill import TradeFill
 
 
 class Market:
@@ -145,6 +150,125 @@ def test_older_same_millisecond_replay_cannot_rewind_newer_order_or_market_state
     asyncio.run(scenario())
 
 
+def test_late_captured_older_fill_does_not_rewind_terminal_order_projection(tmp_path):
+    async def scenario():
+        async with runtime(tmp_path / 'orders.sqlite') as (manager, recorder, market, order):
+            creation = recorder._capture_order_creation(MarketEvent.BuyOrderCreated.value, market, created_event())
+            creation.update(recorder._capture_market_state_payload(market))
+            recorder._persist_order_creation_payload(creation)
+            terminal = {
+                'order_id': 'order-1', 'config_file_path': 'test_config', 'market': market.display_name,
+                'timestamp': 105000, 'event_status': 'BuyOrderCompleted', 'creation_if_missing': None,
+                'cancel_event': False, 'recorder_sequence': 10,
+                'market_state_timestamp': 105000, 'market_state_json': '{}',
+            }
+            # The fill happened before completion, but a delayed callback or
+            # replay can capture it later. Keep the fill receipt while
+            # retaining the chronologically newer terminal projection.
+            late_fill = {**terminal, 'timestamp': 104000, 'event_status': 'OrderFilled', 'recorder_sequence': 11}
+            recorder._persist_order_status_payload(terminal)
+            recorder._persist_order_status_payload(late_fill)
+            with manager.get_new_session() as session:
+                row = session.get(Order, 'order-1')
+                assert (row.last_status, row.last_update_timestamp) == ('BuyOrderCompleted', 105000)
+                marker = session.get(
+                    Metadata,
+                    'native-recorder-sequence:test_config:order:order-1',
+                )
+                assert marker.value == '11'
+                assert session.query(OrderStatus).filter_by(order_id='order-1', status='BuyOrderCompleted').count() == 1
+                assert session.query(OrderStatus).filter_by(order_id='order-1', status='OrderFilled').count() == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('terminal_status,fill_timestamp', [
+    ('BuyOrderCompleted', 105),  # Same-millisecond nonterminal replay.
+    ('OrderCancelled', 106),     # Later-timestamp partial fill callback.
+])
+def test_late_financial_fill_keeps_terminal_projection_and_persists_receipt(
+        tmp_path, terminal_status, fill_timestamp):
+    async def scenario():
+        async with runtime(tmp_path / 'orders.sqlite') as (manager, recorder, market, order):
+            creation = recorder._capture_order_creation(MarketEvent.BuyOrderCreated.value, market, created_event())
+            creation.update(recorder._capture_market_state_payload(market))
+            recorder._persist_order_creation_payload(creation)
+            terminal_state = recorder._capture_market_state_payload(market)
+            terminal = {
+                'order_id': 'order-1', 'config_file_path': 'test_config', 'market': market.display_name,
+                'timestamp': 105000, 'event_status': terminal_status, 'creation_if_missing': None,
+                'cancel_event': terminal_status == 'OrderCancelled', **terminal_state,
+            }
+            recorder._persist_order_status_payload(terminal)
+            # A delayed fill callback can carry an equal or later timestamp.
+            # Its financial receipt must commit without reopening the terminal.
+            _, captured = recorder._capture_financial_fill(
+                MarketEvent.OrderFilled.value, market,
+                OrderFilledEvent(timestamp=fill_timestamp, order_id='order-1', trading_pair='BTC-USDC',
+                                 trade_type=TradeType.BUY, order_type=OrderType.LIMIT,
+                                 price=Decimal('100'), amount=Decimal('0.25'),
+                                 trade_fee=AddedToCostTradeFee(), exchange_trade_id='trade-late'),
+            )
+            fill_payload = captured['payload']
+            recorder._persist_financial_fill(fill_payload)
+            with manager.get_new_session() as session:
+                row = session.get(Order, 'order-1')
+                assert (row.last_status, row.last_update_timestamp) == (terminal_status, 105000)
+                assert session.query(OrderStatus).filter_by(order_id='order-1', status='OrderFilled').count() == 1
+                fill = session.query(TradeFill).filter_by(order_id='order-1', exchange_trade_id='trade-late').one()
+                assert (fill.timestamp, fill.amount_decimal) == (fill_timestamp * 1000, Decimal('0.25'))
+                marker = session.get(Metadata, 'native-recorder-sequence:test_config:order:order-1')
+                assert marker.value == str(fill_payload['recorder_sequence'])
+    asyncio.run(scenario())
+
+
+def test_conflicting_terminal_receipts_remain_visible_without_capture_order_winner(tmp_path):
+    async def scenario():
+        async with runtime(tmp_path / 'orders.sqlite') as (manager, recorder, market, order):
+            creation = recorder._capture_order_creation(MarketEvent.BuyOrderCreated.value, market, created_event())
+            creation.update(recorder._capture_market_state_payload(market))
+            recorder._persist_order_creation_payload(creation)
+            base = {
+                'order_id': 'order-1', 'config_file_path': 'test_config', 'market': market.display_name,
+                'creation_if_missing': None, 'cancel_event': False,
+                'market_state_timestamp': 105000, 'market_state_json': '{}',
+            }
+            cancelled = {**base, 'timestamp': 105000, 'event_status': 'OrderCancelled', 'recorder_sequence': 10}
+            completed = {**base, 'timestamp': 106000, 'event_status': 'BuyOrderCompleted', 'recorder_sequence': 11}
+            recorder._persist_order_status_payload(cancelled)
+            recorder._persist_order_status_payload(completed)
+            with manager.get_new_session() as session:
+                assert session.get(Order, 'order-1').last_status == 'OrderCancelled'
+                statuses = {row.status for row in session.query(OrderStatus).filter_by(order_id='order-1')}
+                assert {'OrderCancelled', 'BuyOrderCompleted'} <= statuses
+            assert recorder.get_order_status_history('order-1') == [
+                'BuyOrderCreated', 'OrderCancelled', 'BuyOrderCompleted',
+            ]
+    asyncio.run(scenario())
+
+
+def test_replayed_creation_does_not_reopen_terminal_order_projection(tmp_path):
+    async def scenario():
+        async with runtime(tmp_path / 'orders.sqlite') as (manager, recorder, market, order):
+            creation = recorder._capture_order_creation(MarketEvent.BuyOrderCreated.value, market, created_event())
+            creation.update(recorder._capture_market_state_payload(market))
+            recorder._persist_order_creation_payload(creation)
+            terminal = {
+                'order_id': 'order-1', 'config_file_path': 'test_config', 'market': market.display_name,
+                'timestamp': 105000, 'event_status': 'OrderCancelled', 'creation_if_missing': None,
+                'cancel_event': True, **recorder._capture_market_state_payload(market),
+            }
+            recorder._persist_order_status_payload(terminal)
+            replayed_creation = recorder._capture_order_creation(
+                MarketEvent.BuyOrderCreated.value, market, created_event())
+            replayed_creation.update(recorder._capture_market_state_payload(market))
+            recorder._persist_order_creation_payload(replayed_creation)
+            with manager.get_new_session() as session:
+                assert session.get(Order, 'order-1').last_status == 'OrderCancelled'
+                assert session.query(OrderStatus).filter_by(
+                    order_id='order-1', status='BuyOrderCreated').count() == 1
+    asyncio.run(scenario())
+
+
 def test_validated_legacy_creation_enrichment_clears_persisted_pending_marker(tmp_path):
     async def scenario():
         async with runtime(tmp_path / 'orders.sqlite') as (manager, recorder, market, order):
@@ -162,4 +286,24 @@ def test_validated_legacy_creation_enrichment_clears_persisted_pending_marker(tm
                 assert exact.amount == '1' and exact.price == '100'
                 assert session.query(OrderStatus).filter_by(order_id='order-1').count() == 1
                 assert not session.query(MarketState).one().saved_state['order-1']['recorder_pending_events']
+    asyncio.run(scenario())
+
+
+def test_same_terminal_replay_keeps_monotone_projection_timestamp(tmp_path):
+    async def scenario():
+        async with runtime(tmp_path / 'orders.sqlite') as (manager, recorder, market, order):
+            creation = recorder._capture_order_creation(MarketEvent.BuyOrderCreated.value, market, created_event())
+            creation.update(recorder._capture_market_state_payload(market))
+            recorder._persist_order_creation_payload(creation)
+            terminal = {'order_id': 'order-1', 'config_file_path': 'test_config',
+                        'market': market.display_name, 'creation_if_missing': None, 'cancel_event': False,
+                        'market_state_timestamp': 105000, 'market_state_json': '{}',
+                        'timestamp': 105000, 'event_status': 'BuyOrderCompleted', 'recorder_sequence': 10}
+            recorder._persist_order_status_payload(terminal)
+            recorder._persist_order_status_payload({**terminal, 'timestamp': 104000, 'recorder_sequence': 11})
+            with manager.get_new_session() as session:
+                row = session.get(Order, 'order-1')
+                assert (row.last_status, row.last_update_timestamp) == ('BuyOrderCompleted', 105000)
+                assert session.get(Metadata, 'native-recorder-sequence:test_config:order:order-1').value == '11'
+                assert session.query(OrderStatus).filter_by(order_id='order-1', status='BuyOrderCompleted').count() == 2
     asyncio.run(scenario())

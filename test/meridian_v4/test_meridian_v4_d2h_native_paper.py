@@ -4,10 +4,11 @@ from decimal import Decimal as D
 from pathlib import Path
 from test.hummingbot.strategy_v2.paper import test_paper_session as session_tests
 from test.meridian_v4.test_meridian_v4_d2h_contract import config
-from test.meridian_v4.test_meridian_v4_native_paper import BOOK, candles, frames, paper
+from test.meridian_v4.test_meridian_v4_native_paper import BOOK, PAIR, candles, frames, paper
 from unittest import IsolatedAsyncioTestCase
 
 from controllers.generic.modular_spot_core.bag import depth_slice_quote
+from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.paper_session import NativePaperSession
 
 OWNER = 'modular_spot_meridian_v4_d2h_paper_bnb'
@@ -22,6 +23,35 @@ def with_high(frame, high, minutes_before_end):
 
 class MeridianV4D2hNativePaperTests(IsolatedAsyncioTestCase):
     setUp = session_tests.NativePaperSessionTests.setUp  # denies all network connections
+
+    async def test_restore_exposes_native_reconciliation_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / 'd2h.sqlite'
+            session = NativePaperSession(paper(cash='200000'), [config(execution_enabled=True)], db)
+            await session.step(600000, books=[dict(**BOOK, sequence=2, timestamp=600000)],
+                               candles=[candles(frames(.05)[0], 600000)])
+            receipt = await session.step(600060, books=[dict(**BOOK, sequence=3, timestamp=600060)],
+                                         candles=[candles(frames(.05)[1], 600060)])
+            self.assertEqual(len(receipt['actions']), 1)
+            amount = session.executor_orchestrator.active_executors[OWNER][0]._open_order.order.amount
+            await session.step(600061, trades=[dict(trading_pair=PAIR, sequence=1, timestamp=600061,
+                                                    side=TradeType.SELL, price=D('99.49'), amount=amount)])
+            await session.close()
+
+            restored = NativePaperSession(paper(cash='200000'), [config(execution_enabled=True)], db, restore=True)
+            try:
+                evidence = restored.reconciliation_status()
+                self.assertEqual(evidence['status'], 'verified')
+                self.assertTrue(evidence['session_identity']['marker_matches'])
+                self.assertFalse(evidence['interrupted_step'])
+                self.assertEqual(evidence['unresolved_executors'], [])
+                self.assertEqual(evidence['unresolved_orders'], [])
+                self.assertEqual(evidence['inventory_consistency']['status'], 'verified')
+                await restored.step(600062, books=[dict(**BOOK, sequence=4, timestamp=600062)],
+                                    candles=[candles(frames(.05)[1], 600062)])
+                self.assertEqual(restored.reconciliation_status()['status'], 'verified')
+            finally:
+                await restored.close()
 
     async def entry_quote(self, high=None):
         before, rebound = frames(.05)

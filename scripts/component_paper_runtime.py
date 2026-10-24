@@ -642,6 +642,7 @@ class PaperRuntime:
             "process_pid": os.getpid(),
             "source_sha256": self.source_sha256,
             "restored": self.restored,
+            "reconciliation": self.session.reconciliation_status(),
             "decision_journal": {"failures": self.journal_failures, "last_error": self.journal_error},
             "ready": not reasons and self.failure is None,
             "reasons": reasons,
